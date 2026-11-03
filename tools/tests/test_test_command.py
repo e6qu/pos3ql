@@ -26,9 +26,15 @@ class TestCommandTests(unittest.TestCase):
         self.assertNotIn("Allocation backtrace", result.stdout)
 
     def test_symbolizes_guard_frames_and_keeps_the_failure(self):
+        self.check_symbolization("deps/pos3ql-abcd")
+
+    def test_symbolizes_verified_native_artifact_and_keeps_the_failure(self):
+        self.check_symbolization("native-test-artifact/pos3ql-native-tests")
+
+    def check_symbolization(self, relative):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binary = root / "deps" / "pos3ql-abcd"
+            binary = root / relative
             binary.parent.mkdir()
             binary.touch()
             tool = root / "addr2line"

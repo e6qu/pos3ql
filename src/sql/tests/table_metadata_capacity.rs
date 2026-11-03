@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn projection_type_visitors_release_schema_scratch_on_success_and_error() {
+    let config = test_config("projection-schema-scratch");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let mut arena = Arena::new(&mut budget, "projection schema scratch", 4 << 20).unwrap();
+    for sql in [
+        "SELECT value FROM generate_series(1,1100) AS input(value)",
+        "SELECT * FROM generate_series(1,1100) AS input(value)",
+        "SELECT 1 UNION ALL SELECT 2",
+        "WITH input AS(SELECT 1 AS value) SELECT value FROM input",
+    ] {
+        arena.reset();
+        let select = crate::sql::parser::parse_query(sql, &arena).unwrap();
+        let baseline = arena.used();
+        for _ in 0..1100 {
+            let mut columns = 0;
+            crate::mem::guard::forbid_alloc(|| {
+                crate::sql::query::visit_projection_types(
+                    select,
+                    &engine.storage,
+                    0,
+                    &arena,
+                    None,
+                    &mut |oid| {
+                        assert_eq!(oid, crate::sql::types::oid::INT4);
+                        columns += 1;
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(columns, 1, "{sql}");
+            assert_eq!(arena.used(), baseline, "{sql}");
+        }
+        let error = crate::mem::guard::forbid_alloc(|| {
+            crate::sql::query::visit_projection_types(
+                select,
+                &engine.storage,
+                0,
+                &arena,
+                None,
+                &mut |_| Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "visitor failed")),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::NUMERIC_OUT_OF_RANGE);
+        assert_eq!(arena.used(), baseline, "{sql}");
+    }
+}
+
+#[test]
 fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_recovery() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -679,10 +730,44 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         }
     }
     assert!(session.transaction.commit_admission().is_none());
-    assert_eq!(
-        data_rows(&session.success(&mut engine, "SELECT id FROM cold_commit_rows", true)),
-        ["2"]
-    );
+    let query = "SELECT id FROM cold_commit_rows";
+    let mut status = session.execute_status(&mut engine, query, true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait,
+    } = status
+    {
+        assert_eq!(wait, StatementWait::ObjectIo);
+        assert!(Instant::now() < deadline, "cold SELECT did not finish");
+        session.send.truncate_to(output_mark);
+        engine.bind_query_connection(session.connection_id);
+        status = crate::mem::guard::forbid_alloc(|| {
+            for slot in 0..engine.block_read_slots() {
+                engine.advance_pending_block_read(slot).unwrap();
+            }
+            engine
+                .execute_simple_from(
+                    query,
+                    completed_statements,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut Responder::new(&mut session.send),
+                    session.connection_id,
+                    false,
+                )
+                .unwrap()
+        });
+        std::thread::yield_now();
+    }
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert_eq!(data_rows(session.send.readable()), ["2"]);
+    assert!(!engine.block_reads_pending());
     let mut truncates = 0;
     let mut updates = 0;
     // Inspect the complete journal after the final engine operation.

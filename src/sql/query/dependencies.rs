@@ -1106,8 +1106,9 @@ pub(crate) fn validate_dml_assignment_casts(
             let index = target.column_index(name).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    target.name.as_str()
                 )
             })?;
             validate_assignment_expression(
@@ -1428,8 +1429,9 @@ pub(crate) fn visit_dml_assignment_types(
                 Some(name) => target.column_index(name).ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        target.name.as_str()
                     )
                 })?,
                 None => index,
@@ -1460,96 +1462,108 @@ pub(crate) fn visit_projection_types(
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
     visit: &mut dyn FnMut(i32) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    let select = super::expand_ctes(select, storage, txid, arena)?;
-    if let Some(tree) = select.set_body {
-        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
-        let mut oids = [0; crate::sql::exec::MAX_PROJ];
-        let count = super::setops::describe_set_body(
-            storage,
-            tree,
-            txid,
-            &mut columns,
-            arena,
-            Some(&mut oids),
-        )?;
-        for oid in &oids[..count] {
-            visit(*oid)?;
+    let mark = arena.mark();
+    let result = (|| {
+        let select = super::expand_ctes(select, storage, txid, arena)?;
+        if let Some(tree) = select.set_body {
+            let mut columns =
+                [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+            let mut oids = [0; crate::sql::exec::MAX_PROJ];
+            let count = super::setops::describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut columns,
+                arena,
+                Some(&mut oids),
+            )?;
+            for oid in &oids[..count] {
+                visit(*oid)?;
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-    let scope = select
-        .from
-        .as_ref()
-        .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, outer))
-        .transpose()?;
-    let catalog = super::storage_catalog(storage, arena, txid);
-    let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
-        row,
-        catalog: Some(&catalog),
-    });
-    let columns = DependencyTypes {
-        scope: scope.as_ref(),
-        excluded: None,
-        transition: transition
+        let scope = select
+            .from
             .as_ref()
-            .map(|columns| columns as &dyn ColTypeResolver),
-        storage,
-        txid,
-        returning_output: None,
-        arena,
-    };
-    for item in select.items {
-        match item {
-            SelectItem::Expr { expression, .. } => visit(
-                crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
-            )?,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
-                if let Some(scope) = &scope {
-                    let count = match item {
-                        SelectItem::TableWildcard(name) => scope.qualified_star_columns(name)?,
-                        _ => scope.star_columns(),
-                    };
-                    for index in 0..count {
-                        let entry = match item {
+            .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, outer))
+            .transpose()?;
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
+            row,
+            catalog: Some(&catalog),
+        });
+        let columns = DependencyTypes {
+            scope: scope.as_ref(),
+            excluded: None,
+            transition: transition
+                .as_ref()
+                .map(|columns| columns as &dyn ColTypeResolver),
+            storage,
+            txid,
+            returning_output: None,
+            arena,
+        };
+        for item in select.items {
+            match item {
+                SelectItem::Expr { expression, .. } => visit(
+                    crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
+                )?,
+                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                    if let Some(scope) = &scope {
+                        let count = match item {
                             SelectItem::TableWildcard(name) => {
-                                scope.qualified_star_entry(name, index)?
+                                scope.qualified_star_columns(name)?
                             }
-                            _ => scope.star_entry(index),
+                            _ => scope.star_columns(),
                         };
-                        let metadata = super::scope_column_metadata(scope, entry, storage, txid)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "source column type identity is unavailable"
-                                )
-                            })?;
-                        visit(metadata.type_oid)?;
+                        for index in 0..count {
+                            let entry = match item {
+                                SelectItem::TableWildcard(name) => {
+                                    scope.qualified_star_entry(name, index)?
+                                }
+                                _ => scope.star_entry(index),
+                            };
+                            let metadata =
+                                super::scope_column_metadata(scope, entry, storage, txid)
+                                    .ok_or_else(|| {
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_OBJECT,
+                                            "source column type identity is unavailable"
+                                        )
+                                    })?;
+                            visit(metadata.type_oid)?;
+                        }
+                    }
+                }
+                SelectItem::RecordStar(expression) => {
+                    let mut result = Ok(());
+                    let shape = crate::sql::exec::record_shape_metadata(
+                        expression,
+                        &columns,
+                        |_, metadata| {
+                            if result.is_ok() {
+                                result = visit(metadata.type_oid);
+                            }
+                        },
+                    )?;
+                    result?;
+                    if shape.is_none() {
+                        let oid =
+                            crate::sql::exec::infer_routine_argument_oid(expression, &columns)?;
+                        return Err(crate::sql::exec::not_composite(
+                            "*",
+                            ColType::from_oid(oid).map_or("unknown", ColType::name),
+                        ));
                     }
                 }
             }
-            SelectItem::RecordStar(expression) => {
-                let mut result = Ok(());
-                let shape = crate::sql::exec::record_shape_metadata(
-                    expression,
-                    &columns,
-                    |_, metadata| {
-                        if result.is_ok() {
-                            result = visit(metadata.type_oid);
-                        }
-                    },
-                )?;
-                result?;
-                if shape.is_none() {
-                    let oid = crate::sql::exec::infer_routine_argument_oid(expression, &columns)?;
-                    return Err(crate::sql::exec::not_composite(
-                        "*",
-                        ColType::from_oid(oid).map_or("unknown", ColType::name),
-                    ));
-                }
-            }
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    // Visitors receive only OIDs; retained cast snapshots use the persistent tail.
+    // Drop schema owners before releasing their temporary definitions and syntax.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 fn geometry_assignment_type(ctype: ColType) -> Option<ColType> {

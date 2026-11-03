@@ -95381,8 +95381,17 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         );
         engine.enable_async_durability();
         namespace.borrow_mut().faults.fail_from_op = Some(0);
-        let failed = session.execute(&mut engine, "COMMIT", false);
-        assert_eq!(error_sqlstates(&failed), ["58030"]);
+        let status = session.execute_status(&mut engine, "COMMIT", false);
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            output_mark,
+            wait,
+        } = status
+        else {
+            panic!("failed durability retains the COMMIT continuation: {status:?}");
+        };
+        assert_eq!(wait, StatementWait::ObjectIo);
+        assert_eq!(error_sqlstates(session.send.readable()), ["58030"]);
         assert!(engine.durable_retry_pending());
         assert!(session.transaction.staged_commit().is_some());
         assert!(engine.fatal_commit_failure().is_none());
@@ -95412,9 +95421,26 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
-        engine
-            .finish_pending_transaction(&mut session.transaction, &session.guc)
-            .unwrap();
+        session.send.truncate_to(output_mark);
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                "COMMIT",
+                completed_statements,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &mut session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(error_sqlstates(session.send.readable()).is_empty());
+        assert_eq!(command_tags(session.send.readable()), ["COMMIT"]);
+        assert!(session.transaction.staged_commit().is_none());
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
         assert!(engine.maybe_checkpoint());

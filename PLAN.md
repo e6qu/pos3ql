@@ -43,7 +43,10 @@ physical reader and startup arenas. Temporary call state belongs to active rows.
 Calls retain selected identities, original defaults and null handling; explicit
 variadic arrays remain distinct from expanded arguments.
 Declared casts retain their selected conversions and evaluation order through
-arrays and assignments, including typed NULL values.
+arrays and assignments, including typed NULL values. Array children convert in
+order; `INSERT ... SELECT` converts each complete selected row before the next row.
+Temporary schema planning releases its scratch space after each visit, so
+repeated function handoffs do not retain another schema copy.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

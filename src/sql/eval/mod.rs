@@ -2503,6 +2503,17 @@ fn catalog_evaluation(
             } else {
                 None
             };
+            if found.is_none()
+                && let Some((kind, _, _)) = crate::storage::NamedTypeKind::from_oid(target)
+            {
+                // Enum input needs this catalog even when no pg_cast row is
+                // involved. Domains and composite fields can execute checks.
+                found = Some(if kind == crate::storage::NamedTypeKind::Enum {
+                    ExpressionEvaluation::Immutable
+                } else {
+                    ExpressionEvaluation::Runtime
+                });
+            }
             if *binding == CastBinding::Resolve
                 && let Some(ColType::Array(element)) =
                     constructor_type_from_oid(target, &|oid| catalog.domain_base_type(oid))
@@ -2659,6 +2670,39 @@ fn fold_check<'a>(
             operator: super::ast::UnaryOp::Not,
             operand,
         } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
+        Expr::Cast {
+            operand: Expr::Array(items),
+            type_name,
+            ..
+        } if ColType::from_sql_name(type_name)
+            .or_else(|| {
+                let catalog = catalog?;
+                constructor_type_from_oid(catalog.user_type_oid(type_name)?, &|oid| {
+                    catalog.domain_base_type(oid)
+                })
+            })
+            .is_some_and(|target| matches!(target, ColType::Array(_))) =>
+        {
+            fn inputs<'a>(
+                items: &[&Expr<'a>],
+                arena: &'a Arena,
+                catalog: Option<&dyn CatalogAccess>,
+            ) -> Result<(), SqlError> {
+                for item in items {
+                    match item {
+                        Expr::Array(children) => inputs(children, arena, catalog)?,
+                        _ => {
+                            fold_check(item, arena, catalog)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // The cast owns the element context, including nested ARRAY[].
+            // Check source expressions without executing runtime conversions.
+            inputs(items, arena, catalog)?;
+            Ok(None)
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::BoundDefault {
@@ -5400,10 +5444,8 @@ fn prepare_array_constructor<'a>(
         } else {
             None
         };
-        let named_conversion = !types.multidimensional
-            && types.element.is_named()
-            && source_oid != target_oid
-            && cast.is_none();
+        let named_conversion =
+            types.element.is_named() && source_oid != target_oid && cast.is_none();
         if named_conversion && named_type.is_none() {
             let catalog = hooks.catalog.ok_or_else(|| {
                 sql_err!(
@@ -5411,16 +5453,12 @@ fn prepare_array_constructor<'a>(
                     "array constructor named type catalog access is unavailable"
                 )
             })?;
-            named_type = Some(
-                catalog
-                    .type_name(types.element.element_oid(), arena)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "array element has no declared type name"
-                        )
-                    })?,
-            );
+            named_type = Some(catalog.type_name(target_oid, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "array element has no declared type name"
+                )
+            })?);
         }
         *input = ArrayConstructorInput {
             expression,
@@ -5472,7 +5510,29 @@ fn execute_array_constructor<'a>(
             None => value,
         };
         *target = if plan.multidimensional {
-            value
+            if input.cast.is_some() {
+                value
+            } else if input.named_conversion {
+                hooks
+                    .catalog
+                    .expect("named array conversion has a catalog")
+                    .cast_user_type(
+                        plan.named_type
+                            .expect("named array conversion has its declared name"),
+                        value,
+                        arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "array type has no catalog conversion"
+                        )
+                    })?
+            } else if element.is_catalog_reference() {
+                reg_array_cast(value, element, hooks.catalog, arena)?
+            } else {
+                cast_to(value, ColType::Array(element), arena)?
+            }
         } else {
             coerce_array_constructor_element(
                 value,

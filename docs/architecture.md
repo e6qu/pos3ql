@@ -82,6 +82,12 @@ a quoted routine name cannot imitate an internal operator or JSON constructor.
 The callable declarations come from PostgreSQL 18.6. Static name/OID indexes
 and streamed candidates avoid a growing candidate list or runtime sort.
 
+Conversion lookup also uses declared types, including typed NULL values, before
+input effects. Each array child converts before the following child runs. For
+`INSERT ... SELECT`, the SELECT's sorting and limits determine its output; each
+complete output row then converts before the next row is produced. For example,
+an overflowing first array child must not advance a sequence in a later child.
+
 When a mutable function needs the engine, input preparation preserves completed
 expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',
@@ -110,9 +116,10 @@ capacity limits and the regression suites for individual cases.
 Single-table statements with supported scalar expressions reuse the owned
 physical reader across mutable function handoffs. Execution keeps the current
 row, finishes its predicate once and retains each completed projection item
-before advancing to the next. Function targets, original defaults, builtin cast choices and whether null
-inputs skip a call bind before row effects. Replacing a function can change
-its body when it starts, while the current query keeps that null-handling
+before advancing to the next. Function targets, original defaults, selected
+conversions and whether null inputs skip a call bind before row effects.
+Replacing a function can change its body when it starts, while the current
+query keeps that null-handling
 decision. A session-setting change in an earlier column cannot redirect
 a later bound call. Each active row borrows the unused region of its existing
 statement arena; completed output is copied before that region is released.

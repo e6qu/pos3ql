@@ -237,6 +237,13 @@ smallest reproducer. Fix the slow work, deadlock, resource contention, or worklo
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
 
+Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
+test jobs run that build's library test executable with the full native filter
+lists; each build, test and lint job retains its 15-minute ceiling. The artifact
+helper checks the source revision, target, byte length and SHA256 before running
+the executable. This keeps a slow cold build from consuming the tests' time
+budget without rebuilding or dropping cases.
+
 Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference
 with explicit container and output arguments:
 

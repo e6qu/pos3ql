@@ -1906,6 +1906,12 @@ pub fn rewrite_view_dml<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
+    let alias = match statement {
+        Stmt::Update(update) => update.alias,
+        Stmt::Delete(delete) => delete.alias,
+        _ => None,
+    };
+    let visible_name = alias.unwrap_or(view_name);
     let context = Subst {
         ctes: &[],
         materialized: &[],
@@ -1916,9 +1922,9 @@ pub fn rewrite_view_dml<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: Some(ViewQualifier {
-            from: view_name,
+            from: visible_name,
             from_schema: None,
-            to: base_name,
+            to: alias.unwrap_or(base_name),
             to_schema: base_schema,
             exposed_columns,
             base_columns,
@@ -1929,7 +1935,7 @@ pub fn rewrite_view_dml<'a>(
         execution: None,
     };
     let expanded_returning =
-        |items| expand_view_returning(items, view_name, exposed_columns, arena);
+        |items| expand_view_returning(items, visible_name, exposed_columns, arena);
     let rewritten = match statement {
         Stmt::Insert(insert) => {
             for column in insert.columns {

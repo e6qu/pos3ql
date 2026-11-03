@@ -19,14 +19,13 @@ jobs:
     name: Format CI
     uses: ./.github/workflows/formatting.yml
 
-  reactor-ownership:
+  native-build:
     needs: formatting
-    name: native ${{ matrix.check }} (${{ matrix.platform }})
+    name: native build (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
         platform: [Linux arm64, macOS arm64]
-        check: [build and test, lint]
         include:
           - platform: Linux arm64
             runner: ubuntu-24.04-arm
@@ -42,8 +41,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: Verify native compiler target
         env:
@@ -60,27 +57,106 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Build all native targets
-        if: ${{ matrix.check == 'build and test' }}
-        run: cargo build --all-targets --locked --target "$NATIVE_TARGET"
+        run: >-
+          cargo build --all-targets --locked --target "$NATIVE_TARGET"
+          --message-format=json-render-diagnostics > "$RUNNER_TEMP/native-build.jsonl"
+
+      - name: Prepare the exact native test executable
+        run: >-
+          python3 tools/native-test-artifact.py prepare
+          "$RUNNER_TEMP/native-build.jsonl" "$RUNNER_TEMP/native-test-artifact"
+          "$GITHUB_SHA" "$NATIVE_TARGET"
+
+      - name: Retain native test executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-tests-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/native-test-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  reactor-ownership:
+    needs: native-build
+    name: native build and test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Linux arm64, macOS arm64]
+        include:
+          - platform: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-tests-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/native-test-artifact
 
       - name: Function and HTTP fixture contracts
-        if: ${{ matrix.check == 'build and test' }}
-        run: >-
-          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" --
-          routine_calls:: object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing
-          --test-threads=1
+        shell: bash
+        run: |
+          native_test_binary=$(python3 tools/native-test-artifact.py verify \
+            "$RUNNER_TEMP/native-test-artifact" "$GITHUB_SHA" "$NATIVE_TARGET")
+          python3 tools/test_command.py "$native_test_binary" \
+            routine_calls:: object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing \
+            --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries
-        if: ${{ matrix.check == 'build and test' }}
-        run: >-
-          python3 tools/test_command.py cargo test --lib --locked --target "$NATIVE_TARGET" -- io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_
-          timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_
-          maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests::
-          reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_
-          --test-threads=1
+        shell: bash
+        run: |
+          native_test_binary=$(python3 tools/native-test-artifact.py verify \
+            "$RUNNER_TEMP/native-test-artifact" "$GITHUB_SHA" "$NATIVE_TARGET")
+          python3 tools/test_command.py "$native_test_binary" \
+            io:: mem::mutex::tests type_ domain_ enum_ composite_ table_name catalog_creation_ \
+            timezone_abbreviation_ fixed_default_abbreviations_ degree_special_and_random_math_ \
+            maintenance_metadata_ cleanup_download_overlap_ object_store::http::tests:: \
+            reader_scratch_is_synchronized_and_startup_bounded database_default_collation_is_bounded_ \
+            --test-threads=1
+
+  native-lint:
+    needs: formatting
+    name: native lint (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Linux arm64, macOS arm64]
+        include:
+          - platform: Linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macOS arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify native compiler target
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$NATIVE_TARGET"
+      - name: Cache Rust dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Native allocation-free boundaries
-        if: ${{ matrix.check == 'lint' }}
         run: cargo clippy --all-targets --locked --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:
@@ -207,6 +283,7 @@ jobs:
           tools/tests/test_run_performance.py
           tools/tests/test_test_ports.py
           tools/tests/test_test_command.py
+          tools/tests/test_native_test_artifact.py
           tools/tests/test_python_env.py
 
       - name: Duplicate-code guard

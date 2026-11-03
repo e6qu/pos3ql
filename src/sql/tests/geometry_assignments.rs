@@ -1,5 +1,85 @@
 use super::*;
 
+// PostgreSQL 18.6 reference SQL SHA256:
+// 9d652291010b05af1db990218c988f1290d3d42bc115096c8717858096b8430d.
+#[test]
+fn named_array_folding_retains_empty_constructor_context() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("named-array-folding-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TYPE fold_enum AS ENUM('a','b'); CREATE DOMAIN fold_domain AS fold_enum CHECK(VALUE<>'b')", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT array_length(ARRAY[]::fold_enum[],1) IS NULL, \
+                    array_length(ARRAY[ARRAY[]]::fold_enum[],1) IS NULL, \
+                    array_length(ARRAY[]::fold_domain[],1) IS NULL, \
+                    array_length(ARRAY[ARRAY[]]::fold_domain[],1) IS NULL",
+                true
+            )),
+            ["t|t|t|t"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT ARRAY['missing']::fold_enum[] WHERE false",
+                true
+            )),
+            ["22P02"]
+        );
+    }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// f6e98e8dcf3eebd33c10b2f41dad32b3d6634609e977b9475174de50ea0dfb72.
+#[test]
+fn array_valued_children_convert_before_later_source_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("array-child-conversion-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE array_child_calls; \
+             CREATE FUNCTION array_bad_child() RETURNS bigint[] LANGUAGE sql VOLATILE \
+               SET search_path TO public,pg_catalog AS $$SELECT ARRAY[2147483648::bigint]$$; \
+             CREATE FUNCTION array_good_child() RETURNS bigint[] LANGUAGE sql VOLATILE \
+               SET search_path TO public,pg_catalog AS $$SELECT ARRAY[7::bigint]$$",
+            true,
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT ARRAY[array_bad_child(),ARRAY[nextval('array_child_calls')]]::integer[]",
+                true
+            )),
+            ["22003"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_called FROM array_child_calls; \
+             SELECT ARRAY[array_good_child(),ARRAY[nextval('array_child_calls')]]::integer[]; \
+             SELECT currval('array_child_calls')",
+                true
+            )),
+            ["f", "{{7},{1}}", "1"]
+        );
+    }
+}
+
 #[test]
 fn registered_array_casts_keep_shape_null_rules_effects_and_selected_definitions() {
     for mode in [
@@ -254,4 +334,126 @@ fn view_assignment_plans_keep_public_columns_casts_and_source_scopes() {
              SELECT currval('view_assignment_calls'),currval('view_assignment_triggers')", true)),
             ["1|(2,9),(2,9)", "2|(5,9),(5,9)", "99|(4,9),(4,9)", "5|1"]);
     }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256s:
+// 937118941cd4013222a80aef69e00d0d8c79e80c0800eca30b7241b04f48e0f6;
+// 27bc473d8424e34b8ddf56427e6106beb972b8bffda116f576b0da290889776a.
+#[test]
+fn insert_select_assignment_casts_follow_source_projection_order_once() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("select-assignment-order-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TYPE select_cast_input AS ENUM('a'); CREATE SEQUENCE select_cast_calls; \
+             CREATE FUNCTION select_cast_source(integer) RETURNS select_cast_input LANGUAGE sql VOLATILE \
+               SET search_path TO public,pg_catalog AS \
+               $$SELECT CASE WHEN nextval('select_cast_calls')>0 THEN 'a'::select_cast_input END$$; \
+             CREATE FUNCTION select_cast_box(select_cast_input) RETURNS box LANGUAGE sql VOLATILE \
+               SET search_path TO public,pg_catalog AS $$SELECT box(point(nextval('select_cast_calls')::float8,9))$$; \
+             CREATE CAST(select_cast_input AS box) WITH FUNCTION select_cast_box(select_cast_input) AS ASSIGNMENT; \
+             CREATE TABLE select_cast_source_rows(id integer); INSERT INTO select_cast_source_rows VALUES(2),(1),(3); \
+             CREATE TABLE select_cast_target(id integer,value box)", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "INSERT INTO select_cast_target SELECT id,select_cast_source(id) FROM select_cast_source_rows; \
+             SELECT id,value::text FROM select_cast_target ORDER BY id; SELECT currval('select_cast_calls')", true)),
+            ["1|(4,9),(4,9)", "2|(2,9),(2,9)", "3|(6,9),(6,9)", "6"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "TRUNCATE select_cast_target; ALTER SEQUENCE select_cast_calls RESTART WITH 1; \
+             INSERT INTO select_cast_target SELECT id,select_cast_source(id) FROM select_cast_source_rows ORDER BY id LIMIT 2; \
+             SELECT id,value::text FROM select_cast_target ORDER BY id; SELECT currval('select_cast_calls')", true)),
+            ["1|(2,9),(2,9)", "2|(4,9),(4,9)", "4"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "TRUNCATE select_cast_target; ALTER SEQUENCE select_cast_calls RESTART WITH 1; \
+             INSERT INTO select_cast_target SELECT id,select_cast_source(id) AS value FROM select_cast_source_rows ORDER BY value,id LIMIT 2; \
+             SELECT id,value::text FROM select_cast_target ORDER BY id; SELECT currval('select_cast_calls')", true)),
+            ["1|(4,9),(4,9)", "2|(5,9),(5,9)", "5"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "CREATE TABLE select_cast_pair(first_value box,second_value box); ALTER SEQUENCE select_cast_calls RESTART WITH 1; \
+             INSERT INTO select_cast_pair SELECT select_cast_source(id),select_cast_source(id) FROM select_cast_source_rows; \
+             SELECT first_value::text,second_value::text FROM select_cast_pair; SELECT currval('select_cast_calls')", true)),
+            ["(3,9),(3,9)|(4,9),(4,9)", "(7,9),(7,9)|(8,9),(8,9)", "(11,9),(11,9)|(12,9),(12,9)", "12"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "TRUNCATE select_cast_pair; ALTER SEQUENCE select_cast_calls RESTART WITH 1; \
+             INSERT INTO select_cast_pair SELECT select_cast_source(id),select_cast_source(id) FROM select_cast_source_rows ORDER BY id LIMIT 2; \
+             SELECT first_value::text,second_value::text FROM select_cast_pair; SELECT currval('select_cast_calls')", true)),
+            ["(3,9),(3,9)|(4,9),(4,9)", "(7,9),(7,9)|(8,9),(8,9)", "8"]);
+        session.success(&mut engine, "CREATE SEQUENCE select_cast_width_calls", true);
+        assert_eq!(error_sqlstates(&session.execute(&mut engine,
+            "INSERT INTO select_cast_target(id,value) SELECT nextval('select_cast_width_calls')::integer", true)), ["42601"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT is_called FROM select_cast_width_calls; INSERT INTO select_cast_target SELECT 99; \
+             SELECT id,value IS NULL FROM select_cast_target WHERE id=99", true)), ["f", "99|t"]);
+        session.success(&mut engine,
+            "CREATE TABLE select_cast_fire(id integer); \
+             CREATE FUNCTION select_cast_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+               INSERT INTO select_cast_target SELECT id,select_cast_source(id) FROM select_cast_source_rows; RETURN NEW; END$$; \
+             CREATE TRIGGER select_cast_trigger AFTER INSERT ON select_cast_fire FOR EACH ROW EXECUTE FUNCTION select_cast_trigger()", true);
+        for dynamic in [false, true] {
+            if dynamic {
+                session.success(&mut engine,
+                    "CREATE OR REPLACE FUNCTION select_cast_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+                       EXECUTE 'INSERT INTO select_cast_target SELECT id,select_cast_source(id) FROM select_cast_source_rows'; RETURN NEW; END$$", true);
+            }
+            assert_eq!(data_rows(&session.success(&mut engine,
+                "TRUNCATE select_cast_target; ALTER SEQUENCE select_cast_calls RESTART WITH 1; INSERT INTO select_cast_fire VALUES(1); \
+                 SELECT id,value::text FROM select_cast_target ORDER BY id; SELECT currval('select_cast_calls')", true)),
+                ["1|(4,9),(4,9)", "2|(2,9),(2,9)", "3|(6,9),(6,9)", "6"]);
+        }
+    }
+}
+
+#[test]
+fn projection_type_visits_keep_selected_cast_snapshots() {
+    use crate::sql::eval::CatalogAccess as _;
+    let config = test_config("projection-type-scratch");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TYPE projection_cast_input AS ENUM('a'); \
+         CREATE FUNCTION projection_cast_box(projection_cast_input) RETURNS box LANGUAGE sql IMMUTABLE \
+           CALLED ON NULL INPUT AS $$SELECT '(7,9),(7,9)'::box$$; \
+         CREATE CAST(projection_cast_input AS box) WITH FUNCTION projection_cast_box(projection_cast_input) AS ASSIGNMENT; \
+         CREATE VIEW projection_type_input AS SELECT NULL::projection_cast_input AS value", true);
+    let arena = Arena::new(&mut budget, "projection type scratch", 64 << 10).unwrap();
+    let select =
+        crate::sql::parser::parse_query("SELECT value FROM projection_type_input", &arena).unwrap();
+    let catalog = query::storage_catalog(&engine.storage, &arena, 0);
+    crate::mem::guard::forbid_alloc(|| {
+        let mut selected = None;
+        query::visit_projection_types(select, &engine.storage, 0, &arena, None, &mut |source| {
+            let cast = catalog
+                .bind_defined_cast(
+                    source,
+                    ColType::Geometry(crate::sql::types::GeometryKind::Box).oid(),
+                    crate::sql::eval::DefinedCastContext::Assignment,
+                )?
+                .expect("registered cast");
+            selected = Some(
+                &arena
+                    .alloc_persistent_slice_with(1, |_| cast)
+                    .map_err(|_| crate::sql::eval::arena_full())?[0],
+            );
+            Ok(())
+        })
+        .unwrap();
+        arena.alloc_slice_with(8192, |_| 0xcc_u8).unwrap();
+        let value = catalog
+            .execute_bound_cast(selected.expect("retained cast"), Datum::Null, &arena)
+            .unwrap();
+        assert!(matches!(
+            value,
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Box,
+                text: "(7,9),(7,9)"
+            }
+        ));
+    });
 }

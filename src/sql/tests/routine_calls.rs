@@ -2885,3 +2885,128 @@ fn builtin_aggregate_support_identities_survive_catalog_publication() {
         );
     }
 }
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// 9ceddc11f76f05b4af9d2234b0d8b08d8c02646f891affbfb07354d41294ddc6.
+#[test]
+fn conflict_condition_types_preserve_qualified_scope_errors() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("conflict-qualified-scope");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SCHEMA reference_scope; \
+             CREATE TABLE reference_scope.source(id integer PRIMARY KEY,value integer); \
+             INSERT INTO reference_scope.source VALUES(1,7)",
+            true,
+        );
+        for (condition, state, message) in [
+            (
+                "abs(ghost.missing)>0",
+                "42P01",
+                "missing FROM-clause entry for table \"ghost\"",
+            ),
+            (
+                "abs(excluded.missing)>0",
+                "42703",
+                "column excluded.missing does not exist",
+            ),
+        ] {
+            let sql = format!(
+                "INSERT INTO reference_scope.source VALUES(1,9) \
+                 ON CONFLICT(id) DO UPDATE SET value=excluded.value WHERE {condition}"
+            );
+            let output = session.execute(&mut engine, &sql, true);
+            assert_eq!(error_sqlstates(&output), [state], "{mode:?}: {sql}");
+            assert!(
+                String::from_utf8_lossy(&output).contains(&format!("M{message}\0")),
+                "{mode:?}: {sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM reference_scope.source",
+                true,
+            )),
+            ["7"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "INSERT INTO reference_scope.source VALUES(1,9) ON CONFLICT(id) \
+                 DO UPDATE SET value=excluded.value WHERE abs(excluded.value)>0 \
+                 RETURNING value",
+                true,
+            )),
+            ["9"]
+        );
+    }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// 2baf7a415c2246607b549a3e1a2cef33191f7e0ca15a8bd311dbfe9dec3b9a89.
+#[test]
+fn auto_updatable_views_map_public_columns_under_target_aliases() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("view-target-alias-columns");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE alias_view_base(id integer,value text,secret text); \
+             INSERT INTO alias_view_base VALUES(1,'a','private'),(2,'b','private'),(3,'c','private'); \
+             CREATE VIEW alias_view(visible_id,visible_value) AS \
+               SELECT id,value FROM alias_view_base WHERE id<=2",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "UPDATE alias_view AS exposed SET visible_value=upper(exposed.visible_value) \
+                 WHERE exposed.visible_id=1 RETURNING exposed.*; \
+                 DELETE FROM alias_view AS exposed WHERE exposed.visible_id=2 RETURNING exposed.*",
+                true,
+            )),
+            ["1|A", "2|b"]
+        );
+        let hidden = session.execute(
+            &mut engine,
+            "UPDATE alias_view AS exposed SET secret='leak' WHERE exposed.visible_id=1",
+            true,
+        );
+        assert_eq!(error_sqlstates(&hidden), ["42703"]);
+        assert!(
+            String::from_utf8_lossy(&hidden)
+                .contains("Mcolumn \"secret\" of relation \"alias_view\" does not exist\0")
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "UPDATE alias_view AS exposed SET visible_value='hidden' WHERE alias_view.visible_id=1",
+                true,
+            )),
+            ["42P01"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT id,value,secret FROM alias_view_base ORDER BY id",
+                true,
+            )),
+            ["1|A|private", "3|c|private"]
+        );
+    }
+}

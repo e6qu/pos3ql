@@ -5204,6 +5204,47 @@ impl<'o, 's, 'e, 'x, 'v, 'd> ColumnLookup<'v> for ExcludedCtx<'o, 's, 'e, 'x, 'v
 where
     's: 'v,
 {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if let Some(qualifier) = qualifier.filter(|value| value.eq_ignore_ascii_case("excluded")) {
+            return self
+                .def
+                .column_index(name)
+                .map(|index| self.def.columns()[index].ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    )
+                });
+        }
+        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+            || (qualifier.is_none() && self.def.column_index(name).is_none())
+        {
+            return self
+                .outer
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                })?
+                .resolve_column_type(qualifier, name);
+        }
+        RowCtx {
+            def: self.def,
+            values: self.existing,
+            alias: None,
+        }
+        .resolve_column_type(qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         let src = if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded")) {
             self.excluded
@@ -16678,14 +16719,13 @@ enum TriggerDml<'a> {
 static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 
 /// The INSERT source is either evaluated by the ordinary executor or already
-/// encoded by a trigger's short-lived read phase. The latter has no reference
-/// to storage, so the subsequent write phase cannot overlap a source borrow.
+/// converted and encoded by a trigger's short-lived read phase. The latter
+/// has no storage borrow; its write phase must not repeat assignment casts.
 #[derive(Clone, Copy)]
 pub enum InsertSource<'a> {
     Statement,
     MaterializedSelect {
         rows: &'a [&'a [u8]],
-        casts: &'a [Option<&'a super::eval::BoundCast>],
         assignments: AssignmentCasts<'a>,
     },
 }
@@ -21198,9 +21238,15 @@ struct TriggerQueryExecution<'params, 'session, 'result> {
     seq_session: &'session crate::sql::guc::SeqSession,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trigger INSERT source and assignment context"
+)]
 fn materialize_trigger_insert_source<'result, 'query>(
     storage: &'query Storage,
+    statement: &Insert<'_>,
     select: &'query Select<'query>,
+    casts: &[Option<&super::eval::BoundCast>],
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
@@ -21210,50 +21256,68 @@ fn materialize_trigger_insert_source<'result, 'query>(
 where
     'result: 'query,
 {
-    let mut count = 0usize;
-    let count_mark = query_arena.mark();
-    {
-        let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
-        super::query::select_into_rows_recycling(
-            storage,
-            txid,
-            select,
-            query_arena,
-            execution.params,
-            scope,
-            Some(&dry),
-            &mut |_| {
-                count += 1;
-                Ok(())
-            },
-        )?;
+    let images = storage.table_definition_images();
+    let view_definition;
+    let definition =
+        match storage.resolve_relation(statement.table.schema, statement.table.name, txid) {
+            Some(crate::storage::ResolvedRelation::Table(table)) => {
+                images.definition(storage, table, txid)?.borrowed()
+            }
+            Some(crate::storage::ResolvedRelation::View(view)) => {
+                view_definition = view_trigger_definition(storage, view, txid, query_arena)?;
+                view_definition.borrowed()
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "INSERT target does not exist"
+                ));
+            }
+        };
+    let mut targets = [0; MAX_COLUMNS];
+    let count = if statement.columns.is_empty() {
+        definition.n_columns
+    } else {
+        statement.columns.len()
+    };
+    for (index, target) in targets[..count].iter_mut().enumerate() {
+        *target = if statement.columns.is_empty() {
+            index
+        } else {
+            definition
+                .column_index(statement.columns[index])
+                .ok_or_else(|| undefined_column(statement.columns[index]))?
+        };
     }
-    // The dry pass retains only the row count; AST and caller scope precede
-    // the mark, and no query value escapes its callback.
-    unsafe { query_arena.rewind_to(count_mark) };
-    const EMPTY: &[u8] = &[];
-    let rows = result_arena
-        .alloc_slice_with(count, |_| EMPTY)
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut at = 0usize;
-    {
-        let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
-        super::query::select_into_rows(
-            storage,
-            txid,
-            select,
-            query_arena,
-            execution.params,
-            scope,
-            Some(&live),
-            &mut |values| {
-                rows[at] = encode_projected_pub(values, result_arena)?;
-                at += 1;
-                Ok(())
-            },
-        )?;
-    }
-    Ok(&*rows)
+    // A counting pass would also execute source functions. Stage each row once.
+    let mut rows = crate::mem::arena::ArenaList::new_persistent(result_arena);
+    let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
+    super::query::select_into_rows_recycling(
+        storage,
+        txid,
+        select,
+        query_arena,
+        execution.params,
+        scope,
+        Some(&live),
+        &mut |values| {
+            let values = coerce_insert_projection(
+                values,
+                &definition,
+                &targets[..count],
+                casts,
+                statement.overriding,
+                storage,
+                txid,
+                query_arena,
+            )?;
+            let encoded = encode_projected_persistent_pub(values, result_arena)?;
+            rows.push(encoded)
+                .map_err(|_| super::query::arena_full_pub())?;
+            Ok(())
+        },
+    )?;
+    Ok(rows.as_slice())
 }
 
 /// Copies through the shared typed-value format so nested records retain every
@@ -21903,7 +21967,9 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
             let prepared_select = match statement.select {
                 Some(select) => Some(materialize_trigger_insert_source(
                     context.storage(),
+                    statement,
                     select,
+                    source_casts.expect("prepared SELECT has a cast plan"),
                     context.arena,
                     context.arena,
                     context.txn.txid,
@@ -21941,7 +22007,6 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     prepared_select.map_or(InsertSource::Statement, |rows| {
                         InsertSource::MaterializedSelect {
                             rows,
-                            casts: source_casts.expect("prepared SELECT has a cast plan"),
                             assignments: assignment_casts,
                         }
                     }),
@@ -26143,21 +26208,20 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 context.arena,
                                 Some(&scope),
                             )?;
-                            Some((
+                            Some(materialize_trigger_insert_source(
+                                context.storage(),
+                                &statement,
+                                select,
                                 casts,
-                                materialize_trigger_insert_source(
-                                    context.storage(),
-                                    select,
-                                    context.arena,
-                                    context.arena,
-                                    context.txn.txid,
-                                    TriggerQueryExecution {
-                                        params: context.params,
-                                        seq_session: context.seq_session(),
-                                    },
-                                    Some(&scope),
-                                )?,
-                            ))
+                                context.arena,
+                                context.arena,
+                                context.txn.txid,
+                                TriggerQueryExecution {
+                                    params: context.params,
+                                    seq_session: context.seq_session(),
+                                },
+                                Some(&scope),
+                            )?)
                         }
                         None => None,
                     };
@@ -26197,10 +26261,9 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             Some(&scope),
                             transition_relations,
                             conflict_scope,
-                            prepared_select.map_or(InsertSource::Statement, |(casts, rows)| {
+                            prepared_select.map_or(InsertSource::Statement, |rows| {
                                 InsertSource::MaterializedSelect {
                                     rows,
-                                    casts,
                                     assignments: assignment_casts,
                                 }
                             }),
@@ -61169,6 +61232,17 @@ pub(crate) fn instead_of_view_dml<'a>(
                     Ok(casts) => casts,
                     Err(error) => return sql_fail(error),
                 };
+                let mut source_targets = [0; MAX_COLUMNS];
+                for (index, target) in source_targets[..target_count].iter_mut().enumerate() {
+                    *target = if insert.columns.is_empty() {
+                        index
+                    } else {
+                        match def.column_index(insert.columns[index]) {
+                            Some(column) => column,
+                            None => return sql_fail(undefined_column(insert.columns[index])),
+                        }
+                    };
+                }
                 let mut rows = match scratch.pool().lease::<&[u8]>(0) {
                     Ok(rows) => rows,
                     Err(error) => {
@@ -61192,6 +61266,16 @@ pub(crate) fn instead_of_view_dml<'a>(
                         txn.txid,
                     )),
                     &mut |values| {
+                        let values = coerce_insert_projection(
+                            values,
+                            &def,
+                            &source_targets[..target_count],
+                            source_casts,
+                            insert.overriding,
+                            storage,
+                            txn.txid,
+                            arena,
+                        )?;
                         let bytes = encode_projected_pub(values, arena)?;
                         rows.push(bytes).map_err(|error| {
                             sql_err!(
@@ -61219,17 +61303,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 None => return sql_fail(undefined_column(insert.columns[source])),
                             }
                         };
-                        values[column] = match coerce_assignment(
-                            *value,
-                            &def.columns[column],
-                            source_casts[source],
-                            storage,
-                            txn.txid,
-                            arena,
-                        ) {
-                            Ok(value) => value,
-                            Err(error) => return sql_fail(error),
-                        };
+                        values[column] = *value;
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -61906,7 +61980,7 @@ where
         statement.columns.len()
     };
     let source_assignment_casts = match source {
-        InsertSource::MaterializedSelect { casts, .. } => Some(casts),
+        InsertSource::MaterializedSelect { .. } => None,
         InsertSource::Statement => match statement.select {
             Some(select) => match prepare_insert_select_casts(
                 statement, select, storage, txn.txid, arena, transition,
@@ -62148,9 +62222,9 @@ where
         }
     }
 
-    // INSERT ... SELECT: materialize the source rows into the arena first
-    // (reading storage immutably), then insert them (mutably) — the source may
-    // read the very table being written, so the two phases must not overlap.
+    // Materialize source rows and their assignment conversions before writing:
+    // the source may read the table being inserted into. Each emitted source
+    // row converts before the next row runs; encoded values are already typed.
     if let Some(sel) = statement.select {
         let (rows_bytes, count): (&[&[u8]], usize) =
             if let InsertSource::MaterializedSelect { rows, .. } = source {
@@ -62167,6 +62241,16 @@ where
                 };
                 let mut rows = crate::mem::arena::ArenaList::new_persistent(arena);
                 let mut fill = |vals: &[Datum]| -> Result<(), SqlError> {
+                    let vals = coerce_insert_projection(
+                        vals,
+                        def,
+                        &targets[..n_targets],
+                        source_assignment_casts.expect("SELECT has a cast plan"),
+                        statement.overriding,
+                        storage,
+                        txn.txid,
+                        arena,
+                    )?;
                     let encoded = encode_projected_persistent_pub(vals, arena)?;
                     rows.push(encoded).map_err(|_| super::eval::arena_full())?;
                     Ok(())
@@ -62234,7 +62318,7 @@ where
         let mut inserted = 0u64;
         for bytes in rows_bytes.iter() {
             let n_src = projected_row_width(bytes);
-            if n_src != n_targets {
+            if n_src > n_targets || (n_src < n_targets && !statement.columns.is_empty()) {
                 let msg = if n_src > n_targets {
                     "INSERT has more expressions than target columns"
                 } else {
@@ -62258,24 +62342,7 @@ where
                     IdentityAction::Accept => {}
                 }
                 let v = decode_projected_pub(bytes, i);
-                let col = &def.columns()[targets[i]];
-                let cast = source_assignment_casts
-                    .expect("SELECT has a cast plan")
-                    .get(i)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "SELECT assignment cast plan is incomplete"
-                        )
-                    });
-                let cast = match cast {
-                    Ok(cast) => *cast,
-                    Err(error) => return sql_fail(error),
-                };
-                match coerce_assignment(v, col, cast, storage, txn.txid, arena) {
-                    Ok(v) => values[targets[i]] = v,
-                    Err(e) => return sql_fail(e),
-                }
+                values[targets[i]] = v;
                 explicit[targets[i]] = true;
             }
             // Defaults for columns the query does not supply: a folded constant,
@@ -72714,15 +72781,61 @@ fn prepare_insert_select_casts<'a>(
         *out = selected
             .map(|cast| {
                 arena
-                    .alloc(cast)
-                    .map(|cast| &*cast)
+                    .alloc_persistent_slice_with(1, |_| cast)
+                    .map(|values| &values[0])
                     .map_err(|_| super::eval::arena_full())
             })
             .transpose()?;
         index += 1;
         Ok(())
     })?;
+    if !statement.columns.is_empty() && index != count {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        ));
+    }
     Ok(casts)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selected INSERT projection contract"
+)]
+fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
+    values: &[Datum<'a>],
+    definition: &crate::storage::TableDefinition<B>,
+    targets: &[usize],
+    casts: &[Option<&super::eval::BoundCast>],
+    overriding: Overriding,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    if values.len() > targets.len() || casts.len() != targets.len() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more expressions than target columns"
+        ));
+    }
+    let output = arena
+        .alloc_slice_copy(values)
+        .map_err(|_| super::eval::arena_full())?;
+    for (index, value) in output.iter_mut().enumerate() {
+        let target = targets[index];
+        if identity_action(definition, target, overriding) == IdentityAction::UseSequence {
+            continue;
+        }
+        *value = coerce_assignment(
+            *value,
+            &definition.columns()[target],
+            casts[index],
+            storage,
+            txid,
+            arena,
+        )?;
+    }
+    Ok(output)
 }
 
 fn coerce_assignment<'a>(

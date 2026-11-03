@@ -3664,7 +3664,6 @@ fn eval_full_inner<'a>(
             variadic,
             star,
             distinct,
-            over,
             ..
         } => {
             let mut selected_builtin = None;

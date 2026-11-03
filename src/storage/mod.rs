@@ -8,7 +8,7 @@
 mod catalog_history;
 mod plan_invalidation_targets;
 mod plan_invalidations;
-pub(crate) use plan_invalidation_targets::SelectedPlanTarget;
+pub(crate) use plan_invalidation_targets::{SelectedPlanTarget, TruncateTarget};
 mod runtime_input_validity;
 pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,

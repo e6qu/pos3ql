@@ -5778,13 +5778,15 @@ impl Engine {
             }
         }
         for event_index in 0..txn.truncates().len() {
-            let event = txn.truncates()[event_index];
+            let event = txn.truncates()[event_index].clone();
             let transaction_id = txn.txid;
-            let (table_slots, tables) = txn.truncate_wal_tables(event);
+            let (table_targets, tables) = txn.truncate_wal_tables(&event);
             tables.clear();
             let mut durable_table_count = 0usize;
-            for &table_slot in table_slots {
-                let definition = self.storage.table_def(table_slot as usize, transaction_id);
+            for target in table_targets {
+                let definition = self
+                    .storage
+                    .table_def(usize::from(target.slot), transaction_id);
                 if definition.persistence == crate::storage::RelationPersistence::Temporary {
                     continue;
                 }
@@ -8415,7 +8417,7 @@ impl Engine {
         }
         for index in (mark.statistics..txn.statistics_undo().len()).rev() {
             match txn.statistics_undo()[index] {
-                StatisticsUndo::Table(table) => self
+                StatisticsUndo::Table { table, .. } => self
                     .storage
                     .rollback_table_statistics(table as usize, txn.txid),
                 StatisticsUndo::Extended(statistics) => self
@@ -8461,7 +8463,7 @@ impl Engine {
         }
         for i in (sp.statistics_mark..txn.statistics_undo().len()).rev() {
             match txn.statistics_undo()[i] {
-                StatisticsUndo::Table(table) => self
+                StatisticsUndo::Table { table, .. } => self
                     .storage
                     .rollback_table_statistics(table as usize, txn.txid),
                 StatisticsUndo::Extended(statistics) => self
@@ -8907,9 +8909,13 @@ impl Engine {
                     txn.record_statistics(slot as u32)?;
                     self.work.reset();
                     let started = datetime::now_micros();
+                    let previous = self.storage.table_statistics(slot, txn.txid);
                     let statistics = self
                         .storage
                         .analyze_table(slot, txn.txid, &[], &self.work)?;
+                    if statistics.relation_estimates_changed(&previous) {
+                        txn.record_statistics_plan_change(&self.storage, slot as u32);
+                    }
                     self.storage.record_relation_analyze(
                         slot,
                         statistics.rows,
@@ -8955,6 +8961,7 @@ impl Engine {
                 txn.record_statistics(slot as u32)?;
                 self.work.reset();
                 let started = datetime::now_micros();
+                let previous = self.storage.table_statistics(slot, txn.txid);
                 let statistics = self.storage.analyze_table(
                     slot,
                     txn.txid,
@@ -8962,6 +8969,9 @@ impl Engine {
                     &self.work,
                 );
                 let statistics = statistics?;
+                if statistics.relation_estimates_changed(&previous) {
+                    txn.record_statistics_plan_change(&self.storage, slot as u32);
+                }
                 self.storage.record_relation_analyze(
                     slot,
                     statistics.rows,
@@ -15863,6 +15873,15 @@ impl Engine {
                     site,
                 }
             }
+            RoutineBodyInputOrigin::CallSite(Some(query::InvocationSite::ArrayElement {
+                position,
+                element,
+            })) => type_inputs::Source::ArrayElementRoutineCallSite {
+                routine_oid,
+                definition_version: routine.version,
+                position,
+                element,
+            },
             RoutineBodyInputOrigin::CallSite(None) => type_inputs::Source::UnlocatedRoutineBody {
                 routine_oid,
                 definition_version: routine.version,
@@ -16094,7 +16113,13 @@ impl Engine {
             }
             (Some(plan), None)
         } else {
-            let prior = match key.map(|key| sqlprep.routine_inputs.find(key)).transpose() {
+            let prior = match key
+                .map(|key| match sequence::replayed_input_plan()? {
+                    Some(plan) => sqlprep.routine_inputs.lookup_replayed(plan, key).map(Some),
+                    None => sqlprep.routine_inputs.find(key),
+                })
+                .transpose()
+            {
                 Ok(prior) => prior.flatten(),
                 Err(error) => return Ok(Err(error)),
             };
@@ -16154,6 +16179,9 @@ impl Engine {
                 let prepared = type_input_plans::with_owner(
                     Owner::Nested(plan),
                     || -> Result<(), SqlError> {
+                        sqlprep
+                            .routine_inputs
+                            .retain_for_statement(plan, sequence::input_attempt())?;
                         if ready.is_some() {
                             return Ok(());
                         }
@@ -16224,8 +16252,8 @@ impl Engine {
             }
             return Ok(Err(error));
         }
-        let image = match sqlprep.routine_inputs.find(key) {
-            Ok(Some(Lookup::Ready(found, image))) if found == plan => image,
+        let image = match sqlprep.routine_inputs.lookup(plan, key) {
+            Ok(Lookup::Ready(found, image)) if found == plan => image,
             Ok(_) => {
                 return Ok(Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -23703,7 +23731,7 @@ fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
     }
     for undo in txn.statistics_undo().iter().rev() {
         match *undo {
-            StatisticsUndo::Table(table) => {
+            StatisticsUndo::Table { table, .. } => {
                 storage.rollback_table_statistics(table as usize, txn.txid)
             }
             StatisticsUndo::Extended(statistics) => {

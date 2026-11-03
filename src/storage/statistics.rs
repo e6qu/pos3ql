@@ -20,6 +20,28 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+impl TableStatistics {
+    pub(crate) fn relation_tuples(&self) -> f64 {
+        if self.valid { self.rows as f64 } else { -1.0 }
+    }
+
+    pub(crate) fn relation_pages(&self) -> i32 {
+        if self.valid {
+            self.rows
+                .saturating_mul(u64::from(self.average_row_width))
+                .div_ceil(8_192)
+                .min(i32::MAX as u64) as i32
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn relation_estimates_changed(&self, previous: &Self) -> bool {
+        self.relation_tuples() != previous.relation_tuples()
+            || self.relation_pages() != previous.relation_pages()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PendingStatisticsHead {
     transaction: u32,
@@ -1828,6 +1850,31 @@ mod tests {
             assert!(storage.pending_table_statistics(table, 7).is_none());
             assert!(storage.reserve_statistics_columns(1).is_ok());
             drop(occupied);
+        });
+    }
+
+    #[test]
+    fn relation_estimate_changes_follow_advertised_counts_and_pages() {
+        crate::mem::guard::forbid_alloc(|| {
+            let empty = TableStatistics::EMPTY;
+            let mut first = empty.clone();
+            first.valid = true;
+            first.rows = 1;
+            first.average_row_width = 8;
+            assert!(first.relation_estimates_changed(&empty));
+            assert_eq!((first.relation_tuples(), first.relation_pages()), (1.0, 1));
+            let mut samples_only = first.clone();
+            samples_only.analyzed_generation = 99;
+            samples_only.average_row_width = 16;
+            assert!(!samples_only.relation_estimates_changed(&first));
+            let mut pages_changed = first.clone();
+            pages_changed.average_row_width = 8_193;
+            assert!(pages_changed.relation_estimates_changed(&first));
+            assert_eq!(pages_changed.relation_pages(), 2);
+            let mut rows_changed = first.clone();
+            rows_changed.rows = 2;
+            assert!(rows_changed.relation_estimates_changed(&first));
+            assert!(!first.relation_estimates_changed(&first));
         });
     }
 }

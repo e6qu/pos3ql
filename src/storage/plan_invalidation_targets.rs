@@ -22,7 +22,34 @@ pub(crate) enum SelectedPlanTarget {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TruncateTarget {
+    pub slot: u16,
+    pub created_at: u64,
+}
+
 impl Storage {
+    pub(crate) fn capture_truncate_targets(
+        &self,
+        tables: &[usize],
+        transaction: u32,
+    ) -> Result<crate::mem::lease_pool::SharedSlice<TruncateTarget>, SqlError> {
+        let full = |error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error);
+        let mut targets = self
+            .metadata_pool
+            .lease::<TruncateTarget>(tables.len())
+            .map_err(full)?;
+        for &slot in tables {
+            targets
+                .push_reserved(TruncateTarget {
+                    slot: u16::try_from(slot).expect("validated physical table slot"),
+                    created_at: self.table_def(slot, transaction).identity().created_at,
+                })
+                .map_err(full)?;
+        }
+        Ok(targets.freeze())
+    }
+
     pub(crate) fn operator_family_plan_change(&self, change: &DdlUndo, transaction: u32) -> bool {
         match change {
             DdlUndo::OperatorFamilyCreated(slot) | DdlUndo::OperatorFamilyDropped(slot) => self
@@ -264,7 +291,8 @@ mod tests {
     #[test]
     fn truncate_events_retain_identities_and_exact_startup_budget_through_rewind() {
         use crate::sql::txn::TxnState;
-        let config = test_config();
+        let mut config = test_config();
+        config.table_metadata_leases = 64;
         let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
         let table = storage
@@ -282,7 +310,31 @@ mod tests {
             TxnState::new_with_large_objects(&mut transaction_budget, 1, 0, 2).unwrap();
         assert_eq!(transaction_budget.remaining(), 0);
         transaction.txid = 7;
+        let mut held = crate::mem::FixedVec::new(
+            &mut budget,
+            "test shared metadata pressure",
+            config.table_metadata_leases,
+        )
+        .unwrap();
         crate::mem::guard::forbid_alloc(|| {
+            loop {
+                match storage.metadata_pool.lease::<u8>(64) {
+                    Ok(lease) => assert!(held.push(lease).is_ok()),
+                    Err(error) => {
+                        assert_eq!(error.available_leases, 0);
+                        break;
+                    }
+                }
+            }
+            let error = transaction
+                .record_truncate(&storage, &[table], false, false, 1)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("table metadata pool"));
+            assert_eq!(transaction.plan_events().count(), 0);
+            assert!(transaction.truncates().is_empty());
+            held.clear();
+
             transaction
                 .record_truncate(&storage, &[table], false, false, 1)
                 .unwrap();

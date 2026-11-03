@@ -85,8 +85,14 @@ pub(crate) enum StatementEffectRetry {
     Continue,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+// The persistent arena handle distinguishes statements even when the same
+// input site is admitted repeatedly or the arena later reuses an offset.
+pub(crate) struct StatementInputAttempt(ArenaHandle<u8>);
+
 #[derive(Clone, Copy)]
 pub(super) struct StatementSequenceReplay {
+    input_attempt: Option<StatementInputAttempt>,
     head: Option<ArenaHandle<SequenceEffect>>,
     tail: Option<ArenaHandle<SequenceEffect>>,
     next: Option<ArenaHandle<SequenceEffect>>,
@@ -103,6 +109,7 @@ impl StatementSequenceReplay {
     }
 
     pub(super) const EMPTY: Self = Self {
+        input_attempt: None,
         head: None,
         tail: None,
         next: None,
@@ -332,6 +339,45 @@ fn with_statement_context<R>(
     execute(Some(unsafe { (&*arena, &*session) }))
 }
 
+pub(crate) fn input_attempt() -> Option<StatementInputAttempt> {
+    with_statement_context(|context| {
+        context.and_then(|(_, session)| session.statement_replay.get().input_attempt)
+    })
+}
+
+pub(crate) fn retains_input_attempt(attempt: StatementInputAttempt) -> bool {
+    with_statement_context(|context| {
+        context.is_some_and(|(arena, session)| {
+            session.statement_replay.get().input_attempt == Some(attempt)
+                && arena.retained(attempt.0).is_some()
+        })
+    })
+}
+
+pub(crate) fn replayed_input_plan() -> Result<Option<super::type_input_plans::PlanId>, SqlError> {
+    with_statement_context(|context| {
+        let Some((arena, session)) = context else {
+            return Ok(None);
+        };
+        let Some(handle) = session.statement_replay.get().effects_next else {
+            return Ok(None);
+        };
+        let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+        if effect.kind != StatementEffectKind::RoutineInput {
+            return Err(replay_changed());
+        }
+        let key = arena
+            .retained_slice_mut(effect.key)
+            .map_err(|_| replay_changed())?;
+        match super::exec::decode_projected_col_record(&key, 0, arena)? {
+            super::types::Datum::Bytea(bytes) => {
+                super::type_input_plans::PlanId::from_key_bytes(bytes).map(Some)
+            }
+            _ => Err(replay_changed()),
+        }
+    })
+}
+
 fn retained_effect_bytes(
     arena: &Arena,
     values: &[super::types::Datum<'_>],
@@ -515,6 +561,11 @@ pub(crate) fn statement_effect<'a>(
             .map_err(|_| effect_full())?;
         super::exec::encode_projected_into(key, encoded_key)?;
         let mut parent = session.statement_replay.get();
+        if kind == StatementEffectKind::RoutineInput && parent.input_attempt.is_none() {
+            parent.input_attempt = Some(StatementInputAttempt(
+                arena.retain(0u8).map_err(|_| effect_full())?,
+            ));
+        }
         let (handle, mut effect) = if let Some(handle) = parent.effects_next {
             let effect = arena.retained(handle).ok_or_else(replay_changed)?;
             let same = {
@@ -536,6 +587,7 @@ pub(crate) fn statement_effect<'a>(
                 result: None,
                 replayable: true,
                 children: StatementSequenceReplay {
+                    input_attempt: parent.input_attempt,
                     initial_lastval: session.last_sequence(),
                     ..StatementSequenceReplay::EMPTY
                 },
@@ -598,6 +650,7 @@ pub(crate) fn statement_effect<'a>(
         super::query::protect_statement_effects();
         let attempt = execute();
         effect.children = session.statement_replay.get();
+        parent.input_attempt = parent.input_attempt.or(effect.children.input_attempt);
         effect.after_lastval = session.last_sequence();
         effect.replayable = !attempt.rewound_state && !effect.children.nonreplayable;
         parent.nonreplayable |= !effect.replayable;

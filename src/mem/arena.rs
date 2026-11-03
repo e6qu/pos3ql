@@ -68,6 +68,7 @@ fn retention_identity() -> u64 {
 
 /// A copied value in the persistent tail. Handles reject a reset, replacement
 /// or different arena before accessing bytes; they do not retain references.
+#[derive(PartialEq, Eq)]
 pub(crate) struct ArenaHandle<T> {
     identity: u64,
     offset: usize,

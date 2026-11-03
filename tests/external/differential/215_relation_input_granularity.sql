@@ -1,4 +1,4 @@
--- Relation changes refresh saved inputs; statistics and index labels preserve them.
+-- Relation catalog changes refresh saved inputs; index labels preserve them.
 CREATE SEQUENCE granularity_checks;
 CREATE TYPE granularity_choice AS ENUM('a');
 CREATE DOMAIN granularity_checked AS granularity_choice CHECK(nextval('granularity_checks')>0);
@@ -27,6 +27,20 @@ INSERT INTO granularity_anchor VALUES(2); SELECT granularity_body();
 SELECT last_value FROM granularity_checks;
 DROP INDEX granularity_renamed; SELECT granularity_body();
 SELECT last_value FROM granularity_checks;
+BEGIN;
+TRUNCATE granularity_anchor;
+SELECT granularity_body();
+PREPARE TRANSACTION 'granularity-commit';
+COMMIT PREPARED 'granularity-commit';
+SELECT granularity_body();
+SELECT 'committed_truncate',last_value FROM granularity_checks;
+BEGIN;
+TRUNCATE granularity_anchor;
+SELECT granularity_body();
+PREPARE TRANSACTION 'granularity-rollback';
+ROLLBACK PREPARED 'granularity-rollback';
+SELECT granularity_body();
+SELECT 'rolled_back_truncate',last_value FROM granularity_checks;
 DROP FUNCTION granularity_body();
 DROP TABLE granularity_anchor;
 DROP DOMAIN granularity_checked;

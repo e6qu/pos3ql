@@ -378,11 +378,16 @@ commit and rollback use the selected object even if a name has changed or a
 catalog slot is later reused. Other backends receive committed changes; an
 aborted edit affects only its originating backend's cache.
 The existing transaction TRUNCATE log also retains each affected table's creation
-identity. Each logged table uses a two-byte slot and an eight-byte identity,
-reserved at startup for `max_ddl_per_transaction * (max_tables + 1)` entries.
-No catalog lookup is needed after a table's definition has been released.
-`ANALYZE` and index renames do not discard saved inputs; index creation, index
-deletion and TRUNCATE refresh plans that depend on the affected table.
+identity. These actual-length records share `table_metadata_bytes` and its lease
+limit; no table-count-sized identity array is reserved per connection. The
+transaction reserves only `max_ddl_per_transaction` event controls and its
+existing table-name encoding buffer. Pool exhaustion returns `54000` before
+publishing an event. No catalog lookup is needed after a table's definition has
+been released.
+Index renames preserve saved inputs. Whole-relation catalog statistics changes,
+index creation, index deletion and TRUNCATE refresh plans that depend on the
+affected table. Repeating ANALYZE without changing those catalog fields does
+not itself require a new input check.
 A compiled procedural function tracks its own definition. Each reached SQL
 statement separately tracks its schemas, role-sensitive dependencies and
 selected support functions, including custom operators and casts.

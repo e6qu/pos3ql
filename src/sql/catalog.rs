@@ -20140,20 +20140,8 @@ fn pg_class<'a>(
         let has_rules = storage.table_has_rules(slot, txid);
         let n_checks = table_def.n_checks as i32;
         let statistics = storage.table_statistics(slot, txid);
-        let reltuples = if statistics.valid {
-            statistics.rows as f64
-        } else {
-            -1.0
-        };
-        let relpages = if statistics.valid {
-            statistics
-                .rows
-                .saturating_mul(u64::from(statistics.average_row_width))
-                .div_ceil(8_192)
-                .min(i32::MAX as u64) as i32
-        } else {
-            0
-        };
+        let reltuples = statistics.relation_tuples();
+        let relpages = statistics.relation_pages();
         let materialized = storage
             .matviews_visible_to(txid)
             .find(|(_, view)| usize::from(view.backing_table) == slot);

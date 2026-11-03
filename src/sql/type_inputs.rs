@@ -52,6 +52,12 @@ pub(crate) enum Source {
         definition_version: u64,
         callsite: usize,
     },
+    ArrayElementRoutineCallSite {
+        routine_oid: i32,
+        definition_version: u64,
+        position: usize,
+        element: usize,
+    },
     SqlInlineAttempt {
         routine_oid: i32,
         definition_version: u64,
@@ -89,6 +95,11 @@ impl Source {
                 ..
             }
             | Self::SqlRoutineCallSite {
+                routine_oid,
+                definition_version,
+                ..
+            }
+            | Self::ArrayElementRoutineCallSite {
                 routine_oid,
                 definition_version,
                 ..

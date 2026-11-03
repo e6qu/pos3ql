@@ -25084,7 +25084,7 @@ fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>,
     }
     for at in (savepoint.statistics_mark..context.txn.statistics_undo().len()).rev() {
         match context.txn.statistics_undo()[at] {
-            super::txn::StatisticsUndo::Table(table) => context
+            super::txn::StatisticsUndo::Table { table, .. } => context
                 .storage_mut()
                 .rollback_table_statistics(table as usize, txid),
             super::txn::StatisticsUndo::Extended(statistics) => context

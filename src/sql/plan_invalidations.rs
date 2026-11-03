@@ -11,13 +11,13 @@ use crate::mem::{Budget, BudgetError, FixedVec, lease_pool::SharedSlice, mutex::
 use crate::sql_err;
 use crate::storage::{RuntimeInputDependency, RuntimeInputScope, SelectedPlanTarget};
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CatalogPlanChange {
     pub global: bool,
     pub roles: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PlanInvalidationEvent {
     pub scope: RuntimeInputScope,
     pub change: CatalogPlanChange,

@@ -4,35 +4,14 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix reproducible defects in the PR that finds them, including incidental defects.
 Record an entry here only with its reproducer, observed behavior and the exact
-external blocker or reason it cannot be repaired. Capacity, ownership and recovery
-regressions, statistics and generator ownership, query-source binding failures,
-prepared-input effects and resolved investigations belong
-in their fixing PR, tests and evidence.
+external blocker or reason it cannot be repaired. Keep resolved investigations
+with their fixing code, tests and evidence.
 
-Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the required comparisons,
-allocation checks and failure diagnostics. Regression details belong in their
-owning tests and technical guides, rather than a second checklist here.
-
-Unfinished resource policies and feature goals, with their acceptance criteria,
-belong in [PLAN.md](PLAN.md). Pending CI and uncollected measurements are
-acceptance work, not blocked defects.
-Repeated failures across native, coverage and PostgreSQL comparison jobs must
-be traced to their shared cause and repaired before acceptance. Saved defaults
-and function inputs require recovery and effect-count regressions, including
-backend reuse, rejected inlining and cursor opening/fetch waits; passing a
-compiler gate alone does not establish their correctness.
-Bind preparation also requires parameter-error timing, retained-value and
-cancelled-portal regressions; cache invalidation needs PostgreSQL comparisons
-across schema changes and transaction boundaries.
-Invalidation regressions also cover retained object identities, pending drops,
-slot reuse and allocation-free delivery; nominally passing compiler checks
-cannot substitute for those runtime comparisons.
-Cast-size arguments, inherited ownership and procedural input retries also need
-regressions that check visible values and effects, rather than compiler success. TRUNCATE invalidations must survive rollback,
-prepared transaction transfer and release of the original table definition.
-Retained metadata tests must keep explicit owners through replay and undo;
-removing ownership or allocation guards is not a compiler fix.
-Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
+[CONTRIBUTING.md](CONTRIBUTING.md) defines the required comparisons, allocation
+checks and failure diagnostics. Preserve ownership and allocation guards when
+repairing tests. Compiler success alone does not establish runtime correctness.
+Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
+not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 
 | ID | Status | Found | Description | Reproducer | Blocker |

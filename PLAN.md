@@ -73,8 +73,12 @@ parameterized planning must use the supplied values when pruning branches.
 already bound portal or cursor. Verify cache changes across
 schema edits, commit, rollback, search paths and roles against PostgreSQL;
 unrelated table changes must not repeat a constraint.
-Verify procedural specialization, nested argument substitution and selected
-index, policy, rule and privilege changes with actual PostgreSQL results.
+Compare procedural specialization, nested arguments, sized casts, selected
+operator/cast support functions and inherited ownership with PostgreSQL.
+Cover index, policy, rule and privilege changes, plus TRUNCATE commit, rollback
+and prepared transactions. Retain the selected table identity through these
+boundaries. Match whether whole-relation catalog statistics changed; repeating
+unchanged statistics and renaming an index must not repeat a constraint.
 Keep completed inputs while rolling back and safely replaying the unfinished
 input within its original deadline. Demonstrate the complete behavior in CI
 before closing this acceptance item.
@@ -270,13 +274,6 @@ distributions, throughput units, CPU/RSS, object requests, bytes and cost inputs
 No representative deployment run or qualified production size/TPS/bandwidth
 claim has been published. Theoretical addressability and calculated examples
 are not acceptance evidence.
-
-Cached function inputs must retain their original attempt while a lock or storage
-request is pending. Compare casts with declared size limits, operator calls,
-reached procedural statements and inherited ownership against PostgreSQL;
-validate runtime effects as well as parsing and compilation. Cover TRUNCATE
-commit, rollback and prepared transactions with captured table identities;
-statistics updates and index labels must not refresh unrelated saved inputs.
 
 ## Rules throughout
 

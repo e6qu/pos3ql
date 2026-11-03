@@ -39,6 +39,7 @@ REASSIGN OWNED BY owner_group TO owner_group;
 SET ROLE owner_group;
 DROP OWNED BY owner_group;
 RESET SESSION AUTHORIZATION;
+DROP OWNED BY owner_group;
 DROP FOREIGN DATA WRAPPER owner_wrapper;
 DROP ROLE set_only;
 DROP ROLE inherited_owner;

@@ -120,18 +120,17 @@ const DEFAULT_MAX_TRUNCATE_TABLES: usize = 16;
 /// One SQL TRUNCATE command, retained until commit so durable logical
 /// decoding preserves its statement-level semantics instead of inferring them
 /// from the row deletes used by the heap.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct TruncateEvent {
     scope: crate::storage::RuntimeInputScope,
     pub command_id: u32,
-    pub table_offset: usize,
-    pub table_count: usize,
+    targets: crate::mem::lease_pool::SharedSlice<crate::storage::TruncateTarget>,
     pub cascade: bool,
     pub restart_identity: bool,
 }
 
 impl TruncateEvent {
-    fn plan_event(self, created_at: u64) -> super::plan_invalidations::PlanInvalidationEvent {
+    fn plan_event(&self, created_at: u64) -> super::plan_invalidations::PlanInvalidationEvent {
         super::plan_invalidations::PlanInvalidationEvent {
             scope: self.scope,
             change: super::plan_invalidations::CatalogPlanChange {
@@ -334,8 +333,6 @@ pub struct TxnState {
     /// reverse-replay to any earlier point.
     touched: FixedVec<(u32, u64, PriorPending)>,
     truncates: FixedVec<TruncateEvent>,
-    truncate_table_slots: FixedVec<u16>,
-    truncate_table_births: FixedVec<u64>,
     truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
@@ -799,7 +796,10 @@ enum ConstraintLifecycle {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StatisticsUndo {
-    Table(u32),
+    Table {
+        table: u32,
+        event: Option<super::plan_invalidations::PlanInvalidationEvent>,
+    },
     Extended(u32),
 }
 
@@ -861,12 +861,6 @@ impl TxnState {
                     .saturating_mul(core::mem::size_of::<TruncateEvent>()),
             )
             .saturating_add(capacity.tables.saturating_mul(128))
-            .saturating_add(
-                capacity
-                    .ddl
-                    .saturating_mul(capacity.tables)
-                    .saturating_mul(core::mem::size_of::<u16>() + core::mem::size_of::<u64>()),
-            )
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<DdlUndo>()))
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<u32>()))
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<
@@ -1023,16 +1017,6 @@ impl TxnState {
             concurrent_partition_detach_pending: false,
             touched: FixedVec::new(budget, "txn_touched", capacity.rows)?,
             truncates: FixedVec::new(budget, "txn_truncates", capacity.ddl)?,
-            truncate_table_slots: FixedVec::new(
-                budget,
-                "txn_truncate_table_slots",
-                capacity.ddl * capacity.tables,
-            )?,
-            truncate_table_births: FixedVec::new(
-                budget,
-                "txn_truncate_table_births",
-                capacity.ddl * capacity.tables,
-            )?,
             truncate_wal_tables: FixedBuf::new(
                 budget,
                 "txn_truncate_wal_tables",
@@ -1783,25 +1767,16 @@ impl TxnState {
                 "transaction TRUNCATE capacity exceeded"
             ));
         }
-        let table_offset = self.truncate_table_slots.len();
         let event = TruncateEvent {
             scope: storage.runtime_input_scope(),
+            targets: storage.capture_truncate_targets(tables, self.txid)?,
             command_id,
-            table_offset,
-            table_count: tables.len(),
             cascade,
             restart_identity,
         };
-        for &table in tables {
-            let birth = storage.table_def(table, self.txid).identity().created_at;
-            self.truncate_table_slots
-                .push(u16::try_from(table).expect("validated physical table slot"))
-                .expect("one full table set reserved per TRUNCATE event");
-            self.truncate_table_births
-                .push(birth)
-                .expect("table identities parallel reserved TRUNCATE slots");
-            if let Some(owner) = &self.plan_invalidations {
-                owner.apply(event.plan_event(birth));
+        if let Some(owner) = &self.plan_invalidations {
+            for target in event.targets.iter() {
+                owner.apply(event.plan_event(target.created_at));
             }
         }
         self.truncates
@@ -1822,12 +1797,11 @@ impl TxnState {
         self.deferred_constraints.capacity()
     }
 
-    pub(crate) fn truncate_wal_tables(&mut self, event: TruncateEvent) -> (&[u16], &mut FixedBuf) {
-        (
-            &self.truncate_table_slots.as_slice()
-                [event.table_offset..event.table_offset + event.table_count],
-            &mut self.truncate_wal_tables,
-        )
+    pub(crate) fn truncate_wal_tables<'a>(
+        &'a mut self,
+        event: &'a TruncateEvent,
+    ) -> (&'a [crate::storage::TruncateTarget], &'a mut FixedBuf) {
+        (&event.targets, &mut self.truncate_wal_tables)
     }
 
     /// Buffers a NOTIFY, collapsing an identical (channel, payload) already
@@ -2581,14 +2555,9 @@ impl TxnState {
     pub(crate) fn rewind_truncates(&mut self, truncate_mark: usize) {
         while self.truncates.len() > truncate_mark {
             let event = self.truncates.pop().expect("nonempty TRUNCATE event list");
-            while self.truncate_table_slots.len() > event.table_offset {
-                self.truncate_table_slots.pop();
-                let birth = self
-                    .truncate_table_births
-                    .pop()
-                    .expect("TRUNCATE identities parallel table slots");
-                if let Some(owner) = &self.plan_invalidations {
-                    owner.apply(event.plan_event(birth));
+            if let Some(owner) = &self.plan_invalidations {
+                for target in event.targets.iter() {
+                    owner.apply(event.plan_event(target.created_at));
                 }
             }
         }
@@ -2610,7 +2579,7 @@ impl TxnState {
 
     pub(crate) fn record_statistics(&mut self, table: u32) -> Result<(), SqlError> {
         self.statistics_undo
-            .push(StatisticsUndo::Table(table))
+            .push(StatisticsUndo::Table { table, event: None })
             .map_err(|_| {
                 sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2618,6 +2587,42 @@ impl TxnState {
                     self.statistics_undo.capacity()
                 )
             })
+    }
+
+    pub(crate) fn record_statistics_plan_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        table: u32,
+    ) {
+        let Some(StatisticsUndo::Table {
+            table: selected,
+            event,
+        }) = self.statistics_undo.last_mut()
+        else {
+            panic!("ANALYZE retained its statistics receipt before publication")
+        };
+        assert_eq!(*selected, table, "ANALYZE publishes its admitted relation");
+        assert!(
+            event.is_none(),
+            "ANALYZE publishes each relation estimate once"
+        );
+        let captured = super::plan_invalidations::PlanInvalidationEvent {
+            scope: storage.runtime_input_scope(),
+            change: super::plan_invalidations::CatalogPlanChange {
+                global: false,
+                roles: false,
+            },
+            selected: Some(crate::storage::SelectedPlanTarget::Relation {
+                created_at: storage
+                    .table_def(table as usize, self.txid)
+                    .identity()
+                    .created_at,
+            }),
+        };
+        *event = Some(captured);
+        // PostgreSQL heap_inplace_update_and_unlock sends an immediate shared
+        // invalidation and retains another receipt for commit or local abort.
+        storage.publish_plan_invalidations(core::iter::once(captured));
     }
 
     pub(crate) fn record_extended_statistics(&mut self, slot: u32) -> Result<(), SqlError> {
@@ -2638,7 +2643,13 @@ impl TxnState {
 
     pub(crate) fn rewind_statistics(&mut self, mark: usize) {
         while self.statistics_undo.len() > mark {
-            self.statistics_undo.pop();
+            if let Some(StatisticsUndo::Table {
+                event: Some(event), ..
+            }) = self.statistics_undo.pop()
+                && let Some(owner) = &self.plan_invalidations
+            {
+                owner.apply(event);
+            }
         }
     }
 
@@ -2912,10 +2923,14 @@ impl TxnState {
             .iter()
             .copied()
             .chain(self.truncates.iter().flat_map(|event| {
-                self.truncate_table_births.as_slice()
-                    [event.table_offset..event.table_offset + event.table_count]
+                event
+                    .targets
                     .iter()
-                    .map(move |&birth| event.plan_event(birth))
+                    .map(move |target| event.plan_event(target.created_at))
+            }))
+            .chain(self.statistics_undo.iter().filter_map(|undo| match undo {
+                StatisticsUndo::Table { event, .. } => *event,
+                StatisticsUndo::Extended(_) => None,
             }))
     }
 
@@ -2973,8 +2988,6 @@ impl TxnState {
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();
-        self.truncate_table_slots.clear();
-        self.truncate_table_births.clear();
         self.ddl.clear();
         self.ddl_origins.clear();
         self.ddl_plan_events.clear();

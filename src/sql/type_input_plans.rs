@@ -16,6 +16,17 @@ pub(crate) struct PlanId {
 }
 
 impl PlanId {
+    pub(crate) fn from_key_bytes(bytes: &[u8]) -> Result<Self, SqlError> {
+        let bytes: &[u8; 16] = bytes.try_into().map_err(|_| stale())?;
+        Ok(Self {
+            slot: usize::try_from(u64::from_le_bytes(
+                bytes[..8].try_into().map_err(|_| stale())?,
+            ))
+            .map_err(|_| stale())?,
+            generation: u64::from_le_bytes(bytes[8..].try_into().map_err(|_| stale())?),
+        })
+    }
+
     pub(crate) fn key_bytes(self) -> [u8; 16] {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&(self.slot as u64).to_le_bytes());
@@ -111,6 +122,7 @@ struct Slot {
     // An executing obsolete generation remains pinned but cannot become current
     // again when its caller later restores the former search path.
     invalidated: bool,
+    input_attempt: Option<super::sequence::StatementInputAttempt>,
 }
 
 impl Slot {
@@ -119,6 +131,7 @@ impl Slot {
         self.specialization = SharedSlice::EMPTY;
         self.validity = None;
         self.invalidated = false;
+        self.input_attempt = None;
     }
 }
 
@@ -144,6 +157,7 @@ impl RoutineInputPlans {
                     specialization: SharedSlice::EMPTY,
                     validity: None,
                     invalidated: false,
+                    input_attempt: None,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -208,6 +222,9 @@ impl RoutineInputPlans {
                 "runtime routine instances require specialized lookup"
             ));
         }
+        if let Some(plan) = super::sequence::replayed_input_plan()? {
+            return self.lookup_replayed(plan, key).map(Some);
+        }
         for index in 0..self.slots.len() {
             let slot = &self.slots[index];
             let found = match slot.state {
@@ -223,7 +240,7 @@ impl RoutineInputPlans {
                     generation: slot.generation,
                 };
                 self.slots[index].invalidated = true;
-                if !plan_is_active(plan) {
+                if !self.is_retained(plan) {
                     self.abandon(plan)?;
                 }
             }
@@ -256,6 +273,33 @@ impl RoutineInputPlans {
                 sqlstate::DATA_EXCEPTION,
                 "routine instance specialization is empty"
             ));
+        }
+        if kind == RoutineInputKind::Sql
+            && let Some(plan) = super::sequence::replayed_input_plan()?
+        {
+            let slot = self.slot(plan)?;
+            if !slot
+                .input_attempt
+                .is_some_and(super::sequence::retains_input_attempt)
+            {
+                return Err(stale());
+            }
+            let key = match slot.state {
+                State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                State::Vacant => return Err(stale()),
+            };
+            if !matches!(key, Key { owner: Owner::Backend,
+                source: Source::RuntimeRoutineInstance { kind: selected, routine_oid: oid,
+                    definition_version: version, .. } }
+                if selected == kind && oid == routine_oid && version == definition_version)
+                || slot.specialization.as_ref() != canonical
+            {
+                return Err(stale());
+            }
+            return Ok(BodyAdmission {
+                key,
+                reserved: None,
+            });
         }
         let mut current = None;
         for index in 0..self.slots.len() {
@@ -291,7 +335,7 @@ impl RoutineInputPlans {
                         generation: slot.generation,
                     };
                     self.slots[index].invalidated = true;
-                    if !plan_is_active(plan) {
+                    if !self.is_retained(plan) {
                         self.abandon(plan)?;
                     }
                 }
@@ -412,6 +456,7 @@ impl RoutineInputPlans {
             specialization,
             validity: None,
             invalidated: false,
+            input_attempt: None,
         };
         PlanId {
             slot: index,
@@ -426,6 +471,77 @@ impl RoutineInputPlans {
         };
         slot.state = State::Ready { key, inputs };
         Ok(())
+    }
+
+    pub(crate) fn retain_for_statement(
+        &mut self,
+        plan: PlanId,
+        attempt: Option<super::sequence::StatementInputAttempt>,
+    ) -> Result<(), SqlError> {
+        self.slot_mut(plan)?.input_attempt = attempt;
+        Ok(())
+    }
+
+    pub(crate) fn lookup(&self, plan: PlanId, key: Key) -> Result<Lookup, SqlError> {
+        if let Owner::Nested(parent) = key.owner {
+            self.slot(parent)?;
+        }
+        match &self.slot(plan)?.state {
+            State::Ready { key: found, inputs } if *found == key => {
+                Ok(Lookup::Ready(plan, inputs.clone()))
+            }
+            State::Preparing {
+                key: found,
+                waiting: true,
+            } if *found == key => Ok(Lookup::Waiting(plan)),
+            _ => Err(stale()),
+        }
+    }
+
+    pub(crate) fn lookup_replayed(&self, plan: PlanId, key: Key) -> Result<Lookup, SqlError> {
+        if !self
+            .slot(plan)?
+            .input_attempt
+            .is_some_and(super::sequence::retains_input_attempt)
+        {
+            return Err(stale());
+        }
+        self.lookup(plan, key)
+    }
+
+    fn is_retained(&self, plan: PlanId) -> bool {
+        if plan_is_active(plan) {
+            return true;
+        }
+        // Recorded input generations and their owners survive until their
+        // statement's ordered receipts are consumed or discarded.
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !slot
+                .input_attempt
+                .is_some_and(super::sequence::retains_input_attempt)
+            {
+                continue;
+            }
+            let mut current = PlanId {
+                slot: index,
+                generation: slot.generation,
+            };
+            for _ in 0..self.slots.len() {
+                if current == plan {
+                    return true;
+                }
+                let Ok(slot) = self.slot(current) else { break };
+                let key = match slot.state {
+                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Vacant => break,
+                };
+                let Owner::Nested(parent) = key.owner else {
+                    break;
+                };
+                current = parent;
+            }
+        }
+        false
     }
 
     pub(crate) fn set_waiting(&mut self, plan: PlanId, waiting: bool) -> Result<(), SqlError> {
@@ -519,10 +635,11 @@ impl RoutineInputPlans {
                     State::Preparing { key, .. } | State::Ready { key, .. } => key,
                 };
                 let (oid, version) = key.source.routine_definition()?;
-                (!visible(oid, version)).then_some(PlanId {
+                let plan = PlanId {
                     slot: index,
                     generation: slot.generation,
-                })
+                };
+                (!visible(oid, version) && !self.is_retained(plan)).then_some(plan)
             });
             let Some(retired) = retired else { break };
             self.abandon(retired).expect("selected plan is live");
@@ -723,6 +840,184 @@ pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::mem::lease_pool::{LeasePool, Purpose};
+
+    #[test]
+    fn statement_receipts_retain_each_input_generation_and_release_between_attempts() {
+        use super::super::sequence::{
+            self, StatementEffectAttempt, StatementEffectKind, StatementEffectRetry,
+        };
+        use super::super::types::Datum;
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 3;
+        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + (64 << 10));
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let mut arena =
+            Arena::new(&mut budget, "retained routine input generations", 64 << 10).unwrap();
+        let guc = super::super::guc::GucState::new();
+        let session = guc.seq_session();
+        let parent = plans
+            .reserve(Key {
+                owner: Owner::Backend,
+                source: source(18),
+            })
+            .unwrap();
+        plans
+            .complete(parent, InputImage::Runtime(SharedSlice::EMPTY))
+            .unwrap();
+        let key = Key {
+            owner: Owner::Nested(parent),
+            source: source(19),
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let first = plans.reserve(key).unwrap();
+            let second;
+            let original_attempt;
+            {
+                let _scope = sequence::enter_statement(&arena, session, false);
+                let bytes = first.key_bytes();
+                sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(first, sequence::input_attempt())
+                            .unwrap();
+                        plans
+                            .complete(first, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                original_attempt = sequence::input_attempt().unwrap();
+                assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
+                assert!(plans.is_retained(first));
+                assert!(plans.is_retained(parent));
+                second = plans.reserve(key).unwrap();
+                let bytes = second.key_bytes();
+                sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(second, sequence::input_attempt())
+                            .unwrap();
+                        plans
+                            .complete(second, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+            }
+            arena.recycle_front();
+            {
+                let scope = sequence::enter_statement(&arena, session, true);
+                for expected in [first, second] {
+                    assert!(
+                        matches!(plans.find_validated(key, |_| panic!("a receipt selects its original generation")).unwrap(),
+                        Some(Lookup::Ready(found, _)) if found == expected)
+                    );
+                    assert_eq!(
+                        plans
+                            .lookup(
+                                expected,
+                                Key {
+                                    source: source(20),
+                                    ..key
+                                }
+                            )
+                            .err()
+                            .unwrap()
+                            .sqlstate,
+                        sqlstate::SERIALIZATION_FAILURE
+                    );
+                    let bytes = expected.key_bytes();
+                    sequence::statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[Datum::Bytea(&bytes)],
+                        StatementEffectRetry::Restart,
+                        &arena,
+                        || panic!("completed checked values cannot execute again"),
+                    )
+                    .unwrap();
+                }
+                scope.finish(session).unwrap();
+                assert!(!plans.is_retained(first));
+                assert!(!plans.is_retained(second));
+                assert!(!plans.is_retained(parent));
+            }
+            {
+                let scope = sequence::enter_statement(&arena, session, false);
+                assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
+                let replacement = plans.reserve(key).unwrap();
+                assert_ne!(replacement, first);
+                assert_ne!(replacement, second);
+                let bytes = replacement.key_bytes();
+                sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(replacement, sequence::input_attempt())
+                            .unwrap();
+                        plans
+                            .complete(replacement, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(sequence::input_attempt() != Some(original_attempt));
+                scope.finish(session).unwrap();
+            }
+            arena.reset();
+            {
+                let scope = sequence::enter_statement(&arena, session, false);
+                assert!(!sequence::retains_input_attempt(original_attempt));
+                assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
+                assert!(plans.lookup(first, key).is_err());
+                let replacement = plans.reserve(key).unwrap();
+                let bytes = replacement.key_bytes();
+                sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(replacement, sequence::input_attempt())
+                            .unwrap();
+                        plans
+                            .complete(replacement, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(sequence::input_attempt() != Some(original_attempt));
+                scope.finish(session).unwrap();
+            }
+        });
+    }
 
     #[test]
     fn discarding_plans_preserves_bound_protocol_and_cursor_owners_until_release() {

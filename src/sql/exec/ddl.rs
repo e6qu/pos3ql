@@ -472,7 +472,15 @@ pub(super) fn resolve_default(
             &NoColumns,
             &hooks,
         )?;
+        let source_oid =
+            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
+                .routine_argument_oid();
         let v = match ctype {
+            ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+                if source_oid == ctype.oid() =>
+            {
+                v
+            }
             ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, txid, arena)?,
             ColType::Array(
                 element @ (crate::sql::types::ArrElem::Enum(_)

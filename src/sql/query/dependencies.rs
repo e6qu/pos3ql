@@ -61,6 +61,11 @@ impl<'a> CollectionContext<'a> {
         transition.resolve(qualifier, name).map(|_| true)
     }
 
+    fn outer_column(self, qualifier: Option<&str>, name: &str) -> bool {
+        self.transition
+            .is_some_and(|columns| columns.column_meta(qualifier, name).is_some())
+    }
+
     fn resolve_relation(
         self,
         storage: &Storage,
@@ -679,18 +684,49 @@ fn collect_statement(
             collect_set_query(query, storage, txid, dependencies, arena, context)
         }
         Stmt::With { ctes, statement } => {
-            for cte in *ctes {
-                collect_select(
-                    cte.query,
+            let mark = arena.mark();
+            let result = (|| {
+                super::cte::visit_cte_sources(
+                    ctes,
                     storage,
                     txid,
-                    CteNames::EMPTY,
-                    dependencies,
+                    Some(*path),
+                    context.bindings,
                     arena,
-                    context,
+                    &mut |source| match source {
+                        super::cte::ScopedCte::Select(select) => collect_select(
+                            select,
+                            storage,
+                            txid,
+                            CteNames::EMPTY,
+                            dependencies,
+                            arena,
+                            context,
+                        ),
+                        super::cte::ScopedCte::DataModification(statement) => collect_statement(
+                            statement,
+                            storage,
+                            txid,
+                            dependencies,
+                            arena,
+                            context,
+                        ),
+                    },
                 )?;
-            }
-            collect_statement(statement, storage, txid, dependencies, arena, context)
+                let statement = super::cte::expand_dml_ctes_schema(
+                    statement,
+                    ctes,
+                    storage,
+                    txid,
+                    Some(*path),
+                    context.bindings,
+                    arena,
+                )?;
+                collect_statement(statement, storage, txid, dependencies, arena, context)
+            })();
+            // Only copied catalog identities escape the CTE schema scope.
+            unsafe { arena.rewind_to(mark) };
+            result
         }
         Stmt::Insert(insert) => {
             let mark = arena.mark();
@@ -1131,6 +1167,14 @@ fn record_dml_column_references(
         }
         let resolved = match scope.find_column(qualifier, name) {
             Ok(resolved) => resolved,
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && context.outer_column(qualifier, name) =>
+            {
+                return;
+            }
             Err(error) => {
                 failure = Some(error);
                 return;
@@ -1165,6 +1209,8 @@ pub(crate) fn validate_dml_assignment_casts(
                     &with[..index],
                     storage,
                     txid,
+                    None,
+                    None,
                     arena,
                 )?;
                 validate_dml_assignment_casts(statement, storage, txid, arena, transition)?;
@@ -1190,7 +1236,8 @@ pub(crate) fn validate_dml_assignment_casts(
             Some(ResolvedRelation::View(_)) => {}
             _ => return Ok(()),
         }
-        let statement = super::cte::expand_dml_ctes_schema(statement, with, storage, txid, arena)?;
+        let statement =
+            super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (alias, extra) = match statement {
             Stmt::Insert(_) => (None, None),
             Stmt::Update(update) => (update.alias, update.from),
@@ -1637,7 +1684,8 @@ fn visit_dml_assignment_inputs(
             Stmt::With { ctes, statement } => (*statement, *ctes),
             _ => (statement, &[][..]),
         };
-        let statement = super::cte::expand_dml_ctes_schema(statement, with, storage, txid, arena)?;
+        let statement =
+            super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (target, alias, extra) = match statement {
             Stmt::Insert(insert) => (insert.table, None, None),
             Stmt::Update(update) => (update.table, update.alias, update.from),
@@ -2947,21 +2995,13 @@ fn record_routine_call(
         }
     };
     let routine = storage.routine_for(slot, txid);
-    let oid = crate::storage::routine_oid(&routine);
-    let bound = storage
-        .function_for_captured_call(oid, argument_names, argument_oids, variadic, txid)
+    let mut bound = routine;
+    let mapping = storage
+        .bind_routine_call_inputs(&mut bound, argument_names, argument_oids, variadic, txid)
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
-                "selected function input types are unavailable"
-            )
-        })?;
-    let (_, mapping) = storage
-        .routine_call_mapping(slot, argument_names, args.len(), variadic, txid)
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "selected function input mapping is unavailable"
+                "selected routine input types are unavailable"
             )
         })?;
     for (index, source) in argument_oids.iter().enumerate() {
@@ -3607,6 +3647,14 @@ fn record_column_references(
         }
         let resolved = match scope.find_column(qualifier, name) {
             Ok(resolved) => resolved,
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && context.outer_column(qualifier, name) =>
+            {
+                return;
+            }
             Err(error) => {
                 failure = Some(error);
                 return;

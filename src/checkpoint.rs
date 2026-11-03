@@ -19014,6 +19014,7 @@ fn load_matview(
     let sql = read_hex(words.next(), "materialized-view sql missing")?;
     let schema = read_hex(words.next(), "materialized-view schema missing")?;
     let path = read_hex(words.next(), "materialized-view path missing")?;
+    let path_buffer = parse_creation_path(&path, "invalid materialized-view creation search path")?;
     let name = read_hex(words.next(), "materialized-view name missing")?;
     let populated: u8 = parse_field(words.next(), "materialized-view populated")?;
     let dependencies = parse_stored_query_dependencies(&mut words)?
@@ -19028,7 +19029,6 @@ fn load_matview(
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let path_buffer = parse_creation_path(&path, "invalid materialized-view creation search path")?;
     let backing_table = backing.slot();
     if backing_table >= storage.table_count()
         || !storage.table_slot_visible_to(backing_table, 0)
@@ -19848,7 +19848,7 @@ mod stored_dependency_tests {
                 "{path:?}"
             );
             let matview = format!(
-                "mv6 0 1 0 2 {} {} {} {} 0 0",
+                "mv6 0 1 0 2 {} {} {} {} 0 i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),

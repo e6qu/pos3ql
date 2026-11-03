@@ -128,10 +128,13 @@ its slot. Planning can inspect already decoded parameters to skip a branch
 such as `CASE WHEN $1=0 THEN checked_function() ELSE 17 END`, without running
 the skipped function's constraints.
 
-`DISCARD PLANS` releases plans for future requests while bound portals and
-cursors retain their checked values until close. `DISCARD ALL` releases cached routine-input plans and their
-value owners. They do not re-evaluate inputs saved in schema definitions.
-Invalidating an executing routine-input plan returns `0A000` before clearing it.
+`DISCARD PLANS` makes future query admissions prepare again. Running calls and
+bound portals or cursors retain their checked images; a compiled PL/pgSQL
+function keeps its identity while its SQL statements can get new plans.
+Ordinary PL statements without checked inputs or SQL planner candidates use
+their enclosing function identity and reserve no checked-plan slot.
+`DISCARD ALL` releases cached routine-input plans and their value owners.
+Neither command re-evaluates inputs saved in schema definitions.
 The [compatibility guide](postgresql-18-compatibility.md) records procedural
 boundaries. Native regressions in `src/sql/tests/type_input_binding.rs` and
 `src/sql/tests/type_input_positions.rs` retain the PostgreSQL 18.6 reference
@@ -198,8 +201,9 @@ runs, and ending a row preserves those command records.
 
 This does not complete every query continuation. Complex plans, functions with
 subqueries or set expansion, named/custom casts and function bodies still have
-restart paths. The cursor reader retains simple physical input positions but
-currently excludes calls and casts. Cursors and results already sent to the
+restart paths. The cursor reader retains simple table scans and one-row queries
+without a table source, including scalar function calls and built-in casts.
+Other cursor plans still materialize their results when opened. Cursors and results already sent to the
 client need the same once-only execution positions before all storage waits can
 yield. Exhaustion remains a named error; no extra per-table or per-query backing
 allocation is introduced by the scoped row region. [PLAN.md](../PLAN.md) owns the

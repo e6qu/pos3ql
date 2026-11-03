@@ -4,6 +4,10 @@ DROP TABLE IF EXISTS introspection_target, introspection_ddl_log,
   introspection_drop_log CASCADE;
 DROP FUNCTION IF EXISTS introspection_capture_ddl() CASCADE;
 DROP FUNCTION IF EXISTS introspection_capture_drop() CASCADE;
+DROP SERVER IF EXISTS introspection_server;
+DROP FOREIGN DATA WRAPPER IF EXISTS introspection_wrapper;
+CREATE FOREIGN DATA WRAPPER introspection_wrapper;
+CREATE SERVER introspection_server FOREIGN DATA WRAPPER introspection_wrapper;
 
 CREATE TABLE introspection_ddl_log
   (position serial, classid oid, objid oid, objsubid integer,
@@ -48,6 +52,7 @@ ALTER TABLE introspection_target ALTER COLUMN value DROP NOT NULL;
 COMMENT ON TABLE introspection_target IS 'table';
 COMMENT ON COLUMN introspection_target.id IS 'column';
 ALTER TABLE introspection_target OWNER TO postgres;
+ALTER SERVER introspection_server OWNER TO postgres;
 GRANT SELECT ON introspection_target TO PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
 DROP TABLE introspection_target;
@@ -68,3 +73,5 @@ DROP EVENT TRIGGER introspection_ddl;
 DROP EVENT TRIGGER introspection_drop;
 DROP TABLE introspection_ddl_log, introspection_drop_log;
 DROP FUNCTION introspection_capture_ddl(), introspection_capture_drop();
+DROP SERVER introspection_server;
+DROP FOREIGN DATA WRAPPER introspection_wrapper;

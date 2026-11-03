@@ -1,6 +1,131 @@
 use super::*;
 
 #[test]
+fn discard_plans_inside_procedural_execution_rechecks_future_inputs() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-discard-plans-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE discarded_checks; CREATE TYPE discarded_choice AS ENUM('a'); \
+             CREATE FUNCTION discarded_allowed(value discarded_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM nextval('discarded_checks'); RETURN true; END$$; \
+             CREATE DOMAIN discarded_checked AS discarded_choice CHECK(discarded_allowed(VALUE)); \
+             CREATE FUNCTION discarded_body() RETURNS integer LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM cardinality('{a}'::discarded_checked[]); DISCARD PLANS; \
+             RETURN cardinality('{a}'::discarded_checked[]); END$$", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT discarded_body(); SELECT last_value FROM discarded_checks",
+                true
+            )),
+            ["1", "2"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT discarded_body(); SELECT last_value FROM discarded_checks",
+                true
+            )),
+            ["1", "4"]
+        );
+        drop((session, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn empty_procedural_sites_leave_cursor_and_checked_input_receipts_in_order() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("empty-pl-site-receipts-{mode:?}"));
+        config.transaction_mode = mode;
+        config.routine_input_slots = 3;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        reader.success(&mut engine,
+            "CREATE TABLE empty_site_gate(id integer PRIMARY KEY,hits integer); INSERT INTO empty_site_gate VALUES(1,0); \
+             CREATE SEQUENCE empty_site_checks; CREATE TYPE empty_site_choice AS ENUM('a'); \
+             CREATE FUNCTION empty_site_allowed(value empty_site_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM nextval('empty_site_checks'); RETURN true; END$$; \
+             CREATE DOMAIN empty_site_checked AS empty_site_choice CHECK(empty_site_allowed(VALUE)); \
+             CREATE FUNCTION empty_site_body() RETURNS integer LANGUAGE plpgsql AS $$ \
+             DECLARE answer integer:=0; selected refcursor; BEGIN PERFORM 1; \
+             EXECUTE 'SELECT 2' INTO answer; OPEN selected FOR SELECT 1; FETCH selected INTO answer; CLOSE selected; \
+             PERFORM cardinality('{a}'::empty_site_checked[]); \
+             UPDATE empty_site_gate SET hits=hits+1 WHERE id=1; RETURN answer; END$$; SET lock_timeout='10s'", true);
+        holder.success(
+            &mut engine,
+            "BEGIN; UPDATE empty_site_gate SET hits=hits WHERE id=1",
+            true,
+        );
+        let query = "SELECT empty_site_body()";
+        assert!(matches!(
+            reader.execute_status(&mut engine, query, true),
+            ExecutionStatus::Blocked { .. }
+        ));
+        let deadline = reader.transaction.suspended_statement_deadline();
+        assert!(deadline.is_some());
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                query,
+                0,
+                &reader.arena,
+                &mut reader.transaction,
+                &mut reader.pool,
+                &mut reader.cursors,
+                &reader.guc,
+                &mut Responder::new(&mut reader.send),
+                1,
+                false,
+            )
+        })
+        .unwrap();
+        assert!(matches!(status, ExecutionStatus::Blocked { .. }));
+        assert_eq!(reader.transaction.suspended_statement_deadline(), deadline);
+        holder.success(&mut engine, "ROLLBACK", true);
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                query,
+                0,
+                &reader.arena,
+                &mut reader.transaction,
+                &mut reader.pool,
+                &mut reader.cursors,
+                &reader.guc,
+                &mut Responder::new(&mut reader.send),
+                1,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert_eq!(data_rows(reader.send.readable()), ["1"]);
+        assert_eq!(
+            data_rows(&holder.success(
+                &mut engine,
+                "SELECT last_value FROM empty_site_checks; SELECT hits FROM empty_site_gate",
+                true
+            )),
+            ["1", "1"]
+        );
+        drop((reader, holder, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -14,6 +139,8 @@ fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
             let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
             let mut holder =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let mut schema_editor =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
             reader.success(&mut engine,
                 "CREATE TABLE caught_gate(id integer PRIMARY KEY,hits integer); INSERT INTO caught_gate VALUES(1,0); \
                  CREATE SEQUENCE caught_checks; CREATE TYPE caught_choice AS ENUM('a'); \
@@ -43,6 +170,7 @@ fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
                 reader.execute_status(&mut engine, query, true),
                 ExecutionStatus::Blocked { .. }
             ));
+            schema_editor.success(&mut engine, "DROP DOMAIN caught_checked", true);
             let deadline = reader.transaction.suspended_statement_deadline();
             assert!(deadline.is_some());
             for _ in 0..2 {
@@ -99,7 +227,7 @@ fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
                 )),
                 ["2", "1"]
             );
-            drop((reader, holder, engine));
+            drop((reader, holder, schema_editor, engine));
             std::fs::remove_dir_all(config.data_dir).unwrap();
         }
     }

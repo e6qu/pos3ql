@@ -16,6 +16,8 @@ and cancellation followed by a fresh statement. Repair temporary-memory leaks
 by releasing their owners; retain regressions at the original arena limits.
 Preserve distinct function effects and caught errors through retries; validate
 the original bounded-row, cursor, driver and recovery cases before merging.
+Keep checked values through reparsing and default conversion; use declared
+type identities rather than repeating a conversion that already completed.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

@@ -1131,14 +1131,34 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             Stmt::Select(select) => self.select(select, None, None),
             Stmt::SetQuery(query) => self.set_tree(query.body, None),
             Stmt::With { ctes, statement } => {
-                for cte in *ctes {
-                    self.select(cte.query, None, None)?;
-                }
+                let storage = self.storage;
+                let txid = self.txid;
+                let arena = self.arena;
+                let planner = self.planner.is_some();
+                super::cte::visit_cte_sources(
+                    ctes,
+                    storage,
+                    txid,
+                    None,
+                    None,
+                    arena,
+                    &mut |source| match source {
+                        super::cte::ScopedCte::Select(select) if !planner => {
+                            self.select(select, None, None)
+                        }
+                        super::cte::ScopedCte::Select(_) => Ok(()),
+                        super::cte::ScopedCte::DataModification(statement) => {
+                            self.statement(statement)
+                        }
+                    },
+                )?;
                 let statement = super::cte::expand_dml_ctes_schema(
                     statement,
                     ctes,
                     self.storage,
                     self.txid,
+                    None,
+                    None,
                     self.arena,
                 )?;
                 self.statement(statement)

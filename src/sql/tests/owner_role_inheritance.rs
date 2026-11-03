@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn unchanged_table_ownership_reports_one_event_without_mutating_the_catalog() {
+fn owner_commands_report_events_without_repeating_catalog_mutations() {
     let config = test_config("owner-noop-event");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -10,11 +10,13 @@ fn unchanged_table_ownership_reports_one_event_without_mutating_the_catalog() {
         &mut engine,
         "CREATE ROLE owner_event_role; GRANT CREATE ON SCHEMA public TO owner_event_role; \
          CREATE TABLE owner_event_target(value integer); \
+         CREATE FOREIGN DATA WRAPPER owner_event_wrapper; \
+         CREATE SERVER owner_event_server FOREIGN DATA WRAPPER owner_event_wrapper; \
          CREATE TABLE owner_event_log(tag text,kind text,identity text); \
          CREATE FUNCTION owner_event_capture() RETURNS event_trigger LANGUAGE plpgsql AS \
          $$BEGIN INSERT INTO owner_event_log SELECT command_tag,object_type,object_identity \
          FROM pg_event_trigger_ddl_commands(); RETURN; END$$; \
-         CREATE EVENT TRIGGER owner_event ON ddl_command_end WHEN TAG IN ('ALTER TABLE') \
+         CREATE EVENT TRIGGER owner_event ON ddl_command_end WHEN TAG IN ('ALTER TABLE','ALTER SERVER') \
          EXECUTE FUNCTION owner_event_capture()",
         true,
     );
@@ -39,13 +41,27 @@ fn unchanged_table_ownership_reports_one_event_without_mutating_the_catalog() {
         true,
     );
     assert_eq!(session.transaction.ddl().len(), changed);
+    for statement in [
+        "ALTER SERVER owner_event_server OWNER TO postgres",
+        "ALTER SERVER owner_event_server OWNER TO owner_event_role",
+        "ALTER SERVER owner_event_server OWNER TO owner_event_role",
+    ] {
+        session.success(&mut engine, statement, true);
+    }
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
-            "SELECT tag,kind,identity FROM owner_event_log",
+            "SELECT tag,kind,identity FROM owner_event_log ORDER BY tag",
             true
         )),
-        ["ALTER TABLE|table|public.owner_event_target"; 3]
+        [
+            "ALTER SERVER|foreign server|owner_event_server",
+            "ALTER SERVER|foreign server|owner_event_server",
+            "ALTER SERVER|foreign server|owner_event_server",
+            "ALTER TABLE|table|public.owner_event_target",
+            "ALTER TABLE|table|public.owner_event_target",
+            "ALTER TABLE|table|public.owner_event_target",
+        ]
     );
     session.success(&mut engine, "ROLLBACK", true);
 }

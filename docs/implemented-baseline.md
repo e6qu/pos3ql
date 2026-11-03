@@ -257,7 +257,12 @@ cursor can use repeated small fetches without retaining earlier batches.
 `MOVE` advances without saving output; a forward jump saves its target row.
 This path accepts columns, wildcards, constants, captured parameters, built-in
 binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
-array construction, element access, slices and filters composed from them.
+array construction, element access, slices, scalar function calls, built-in
+casts and filters composed from them. A query without a table source retains
+one input row: `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')`
+does not issue a number until its first nonzero fetch. `FETCH 0` issues none,
+and fetching after its one row issues no further number. A holdable cursor
+evaluates an unread row when commit saves its remaining results.
 `BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
 and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
 the lower comparison is false. PostgreSQL can evaluate the tested expression

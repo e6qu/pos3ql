@@ -152,6 +152,7 @@ fn expand_ctes_with_path<'a>(
         depth,
         authorization_role,
         arena,
+        None,
         |context| subst_select_body(sel, context, arena),
     )
 }
@@ -169,6 +170,7 @@ fn with_schema_context<'a, 's, R>(
     depth: u32,
     authorization_role: Option<u16>,
     arena: &'a Arena,
+    mut visit: Option<&mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>>,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'a>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
@@ -219,6 +221,11 @@ fn with_schema_context<'a, 's, R>(
                 }
             };
             let entry = describe_dml_materialized(cte, &expanded, storage, txid, arena)?;
+            if let Some(visit) = &mut visit {
+                visit(ScopedCte::DataModification(
+                    arena.alloc(expanded).map_err(|_| arena_full())?,
+                ))?;
+            }
             materialized
                 .push((cte.name, entry))
                 .map_err(|_| arena_full())?;
@@ -227,8 +234,28 @@ fn with_schema_context<'a, 's, R>(
             materialized
                 .push((cte.name, entry))
                 .map_err(|_| arena_full())?;
+            if let Some(visit) = &mut visit {
+                let context = Subst {
+                    ctes: resolved.as_slice(),
+                    materialized: materialized.as_slice(),
+                    storage,
+                    txid,
+                    depth,
+                    path,
+                    dependencies,
+                    authorization_role,
+                    qualifier: None,
+                    rule_transition: None,
+                    recursive_state: None,
+                    execution: None,
+                };
+                visit(ScopedCte::Select(subst_select(cte.query, context, arena)?))?;
+            }
         } else {
             let query = subst_select(cte.query, context, arena)?;
+            if let Some(visit) = &mut visit {
+                visit(ScopedCte::Select(query))?;
+            }
             resolved
                 .push((cte.name, query, cte.columns))
                 .map_err(|_| arena_full())?;
@@ -253,29 +280,72 @@ fn with_schema_context<'a, 's, R>(
     build(context)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ScopedCte<'a> {
+    Select(&'a Select<'a>),
+    DataModification(&'a Stmt<'a>),
+}
+
+/// Visit each CTE after binding earlier entries and a recursive self-reference.
+pub(super) fn visit_cte_sources<'a>(
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
+    arena: &'a Arena,
+    visit: &mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    with_schema_context(
+        with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        0,
+        None,
+        arena,
+        Some(visit),
+        |_| Ok(()),
+    )
+}
+
 /// Resolve input shapes without materializing a CTE or executing its defaults.
 pub(crate) fn expand_dml_ctes_schema<'a>(
     statement: &'a Stmt<'a>,
     with: &'a [Cte<'a>],
     storage: &Storage,
     txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    with_schema_context(with, storage, txid, None, None, 0, None, arena, |context| {
-        let statement = match statement {
-            Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
-            Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
-            Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
-            Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "assignment statement kind is invalid"
-                ));
-            }
-        };
-        Ok(&*arena.alloc(statement).map_err(|_| arena_full())?)
-    })
+    with_schema_context(
+        with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        0,
+        None,
+        arena,
+        None,
+        |context| {
+            let statement = match statement {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "assignment statement kind is invalid"
+                    ));
+                }
+            };
+            Ok(&*arena.alloc(statement).map_err(|_| arena_full())?)
+        },
+    )
 }
 
 /// Expand stored-view sources for metadata-only DML target/source lookup.
@@ -288,10 +358,21 @@ pub(super) fn expand_from_schema<'a>(
     if !storage.has_any_view() {
         return Ok(from);
     }
-    with_schema_context(&[], storage, txid, None, None, 0, None, arena, |context| {
-        let expanded = subst_from(from, context, arena)?;
-        Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
-    })
+    with_schema_context(
+        &[],
+        storage,
+        txid,
+        None,
+        None,
+        0,
+        None,
+        arena,
+        None,
+        |context| {
+            let expanded = subst_from(from, context, arena)?;
+            Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
+        },
+    )
 }
 
 /// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is

@@ -557,7 +557,24 @@ impl<'d> QueryScope<'d> {
         arena: &'d Arena,
         from: &FromClause<'d>,
     ) -> Result<Self, SqlError> {
-        let table_count = from.joins.len() + 1;
+        Self::empty_sources(storage, txid, arena, from.joins.len() + 1, from.joins.len())
+    }
+
+    pub(super) fn singleton(
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+    ) -> Result<Self, SqlError> {
+        Self::empty_sources(storage, txid, arena, 0, 0)
+    }
+
+    fn empty_sources(
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+        table_count: usize,
+        join_count: usize,
+    ) -> Result<Self, SqlError> {
         let names = arena
             .alloc_slice_with(table_count, |_| "")
             .map_err(|_| arena_full())?;
@@ -599,10 +616,10 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(0, |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let join_on = arena
-            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         let using_aliases = arena
-            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
             txid,
@@ -850,7 +867,7 @@ impl<'d> QueryScope<'d> {
                 }
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
-                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena)?;
+                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena, sequences)?;
                 self.derived[source] = Some(rows);
                 return Ok(());
             }

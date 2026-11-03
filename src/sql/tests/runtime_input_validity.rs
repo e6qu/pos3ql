@@ -336,3 +336,161 @@ fn enum_filters_and_repeated_dependency_visits_fit_a_small_statement_arena() {
         );
     });
 }
+
+#[test]
+fn dependency_columns_keep_inner_sql_precedence_and_resolve_outer_locals() {
+    struct Locals;
+    impl crate::sql::exec::ColTypeResolver for Locals {
+        fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+            if qualifier.is_none() && matches!(name, "label" | "id" | "keep" | "max_rows") {
+                Ok(match name {
+                    "label" => ColType::Text,
+                    "keep" => ColType::Bool,
+                    _ => ColType::Int4,
+                })
+            } else {
+                Err(crate::sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "unknown outer column"
+                ))
+            }
+        }
+    }
+    let config = test_config("dependency-outer-columns");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE input_rows(id integer)", true);
+    let arena = Arena::new(&mut budget, "outer column dependency scratch", 256 << 10).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for source in [
+            "SELECT id,label FROM input_rows WHERE keep LIMIT max_rows",
+            "UPDATE input_rows SET id=id+max_rows WHERE keep RETURNING label",
+        ] {
+            let statement = parser::parse_stored_statement(source, &arena).unwrap();
+            let mut dependencies = engine
+                .storage
+                .empty_stored_query_dependencies(&arena)
+                .unwrap();
+            query::collect_runtime_statement(
+                statement,
+                &engine.storage,
+                0,
+                &mut dependencies,
+                &arena,
+                Some(&Locals),
+            )
+            .unwrap();
+            let table = dependencies
+                .entries()
+                .iter()
+                .find(|entry| entry.class == crate::storage::DependencyClass::Table)
+                .unwrap();
+            assert!(
+                table.referenced_columns.contains(0),
+                "inner id remains a table dependency"
+            );
+        }
+    });
+}
+
+#[test]
+fn cte_dependency_capture_uses_bound_sources_without_running_modifications() {
+    let config = test_config("cte-dependency-source-scopes");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE cte_source(id integer); CREATE TABLE cte_target(id integer); \
+         INSERT INTO cte_source VALUES(1); \
+         CREATE AGGREGATE public.sum(integer)(SFUNC=pg_catalog.int4pl,STYPE=integer,INITCOND='0')",
+        true,
+    );
+    let arena = Arena::new(&mut budget, "CTE dependency metadata", 2 << 20).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for source in [
+            "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<4) INSERT INTO cte_target SELECT n FROM numbers",
+            "WITH moved AS (DELETE FROM cte_source RETURNING id), later AS (SELECT id+1 AS id FROM moved) INSERT INTO cte_target SELECT id FROM later",
+            "SELECT public.sum(id) FROM cte_source",
+        ] {
+            let statement = parser::parse_stored_statement(source, &arena).unwrap();
+            let mut dependencies = engine
+                .storage
+                .empty_stored_query_dependencies(&arena)
+                .unwrap();
+            query::collect_runtime_statement(
+                statement,
+                &engine.storage,
+                0,
+                &mut dependencies,
+                &arena,
+                None,
+            )
+            .unwrap();
+            assert!(
+                dependencies
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.class == crate::storage::DependencyClass::Table)
+            );
+            if source.starts_with("SELECT") {
+                assert!(dependencies.entries().iter().any(|entry| entry.class
+                    == crate::storage::DependencyClass::Routine
+                    && entry.name.as_str() == "sum"));
+            }
+        }
+    });
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM cte_source; SELECT count(*) FROM cte_target",
+            true
+        )),
+        ["1", "0"]
+    );
+}
+
+#[test]
+fn describing_typed_routine_arguments_uses_complete_catalog_metadata_without_checks() {
+    let config = test_config("typed-routine-describe-metadata");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE describe_checks; CREATE TYPE describe_choice AS ENUM('a'); \
+         CREATE DOMAIN describe_count AS integer CHECK(nextval('describe_checks')>0); \
+         CREATE TYPE describe_pair AS(id integer,label text); \
+         CREATE FUNCTION describe_enum(describe_choice) RETURNS describe_choice LANGUAGE sql AS $$SELECT $1$$; \
+         CREATE FUNCTION describe_domain(describe_count) RETURNS describe_count LANGUAGE sql AS $$SELECT $1$$; \
+         CREATE FUNCTION describe_record(describe_pair) RETURNS describe_pair LANGUAGE sql AS $$SELECT $1$$", true);
+    let arena = Arena::new(&mut budget, "typed routine description", 256 << 10).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let select = parser::parse_query("SELECT describe_enum('a'::describe_choice)::text,describe_domain(1::describe_count)::text,describe_record(ROW(1,'a')::describe_pair)::text", &arena).unwrap();
+        let mut columns = [ColDesc::new("", 0, 0); 3];
+        let count = exec::describe_items(
+            select.items,
+            None,
+            None,
+            Some(&engine.storage),
+            0,
+            &arena,
+            &mut columns,
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.type_oid == types::oid::TEXT)
+        );
+    });
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM describe_checks",
+            true
+        )),
+        ["1|f"]
+    );
+}

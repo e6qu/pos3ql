@@ -102,6 +102,11 @@ row changes, local variables, branch position and transition rows while input
 preparation waits. Verify that constraints see the preceding transaction and
 statement changes, run once, and do not fire in unreached branches. Do not route
 these checks through a retry that first undoes the rows they must observe.
+Keep simple table and one-row cursor expressions deferred until fetching,
+including scalar calls, then extend those positions to the remaining cursor
+plans that currently execute when opened. Ordinary PL statements without any
+checked or planner inputs must not consume checked-plan slots. Keep running
+images alive when `DISCARD PLANS` refreshes future query admissions.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

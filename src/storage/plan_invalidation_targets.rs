@@ -150,8 +150,8 @@ impl Storage {
                 let state = self.partition_trigger_state(*slot as usize);
                 let image = state
                     .image_to(transaction)
-                    .or_else(|| prior.and_then(|pending| pending.image))
-                    .or(state.committed)
+                    .or_else(|| prior.image_to(transaction))
+                    .or(prior.committed)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -324,15 +324,25 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             for (committed, pending, prior) in [
-                (None, Some(image), None),
-                (Some(image), None, None),
+                (None, Some(image), PartitionTriggerState::EMPTY),
+                (
+                    Some(image),
+                    None,
+                    PartitionTriggerState {
+                        committed: Some(image),
+                        ..PartitionTriggerState::EMPTY
+                    },
+                ),
                 (
                     None,
                     None,
-                    Some(PendingPartitionTriggerState {
-                        txid: 1,
-                        image: Some(image),
-                    }),
+                    PartitionTriggerState {
+                        pending: Some(PendingPartitionTriggerState {
+                            txid: 1,
+                            image: Some(image),
+                        }),
+                        ..PartitionTriggerState::EMPTY
+                    },
                 ),
             ] {
                 storage.trigger_catalog.lock().unwrap().partition_states[slot] =

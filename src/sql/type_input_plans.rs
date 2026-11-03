@@ -261,7 +261,7 @@ impl RoutineInputPlans {
         if matches!(key.source, Source::RuntimeRoutineInstance { .. }) {
             return Err(stale());
         }
-        self.retire_failed_preparations();
+        self.retire_obsolete_generations();
         if let Owner::Nested(parent) = key.owner {
             self.slot(parent)?;
         }
@@ -284,7 +284,7 @@ impl RoutineInputPlans {
                 "routine instance specialization is empty"
             ));
         }
-        self.retire_failed_preparations();
+        self.retire_obsolete_generations();
         if kind == RoutineInputKind::Sql
             && let Some(plan) = super::sequence::replayed_input_plan()?
         {
@@ -531,6 +531,45 @@ impl RoutineInputPlans {
         self.lookup(plan, key)
     }
 
+    pub(crate) fn matching_replayed(
+        &self,
+        plan: PlanId,
+        key: Key,
+    ) -> Result<Option<Lookup>, SqlError> {
+        let found = match self.slot(plan)?.state {
+            State::Preparing { key, .. } | State::Ready { key, .. } | State::Failed { key, .. } => {
+                key
+            }
+            State::Vacant => return Err(stale()),
+        };
+        if found == key {
+            self.lookup_replayed(plan, key).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn retire_unused_site(&mut self, key: Key) {
+        loop {
+            let expired = self.slots.iter().enumerate().find_map(|(index, slot)| {
+                let found = match slot.state {
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
+                    State::Vacant => return None,
+                };
+                let plan = PlanId {
+                    slot: index,
+                    generation: slot.generation,
+                };
+                (found == key && !self.is_retained(plan)).then_some(plan)
+            });
+            let Some(plan) = expired else { break };
+            self.abandon(plan)
+                .expect("selected unused input site is live");
+        }
+    }
+
     pub(crate) fn fail(&mut self, plan: PlanId, output_exhausted: bool) -> Result<(), SqlError> {
         let slot = self.slot_mut(plan)?;
         let key = match slot.state {
@@ -546,19 +585,20 @@ impl RoutineInputPlans {
         Ok(())
     }
 
-    fn retire_failed_preparations(&mut self) {
+    fn retire_obsolete_generations(&mut self) {
         loop {
             let expired = self.slots.iter().enumerate().find_map(|(index, slot)| {
                 let plan = PlanId {
                     slot: index,
                     generation: slot.generation,
                 };
-                (matches!(slot.state, State::Failed { .. }) && !self.is_retained(plan))
-                    .then_some(plan)
+                ((slot.invalidated || matches!(slot.state, State::Failed { .. }))
+                    && !self.is_retained(plan))
+                .then_some(plan)
             });
             let Some(plan) = expired else { break };
             self.abandon(plan)
-                .expect("selected failed generation is live");
+                .expect("selected obsolete generation is live");
         }
     }
 
@@ -757,26 +797,61 @@ impl RoutineInputPlans {
         }
     }
 
+    fn has_bound_owner(&self, mut plan: PlanId) -> bool {
+        for _ in 0..self.slots.len() {
+            let Ok(slot) = self.slot(plan) else {
+                return false;
+            };
+            let key = match slot.state {
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => key,
+                State::Vacant => return false,
+            };
+            match key.owner {
+                Owner::ProtocolPrepared(_) | Owner::ProtocolPortal(_) | Owner::Cursor(_) => {
+                    return true;
+                }
+                Owner::Nested(parent) => plan = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     pub(crate) fn discard_unpinned_plans(&mut self) {
-        loop {
-            let owner = self.slots.iter().find_map(|slot| {
-                let key = match &slot.state {
-                    State::Preparing { key, .. }
-                    | State::Ready { key, .. }
-                    | State::Failed { key, .. } => key,
-                    State::Vacant => return None,
-                };
-                (!matches!(
-                    key.owner,
-                    Owner::ProtocolPrepared(_)
-                        | Owner::ProtocolPortal(_)
-                        | Owner::Cursor(_)
-                        | Owner::Nested(_)
-                ))
-                .then_some(key.owner)
-            });
-            let Some(owner) = owner else { break };
-            self.retire(owner);
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            let key = match slot.state {
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => key,
+                State::Vacant => continue,
+            };
+            let plan = PlanId {
+                slot: index,
+                generation: slot.generation,
+            };
+            if self.has_bound_owner(plan)
+                || matches!(
+                    key.source,
+                    Source::RuntimeRoutineInstance {
+                        kind: RoutineInputKind::Plpgsql,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            // Pending parsers complete after DISCARD. Running completed images
+            // stay alive, but a later admission must choose a new generation.
+            if !matches!(slot.state, State::Preparing { .. }) {
+                self.slots[index].invalidated = true;
+            }
+            if !self.is_retained(plan) {
+                self.abandon(plan)
+                    .expect("selected discarded generation is live");
+            }
         }
     }
 
@@ -915,6 +990,91 @@ pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::mem::lease_pool::{LeasePool, Purpose};
+
+    #[test]
+    fn discard_plans_keeps_active_generations_and_replaces_future_query_admissions() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 4;
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(128, 2));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 128, 2).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let instance = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Plpgsql,
+                    100_001,
+                    7,
+                    b"pl",
+                    |_| Ok(true),
+                    freeze,
+                )
+                .unwrap();
+            let parent = instance.reserved.unwrap();
+            plans
+                .complete(parent, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
+            let sql = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_002,
+                    7,
+                    b"sql",
+                    |_| Ok(true),
+                    freeze,
+                )
+                .unwrap();
+            plans
+                .complete(
+                    sql.reserved.unwrap(),
+                    InputImage::Runtime(SharedSlice::EMPTY),
+                )
+                .unwrap();
+            let key = Key {
+                owner: Owner::Nested(parent),
+                source: source(1),
+            };
+            let original = plans.reserve(key).unwrap();
+            plans
+                .complete(original, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
+            let replacement = with_owner(Owner::Nested(parent), || {
+                with_owner(Owner::Nested(original), || {
+                    plans.discard_unpinned_plans();
+                    assert!(
+                        matches!(plans.lookup(original, key).unwrap(), Lookup::Ready(found, _) if found == original)
+                    );
+                    assert!(plans.find(sql.key).unwrap().is_none());
+                    assert!(plans.find_validated(key, |_| Ok(true)).unwrap().is_none());
+                    let replacement = plans.reserve(key).unwrap();
+                    assert_ne!(replacement, original);
+                    plans
+                        .complete(replacement, InputImage::Runtime(SharedSlice::EMPTY))
+                        .unwrap();
+                    replacement
+                })
+            });
+            let again = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Plpgsql,
+                    100_001,
+                    7,
+                    b"pl",
+                    |_| Ok(true),
+                    |_| panic!("DISCARD PLANS does not replace the compiled PL function"),
+                )
+                .unwrap();
+            assert_eq!(again.key, instance.key);
+            assert!(plans.lookup(original, key).is_err());
+            assert!(
+                matches!(plans.find_validated(key, |_| Ok(true)).unwrap(), Some(Lookup::Ready(found, _)) if found == replacement)
+            );
+        });
+    }
 
     #[test]
     fn caught_input_errors_keep_exact_generations_until_later_waits_finish() {

@@ -1,5 +1,53 @@
 use super::*;
 
+#[test]
+fn singleton_cursors_defer_function_defaults_and_effects_until_fetch() {
+    let config = test_config("singleton-cursor-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE singleton_effects START 10; \
+         CREATE FUNCTION singleton_value(value bigint DEFAULT nextval('singleton_effects')) \
+         RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT $1'; BEGIN; \
+         DECLARE singleton_cursor NO SCROLL CURSOR FOR SELECT singleton_value(),nextval('singleton_effects')", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM singleton_effects; FETCH 0 FROM singleton_cursor; \
+         SELECT last_value,is_called FROM singleton_effects",
+            true
+        )),
+        ["10|f", "10|f"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "FETCH 1 FROM singleton_cursor; SELECT last_value FROM singleton_effects; \
+         FETCH 1 FROM singleton_cursor; SELECT last_value FROM singleton_effects; \
+         CLOSE singleton_cursor; COMMIT",
+            true
+        )),
+        ["10|11", "11", "11"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "BEGIN; DECLARE singleton_held NO SCROLL CURSOR WITH HOLD FOR SELECT singleton_value(); \
+         SELECT last_value FROM singleton_effects; COMMIT; FETCH ALL FROM singleton_held; \
+         SELECT last_value FROM singleton_effects; CLOSE singleton_held", true)), ["11", "12", "12"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE FUNCTION public.sum(value integer) RETURNS bigint LANGUAGE sql VOLATILE \
+         AS $$SELECT nextval('singleton_effects')+$1$$; \
+         BEGIN; DECLARE singleton_shadow NO SCROLL CURSOR FOR SELECT public.sum(7); \
+         SELECT last_value FROM singleton_effects; FETCH 1 FROM singleton_shadow; \
+         SELECT last_value FROM singleton_effects; CLOSE singleton_shadow; COMMIT",
+            true
+        )),
+        ["12", "20", "13"]
+    );
+}
+
 // PostgreSQL 18.6 opaque SQL-function phase oracle SQL SHA256:
 // 71df626e54f2dd353981387010aff2ce26bf2028bb44920a630526c8fc9a5993.
 // Backend cache reuse SQL SHA256:

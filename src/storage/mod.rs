@@ -45363,6 +45363,25 @@ impl Storage {
         let slot = self.routine_slot_by_oid(oid, txid)?;
         let mut routine = self.routine_for(slot, txid);
         routine.kind.function_result()?;
+        self.bind_routine_call_inputs(
+            &mut routine,
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+        )?;
+        Some(routine)
+    }
+
+    /// Resolve named/default/variadic actuals against one selected definition.
+    pub(crate) fn bind_routine_call_inputs(
+        &self,
+        routine: &mut RoutineDef,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
         let mapping = routine.call_input_mapping(
             argument_names,
             argument_type_oids.len(),
@@ -45383,8 +45402,8 @@ impl Storage {
             }
         }
         let count = routine.argument_count;
-        self.bind_routine_call(&mut routine, &completed[..count], txid)?;
-        Some(routine)
+        self.bind_routine_call(routine, &completed[..count], txid)?;
+        Some(mapping)
     }
 
     pub(crate) fn function_for_named_call_oids(

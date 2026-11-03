@@ -13,18 +13,41 @@ enum RetainedMode {
 }
 
 struct PendingRow<'a> {
-    row: CursorRow<'a>,
+    row: RetainedRow<'a>,
     mark: ArenaMark,
     counted: bool,
+}
+
+enum RetainedRow<'a> {
+    Physical(CursorRow<'a>),
+    Singleton,
+}
+
+enum RetainedSource {
+    Physical(RowCursor),
+    Singleton { available: bool },
+}
+
+impl RetainedSource {
+    fn close(&mut self) {
+        match self {
+            Self::Physical(cursor) => cursor.close(),
+            Self::Singleton { available } => *available = false,
+        }
+    }
 }
 
 impl PendingRow<'_> {
     fn decode<'row>(
         &'row self,
-        definition: &TableDef,
+        scope: &QueryScope<'_>,
         values: &mut [Datum<'row>; MAX_COLUMNS],
     ) -> Result<(), SqlError> {
-        match self.row.representation() {
+        let RetainedRow::Physical(row) = &self.row else {
+            return Ok(());
+        };
+        let definition = scope.defs.stored(0).expect("physical source definition");
+        match row.representation() {
             SpilledRowRepresentation::Encoded(bytes) => {
                 let mut schema = [ColType::Bool; MAX_COLUMNS];
                 definition.schema(&mut schema);
@@ -67,7 +90,7 @@ pub(crate) struct RetainedSelect<'a> {
     predicate: Option<&'a Expr<'a>>,
     bounds: RowBounds<'a>,
     scope: QueryScope<'a>,
-    source: RowCursor,
+    source: RetainedSource,
     decoded_columns: Option<[bool; MAX_COLUMNS]>,
     pending: Option<PendingRow<'a>>,
     state: ReaderState,
@@ -140,7 +163,6 @@ fn retained_expression(
                 && retained_expression(operand, catalog, statement)
         }
         Expr::Call {
-            name,
             args,
             star: false,
             distinct: false,
@@ -148,18 +170,87 @@ fn retained_expression(
             over: None,
             filter: None,
             ..
-        } if statement.is_some() && order_by.is_empty() => {
-            let (storage, txid) = statement.expect("statement expression mode");
-            !expression.is_aggregate_use()
-                && !storage.has_aggregate_candidate(name, args.len(), txid)
-                && !is_builtin_set_routine(name)
-                && !storage.has_set_routine_candidate(name, args.len(), txid)
-                && args
-                    .iter()
-                    .all(|argument| retained_expression(argument, catalog, statement))
-        }
+        } if statement.is_some() && order_by.is_empty() => args
+            .iter()
+            .all(|argument| retained_expression(argument, catalog, statement)),
         _ => false,
     }
+}
+
+fn retained_scalar_calls(
+    expression: &Expr<'_>,
+    columns: &CatalogScopeCols<'_, '_, '_, '_>,
+) -> Result<bool, SqlError> {
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = expression
+    {
+        let mut types = [super::super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() > types.len() {
+            return Ok(false);
+        }
+        for (target, argument) in types.iter_mut().zip(*args) {
+            *target = super::super::exec::infer_routine_argument_oid(argument, columns)?;
+        }
+        let catalog = storage_catalog(columns.storage, columns.arena, columns.txid);
+        match catalog.resolve_routine_call(
+            name,
+            crate::sql::ast::CallKind::Routine,
+            *bound_oid,
+            argument_names,
+            *variadic,
+            &types[..args.len()],
+        )? {
+            Some(super::super::eval::RoutineCallTarget::Stored { oid, .. }) => {
+                let slot = columns
+                    .storage
+                    .routine_slot_by_oid(oid, columns.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "captured function with OID {} does not exist",
+                            oid
+                        )
+                    })?;
+                if !matches!(
+                    columns.storage.routine_for(slot, columns.txid).kind,
+                    crate::storage::RoutineKind::Function { .. }
+                        | crate::storage::RoutineKind::RecordFunction {
+                            set_returning: false
+                        }
+                ) {
+                    return Ok(false);
+                }
+            }
+            Some(super::super::eval::RoutineCallTarget::Builtin { oid, .. }) => {
+                let signature =
+                    super::super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "selected builtin declaration is unavailable"
+                        )
+                    })?;
+                if signature.kind != b'f' || signature.returns_set {
+                    return Ok(false);
+                }
+            }
+            Some(super::super::eval::RoutineCallTarget::Operator { .. }) | None => {
+                return Ok(false);
+            }
+        }
+    }
+    let mut scalar = true;
+    walk_children(expression, &mut |child| {
+        scalar &= retained_scalar_calls(child, columns)?;
+        Ok(())
+    })?;
+    Ok(scalar)
 }
 
 fn row_independent(expression: &Expr<'_>, scope: &QueryScope<'_>) -> bool {
@@ -781,15 +872,21 @@ impl<'a> RetainedSelect<'a> {
         responder: &mut Responder<'_>,
         mode: RetainedMode,
     ) -> Result<Option<Self>, SqlError> {
-        let Some(from) = statement.from.as_ref() else {
+        let from = statement.from.as_ref();
+        if from.is_none() && mode == RetainedMode::Statement {
             return Ok(None);
-        };
-        if !from.joins.is_empty()
-            || from.base.is_function_source()
-            || from.base.subquery.is_some()
-            || from.base.cte.is_some()
-            || from.base.sample.is_some()
-            || !statement.with.is_empty()
+        }
+        if from.is_some_and(|from| {
+            !from.joins.is_empty()
+                || from.base.is_function_source()
+                || from.base.subquery.is_some()
+                || from.base.cte.is_some()
+                || from.base.sample.is_some()
+                || matches!(
+                    storage.resolve_relation(from.base.schema, from.base.table, txid),
+                    Some(crate::storage::ResolvedRelation::View(_))
+                )
+        }) || !statement.with.is_empty()
             || statement.set_body.is_some()
             || statement.distinct
             || !statement.distinct_on.is_empty()
@@ -799,15 +896,11 @@ impl<'a> RetainedSelect<'a> {
             || !statement.order_by.is_empty()
             || !statement.locking.is_empty()
             || statement.with_ties
-            || matches!(
-                storage.resolve_relation(from.base.schema, from.base.table, txid),
-                Some(crate::storage::ResolvedRelation::View(_))
-            )
         {
             return Ok(None);
         }
         let catalog = storage_catalog(storage, arena, txid);
-        let expression_mode = (mode == RetainedMode::Statement).then_some((storage, txid));
+        let expression_mode = Some((storage, txid));
         if !statement.items.iter().all(|item| match item {
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
             SelectItem::Expr { expression, .. } => {
@@ -827,10 +920,16 @@ impl<'a> RetainedSelect<'a> {
         {
             return Ok(None);
         }
-        let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-        if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
-            return Ok(None);
-        }
+        let scope = match from {
+            Some(from) => {
+                let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+                if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
+                    return Ok(None);
+                }
+                scope
+            }
+            None => QueryScope::singleton(storage, txid, arena)?,
+        };
         let columns = CatalogScopeCols {
             scope: &scope,
             outer_scope: None,
@@ -838,6 +937,19 @@ impl<'a> RetainedSelect<'a> {
             txid,
             arena,
         };
+        for expression in statement
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expression, .. } => Some(*expression),
+                _ => None,
+            })
+            .chain(statement.where_clause)
+        {
+            if !retained_scalar_calls(expression, &columns)? {
+                return Ok(None);
+            }
+        }
         for bound in [statement.limit, statement.offset].into_iter().flatten() {
             let (oid, _) = super::super::exec::infer_type_res(bound, &columns)?;
             if oid != super::super::types::oid::UNKNOWN
@@ -868,30 +980,39 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
         }
-        let binding_columns = (mode == RetainedMode::Statement).then_some(&columns);
-        let table = scope.slots[0];
-        let definition = scope.defs.stored(0).expect("resolved physical source");
-        if definition.kind != crate::storage::TableKind::Local
-            || definition.partition.is_partitioned()
-            || (from.base.inheritance == crate::sql::ast::RelationInheritance::Descendants
-                && storage.relation_has_descendants(table, txid))
-        {
-            return Ok(None);
-        }
-        let role = storage.current_role_slot(txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            )
-        })?;
-        let role = scope.authorization_roles[0].map_or(role, usize::from);
-        if storage.row_security_applies(table, role, txid) {
-            return Ok(None);
-        }
+        let binding_columns = Some(&columns);
+        let table = if let Some(from) = from {
+            let table = scope.slots[0];
+            let definition = scope.defs.stored(0).expect("resolved physical source");
+            if definition.kind != crate::storage::TableKind::Local
+                || definition.partition.is_partitioned()
+                || (from.base.inheritance == crate::sql::ast::RelationInheritance::Descendants
+                    && storage.relation_has_descendants(table, txid))
+            {
+                return Ok(None);
+            }
+            let role = storage.current_role_slot(txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            })?;
+            let role = scope.authorization_roles[0].map_or(role, usize::from);
+            if storage.row_security_applies(table, role, txid) {
+                return Ok(None);
+            }
+            Some(table)
+        } else {
+            None
+        };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         check_select_constants(statement, arena, storage, txid)?;
-        let demand = streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-        scan::admit_sources(storage, &scope, txid, demand)?;
+        let demand = from.map(|from| {
+            streaming_pax_columns(&scope, from, statement.items, statement.where_clause)
+        });
+        if let Some(demand) = demand {
+            scan::admit_sources(storage, &scope, txid, demand)?;
+        }
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         let width = describe_scope_items(
             statement.items,
@@ -916,10 +1037,13 @@ impl<'a> RetainedSelect<'a> {
             arena,
             &mut columns[..width],
         )?;
-        let mut source = RowCursor::closed();
-        let decoded_columns = demand.selected_mask(0).map(|mask| {
-            core::array::from_fn(|column| column < u64::BITS as usize && mask & (1 << column) != 0)
-        });
+        let decoded_columns = demand
+            .and_then(|demand| demand.selected_mask(0))
+            .map(|mask| {
+                core::array::from_fn(|column| {
+                    column < u64::BITS as usize && mask & (1 << column) != 0
+                })
+            });
         let items = arena.alloc_slice_copy(statement.items).map_err(|error| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1013,7 +1137,9 @@ impl<'a> RetainedSelect<'a> {
         } else {
             bounds
         };
-        if mode == RetainedMode::Statement {
+        if let Some(table) = table
+            && mode == RetainedMode::Statement
+        {
             storage.lock_table(
                 txid,
                 table,
@@ -1021,10 +1147,18 @@ impl<'a> RetainedSelect<'a> {
                 false,
             )?;
         }
-        if !eliminated {
-            scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
-            source.open(storage, table, txid, arena)?;
-        }
+        let source = if let Some(table) = table {
+            let mut source = RowCursor::closed();
+            if !eliminated {
+                scan::validate_materialized_view_reads(storage, &scope, None, arena, txid)?;
+                source.open(storage, table, txid, arena)?;
+            }
+            RetainedSource::Physical(source)
+        } else {
+            RetainedSource::Singleton {
+                available: !eliminated,
+            }
+        };
         responder
             .row_description(&columns[..width])
             .map_err(|_| match mode {
@@ -1074,7 +1208,15 @@ impl<'a> RetainedSelect<'a> {
         match self.state {
             ReaderState::Complete | ReaderState::Eliminated => return Ok(false),
             ReaderState::Unstarted => {
-                storage.record_relation_scan(txid, self.scope.slots[0], None, 0, observed_at)?;
+                if matches!(self.source, RetainedSource::Physical(_)) {
+                    storage.record_relation_scan(
+                        txid,
+                        self.scope.slots[0],
+                        None,
+                        0,
+                        observed_at,
+                    )?;
+                }
                 self.state = ReaderState::Reading;
             }
             ReaderState::Reading => {}
@@ -1082,12 +1224,20 @@ impl<'a> RetainedSelect<'a> {
         check_timeout()?;
         if self.pending.is_none() {
             let mark = state_arena.mark();
-            let row = match self.source.next(
-                buffers,
-                state_arena,
-                state_arena,
-                self.decoded_columns.as_ref(),
-            ) {
+            let next = match &mut self.source {
+                RetainedSource::Physical(source) => source
+                    .next(
+                        buffers,
+                        state_arena,
+                        state_arena,
+                        self.decoded_columns.as_ref(),
+                    )
+                    .map(|row| row.map(RetainedRow::Physical)),
+                RetainedSource::Singleton { available } => {
+                    Ok(core::mem::replace(available, false).then_some(RetainedRow::Singleton))
+                }
+            };
+            let row = match next {
                 Ok(row) => row,
                 Err(error) => {
                     // Failed reads retain navigation state, not front scratch.
@@ -1109,7 +1259,9 @@ impl<'a> RetainedSelect<'a> {
         }
         let pending = self.pending.as_mut().expect("captured statement row");
         if !pending.counted {
-            storage.record_relation_tuple_read(txid, self.scope.slots[0], None)?;
+            if matches!(pending.row, RetainedRow::Physical(_)) {
+                storage.record_relation_tuple_read(txid, self.scope.slots[0], None)?;
+            }
             pending.counted = true;
         }
         Ok(true)
@@ -1120,14 +1272,12 @@ impl<'a> RetainedSelect<'a> {
         each: impl FnOnce(&scan::JoinRow<'_, 'work, '_>) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let pending = self.pending.as_ref().expect("prepared statement row");
-        let definition = self
-            .scope
-            .defs
-            .stored(0)
-            .expect("retained source definition");
         let mut values = [Datum::Null; MAX_COLUMNS];
-        pending.decode(definition, &mut values)?;
-        let rowids = [Some(pending.row.rowid)];
+        pending.decode(&self.scope, &mut values)?;
+        let rowids = [match &pending.row {
+            RetainedRow::Physical(row) => Some(row.rowid),
+            RetainedRow::Singleton => None,
+        }];
         each(&scan::JoinRow {
             scope: &self.scope,
             values: scan::JoinRowValues::Flat {

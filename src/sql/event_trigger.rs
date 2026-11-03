@@ -4040,10 +4040,25 @@ pub(crate) fn collect<'a>(
     }
     // A successful OWNER command is observable even when ownership is unchanged.
     // PostgreSQL REL_18_6 src/backend/tcop/utility.c collects its returned address.
-    if let Stmt::AlterOwner { kind, name, .. } = statement
-        && let Some(object) = super::exec::alter_owner_target(storage, txid, *kind, name)?
-        && let Some(reference) = access_reference(object)
-    {
+    let owner_target = match statement {
+        Stmt::AlterOwner { kind, name, .. } => {
+            super::exec::alter_owner_target(storage, txid, *kind, name)?.and_then(access_reference)
+        }
+        Stmt::AlterForeignServer {
+            name,
+            action: crate::sql::ast::AlterForeignServerAction::Owner(_),
+        } => storage
+            .foreign_server(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
+        Stmt::AlterForeignDataWrapper {
+            name,
+            action: crate::sql::ast::AlterForeignDataWrapperAction::Owner(_),
+        } => storage
+            .foreign_wrapper(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
+        _ => None,
+    };
+    if let Some(reference) = owner_target {
         let reference = EventObjectRef::Primary(reference);
         if !seen_commands.as_slice().contains(&reference) {
             push_command(

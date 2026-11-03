@@ -9647,11 +9647,15 @@ impl Engine {
             };
             types[index] = ctype;
         }
+        let inherited = match type_inputs::bindings_for_active_source(sql, arena) {
+            Ok(bindings) => bindings.unwrap_or(&[]),
+            Err(error) => return Ok(Err(error)),
+        };
         let mut parser = match Parser::new(sql, arena) {
             Ok(parser) => parser,
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
         };
-        parser.capture_type_inputs();
+        parser.set_type_inputs(inherited);
         let statement = match parser.next_stmt() {
             Ok(Some(statement)) => statement,
             Ok(None) => {
@@ -9684,6 +9688,9 @@ impl Engine {
         ) {
             return Ok(Err(error));
         }
+        if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
+            return Ok(Err(error));
+        }
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         let bindings = match self.bind_type_inputs(
             parser.type_input_candidates(),
@@ -9707,6 +9714,35 @@ impl Engine {
                 self.rollback_waiting_statement(txn, mark);
                 return Err(error);
             }
+        };
+        let bindings = match (|| -> Result<&[type_inputs::Binding<'_>], SqlError> {
+            let count = inherited
+                .len()
+                .checked_add(bindings.len())
+                .ok_or_else(eval::arena_full)?;
+            let merged = arena
+                .alloc_slice_with(count, |index| {
+                    if index < inherited.len() {
+                        inherited[index]
+                    } else {
+                        bindings[index - inherited.len()]
+                    }
+                })
+                .map_err(|_| eval::arena_full())?;
+            merged.sort_unstable_by_key(|binding| (binding.start, binding.end, binding.kind));
+            if merged.windows(2).any(|pair| {
+                (pair[0].start, pair[0].end, pair[0].kind)
+                    == (pair[1].start, pair[1].end, pair[1].kind)
+            }) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared input occurrence was bound twice"
+                ));
+            }
+            Ok(merged)
+        })() {
+            Ok(bindings) => bindings,
+            Err(error) => return Ok(Err(error)),
         };
         let bound_inputs = match (|| -> Result<&[u8], SqlError> {
             if bindings.is_empty() {
@@ -9854,9 +9890,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if matches!(target, ast::DiscardTarget::Plans | ast::DiscardTarget::All)
-            && type_input_plans::has_active_plan()
-        {
+        if target == ast::DiscardTarget::All && type_input_plans::has_active_plan() {
             return Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "invalidating an executing routine input plan is not supported"
@@ -15793,73 +15827,105 @@ impl Engine {
             return Ok(Err(error));
         }
         let source = key.source;
-        let prior = match sqlprep
-            .routine_inputs
-            .find_validated(key, |validity| match validity {
-                Some(validity) => validity.matches(&self.storage, txn.txid),
-                None => Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "PL/pgSQL statement plan has no validity image"
-                )),
-            }) {
+        let replayed = match sequence::expected_input().and_then(|expected| match expected {
+            sequence::ExpectedInput::Plan(plan) => {
+                sqlprep.routine_inputs.matching_replayed(plan, key)
+            }
+            sequence::ExpectedInput::None | sequence::ExpectedInput::OtherEffect => Ok(None),
+        }) {
             Ok(prior) => prior,
             Err(error) => return Ok(Err(error)),
         };
-        let ready = matches!(
-            prior,
+        let replay_complete = matches!(
+            replayed,
             Some(type_input_plans::Lookup::Ready(_, _) | type_input_plans::Lookup::Failed(_, _))
         );
-        let reserved = if prior.is_none() {
-            match sqlprep.routine_inputs.reserve(key) {
-                Ok(plan) => Some(plan),
-                Err(error) => return Ok(Err(error)),
-            }
-        } else {
-            None
-        };
-        let parser = if ready {
+        let parsed = if replay_complete {
             None
         } else {
             let parsed = (|| {
-                let mut dependencies = reserved
-                    .map(|_| self.storage.empty_stored_query_dependencies(arena))
-                    .transpose()?;
+                let mut dependencies = self.storage.empty_stored_query_dependencies(arena)?;
                 let parser = plpgsql_inputs::parse(
                     site,
                     &self.storage,
                     txn.txid,
                     row,
                     arena,
-                    dependencies.as_mut(),
+                    Some(&mut dependencies),
                 )?;
-                if let Some(plan) = reserved {
-                    let dependencies = dependencies
-                        .as_ref()
-                        .expect("new PL plans captured dependencies");
-                    let validity = self.storage.capture_runtime_input_validity(
-                        dependencies,
-                        txn,
-                        source.routine_definition().map(|(oid, _)| oid),
-                    )?;
-                    sqlprep.routine_inputs.set_plan_validity(plan, validity)?;
-                }
-                Ok(parser)
+                Ok((parser, dependencies))
             })();
             match parsed {
-                Ok(parser) => Some(parser),
-                Err(error) => {
-                    if let Some(plan) = reserved
-                        && let Err(abandon) = sqlprep.routine_inputs.abandon(plan)
-                    {
-                        return Ok(Err(abandon));
-                    }
-                    return Ok(Err(error));
-                }
+                Ok(parsed) => Some(parsed),
+                Err(error) => return Ok(Err(error)),
             }
         };
-        let candidates = parser
+        let mut captured_planner = None;
+        if replayed.is_none() {
+            let (parser, _) = parsed.as_ref().expect("a new site has parsed its inputs");
+            let checked = parser.type_input_candidates().iter().any(|candidate| {
+                type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate).is_some()
+            });
+            if !checked {
+                let captured =
+                    match self.capture_plpgsql_planner_inputs(site, row, &[], arena, txn.txid) {
+                        Ok(captured) => captured,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                if captured.is_empty() {
+                    sqlprep.routine_inputs.retire_unused_site(key);
+                    return Ok(Ok(PreparedTypeInputs {
+                        owner: key.owner,
+                        source,
+                        bindings: &[],
+                    }));
+                }
+                captured_planner = Some(captured);
+            }
+        }
+        let prior = match replayed {
+            Some(prior) => Some(prior),
+            None => match sqlprep
+                .routine_inputs
+                .find_validated(key, |validity| match validity {
+                    Some(validity) => validity.matches(&self.storage, txn.txid),
+                    None => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "PL/pgSQL statement plan has no validity image"
+                    )),
+                }) {
+                Ok(prior) => prior,
+                Err(error) => return Ok(Err(error)),
+            },
+        };
+        let reserved = if prior.is_none() {
+            let plan = match sqlprep.routine_inputs.reserve(key) {
+                Ok(plan) => plan,
+                Err(error) => return Ok(Err(error)),
+            };
+            let admitted = (|| {
+                let (_, dependencies) =
+                    parsed.as_ref().expect("new site captured its dependencies");
+                let validity = self.storage.capture_runtime_input_validity(
+                    dependencies,
+                    txn,
+                    source.routine_definition().map(|(oid, _)| oid),
+                )?;
+                sqlprep.routine_inputs.set_plan_validity(plan, validity)
+            })();
+            if let Err(error) = admitted {
+                if let Err(abandon) = sqlprep.routine_inputs.abandon(plan) {
+                    return Ok(Err(abandon));
+                }
+                return Ok(Err(error));
+            }
+            Some(plan)
+        } else {
+            None
+        };
+        let candidates = parsed
             .as_ref()
-            .map_or(&[][..], |parser| parser.type_input_candidates());
+            .map_or(&[][..], |(parser, _)| parser.type_input_candidates());
         let prepared = match self.prepare_type_input_plan(
             TypeInputPlanSource {
                 key: Some(key),
@@ -15879,9 +15945,16 @@ impl Engine {
             Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
-        let planned = self.prepare_plpgsql_planner_inputs(
-            site, row, prepared, arena, txn, sqlprep, cursors, guc, responder,
-        )?;
+        let planned = match captured_planner {
+            Some(captured) => type_input_plans::with_owner(prepared.owner, || {
+                self.prepare_captured_planner_inputs(
+                    captured, arena, txn, sqlprep, cursors, guc, responder,
+                )
+            }),
+            None => self.prepare_plpgsql_planner_inputs(
+                site, row, prepared, arena, txn, sqlprep, cursors, guc, responder,
+            ),
+        }?;
         if let Err(error) = planned {
             return Ok(Err(error));
         }
@@ -20723,7 +20796,18 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 if c.to {
-                    match exec::copy_out(&self.storage, txn.txid, &setup, arena, responder) {
+                    match exec::copy_out(
+                        &self.storage,
+                        txn.txid,
+                        &setup,
+                        arena,
+                        responder,
+                        Some(&sequence::SeqEval::new(
+                            &self.storage,
+                            guc.seq_session(),
+                            txn.txid,
+                        )),
+                    ) {
                         Ok(count) => {
                             responder.command_complete(
                                 crate::stack_format!(32, "COPY {count}").as_str(),
@@ -22498,7 +22582,7 @@ impl Engine {
                             crate::pg::respond::CursorRowOutput::Save(rows),
                         );
                         capture.set_render(guc.render());
-                        query.with_query(|parsed, params, arena| {
+                        query.with_query(|parsed, params, _| {
                             let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txid);
                             match parsed {
                                 cursor::CursorStatement::Select(select) => {

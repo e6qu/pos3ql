@@ -3409,3 +3409,73 @@ fn domain_checks_keep_sequence_context_through_casts_arrays_and_assignments() {
         );
     }
 }
+
+#[test]
+fn foreign_row_inputs_preserve_the_request_sequence_context_without_allocating() {
+    let config = test_config("foreign-domain-sequence-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE foreign_domain_checks; \
+         CREATE DOMAIN foreign_checked AS integer CHECK(nextval('foreign_domain_checks')>0); \
+         CREATE TABLE foreign_layout(value foreign_checked,items foreign_checked[])",
+        true,
+    );
+    let slot = engine
+        .storage
+        .find_visible("public", "foreign_layout", 0)
+        .unwrap();
+    let table = (*engine.storage.table_def(slot, 0)).clone();
+    let arena = Arena::new(&mut budget, "foreign value conversion", 256 << 10).unwrap();
+    let sequences =
+        crate::sql::sequence::SeqEval::new(&engine.storage, session.guc.seq_session(), 0);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            crate::sql::foreign::decode_foreign_field(
+                &engine.storage,
+                &table,
+                0,
+                Some(b"7"),
+                0,
+                &arena,
+                Some(&sequences)
+            )
+            .unwrap(),
+            Datum::Int4(7)
+        );
+        let array = crate::sql::foreign::decode_foreign_field(
+            &engine.storage,
+            &table,
+            1,
+            Some(b"{8,9}"),
+            0,
+            &arena,
+            Some(&sequences),
+        )
+        .unwrap();
+        assert!(matches!(array, Datum::Array { .. }));
+        assert_eq!(
+            crate::sql::foreign::decode_foreign_field(
+                &engine.storage,
+                &table,
+                0,
+                None,
+                0,
+                &arena,
+                Some(&sequences)
+            )
+            .unwrap(),
+            Datum::Null
+        );
+    });
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value FROM foreign_domain_checks",
+            true
+        )),
+        ["4"]
+    );
+}

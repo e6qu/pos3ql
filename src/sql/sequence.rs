@@ -672,37 +672,52 @@ pub(crate) fn restore_replay_cursor(cursor: StatementReplayCursor) -> Result<(),
     })
 }
 
-pub(crate) fn replayed_input_plan() -> Result<Option<super::type_input_plans::PlanId>, SqlError> {
+#[derive(Clone, Copy)]
+pub(crate) enum ExpectedInput {
+    None,
+    Plan(super::type_input_plans::PlanId),
+    OtherEffect,
+}
+
+pub(crate) fn expected_input() -> Result<ExpectedInput, SqlError> {
     with_statement_context(|context| {
         let Some((arena, session)) = context else {
-            return Ok(None);
+            return Ok(ExpectedInput::None);
         };
         let Some(handle) = session.statement_replay.get().effects_next else {
-            return Ok(None);
+            return Ok(ExpectedInput::None);
         };
         let handle = match handle {
             EffectHandle::ReadyInput(handle) => {
                 return arena
                     .retained(handle)
-                    .map(|effect| Some(effect.plan))
+                    .map(|effect| ExpectedInput::Plan(effect.plan))
                     .ok_or_else(replay_changed);
             }
             EffectHandle::Full(handle) => handle,
         };
         let effect = arena.retained(handle).ok_or_else(replay_changed)?;
         if effect.kind != StatementEffectKind::RoutineInput {
-            return Err(replay_changed());
+            return Ok(ExpectedInput::OtherEffect);
         }
         let key = arena
             .retained_slice_mut(effect.key)
             .map_err(|_| replay_changed())?;
         match super::exec::decode_projected_col_record(&key, 0, arena)? {
             super::types::Datum::Bytea(bytes) => {
-                super::type_input_plans::PlanId::from_key_bytes(bytes).map(Some)
+                super::type_input_plans::PlanId::from_key_bytes(bytes).map(ExpectedInput::Plan)
             }
             _ => Err(replay_changed()),
         }
     })
+}
+
+pub(crate) fn replayed_input_plan() -> Result<Option<super::type_input_plans::PlanId>, SqlError> {
+    match expected_input()? {
+        ExpectedInput::None => Ok(None),
+        ExpectedInput::Plan(plan) => Ok(Some(plan)),
+        ExpectedInput::OtherEffect => Err(replay_changed()),
+    }
 }
 
 fn retained_effect_bytes(

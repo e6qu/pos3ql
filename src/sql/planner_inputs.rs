@@ -164,6 +164,12 @@ pub(crate) struct CapturedPlannerInputs<'a> {
     candidates: &'a [Candidate<'a>],
 }
 
+impl CapturedPlannerInputs<'_> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+}
+
 /// Only detached type/effect facts escape the source plan's schema scope.
 pub(crate) fn capture_planner_inputs<'a, 'source>(
     statement: &Stmt<'source>,
@@ -831,6 +837,67 @@ fn capture_operator<'a>(
 }
 
 impl Engine {
+    pub(super) fn capture_plpgsql_planner_inputs<'a>(
+        &self,
+        site: super::plpgsql_inputs::Site<'a>,
+        row: &dyn ColumnLookup<'a>,
+        bindings: &'a [type_inputs::Binding<'a>],
+        arena: &'a Arena,
+        transaction: u32,
+    ) -> Result<CapturedPlannerInputs<'a>, SqlError> {
+        let mut parser =
+            Parser::new(site.text, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+        parser.set_type_inputs(bindings);
+        let mut candidates = ArenaList::new_persistent(arena);
+        if site.kind == super::plpgsql_inputs::Kind::Expression {
+            let expression = parser
+                .expression(0)
+                .map_err(|error| super::parse_error_to_sql(&error))?;
+            let mark = arena.mark();
+            let captured = query::visit_planner_expression(
+                expression,
+                &self.storage,
+                transaction,
+                arena,
+                row,
+                &mut |expression, columns, _assignment| {
+                    capture_expression_into(
+                        expression,
+                        columns,
+                        &self.storage,
+                        transaction,
+                        arena,
+                        &mut candidates,
+                    )
+                },
+            );
+            unsafe { arena.rewind_to(mark) };
+            captured?;
+        } else {
+            while let Some(statement) = parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+            {
+                let captured = capture_planner_inputs(
+                    &statement,
+                    Some(row),
+                    &self.storage,
+                    transaction,
+                    arena,
+                )?;
+                for candidate in captured.candidates {
+                    candidates
+                        .push(*candidate)
+                        .map_err(|_| super::eval::arena_full())?;
+                }
+            }
+        }
+        type_inputs::validate_restored(&parser, &self.storage, transaction)?;
+        Ok(CapturedPlannerInputs {
+            candidates: candidates.as_slice(),
+        })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "PL planning uses the restored lexical source, local types and existing execution context"
@@ -847,59 +914,8 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let captured = (|| {
-            let mut parser =
-                Parser::new(site.text, arena).map_err(|error| super::parse_error_to_sql(&error))?;
-            parser.set_type_inputs(prepared.bindings);
-            let mut candidates = ArenaList::new_persistent(arena);
-            if site.kind == super::plpgsql_inputs::Kind::Expression {
-                let expression = parser
-                    .expression(0)
-                    .map_err(|error| super::parse_error_to_sql(&error))?;
-                let mark = arena.mark();
-                let captured = query::visit_planner_expression(
-                    expression,
-                    &self.storage,
-                    txn.txid,
-                    arena,
-                    row,
-                    &mut |expression, columns, _assignment| {
-                        capture_expression_into(
-                            expression,
-                            columns,
-                            &self.storage,
-                            txn.txid,
-                            arena,
-                            &mut candidates,
-                        )
-                    },
-                );
-                unsafe { arena.rewind_to(mark) };
-                captured?;
-            } else {
-                while let Some(statement) = parser
-                    .next_stmt()
-                    .map_err(|error| super::parse_error_to_sql(&error))?
-                {
-                    let captured = capture_planner_inputs(
-                        &statement,
-                        Some(row),
-                        &self.storage,
-                        txn.txid,
-                        arena,
-                    )?;
-                    for candidate in captured.candidates {
-                        candidates
-                            .push(*candidate)
-                            .map_err(|_| super::eval::arena_full())?;
-                    }
-                }
-            }
-            type_inputs::validate_restored(&parser, &self.storage, txn.txid)?;
-            Ok(CapturedPlannerInputs {
-                candidates: candidates.as_slice(),
-            })
-        })();
+        let captured =
+            self.capture_plpgsql_planner_inputs(site, row, prepared.bindings, arena, txn.txid);
         let captured = match captured {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),

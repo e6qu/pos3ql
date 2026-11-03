@@ -7574,7 +7574,7 @@ pub fn alter_owner(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::AlterOwnerKind;
-    use crate::storage::AccessClass;
+    use crate::storage::{AccessClass, AccessObject};
     let (noun, tag) = match kind {
         AlterOwnerKind::Schema => ("schema", "ALTER SCHEMA"),
         AlterOwnerKind::Type => ("type", "ALTER TYPE"),
@@ -18552,10 +18552,16 @@ fn parse_trigger_local<'a>(
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
-    let initial = trigger_top_level_keyword(statement, ":=")
-        .map(|offset| (offset, 2))
-        .or_else(|| trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7)))
-        .or_else(|| trigger_top_level_keyword(statement, "=").map(|offset| (offset, 1)));
+    let assignment = trigger_assignment_operator(statement);
+    let default = trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7));
+    let initial = match (assignment, default) {
+        (Some(assignment), Some(default)) => Some(if assignment.0 < default.0 {
+            assignment
+        } else {
+            default
+        }),
+        (assignment, default) => assignment.or(default),
+    };
     let (declaration, initial) = if let Some((offset, width)) = initial {
         let expression = statement[offset + width..].trim();
         if expression.is_empty() {
@@ -21592,6 +21598,32 @@ mod trigger_program_tests {
                         Some(site.text)
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn local_initializers_split_punctuation_before_parsing_type_names() {
+        let mut budget = Budget::new(1 << 17);
+        let arena = Arena::new(&mut budget, "PL initializer punctuation", 1 << 16).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (body, expression) in [
+                ("DECLARE value integer:=1; BEGIN RETURN NEW; END", "1"),
+                ("DECLARE value integer=1; BEGIN RETURN NEW; END", "1"),
+                (
+                    "DECLARE value boolean DEFAULT 1=1; BEGIN RETURN NEW; END",
+                    "1=1",
+                ),
+                (
+                    "DECLARE value text:='default'; BEGIN RETURN NEW; END",
+                    "'default'",
+                ),
+            ] {
+                let program = parse_trigger_program(body, &arena).unwrap();
+                assert_eq!(program.locals.len(), 1);
+                assert!(program.locals[0].initial.is_some());
+                assert_eq!(program.input_sites.len(), 1);
+                assert_eq!(program.input_sites[0].text, expression);
             }
         });
     }
@@ -25272,7 +25304,7 @@ fn coerce_plpgsql_local<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let sequences = crate::sql::sequence::SeqEval::new(
         context.storage(),
-        context.seq_session,
+        context.seq_session(),
         context.txn.txid,
     );
     let value = match local.record_shape {
@@ -25310,7 +25342,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let sequences = crate::sql::sequence::SeqEval::new(
         context.storage(),
-        context.seq_session,
+        context.seq_session(),
         context.txn.txid,
     );
     if value.is_null() {
@@ -26161,7 +26193,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     context.arena,
                     Some(&crate::sql::sequence::SeqEval::new(
                         context.storage(),
-                        context.seq_session,
+                        context.seq_session(),
                         context.txn.txid,
                     )),
                 )?;
@@ -57336,6 +57368,11 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     false,
                     responder.render_context(),
                     arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 )?
                 .ok_or_else(|| {
                     sql_err!(
@@ -59412,6 +59449,7 @@ pub fn copy_out(
     setup: &CopySetup,
     arena: &Arena,
     responder: &mut Responder,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<u64, SqlError> {
     let def = setup
         .definitions
@@ -59489,7 +59527,8 @@ pub fn copy_out(
             .map_err(wire_to_sql)?;
     }
     if def.kind == crate::storage::TableKind::Foreign {
-        let rows = crate::sql::foreign::materialize(storage, setup.table_index, txid, arena)?;
+        let rows =
+            crate::sql::foreign::materialize(storage, setup.table_index, txid, arena, sequences)?;
         let mut count = 0u64;
         for row in rows {
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -60525,9 +60564,19 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
         eval_full(expression, arena, params, row, &hooks)?
     };
     let value = match assignment {
-        Some((column, cast)) => {
-            coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)?
-        }
+        Some((column, cast)) => coerce_assignment(
+            value,
+            column,
+            cast,
+            storage,
+            txid,
+            arena,
+            Some(&crate::sql::sequence::SeqEval::new(
+                storage,
+                seq_session,
+                txid,
+            )),
+        )?,
         None => value,
     };
     detached_trigger_datum(value, arena)
@@ -61485,6 +61534,11 @@ pub(crate) fn merge<'a>(
                 n_target += 1;
                 Ok(())
             },
+            Some(&crate::sql::sequence::SeqEval::new(
+                storage,
+                seq_session,
+                coercion_txid,
+            )),
         ) {
             return sql_fail(error);
         }
@@ -61898,6 +61952,11 @@ pub(crate) fn merge<'a>(
                                 txn.txid,
                                 tuple_id,
                                 arena,
+                                Some(&crate::sql::sequence::SeqEval::new(
+                                    storage,
+                                    seq_session,
+                                    coercion_txid,
+                                )),
                             ) {
                                 Ok(Some(deleted)) => deleted,
                                 Ok(None) => {
@@ -62309,6 +62368,11 @@ pub(crate) fn merge<'a>(
                                     render: responder.render_context(),
                                 },
                                 arena,
+                                Some(&crate::sql::sequence::SeqEval::new(
+                                    storage,
+                                    seq_session,
+                                    coercion_txid,
+                                )),
                             ) {
                                 Ok(changed) => changed,
                                 Err(error) => return sql_fail(error),
@@ -62925,6 +62989,11 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
                     false,
                     responder.render_context(),
                     arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 )?
                 .is_none()
                 {
@@ -63255,6 +63324,11 @@ where
                     statement.on_conflict.is_some(),
                     responder.render_context(),
                     arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 ) {
                     Ok(Some(_)) => {}
                     Ok(None) => return Ok(Ok(false)),
@@ -66053,15 +66127,24 @@ pub(crate) fn update<'a>(
         // Referential actions retain the arena-owned old values across mutation.
         let row_bytes = match (|| match (home, remote_tuple) {
             (Some(_), None) => retained_rows.bytes(row_table, rowid),
-            (None, Some(tuple_id)) => {
-                crate::sql::foreign::fetch_row(storage, row_table, txn.txid, tuple_id, arena)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::SERIALIZATION_FAILURE,
-                            "foreign row changed before UPDATE could lock it"
-                        )
-                    })
-            }
+            (None, Some(tuple_id)) => crate::sql::foreign::fetch_row(
+                storage,
+                row_table,
+                txn.txid,
+                tuple_id,
+                arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "foreign row changed before UPDATE could lock it"
+                )
+            }),
             _ => unreachable!("DML row identity has one closed variant"),
         })() {
             Ok(b) => b,
@@ -66551,6 +66634,11 @@ pub(crate) fn update<'a>(
                     render: responder.render_context(),
                 },
                 arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 Ok(changed) => changed,
                 Err(error) => return sql_fail(error),
@@ -66817,6 +66905,7 @@ pub(crate) fn delete<'a>(
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -67112,7 +67201,16 @@ pub(crate) fn delete<'a>(
         } = scratch[i]
         {
             let Some(old_row) = (match crate::sql::foreign::fetch_row(
-                storage, row_table, txn.txid, tuple_id, arena,
+                storage,
+                row_table,
+                txn.txid,
+                tuple_id,
+                arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 Ok(row) => row,
                 Err(error) => return sql_fail(error),
@@ -67164,7 +67262,16 @@ pub(crate) fn delete<'a>(
                 return sql_fail(error);
             }
             let Some(deleted_row) = (match crate::sql::foreign::delete_row(
-                storage, row_table, txn.txid, tuple_id, arena,
+                storage,
+                row_table,
+                txn.txid,
+                tuple_id,
+                arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 Ok(row) => row,
                 Err(error) => return sql_fail(error),
@@ -74531,6 +74638,7 @@ pub(super) fn collect_matches<'a>(
                 }
                 Ok(())
             },
+            hooks.sequences,
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return images.finish();
@@ -74706,6 +74814,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 }
                 Ok(())
             },
+            hooks.sequences,
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return images.finish();
@@ -74874,6 +74983,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                 }
                 Ok(())
             },
+            hooks.sequences,
         )?;
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return images.finish();

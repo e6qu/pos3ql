@@ -258,6 +258,19 @@ container image. It includes the input/output routine identities reported by
 `pg_type`; user-defined domains, enums, arrays and row types derive those
 identities from their type definitions.
 
+Planner procedure attributes use the pinned upstream `REL_18_6` files
+[`pg_proc.dat`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat)
+and [`pg_proc.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.h):
+
+```sh
+python3 tools/generate-pg18-planner-properties.py \
+  --source /path/to/pg_proc.dat --header /path/to/pg_proc.h \
+  --output src/sql/catalog_planner_properties.rs
+```
+
+The generator verifies both source checksums before writing. These planning
+facts include internal type conversions; they do not add callable SQL functions.
+
 The catalog comparison also checks built-in view SQL against the PostgreSQL
 service. To regenerate its static definitions from retained `catalog-metadata.json`
 evidence, supply the evidence URL and destination explicitly:

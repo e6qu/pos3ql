@@ -230,7 +230,7 @@ fn predicate_strength(expression: &Expr) -> u32 {
                 operator: BinaryOp::Eq,
                 left,
                 right,
-            } if left.is_constant() != right.is_constant() => Some(1),
+            } if left.is_constant(false) != right.is_constant(false) => Some(1),
             _ => None,
         }
     }
@@ -247,7 +247,7 @@ fn predicate_strength(expression: &Expr) -> u32 {
             list,
             negated: false,
             ..
-        } if list.iter().all(|item| item.is_constant()) => EXACT / (list.len() as u32).max(1),
+        } if list.iter().all(|item| item.is_constant(false)) => EXACT / (list.len() as u32).max(1),
         Expr::IsNull { .. } => EXACT / 4,
         Expr::Binary {
             operator: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
@@ -311,7 +311,7 @@ pub(super) fn is_error_safe(e: &Expr) -> bool {
     // there, so by the time a row is filtered it is known good. This lets a
     // constant-false conjunct (e.g. `-2.25 <> -2.25`, whose unary minus would
     // otherwise mark it unsafe) filter the row before an erroring sibling runs.
-    if e.is_constant() {
+    if e.is_constant(false) {
         return true;
     }
     match e {
@@ -714,7 +714,7 @@ pub(super) fn factor_common_or_terms<'a>(
 /// settled by one constant side. `None` = not decidable at plan time.
 pub(crate) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
     use crate::sql::ast::BinaryOp;
-    if e.is_constant() {
+    if e.is_constant(false) {
         return match crate::sql::eval::eval(
             e,
             arena,
@@ -936,7 +936,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
     use Expr::*;
     // PostgreSQL costs the *plan-time-folded* expression: a fully-constant
     // subtree has become a Const by then and costs nothing.
-    if e.is_constant() {
+    if e.is_constant(false) {
         return 0;
     }
     let oid_of = |x: &Expr| -> Option<i32> {
@@ -965,7 +965,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         match (oid_of(l).and_then(rank), oid_of(r).and_then(rank)) {
             (Some(a), Some(b)) if a != b => {
                 let coerced = if a < b { l } else { r };
-                if coerced.is_constant() { 0 } else { 2 }
+                if coerced.is_constant(false) { 0 } else { 2 }
             }
             _ => 0,
         }
@@ -1064,7 +1064,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             if unifying {
                 let unified = oid_of(e).and_then(rank);
                 for a in *args {
-                    if a.is_constant() {
+                    if a.is_constant(false) {
                         continue;
                     }
                     match (oid_of(a).and_then(rank), unified) {
@@ -1087,7 +1087,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             // counts (a constant result is pre-cast at plan time).
             let case_rank = oid_of(e).and_then(rank);
             let result_cast = |result: &Expr| -> u32 {
-                if result.is_constant() {
+                if result.is_constant(false) {
                     return 0;
                 }
                 match (oid_of(result).and_then(rank), case_rank) {

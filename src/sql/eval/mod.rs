@@ -2553,7 +2553,7 @@ pub(super) fn constant_evaluation(
     expression: &Expr<'_>,
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<Option<ExpressionEvaluation>, SqlError> {
-    if !expression.is_constant() {
+    if !expression.is_constant(catalog.is_some()) {
         return Ok(Some(ExpressionEvaluation::Runtime));
     }
     match catalog {

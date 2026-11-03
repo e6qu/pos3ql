@@ -5805,7 +5805,7 @@ fn scan_source_mode<'a>(
                 let Expr::Column { qualifier, name } = column else {
                     return Ok(false);
                 };
-                if !constant.is_constant() || constant.contains_call() {
+                if !constant.is_constant(false) || constant.contains_call() {
                     return Ok(false);
                 }
                 let Ok(ResolvedColumn::Table(table, index)) = scope.find_column(*qualifier, name)

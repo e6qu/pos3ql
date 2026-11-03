@@ -996,7 +996,7 @@ fn record_dml_column_references(
             let Some(column) = definition.column_index(name) else {
                 failure = Some(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
+                    "column excluded.{} does not exist",
                     name
                 ));
                 return;
@@ -1084,6 +1084,7 @@ pub(crate) fn validate_dml_assignment_casts(
             }
             _ => unreachable!(),
         };
+        let target_name = target.name;
         let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
         let target = scope.defs.get(0).expect("assignment target resolved");
         let catalog = super::storage_catalog(storage, arena, txid);
@@ -1108,7 +1109,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" of relation \"{}\" does not exist",
                     name,
-                    target.name.as_str()
+                    target_name
                 )
             })?;
             validate_assignment_expression(
@@ -1403,6 +1404,7 @@ pub(crate) fn visit_dml_assignment_types(
             }
             _ => return Ok(()),
         };
+        let target_name = target.name;
         let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
         let target = scope.defs.get(0).expect("assignment target resolved");
         let catalog = super::storage_catalog(storage, arena, txid);
@@ -1431,7 +1433,7 @@ pub(crate) fn visit_dml_assignment_types(
                         sqlstate::UNDEFINED_COLUMN,
                         "column \"{}\" of relation \"{}\" does not exist",
                         name,
-                        target.name.as_str()
+                        target_name
                     )
                 })?,
                 None => index,
@@ -1966,14 +1968,18 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             return transition.resolve(qualifier, name);
         }
         if qualifier == Some("excluded")
-            && let Some(column) = self.excluded.and_then(|definition| {
-                definition
-                    .columns()
-                    .iter()
-                    .find(|column| column.name.as_str() == name)
-            })
+            && let Some(definition) = self.excluded
         {
-            return Ok(column.ctype);
+            return definition
+                .column_index(name)
+                .map(|index| definition.columns()[index].ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column excluded.{} does not exist",
+                        name
+                    )
+                });
         }
         let resolved = match self.scope {
             Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),

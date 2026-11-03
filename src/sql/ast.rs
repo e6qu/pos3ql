@@ -5892,11 +5892,9 @@ impl Expr<'_> {
         self.is_aggregate() && matches!(self, Expr::Call { over: None, .. })
     }
 
-    /// True when the expression is a compile-time constant: only literals
-    /// and pure operations over them, with no column/parameter/subquery/
-    /// aggregate reference. PostgreSQL evaluates these at plan time, so
-    /// their errors (division by zero, overflow) surface eagerly.
-    pub fn is_constant(&self) -> bool {
+    /// Whether syntax has only constant inputs. Catalog-aware callers still
+    /// classify function volatility and named-type checks before evaluation.
+    pub fn is_constant(&self, catalog_aware: bool) -> bool {
         /// Set-returning functions expand to multiple rows and are never a
         /// foldable constant.
         fn is_set_returning(name: &str) -> bool {
@@ -5922,10 +5920,11 @@ impl Expr<'_> {
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
-            // User-defined casts retain runtime type/domain validation. Builtin
-            // catalog identifiers use the catalog-aware constant evaluator.
+            // A catalog-free probe cannot classify a named type's input or
+            // checks. Catalog-aware evaluation decides whether these can fold.
             Expr::Cast { type_name, .. }
-                if crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
+                if !catalog_aware
+                    && crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
             {
                 false
             }
@@ -5936,28 +5935,35 @@ impl Expr<'_> {
                 ..
             }
             | Expr::Collate { operand, .. }
-            | Expr::IsNull { operand, .. } => operand.is_constant(),
-            Expr::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
+            | Expr::IsNull { operand, .. } => operand.is_constant(catalog_aware),
+            Expr::Binary { left, right, .. } => {
+                left.is_constant(catalog_aware) && right.is_constant(catalog_aware)
+            }
             Expr::InList { operand, list, .. } => {
-                operand.is_constant() && list.iter().all(|e| e.is_constant())
+                operand.is_constant(catalog_aware)
+                    && list.iter().all(|e| e.is_constant(catalog_aware))
             }
             Expr::Like {
                 operand, pattern, ..
             }
             | Expr::Match {
                 operand, pattern, ..
-            } => operand.is_constant() && pattern.is_constant(),
+            } => operand.is_constant(catalog_aware) && pattern.is_constant(catalog_aware),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
             } => {
-                operand.map(|o| o.is_constant()).unwrap_or(true)
+                operand
+                    .map(|o| o.is_constant(catalog_aware))
+                    .unwrap_or(true)
                     && whens
                         .iter()
-                        .all(|(c, r)| c.is_constant() && r.is_constant())
-                    && otherwise.map(|e| e.is_constant()).unwrap_or(true)
+                        .all(|(c, r)| c.is_constant(catalog_aware) && r.is_constant(catalog_aware))
+                    && otherwise
+                        .map(|e| e.is_constant(catalog_aware))
+                        .unwrap_or(true)
             }
             // Aggregates, windows, set-returning functions, and non-immutable
             // calls are never constants. In particular, probing a volatile
@@ -5969,17 +5975,23 @@ impl Expr<'_> {
                     && !self.is_aggregate()
                     && !is_set_returning(name)
                     && !is_nonimmutable_function(name)
-                    && args.iter().all(|a| a.is_constant())
+                    && args.iter().all(|a| a.is_constant(catalog_aware))
             }
-            Expr::Array(items) => items.iter().all(|e| e.is_constant()),
-            Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),
+            Expr::Array(items) => items.iter().all(|e| e.is_constant(catalog_aware)),
+            Expr::Subscript { base, index } => {
+                base.is_constant(catalog_aware) && index.is_constant(catalog_aware)
+            }
             Expr::Slice { base, lower, upper } => {
-                base.is_constant()
-                    && lower.is_none_or(|e| e.is_constant())
-                    && upper.is_none_or(|e| e.is_constant())
+                base.is_constant(catalog_aware)
+                    && lower.is_none_or(|e| e.is_constant(catalog_aware))
+                    && upper.is_none_or(|e| e.is_constant(catalog_aware))
             }
-            Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => base.is_constant(),
-            Expr::AnyAll { operand, array, .. } => operand.is_constant() && array.is_constant(),
+            Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
+                base.is_constant(catalog_aware)
+            }
+            Expr::AnyAll { operand, array, .. } => {
+                operand.is_constant(catalog_aware) && array.is_constant(catalog_aware)
+            }
         }
     }
 

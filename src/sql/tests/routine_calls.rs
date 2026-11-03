@@ -2990,7 +2990,9 @@ fn auto_updatable_views_map_public_columns_under_target_aliases() {
         assert_eq!(error_sqlstates(&hidden), ["42703"]);
         assert!(
             String::from_utf8_lossy(&hidden)
-                .contains("Mcolumn \"secret\" of relation \"alias_view\" does not exist\0")
+                .contains("Mcolumn \"secret\" of relation \"alias_view\" does not exist\0"),
+            "{}",
+            String::from_utf8_lossy(&hidden)
         );
         assert_eq!(
             error_sqlstates(&session.execute(

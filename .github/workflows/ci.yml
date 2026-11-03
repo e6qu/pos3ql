@@ -96,10 +96,27 @@ jobs:
       NATIVE_TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - uses: actions/download-artifact@v8
         with:
           name: native-tests-${{ matrix.target }}-${{ github.sha }}
           path: ${{ runner.temp }}/native-test-artifact
+
+      - name: Restore the configured test stack
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          configuration = tomllib.loads(Path(".cargo/config.toml").read_text())
+          stack = configuration["env"]["RUST_MIN_STACK"]["value"]
+          if not isinstance(stack, str) or not stack.isdecimal() or int(stack) <= 0:
+              raise SystemExit("RUST_MIN_STACK must be an explicit positive byte count")
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+              environment.write(f"RUST_MIN_STACK={stack}\n")
+          PY
 
       - name: Function and HTTP fixture contracts
         shell: bash

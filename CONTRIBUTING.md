@@ -241,7 +241,9 @@ Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
 test jobs run that build's library test executable with the full native filter
 lists; each build, test and lint job retains its 15-minute ceiling. The artifact
 helper checks the source revision, target, byte length and SHA256 before running
-the executable. This keeps a slow cold build from consuming the tests' time
+the executable. Test workers also restore `RUST_MIN_STACK` from the checked-in
+Cargo configuration, which direct executable launches do not read. This keeps
+a slow cold build from consuming the tests' time
 budget without rebuilding or dropping cases.
 
 Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference

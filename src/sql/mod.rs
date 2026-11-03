@@ -13940,45 +13940,43 @@ impl Engine {
         let contract = match pending.target {
             query::PendingRoutineTarget::Stored(contract) => contract,
             query::PendingRoutineTarget::Intrinsic(oid) => {
-                let arguments =
-                    match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
-                        Ok(arguments) => arguments,
-                        Err(_) => return Ok(Err(eval::arena_full())),
-                    };
-                for (index, argument) in arguments.iter_mut().enumerate() {
-                    *argument =
-                        match exec::decode_projected_col_record(pending.arguments, index, arena) {
-                            Ok(value) => value,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                }
-                let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
-                let statistics_intrinsic = statistics::is_intrinsic(oid);
-                if !logical_replication_intrinsic
-                    && !statistics_intrinsic
-                    && large_object::is_mutating(oid)
-                {
-                    self.storage.assign_transaction_identity(txn.txid);
-                }
-                let value = match if statistics_intrinsic {
-                    statistics::execute(oid, &arguments[..pending.argument_count], self, txn)
-                } else if logical_replication_intrinsic {
-                    logical_replication::execute(
-                        oid,
-                        &arguments[..pending.argument_count],
-                        self,
-                        txn,
-                        arena,
-                    )
-                } else {
-                    large_object::execute(
-                        oid,
-                        &arguments[..pending.argument_count],
-                        &mut self.storage,
-                        txn,
-                        arena,
-                    )
-                } {
+                let encoded = arena.with_remaining_bytes(|scratch| {
+                    let arguments = scratch
+                        .alloc_slice_with(pending.argument_count, |_| Datum::Null)
+                        .map_err(|_| eval::arena_full())?;
+                    for (index, argument) in arguments.iter_mut().enumerate() {
+                        *argument =
+                            exec::decode_projected_col_record(pending.arguments, index, scratch)?;
+                    }
+                    let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
+                    let statistics_intrinsic = statistics::is_intrinsic(oid);
+                    if !logical_replication_intrinsic
+                        && !statistics_intrinsic
+                        && large_object::is_mutating(oid)
+                    {
+                        self.storage.assign_transaction_identity(txn.txid);
+                    }
+                    let value = if statistics_intrinsic {
+                        statistics::execute(oid, arguments, self, txn)
+                    } else if logical_replication_intrinsic {
+                        logical_replication::execute(oid, arguments, self, txn, scratch)
+                    } else {
+                        large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
+                    }?;
+                    exec::encode_projected_pub(&[value], scratch)
+                });
+                let encoded = match encoded {
+                    Ok(Ok(encoded)) => encoded,
+                    Ok(Err(error)) => return Ok(Err(error)),
+                    Err(error) => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "routine body exceeds statement memory: {}",
+                            error
+                        )));
+                    }
+                };
+                let value = match exec::decode_projected_col_record(encoded, 0, arena) {
                     Ok(value) => value,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -14010,32 +14008,41 @@ impl Engine {
             let _ = statistics::finish_function_timing(timed);
             return Ok(Err(error));
         }
-        if routine.kind.is_set_returning() {
-            let executed = self.execute_pending_table_routine(
-                pending, slot, &routine, arena, txn, sqlprep, cursors, guc, responder,
-            );
-            let succeeded = matches!(&executed, Ok(Ok(_)));
-            if let Some((total, own)) = statistics::finish_function_timing(timed)
-                && succeeded
-                && let Err(error) = self.storage.record_function_call(
-                    txn.txid,
-                    crate::storage::routine_oid(&routine),
-                    total,
-                    own,
-                )
-            {
-                return Ok(Err(error));
-            }
-            let rows = match executed? {
-                Ok(rows) => rows,
-                Err(error) => return Ok(Err(error)),
-            };
-            return Ok(invocations.complete_rows(rows));
+        enum BodyError {
+            Sql(SqlError),
+            Wire(WireFull),
         }
-        let executed = self.execute_pending_scalar_routine(
-            pending, slot, &routine, arena, txn, sqlprep, cursors, guc, responder,
-        );
-        let succeeded = matches!(&executed, Ok(Ok(_)));
+        let set_returning = routine.kind.is_set_returning();
+        let executed = arena.with_remaining_bytes(|scratch| {
+            // Only encoded results survive the body, for owning statement
+            // arenas and borrowed row arenas alike.
+            if set_returning {
+                let rows = self
+                    .execute_pending_table_routine(
+                        pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                    )
+                    .map_err(BodyError::Wire)?
+                    .map_err(BodyError::Sql)?;
+                exec::pack_projected_rows(rows, scratch).map_err(BodyError::Sql)
+            } else {
+                let value = self
+                    .execute_pending_scalar_routine(
+                        pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                    )
+                    .map_err(BodyError::Wire)?
+                    .map_err(BodyError::Sql)?;
+                exec::encode_projected_pub(&[value], scratch).map_err(BodyError::Sql)
+            }
+        });
+        let executed = match executed {
+            Ok(executed) => executed,
+            Err(error) => Err(BodyError::Sql(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine body exceeds statement memory: {}",
+                error
+            ))),
+        };
+        let succeeded = executed.is_ok();
         if let Some((total, own)) = statistics::finish_function_timing(timed)
             && succeeded
             && let Err(error) = self.storage.record_function_call(
@@ -14047,7 +14054,19 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let value = match executed? {
+        let encoded = match executed {
+            Ok(encoded) => encoded,
+            Err(BodyError::Sql(error)) => return Ok(Err(error)),
+            Err(BodyError::Wire(error)) => return Err(error),
+        };
+        if set_returning {
+            let rows = match exec::unpack_projected_rows(encoded, arena) {
+                Ok(rows) => rows,
+                Err(error) => return Ok(Err(error)),
+            };
+            return Ok(invocations.complete_rows(rows));
+        }
+        let value = match exec::decode_projected_col_record(encoded, 0, arena) {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };

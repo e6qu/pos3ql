@@ -47,6 +47,8 @@ arrays and assignments, including typed NULL values. Array children convert in
 order; `INSERT ... SELECT` converts each complete selected row before the next row.
 Temporary schema planning releases its scratch space after each visit, so
 repeated function handoffs do not retain another schema copy.
+Completed calls release body workspaces while preserving typed results and
+command effects, including nested calls and table-function results.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

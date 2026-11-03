@@ -307,7 +307,7 @@ fn predicate_column(
                 let Expr::Column { qualifier, name } = column else {
                     return None;
                 };
-                if !constant.is_constant() || constant.contains_call() {
+                if !constant.is_constant(false) || constant.contains_call() {
                     return None;
                 }
                 match scope.find_column(*qualifier, name).ok()? {
@@ -370,9 +370,9 @@ fn expression_statistics_selectivity(
     else {
         return None;
     };
-    let candidate = if right.is_constant() && !right.contains_call() {
+    let candidate = if right.is_constant(false) && !right.contains_call() {
         *left
-    } else if left.is_constant() && !left.contains_call() {
+    } else if left.is_constant(false) && !left.contains_call() {
         *right
     } else {
         return None;
@@ -429,7 +429,7 @@ fn extended_statistics_selectivity<'a>(
             let Expr::Column { qualifier, name } = candidate else {
                 return None;
             };
-            if !other.is_constant() || other.contains_call() {
+            if !other.is_constant(false) || other.contains_call() {
                 return None;
             }
             match scope.find_column(*qualifier, name).ok()? {
@@ -663,7 +663,7 @@ fn predicate_selectivity<'a>(
             operand,
             list,
             negated: false,
-        } if list.iter().all(|item| item.is_constant()) => {
+        } if list.iter().all(|item| item.is_constant(false)) => {
             let Expr::Column { qualifier, name } = **operand else {
                 return 1.0;
             };

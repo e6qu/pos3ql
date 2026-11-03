@@ -756,8 +756,8 @@ pub(crate) use describe::{describe_data_modification_columns, describe_returning
 mod projected;
 pub(crate) use projected::{
     compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, projected_row_len,
-    projected_row_len_by, projected_row_width,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
+    projected_row_len_by, projected_row_width, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,

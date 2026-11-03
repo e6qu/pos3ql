@@ -1,6 +1,131 @@
 use super::*;
 
 #[test]
+fn completed_mutable_routines_reclaim_body_memory_and_retain_typed_effects() {
+    let mut config = test_config("completed-routine-body-memory");
+    config.row_overlay_slots = 1024;
+    config.txn_rows = 512;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 1 << 20);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE body_calls CACHE 1; \
+         CREATE TABLE body_audit(input integer,call_number bigint); \
+         CREATE TYPE body_result AS(input integer,call_number bigint,width integer); \
+         CREATE FUNCTION body_record(input_value integer) RETURNS body_result \
+           LANGUAGE plpgsql AS $$ \
+           DECLARE payload text; assigned_call bigint; \
+           BEGIN \
+             assigned_call:=nextval('body_calls'); \
+             INSERT INTO body_audit VALUES(input_value,assigned_call); \
+             payload:=repeat('x',CASE WHEN input_value<0 THEN 2097152 \
+                                    WHEN input_value>=1000 THEN 655360 ELSE 65536 END); \
+             RETURN ROW(input_value,assigned_call,length(payload))::body_result; \
+           END $$",
+        true,
+    );
+    // Two MiB of completed scratch must fit one MiB of statement storage.
+    let output = session.success(
+        &mut engine,
+        "SELECT (result).input,(result).call_number,(result).width \
+         FROM(SELECT body_record(value) AS result FROM generate_series(1,32) AS source(value)) AS result_rows \
+         ORDER BY (result).input",
+        true,
+    );
+    let expected: Vec<_> = (1..=32)
+        .map(|value| format!("{value}|{value}|65536"))
+        .collect();
+    assert_eq!(data_rows(&output), expected);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*),min(input),max(input),sum(call_number) FROM body_audit; \
+             SELECT currval('body_calls')",
+            true,
+        )),
+        ["32|1|32|528", "32"]
+    );
+    let exhausted = session.execute(&mut engine, "SELECT body_record(-1)", true);
+    assert_eq!(error_sqlstates(&exhausted), ["54000"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM body_audit; SELECT currval('body_calls'); \
+             SELECT (body_record(33)).input; SELECT currval('body_calls')",
+            true,
+        )),
+        ["32", "33", "33", "34"]
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE body_source(input integer); \
+         INSERT INTO body_source SELECT value FROM generate_series(1,256) AS source(value); \
+         CREATE FUNCTION body_nested(input_value integer) RETURNS body_result LANGUAGE plpgsql AS $$ \
+           DECLARE held text; result body_result; \
+           BEGIN \
+             held:=repeat('a',131072); result:=body_record(input_value); \
+             held:=repeat('b',393216); RETURN result; \
+           END $$; \
+         CREATE FUNCTION body_series(input_value integer) RETURNS SETOF body_result LANGUAGE plpgsql AS $$ \
+           DECLARE payload text; \
+           BEGIN \
+             payload:=repeat('s',65536); \
+             RETURN NEXT ROW(input_value,nextval('body_calls'),length(payload))::body_result; \
+             RETURN; \
+           END $$",
+        true,
+    );
+    // A physical source selects the retained row-frame path, not whole-query replay.
+    let output = session.success(
+        &mut engine,
+        "SELECT body_record(input) FROM body_source",
+        true,
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 256);
+    let mut inputs = Vec::new();
+    let mut calls = Vec::new();
+    for row in rows {
+        let fields: Vec<_> = row.trim_matches(['(', ')']).split(',').collect();
+        assert_eq!(fields.len(), 3);
+        inputs.push(fields[0].parse::<i32>().unwrap());
+        calls.push(fields[1].parse::<i32>().unwrap());
+        assert_eq!(fields[2], "65536");
+    }
+    inputs.sort_unstable();
+    calls.sort_unstable();
+    assert_eq!(inputs, (1..=256).collect::<Vec<_>>());
+    assert_eq!(calls, (35..=290).collect::<Vec<_>>());
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT body_record(1001),body_record(1002) FROM body_source LIMIT 1; \
+             SELECT body_nested(1003) FROM body_source LIMIT 1",
+            true,
+        )),
+        ["(1001,291,655360)|(1002,292,655360)", "(1003,293,655360)"]
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT body_series(value) FROM generate_series(1,32) AS source(value)",
+        true,
+    );
+    let expected: Vec<_> = (1..=32)
+        .map(|value| format!("({value},{},65536)", value + 293))
+        .collect();
+    assert_eq!(data_rows(&output), expected);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM body_audit; SELECT currval('body_calls')",
+            true,
+        )),
+        ["292", "325"]
+    );
+}
+
+#[test]
 fn projection_type_visitors_release_schema_scratch_on_success_and_error() {
     let config = test_config("projection-schema-scratch");
     let mut budget = test_engine_budget(&config, 1 << 29);

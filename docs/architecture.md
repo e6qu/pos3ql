@@ -125,6 +125,13 @@ a later bound call. Each active row borrows the unused region of its existing
 statement arena; completed output is copied before that region is released.
 Nested function execution can borrow a further region without growing memory.
 Row ownership and scan positions survive outside those temporary regions.
+Completed function bodies also release their parsed statements, local values
+and temporary plans. Only encoded results move into the caller's arena; this
+applies to scalar functions, table functions and engine-owned calls, including
+nested calls within a row. For example, a function can create and discard 64 KiB
+of text for each of 1,100 input rows without retaining all that text. Live outer
+locals and results still need space, and a single oversized call fails with
+`54000` rather than growing memory.
 Issued sequence numbers keep command-lived records in the owning arena. For
 example, a number issued before a lock wait must not be issued again when that
 command retries. Temporary row regions and the command's retained records share

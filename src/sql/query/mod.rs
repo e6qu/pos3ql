@@ -64,7 +64,10 @@ pub(crate) use scan::{
 };
 
 mod scope;
-pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};
+pub(crate) use cte::{
+    bind_dml_materialized_relations, bind_materialized_expression, bind_materialized_relations,
+    bind_materialized_statement,
+};
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;

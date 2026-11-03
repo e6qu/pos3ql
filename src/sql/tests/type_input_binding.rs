@@ -50,6 +50,70 @@ fn procedural_queries_finish_nested_calls_before_publishing_rows_or_locals() {
     }
 }
 
+#[test]
+fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_database() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("type-cascade-database-scope-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        engine
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        session.success(
+            &mut engine,
+            "CREATE TYPE cascade_choice AS ENUM('a'); \
+             CREATE FUNCTION cascade_value() RETURNS cascade_choice LANGUAGE sql \
+               BEGIN ATOMIC SELECT 'a'::cascade_choice; END; \
+             CREATE VIEW cascade_view AS SELECT cascade_value() AS value; \
+             CREATE MATERIALIZED VIEW cascade_matview AS SELECT cascade_value() AS value",
+            true,
+        );
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        session.success(
+            &mut engine,
+            "CREATE DATABASE cascade_copy TEMPLATE template1",
+            true,
+        );
+        let copied = engine
+            .storage
+            .database_named("cascade_copy", 0)
+            .unwrap()
+            .1
+            .oid;
+        engine
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        session.success(&mut engine, "DROP TYPE cascade_choice CASCADE", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_proc WHERE proname='cascade_value'; \
+             SELECT count(*) FROM pg_class WHERE relname IN ('cascade_view','cascade_matview')",
+                true
+            )),
+            ["0", "0"]
+        );
+        engine.select_database(copied).unwrap();
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT cascade_value()::text; SELECT value::text FROM cascade_view; \
+             SELECT value::text FROM cascade_matview",
+                true
+            )),
+            ["a", "a", "a"],
+            "{mode:?}"
+        );
+    }
+}
+
 // PostgreSQL 18.6 SQL SHA256:
 // a6d12a932def651411044e1d08dbd2bb3d67c958d9c9ada897433d434a310f1a.
 #[test]

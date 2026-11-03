@@ -1048,20 +1048,17 @@ fn collect_dml_routine_calls_with_output<'a>(
         transition: context.transition,
         arena,
     };
-    let mut needs_scope = false;
+    let mut unresolved = None;
     visit_routine_expression(
         expression,
         storage,
         txid,
         &resolver,
         dependencies,
-        &mut needs_scope,
+        &mut unresolved,
     )?;
-    if needs_scope {
-        return Err(sql_err!(
-            sqlstate::INVALID_FUNCTION_DEFINITION,
-            "routine call in a data-modifying SQL body needs an unresolved column type"
-        ));
+    if let Some(error) = unresolved {
+        return Err(error);
     }
     Ok(())
 }
@@ -2673,15 +2670,12 @@ fn collect_routine_dependencies(
         returning_output: None,
         arena,
     };
-    let needs_scope =
+    let unresolved =
         collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
-    if needs_scope {
-        let from = select.from.as_ref().ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "stored routine dependency did not resolve at its typed boundary"
-            )
-        })?;
+    if let Some(error) = unresolved {
+        let Some(from) = select.from.as_ref() else {
+            return Err(error);
+        };
         let mark = arena.mark();
         let result = (|| {
             let bound = context.bound_from(from, storage, txid, ctes, arena)?;
@@ -2695,17 +2689,14 @@ fn collect_routine_dependencies(
                 returning_output: None,
                 arena,
             };
-            if collect_routine_dependencies_with_resolver(
+            if let Some(error) = collect_routine_dependencies_with_resolver(
                 select,
                 storage,
                 txid,
                 dependencies,
                 &resolver,
             )? {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "stored routine dependency remained unresolved after scope binding"
-                ));
+                return Err(error);
             }
             Ok(())
         })();
@@ -2945,7 +2936,7 @@ fn record_routine_call(
     txid: u32,
     resolver: &DependencyTypes<'_, '_, '_>,
     dependencies: &mut StoredQueryDependencies,
-    needs_scope: &mut bool,
+    unresolved: &mut Option<SqlError>,
 ) -> Result<(), SqlError> {
     if kind == crate::sql::ast::CallKind::SqlSyntax {
         return Ok(());
@@ -2969,7 +2960,9 @@ fn record_routine_call(
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                *needs_scope = true;
+                if unresolved.is_none() {
+                    *unresolved = Some(error);
+                }
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -3080,7 +3073,7 @@ fn record_operator_call(
     txid: u32,
     resolver: &DependencyTypes<'_, '_, '_>,
     dependencies: &mut StoredQueryDependencies,
-    needs_scope: &mut bool,
+    unresolved: &mut Option<SqlError>,
 ) -> Result<(), SqlError> {
     let crate::sql::ast::QualName { schema, name } = identity;
     let has_catalog_candidate = storage.operators_visible_to(txid).any(|(_, operator)| {
@@ -3115,7 +3108,9 @@ fn record_operator_call(
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                *needs_scope = true;
+                if unresolved.is_none() {
+                    *unresolved = Some(error);
+                }
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -3171,7 +3166,7 @@ fn visit_routine_expression(
     txid: u32,
     resolver: &DependencyTypes<'_, '_, '_>,
     dependencies: &mut StoredQueryDependencies,
-    needs_scope: &mut bool,
+    unresolved: &mut Option<SqlError>,
 ) -> Result<(), SqlError> {
     if let Expr::Cast {
         operand,
@@ -3211,7 +3206,9 @@ fn visit_routine_expression(
                         sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                     ) =>
                 {
-                    *needs_scope = true
+                    if unresolved.is_none() {
+                        *unresolved = Some(error);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -3224,7 +3221,9 @@ fn visit_routine_expression(
                         sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                     ) =>
                 {
-                    *needs_scope = true;
+                    if unresolved.is_none() {
+                        *unresolved = Some(error);
+                    }
                     None
                 }
                 Err(error) => return Err(error),
@@ -3267,7 +3266,7 @@ fn visit_routine_expression(
                     txid,
                     resolver,
                     dependencies,
-                    needs_scope,
+                    unresolved,
                 )?;
             }
         } else {
@@ -3281,7 +3280,7 @@ fn visit_routine_expression(
                 txid,
                 resolver,
                 dependencies,
-                needs_scope,
+                unresolved,
             )?;
         }
     }
@@ -3300,11 +3299,11 @@ fn visit_routine_expression(
             txid,
             resolver,
             dependencies,
-            needs_scope,
+            unresolved,
         )?;
     }
     super::walk_children(expression, &mut |child| {
-        visit_routine_expression(child, storage, txid, resolver, dependencies, needs_scope)
+        visit_routine_expression(child, storage, txid, resolver, dependencies, unresolved)
     })
 }
 
@@ -3314,8 +3313,8 @@ fn collect_routine_dependencies_with_resolver(
     txid: u32,
     dependencies: &mut StoredQueryDependencies,
     resolver: &DependencyTypes<'_, '_, '_>,
-) -> Result<bool, SqlError> {
-    let mut needs_scope = false;
+) -> Result<Option<SqlError>, SqlError> {
+    let mut unresolved = None;
 
     fn record_table_call(
         table: &TableRef<'_>,
@@ -3324,7 +3323,7 @@ fn collect_routine_dependencies_with_resolver(
         txid: u32,
         resolver: &DependencyTypes<'_, '_, '_>,
         dependencies: &mut StoredQueryDependencies,
-        needs_scope: &mut bool,
+        unresolved: &mut Option<SqlError>,
     ) -> Result<(), SqlError> {
         use core::fmt::Write as _;
         let mut qualified = crate::util::StackStr::<128>::new();
@@ -3349,7 +3348,7 @@ fn collect_routine_dependencies_with_resolver(
             txid,
             resolver,
             dependencies,
-            needs_scope,
+            unresolved,
         )
     }
 
@@ -3362,7 +3361,7 @@ fn collect_routine_dependencies_with_resolver(
                     txid,
                     resolver,
                     dependencies,
-                    &mut needs_scope,
+                    &mut unresolved,
                 )?
             }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
@@ -3385,7 +3384,7 @@ fn collect_routine_dependencies_with_resolver(
             txid,
             resolver,
             dependencies,
-            &mut needs_scope,
+            &mut unresolved,
         )?;
     }
     if let Some(from) = select.from {
@@ -3397,7 +3396,7 @@ fn collect_routine_dependencies_with_resolver(
                     txid,
                     resolver,
                     dependencies,
-                    &mut needs_scope,
+                    &mut unresolved,
                 )?;
                 if let Some(repeatable) = sample.repeatable {
                     visit_routine_expression(
@@ -3406,7 +3405,7 @@ fn collect_routine_dependencies_with_resolver(
                         txid,
                         resolver,
                         dependencies,
-                        &mut needs_scope,
+                        &mut unresolved,
                     )?;
                 }
             }
@@ -3418,7 +3417,7 @@ fn collect_routine_dependencies_with_resolver(
                     txid,
                     resolver,
                     dependencies,
-                    &mut needs_scope,
+                    &mut unresolved,
                 )?;
                 for argument in args {
                     visit_routine_expression(
@@ -3427,7 +3426,7 @@ fn collect_routine_dependencies_with_resolver(
                         txid,
                         resolver,
                         dependencies,
-                        &mut needs_scope,
+                        &mut unresolved,
                     )?;
                 }
             }
@@ -3441,7 +3440,7 @@ fn collect_routine_dependencies_with_resolver(
                             txid,
                             resolver,
                             dependencies,
-                            &mut needs_scope,
+                            &mut unresolved,
                         )?;
                         for argument in args {
                             visit_routine_expression(
@@ -3450,7 +3449,7 @@ fn collect_routine_dependencies_with_resolver(
                                 txid,
                                 resolver,
                                 dependencies,
-                                &mut needs_scope,
+                                &mut unresolved,
                             )?;
                         }
                     }
@@ -3465,12 +3464,12 @@ fn collect_routine_dependencies_with_resolver(
                     txid,
                     resolver,
                     dependencies,
-                    &mut needs_scope,
+                    &mut unresolved,
                 )?;
             }
         }
     }
-    Ok(needs_scope)
+    Ok(unresolved)
 }
 
 #[derive(Clone, Copy)]

@@ -201,6 +201,9 @@ fn retained_scalar_calls(
     expression: &Expr<'_>,
     columns: &CatalogScopeCols<'_, '_, '_, '_>,
 ) -> Result<bool, SqlError> {
+    if super::super::eval::is_sql_syntax_call(expression) && expression.is_aggregate_use() {
+        return Ok(false);
+    }
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::Routine,
         name,

@@ -597,6 +597,7 @@ fn binding_transaction_settings_does_not_take_a_data_snapshot() {
         message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
         message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
         assert!(!conn.txn.snapshot_taken());
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"P\0", false);
         parse_command(&mut conn, &mut engine, "SELECT 1");
         assert!(conn.txn.snapshot_taken());
         bind_command(
@@ -625,6 +626,9 @@ fn binding_transaction_settings_does_not_take_a_data_snapshot() {
         assert!(conn.txn.snapshot_taken());
         message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
         message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"P\0", false);
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+        assert!(conn.txn.snapshot_taken());
         bind_command(
             &mut conn,
             &mut engine,

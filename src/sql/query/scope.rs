@@ -1365,7 +1365,11 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let subqueries = super::ProceduralSubqueries { storage, txid };
         let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            subquery_executor: Some(&subqueries),
             sequences,
             ..crate::sql::eval::NO_HOOKS
         };

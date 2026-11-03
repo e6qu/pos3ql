@@ -166,6 +166,11 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
         );
         session.success(
             &mut engine,
+            "DROP FUNCTION body_collation_pair(text,text)",
+            true,
+        );
+        session.success(
+            &mut engine,
             "CREATE FUNCTION body_collation_echo(first_input text DEFAULT ('a' COLLATE \"POSIX\"), \
                second_input text DEFAULT ('b' COLLATE \"POSIX\")) RETURNS text \
                LANGUAGE sql SET search_path=public AS 'SELECT first_input'",

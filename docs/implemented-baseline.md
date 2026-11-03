@@ -347,6 +347,12 @@ generated-column calculation, before AFTER row triggers. An AFTER row trigger
 cannot rewrite those saved transition values. Each connection and subscription
 worker has `copy_transition_bytes` plus `txn_rows` records reserved at startup.
 Exhaustion returns `54000` and aborts COPY; cleanup permits a smaller retry.
+If a statement trigger declares `REFERENCING NEW TABLE AS inserted_rows`, its
+queries can read `inserted_rows` while preparing and executing the trigger.
+For example, `INSERT INTO audit SELECT id FROM inserted_rows` sees that COPY
+statement's saved values. Discovering those columns' types does not run the
+trigger's queries or functions. A local `WITH inserted_rows AS (...)` uses its
+own rows under the ordinary SQL name rules.
 
 `COPY TO` retains the selected schema and row sources and releases them on
 completion or error. Table form reads only that relation; use query form to

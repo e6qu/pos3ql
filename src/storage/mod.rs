@@ -19699,7 +19699,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingOwnership>, SqlError> {
         self.role_reference_ready(usize::from(owner), txid)?;
-        if self.current_role_slot(txid) != Some(usize::from(owner)) {
+        if self.current_role_slot(txid).is_none() {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "current role is not present in the role catalog"

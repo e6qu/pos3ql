@@ -109,6 +109,7 @@ pub(super) fn parse<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
     row: &dyn super::eval::ColumnLookup<'a>,
+    relations: Option<&'a [(&'a str, &'a super::ast::MaterializedCte<'a>)]>,
     arena: &'a Arena,
     mut dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
 ) -> Result<super::parser::Parser<'a>, SqlError> {
@@ -125,6 +126,12 @@ pub(super) fn parse<'a>(
             let expression = parser
                 .expression(0)
                 .map_err(|error| super::parse_error_to_sql(&error))?;
+            let expression = match relations {
+                Some(relations) => super::query::bind_materialized_expression(
+                    expression, relations, storage, txid, arena,
+                )?,
+                None => expression,
+            };
             super::query::capture_contextual_expression_type_inputs(
                 &parser, expression, storage, txid, arena, &columns, row,
             )?;
@@ -147,6 +154,12 @@ pub(super) fn parse<'a>(
                 let statement = arena
                     .alloc(statement)
                     .map_err(|_| super::query::arena_full_pub())?;
+                let statement = match relations {
+                    Some(relations) => super::query::bind_materialized_statement(
+                        statement, relations, storage, txid, arena,
+                    )?,
+                    None => statement,
+                };
                 super::query::capture_procedural_statement_type_inputs(
                     &parser, statement, storage, txid, arena, row,
                 )?;
@@ -171,11 +184,12 @@ pub(super) fn reject_atomic<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
     row: &dyn super::eval::ColumnLookup<'a>,
+    relations: Option<&'a [(&'a str, &'a super::ast::MaterializedCte<'a>)]>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let parser = parse(site, storage, txid, row, arena, None)?;
+        let parser = parse(site, storage, txid, row, relations, arena, None)?;
         if parser.type_input_candidates().iter().any(|candidate| {
             super::type_inputs::candidate_target_oid(storage, txid, candidate).is_some()
         }) {

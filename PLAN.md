@@ -102,7 +102,8 @@ the same object kind; an unchanged owner still produces the expected DDL event.
 Reassigning ownership must exclude the destination from the objects still to
 change. Repeated same-owner commands must finish without consuming catalog
 versions; foreign wrappers and servers must preserve ownership through rollback
-and recovery.
+and recovery. Dropping a type with CASCADE must remove dependents only in its
+database, preserving routines and views copied into another database.
 Data-change trigger statements that need checked domain-array input currently
 raise `0A000` before running the constraint; event triggers have an engine-owned
 execution context. Finish a retained trigger continuation that preserves prior
@@ -110,6 +111,8 @@ row changes, local variables, branch position and transition rows while input
 preparation waits. Verify that constraints see the preceding transaction and
 statement changes, run once, and do not fire in unreached branches. Do not route
 these checks through a retry that first undoes the rows they must observe.
+Trigger query preparation must see its invocation's transition rows without
+executing queries while discovering their types.
 Keep simple table, constant VALUES and one-row cursor expressions deferred until fetching,
 including scalar calls, then extend those positions to the remaining cursor
 plans that currently execute when opened. Ordinary PL statements without any

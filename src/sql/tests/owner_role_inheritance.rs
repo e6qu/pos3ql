@@ -80,7 +80,8 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(
         &mut engine,
-        "CREATE ROLE owner_event_role; GRANT CREATE ON SCHEMA public TO owner_event_role; \
+        "CREATE ROLE owner_event_role; CREATE ROLE owner_event_wrapper_role SUPERUSER; \
+         GRANT CREATE ON SCHEMA public TO owner_event_role; \
          CREATE TABLE owner_event_target(value integer); \
          CREATE FOREIGN DATA WRAPPER owner_event_wrapper; \
          CREATE SERVER owner_event_server FOREIGN DATA WRAPPER owner_event_wrapper; \
@@ -120,11 +121,13 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
     ] {
         session.success(&mut engine, statement, true);
     }
-    session.success(
-        &mut engine,
+    for statement in [
         "ALTER FOREIGN DATA WRAPPER owner_event_wrapper OWNER TO postgres",
-        true,
-    );
+        "ALTER FOREIGN DATA WRAPPER owner_event_wrapper OWNER TO owner_event_wrapper_role",
+        "ALTER FOREIGN DATA WRAPPER owner_event_wrapper OWNER TO owner_event_wrapper_role",
+    ] {
+        session.success(&mut engine, statement, true);
+    }
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -132,6 +135,8 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
             true
         )),
         [
+            "ALTER FOREIGN DATA WRAPPER|foreign-data wrapper|owner_event_wrapper",
+            "ALTER FOREIGN DATA WRAPPER|foreign-data wrapper|owner_event_wrapper",
             "ALTER FOREIGN DATA WRAPPER|foreign-data wrapper|owner_event_wrapper",
             "ALTER SERVER|server|owner_event_server",
             "ALTER SERVER|server|owner_event_server",
@@ -149,7 +154,27 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
              SELECT classid='pg_foreign_server'::regclass FROM pg_get_object_address('server',ARRAY['owner_event_server'],ARRAY[]::text[])", true)),
         ["foreign-data wrapper|owner_event_wrapper", "server|owner_event_server", "t", "t"]
     );
+    let owners = "SELECT pg_get_userbyid(fdwowner) FROM pg_foreign_data_wrapper WHERE fdwname='owner_event_wrapper'; \
+                  SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='owner_event_server'";
+    assert_eq!(
+        data_rows(&session.success(&mut engine, owners, true)),
+        ["owner_event_wrapper_role", "owner_event_role"]
+    );
     session.success(&mut engine, "ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(&mut engine, owners, true)),
+        ["postgres", "postgres"]
+    );
+    session.success(&mut engine, "SET ROLE owner_event_role", true);
+    assert_eq!(
+        error_sqlstates(&session.execute(
+            &mut engine,
+            "ALTER FOREIGN DATA WRAPPER owner_event_wrapper OWNER TO owner_event_wrapper_role",
+            true
+        )),
+        [sqlstate::INSUFFICIENT_PRIVILEGE]
+    );
+    session.success(&mut engine, "RESET ROLE", true);
 }
 
 #[test]

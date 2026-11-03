@@ -3728,6 +3728,7 @@ fn row_trigger_when_passes<'a, Definition0: crate::storage::DefinitionBacking>(
             old,
             new,
         },
+        None,
         context.arena,
     )?;
     match eval_trigger_expression(
@@ -3817,6 +3818,10 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     let invocation = invocation.with_input_sites(program.input_sites);
     let transition_relations =
         trigger_transition_relations(trigger, definition, transition_rows, context.arena)?;
+    let invocation = TriggerInvocation {
+        materialized_relations: transition_relations,
+        ..invocation
+    };
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
@@ -13512,7 +13517,9 @@ pub(crate) fn drop_schema(
             {
                 let routine = storage.routine_for(routine_slot, txn.txid);
                 if is_dependent
-                    && routine.visible_to(txn.txid)
+                    && storage
+                        .routine_identity_for(routine_slot, txn.txid)
+                        .is_some()
                     && !in_listed(storage, routine.schema_for(txn.txid).as_str())
                     && let Err(error) = push(SchemaObject::Routine(routine_slot), &mut n_objects)
                 {
@@ -14419,7 +14426,7 @@ pub(crate) fn drop_schema(
                 }
             }
             SchemaObject::Routine(routine) => {
-                if storage.routine(*routine).visible_to(txn.txid) {
+                if storage.routine_identity_for(*routine, txn.txid).is_some() {
                     let routine_oid =
                         crate::storage::routine_oid(&storage.routine_for(*routine, txn.txid));
                     if let Err(error) = cascade_routine_cast_operator_dependents(
@@ -16834,6 +16841,7 @@ struct TriggerInvocation<'a> {
     input_owner: super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
+    materialized_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     nargs: i32,
     when: &'static str,
     level: &'static str,
@@ -17006,6 +17014,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            materialized_relations: None,
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
             when: match trigger.timing {
@@ -17039,6 +17048,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            materialized_relations: None,
             nargs: 0,
             when: "",
             level: "",
@@ -17075,6 +17085,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
+            materialized_relations: None,
             nargs: 0,
             when: "",
             level: "",
@@ -17112,6 +17123,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
+            materialized_relations: None,
             nargs: i32::try_from(routine.arguments().len())
                 .expect("routine argument capacity fits int4"),
             when: "",
@@ -17150,6 +17162,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            materialized_relations: None,
             nargs: 0,
             when: "",
             level: "",
@@ -22701,9 +22714,20 @@ fn eval_procedural_expression<'a>(
                 context.storage(),
                 context.txn.txid,
                 row,
+                row.invocation.materialized_relations,
                 arena,
             )?;
         }
+        let expression = match row.invocation.materialized_relations {
+            Some(relations) => super::query::bind_materialized_expression(
+                expression,
+                relations,
+                context.storage(),
+                context.txn.txid,
+                arena,
+            )?,
+            None => expression,
+        };
         return eval_trigger_expression(context, expression, row);
     };
     let txid = context.txn.txid;
@@ -22895,22 +22919,34 @@ fn bind_plpgsql_dynamic_query<'a>(
                 context.storage(),
                 context.txn.txid,
                 &NoColumns,
+                scope.invocation.materialized_relations,
                 context.arena,
             )?;
             None
         }
     };
     let inputs = prepared.map_or(&[][..], |prepared| prepared.bindings);
-    Ok(BoundPlpgsqlCommand {
-        owner: prepared.map_or(owner, |prepared| prepared.owner),
-        source: command,
-        statement: restore_plpgsql_statement(
-            command,
-            inputs,
+    let statement = restore_plpgsql_statement(
+        command,
+        inputs,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+    )?;
+    let statement = match scope.invocation.materialized_relations {
+        Some(relations) => super::query::bind_materialized_statement(
+            statement,
+            relations,
             context.storage(),
             context.txn.txid,
             context.arena,
         )?,
+        None => statement,
+    };
+    Ok(BoundPlpgsqlCommand {
+        owner: prepared.map_or(owner, |prepared| prepared.owner),
+        source: command,
+        statement,
         arguments: &*arguments,
         parameter_types,
         inputs,
@@ -23112,13 +23148,6 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     let input_source = plpgsql_command_source(query.source, context.arena)?;
     super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
-            super::query::validate_dml_assignment_casts(
-                query.statement,
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                None,
-            )?;
             let statement = match transition_relations {
                 Some(relations) => super::query::bind_dml_materialized_relations(
                     query.statement,
@@ -23130,6 +23159,13 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 )?,
                 None => query.statement,
             };
+            super::query::validate_dml_assignment_casts(
+                statement,
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+                None,
+            )?;
             match statement {
                 Stmt::Insert(statement) => {
                     let assignment_casts = prepare_dml_assignment_casts(
@@ -25716,23 +25752,35 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     with_bound_parameter_types(query.parameter_types, || {
-        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let width = match query.statement {
-            Stmt::Select(select) => super::query::describe_select(
-                select,
-                context.storage(),
-                context.txn.txid,
-                arena,
-                &mut columns,
-            )?,
-            Stmt::SetQuery(set_query) => super::query::describe_set_query(
-                context.storage(),
-                context.txn.txid,
-                set_query,
-                &mut columns,
-                arena,
-            )?,
-            _ => 0,
+        let mut fields = [("", 0); MAX_PROJ];
+        let width = {
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let width = match query.statement {
+                Stmt::Select(select) => super::query::describe_select(
+                    select,
+                    context.storage(),
+                    context.txn.txid,
+                    arena,
+                    &mut columns,
+                )?,
+                Stmt::SetQuery(set_query) => super::query::describe_set_query(
+                    context.storage(),
+                    context.txn.txid,
+                    set_query,
+                    &mut columns,
+                    arena,
+                )?,
+                _ => 0,
+            };
+            for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+                *field = (
+                    arena
+                        .alloc_str(column.name)
+                        .map_err(|_| super::query::arena_full_pub())?,
+                    column.type_oid,
+                );
+            }
+            width
         };
         if !record_target && width != 1 {
             return Err(sql_err!(
@@ -25749,22 +25797,20 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 ));
             }
             let value = if record_target {
-                let mut fields = [RecordField {
+                let mut row_fields = [RecordField {
                     name: "",
                     type_oid: 0,
                     value: Datum::Null,
                 }; MAX_PROJ];
                 for index in 0..width {
-                    fields[index] = RecordField {
-                        name: arena
-                            .alloc_str(columns[index].name)
-                            .map_err(|_| super::query::arena_full_pub())?,
-                        type_oid: columns[index].type_oid,
+                    row_fields[index] = RecordField {
+                        name: fields[index].0,
+                        type_oid: fields[index].1,
                         value: detached_trigger_datum(values[index], arena)?,
                     };
                 }
                 let fields = arena
-                    .alloc_slice_copy(&fields[..width])
+                    .alloc_slice_copy(&row_fields[..width])
                     .map_err(|_| super::query::arena_full_pub())?;
                 Datum::Record(&*fields)
             } else {
@@ -25922,6 +25968,7 @@ fn prepare_static_plpgsql_statement<'a>(
             context.storage(),
             context.txn.txid,
             row,
+            row.invocation.materialized_relations,
             context.arena,
         )?;
         return Ok((statement, None));
@@ -26838,19 +26885,29 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         locals[targets[0]].ctype,
                         ColType::Record | ColType::Composite(_)
                     );
-                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let arena = context.arena;
+                let mut fields = [("", 0); MAX_PROJ];
                 let record_width = if record_target {
-                    super::query::describe_select(
+                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let width = super::query::describe_select(
                         query,
                         context.storage(),
                         context.txn.txid,
-                        context.arena,
+                        arena,
                         &mut columns,
-                    )?
+                    )?;
+                    for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+                        *field = (
+                            arena
+                                .alloc_str(column.name)
+                                .map_err(|_| super::query::arena_full_pub())?,
+                            column.type_oid,
+                        );
+                    }
+                    width
                 } else {
                     0
                 };
-                let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
                 let (selected, row_count) =
@@ -26890,23 +26947,21 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 }
                                 if !found {
                                     if record_target {
-                                        let mut fields = [RecordField {
+                                        let mut row_fields = [RecordField {
                                             name: "",
                                             type_oid: 0,
                                             value: Datum::Null,
                                         };
                                             MAX_PROJ];
                                         for (index, value) in values.iter().copied().enumerate() {
-                                            fields[index] = RecordField {
-                                                name: arena
-                                                    .alloc_str(columns[index].name)
-                                                    .map_err(|_| super::query::arena_full_pub())?,
-                                                type_oid: columns[index].type_oid,
+                                            row_fields[index] = RecordField {
+                                                name: fields[index].0,
+                                                type_oid: fields[index].1,
                                                 value: detached_trigger_datum(value, arena)?,
                                             };
                                         }
                                         let fields = arena
-                                            .alloc_slice_copy(&fields[..values.len()])
+                                            .alloc_slice_copy(&row_fields[..values.len()])
                                             .map_err(|_| super::query::arena_full_pub())?;
                                         selected[0] = Datum::Record(&*fields);
                                     } else {
@@ -27636,6 +27691,24 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 statement: TriggerDml::Insert(statement),
                 ..
             } => execute_trigger_statement(|| {
+                let statement = match transition_relations {
+                    Some(relations) => Insert {
+                        select: statement
+                            .select
+                            .map(|select| {
+                                super::query::bind_materialized_relations(
+                                    select,
+                                    relations,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                )
+                            })
+                            .transpose()?,
+                        ..statement
+                    },
+                    None => statement,
+                };
                 let transition = TriggerTransition {
                     definition: crate::storage::RelationDefinition::from_definition(definition),
                     old,
@@ -27664,16 +27737,6 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 )?;
                 let prepared_select = match statement.select {
                     Some(select) => {
-                        let select = match transition_relations {
-                            Some(relations) => super::query::bind_materialized_relations(
-                                select,
-                                relations,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                            )?,
-                            None => select,
-                        };
                         let casts = prepare_insert_select_casts(
                             &statement,
                             select,
@@ -29713,6 +29776,10 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         let invocation = invocation.with_input_sites(program.input_sites);
         let transition_relations =
             trigger_transition_relations(&trigger, definition, rows, context.arena)?;
+        let invocation = TriggerInvocation {
+            materialized_relations: transition_relations,
+            ..invocation
+        };
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
         let mut status = TriggerExecutionStatus::default();
@@ -39250,7 +39317,7 @@ pub fn drop_routine(
         }
         let dependent_aggregate = (0..storage.routine_count()).find(|candidate| {
             *candidate != slot
-                && storage.routine(*candidate).visible_to(txn.txid)
+                && storage.routine_identity_for(*candidate, txn.txid).is_some()
                 && matches!(
                     storage.routine_for(*candidate, txn.txid).kind,
                     crate::storage::RoutineKind::Aggregate(aggregate)
@@ -39273,7 +39340,7 @@ pub fn drop_routine(
         loop {
             let dependent = (0..storage.routine_count()).find(|candidate| {
                 *candidate != slot
-                    && storage.routine(*candidate).visible_to(txn.txid)
+                    && storage.routine_identity_for(*candidate, txn.txid).is_some()
                     && matches!(
                         storage.routine_for(*candidate, txn.txid).kind,
                         crate::storage::RoutineKind::Aggregate(aggregate)
@@ -45184,16 +45251,18 @@ fn drop_type_dependent_routines(
         .enumerate()
         .take(storage.routine_count())
     {
+        if storage.routine_identity_for(slot, txn.txid).is_none() {
+            continue;
+        }
         let routine = storage.routine_for(slot, txn.txid);
-        *selected_slot = routine.visible_to(txn.txid)
-            && routine_uses_selected_type(
-                storage,
-                txn.txid,
-                routine,
-                selected_domains,
-                selected_enum,
-                selected_composite,
-            );
+        *selected_slot = routine_uses_selected_type(
+            storage,
+            txn.txid,
+            routine,
+            selected_domains,
+            selected_enum,
+            selected_composite,
+        );
     }
     if !selected.iter().any(|selected| *selected) {
         return Ok(());
@@ -45208,7 +45277,7 @@ fn drop_type_dependent_routines(
     loop {
         let mut changed = false;
         for slot in 0..storage.routine_count() {
-            if selected[slot] || !storage.routine(slot).visible_to(txn.txid) {
+            if selected[slot] || storage.routine_identity_for(slot, txn.txid).is_none() {
                 continue;
             }
             let crate::storage::RoutineKind::Aggregate(aggregate) =
@@ -45286,7 +45355,7 @@ fn drop_type_dependent_routines(
     }
 
     for slot in (0..storage.routine_count()).rev() {
-        if !selected[slot] || !storage.routine(slot).visible_to(txn.txid) {
+        if !selected[slot] || storage.routine_identity_for(slot, txn.txid).is_none() {
             continue;
         }
         let routine = storage.routine_for(slot, txn.txid);
@@ -47624,10 +47693,10 @@ fn stored_query_dependent_closure<'a>(
     loop {
         let mut changed = false;
         for slot in 0..storage.routine_count() {
-            let routine = storage.routine_for(slot, txid);
-            if routines[slot] || !routine.visible_to(txid) {
+            if routines[slot] || storage.routine_identity_for(slot, txid).is_none() {
                 continue;
             }
+            let routine = storage.routine_for(slot, txid);
             let dependency_hit = storage
                 .snapshot_routine_dependencies_for(slot, txid, arena)?
                 .entries()
@@ -47657,8 +47726,7 @@ fn stored_query_dependent_closure<'a>(
             }
         }
         for slot in 0..storage.view_count() {
-            let view = storage.view(slot);
-            if views[slot] || !view.visible_to(txid) {
+            if views[slot] || !storage.view_slot_visible_to(slot, txid) {
                 continue;
             }
             let hit = storage
@@ -47705,10 +47773,8 @@ fn stored_query_dependent_closure<'a>(
                 changed = true;
             }
         }
-        let mut slot = 0;
-        while slot < storage.matview_count() {
-            if matviews[slot] || !storage.matview(slot).visible_to(txid) {
-                slot += 1;
+        for (slot, _) in storage.matviews_visible_to(txid) {
+            if matviews[slot] {
                 continue;
             }
             let hit = storage
@@ -47728,7 +47794,6 @@ fn stored_query_dependent_closure<'a>(
                 matviews[slot] = true;
                 changed = true;
             }
-            slot += 1;
         }
         if !changed {
             break;
@@ -48989,7 +49054,7 @@ fn drop_selected_stored_queries(
         drop_trigger_with_undo(storage, wal, txn, slot, trigger)?;
     }
     for slot in (0..storage.routine_count()).rev() {
-        if !routines[slot] || !storage.routine(slot).visible_to(txn.txid) {
+        if !routines[slot] || storage.routine_identity_for(slot, txn.txid).is_none() {
             continue;
         }
         let routine = storage.routine_for(slot, txn.txid);

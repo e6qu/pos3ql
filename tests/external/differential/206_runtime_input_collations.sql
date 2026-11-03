@@ -82,6 +82,7 @@ SELECT body_collation_nested('a' COLLATE "C");
 SELECT 'nested_default_and_explicit_c_are_separate',last_value FROM body_collation_checks;
 SELECT body_collation_nested('a'::text);
 SELECT 'nested_default_is_separate',last_value FROM body_collation_checks;
+DROP FUNCTION body_collation_pair(text,text);
 CREATE FUNCTION body_collation_echo(first_input text DEFAULT ('a' COLLATE "POSIX"),
   second_input text DEFAULT ('b' COLLATE "POSIX")) RETURNS text
   LANGUAGE sql SET search_path=public AS 'SELECT first_input';
@@ -93,7 +94,7 @@ DROP FUNCTION body_collation_echo(text,text);
 DROP FUNCTION body_collation_nested(text);
 DROP FUNCTION body_collation_identity(text);
 DROP PROCEDURE body_collation_procedure(text);
-DROP FUNCTION body_collation_default(text),body_collation_pair(text,text),body_collation_srf(text);
+DROP FUNCTION body_collation_default(text),body_collation_srf(text);
 DROP TABLE body_collation_texts;
 DROP TABLE body_collation_numbers;
 DROP CAST(text AS integer);

@@ -36356,6 +36356,58 @@ fn sql_json_aggregates_support_options_ordering_and_returning() {
 }
 
 #[test]
+fn sql_json_aggregates_over_physical_rows_preserve_syntax_and_routine_namespaces() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("physical-sql-json-aggregates-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE physical_json_inputs(id integer,j jsonb); \
+             INSERT INTO physical_json_inputs VALUES(1,'1'::jsonb),(2,NULL)",
+            true,
+        );
+        let aggregates = "SELECT JSON_OBJECTAGG(id VALUE j ABSENT ON NULL RETURNING jsonb) FROM physical_json_inputs; \
+                          SELECT JSON_ARRAYAGG(j ABSENT ON NULL RETURNING jsonb) FROM physical_json_inputs";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, aggregates, true)),
+            ["{\"1\": 1}", "[1]"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT __json_objectagg_absent_jsonb(id,j) FROM physical_json_inputs",
+                true
+            )),
+            [sqlstate::UNDEFINED_FUNCTION]
+        );
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION __json_objectagg_absent_jsonb(integer,jsonb) RETURNS text \
+               LANGUAGE sql IMMUTABLE AS $$SELECT 'ordinary routine'$$",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT __json_objectagg_absent_jsonb(id,j) FROM physical_json_inputs",
+                true
+            )),
+            ["ordinary routine", "ordinary routine"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, aggregates, true)),
+            ["{\"1\": 1}", "[1]"]
+        );
+    }
+}
+
+#[test]
 fn json_table_projects_nested_rows_siblings_and_column_behaviors() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

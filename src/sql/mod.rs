@@ -16134,6 +16134,7 @@ impl Engine {
                     &self.storage,
                     txn.txid,
                     row,
+                    None,
                     arena,
                     Some(&mut dependencies),
                 )?;

@@ -421,7 +421,45 @@ pub(crate) fn bind_materialized_relations<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let context = Subst {
+    let context = materialized_input_context(relations, storage, txid);
+    subst_select(select, context, arena)
+}
+
+pub(crate) fn bind_materialized_expression<'a>(
+    expression: &'a Expr<'a>,
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    subst_expr(
+        expression,
+        materialized_input_context(relations, storage, txid),
+        arena,
+    )
+}
+
+/// Binds relation metadata without executing CTEs or converting row values.
+pub(crate) fn bind_materialized_statement<'a>(
+    statement: &'a Stmt<'a>,
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    subst_materialized_statement(
+        statement,
+        materialized_input_context(relations, storage, txid),
+        arena,
+    )
+}
+
+fn materialized_input_context<'a, 's>(
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &'s Storage,
+    txid: u32,
+) -> Subst<'a, 'a, 's, 'a> {
+    Subst {
         ctes: &[],
         materialized: relations,
         storage,
@@ -434,8 +472,96 @@ pub(crate) fn bind_materialized_relations<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+    }
+}
+
+fn materialized_not_shadowed<'a, 'scope>(
+    with: &[Cte<'a>],
+    relations: &'scope [(&'a str, &'a MaterializedCte<'a>)],
+    arena: &'a Arena,
+) -> Result<&'scope [(&'a str, &'a MaterializedCte<'a>)], SqlError>
+where
+    'a: 'scope,
+{
+    if !relations
+        .iter()
+        .any(|relation| with.iter().any(|cte| cte.name == relation.0))
+    {
+        return Ok(relations);
+    }
+    let mut visible = ArenaList::new(arena);
+    for relation in relations {
+        if !with.iter().any(|cte| cte.name == relation.0) {
+            visible.push(*relation).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(visible.as_slice())
+}
+
+fn subst_materialized_statement<'a>(
+    statement: &'a Stmt<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let statement = match statement {
+        Stmt::Select(select) => Stmt::Select(*subst_select(select, context, arena)?),
+        Stmt::SetQuery(query) if !query.with.is_empty() => {
+            let statement = arena
+                .alloc(Stmt::SetQuery(SetQuery {
+                    with: &[],
+                    ..*query
+                }))
+                .map_err(|_| arena_full())?;
+            let statement = arena
+                .alloc(Stmt::With {
+                    ctes: query.with,
+                    statement,
+                })
+                .map_err(|_| arena_full())?;
+            return subst_materialized_statement(statement, context, arena);
+        }
+        Stmt::SetQuery(query) => Stmt::SetQuery(*subst_set_query_body(query, context, arena)?),
+        Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+        Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+        Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+        Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+        Stmt::With { ctes, statement } => {
+            let mut bound = ArenaList::new(arena);
+            for (index, cte) in ctes.iter().enumerate() {
+                let visible = materialized_not_shadowed(
+                    &ctes[..index + usize::from(cte.recursive)],
+                    context.materialized,
+                    arena,
+                )?;
+                let child = Subst {
+                    materialized: visible,
+                    ..context
+                };
+                let cte = Cte {
+                    query: subst_select(cte.query, child, arena)?,
+                    dml: cte
+                        .dml
+                        .map(|statement| subst_materialized_statement(statement, child, arena))
+                        .transpose()?,
+                    ..*cte
+                };
+                bound.push(cte).map_err(|_| arena_full())?;
+            }
+            let child = Subst {
+                materialized: materialized_not_shadowed(ctes, context.materialized, arena)?,
+                ..context
+            };
+            Stmt::With {
+                ctes: bound.as_slice(),
+                statement: subst_materialized_statement(statement, child, arena)?,
+            }
+        }
+        _ => return Ok(statement),
     };
-    subst_select(select, context, arena)
+    arena
+        .alloc(statement)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
 }
 
 /// Expands a `WITH` list into a data-modifying main statement. The returned
@@ -4790,6 +4916,11 @@ fn subst_select<'a>(
         }
         let child = Subst {
             ctes: scoped.as_slice(),
+            materialized: materialized_not_shadowed(
+                &select.with[..index + usize::from(cte.recursive)],
+                context.materialized,
+                arena,
+            )?,
             ..context
         };
         let query = if cte.recursive && select_references(cte.query, cte.name) > 0 {
@@ -4816,6 +4947,7 @@ fn subst_select<'a>(
         select,
         Subst {
             ctes: scoped.as_slice(),
+            materialized: materialized_not_shadowed(select.with, context.materialized, arena)?,
             ..context
         },
         arena,

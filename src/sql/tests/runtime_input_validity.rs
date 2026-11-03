@@ -397,6 +397,44 @@ fn dependency_columns_keep_inner_sql_precedence_and_resolve_outer_locals() {
 }
 
 #[test]
+fn dependency_analysis_preserves_record_field_errors_with_and_without_relation_scope() {
+    let config = test_config("dependency-record-field-errors");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE TABLE input_rows(id integer)", true);
+    let arena = Arena::new(&mut budget, "record dependency errors", 256 << 10).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for source in [
+            "SELECT (ROW(1)).f2::integer",
+            "SELECT (ROW(1)).f2::integer FROM input_rows",
+            "UPDATE input_rows SET id=(ROW(1)).f2::integer",
+        ] {
+            let statement = parser::parse_stored_statement(source, &arena).unwrap();
+            let mut dependencies = engine
+                .storage
+                .empty_stored_query_dependencies(&arena)
+                .unwrap();
+            let error = query::collect_runtime_statement(
+                statement,
+                &engine.storage,
+                0,
+                &mut dependencies,
+                &arena,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::UNDEFINED_COLUMN, "{source}");
+            assert_eq!(
+                error.message.as_str(),
+                "could not identify column \"f2\" in record data type",
+                "{source}"
+            );
+        }
+    });
+}
+
+#[test]
 fn cte_dependency_capture_uses_bound_sources_without_running_modifications() {
     let config = test_config("cte-dependency-source-scopes");
     let mut budget = test_engine_budget(&config, 1 << 29);

@@ -336,6 +336,7 @@ impl ParameterInference<'_> {
             Expr::Unary {
                 operator: ast::UnaryOp::Not,
                 operand,
+                ..
             } => assign(operand, types::oid::BOOL, oids),
             Expr::Case { whens, .. } => {
                 for (condition, _) in *whens {
@@ -609,6 +610,7 @@ impl ParameterInference<'_> {
             operator,
             left,
             right,
+            ..
         } = expression
         {
             match operator {

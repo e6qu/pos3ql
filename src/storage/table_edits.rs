@@ -338,7 +338,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             invalidated_statistics,
         )?;
         self.storage
-            .validate_table_type_inputs(&definition, transaction)?;
+            .validate_table_type_inputs(&definition, transaction, _source.as_deref())?;
         let stored = definition.freeze(&self.storage.metadata_pool)?;
         let transition = self
             .storage

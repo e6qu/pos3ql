@@ -20,7 +20,7 @@ use super::eval::SqlError;
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct PrngState {
     s0: u64,
     s1: u64,
@@ -680,9 +680,7 @@ struct GucValues {
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
     xml_document: bool,
-    /// Whether function bodies are checked at definition time. Function DDL is
-    /// rejected before this matters, but the session value is still observable
-    /// and is emitted by pg_dump.
+    /// Whether stored function bodies are checked when their definitions are created.
     check_function_bodies: bool,
     default_transaction_isolation: TransactionIsolation,
     default_transaction_read_only: bool,
@@ -756,6 +754,38 @@ pub(crate) enum PasswordEncryption {
 }
 
 impl GucValues {
+    fn same_settings(&self, other: &Self) -> bool {
+        // The stored time-zone name determines its private parsed cache.
+        macro_rules! equal { ($($field:ident),+ $(,)?) => { true $(&& self.$field == other.$field)+ }; }
+        equal!(
+            current_role,
+            session_authorization,
+            datestyle,
+            intervalstyle,
+            lc_monetary,
+            timezone,
+            client_encoding,
+            application_name,
+            search_path,
+            default_tablespace,
+            default_text_search_config,
+            client_min_messages,
+            extra_float_digits,
+            lock_timeout,
+            statement_timeout,
+            row_security,
+            event_triggers,
+            bytea_escape,
+            xml_document,
+            check_function_bodies,
+            default_transaction_isolation,
+            default_transaction_read_only,
+            default_transaction_deferrable,
+            password_encryption,
+            track_functions
+        )
+    }
+
     fn new() -> Self {
         let mut values = Self {
             current_role: crate::storage::SessionIdentity::bootstrap(),
@@ -1130,6 +1160,18 @@ impl GucState {
         self.random.set(mark.random);
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
         crate::sql::timezone::set_session(self.timezone());
+    }
+
+    pub(crate) fn matches_statement_settings(&self, mark: &StatementSettings) -> bool {
+        let state = self.store.borrow();
+        state.current.same_settings(&mark.values.current)
+            && state
+                .transaction
+                .session
+                .same_settings(&mark.values.session)
+            && state.session_overrides == mark.values.current_overrides
+            && state.transaction.session_overrides == mark.values.session_overrides
+            && self.random.get() == mark.random
     }
 
     #[cfg(test)]

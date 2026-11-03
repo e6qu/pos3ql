@@ -1161,7 +1161,8 @@ impl TypeCatalog {
 
 impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(super) fn requires_type_catalog(&self) -> bool {
-        self.type_membership != super::TableTypeMembership::None
+        !self.type_inputs.as_ref().bytes().is_empty()
+            || self.type_membership != super::TableTypeMembership::None
             || self.columns().iter().any(|column| {
                 RoutineResult {
                     ctype: column.ctype,

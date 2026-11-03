@@ -80,6 +80,7 @@ pub(crate) fn rename(
             not_null_name: definition.not_null_name,
             not_null_identity: definition.not_null_identity,
             default_expr: definition.default_expr,
+            default_inputs: definition.default_inputs.clone(),
             checks: definition.checks,
             n_checks: definition.n_checks,
         };
@@ -120,7 +121,7 @@ pub(crate) fn rename(
         }
         let (target, selected) = storage.select_table_definition(slot, txn.txid);
         let mut definition = crate::storage::TableDefBuilder::from_definition(&selected);
-        if source.rewrite_table(name, &mut definition, arena)? {
+        if source.rewrite_table(storage, name, &mut definition, arena)? {
             let mut mapping = [None; MAX_COLUMNS];
             for (entry, column) in mapping.iter_mut().zip(definition.columns()) {
                 *entry = Some(column.name);

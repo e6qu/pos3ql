@@ -557,6 +557,27 @@ pub fn parse_query<'a>(
     parse_query_with_string_parameters(sql, arena, &[])
 }
 
+pub(crate) fn parse_expression_with_type_inputs<'a>(
+    sql: &'a str,
+    bindings: &'a [super::type_inputs::Binding<'a>],
+    arena: &'a Arena,
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
+) -> Result<&'a Expr<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(bindings);
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after expression"
+        ));
+    }
+    validate(&parser)?;
+    Ok(expression)
+}
+
 pub(crate) fn parse_query_with_type_inputs<'a>(
     sql: &'a str,
     bindings: &'a [super::type_inputs::Binding<'a>],
@@ -841,6 +862,99 @@ impl<'a> Parser<'a> {
         self.type_input_sources
             .as_ref()
             .map_or(&[], |sources| sources.borrow().strings.as_slice())
+    }
+
+    pub(crate) fn add_contextual_type_input(
+        &self,
+        expression: &Expr<'_>,
+        target_oid: i32,
+        type_mod: i32,
+    ) -> Result<(), super::eval::SqlError> {
+        let Some(candidate) = super::type_inputs::contextual_candidate(
+            self.string_literals(),
+            expression,
+            target_oid,
+            type_mod,
+        )?
+        else {
+            return Ok(());
+        };
+        let sources = self.type_input_sources.as_ref().ok_or_else(|| {
+            crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL type input source capture is unavailable"
+            )
+        })?;
+        if let Some(prior) = sources.borrow().candidates.as_slice().iter().find(|prior| {
+            (prior.start, prior.end, prior.kind) == (candidate.start, candidate.end, candidate.kind)
+        }) {
+            if prior.target != candidate.target || prior.type_mod != candidate.type_mod {
+                return Err(crate::sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "SQL type input expected type changed"
+                ));
+            }
+            return Ok(());
+        }
+        sources
+            .borrow_mut()
+            .candidates
+            .push(candidate)
+            .map_err(|_| super::query::arena_full_pub())
+    }
+
+    pub(crate) fn reorder_type_input_candidates(
+        &self,
+        order: &[(usize, usize, super::type_inputs::InputKind)],
+    ) -> Result<(), super::eval::SqlError> {
+        let Some(first) = order.iter().map(|key| key.0).min() else {
+            return Ok(());
+        };
+        let sources = self.type_input_sources.as_ref().ok_or_else(|| {
+            crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL type input source capture is unavailable"
+            )
+        })?;
+        let current = sources.borrow().candidates.as_slice();
+        let key = |candidate: &super::type_inputs::Candidate<'_>| {
+            (candidate.start, candidate.end, candidate.kind)
+        };
+        for (index, wanted) in order.iter().enumerate() {
+            if order[..index].contains(wanted)
+                || !current.iter().any(|candidate| key(candidate) == *wanted)
+            {
+                return Err(crate::sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "SQL type input order changed"
+                ));
+            }
+        }
+        let mut reordered = ArenaList::new(self.arena);
+        for candidate in current.iter().filter(|candidate| candidate.start < first) {
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        for wanted in order {
+            let candidate = current
+                .iter()
+                .find(|candidate| key(candidate) == *wanted)
+                .expect("checked input occurrence");
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        for candidate in current
+            .iter()
+            .filter(|candidate| candidate.start >= first && !order.contains(&key(candidate)))
+        {
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        sources.borrow_mut().candidates = reordered;
+        Ok(())
     }
 
     pub(crate) fn restored_type_inputs(
@@ -3046,6 +3160,7 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: None,
                 inheritance,
@@ -3173,6 +3288,7 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     func_argument_names: &[],
                     func_variadic: false,
+                    func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     rows_from: Some(functions.as_slice()),
                     col_alias,
                     inheritance: RelationInheritance::Descendants,
@@ -3227,6 +3343,7 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias,
                 inheritance: RelationInheritance::Descendants,
@@ -3381,6 +3498,9 @@ impl<'a> Parser<'a> {
             func_args,
             func_argument_names,
             func_variadic,
+            func_source_position: crate::sql::ast::SourcePosition::new(
+                func_args.map(|_| source.start),
+            ),
             rows_from: None,
             col_alias,
             inheritance,
@@ -11329,6 +11449,7 @@ mod tests {
                 operator: BinaryOp::Add,
                 left,
                 right,
+                ..
             } = expression
             else {
                 panic!()
@@ -12472,6 +12593,42 @@ mod tests {
                 parser.next_stmt().unwrap_err().sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod source_position_tests {
+    use super::*;
+
+    #[test]
+    fn source_positions_preserve_occurrence_identity_without_affecting_expression_equality() {
+        let mut budget = crate::mem::budget::Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "expression source metadata", 64 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = parse_expr("f(1)+g(2)::integer", &arena).unwrap();
+            let second = parse_expr(" f(1)+g(2)::integer", &arena).unwrap();
+            assert_eq!(first, second, "nested provenance is not SQL semantics");
+            assert_eq!(first.source_position().get(), Some(4));
+            assert_eq!(second.source_position().get(), Some(5));
+            let Expr::Binary { left, right, .. } = first else {
+                panic!("binary expression")
+            };
+            assert_eq!(left.source_position().get(), Some(0));
+            assert_eq!(right.source_position().get(), Some(9));
+            let copied = crate::sql::ast::duplicate_expression(first, &arena, &[]).unwrap();
+            assert_eq!(copied, first);
+            assert_eq!(copied.source_position().get(), Some(4));
+            let Expr::Binary { left, right, .. } = copied else {
+                panic!("copied binary")
+            };
+            assert_eq!(left.source_position().get(), Some(0));
+            assert_eq!(right.source_position().get(), Some(9));
+            let query =
+                parse_query("SELECT * FROM first_fn() JOIN second_fn() ON true", &arena).unwrap();
+            let from = query.from.unwrap();
+            assert_eq!(from.base.func_source_position.get(), Some(14));
+            assert_eq!(from.joins[0].table.func_source_position.get(), Some(30));
         });
     }
 }

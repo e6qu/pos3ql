@@ -109,6 +109,7 @@ impl Storage {
             persistence: definition.persistence,
             return_rule: rule_slot as u16,
             options: definition.options,
+            default_inputs: definition.default_inputs.clone(),
             columns: definition.columns,
             ownership,
             version: identity.created_at(),

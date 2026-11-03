@@ -98,6 +98,16 @@ impl StoredTypeInputs {
         &self.bytes
     }
 
+    pub(super) fn references_type(&self, kind: super::NamedTypeKind, creation: u64) -> bool {
+        let mut found = false;
+        self.visit(|_, input| {
+            found |= matches!(super::NamedTypeKind::from_oid(input.type_oid), Some((input_kind, input_creation, _))
+                if input_kind == kind && input_creation.created_at() == creation);
+            Ok(())
+        }).expect("immutable type input images are validated before publication");
+        found
+    }
+
     pub(crate) fn validate_encoded(bytes: &[u8]) -> Result<(), SqlError> {
         visit_sections(bytes, |_, _| Ok(()))
     }
@@ -114,21 +124,6 @@ impl StoredTypeInputs {
         Ok(Self {
             bytes: owned.freeze(),
         })
-    }
-
-    pub(crate) fn bindings<'a>(
-        &'a self,
-        section: StoredInputSection,
-        arena: &'a Arena,
-    ) -> Result<&'a [Binding<'a>], SqlError> {
-        let mut selected = &[][..];
-        visit_sections(self.bytes(), |found, bytes| {
-            if found == section {
-                selected = bytes;
-            }
-            Ok(())
-        })?;
-        type_inputs::decode(selected, arena)
     }
 
     pub(crate) fn detached_bindings<'a>(
@@ -149,27 +144,138 @@ impl StoredTypeInputs {
         type_inputs::decode(bytes, arena)
     }
 
-    pub(crate) fn from_bindings(
-        section: StoredInputSection,
-        source: &str,
-        bindings: &[Binding<'_>],
-        dependencies: super::StoredQueryDependencyView<'_>,
+    pub(crate) fn detached_sections<'a>(
+        &self,
+        arena: &'a Arena,
+    ) -> Result<&'a [(StoredInputSection, &'a [Binding<'a>])], SqlError> {
+        let bytes = arena
+            .alloc_slice_copy(self.bytes())
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+        decode_sections(bytes, arena)
+    }
+
+    pub(crate) fn borrowed_sections<'a>(
+        &'a self,
+        arena: &'a Arena,
+    ) -> Result<&'a [(StoredInputSection, &'a [Binding<'a>])], SqlError> {
+        decode_sections(self.bytes(), arena)
+    }
+
+    pub(super) fn relocated_sources(
+        &self,
+        sources: &[StoredInputSource<'_>],
         pool: &Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        Self::from_sources(
-            &[StoredInputSource {
-                section,
-                sql: source,
-                bindings,
-            }],
-            dependencies,
-            pool,
-        )
+        if self.matches_sources(sources)? {
+            return Ok(self.clone());
+        }
+        let mut found = 0;
+        visit_sections(self.bytes(), |section, map| {
+            let source = sources
+                .iter()
+                .find(|source| source.section == section)
+                .ok_or_else(invalid)?;
+            let mut index = 0;
+            type_inputs::visit(map, |binding| {
+                let next = source.bindings.get(index).ok_or_else(invalid)?;
+                if (
+                    binding.kind,
+                    binding.type_oid,
+                    binding.type_mod,
+                    binding.collation,
+                ) != (next.kind, next.type_oid, next.type_mod, next.collation)
+                    || binding.encoded != next.encoded
+                {
+                    return Err(invalid());
+                }
+                index += 1;
+                Ok(())
+            })?;
+            if index != source.bindings.len() {
+                return Err(invalid());
+            }
+            found += 1;
+            Ok(())
+        })?;
+        if found
+            != sources
+                .iter()
+                .filter(|source| !source.bindings.is_empty())
+                .count()
+        {
+            return Err(invalid());
+        }
+        Self::from_validated_sources(sources, |_| Ok(()), pool)
+    }
+
+    pub(crate) fn matches_sources(
+        &self,
+        sources: &[StoredInputSource<'_>],
+    ) -> Result<bool, SqlError> {
+        let mut source_index = 0;
+        let mut same = true;
+        visit_sections(self.bytes(), |section, map| {
+            while sources
+                .get(source_index)
+                .is_some_and(|source| source.bindings.is_empty())
+            {
+                source_index += 1;
+            }
+            let Some(source) = sources.get(source_index) else {
+                same = false;
+                return Ok(());
+            };
+            same &= source.section == section;
+            let mut index = 0;
+            type_inputs::visit(map, |binding| {
+                same &= source.bindings.get(index).is_some_and(|other| {
+                    (
+                        binding.start,
+                        binding.end,
+                        binding.kind,
+                        binding.type_oid,
+                        binding.type_mod,
+                        binding.collation,
+                    ) == (
+                        other.start,
+                        other.end,
+                        other.kind,
+                        other.type_oid,
+                        other.type_mod,
+                        other.collation,
+                    ) && binding.encoded == other.encoded
+                });
+                index += 1;
+                Ok(())
+            })?;
+            same &= index == source.bindings.len();
+            source_index += 1;
+            Ok(())
+        })?;
+        while sources
+            .get(source_index)
+            .is_some_and(|source| source.bindings.is_empty())
+        {
+            source_index += 1;
+        }
+        Ok(same && source_index == sources.len())
     }
 
     pub(crate) fn from_sources(
         sources: &[StoredInputSource<'_>],
         dependencies: super::StoredQueryDependencyView<'_>,
+        pool: &Arc<LeasePool>,
+    ) -> Result<Self, SqlError> {
+        Self::from_validated_sources(
+            sources,
+            |binding| validate_target(binding, dependencies),
+            pool,
+        )
+    }
+
+    fn from_validated_sources(
+        sources: &[StoredInputSource<'_>],
+        mut validate: impl FnMut(Binding<'_>) -> Result<(), SqlError>,
         pool: &Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
         let mut length = HEADER;
@@ -183,7 +289,11 @@ impl StoredTypeInputs {
                 return Err(invalid());
             }
             previous = Some(source.section);
-            validate_bindings(source.sql, source.bindings, dependencies)?;
+            type_inputs::encoded_len(source.bindings)?;
+            for binding in source.bindings {
+                validate_span(source.sql, *binding)?;
+                validate(*binding)?;
+            }
             if source.bindings.is_empty() {
                 continue;
             }
@@ -273,6 +383,28 @@ impl PartialEq for StoredTypeInputs {
 }
 impl Eq for StoredTypeInputs {}
 
+fn decode_sections<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<&'a [(StoredInputSection, &'a [Binding<'a>])], SqlError> {
+    StoredTypeInputs::validate_encoded(bytes)?;
+    if bytes.is_empty() {
+        return Ok(&[]);
+    }
+    let count =
+        u32::from_le_bytes(bytes[4..8].try_into().expect("validated section header")) as usize;
+    let output = arena
+        .alloc_slice_with(count, |_| (StoredInputSection::Query, &[][..]))
+        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    let mut index = 0;
+    visit_sections(bytes, |section, map| {
+        output[index] = (section, type_inputs::decode(map, arena)?);
+        index += 1;
+        Ok(())
+    })?;
+    Ok(output)
+}
+
 fn visit_sections<'a>(
     bytes: &'a [u8],
     mut visit: impl FnMut(StoredInputSection, &'a [u8]) -> Result<(), SqlError>,
@@ -331,19 +463,6 @@ fn validate_span(source: &str, binding: Binding<'_>) -> Result<(), SqlError> {
     Ok(())
 }
 
-fn validate_bindings(
-    source: &str,
-    bindings: &[Binding<'_>],
-    dependencies: super::StoredQueryDependencyView<'_>,
-) -> Result<(), SqlError> {
-    type_inputs::encoded_len(bindings)?;
-    for binding in bindings {
-        validate_span(source, *binding)?;
-        validate_target(*binding, dependencies)?;
-    }
-    Ok(())
-}
-
 fn validate_target(
     binding: Binding<'_>,
     dependencies: super::StoredQueryDependencyView<'_>,
@@ -379,7 +498,97 @@ fn metadata_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
     )
 }
 
+fn validate_representation(
+    binding: Binding<'_>,
+    target: crate::sql::types::ColType,
+) -> Result<(), SqlError> {
+    if binding.encoded[2] == 200 {
+        let descriptor = super::CachedArrayElement::from_bytes(
+            binding.encoded[3..9]
+                .try_into()
+                .expect("validated array descriptor"),
+        )
+        .ok_or_else(invalid)?;
+        if target != crate::sql::types::ColType::Array(descriptor.element()) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_definition_inputs<'source>(
+    inputs: &StoredTypeInputs,
+    mut source: impl FnMut(StoredInputSection) -> Option<&'source str>,
+    txid: u32,
+    catalog: Option<&super::TypeCatalog>,
+) -> Result<(), SqlError> {
+    inputs.visit(|section, binding| {
+        let source = source(section).ok_or_else(invalid)?;
+        crate::sql::enum_values::checks::with_default_display(source, |display| {
+            validate_span(display, binding)
+        })?;
+        let catalog = catalog.ok_or_else(invalid)?;
+        let target = super::Storage::routine_result_for_oid_in(catalog, binding.type_oid, txid)
+            .ok_or_else(invalid)?;
+        validate_representation(binding, target.ctype)
+    })
+}
+
 impl super::Storage {
+    pub(super) fn validate_definition_type_inputs<'source>(
+        &self,
+        inputs: &StoredTypeInputs,
+        source: impl FnMut(StoredInputSection) -> Option<&'source str>,
+        txid: u32,
+        catalog: Option<&super::TypeCatalog>,
+    ) -> Result<(), SqlError> {
+        validate_definition_inputs(inputs, source, txid, catalog)
+    }
+    pub(crate) fn freeze_runtime_type_inputs(
+        &self,
+        source: &str,
+        bindings: &[Binding<'_>],
+        txid: u32,
+    ) -> Result<SharedSlice<u8>, SqlError> {
+        for binding in bindings {
+            if binding.end > source.len()
+                || !source.is_char_boundary(binding.start)
+                || !source.is_char_boundary(binding.end)
+            {
+                return Err(invalid());
+            }
+            self.validate_stored_input_type(*binding, txid)?;
+        }
+        let length = type_inputs::encoded_len(bindings)?;
+        let mut bytes = self
+            .metadata_pool
+            .lease::<u8>(length)
+            .map_err(metadata_full)?;
+        for _ in 0..length {
+            bytes.push_reserved(0).map_err(metadata_full)?;
+        }
+        type_inputs::encode_into(bindings, bytes.as_mut_slice())?;
+        Ok(bytes.freeze())
+    }
+
+    pub(crate) fn capture_definition_type_inputs(
+        &self,
+        sources: &[StoredInputSource<'_>],
+        txid: u32,
+    ) -> Result<StoredTypeInputs, SqlError> {
+        StoredTypeInputs::from_validated_sources(
+            sources,
+            |binding| self.validate_stored_input_type(binding, txid),
+            &self.metadata_pool,
+        )
+    }
+    pub(crate) fn capture_stored_type_inputs(
+        &self,
+        sources: &[StoredInputSource<'_>],
+        dependencies: super::StoredQueryDependencyView<'_>,
+    ) -> Result<StoredTypeInputs, SqlError> {
+        StoredTypeInputs::from_sources(sources, dependencies, &self.metadata_pool)
+    }
     pub(crate) fn decode_stored_type_inputs(
         &self,
         bytes: &[u8],
@@ -387,23 +596,41 @@ impl super::Storage {
         StoredTypeInputs::decode(bytes, &self.metadata_pool)
     }
 
-    pub(crate) fn validate_table_type_inputs<B: super::DefinitionBacking>(
+    pub(super) fn validate_table_type_inputs<B: super::DefinitionBacking>(
         &self,
         definition: &super::TableDefinition<B>,
         txid: u32,
+        catalog: Option<&super::TypeCatalog>,
     ) -> Result<(), SqlError> {
-        definition.type_inputs.as_ref().visit(|section, binding| {
-            let StoredInputSection::TableDefault(attribute) = section else {
-                return Err(invalid());
-            };
-            let column = definition.attribute_column(attribute).ok_or_else(invalid)?;
-            let source = definition.columns.as_ref()[column]
-                .default
-                .expression()
-                .ok_or_else(invalid)?;
-            validate_span(source.as_str(), binding)?;
-            self.validate_stored_input_type(binding, txid)
-        })
+        Self::validate_table_type_input_root(
+            definition,
+            definition.type_inputs.as_ref(),
+            txid,
+            catalog,
+        )
+    }
+
+    fn validate_table_type_input_root<B: super::DefinitionBacking>(
+        definition: &super::TableDefinition<B>,
+        inputs: &StoredTypeInputs,
+        txid: u32,
+        catalog: Option<&super::TypeCatalog>,
+    ) -> Result<(), SqlError> {
+        validate_definition_inputs(
+            inputs,
+            |section| {
+                let StoredInputSection::TableDefault(attribute) = section else {
+                    return None;
+                };
+                let column = definition.attribute_column(attribute)?;
+                definition.columns.as_ref()[column]
+                    .default
+                    .expression()
+                    .map(|sql| sql.as_str())
+            },
+            txid,
+            catalog,
+        )
     }
 
     pub(crate) fn restore_table_type_inputs(
@@ -412,41 +639,35 @@ impl super::Storage {
         bytes: &[u8],
         txid: u32,
     ) -> Result<(), SqlError> {
-        let inputs = StoredTypeInputs::restore_validated(
-            bytes,
-            |section| {
-                let StoredInputSection::TableDefault(attribute) = section else {
-                    return None;
-                };
-                let column = definition.attribute_column(attribute)?;
-                definition.columns[column]
-                    .default
-                    .expression()
-                    .map(|sql| sql.as_str())
-            },
-            |binding| self.validate_stored_input_type(binding, txid),
-            &self.metadata_pool,
-        )?;
+        let inputs = self.decode_stored_type_inputs(bytes)?;
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        Self::validate_table_type_input_root(definition, &inputs, txid, Some(&catalog))?;
         definition.type_inputs = inputs;
         Ok(())
+    }
+
+    pub(crate) fn restore_definition_type_inputs<'source>(
+        &self,
+        bytes: &[u8],
+        source: impl FnMut(StoredInputSection) -> Option<&'source str>,
+        txid: u32,
+    ) -> Result<StoredTypeInputs, SqlError> {
+        StoredTypeInputs::restore_validated(
+            bytes,
+            source,
+            |binding| self.validate_stored_input_type(binding, txid),
+            &self.metadata_pool,
+        )
     }
 
     fn validate_stored_input_type(&self, binding: Binding<'_>, txid: u32) -> Result<(), SqlError> {
         let target = self
             .routine_result_for_oid(binding.type_oid, txid)
             .ok_or_else(invalid)?;
-        if binding.encoded[2] == 200 {
-            let descriptor = super::CachedArrayElement::from_bytes(
-                binding.encoded[3..9]
-                    .try_into()
-                    .expect("validated array descriptor"),
-            )
-            .ok_or_else(invalid)?;
-            if target.ctype != crate::sql::types::ColType::Array(descriptor.element()) {
-                return Err(invalid());
-            }
-        }
-        Ok(())
+        validate_representation(binding, target.ctype)
     }
 
     pub(crate) fn restore_stored_type_inputs<'source>(
@@ -502,10 +723,12 @@ mod tests {
         let input = binding(source, &arena);
         let dependencies = super::super::StoredQueryDependencyView::new(&[]);
         crate::mem::guard::forbid_alloc(|| {
-            let first = StoredTypeInputs::from_bindings(
-                StoredInputSection::Query,
-                source,
-                &[input],
+            let first = StoredTypeInputs::from_sources(
+                &[StoredInputSource {
+                    section: StoredInputSection::Query,
+                    sql: source,
+                    bindings: &[input],
+                }],
                 dependencies,
                 &pool,
             )
@@ -513,7 +736,9 @@ mod tests {
             let reader = first.clone();
             assert_eq!(pool.lease::<u8>(1).unwrap_err().available_leases, 0);
             drop(first);
-            let decoded = reader.bindings(StoredInputSection::Query, &arena).unwrap();
+            let decoded = reader
+                .detached_bindings(StoredInputSection::Query, &arena)
+                .unwrap();
             assert_eq!(decoded.len(), 1);
             assert_eq!(decoded[0].encoded, input.encoded);
             drop(pool);
@@ -531,10 +756,12 @@ mod tests {
         let input = binding(source, &arena);
         let dependencies = super::super::StoredQueryDependencyView::new(&[]);
         crate::mem::guard::forbid_alloc(|| {
-            let first = StoredTypeInputs::from_bindings(
-                StoredInputSection::Query,
-                source,
-                &[input],
+            let first = StoredTypeInputs::from_sources(
+                &[StoredInputSource {
+                    section: StoredInputSection::Query,
+                    sql: source,
+                    bindings: &[input],
+                }],
                 dependencies,
                 &pool,
             )

@@ -36,6 +36,7 @@ fn catalog_scan(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } => {
                 constrained(left, column, table, unqualified)
                     || constrained(right, column, table, unqualified)
@@ -44,6 +45,7 @@ fn catalog_scan(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } => {
                 let matches = |key: &Expr<'_>, value: &Expr<'_>| {
                     let Expr::Column { qualifier, name } = key else {
@@ -515,6 +517,7 @@ impl<'d> QueryScope<'d> {
                     func_args: None,
                     func_argument_names: &[],
                     func_variadic: false,
+                    func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     rows_from: None,
                     col_alias: None,
                     inheritance: crate::sql::ast::RelationInheritance::Only,
@@ -1675,6 +1678,7 @@ impl<'d> QueryScope<'d> {
                         .map_err(|_| arena_full())?;
                     let eq = arena
                         .alloc(Expr::Binary {
+                            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                             operator: BinaryOp::Eq,
                             left: left_ref,
                             right: right_ref,
@@ -1684,6 +1688,7 @@ impl<'d> QueryScope<'d> {
                         None => eq,
                         Some(prev) => arena
                             .alloc(Expr::Binary {
+                                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                                 operator: BinaryOp::And,
                                 left: prev,
                                 right: eq,
@@ -1843,6 +1848,7 @@ impl<'d> QueryScope<'d> {
                         kind: crate::sql::ast::CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         name: "coalesce",
                         args,
                         argument_names: &[],

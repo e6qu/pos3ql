@@ -88,13 +88,27 @@ input effects. Each array child converts before the following child runs. For
 complete output row then converts before the next row is produced. For example,
 an overflowing first array child must not advance a sequence in a later child.
 
-When a mutable function needs the engine, input preparation preserves completed
+Some literal values are checked while SQL is prepared. For example, preparing
+`SELECT '{approved}'::checked_status[]` can run checks on a domain, a type with
+extra constraints. The parser records each literal's position and selected type;
+Describe and Execute reuse its encoded value. Equal literals at different
+positions remain distinct inputs. Converting a typed text expression or an
+`ARRAY[...]` constructor retains PostgreSQL's later check timing.
+
+When an expression hands a mutable function to the engine, input preparation preserves completed
 expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',
 current_setting('application_name') || '.', false))` appends one dot when the
-input finishes, even if `save_order` pauses. Simple builtin trees that cannot
+input finishes across those function handoffs. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+
+Waiting for another connection's lock can require restarting an unfinished
+function body. Completed cursor operations and checked routine inputs keep
+their results and sequence effects. If restarting would lose their data writes
+or session changes, the command fails explicitly with `0A000` and rolls back;
+it does not silently repeat or discard those effects. Retaining the remaining
+function-body execution position is still a roadmap item.
 
 SQL `SET` parses SQL syntax; `set_config` and saved settings take decoded values.
 For example, `set_config('search_path', 'orders,public', false)` preserves that
@@ -293,7 +307,8 @@ reserving a maximum array for every potential table.
 
 `table_metadata_bytes` reserves one shared backing pool for actual-length table
 columns, physical column-number records, constraints, pending edit mappings and
-index-binding collections. Its starter value is 64 MiB;
+index-binding collections, plus actual bytes of saved checked SQL inputs.
+SQL sources without such inputs reserve no input payload. Its starter value is 64 MiB;
 `table_metadata_leases` starts at 8,192 concurrently occupied ranges. File
 configurations must name both settings. Bytes must be a positive multiple of 64;
 allocator controls and per-table headers are additional startup reservations.
@@ -305,6 +320,12 @@ Each range rounds to 64 bytes. Fragmentation, retained old versions and the
 overlap with replacement data can exhaust bytes or descriptors independently.
 The named `54000` diagnostic identifies the metadata pool and requested, free
 and largest contiguous bytes plus available descriptors. Pools never grow.
+
+Each connection reserves `prepared_bytes` for every SQL and protocol prepared
+statement slot, plus one `prepared_bytes` buffer for active input preparation.
+For example, with `max_prepared=8`, those buffers reserve `17 * prepared_bytes`.
+Text, parameter declarations and checked literal values share each buffer.
+Exhaustion returns `54000`; increasing the setting takes effect at startup.
 
 `statistics_bytes` and `statistics_leases` reserve a separate shared pool for
 analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.

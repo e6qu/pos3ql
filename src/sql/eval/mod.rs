@@ -2466,6 +2466,7 @@ fn catalog_evaluation(
         operator,
         left,
         right,
+        ..
     } = expression
         && let Some(name) = operator.operator_name()
         && catalog.has_operator_candidate(name)
@@ -2663,6 +2664,7 @@ fn fold_check<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             // FALSE settles AND; otherwise the result is known only when both
             // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
@@ -2683,6 +2685,7 @@ fn fold_check<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             // TRUE settles OR; otherwise the result is known only when both
             // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
@@ -2706,6 +2709,7 @@ fn fold_check<'a>(
         Expr::Unary {
             operator: super::ast::UnaryOp::Not,
             operand,
+            ..
         } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
         Expr::Cast {
             operand: Expr::Array(items),
@@ -3317,6 +3321,7 @@ pub fn eval_full<'a>(
                 over,
                 filter,
                 bound_strict,
+                source_position,
                 ..
             },
         ) = (position.target, *expression)
@@ -3326,6 +3331,7 @@ pub fn eval_full<'a>(
                 name,
                 bound_oid: Some(oid),
                 bound_strict,
+                source_position,
                 args,
                 argument_names,
                 variadic,
@@ -3596,7 +3602,9 @@ fn eval_full_inner<'a>(
                 n
             )
         }),
-        Expr::Unary { operator, operand } => {
+        Expr::Unary {
+            operator, operand, ..
+        } => {
             // The prefix arithmetic operators compute exactly what their
             // functions do, so they run the same code rather than a second copy.
             if let Some(function) = operator.arithmetic_function() {
@@ -3617,6 +3625,7 @@ fn eval_full_inner<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
             // scan qual in a cost order that is not fixed, so a FALSE operand
@@ -3631,6 +3640,7 @@ fn eval_full_inner<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             // Dual of AND: a definite TRUE on either side yields TRUE and
             // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
@@ -3640,6 +3650,7 @@ fn eval_full_inner<'a>(
             operator,
             left,
             right,
+            ..
         } => eval_binary_expression(
             BinaryExpression {
                 operator,
@@ -3658,6 +3669,7 @@ fn eval_full_inner<'a>(
             type_name,
             type_mod,
             binding,
+            ..
         } => {
             let array_target = ColType::from_sql_name(type_name).or_else(|| {
                 let catalog = hooks.catalog?;
@@ -5269,6 +5281,7 @@ fn expression_collation<'a>(
             operator: BinaryOp::Concat,
             left,
             right,
+            ..
         } => merge_derived_collations(
             expression_collation(left, row, catalog)?,
             expression_collation(right, row, catalog)?,
@@ -6034,6 +6047,7 @@ fn bind_builtin_default<'a>(
             let operand = bind_builtin_default(operand, arena)?;
             arena
                 .alloc(Expr::Cast {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     operand,
                     type_name,
                     type_mod,
@@ -7432,10 +7446,12 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Unary {
             operator: UnaryOp::Neg,
             operand,
+            ..
         } => static_type(operand, row),
         Expr::Unary {
             operator: UnaryOp::BitNot,
             operand,
+            ..
         } => static_type(operand, row).map(|ctype| {
             if matches!(ctype, ColType::Inet | ColType::Cidr) {
                 ColType::Inet
@@ -7455,6 +7471,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             operator,
             left,
             right,
+            ..
         } => super::exec::builtin_binary_type(
             operator,
             static_type(left, row)?.oid(),

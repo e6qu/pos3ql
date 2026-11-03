@@ -770,6 +770,7 @@ pub(super) fn correlated_scan_conjuncts<'a>(
             None => *conjunct,
             Some(left) => arena
                 .alloc(Expr::Binary {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     operator: BinaryOp::And,
                     left,
                     right: conjunct,

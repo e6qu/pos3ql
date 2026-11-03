@@ -192,7 +192,7 @@ pub(super) fn allocate(
         if matches!(allocation, super::CatalogAllocation::Restore(_)) {
             storage.catalog_sequence.observe(created_at);
         }
-        storage.validate_table_type_inputs(&def, transaction)?;
+        storage.validate_table_type_inputs(&def, transaction, Some(&source))?;
         let definition = def.freeze(&storage.metadata_pool)?;
         let statistics_admission = storage.reserve_implicit_index_statistics(
             slot,

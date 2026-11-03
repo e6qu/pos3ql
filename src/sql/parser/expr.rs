@@ -12,7 +12,7 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
 use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
-use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, UnaryOp};
+use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, SourcePosition, UnaryOp};
 use crate::sql::types::ColType;
 
 // Parsing bounds recursion; array dimensionality is checked when evaluated.
@@ -21,6 +21,7 @@ const MAX_ARRAY_BRACKET_NESTING: usize = 64;
 impl<'a> Parser<'a> {
     fn between_comparisons(
         &self,
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         low: &'a Expr<'a>,
         high: &'a Expr<'a>,
@@ -32,6 +33,7 @@ impl<'a> Parser<'a> {
         let repeated = crate::sql::ast::duplicate_expression(operand, self.arena, &[])
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let lower = self.arena_expr(Expr::Binary {
+            source_position,
             operator: if negated {
                 BinaryOp::Lt
             } else {
@@ -41,6 +43,7 @@ impl<'a> Parser<'a> {
             right: low,
         })?;
         let upper = self.arena_expr(Expr::Binary {
+            source_position,
             operator: if negated {
                 BinaryOp::Gt
             } else {
@@ -50,6 +53,7 @@ impl<'a> Parser<'a> {
             right: high,
         })?;
         self.arena_expr(Expr::Binary {
+            source_position,
             operator: if negated { BinaryOp::Or } else { BinaryOp::And },
             left: lower,
             right: upper,
@@ -68,6 +72,7 @@ impl<'a> Parser<'a> {
     pub(super) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
         let mut left = self.prefix()?;
         loop {
+            let source_position = SourcePosition::new(Some(self.peek_at));
             // Postfix `::type` binds tightest.
             if self.peeked == Tok::Op("::") {
                 self.advance()?;
@@ -76,6 +81,7 @@ impl<'a> Parser<'a> {
                     self.record_catalog_literal(left, kind)?;
                 }
                 left = self.arena_expr(Expr::Cast {
+                    source_position,
                     binding: CastBinding::Resolve,
                     operand: left,
                     type_name,
@@ -104,6 +110,7 @@ impl<'a> Parser<'a> {
                     left = self.plain_call("pg_catalog.is_normalized", &[left, form])?;
                     if negated {
                         left = self.arena_expr(Expr::Unary {
+                            source_position,
                             operator: UnaryOp::Not,
                             operand: left,
                         })?;
@@ -148,6 +155,7 @@ impl<'a> Parser<'a> {
                         kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position,
                         name,
                         args: self.arena_slice(&[left])?,
                         argument_names: &[],
@@ -160,6 +168,7 @@ impl<'a> Parser<'a> {
                     })?;
                     if negated {
                         left = self.arena_expr(Expr::Unary {
+                            source_position,
                             operator: UnaryOp::Not,
                             operand: left,
                         })?;
@@ -181,6 +190,7 @@ impl<'a> Parser<'a> {
                         left
                     } else {
                         self.arena_expr(Expr::Unary {
+                            source_position,
                             operator: UnaryOp::Not,
                             operand: left,
                         })?
@@ -255,6 +265,7 @@ impl<'a> Parser<'a> {
                         kind: CallKind::Routine,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position,
                         name: "pg_catalog.timezone",
                         args: self.arena_slice(&[left])?,
                         argument_names: &[],
@@ -274,6 +285,7 @@ impl<'a> Parser<'a> {
                     kind: CallKind::Routine,
                     bound_oid: None,
                     bound_strict: None,
+                    source_position,
                     name: "pg_catalog.timezone",
                     args: self.arena_slice(&[zone, left])?,
                     argument_names: &[],
@@ -306,7 +318,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 let right = self.expression(5)?;
-                left = self.build_operator(schema, operator, left, right)?;
+                left = self.build_operator(source_position, schema, operator, left, right)?;
                 continue;
             }
             // IN / BETWEEN / LIKE / ILIKE, optionally NOT-prefixed. They
@@ -381,7 +393,13 @@ impl<'a> Parser<'a> {
                     let low = self.expression(5)?;
                     self.expect_ident("and")?;
                     let high = self.expression(5)?;
-                    left = self.between_comparisons(left_operand, low, high, negated)?;
+                    left = self.between_comparisons(
+                        source_position,
+                        left_operand,
+                        low,
+                        high,
+                        negated,
+                    )?;
                     if symmetric {
                         // `x BETWEEN SYMMETRIC a AND b` holds when x lies between
                         // the two bounds in either order, which is the pair of
@@ -392,12 +410,14 @@ impl<'a> Parser<'a> {
                                 .map_err(|_| self.arena_full("statement too large for SQL arena"))
                         };
                         let swapped = self.between_comparisons(
+                            source_position,
                             duplicate(left_operand)?,
                             duplicate(high)?,
                             duplicate(low)?,
                             negated,
                         )?;
                         left = self.arena_expr(Expr::Binary {
+                            source_position,
                             operator: if negated { BinaryOp::And } else { BinaryOp::Or },
                             left,
                             right: swapped,
@@ -432,6 +452,7 @@ impl<'a> Parser<'a> {
                         })?;
                         left = if negated {
                             self.arena_expr(Expr::Unary {
+                                source_position,
                                 operator: crate::sql::ast::UnaryOp::Not,
                                 operand: inner,
                             })?
@@ -466,6 +487,7 @@ impl<'a> Parser<'a> {
                         kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position,
                         name: crate::sql::parser::SIMILAR_TO,
                         args,
                         argument_names: &[],
@@ -478,6 +500,7 @@ impl<'a> Parser<'a> {
                     })?;
                     left = if negated {
                         self.arena_expr(Expr::Unary {
+                            source_position,
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: call,
                         })?
@@ -513,7 +536,8 @@ impl<'a> Parser<'a> {
                 {
                     self.advance()?;
                     let right = self.expression(6)?;
-                    left = self.catalog_operator_expr(None, operator, left, right)?;
+                    left =
+                        self.catalog_operator_expr(source_position, None, operator, left, right)?;
                     continue;
                 }
                 return Ok(left);
@@ -575,6 +599,7 @@ impl<'a> Parser<'a> {
             }
             let right = self.expression(operator.precedence() + 1)?;
             left = self.arena_expr(Expr::Binary {
+                source_position,
                 operator,
                 left,
                 right,
@@ -620,6 +645,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn prefix(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let tok = self.peeked;
         let namespace_source = super::NamespaceSource {
             start: self.peek_at,
@@ -743,12 +769,17 @@ impl<'a> Parser<'a> {
                 // — the operand takes everything that binds tighter than this
                 // level, which is where `||` and the bitwise operators sit too.
                 let operand = self.expression(6)?;
-                self.arena_expr(Expr::Unary { operator, operand })
+                self.arena_expr(Expr::Unary {
+                    source_position,
+                    operator,
+                    operand,
+                })
             }
             Tok::Op("~") => {
                 self.advance()?;
                 let operand = self.expression(8)?;
                 self.arena_expr(Expr::Unary {
+                    source_position,
                     operator: UnaryOp::BitNot,
                     operand,
                 })
@@ -775,6 +806,7 @@ impl<'a> Parser<'a> {
                 }
                 let operand = self.expression(8)?;
                 self.arena_expr(Expr::Unary {
+                    source_position,
                     operator: UnaryOp::Neg,
                     operand,
                 })
@@ -800,12 +832,13 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 let operand = self.expression(6)?;
-                self.catalog_prefix_operator_expr(schema, operator, operand)
+                self.catalog_prefix_operator_expr(source_position, schema, operator, operand)
             }
             Tok::Ident("not") => {
                 self.advance()?;
                 let operand = self.expression(3)?;
                 self.arena_expr(Expr::Unary {
+                    source_position,
                     operator: UnaryOp::Not,
                     operand,
                 })
@@ -828,6 +861,7 @@ impl<'a> Parser<'a> {
                     kind: CallKind::Routine,
                     bound_oid: None,
                     bound_strict: None,
+                    source_position,
                     name: "pg_catalog.extract",
                     args: self.arena_slice(&[field_lit, source])?,
                     argument_names: &[],
@@ -897,7 +931,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(kw @ ("left" | "right")) => {
                 self.advance()?;
                 if self.peeked == Tok::Op("(") {
-                    self.call(kw, true)
+                    self.call(kw, true, None)
                 } else {
                     Err(self.unexpected("expected an expression"))
                 }
@@ -914,6 +948,7 @@ impl<'a> Parser<'a> {
                     self.record_catalog_literal(operand, kind)?;
                 }
                 self.arena_expr(Expr::Cast {
+                    source_position,
                     binding: CastBinding::Resolve,
                     operand,
                     type_name,
@@ -1008,7 +1043,7 @@ impl<'a> Parser<'a> {
                     return self.plain_call(name, &[precision]);
                 }
                 if self.peeked == Tok::Op("(") {
-                    return self.call(name, true);
+                    return self.call(name, true, Some(name_at));
                 }
                 // The unmodified SQL-standard temporal spelling keeps its
                 // `WITH[OUT] TIME ZONE` words between the type name and the
@@ -1029,6 +1064,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     let operand = self.arena_expr(Expr::Str(lit))?;
                     return self.arena_expr(Expr::Cast {
+                        source_position,
                         binding: CastBinding::Resolve,
                         operand,
                         type_name: if with_timezone {
@@ -1069,6 +1105,7 @@ impl<'a> Parser<'a> {
                         self.record_catalog_literal(operand, kind)?;
                     }
                     return self.arena_expr(Expr::Cast {
+                        source_position,
                         binding: CastBinding::Resolve,
                         operand,
                         type_name: name,
@@ -1089,7 +1126,7 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
-                        return self.call(routine, false);
+                        return self.call(routine, false, Some(name_at));
                     }
                     // A third part makes it `schema.table.column`.
                     if self.peeked == Tok::Op(".") {
@@ -1145,6 +1182,7 @@ impl<'a> Parser<'a> {
                         kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position,
                         name,
                         args: &[],
                         argument_names: &[],
@@ -1181,9 +1219,10 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::QuotedIdent(name) => {
+                let name_at = self.peek_at;
                 self.advance()?;
                 if self.peeked == Tok::Op("(") {
-                    return self.call(name, false);
+                    return self.call(name, false, Some(name_at));
                 }
                 if self.peeked == Tok::Op(".") {
                     self.advance()?;
@@ -1199,7 +1238,7 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
-                        return self.call(routine, false);
+                        return self.call(routine, false, Some(name_at));
                     }
                     if self.peeked == Tok::Op(".") {
                         self.record_namespace(namespace_source)?;
@@ -1248,7 +1287,7 @@ impl<'a> Parser<'a> {
             Tok::Op(operator) if !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | "=") => {
                 self.advance()?;
                 let operand = self.expression(6)?;
-                self.catalog_prefix_operator_expr(None, operator, operand)
+                self.catalog_prefix_operator_expr(source_position, None, operator, operand)
             }
             _ => Err(self.unexpected("expected an expression")),
         }
@@ -1259,11 +1298,13 @@ impl<'a> Parser<'a> {
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name,
             args,
             argument_names: &[],
@@ -1463,6 +1504,7 @@ impl<'a> Parser<'a> {
     /// KEYS])`. It is represented as an internal ordinary call so all existing
     /// expression walkers retain the argument and its exactly-once evaluation.
     fn sql_json_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         self.expect_op("(")?;
         let input = self.expression(0)?;
         if self.eat_ident("format")? {
@@ -1487,6 +1529,7 @@ impl<'a> Parser<'a> {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name: if unique { "__json_unique" } else { "__json" },
             args: self.arena_slice(&[input])?,
             argument_names: &[],
@@ -1547,6 +1590,7 @@ impl<'a> Parser<'a> {
         args: &[&'a Expr<'a>],
         type_mod: i32,
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let name = match (family, option, result) {
             ("array", true, "json") => "__json_array_absent_json",
             ("array", true, "jsonb") => "__json_array_absent_jsonb",
@@ -1571,6 +1615,7 @@ impl<'a> Parser<'a> {
             return Ok(call);
         }
         self.arena_expr(Expr::Cast {
+            source_position,
             binding: CastBinding::Resolve,
             operand: call,
             type_name,
@@ -1708,6 +1753,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sql_json_serialize(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         self.expect_op("(")?;
         let input = self.expression(0)?;
         if self.eat_ident("format")? {
@@ -1735,6 +1781,7 @@ impl<'a> Parser<'a> {
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
             return self.arena_expr(Expr::Cast {
+                source_position,
                 binding: CastBinding::Resolve,
                 operand: call,
                 type_name,
@@ -1793,6 +1840,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sql_json_value(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         self.expect_op("(")?;
         let null = self.arena_expr(Expr::Null)?;
         let mut args = ArenaList::new(self.arena);
@@ -1856,6 +1904,7 @@ impl<'a> Parser<'a> {
         self.push(&mut args, type_mod_expr)?;
         let call = self.plain_call("__json_value", args.as_slice())?;
         self.arena_expr(Expr::Cast {
+            source_position,
             binding: CastBinding::Resolve,
             operand: call,
             type_name,
@@ -1864,6 +1913,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sql_json_query(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         self.expect_op("(")?;
         let null = self.arena_expr(Expr::Null)?;
         let mut args = ArenaList::new(self.arena);
@@ -1978,6 +2028,7 @@ impl<'a> Parser<'a> {
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
             return self.arena_expr(Expr::Cast {
+                source_position,
                 binding: CastBinding::Resolve,
                 operand: call,
                 type_name,
@@ -1993,6 +2044,7 @@ impl<'a> Parser<'a> {
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
             kind: if crate::sql::eval::sql_syntax_call_name(name) {
@@ -2002,6 +2054,7 @@ impl<'a> Parser<'a> {
             },
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name,
             args,
             argument_names: &[],
@@ -2014,7 +2067,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn call(&mut self, name: &'a str, syntax: bool) -> Result<&'a Expr<'a>, ParseError> {
+    pub(super) fn call(
+        &mut self,
+        name: &'a str,
+        syntax: bool,
+        source_position: Option<usize>,
+    ) -> Result<&'a Expr<'a>, ParseError> {
         let kind = if syntax
             && matches!(
                 name,
@@ -2190,6 +2248,7 @@ impl<'a> Parser<'a> {
                 kind,
                 bound_oid: None,
                 bound_strict: None,
+                source_position: crate::sql::ast::SourcePosition::new(source_position),
                 name,
                 args: &[],
                 argument_names: &[],
@@ -2321,6 +2380,7 @@ impl<'a> Parser<'a> {
             kind,
             bound_oid: None,
             bound_strict: None,
+            source_position: crate::sql::ast::SourcePosition::new(source_position),
             name,
             args,
             argument_names,
@@ -2334,6 +2394,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sql_json_array_aggregate(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let value = self.expression(0)?;
         let value = self.sql_json_format_argument(value)?;
         let order_by = if self.eat_ident("order")? {
@@ -2361,6 +2422,7 @@ impl<'a> Parser<'a> {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name: match (absent, result == "jsonb") {
                 (true, false) => "__json_arrayagg_absent_json",
                 (false, false) => "__json_arrayagg_null_json",
@@ -2380,6 +2442,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sql_json_object_aggregate(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let key = self.expression(0)?;
         if !self.eat_ident("value")? && !self.eat_op(":")? {
             return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECTAGG"));
@@ -2416,6 +2479,7 @@ impl<'a> Parser<'a> {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name: match (absent, unique, result == "jsonb") {
                 (false, false, false) => "__json_objectagg_null_json",
                 (true, false, false) => "__json_objectagg_absent_json",
@@ -2445,11 +2509,13 @@ impl<'a> Parser<'a> {
         type_name: &'a str,
         type_mod: i32,
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         if result == "bytea" {
             return self.plain_call("__json_serialize_bytea", &[aggregate]);
         }
         if result == "text" {
             return self.arena_expr(Expr::Cast {
+                source_position,
                 binding: CastBinding::Resolve,
                 operand: aggregate,
                 type_name,
@@ -2479,6 +2545,7 @@ impl<'a> Parser<'a> {
     /// Builds an expression for an explicit `OPERATOR(operator)` symbol.
     pub(super) fn build_operator(
         &self,
+        source_position: SourcePosition,
         schema: Option<&'a str>,
         operator: &'a str,
         left: &'a Expr<'a>,
@@ -2495,7 +2562,7 @@ impl<'a> Parser<'a> {
             });
         }
         if schema.is_some() {
-            return self.catalog_operator_expr(schema, operator, left, right);
+            return self.catalog_operator_expr(source_position, schema, operator, left, right);
         }
         let bop = match operator {
             "=" => BinaryOp::Eq,
@@ -2512,9 +2579,10 @@ impl<'a> Parser<'a> {
             "||" => BinaryOp::Concat,
             "@@" | "@@@" => BinaryOp::TextSearchMatch,
             "<->" => BinaryOp::TextSearchPhrase,
-            _ => return self.catalog_operator_expr(schema, operator, left, right),
+            _ => return self.catalog_operator_expr(source_position, schema, operator, left, right),
         };
         self.arena_expr(Expr::Binary {
+            source_position,
             operator: bop,
             left,
             right,
@@ -2523,6 +2591,7 @@ impl<'a> Parser<'a> {
 
     fn catalog_operator_expr(
         &self,
+        source_position: SourcePosition,
         schema: Option<&'a str>,
         operator: &'a str,
         left: &'a Expr<'a>,
@@ -2547,6 +2616,7 @@ impl<'a> Parser<'a> {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name,
             args,
             argument_names: &[],
@@ -2561,6 +2631,7 @@ impl<'a> Parser<'a> {
 
     fn catalog_prefix_operator_expr(
         &self,
+        source_position: SourcePosition,
         schema: Option<&'a str>,
         operator: &'a str,
         operand: &'a Expr<'a>,
@@ -2583,6 +2654,7 @@ impl<'a> Parser<'a> {
             kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position,
             name,
             args: self.arena_slice(&[operand])?,
             argument_names: &[],
@@ -2719,6 +2791,7 @@ impl<'a> Parser<'a> {
         schema: &str,
         name: &'a str,
     ) -> Result<Option<&'a Expr<'a>>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         if schema != "pg_catalog" || crate::sql::types::ColType::from_sql_name(name).is_none() {
             return Ok(None);
         }
@@ -2750,6 +2823,7 @@ impl<'a> Parser<'a> {
             self.record_catalog_literal(operand, kind)?;
         }
         self.arena_expr(Expr::Cast {
+            source_position,
             binding: CastBinding::Resolve,
             operand,
             type_name: name,
@@ -2798,6 +2872,7 @@ impl<'a> Parser<'a> {
     }
 
     fn modified_typed_literal(&mut self, mut name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let type_mod = if name.eq_ignore_ascii_case("float") {
             name = self.float_precision_type()?;
             -1
@@ -2835,6 +2910,7 @@ impl<'a> Parser<'a> {
         };
         let operand = self.arena_expr(Expr::Str(literal))?;
         self.arena_expr(Expr::Cast {
+            source_position,
             binding: CastBinding::Resolve,
             operand,
             type_name: name,
@@ -3084,6 +3160,7 @@ impl<'a> Parser<'a> {
         right: &'a Expr<'a>,
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(self.peek_at));
         let l_null = self.arena_expr(Expr::IsNull {
             operand: left,
             negated: false,
@@ -3093,11 +3170,13 @@ impl<'a> Parser<'a> {
             negated: false,
         })?;
         let both = self.arena_expr(Expr::Binary {
+            source_position,
             operator: BinaryOp::And,
             left: l_null,
             right: r_null,
         })?;
         let either = self.arena_expr(Expr::Binary {
+            source_position,
             operator: BinaryOp::Or,
             left: l_null,
             right: r_null,
@@ -3108,6 +3187,7 @@ impl<'a> Parser<'a> {
             BinaryOp::NotEq
         };
         let cmp = self.arena_expr(Expr::Binary {
+            source_position,
             operator: cmp_op,
             left,
             right,

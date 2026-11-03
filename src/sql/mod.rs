@@ -68,6 +68,7 @@ mod timezone_abbreviation_data;
 pub mod to_char;
 pub(crate) mod two_phase;
 pub mod txn;
+pub(crate) mod type_input_plans;
 pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
 pub mod types;
@@ -559,6 +560,12 @@ pub(crate) enum CopyFinishMode {
 struct CommandSnapshot {
     lease: Option<crate::storage::StatementSnapshotLease>,
     _files: Option<crate::storage::StatementFileScope>,
+}
+
+struct RoutineBodyInputs<'a> {
+    owner: type_input_plans::Owner,
+    source: type_inputs::Source,
+    bindings: &'a [type_inputs::Binding<'a>],
 }
 
 /// The query engine: catalog, memtable storage, WAL, object-storage
@@ -5573,7 +5580,7 @@ impl Engine {
             }
             DdlUndo::ViewChanged(publication) => self
                 .storage
-                .validate_view_publication(*publication, txn.txid),
+                .validate_view_publication(publication.clone(), txn.txid),
             DdlUndo::ViewDropped(undo) => self.storage.validate_view_drop(*undo, txn.txid),
             DdlUndo::RuleChanged { publication, .. } => self
                 .storage
@@ -7122,7 +7129,7 @@ impl Engine {
                 }
                 DdlUndo::TableAltered(_) => {}
                 DdlUndo::ViewChanged(publication) => self.storage.finish_view_publication(
-                    *publication,
+                    publication.clone(),
                     crate::storage::CatalogDdlDecision::Commit,
                 ),
                 DdlUndo::ViewDropped(undo) => self.storage.commit_view_drop(*undo),
@@ -7597,13 +7604,13 @@ impl Engine {
             DdlUndo::ForeignOwnerChanged { class, slot, .. } => Some((class, slot)),
             _ => None,
         };
-        for (position, undo) in txn.ddl().iter().copied().enumerate() {
+        for (position, undo) in txn.ddl().iter().cloned().enumerate() {
             let Some((class, slot)) = foreign_target(undo) else {
                 continue;
             };
             if txn.ddl()[position + 1..]
                 .iter()
-                .copied()
+                .cloned()
                 .filter_map(foreign_target)
                 .any(|later| later == (class, slot))
             {
@@ -8310,7 +8317,7 @@ impl Engine {
                 .restore_pending(table as usize, rowid, txn.txid, prior);
         }
         for index in (mark.ddl..txn.ddl().len()).rev() {
-            self.rollback_ddl(txn.ddl()[index], txn.txid);
+            self.rollback_ddl(txn.ddl()[index].clone(), txn.txid);
         }
         for index in (mark.statistics..txn.statistics_undo().len()).rev() {
             match txn.statistics_undo()[index] {
@@ -8356,7 +8363,7 @@ impl Engine {
                 .restore_pending(table as usize, rowid, txn.txid, prior);
         }
         for i in (sp.ddl_mark..txn.ddl().len()).rev() {
-            self.rollback_ddl(txn.ddl()[i], txn.txid);
+            self.rollback_ddl(txn.ddl()[i].clone(), txn.txid);
         }
         for i in (sp.statistics_mark..txn.statistics_undo().len()).rev() {
             match txn.statistics_undo()[i] {
@@ -9527,6 +9534,15 @@ impl Engine {
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
         }
         if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = query::capture_contextual_type_inputs(
+            &parser,
+            &statement,
+            &self.storage,
+            txn.txid,
+            arena,
+        ) {
             return Ok(Err(error));
         }
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
@@ -11153,7 +11169,7 @@ impl Engine {
         let mut statement_count = 0usize;
         loop {
             let source_start = parser.source_position();
-            let input_start = parser.type_input_candidates().len();
+            let input_start = parser.string_literals().len();
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
                     debug_assert!(statement_count < statements.len());
@@ -11161,7 +11177,7 @@ impl Engine {
                         statement,
                         source_start,
                         parser.source_position(),
-                        parser.type_input_candidates().len() != input_start,
+                        parser.string_literals().len() != input_start,
                     ));
                     statement_count += 1;
                 }
@@ -11350,27 +11366,32 @@ impl Engine {
             let output_mark = responder.buffer.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-            let outcome = match self.storage.begin_advisory_statement() {
-                Ok(()) => type_inputs::with_source(
-                    type_inputs::Source::RootCommand {
-                        statement: statement_index,
-                    },
-                    source,
-                    source_bindings,
-                    || {
-                        self.execute_stmt(
-                            statement,
-                            arena,
-                            NO_PARAMS,
-                            txn,
-                            sqlprep,
-                            cursors,
-                            guc,
-                            routine_transaction_context,
-                            responder,
-                        )
-                    },
-                )?,
+            let plan_owner = sqlprep
+                .transient_owner(statement_index)
+                .and_then(|owner| self.storage.begin_advisory_statement().map(|()| owner));
+            let outcome = match plan_owner {
+                Ok(owner) => type_input_plans::with_owner(owner, || {
+                    type_inputs::with_source(
+                        type_inputs::Source::RootCommand {
+                            statement: statement_index,
+                        },
+                        source,
+                        source_bindings,
+                        || {
+                            self.execute_stmt(
+                                statement,
+                                arena,
+                                NO_PARAMS,
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                routine_transaction_context,
+                                responder,
+                            )
+                        },
+                    )
+                })?,
                 Err(error) => Err(error),
             };
             let outcome = outcome
@@ -11394,6 +11415,14 @@ impl Engine {
                 .and_then(|()| query::check_timeout())
                 .and_then(|()| sequence_scope.finish(guc.seq_session()));
             if let Err(mut e) = outcome {
+                if (e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                    && txn.staged_commit().is_none()
+                    && txn.commit_admission().is_none()
+                    && let Err(error) = sequence::ensure_statement_effects_replayable()
+                {
+                    e = error;
+                }
                 if self.fatal_commit_failure.is_some() {
                     responder.error(
                         sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
@@ -11582,26 +11611,32 @@ impl Engine {
                     txn.failed = true;
                 } else {
                     self.rollback_txn(txn, guc);
+                    cursors.on_rollback();
                 }
                 sqlprep.clear_request_type_inputs();
                 responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExtendedExecutionStatus::Complete(false));
             }
         };
-        let result = self.execute_extended_selected(
-            text,
-            arena,
-            params,
-            parameter_type_oids,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            responder,
-            conn_id,
-            lock_timeout_expired,
-            bound_inputs,
-        );
+        let owner = sqlprep
+            .transient_owner(0)
+            .expect("root input admission retains its transient plan");
+        let result = type_input_plans::with_owner(owner, || {
+            self.execute_extended_selected(
+                text,
+                arena,
+                params,
+                parameter_type_oids,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+                conn_id,
+                lock_timeout_expired,
+                bound_inputs,
+            )
+        });
         if !matches!(result, Ok(ExtendedExecutionStatus::Blocked { .. })) {
             sqlprep.clear_request_type_inputs();
         }
@@ -11838,6 +11873,14 @@ impl Engine {
                             Ok(ExtendedExecutionStatus::Complete(true))
                         }
                         Err(mut e) => {
+                            if (e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                                && txn.staged_commit().is_none()
+                                && txn.commit_admission().is_none()
+                                && let Err(error) = sequence::ensure_statement_effects_replayable()
+                            {
+                                e = error;
+                            }
                             if self.fatal_commit_failure.is_some() {
                                 responder.error(
                                     sqlstate::TRANSACTION_RESOLUTION_UNKNOWN,
@@ -12088,239 +12131,279 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<Result<&'a [u8], SqlError>, WireFull> {
         self.bind_query_connection(conn_id);
-        let result = type_inputs::with_source(source, text, &[], || {
-            let mut progress = None;
-            let previous = match sqlprep.request_type_inputs(source, text) {
-                Ok(Some((bytes, saved))) => {
-                    progress = Some(saved);
-                    if saved.complete {
-                        return Ok(arena
-                            .alloc_slice_copy(bytes)
-                            .map(|bytes| &*bytes)
-                            .map_err(|_| eval::arena_full()));
-                    }
-                    let bytes = match arena.alloc_slice_copy(bytes) {
-                        Ok(bytes) => &*bytes,
-                        Err(_) => return Ok(Err(eval::arena_full())),
-                    };
-                    match type_inputs::decode(bytes, arena) {
-                        Ok(bindings) => bindings,
-                        Err(error) => return Ok(Err(error)),
-                    }
-                }
-                Ok(None) => &[],
-                Err(error) => return Ok(Err(error)),
-            };
-            let mut parser = match Parser::new(text, arena) {
-                Ok(parser) => parser,
-                Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-            };
-            parser.capture_type_inputs();
-            loop {
-                match parser.next_stmt() {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-                }
-            }
-            if parser.type_input_candidates().is_empty() {
-                return Ok(Ok(&[]));
-            }
-            if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
-                return Ok(Err(error));
-            }
-            guc.refresh_identities(&self.storage, txn.txid);
-            eval::funcs::system::set_session_user(guc.session_identity());
-            eval::funcs::system::set_current_user(guc.current_identity());
-            let role = guc.current_role();
-            if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
-                return Ok(Err(error));
-            }
-            timezone::set_session(guc.timezone());
-            let mut progress = progress.unwrap_or(prep::RequestInputProgress {
-                next: 0,
-                waiting: None,
-                complete: false,
-                mark: txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark()),
-            });
-            if !txn.owns_statement_mark(progress.mark) {
+        let statement = match source {
+            type_inputs::Source::RootCommand { statement } => statement,
+            _ => {
                 return Ok(Err(sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "active type input lost its transaction"
+                    sqlstate::INTERNAL_ERROR,
+                    "root input preparation requires a root command source"
                 )));
             }
-            txn.begin_statement_clock();
-            if let Some(deadline) = txn.suspended_statement_deadline() {
-                query::restore_statement_deadline(deadline);
-            } else {
-                query::arm_timeout(guc.statement_timeout_ms());
-            }
-            let candidates = parser.type_input_candidates();
-            let bindings =
-                match arena.alloc_slice_with(candidates.len(), |_| type_inputs::Binding {
-                    start: 0,
-                    end: 0,
-                    kind: type_inputs::InputKind::ExplicitCast,
-                    type_oid: 0,
-                    type_mod: -1,
-                    collation: None,
-                    encoded: &[],
-                }) {
-                    Ok(bindings) => bindings,
-                    Err(_) => return Ok(Err(eval::arena_full())),
+        };
+        let owner = match sqlprep.transient_owner(statement) {
+            Ok(owner) => owner,
+            Err(error) => return Ok(Err(error)),
+        };
+        let result = type_input_plans::with_owner(owner, || {
+            type_inputs::with_source(source, text, &[], || {
+                let mut progress = None;
+                let previous = match sqlprep.request_type_inputs(source, text) {
+                    Ok(Some((bytes, saved))) => {
+                        progress = Some(saved);
+                        if saved.complete {
+                            return Ok(arena
+                                .alloc_slice_copy(bytes)
+                                .map(|bytes| &*bytes)
+                                .map_err(|_| eval::arena_full()));
+                        }
+                        let bytes = match arena.alloc_slice_copy(bytes) {
+                            Ok(bytes) => &*bytes,
+                            Err(_) => return Ok(Err(eval::arena_full())),
+                        };
+                        match type_inputs::decode(bytes, arena) {
+                            Ok(bindings) => bindings,
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                    Ok(None) => &[],
+                    Err(error) => return Ok(Err(error)),
                 };
-            if progress.next > candidates.len() || previous.len() > bindings.len() {
-                return Ok(Err(sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "invalid active type-input progress"
-                )));
-            }
-            bindings[..previous.len()].copy_from_slice(previous);
-            let mut count = previous.len();
-            let effect_reads = self
-                .ckpt
-                .as_ref()
-                .map(Checkpointer::deferred_atomic_block_read_scope);
-            let _effects = query::enter_statement_read_effect_scope(effect_reads.as_ref());
-            for (index, candidate) in candidates.iter().enumerate().skip(progress.next) {
-                let target = type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate);
-                let pending = target.map(|target| prep::PendingTypeInput {
-                    start: candidate.start,
-                    end: candidate.end,
-                    kind: candidate.kind,
-                    target,
+                let mut parser = match Parser::new(text, arena) {
+                    Ok(parser) => parser,
+                    Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+                };
+                guc.refresh_identities(&self.storage, txn.txid);
+                eval::funcs::system::set_session_user(guc.session_identity());
+                eval::funcs::system::set_current_user(guc.current_identity());
+                let role = guc.current_role();
+                if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
+                    return Ok(Err(error));
+                }
+                timezone::set_session(guc.timezone());
+                parser.capture_type_inputs();
+                loop {
+                    match parser.next_stmt() {
+                        Ok(Some(statement)) => {
+                            if let Err(error) = query::capture_contextual_type_inputs(
+                                &parser,
+                                &statement,
+                                &self.storage,
+                                txn.txid,
+                                arena,
+                            ) {
+                                return Ok(Err(error));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+                    }
+                }
+                if parser.type_input_candidates().is_empty() {
+                    return Ok(Ok(&[]));
+                }
+                if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
+                    return Ok(Err(error));
+                }
+                let mut progress = progress.unwrap_or(prep::RequestInputProgress {
+                    next: 0,
+                    waiting: None,
+                    complete: false,
+                    mark: txn
+                        .statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark()),
                 });
-                if progress.waiting.is_some() && progress.waiting != pending {
-                    sequence::finish_statement(guc.seq_session());
-                    self.rollback_waiting_statement(txn, progress.mark);
-                    txn.release_suspended_statement();
+                if !txn.owns_statement_mark(progress.mark) {
                     return Ok(Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
-                        "active type input changed while waiting"
+                        "active type input lost its transaction"
                     )));
                 }
-                if target.is_none() {
-                    continue;
+                txn.begin_statement_clock();
+                if let Some(deadline) = txn.suspended_statement_deadline() {
+                    query::restore_statement_deadline(deadline);
+                } else {
+                    query::arm_timeout(guc.statement_timeout_ms());
                 }
-                let mark =
-                    txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                let settings = guc.statement_settings();
-                let descriptors = match txn.statement_large_object_descriptors(arena) {
-                    Ok(descriptors) => descriptors,
-                    Err(error) => {
+                let candidates = parser.type_input_candidates();
+                let bindings =
+                    match arena.alloc_slice_with(candidates.len(), |_| type_inputs::Binding {
+                        start: 0,
+                        end: 0,
+                        kind: type_inputs::InputKind::ExplicitCast,
+                        type_oid: 0,
+                        type_mod: -1,
+                        collation: None,
+                        encoded: &[],
+                    }) {
+                        Ok(bindings) => bindings,
+                        Err(_) => return Ok(Err(eval::arena_full())),
+                    };
+                if progress.next > candidates.len() || previous.len() > bindings.len() {
+                    return Ok(Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "invalid active type-input progress"
+                    )));
+                }
+                bindings[..previous.len()].copy_from_slice(previous);
+                let mut count = previous.len();
+                let effect_reads = self
+                    .ckpt
+                    .as_ref()
+                    .map(Checkpointer::deferred_atomic_block_read_scope);
+                let _effects = query::enter_statement_read_effect_scope(effect_reads.as_ref());
+                for (index, candidate) in candidates.iter().enumerate().skip(progress.next) {
+                    let target =
+                        type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate);
+                    let pending = target.map(|target| prep::PendingTypeInput {
+                        start: candidate.start,
+                        end: candidate.end,
+                        kind: candidate.kind,
+                        target,
+                    });
+                    if progress.waiting.is_some() && progress.waiting != pending {
+                        sequence::finish_statement(guc.seq_session());
                         self.rollback_waiting_statement(txn, progress.mark);
                         txn.release_suspended_statement();
-                        return Ok(Err(error));
+                        return Ok(Err(sql_err!(
+                            sqlstate::SERIALIZATION_FAILURE,
+                            "active type input changed while waiting"
+                        )));
                     }
-                };
-                let sequence_scope =
-                    sequence::enter_statement(arena, guc.seq_session(), progress.waiting.is_some());
-                let output_mark = responder.buffer.mark();
-                let result = if lock_timeout_expired {
-                    Ok(Err(sql_err!(
-                        sqlstate::LOCK_NOT_AVAILABLE,
-                        "canceling statement due to lock timeout"
-                    )))
-                } else if let Err(error) =
-                    query::check_timeout().and_then(|()| self.storage.begin_advisory_statement())
-                {
-                    Ok(Err(error))
-                } else {
-                    self.bind_type_inputs(
-                        core::slice::from_ref(candidate),
-                        arena,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                    )
-                };
-                match result {
-                    Ok(Ok(value)) => {
-                        if let Err(error) = sequence_scope.finish(guc.seq_session()) {
+                    if target.is_none() {
+                        continue;
+                    }
+                    let mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+                    let settings = guc.statement_settings();
+                    let descriptors = match txn.statement_large_object_descriptors(arena) {
+                        Ok(descriptors) => descriptors,
+                        Err(error) => {
                             self.rollback_waiting_statement(txn, progress.mark);
                             txn.release_suspended_statement();
                             return Ok(Err(error));
                         }
-                        debug_assert_eq!(value.len(), 1);
-                        bindings[count] = value[0];
-                        count += 1;
-                        bindings[..count].sort_unstable_by_key(|binding| {
-                            (binding.start, binding.end, binding.kind)
-                        });
-                        progress.next = index + 1;
-                        progress.waiting = None;
-                        txn.release_suspended_statement();
-                        if let Err(error) = sqlprep.save_request_input_progress(
-                            source,
-                            text,
-                            &bindings[..count],
-                            progress,
-                        ) {
-                            self.rollback_waiting_statement(txn, progress.mark);
-                            return Ok(Err(error));
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        responder.buffer.truncate_to(output_mark);
-                        if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
-                        {
-                            self.storage.preserve_advisory_statement();
-                            self.rollback_waiting_statement(txn, mark);
-                            guc.restore_statement_settings(settings);
-                            txn.restore_statement_large_object_descriptors(descriptors);
-                            txn.suspend_statement(
-                                None,
-                                datetime::statement_clock(),
-                                query::statement_deadline(),
-                                exec::PlpgsqlTransactionContext::Atomic,
-                            );
-                            progress.next = index;
-                            progress.waiting = pending;
+                    };
+                    let sequence_scope = sequence::enter_statement(
+                        arena,
+                        guc.seq_session(),
+                        progress.waiting.is_some(),
+                    );
+                    let output_mark = responder.buffer.mark();
+                    let result = if lock_timeout_expired {
+                        Ok(Err(sql_err!(
+                            sqlstate::LOCK_NOT_AVAILABLE,
+                            "canceling statement due to lock timeout"
+                        )))
+                    } else if let Err(error) = query::check_timeout()
+                        .and_then(|()| self.storage.begin_advisory_statement())
+                    {
+                        Ok(Err(error))
+                    } else {
+                        self.bind_type_inputs(
+                            core::slice::from_ref(candidate),
+                            arena,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                        )
+                    };
+                    match result {
+                        Ok(Ok(value)) => {
+                            if let Err(error) = sequence_scope.finish(guc.seq_session()) {
+                                self.rollback_waiting_statement(txn, progress.mark);
+                                txn.release_suspended_statement();
+                                return Ok(Err(error));
+                            }
+                            debug_assert_eq!(value.len(), 1);
+                            bindings[count] = value[0];
+                            count += 1;
+                            bindings[..count].sort_unstable_by_key(|binding| {
+                                (binding.start, binding.end, binding.kind)
+                            });
+                            progress.next = index + 1;
+                            progress.waiting = None;
+                            txn.release_suspended_statement();
                             if let Err(error) = sqlprep.save_request_input_progress(
                                 source,
                                 text,
                                 &bindings[..count],
                                 progress,
                             ) {
+                                self.rollback_waiting_statement(txn, progress.mark);
+                                return Ok(Err(error));
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            responder.buffer.truncate_to(output_mark);
+                            let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                            {
+                                match sequence::ensure_statement_effects_replayable() {
+                                    Ok(()) => error,
+                                    Err(error) => error,
+                                }
+                            } else {
+                                error
+                            };
+                            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                            {
+                                self.storage.preserve_advisory_statement();
+                                self.rollback_waiting_statement(txn, mark);
+                                guc.restore_statement_settings(settings);
+                                txn.restore_statement_large_object_descriptors(descriptors);
+                                txn.suspend_statement(
+                                    None,
+                                    datetime::statement_clock(),
+                                    query::statement_deadline(),
+                                    exec::PlpgsqlTransactionContext::Atomic,
+                                );
+                                progress.next = index;
+                                progress.waiting = pending;
+                                if let Err(error) = sqlprep.save_request_input_progress(
+                                    source,
+                                    text,
+                                    &bindings[..count],
+                                    progress,
+                                ) {
+                                    sequence_scope.discard(guc.seq_session());
+                                    self.rollback_waiting_statement(txn, progress.mark);
+                                    txn.release_suspended_statement();
+                                    return Ok(Err(error));
+                                }
+                            } else {
                                 sequence_scope.discard(guc.seq_session());
                                 self.rollback_waiting_statement(txn, progress.mark);
                                 txn.release_suspended_statement();
-                                return Ok(Err(error));
                             }
-                        } else {
+                            return Ok(Err(error));
+                        }
+                        Err(error) => {
                             sequence_scope.discard(guc.seq_session());
                             self.rollback_waiting_statement(txn, progress.mark);
                             txn.release_suspended_statement();
+                            return Err(error);
                         }
-                        return Ok(Err(error));
-                    }
-                    Err(error) => {
-                        sequence_scope.discard(guc.seq_session());
-                        self.rollback_waiting_statement(txn, progress.mark);
-                        txn.release_suspended_statement();
-                        return Err(error);
                     }
                 }
-            }
-            let bindings = &bindings[..count];
-            progress.complete = true;
-            progress.waiting = None;
-            let encoded = (|| {
-                let length = type_inputs::encoded_len(bindings)?;
-                let bytes = arena
-                    .alloc_slice_with(length, |_| 0u8)
-                    .map_err(|_| eval::arena_full())?;
-                type_inputs::encode_into(bindings, bytes)?;
-                sqlprep.save_request_input_progress(source, text, bindings, progress)?;
-                Ok(&*bytes)
-            })();
-            if encoded.is_err() {
-                self.rollback_waiting_statement(txn, progress.mark);
-            }
-            Ok(encoded)
+                let bindings = &bindings[..count];
+                progress.complete = true;
+                progress.waiting = None;
+                let encoded = (|| {
+                    let length = type_inputs::encoded_len(bindings)?;
+                    let bytes = arena
+                        .alloc_slice_with(length, |_| 0u8)
+                        .map_err(|_| eval::arena_full())?;
+                    type_inputs::encode_into(bindings, bytes)?;
+                    sqlprep.save_request_input_progress(source, text, bindings, progress)?;
+                    Ok(&*bytes)
+                })();
+                if encoded.is_err() {
+                    self.rollback_waiting_statement(txn, progress.mark);
+                }
+                Ok(encoded)
+            })
         });
         query::disarm_timeout();
         result
@@ -12438,6 +12521,8 @@ impl Engine {
             count += 1;
         }
         drop(snapshot);
+        bindings[..count]
+            .sort_unstable_by_key(|binding| (binding.start, binding.end, binding.kind));
         Ok(Ok(&bindings[..count]))
     }
 
@@ -13272,14 +13357,6 @@ impl Engine {
             let path =
                 storage.compute_path(definition.creation_path.as_str(), user.as_str(), txn.txid);
             let sql = definition.condition_sql().expect("qualified rule");
-            let sql = match arena.alloc_str(sql) {
-                Ok(sql) => sql,
-                Err(_) => return Ok(Err(query::arena_full_pub())),
-            };
-            let parsed = match parser::parse_expr(sql, arena) {
-                Ok(parsed) => parsed,
-                Err(error) => return Ok(Err(error)),
-            };
             let binding = if insert_event {
                 (transition.names, transition.old, transition.new)
             } else {
@@ -13292,6 +13369,17 @@ impl Engine {
             let dependencies = match storage.snapshot_rule_dependencies(rule_slot, txn.txid, arena)
             {
                 Ok(dependencies) => dependencies,
+                Err(error) => return Ok(Err(error)),
+            };
+            let parsed = match query::parse_stored_rule_expression(
+                &definition,
+                sql,
+                storage,
+                txn.txid,
+                dependencies.view(),
+                arena,
+            ) {
+                Ok(parsed) => parsed,
                 Err(error) => return Ok(Err(error)),
             };
             let condition = match query::expand_stored_rule_expression_exec(
@@ -13320,6 +13408,7 @@ impl Engine {
             let exclusion = match arena.alloc(Expr::Unary {
                 operator: ast::UnaryOp::Not,
                 operand: condition,
+                ..
             }) {
                 Ok(exclusion) => &*exclusion,
                 Err(_) => return Ok(Err(query::arena_full_pub())),
@@ -13398,11 +13487,14 @@ impl Engine {
                     };
                 let condition = match definition.condition_sql() {
                     Some(sql) => {
-                        let sql = match arena.alloc_str(sql) {
-                            Ok(sql) => sql,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
-                        };
-                        let parsed = match parser::parse_expr(sql, arena) {
+                        let parsed = match query::parse_stored_rule_expression(
+                            &definition,
+                            sql,
+                            storage,
+                            txn.txid,
+                            dependencies.view(),
+                            arena,
+                        ) {
                             Ok(parsed) => parsed,
                             Err(error) => return Ok(Err(error)),
                         };
@@ -13434,11 +13526,14 @@ impl Engine {
                 };
                 let mut affected = 0u64;
                 for (action_index, action_sql) in definition.action_sql().enumerate() {
-                    let action_sql = match arena.alloc_str(action_sql) {
-                        Ok(sql) => sql,
-                        Err(_) => return Ok(Err(query::arena_full_pub())),
-                    };
-                    let parsed = match parser::parse_stored_statement(action_sql, arena) {
+                    let parsed = match query::parse_stored_rule_statement(
+                        &definition,
+                        action_sql,
+                        storage,
+                        txn.txid,
+                        dependencies.view(),
+                        arena,
+                    ) {
                         Ok(parsed) => parsed,
                         Err(error) => return Ok(Err(error)),
                     };
@@ -14576,145 +14671,167 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        query::protect_statement_effects();
-        let contract = match pending.target {
-            query::PendingRoutineTarget::Stored(contract) => contract,
-            query::PendingRoutineTarget::Intrinsic(oid) => {
-                let encoded = arena.with_remaining_bytes(|scratch| {
-                    let arguments = scratch
-                        .alloc_slice_with(pending.argument_count, |_| Datum::Null)
-                        .map_err(|_| eval::arena_full())?;
-                    for (index, argument) in arguments.iter_mut().enumerate() {
-                        *argument =
-                            exec::decode_projected_col_record(pending.arguments, index, scratch)?;
-                    }
-                    let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
-                    let statistics_intrinsic = statistics::is_intrinsic(oid);
-                    if !logical_replication_intrinsic
-                        && !statistics_intrinsic
-                        && large_object::is_mutating(oid)
-                    {
-                        self.storage.assign_transaction_identity(txn.txid);
-                    }
-                    let value = if statistics_intrinsic {
-                        statistics::execute(oid, arguments, self, txn)
-                    } else if logical_replication_intrinsic {
-                        logical_replication::execute(oid, arguments, self, txn, scratch)
-                    } else {
-                        large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
-                    }?;
-                    exec::encode_projected_pub(&[value], scratch)
-                });
-                let encoded = match encoded {
-                    Ok(Ok(encoded)) => encoded,
-                    Ok(Err(error)) => return Ok(Err(error)),
-                    Err(error) => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "routine body exceeds statement memory: {}",
-                            error
-                        )));
-                    }
-                };
-                let value = match exec::decode_projected_col_record(encoded, 0, arena) {
-                    Ok(value) => value,
+        let outcome = (|| {
+            query::protect_statement_effects();
+            let contract = match pending.target {
+                query::PendingRoutineTarget::Stored(contract) => contract,
+                query::PendingRoutineTarget::Intrinsic(oid) => {
+                    let encoded = arena.with_remaining_bytes(|scratch| {
+                        let arguments = scratch
+                            .alloc_slice_with(pending.argument_count, |_| Datum::Null)
+                            .map_err(|_| eval::arena_full())?;
+                        for (index, argument) in arguments.iter_mut().enumerate() {
+                            *argument = exec::decode_projected_col_record(
+                                pending.arguments,
+                                index,
+                                scratch,
+                            )?;
+                        }
+                        let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
+                        let statistics_intrinsic = statistics::is_intrinsic(oid);
+                        if !logical_replication_intrinsic
+                            && !statistics_intrinsic
+                            && large_object::is_mutating(oid)
+                        {
+                            self.storage.assign_transaction_identity(txn.txid);
+                        }
+                        let value = if statistics_intrinsic {
+                            statistics::execute(oid, arguments, self, txn, scratch)
+                        } else if logical_replication_intrinsic {
+                            logical_replication::execute(oid, arguments, self, txn, scratch)
+                        } else {
+                            large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
+                        }?;
+                        exec::encode_projected_pub(&[value], scratch)
+                    });
+                    let encoded = match encoded {
+                        Ok(Ok(encoded)) => encoded,
+                        Ok(Err(error)) => return Ok(Err(error)),
+                        Err(error) => {
+                            return Ok(Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "routine body exceeds statement memory: {}",
+                                error
+                            )));
+                        }
+                    };
+                    let value = match exec::decode_projected_col_record(encoded, 0, arena) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    return Ok(invocations.complete(value));
+                }
+            };
+            let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
+                return Ok(Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "pending function with OID {} does not exist",
+                    contract.oid
+                )));
+            };
+            let mut routine = self.storage.routine_for(slot, txn.txid);
+            if let Err(error) = contract.bind(&mut routine) {
+                return Ok(Err(error));
+            }
+            let track = match guc.track_functions() {
+                guc::TrackFunctions::None => false,
+                guc::TrackFunctions::Pl => {
+                    routine.language == crate::storage::RoutineLanguage::PlPgSql
+                }
+                guc::TrackFunctions::All => true,
+            };
+            let timed = statistics::begin_function_timing(track);
+            if track
+                && let Err(error) = self
+                    .storage
+                    .ensure_function_statistics(crate::storage::routine_oid(&routine))
+            {
+                let _ = statistics::finish_function_timing(timed);
+                return Ok(Err(error));
+            }
+            #[expect(
+                clippy::large_enum_variant,
+                reason = "SQL errors remain inline because runtime heap allocation is forbidden"
+            )]
+            enum BodyError {
+                Sql(SqlError),
+                Wire(WireFull),
+            }
+            let set_returning = routine.kind.is_set_returning();
+            let executed = arena.with_remaining_bytes(|scratch| {
+                // Only encoded results survive the body, for owning statement
+                // arenas and borrowed row arenas alike.
+                if set_returning {
+                    let rows = self
+                        .execute_pending_table_routine(
+                            pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                        )
+                        .map_err(BodyError::Wire)?
+                        .map_err(BodyError::Sql)?;
+                    exec::pack_projected_rows(rows, scratch).map_err(BodyError::Sql)
+                } else {
+                    let value = self
+                        .execute_pending_scalar_routine(
+                            pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                        )
+                        .map_err(BodyError::Wire)?
+                        .map_err(BodyError::Sql)?;
+                    exec::encode_projected_pub(&[value], scratch).map_err(BodyError::Sql)
+                }
+            });
+            let executed = match executed {
+                Ok(executed) => executed,
+                Err(error) => Err(BodyError::Sql(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine body exceeds statement memory: {}",
+                    error
+                ))),
+            };
+            let succeeded = executed.is_ok();
+            if let Some((total, own)) = statistics::finish_function_timing(timed)
+                && succeeded
+                && let Err(error) = self.storage.record_function_call(
+                    txn.txid,
+                    crate::storage::routine_oid(&routine),
+                    total,
+                    own,
+                )
+            {
+                return Ok(Err(error));
+            }
+            let encoded = match executed {
+                Ok(encoded) => encoded,
+                Err(BodyError::Sql(error)) => return Ok(Err(error)),
+                Err(BodyError::Wire(error)) => return Err(error),
+            };
+            if set_returning {
+                let rows = match exec::unpack_projected_rows(encoded, arena) {
+                    Ok(rows) => rows,
                     Err(error) => return Ok(Err(error)),
                 };
-                return Ok(invocations.complete(value));
+                return Ok(invocations.complete_rows(rows));
             }
-        };
-        let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
-            return Ok(Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "pending function with OID {} does not exist",
-                contract.oid
-            )));
-        };
-        let mut routine = self.storage.routine_for(slot, txn.txid);
-        if let Err(error) = contract.bind(&mut routine) {
-            return Ok(Err(error));
-        }
-        let track = match guc.track_functions() {
-            guc::TrackFunctions::None => false,
-            guc::TrackFunctions::Pl => routine.language == crate::storage::RoutineLanguage::PlPgSql,
-            guc::TrackFunctions::All => true,
-        };
-        let timed = statistics::begin_function_timing(track);
-        if track
-            && let Err(error) = self
-                .storage
-                .ensure_function_statistics(crate::storage::routine_oid(&routine))
-        {
-            let _ = statistics::finish_function_timing(timed);
-            return Ok(Err(error));
-        }
-        #[expect(
-            clippy::large_enum_variant,
-            reason = "SQL errors remain inline because runtime heap allocation is forbidden"
-        )]
-        enum BodyError {
-            Sql(SqlError),
-            Wire(WireFull),
-        }
-        let set_returning = routine.kind.is_set_returning();
-        let executed = arena.with_remaining_bytes(|scratch| {
-            // Only encoded results survive the body, for owning statement
-            // arenas and borrowed row arenas alike.
-            if set_returning {
-                let rows = self
-                    .execute_pending_table_routine(
-                        pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
-                    )
-                    .map_err(BodyError::Wire)?
-                    .map_err(BodyError::Sql)?;
-                exec::pack_projected_rows(rows, scratch).map_err(BodyError::Sql)
-            } else {
-                let value = self
-                    .execute_pending_scalar_routine(
-                        pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
-                    )
-                    .map_err(BodyError::Wire)?
-                    .map_err(BodyError::Sql)?;
-                exec::encode_projected_pub(&[value], scratch).map_err(BodyError::Sql)
-            }
-        });
-        let executed = match executed {
-            Ok(executed) => executed,
-            Err(error) => Err(BodyError::Sql(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine body exceeds statement memory: {}",
-                error
-            ))),
-        };
-        let succeeded = executed.is_ok();
-        if let Some((total, own)) = statistics::finish_function_timing(timed)
-            && succeeded
-            && let Err(error) = self.storage.record_function_call(
-                txn.txid,
-                crate::storage::routine_oid(&routine),
-                total,
-                own,
-            )
-        {
-            return Ok(Err(error));
-        }
-        let encoded = match executed {
-            Ok(encoded) => encoded,
-            Err(BodyError::Sql(error)) => return Ok(Err(error)),
-            Err(BodyError::Wire(error)) => return Err(error),
-        };
-        if set_returning {
-            let rows = match exec::unpack_projected_rows(encoded, arena) {
-                Ok(rows) => rows,
+            let value = match exec::decode_projected_col_record(encoded, 0, arena) {
+                Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
-            return Ok(invocations.complete_rows(rows));
-        }
-        let value = match exec::decode_projected_col_record(encoded, 0, arena) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
+            Ok(invocations.complete(value))
+        })();
+        let role = eval::funcs::system::current_identity();
+        let role = if matches!(outcome, Ok(Ok(()))) {
+            role.refresh(&self.storage, txn.txid)
+        } else {
+            role
         };
-        Ok(invocations.complete(value))
+        eval::funcs::system::set_current_user(role);
+        timezone::set_session(guc.timezone());
+        let restored = self.publish_session_context(guc, txn, role.as_str());
+        // Cleanup must not replace the body's SQL or wire error.
+        match outcome {
+            Err(error) => Err(error),
+            Ok(Err(error)) => Ok(Err(error)),
+            Ok(Ok(())) => Ok(restored.map(|_| ())),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14801,31 +14918,6 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
-        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-            return Ok(Err(error));
-        }
-        let owner = match self
-            .storage
-            .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
-        {
-            Ok(role) => crate::storage::SessionIdentity::bound(role),
-            Err(error) => return Ok(Err(error)),
-        };
-        let _security = routine
-            .attributes
-            .security_definer
-            .then(|| eval::funcs::system::enter_current_user(owner));
-        let _config = match guc.enter_routine_configs(routine.configs()) {
-            Ok(scope) => scope,
-            Err(error) => return Ok(Err(error)),
-        };
-        let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(),
-            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
-        ) {
-            Ok(scope) => scope,
-            Err(error) => return Ok(Err(error)),
-        };
         let nested_invocations = query::RoutineInvocationState::new(arena);
         nested_invocations.begin_attempt();
         let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
@@ -15058,6 +15150,240 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn prepare_routine_body_inputs<'a>(
+        &mut self,
+        source_position: Option<usize>,
+        slot: usize,
+        routine: &crate::storage::RoutineDef,
+        body: &'a str,
+        arena: &'a Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<RoutineBodyInputs<'a>, SqlError>, WireFull> {
+        use type_input_plans::{InputImage, Key, Lookup, Owner};
+        let routine_oid = crate::storage::routine_oid(routine);
+        let parent = match type_input_plans::owner() {
+            Ok(owner) => owner,
+            Err(error) => return Ok(Err(error)),
+        };
+        let source = match source_position {
+            Some(callsite) => type_inputs::Source::SqlRoutineCallSite {
+                routine_oid,
+                definition_version: routine.version,
+                callsite,
+            },
+            None => type_inputs::Source::UnlocatedRoutineBody {
+                routine_oid,
+                definition_version: routine.version,
+            },
+        };
+        let key = (source_position.is_some() && parent != Owner::Unlocated).then_some(Key {
+            owner: parent,
+            source,
+        });
+        let prior = match key.map(|key| sqlprep.routine_inputs.find(key)).transpose() {
+            Ok(prior) => prior.flatten(),
+            Err(error) => return Ok(Err(error)),
+        };
+        let (plan, ready) = match prior {
+            Some(Lookup::Ready(plan, image)) => (Some(plan), Some(image)),
+            Some(Lookup::Waiting(plan)) => (Some(plan), None),
+            None => (None, None),
+        };
+        let mut captured = None;
+        let mut parser = None;
+        if ready.is_none() {
+            if routine.body_kind != crate::storage::RoutineBodyKind::String {
+                let dependencies = self.storage.routine_dependencies_for(slot, txn.txid);
+                captured = Some(InputImage::Stored(
+                    dependencies
+                        .view()
+                        .type_inputs()
+                        .expect("stored routine dependency images own their inputs")
+                        .clone(),
+                    crate::storage::StoredInputSection::RoutineBody,
+                ));
+            } else {
+                let parsed = (|| {
+                    let name = arena
+                        .alloc_str(routine.name.as_str())
+                        .map_err(|_| eval::arena_full())?;
+                    let mut parser = Parser::new(body, arena)
+                        .and_then(|parser| {
+                            parser.with_routine_parameters(name, routine.arguments())
+                        })
+                        .map_err(|error| parse_error_to_sql(&error))?;
+                    parser.capture_type_inputs();
+                    while let Some(statement) = parser
+                        .next_stmt()
+                        .map_err(|error| parse_error_to_sql(&error))?
+                    {
+                        query::capture_contextual_type_inputs(
+                            &parser,
+                            &statement,
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                        )?;
+                    }
+                    Ok(parser)
+                })();
+                match parsed {
+                    Ok(parsed) => parser = Some(parsed),
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        }
+        let Some(key) = key else {
+            let bindings = match captured {
+                Some(image) => image.bindings(arena),
+                None if parser.as_ref().is_some_and(|parser| {
+                    parser.type_input_candidates().iter().any(|candidate| {
+                        type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate)
+                            .is_some()
+                    })
+                }) =>
+                {
+                    Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "checked SQL routine inputs require a retained source position"
+                    ))
+                }
+                None => Ok(&[][..]),
+            };
+            return Ok(bindings.map(|bindings| RoutineBodyInputs {
+                owner: Owner::Unlocated,
+                source,
+                bindings,
+            }));
+        };
+        let plan = match plan {
+            Some(plan) => plan,
+            None => match sqlprep.routine_inputs.reserve(key) {
+                Ok(plan) => plan,
+                Err(error) => return Ok(Err(error)),
+            },
+        };
+        let bytes = plan.key_bytes();
+        let mut wire_full = false;
+        let result = sequence::statement_effect(
+            sequence::StatementEffectKind::RoutineInput,
+            &[Datum::Bytea(&bytes)],
+            sequence::StatementEffectRetry::Restart,
+            arena,
+            || {
+                let before = txn.transaction_effect_mark();
+                let settings = guc.statement_settings();
+                let advisory = self.storage.advisory_statement_mark();
+                let descriptors = match txn.statement_large_object_descriptors(arena) {
+                    Ok(descriptors) => descriptors,
+                    Err(error) => {
+                        return sequence::StatementEffectAttempt {
+                            result: Err(error),
+                            rewound_state: false,
+                        };
+                    }
+                };
+                let prepared = type_input_plans::with_owner(
+                    Owner::Nested(plan),
+                    || -> Result<(), SqlError> {
+                        if ready.is_some() {
+                            return Ok(());
+                        }
+                        sqlprep.routine_inputs.set_waiting(plan, false)?;
+                        let image = match captured.take() {
+                            Some(image) => image,
+                            None => {
+                                let parser = parser
+                                    .as_ref()
+                                    .expect("string routine input preparation owns its parser");
+                                let bindings = match self.bind_type_inputs(
+                                    parser.type_input_candidates(),
+                                    arena,
+                                    txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder,
+                                ) {
+                                    Ok(result) => result?,
+                                    Err(_) => {
+                                        wire_full = true;
+                                        return Err(sql_err!(
+                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                            "routine input output exceeds the send buffer"
+                                        ));
+                                    }
+                                };
+                                let ordered = arena
+                                    .alloc_slice_copy(bindings)
+                                    .map_err(|_| eval::arena_full())?;
+                                ordered.sort_unstable_by_key(|binding| {
+                                    (binding.start, binding.end, binding.kind)
+                                });
+                                InputImage::Runtime(
+                                    self.storage
+                                        .freeze_runtime_type_inputs(body, ordered, txn.txid)?,
+                                )
+                            }
+                        };
+                        sqlprep.routine_inputs.complete(plan, image)
+                    },
+                );
+                let rewound_state = prepared.is_ok()
+                    && (txn.transaction_effect_mark() != before
+                        || !guc.matches_statement_settings(&settings)
+                        || !txn.matches_statement_large_object_descriptors(descriptors)
+                        || self.storage.advisory_statement_mark() != advisory);
+                if matches!(&prepared, Err(error) if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                {
+                    guc.restore_statement_settings(settings);
+                    txn.restore_statement_large_object_descriptors(descriptors);
+                }
+                sequence::StatementEffectAttempt {
+                    result: prepared.map(|()| &[][..]),
+                    rewound_state,
+                }
+            },
+        );
+        if wire_full {
+            let _ = sqlprep.routine_inputs.abandon(plan);
+            return Err(WireFull);
+        }
+        if let Err(error) = result {
+            if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+            {
+                if let Err(error) = sqlprep.routine_inputs.set_waiting(plan, true) {
+                    return Ok(Err(error));
+                }
+            } else if let Err(error) = sqlprep.routine_inputs.abandon(plan) {
+                return Ok(Err(error));
+            }
+            return Ok(Err(error));
+        }
+        let image = match sqlprep.routine_inputs.find(key) {
+            Ok(Some(Lookup::Ready(found, image))) if found == plan => image,
+            Ok(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine input plan did not finish preparation"
+                )));
+            }
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(image.bindings(arena).map(|bindings| RoutineBodyInputs {
+            owner: Owner::Nested(plan),
+            source,
+            bindings,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn execute_pending_scalar_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation<'a>,
@@ -15082,6 +15408,36 @@ impl Engine {
                 "scalar routine resolved to a set-returning function"
             )));
         }
+        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
+            return Ok(Err(error));
+        }
+        let owner = match self
+            .storage
+            .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
+        {
+            Ok(role) => crate::storage::SessionIdentity::bound(role),
+            Err(error) => return Ok(Err(error)),
+        };
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| eval::funcs::system::enter_current_user(owner));
+        let _config = match guc.enter_routine_configs(routine.configs()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
+        let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(),
+            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
+        let role = eval::funcs::system::current_user_owned();
+        if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
+            return Ok(Err(error));
+        }
+        timezone::set_session(guc.timezone());
         let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if pending.argument_count > arguments.len() {
             return Ok(Err(sql_err!(
@@ -15100,24 +15456,6 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
-                return Ok(Err(error));
-            }
-            let owner = match self
-                .storage
-                .capture_role_slot(routine.ownership.owner_to(txn.txid).into(), txn.txid)
-            {
-                Ok(role) => crate::storage::SessionIdentity::bound(role),
-                Err(error) => return Ok(Err(error)),
-            };
-            let _security = routine
-                .attributes
-                .security_definer
-                .then(|| eval::funcs::system::enter_current_user(owner));
-            let _config = match guc.enter_routine_configs(routine.configs()) {
-                Ok(scope) => scope,
-                Err(error) => return Ok(Err(error)),
-            };
             let value = match exec::execute_plpgsql_function(
                 self,
                 txn,
@@ -15156,6 +15494,21 @@ impl Engine {
                 )));
             }
         };
+        let body_inputs = match self.prepare_routine_body_inputs(
+            pending.source_position,
+            slot,
+            routine,
+            body,
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )? {
+            Ok(inputs) => inputs,
+            Err(error) => return Ok(Err(error)),
+        };
         let program = match query::parse_stored_routine_function_program(
             routine.body_kind,
             body,
@@ -15163,23 +15516,40 @@ impl Engine {
             result_type == ColType::Void,
             routine_name,
             routine.arguments(),
+            body_inputs.bindings,
+            |parser| {
+                if routine.body_kind == crate::storage::RoutineBodyKind::String {
+                    type_inputs::validate_restored(parser, &self.storage, txn.txid)
+                } else {
+                    query::validate_stored_type_inputs(
+                        parser,
+                        &self.storage,
+                        txn.txid,
+                        self.storage.routine_dependencies_for(slot, txn.txid).view(),
+                    )
+                }
+            },
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
         };
-        self.execute_scalar_routine_program(
-            slot,
-            routine,
-            result_type,
-            program,
-            &arguments[..pending.argument_count],
-            arena,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            responder,
-        )
+        type_input_plans::with_owner(body_inputs.owner, || {
+            type_inputs::with_source(body_inputs.source, body, body_inputs.bindings, || {
+                self.execute_scalar_routine_program(
+                    slot,
+                    routine,
+                    result_type,
+                    program,
+                    &arguments[..pending.argument_count],
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )
+            })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15219,6 +15589,18 @@ impl Engine {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
+        let _formal_scope = match exec::enter_routine_parameter_types(
+            routine.arguments(),
+            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
+        let role = eval::funcs::system::current_user_owned();
+        if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
+            return Ok(Err(error));
+        }
+        timezone::set_session(guc.timezone());
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if pending.argument_count > arguments.len() {
@@ -15247,13 +15629,6 @@ impl Engine {
                     )));
                 }
             };
-            let _formal_scope = match exec::enter_routine_parameter_types(
-                routine.arguments(),
-                Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
-            ) {
-                Ok(scope) => scope,
-                Err(error) => return Ok(Err(error)),
-            };
             return Ok(exec::execute_plpgsql_table_function(
                 self, txn, sqlprep, cursors, guc, routine, &*inputs, arena, responder,
             ));
@@ -15277,6 +15652,21 @@ impl Engine {
             }
         };
         let result_type = routine.kind.function_result().expect("set routine result");
+        let body_inputs = match self.prepare_routine_body_inputs(
+            pending.source_position,
+            slot,
+            routine,
+            body,
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )? {
+            Ok(inputs) => inputs,
+            Err(error) => return Ok(Err(error)),
+        };
         let program = match query::parse_stored_routine_function_program(
             routine.body_kind,
             body,
@@ -15284,256 +15674,71 @@ impl Engine {
             result_type == ColType::Void,
             routine_name,
             routine.arguments(),
+            body_inputs.bindings,
+            |parser| {
+                if routine.body_kind == crate::storage::RoutineBodyKind::String {
+                    type_inputs::validate_restored(parser, &self.storage, txn.txid)
+                } else {
+                    query::validate_stored_type_inputs(
+                        parser,
+                        &self.storage,
+                        txn.txid,
+                        self.storage.routine_dependencies_for(slot, txn.txid).view(),
+                    )
+                }
+            },
         ) {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
         };
-        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        if pending.argument_count > arguments.len() {
-            return Ok(Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many function arguments"
-            )));
-        }
-        for (index, argument) in arguments
-            .iter_mut()
-            .enumerate()
-            .take(pending.argument_count)
-        {
-            *argument = match exec::decode_projected_col_record(pending.arguments, index, arena) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-        }
-        let _formal_scope = match exec::enter_routine_parameter_types(
-            routine.arguments(),
-            Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
-        ) {
-            Ok(scope) => scope,
-            Err(error) => return Ok(Err(error)),
-        };
-        let nested_invocations = query::RoutineInvocationState::new(arena);
-        nested_invocations.begin_attempt();
-        let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
-            query::RoutineInvocationContext::new(&nested_invocations, arena),
-        ));
-        let output_mark = responder.buffer.mark();
-        for step in program.preceding {
-            let query::RoutinePrelude::Statement(statement) = step else {
-                let query::RoutinePrelude::Forbidden(statement) = step else {
-                    unreachable!("routine prelude has two variants");
-                };
-                responder.buffer.truncate_to(output_mark);
-                return Ok(Err(query::routine_forbidden_statement_error(statement)));
-            };
-            let statement = match query::bind_stored_routine_statement(
-                statement,
-                &self.storage,
-                slot,
-                routine,
-                txn.txid,
-                arena,
-                &arguments[..pending.argument_count],
-            ) {
-                Ok(statement) => statement,
-                Err(error) => return Ok(Err(error)),
-            };
-            self.work.reset();
-            match self.execute_routine_stmt(
-                statement,
-                arena,
-                &arguments[..pending.argument_count],
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-                None,
-            ) {
-                Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
-                Ok(Err(error)) => {
-                    responder.buffer.truncate_to(output_mark);
-                    return Ok(Err(error));
-                }
-                Err(error) => {
-                    responder.buffer.truncate_to(output_mark);
-                    return Err(error);
-                }
-            }
-        }
-        const EMPTY: &[u8] = &[];
-        let table_columns = routine.table_columns();
-        let rows = core::cell::Cell::new(core::ptr::null_mut::<&[u8]>());
-        let len = core::cell::Cell::new(0usize);
-        let cap = core::cell::Cell::new(0usize);
-        let mut capture_rows = |values: &[Datum]| {
-            let expected_columns = table_columns.map_or(1, <[_]>::len);
-            if values.len() != expected_columns {
-                return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "SQL function query must return {} column{}",
-                    expected_columns,
-                    if expected_columns == 1 { "" } else { "s" }
-                ));
-            }
-            let encoded = if let Some(output) = table_columns {
-                let mut cast = [Datum::Null; crate::storage::MAX_COLUMNS];
-                for (slot, column) in output.iter().enumerate() {
-                    cast[slot] = eval::cast_to(
-                        exec::detach_routine_datum(values[slot], arena)?,
-                        column.ctype,
-                        arena,
-                    )?;
-                }
-                exec::encode_projected_pub(&cast[..output.len()], arena)?
-            } else {
-                let value = eval::cast_to(
-                    exec::detach_routine_datum(values[0], arena)?,
-                    result_type,
-                    arena,
-                )?;
-                exec::encode_projected_pub(&[value], arena)?
-            };
-            if len.get() == cap.get() {
-                let new_cap = if cap.get() == 0 { 8 } else { cap.get() * 2 };
-                let fresh = arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| {
-                    sql_err!(
+        type_input_plans::with_owner(body_inputs.owner, || {
+            type_inputs::with_source(body_inputs.source, body, body_inputs.bindings, || {
+                let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                if pending.argument_count > arguments.len() {
+                    return Ok(Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "statement arena exhausted while materializing SQL table function"
-                    )
-                })?;
-                if len.get() > 0 {
-                    let prior = unsafe { core::slice::from_raw_parts(rows.get(), len.get()) };
-                    fresh[..len.get()].copy_from_slice(prior);
+                        "too many function arguments"
+                    )));
                 }
-                rows.set(fresh.as_mut_ptr());
-                cap.set(new_cap);
-            }
-            unsafe { rows.get().add(len.get()).write(encoded) };
-            len.set(len.get() + 1);
-            Ok(())
-        };
-        let sequence_replay = sequence::SequenceReplayState::empty();
-        let outcome = match program.result {
-            query::RoutineFunctionResult::Query(result) => loop {
-                self.work.reset();
+                for (index, argument) in arguments
+                    .iter_mut()
+                    .enumerate()
+                    .take(pending.argument_count)
+                {
+                    *argument =
+                        match exec::decode_projected_col_record(pending.arguments, index, arena) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                }
+                let nested_invocations = query::RoutineInvocationState::new(arena);
                 nested_invocations.begin_attempt();
-                len.set(0);
-                sequence_replay.begin_attempt();
-                let sequence = sequence::ReplaySeqEval::new(
-                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                    &sequence_replay,
-                    arena,
-                );
-                let outcome = query::execute_bound_routine_query(
-                    result,
-                    &self.storage,
-                    slot,
-                    routine,
-                    txn.txid,
-                    &self.work,
-                    &arguments[..pending.argument_count],
-                    true,
-                    Some(&sequence),
-                    &mut capture_rows,
-                );
-                let Err(error) = outcome else { break outcome };
-                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                    break Err(error);
-                }
-                let Some(pending) = nested_invocations.take_pending() else {
-                    break Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "nested routine invocation yielded without a pending call"
-                    ));
-                };
-                if let Err(error) = self.complete_pending_routine(
-                    pending,
-                    &nested_invocations,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )? {
-                    break Err(error);
-                }
-            },
-            query::RoutineFunctionResult::DataModification(statement) => {
-                let statement = match query::bind_stored_routine_statement(
-                    statement,
-                    &self.storage,
-                    slot,
-                    routine,
-                    txn.txid,
-                    arena,
-                    &arguments[..pending.argument_count],
-                ) {
-                    Ok(statement) => statement,
-                    Err(error) => return Ok(Err(error)),
-                };
-                loop {
-                    self.work.reset();
-                    nested_invocations.begin_attempt();
-                    len.set(0);
-                    let mark =
-                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                    let outcome = self.execute_routine_stmt(
+                let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
+                    query::RoutineInvocationContext::new(&nested_invocations, arena),
+                ));
+                let output_mark = responder.buffer.mark();
+                for step in program.preceding {
+                    let query::RoutinePrelude::Statement(statement) = step else {
+                        let query::RoutinePrelude::Forbidden(statement) = step else {
+                            unreachable!("routine prelude has two variants");
+                        };
+                        responder.buffer.truncate_to(output_mark);
+                        return Ok(Err(query::routine_forbidden_statement_error(statement)));
+                    };
+                    let statement = match query::bind_stored_routine_statement(
                         statement,
+                        &self.storage,
+                        slot,
+                        routine,
+                        txn.txid,
                         arena,
                         &arguments[..pending.argument_count],
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                        Some(&mut capture_rows),
-                    )?;
-                    let Err(error) = outcome else { break Ok(()) };
-                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                        break Err(error);
-                    }
-                    self.rollback_waiting_statement(txn, mark);
-                    let Some(pending) = nested_invocations.take_pending() else {
-                        break Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "nested routine invocation yielded without a pending call"
-                        ));
+                    ) {
+                        Ok(statement) => statement,
+                        Err(error) => return Ok(Err(error)),
                     };
-                    if let Err(error) = self.complete_pending_routine(
-                        pending,
-                        &nested_invocations,
-                        arena,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                    )? {
-                        break Err(error);
-                    }
-                }
-            }
-            query::RoutineFunctionResult::Void(statement) => {
-                let statement = match query::bind_stored_routine_statement(
-                    statement,
-                    &self.storage,
-                    slot,
-                    routine,
-                    txn.txid,
-                    arena,
-                    &arguments[..pending.argument_count],
-                ) {
-                    Ok(statement) => statement,
-                    Err(error) => return Ok(Err(error)),
-                };
-                loop {
                     self.work.reset();
-                    nested_invocations.begin_attempt();
-                    let mark =
-                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                    let outcome = self.execute_routine_stmt(
+                    match self.execute_routine_stmt(
                         statement,
                         arena,
                         &arguments[..pending.argument_count],
@@ -15543,45 +15748,246 @@ impl Engine {
                         guc,
                         responder,
                         None,
-                    )?;
-                    let Err(error) = outcome else { break Ok(()) };
-                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                        break Err(error);
-                    }
-                    self.rollback_waiting_statement(txn, mark);
-                    let Some(pending) = nested_invocations.take_pending() else {
-                        break Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "nested routine invocation yielded without a pending call"
-                        ));
-                    };
-                    if let Err(error) = self.complete_pending_routine(
-                        pending,
-                        &nested_invocations,
-                        arena,
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        responder,
-                    )? {
-                        break Err(error);
+                    ) {
+                        Ok(Ok(())) => responder.buffer.truncate_to(output_mark),
+                        Ok(Err(error)) => {
+                            responder.buffer.truncate_to(output_mark);
+                            return Ok(Err(error));
+                        }
+                        Err(error) => {
+                            responder.buffer.truncate_to(output_mark);
+                            return Err(error);
+                        }
                     }
                 }
-            }
-            query::RoutineFunctionResult::Forbidden(statement) => {
-                Err(query::routine_forbidden_statement_error(statement))
-            }
-        };
-        responder.buffer.truncate_to(output_mark);
-        if let Err(error) = outcome {
-            return Ok(Err(error));
-        }
-        Ok(Ok(if len.get() == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(rows.get(), len.get()) }
-        }))
+                const EMPTY: &[u8] = &[];
+                let table_columns = routine.table_columns();
+                let rows = core::cell::Cell::new(core::ptr::null_mut::<&[u8]>());
+                let len = core::cell::Cell::new(0usize);
+                let cap = core::cell::Cell::new(0usize);
+                let mut capture_rows = |values: &[Datum]| {
+                    let expected_columns = table_columns.map_or(1, <[_]>::len);
+                    if values.len() != expected_columns {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "SQL function query must return {} column{}",
+                            expected_columns,
+                            if expected_columns == 1 { "" } else { "s" }
+                        ));
+                    }
+                    let encoded = if let Some(output) = table_columns {
+                        let mut cast = [Datum::Null; crate::storage::MAX_COLUMNS];
+                        for (slot, column) in output.iter().enumerate() {
+                            cast[slot] = eval::cast_to(
+                                exec::detach_routine_datum(values[slot], arena)?,
+                                column.ctype,
+                                arena,
+                            )?;
+                        }
+                        exec::encode_projected_pub(&cast[..output.len()], arena)?
+                    } else {
+                        let value = eval::cast_to(
+                            exec::detach_routine_datum(values[0], arena)?,
+                            result_type,
+                            arena,
+                        )?;
+                        exec::encode_projected_pub(&[value], arena)?
+                    };
+                    if len.get() == cap.get() {
+                        let new_cap = if cap.get() == 0 { 8 } else { cap.get() * 2 };
+                        let fresh = arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement arena exhausted while materializing SQL table function"
+                            )
+                        })?;
+                        if len.get() > 0 {
+                            let prior =
+                                unsafe { core::slice::from_raw_parts(rows.get(), len.get()) };
+                            fresh[..len.get()].copy_from_slice(prior);
+                        }
+                        rows.set(fresh.as_mut_ptr());
+                        cap.set(new_cap);
+                    }
+                    unsafe { rows.get().add(len.get()).write(encoded) };
+                    len.set(len.get() + 1);
+                    Ok(())
+                };
+                let sequence_replay = sequence::SequenceReplayState::empty();
+                let outcome = match program.result {
+                    query::RoutineFunctionResult::Query(result) => loop {
+                        self.work.reset();
+                        nested_invocations.begin_attempt();
+                        len.set(0);
+                        sequence_replay.begin_attempt();
+                        let sequence = sequence::ReplaySeqEval::new(
+                            sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                            &sequence_replay,
+                            arena,
+                        );
+                        let outcome = query::execute_bound_routine_query(
+                            result,
+                            &self.storage,
+                            slot,
+                            routine,
+                            txn.txid,
+                            &self.work,
+                            &arguments[..pending.argument_count],
+                            true,
+                            Some(&sequence),
+                            &mut capture_rows,
+                        );
+                        let Err(error) = outcome else { break outcome };
+                        if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                            break Err(error);
+                        }
+                        let Some(pending) = nested_invocations.take_pending() else {
+                            break Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "nested routine invocation yielded without a pending call"
+                            ));
+                        };
+                        if let Err(error) = self.complete_pending_routine(
+                            pending,
+                            &nested_invocations,
+                            arena,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                        )? {
+                            break Err(error);
+                        }
+                    },
+                    query::RoutineFunctionResult::DataModification(statement) => {
+                        let statement = match query::bind_stored_routine_statement(
+                            statement,
+                            &self.storage,
+                            slot,
+                            routine,
+                            txn.txid,
+                            arena,
+                            &arguments[..pending.argument_count],
+                        ) {
+                            Ok(statement) => statement,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        loop {
+                            self.work.reset();
+                            nested_invocations.begin_attempt();
+                            len.set(0);
+                            let mark = txn.statement_mark(
+                                self.wal.stage_mark(txn.txid),
+                                self.storage.lock_mark(),
+                            );
+                            let outcome = self.execute_routine_stmt(
+                                statement,
+                                arena,
+                                &arguments[..pending.argument_count],
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                responder,
+                                Some(&mut capture_rows),
+                            )?;
+                            let Err(error) = outcome else { break Ok(()) };
+                            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                                break Err(error);
+                            }
+                            self.rollback_waiting_statement(txn, mark);
+                            let Some(pending) = nested_invocations.take_pending() else {
+                                break Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "nested routine invocation yielded without a pending call"
+                                ));
+                            };
+                            if let Err(error) = self.complete_pending_routine(
+                                pending,
+                                &nested_invocations,
+                                arena,
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                responder,
+                            )? {
+                                break Err(error);
+                            }
+                        }
+                    }
+                    query::RoutineFunctionResult::Void(statement) => {
+                        let statement = match query::bind_stored_routine_statement(
+                            statement,
+                            &self.storage,
+                            slot,
+                            routine,
+                            txn.txid,
+                            arena,
+                            &arguments[..pending.argument_count],
+                        ) {
+                            Ok(statement) => statement,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        loop {
+                            self.work.reset();
+                            nested_invocations.begin_attempt();
+                            let mark = txn.statement_mark(
+                                self.wal.stage_mark(txn.txid),
+                                self.storage.lock_mark(),
+                            );
+                            let outcome = self.execute_routine_stmt(
+                                statement,
+                                arena,
+                                &arguments[..pending.argument_count],
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                responder,
+                                None,
+                            )?;
+                            let Err(error) = outcome else { break Ok(()) };
+                            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                                break Err(error);
+                            }
+                            self.rollback_waiting_statement(txn, mark);
+                            let Some(pending) = nested_invocations.take_pending() else {
+                                break Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "nested routine invocation yielded without a pending call"
+                                ));
+                            };
+                            if let Err(error) = self.complete_pending_routine(
+                                pending,
+                                &nested_invocations,
+                                arena,
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                responder,
+                            )? {
+                                break Err(error);
+                            }
+                        }
+                    }
+                    query::RoutineFunctionResult::Forbidden(statement) => {
+                        Err(query::routine_forbidden_statement_error(statement))
+                    }
+                };
+                responder.buffer.truncate_to(output_mark);
+                if let Err(error) = outcome {
+                    return Ok(Err(error));
+                }
+                Ok(Ok(if len.get() == 0 {
+                    &[]
+                } else {
+                    unsafe { core::slice::from_raw_parts(rows.get(), len.get()) }
+                }))
+            })
+        })
     }
 
     pub(crate) fn execute_explained_statement(
@@ -19336,37 +19742,42 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
                 inner.set_type_inputs(source_bindings);
-                type_inputs::with_source(
-                    type_inputs::Source::RootCommand { statement: 0 },
-                    text,
-                    source_bindings,
-                    || match inner.next_stmt() {
-                        Ok(Some(statement)) => {
-                            if let Err(error) =
-                                type_inputs::validate_restored(&inner, &self.storage, txn.txid)
-                            {
-                                return Ok(Err(error));
+                let owner = sqlprep
+                    .plan_owner(name)
+                    .expect("a live SQL prepared statement owns its input plans");
+                type_input_plans::with_owner(owner, || {
+                    type_inputs::with_source(
+                        type_inputs::Source::RootCommand { statement: 0 },
+                        text,
+                        source_bindings,
+                        || match inner.next_stmt() {
+                            Ok(Some(statement)) => {
+                                if let Err(error) =
+                                    type_inputs::validate_restored(&inner, &self.storage, txn.txid)
+                                {
+                                    return Ok(Err(error));
+                                }
+                                sqlprep.record_custom_plan(name);
+                                self.execute_stmt(
+                                    &statement,
+                                    arena,
+                                    &inner_params[..args.len()],
+                                    txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    exec::PlpgsqlTransactionContext::Atomic,
+                                    responder,
+                                )
                             }
-                            sqlprep.record_custom_plan(name);
-                            self.execute_stmt(
-                                &statement,
-                                arena,
-                                &inner_params[..args.len()],
-                                txn,
-                                sqlprep,
-                                cursors,
-                                guc,
-                                exec::PlpgsqlTransactionContext::Atomic,
-                                responder,
-                            )
-                        }
-                        Ok(None) => Ok(Ok(())),
-                        Err(e) => Ok(Err(SqlError {
-                            sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
-                            message: stack_format!(192, "{}", e.message.as_str()),
-                        })),
-                    },
-                )
+                            Ok(None) => Ok(Ok(())),
+                            Err(e) => Ok(Err(SqlError {
+                                sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
+                                message: stack_format!(192, "{}", e.message.as_str()),
+                            })),
+                        },
+                    )
+                })
             }
             Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
@@ -19816,7 +20227,7 @@ impl Engine {
             }
             let ddl_end = txn.ddl().len();
             for index in ddl_start..ddl_end {
-                if let Some(object) = created_access_object(txn.ddl()[index])
+                if let Some(object) = created_access_object(txn.ddl()[index].clone())
                     && let Err(error) =
                         exec::record_extension_member(&mut self.storage, txn, extension, object)
                 {
@@ -24037,6 +24448,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(name)?,
                 crate::storage::ViewDefinition {
                     persistence: crate::storage::RelationPersistence::Permanent,
+                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                     columns,
                     query: crate::storage::StoredQueryDefinition {
                         sql: buffer,
@@ -24841,6 +25253,7 @@ fn apply_wal_op(
                 not_null_name: def.not_null_name,
                 not_null_identity: def.not_null_identity,
                 default_expr: def.default_expr,
+                default_inputs: def.default_inputs.clone(),
                 checks: def.checks,
                 n_checks: def.n_checks,
             };

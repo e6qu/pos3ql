@@ -203,9 +203,12 @@ impl TypeReferenceMove {
 
     pub(super) fn references_definition(self, definition: &TableDef) -> bool {
         definition
-            .columns()
-            .iter()
-            .any(|column| self.matches(column.ctype, column.user_type))
+            .type_inputs
+            .references_type(self.identity.slot().kind(), self.identity.created_at())
+            || definition
+                .columns()
+                .iter()
+                .any(|column| self.matches(column.ctype, column.user_type))
     }
 
     pub(super) fn rewrite_definition(self, definition: &mut TableDefBuilder) -> bool {
@@ -1249,6 +1252,7 @@ mod tests {
                             not_null_name: None,
                             not_null_identity: None,
                             default_expr: None,
+                            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                             checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                             n_checks: 0,
                         },
@@ -1648,6 +1652,7 @@ mod tests {
                     not_null_name: None,
                     not_null_identity: None,
                     default_expr: None,
+                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
                 };

@@ -70,6 +70,8 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
+mod type_inputs;
+pub(crate) use type_inputs::capture_contextual_type_inputs;
 pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
@@ -90,11 +92,183 @@ pub(crate) fn stored_query_dependencies(
     txid: u32,
     path: crate::storage::PathContext,
     bindings: Option<crate::storage::StoredQueryDependencyView<'_>>,
+    literal_inputs: &[super::type_inputs::Binding<'_>],
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
-    dependencies::collect(sql, storage, txid, path, bindings, arena)
+    let mut dependencies =
+        dependencies::collect(sql, storage, txid, path, bindings, literal_inputs, arena)?;
+    let inputs = storage.capture_stored_type_inputs(
+        &[crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::Query,
+            sql,
+            bindings: literal_inputs,
+        }],
+        dependencies.view(),
+    )?;
+    dependencies.set_type_inputs(inputs);
+    Ok(dependencies)
 }
 
+pub(crate) fn parse_stored_query<'a>(
+    sql: &'a str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let bindings = match dependencies.type_inputs() {
+        Some(inputs) => {
+            inputs.detached_bindings(crate::storage::StoredInputSection::Query, arena)?
+        }
+        None => &[],
+    };
+    super::parser::parse_query_with_type_inputs(sql, bindings, arena, |parser| {
+        super::type_inputs::validate_restored_with(parser, |name| {
+            if let Some(oid) = cte::captured_type_oid(name, dependencies) {
+                return Ok(matches!(
+                    crate::storage::NamedTypeKind::from_oid(oid),
+                    Some((crate::storage::NamedTypeKind::Domain, _, true))
+                )
+                .then_some(oid));
+            }
+            Ok(super::type_inputs::target_oid(storage, txid, name))
+        })
+    })
+}
+
+pub(crate) fn rebase_stored_query_inputs<'a>(
+    old: &str,
+    new: &str,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [super::type_inputs::Binding<'a>], SqlError> {
+    let inputs = match dependencies.type_inputs() {
+        Some(inputs) => {
+            inputs.detached_bindings(crate::storage::StoredInputSection::Query, arena)?
+        }
+        None => &[],
+    };
+    super::type_inputs::rebase(
+        old,
+        new,
+        super::parser::StoredSqlKind::Statements,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )
+}
+
+pub(crate) fn parse_stored_expression<'a>(
+    sql: &'a str,
+    section: crate::storage::StoredInputSection,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let inputs = match dependencies.type_inputs() {
+        Some(inputs) => inputs.detached_bindings(section, arena)?,
+        None => &[],
+    };
+    super::parser::parse_expression_with_type_inputs(sql, inputs, arena, |parser| {
+        super::type_inputs::validate_restored_with(parser, |name| {
+            if let Some(oid) = cte::captured_type_oid(name, dependencies) {
+                return Ok(matches!(
+                    crate::storage::NamedTypeKind::from_oid(oid),
+                    Some((crate::storage::NamedTypeKind::Domain, _, true))
+                )
+                .then_some(oid));
+            }
+            Ok(super::type_inputs::target_oid(storage, txid, name))
+        })
+    })
+}
+
+pub(crate) fn validate_stored_type_inputs(
+    parser: &super::parser::Parser<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+) -> Result<(), SqlError> {
+    super::type_inputs::validate_restored_with(parser, |name| {
+        if let Some(oid) = cte::captured_type_oid(name, dependencies) {
+            return Ok(matches!(
+                crate::storage::NamedTypeKind::from_oid(oid),
+                Some((crate::storage::NamedTypeKind::Domain, _, true))
+            )
+            .then_some(oid));
+        }
+        Ok(super::type_inputs::target_oid(storage, txid, name))
+    })
+}
+
+fn rule_type_inputs<'a>(
+    definition: &crate::storage::RuleDefinition,
+    fragment: &str,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a [super::type_inputs::Binding<'a>], SqlError> {
+    let inputs = match dependencies.type_inputs() {
+        Some(inputs) => {
+            inputs.detached_bindings(crate::storage::StoredInputSection::RuleSource, arena)?
+        }
+        None => &[],
+    };
+    super::type_inputs::bindings_for_source(definition.source.as_str(), inputs, fragment, arena)
+}
+
+pub(crate) fn parse_stored_rule_expression<'a>(
+    definition: &crate::storage::RuleDefinition,
+    fragment: &str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let inputs = rule_type_inputs(definition, fragment, dependencies, arena)?;
+    let source = arena.alloc_str(fragment).map_err(|_| arena_full())?;
+    super::parser::parse_expression_with_type_inputs(source, inputs, arena, |parser| {
+        validate_stored_type_inputs(parser, storage, txid, dependencies)
+    })
+}
+
+pub(crate) fn parse_stored_rule_statement<'a>(
+    definition: &crate::storage::RuleDefinition,
+    fragment: &str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let inputs = rule_type_inputs(definition, fragment, dependencies, arena)?;
+    let source = arena.alloc_str(fragment).map_err(|_| arena_full())?;
+    let mut parser = super::parser::Parser::new(source, arena)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(inputs);
+    let statement = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "empty stored rule action"))?;
+    if parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .is_some()
+    {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "stored rule action has multiple statements"
+        ));
+    }
+    validate_stored_type_inputs(&parser, storage, txid, dependencies)?;
+    arena
+        .alloc(statement)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+pub(crate) use dependencies::collect as collect_query_dependencies;
 pub(crate) use dependencies::collect_routine_parameter_defaults;
 pub(crate) use dependencies::{
     for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
@@ -113,13 +287,14 @@ pub(crate) fn stored_routine_dependencies(
 
 pub(crate) fn stored_rule_dependencies(
     actions: &[crate::sql::ast::RuleAction<'_>],
+    condition: Option<&Expr<'_>>,
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
     arena: &Arena,
     transition: &dyn crate::sql::exec::ColTypeResolver,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
-    dependencies::collect_rule_actions(actions, storage, txid, path, arena, transition)
+    dependencies::collect_rule_actions(actions, condition, storage, txid, path, arena, transition)
 }
 
 pub(crate) fn dml_input_dependencies(
@@ -711,6 +886,7 @@ pub(crate) struct PendingRoutineInvocation<'a> {
     pub target: PendingRoutineTarget<'a>,
     pub arguments: &'a [u8],
     pub argument_count: usize,
+    pub source_position: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -1076,6 +1252,7 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
         self.pending.set(Some(PendingRoutineInvocation {
+            source_position: input_progress::source_position(),
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1109,6 +1286,7 @@ impl<'a> RoutineInvocationState<'a> {
             return super::exec::detach_routine_datum(value, query_arena);
         }
         self.pending.set(Some(PendingRoutineInvocation {
+            source_position: input_progress::source_position(),
             target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
@@ -1143,6 +1321,7 @@ impl<'a> RoutineInvocationState<'a> {
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
         statement_arena: &'a Arena,
+        source_position: Option<usize>,
     ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1157,6 +1336,7 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(rows));
         }
         self.pending.set(Some(PendingRoutineInvocation {
+            source_position,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1229,10 +1409,13 @@ pub(crate) fn parse_routine_function_program<'a>(
     returns_void: bool,
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
+    inputs: &'a [super::type_inputs::Binding<'a>],
+    validate: impl FnOnce(&super::parser::Parser<'a>) -> Result<(), SqlError>,
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(body, arena)
         .and_then(|parser| parser.with_routine_parameters(routine_name, parameters))
         .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(inputs);
     let parsed = arena
         .alloc_slice_with(super::parser::statement_capacity(body), |_| None)
         .map_err(|_| arena_full())?;
@@ -1251,6 +1434,7 @@ pub(crate) fn parse_routine_function_program<'a>(
         parsed[count] = Some(step);
         count += 1;
     }
+    validate(&parser)?;
     let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
         return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
     };
@@ -1290,6 +1474,10 @@ pub(crate) fn parse_routine_function_program<'a>(
     Ok(RoutineFunctionProgram { preceding, result })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine parsing preserves explicit source maps and their captured nominal authority"
+)]
 pub(crate) fn parse_stored_routine_function_program<'a>(
     body_kind: crate::storage::RoutineBodyKind,
     body: &'a str,
@@ -1297,8 +1485,10 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
     returns_void: bool,
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
+    inputs: &'a [super::type_inputs::Binding<'a>],
+    validate: impl FnOnce(&super::parser::Parser<'a>) -> Result<(), SqlError>,
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
-    let executable = if body_kind == crate::storage::RoutineBodyKind::Return {
+    let (executable, inputs) = if body_kind == crate::storage::RoutineBodyKind::Return {
         use core::fmt::Write;
         let mut query = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX + 8 }>::new();
         write!(query, "SELECT {body}").map_err(|_| {
@@ -1308,11 +1498,25 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
                 crate::storage::ROUTINE_SQL_MAX
             )
         })?;
-        arena.alloc_str(query.as_str()).map_err(|_| arena_full())?
+        let executable = arena.alloc_str(query.as_str()).map_err(|_| arena_full())?;
+        let shifted = arena.alloc_slice_copy(inputs).map_err(|_| arena_full())?;
+        for input in shifted.iter_mut() {
+            input.start = input.start.checked_add(7).ok_or_else(arena_full)?;
+            input.end = input.end.checked_add(7).ok_or_else(arena_full)?;
+        }
+        (executable, &*shifted)
     } else {
-        body
+        (body, inputs)
     };
-    parse_routine_function_program(executable, arena, returns_void, routine_name, parameters)
+    parse_routine_function_program(
+        executable,
+        arena,
+        returns_void,
+        routine_name,
+        parameters,
+        inputs,
+        validate,
+    )
 }
 
 fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
@@ -1448,13 +1652,21 @@ pub(crate) fn execute_bound_routine_query<'a>(
 
 pub(crate) fn bind_routine_parameter_default<'a>(
     source: &str,
+    parameter: usize,
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     let source = arena.alloc_str(source).map_err(|_| arena_full())?;
-    let expression = super::parser::parse_expression(source, arena)?;
+    let expression = parse_stored_expression(
+        source,
+        crate::storage::StoredInputSection::ParameterDefault(parameter as u16),
+        storage,
+        txid,
+        dependencies,
+        arena,
+    )?;
     cte::expand_stored_expression(expression, storage, txid, dependencies, arena)
 }
 
@@ -1862,6 +2074,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 })?;
                 default_expressions[input_index] = Some(bind_routine_parameter_default(
                     default.as_str(),
+                    declared
+                        .parameters()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, parameter)| parameter.mode.is_input())
+                        .nth(input_index)
+                        .expect("input signature has a declared parameter")
+                        .0,
                     self.storage,
                     self.txid,
                     captured
@@ -2574,7 +2794,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )?;
-        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+        if self.invocations.is_some()
+            || active_routine_invocations().is_some()
+            || routine.language == crate::storage::RoutineLanguage::PlPgSql
+        {
             if let Some(invocations) = self.invocations {
                 return invocations.resolve(
                     routine,
@@ -2594,6 +2817,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
         }
         let _formal_scope =
             super::exec::enter_routine_parameter_types(routine.arguments(), Some(self))?;
+        let dependencies = self.storage.snapshot_routine_dependencies_for(
+            slot,
+            self.txid,
+            self.routine_workspace,
+        )?;
+        let inputs = if routine.body_kind == crate::storage::RoutineBodyKind::String {
+            &[][..]
+        } else {
+            dependencies.type_inputs().detached_bindings(
+                crate::storage::StoredInputSection::RoutineBody,
+                self.routine_workspace,
+            )?
+        };
         let function_program = parse_stored_routine_function_program(
             routine.body_kind,
             routine.body.as_str(),
@@ -2601,6 +2837,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             result_type == ColType::Void,
             routine.name.as_str(),
             routine.arguments(),
+            inputs,
+            |parser| {
+                validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
+            },
         )?;
         if routine_program_requires_mutable_execution(&function_program) {
             if let Some(invocations) = self.invocations {
@@ -6651,8 +6891,8 @@ pub fn resolve_view_for_dml<'a>(
             name
         )
     };
-    let sel = super::parser::parse_view_select(sql, arena)?;
     let dependencies = query.dependencies;
+    let sel = parse_stored_query(sql, storage, txid, dependencies.view(), arena)?;
     let sel = expand_stored_query(sel, storage, txid, view_path, dependencies.view(), arena)?;
     if sel.set_body.is_some()
         || sel.distinct
@@ -6786,6 +7026,7 @@ pub fn and_where<'a>(
         (None, w) | (w, None) => Ok(w),
         (Some(a), Some(b)) => {
             let e = Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operator: super::ast::BinaryOp::And,
                 left: a,
                 right: b,
@@ -6840,10 +7081,13 @@ pub fn describe_query_under<'a>(
     storage: &'a Storage,
     txid: u32,
     path: crate::storage::PathContext,
+    inputs: &'a [super::type_inputs::Binding<'a>],
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
 ) -> Result<usize, SqlError> {
-    let select = super::parser::parse_query(sql, arena)?;
+    let select = super::parser::parse_query_with_type_inputs(sql, inputs, arena, |parser| {
+        super::type_inputs::validate_restored(parser, storage, txid)
+    })?;
     let select = expand_ctes_under(select, storage, txid, path, arena)?;
     describe_select(select, storage, txid, arena, out)
 }
@@ -6857,7 +7101,7 @@ pub(crate) fn describe_stored_query<'a>(
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
 ) -> Result<usize, SqlError> {
-    let select = super::parser::parse_query(sql, arena)?;
+    let select = parse_stored_query(sql, storage, txid, dependencies, arena)?;
     let select = expand_stored_query(select, storage, txid, path, dependencies, arena)?;
     describe_select(select, storage, txid, arena, out)
 }
@@ -7349,15 +7593,15 @@ fn rewrite_grouped_expr<'a>(
                 name
             ))
         }
-        Expr::Unary { operator, operand } => {
-            alloc(Expr::Unary { operator: *operator, operand: rewrite(operand)? })
+        Expr::Unary { operator, operand , .. } => {
+            alloc(Expr::Unary {source_position: e.source_position(),  operator: *operator, operand: rewrite(operand)? })
         }
-        Expr::Binary { operator, left, right } => alloc(Expr::Binary {
+        Expr::Binary { operator, left, right , .. } => alloc(Expr::Binary {source_position: e.source_position(),
             operator: *operator,
             left: rewrite(left)?,
             right: rewrite(right)?,
         }),
-        Expr::Cast { operand, type_name, type_mod, binding } => alloc(Expr::Cast {
+        Expr::Cast { operand, type_name, type_mod, binding , .. } => alloc(Expr::Cast {source_position: e.source_position(),
             operand: rewrite(operand)?,
             type_name,
             type_mod: *type_mod,
@@ -7432,6 +7676,7 @@ fn rewrite_grouped_expr<'a>(
             filter,
             bound_strict,
             kind,
+            source_position,
         } => {
             let mut rewritten = ArenaList::new(arena);
             for a in args.iter() {
@@ -7483,6 +7728,7 @@ fn rewrite_grouped_expr<'a>(
                 kind: *kind,
                 bound_oid: *bound_oid,
                 bound_strict: *bound_strict,
+                source_position: *source_position,
                 args,
                 argument_names,
                 variadic: *variadic,
@@ -8520,6 +8766,7 @@ fn over_one_row<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: None,
             inheritance: crate::sql::ast::RelationInheritance::Descendants,

@@ -41,7 +41,7 @@ they never select a guessed decoder.
 A column container and a row index can contain identical bytes and still be
 different blocks. Their type is part of the object name, so writing one cannot
 replace the other. Headers without the current identity version are rejected.
-Manifest v33 and older manifests are rejected before their references are used.
+Manifest identities other than v35 are rejected before their references are used.
 
 Role identifiers are independent of catalog slots. The bootstrap administrator
 keeps PostgreSQL OID 10; user roles receive identifiers from 16,385 through
@@ -79,7 +79,7 @@ keys keep their stamps beside stable attribute numbers in the table definition;
 the shared column metadata stays within its existing 512-byte recovery bound.
 Renaming its constraint, dropping an earlier constraint, or moving its column preserves
 that identity. Replacing the index reserves a fresh stamp. Manifest
-`implicit_index POSITION CREATED_AT` records and table payload v14 store the
+`implicit_index POSITION CREATED_AT` records and table payload v15 store the
 complete set; missing, duplicate, out-of-range or truncated identities are
 rejected before installation. Recovery also checks relation identities across
 catalog families within each database before durable startup publication. A
@@ -102,7 +102,7 @@ identifiers. The shared counter permits identities 1–9,999,999; reserving anot
 returns `54000` rather than wrapping. Renames and unchanged rules preserve their
 identities; dropping and recreating a rule reserves a new one.
 
-Table payload v14 and domain payload marker 252 append one four-byte,
+Table payload v15 and domain payload marker 252 append one four-byte,
 little-endian identity per constraint. Tables order CHECKs, foreign keys, live
 NOT NULL attributes by stable attribute number, then the detached partition
 CHECK. Domains order CHECKs, then NOT NULL when required. Manifest
@@ -156,7 +156,7 @@ filters and exact result checks can need more data.
 
 Catalog vectors retain their signed lower bounds in rows, projected values, and
 constant defaults. Each stored vector adds four bytes for this bound; writers
-and readers use manifest v35, journal v23, and table-definition payload v14.
+and readers use manifest v35, journal v23, and table-definition payload v15.
 
 The codec retains these bounds independently of SQL input conversion; SQL
 array-to-vector casts are rejected. Recovery tests cover text-created vectors,
@@ -297,7 +297,8 @@ Journal records version field-width changes with distinct kind bytes. Current
 writers use publication kinds 139/140, trigger kind 141, routine kind 142,
 composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
 counts. Readers retain the preceding publication, trigger, routine, composite,
-and view kinds; trigger payloads require the current ten-byte position prefix. Stored-query dependencies use marker `0xfd`, a length-prefixed
+and view kinds; trigger payloads require the current ten-byte position prefix.
+Stored-query dependencies use marker `0xfc`, a length-prefixed
 identity and the complete column set. Type identities use `d:<slot>:<creation>`,
 `e:<slot>:<creation>` or `c:<slot>:<creation>`. Table and view identities use
 `t:<creation>` and `v:<creation>` with checked creation numbers from 1 through
@@ -307,8 +308,10 @@ recorded current names and original SQL spelling remain separate from the
 source lifetime, so a rename cannot redirect a query to a replacement object.
 Zero/name-only table or view keys, the wrong relation kind and invalid creation
 numbers are rejected. Other identities retain their decimal object identifiers
-or zero for the remaining name-based objects. Earlier dependency grammars are
-rejected. Table statistics use the
+or zero for the remaining name-based objects. A four-byte little-endian length
+and the checked SQL-input image follow the dependencies. Manifest dependency
+records use `i2` and a trailing hexadecimal input image (`-` for empty).
+Earlier dependency grammars are rejected. Table statistics use the
 V5 marker 251, a declared record count and strictly increasing original
 column numbers in the range 1 through 1,600. Older V3/V4 images are rejected.
 Journal statistics records distinguish explicit ANALYZE, definition invalidation
@@ -341,7 +344,7 @@ system column; the two body fields exist only in catalog history. The journal re
 
 Unique keys retain an explicit mode: tag `0` means NULLs are distinct, tag `1`
 means primary key, and tag `2` means `NULLS NOT DISTINCT`. Other tags are rejected.
-The checkpoint `ukey` record starts with this tag. Table-definition payload v14
+The checkpoint `ukey` record starts with this tag. Table-definition payload v15
 stores the tag, key-column count and timing as three bytes before the column
 positions. Older format identities are rejected before these records are read.
 
@@ -484,6 +487,37 @@ and dependency image.
 The same routine dependency image retains references from parameter defaults.
 Bound call identities in expanded expressions are rebuilt from that image;
 they do not add a separate saved expression format.
+
+### Checked SQL literal values
+
+Preparing a serialized array can run a domain's user-defined checks. A saved
+input image preserves the resulting typed value instead of running those checks
+again during description, execution or recovery. Its source positions distinguish
+two equal literals in the same command. Renaming a referenced object changes
+those positions with the SQL text while retaining the selected type and value.
+
+`TIP2` starts with its four-byte identity and a four-byte record count. Each
+44-byte record contains two eight-byte source offsets, the four-byte type OID,
+four-byte type modifier, four-byte input kind (explicit cast or implicit
+literal), four-byte collation-present flag, four-byte collation code and
+eight-byte value length. Its encoded single-value payload follows immediately.
+Integers are little-endian. Records are ordered by source span and input kind;
+unknown kinds, duplicate keys, invalid array payloads and trailing bytes reject.
+
+`STI1` groups those maps by their owning SQL fragment: query, rule, policy
+condition, routine body, parameter default, or table, view or domain default.
+Its eight-byte header contains the identity and section count; each section
+adds a two-byte kind, two-byte parameter/attribute number and eight-byte map
+length, then the `TIP2` bytes. Sections are strictly ordered. No input values
+means an empty image with no metadata-pool lease. Nonempty immutable images
+charge their actual bytes to `table_metadata_bytes` and retain their selected
+owner through cloning, pending edits and rollback.
+
+Table payload v15 appends a four-byte input-image length and the image. The
+manifest's `table2` record retains it as hexadecimal before the table name.
+Other saved SQL owners carry it in their dependency image. Recovery checks the
+format and source/type identities before installing an owner. Unsupported
+table payload versions, dependency markers and `TIP1` images are rejected.
 
 ### Type lifetimes and saved references
 
@@ -756,7 +790,7 @@ stamp before the name. Manifest v35 and journal v23 reject earlier framing.
 
 ## Text comparison and text-search identities
 
-Manifest v35, journal v23 and table payload v14 replace slot-based text identities.
+Manifest v35, journal v23 and table payload v15 retain text identities by lifetime.
 A named collation stores a four-byte little-endian code: bit 31 marks a named
 collation, bits 2–30 hold its checked creation identity (1–9,999,999), bit 0 selects
 the configured database locale, and bit 1 selects full Unicode case mapping.
@@ -807,7 +841,7 @@ methods, event triggers, operators, operator families and operator classes in
 that order. Copies preserve database-local public identifiers. Operator replay
 keys include both the database and creation stamp, so editing a copied operator
 cannot replace its source database's root during recovery. Manifest v35 and
-journal v23 reject earlier framing; table payload v14 remains unchanged.
+journal v23 reject earlier framing.
 
 ## Memberships, default privileges and inherited triggers
 
@@ -865,8 +899,7 @@ ten-byte trigger position, ten-byte table position and one-byte enabled mode.
 Kind 157 retains an eight-byte nonzero creation-counter reservation, including
 committed transactions that create and remove all their new permission or clone
 images. Recovery checks expected images rather than silently replacing another
-lifetime. Manifest v35 and journal v23 reject earlier framing; table payload v14
-is unchanged.
+lifetime. Manifest v35 and journal v23 reject earlier framing.
 
 Rewrite rules, routines and row-security policies also admit only checked
 creation stamps 1–9,999,999. Their identifier bases are 880,000,000, 100,000 and

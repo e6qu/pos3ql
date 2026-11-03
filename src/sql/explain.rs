@@ -286,11 +286,13 @@ fn predicate_column(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => predicate_column(left, scope).or_else(|| predicate_column(right, scope)),
         Expr::Binary {
             operator,
             left,
             right,
+            ..
         } if matches!(
             operator,
             BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
@@ -366,6 +368,7 @@ fn expression_statistics_selectivity(
         operator: BinaryOp::Eq,
         left,
         right,
+        ..
     } = expression
     else {
         return None;
@@ -444,6 +447,7 @@ fn extended_statistics_selectivity<'a>(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } => {
                 collect(left, scope, table, arena, columns, values, count)
                     && collect(right, scope, table, arena, columns, values, count)
@@ -452,6 +456,7 @@ fn extended_statistics_selectivity<'a>(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } => {
                 let Some((column, constant)) = column_constant(left, right, scope, table)
                     .or_else(|| column_constant(right, left, scope, table))
@@ -590,6 +595,7 @@ fn predicate_selectivity<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             if let Some(selectivity) =
                 extended_statistics_selectivity(storage, scope, table, expression, txid, arena)
@@ -604,6 +610,7 @@ fn predicate_selectivity<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             let left = predicate_selectivity(storage, scope, table, left, txid, arena);
             let right = predicate_selectivity(storage, scope, table, right, txid, arena);

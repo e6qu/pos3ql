@@ -136,6 +136,10 @@ impl<'arena> DmlRowImages<'arena> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "retained DML layouts bind stored expressions with their catalog and transaction authority"
+    )]
     fn capture_layout<
         Definition0: crate::storage::DefinitionBacking,
         Definition1: crate::storage::DefinitionBacking,
@@ -146,6 +150,8 @@ impl<'arena> DmlRowImages<'arena> {
         physical: &crate::storage::TableDefinition<Definition1>,
         capture: DmlCapture,
         arena: &'arena Arena,
+        storage: &Storage,
+        txid: u32,
     ) -> Result<DmlTableLayout<'arena>, SqlError> {
         if let Some(layout) = self
             .tables
@@ -168,7 +174,7 @@ impl<'arena> DmlRowImages<'arena> {
                 .iter()
                 .any(|column| column.default.is_generated())
             {
-                let generated = parse_generated(physical, arena)?;
+                let generated = parse_generated(physical, arena, storage, txid)?;
                 &*arena
                     .alloc_slice_copy(&generated[..physical.n_columns])
                     .map_err(|_| arena_full())?
@@ -1124,6 +1130,10 @@ fn create_table_kind(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = capture_created_table_inputs(storage, &mut def, statement, txn.txid, arena)
+    {
+        return sql_fail(error);
+    }
     def.persistence = statement.persistence.into();
     def.on_commit = statement.on_commit.into();
     def.schema = match if statement.persistence == crate::sql::ast::RelationPersistence::Temporary {
@@ -1284,7 +1294,7 @@ fn create_table_kind(
             def.columns[column].auto_increment = false;
         }
     }
-    let created_slot = match storage.create_table_in(def, txn.txid) {
+    let created_slot = match storage.create_table_in(def.clone(), txn.txid) {
         Ok(slot) => {
             let foreign_slot = if let Some(foreign) = foreign {
                 match storage.create_foreign_table_binding(
@@ -3138,7 +3148,7 @@ fn build_inherited_table_def(
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
         return Ok(own);
     };
-    let mut definition = own;
+    let mut definition = own.clone();
     definition.n_columns = 0;
     definition.columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
     definition.inheritance = crate::storage::TableInheritance::NONE;
@@ -4021,6 +4031,248 @@ fn build_def_with_likes(
     }
     def.n_columns = n;
     Ok(def)
+}
+
+fn capture_created_table_inputs(
+    storage: &Storage,
+    definition: &mut TableDefBuilder,
+    statement: &CreateTable<'_>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    definition.attributes.initialize(definition.n_columns)?;
+    let sources = arena
+        .alloc_slice_with(definition.n_columns, |column| {
+            crate::storage::StoredInputSource {
+                section: crate::storage::StoredInputSection::TableDefault(
+                    definition.attribute_number(column),
+                ),
+                sql: "",
+                bindings: &[],
+            }
+        })
+        .map_err(|_| arena_full())?;
+    for (column, output) in sources.iter_mut().enumerate() {
+        let metadata = definition.columns[column];
+        if metadata.default.constant().is_some() || metadata.default.expression().is_none() {
+            continue;
+        }
+        output.sql = super::enum_values::checks::default_display(
+            metadata
+                .default
+                .expression()
+                .expect("expression-backed default")
+                .as_str(),
+            arena,
+        )?;
+        if let Some(raw) = statement
+            .columns
+            .iter()
+            .find(|declared| declared.name == metadata.name.as_str())
+            .and_then(|declared| declared.default_text.or(declared.generated_text))
+        {
+            let inputs = super::type_inputs::bindings_for_active_source(raw, arena)?.unwrap_or(&[]);
+            output.bindings = if raw == output.sql {
+                inputs
+            } else {
+                super::type_inputs::rebase(
+                    raw,
+                    output.sql,
+                    super::parser::StoredSqlKind::Expression,
+                    inputs,
+                    |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+                    arena,
+                )?
+            };
+            continue;
+        }
+        for like in statement
+            .likes
+            .iter()
+            .filter(|like| like.defaults || like.generated)
+        {
+            let source = like_source(storage, like, txid)?;
+            let Some(old_column) = source.column_index(metadata.name.as_str()) else {
+                continue;
+            };
+            if source.columns()[old_column].default != metadata.default {
+                continue;
+            }
+            output.bindings = source.type_inputs.detached_bindings(
+                crate::storage::StoredInputSection::TableDefault(
+                    source.attribute_number(old_column),
+                ),
+                arena,
+            )?;
+            break;
+        }
+        if !output.bindings.is_empty() {
+            continue;
+        }
+        for parent in definition.inheritance.parents_ref() {
+            let source = storage.table_def(usize::from(*parent), txid);
+            let Some(old_column) = source.column_index(metadata.name.as_str()) else {
+                continue;
+            };
+            if source.columns()[old_column].default != metadata.default {
+                continue;
+            }
+            output.bindings = source.type_inputs.detached_bindings(
+                crate::storage::StoredInputSection::TableDefault(
+                    source.attribute_number(old_column),
+                ),
+                arena,
+            )?;
+            break;
+        }
+        if output.bindings.is_empty() {
+            output.bindings = inherited_domain_default_inputs(storage, &metadata, txid, arena)?;
+        }
+    }
+    sources.sort_unstable_by_key(|source| source.section);
+    let inputs = storage.capture_definition_type_inputs(sources, txid)?;
+    definition.type_inputs = inputs;
+    Ok(())
+}
+
+fn inherited_domain_default_inputs<'a>(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [super::type_inputs::Binding<'a>], SqlError> {
+    let Some((crate::storage::NamedTypeKind::Domain, creation, false)) = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .and_then(crate::storage::NamedTypeKind::from_oid)
+    else {
+        return Ok(&[]);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Domain,
+        creation,
+    )?;
+    let domain = storage
+        .read_domain_definition(target, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "column default domain source is unavailable"
+            )
+        })?;
+    if domain.default_expr.as_ref() != column.default.expression() {
+        return Ok(&[]);
+    }
+    domain
+        .default_inputs
+        .detached_bindings(crate::storage::StoredInputSection::DomainDefault, arena)
+}
+
+#[derive(Clone, Copy)]
+struct TableInputOverride<'a> {
+    column: usize,
+    source: &'a str,
+    inputs: &'a [super::type_inputs::Binding<'a>],
+}
+
+fn record_table_input_override<'a>(
+    overrides: &mut ArenaList<'a, TableInputOverride<'a>>,
+    column: usize,
+    source: &'a str,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let inputs = if source.is_empty() {
+        &[][..]
+    } else {
+        super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[])
+    };
+    overrides
+        .push(TableInputOverride {
+            column,
+            source,
+            inputs,
+        })
+        .map_err(|_| arena_full())
+}
+
+fn refresh_table_type_inputs(
+    storage: &Storage,
+    previous: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    definition: &mut TableDefBuilder,
+    overrides: &[TableInputOverride<'_>],
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if previous.type_inputs.as_ref().bytes().is_empty()
+        && overrides.iter().all(|input| input.inputs.is_empty())
+    {
+        definition.type_inputs = crate::storage::StoredTypeInputs::EMPTY;
+        return Ok(());
+    }
+    let previous_sections = previous.type_inputs.as_ref().borrowed_sections(arena)?;
+    let sources = arena
+        .alloc_slice_with(definition.n_columns, |column| {
+            crate::storage::StoredInputSource {
+                section: crate::storage::StoredInputSection::TableDefault(
+                    definition.attribute_number(column),
+                ),
+                sql: "",
+                bindings: &[],
+            }
+        })
+        .map_err(|_| arena_full())?;
+    for (column, output) in sources.iter_mut().enumerate() {
+        let metadata = definition.columns[column];
+        let Some(source) = metadata
+            .default
+            .expression()
+            .filter(|_| metadata.default.constant().is_none())
+        else {
+            continue;
+        };
+        output.sql = super::enum_values::checks::default_display(source.as_str(), arena)?;
+        let (old_source, inputs) = if let Some(input) =
+            overrides.iter().rev().find(|input| input.column == column)
+        {
+            (input.source, input.inputs)
+        } else if let Some(old_column) =
+            previous.attribute_column(definition.attribute_number(column))
+        {
+            let Some(old) = previous.columns()[old_column].default.expression() else {
+                output.bindings = inherited_domain_default_inputs(storage, &metadata, txid, arena)?;
+                continue;
+            };
+            (
+                super::enum_values::checks::default_display(old.as_str(), arena)?,
+                previous_sections
+                    .binary_search_by_key(&output.section, |(section, _)| *section)
+                    .ok()
+                    .map_or(&[][..], |index| previous_sections[index].1),
+            )
+        } else {
+            output.bindings = inherited_domain_default_inputs(storage, &metadata, txid, arena)?;
+            continue;
+        };
+        output.bindings = if old_source == output.sql {
+            inputs
+        } else {
+            super::type_inputs::rebase(
+                old_source,
+                output.sql,
+                super::parser::StoredSqlKind::Expression,
+                inputs,
+                |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+                arena,
+            )?
+        };
+    }
+    sources.sort_unstable_by_key(|source| source.section);
+    if previous.type_inputs.as_ref().matches_sources(sources)? {
+        definition.type_inputs = previous.type_inputs.as_ref().clone();
+    } else {
+        definition.type_inputs = storage.capture_definition_type_inputs(sources, txid)?;
+    }
+    Ok(())
 }
 
 /// Appends one column, rejecting a name already taken.
@@ -5669,7 +5921,7 @@ where
         let column = def.column_index(name).expect("validated above");
         updated_columns.insert(column);
     }
-    let generated = parse_generated(def, arena)?;
+    let generated = parse_generated(def, arena, storage, txn.txid)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -17796,6 +18048,7 @@ fn parse_plpgsql_assignment_target<'a>(
             kind: crate::sql::ast::CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             name: "__jsonb_subscript_set",
             args,
             argument_names: &[],
@@ -20378,14 +20631,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<Datum<'a>, SqlError> {
-    let _formal_scope = enter_routine_parameter_types(
-        routine.arguments(),
-        Some(&super::query::storage_catalog(
-            &engine.storage,
-            arena,
-            txn.txid,
-        )),
-    )?;
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
@@ -21718,7 +21963,7 @@ fn eval_trigger_expression<'a>(
 
 fn eval_procedural_expression<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    expression: &Expr<'a>,
+    expression: &'a Expr<'a>,
     row: &TriggerLocalScope<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let arena = context.arena;
@@ -25056,320 +25301,390 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(None)
             }),
             TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
-                let local = trigger_local_index(locals, statement.variable)?;
-                if locals[local].ctype != ColType::Refcursor {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "variable \"{}\" must be of type cursor or refcursor",
-                        statement.variable.as_str()
-                    ));
+                let changed = [trigger_local_index(locals, statement.variable)?];
+                cursor_statement_effect(
+                    context,
+                    &invocation,
+                    CursorReceiptOperation::Open {
+                        variable: statement.variable,
+                        scroll: statement.scroll,
+                    },
+                    &changed,
+                    local_values,
+                    status,
+                    |context, local_values, status, completed| {
+                        let local = trigger_local_index(locals, statement.variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "variable \"{}\" must be of type cursor or refcursor",
+                                statement.variable.as_str()
+                            ));
+                        }
+                        let generated;
+                        let name = match local_values[local] {
+                            Datum::Text(name) => name,
+                            Datum::Null => {
+                                let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host
+                                else {
+                                    return Err(sql_err!(
+                                        sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "SQL cursors are not available in trigger execution"
+                                    ));
+                                };
+                                generated = cursors.unnamed_name()?;
+                                context
+                                    .arena
+                                    .alloc_str(generated.as_str())
+                                    .map_err(|_| super::query::arena_full_pub())?
+                            }
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "variable \"{}\" must be of type cursor or refcursor",
+                                    statement.variable.as_str()
+                                ));
+                            }
+                        };
+                        let transition = TriggerTransition {
+                            definition: crate::storage::RelationDefinition::from_definition(
+                                definition,
+                            ),
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        let (source, arguments, capture_locals, parameter_types) = match statement
+                            .query
+                        {
+                            PlpgsqlCursorQuery::Static(source) => {
+                                let parsed =
+                                    super::parser::parse_stored_statement(source, context.arena)?;
+                                match parsed {
+                                    Stmt::Select(_) | Stmt::SetQuery(_) => {
+                                        (source, context.params, true, None)
+                                    }
+                                    _ => {
+                                        return Err(sql_err!(
+                                            sqlstate::SYNTAX_ERROR,
+                                            "OPEN requires a SELECT"
+                                        ));
+                                    }
+                                }
+                            }
+                            PlpgsqlCursorQuery::Dynamic(query) => {
+                                let bound = bind_plpgsql_dynamic_query(
+                                    context,
+                                    query,
+                                    &scope,
+                                    DynamicCommandKind::Cursor,
+                                )?;
+                                let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
+                                if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
+                                    return Err(sql_err!(
+                                        sqlstate::SYNTAX_ERROR,
+                                        "OPEN requires a SELECT"
+                                    ));
+                                }
+                                (
+                                    bound.source,
+                                    bound.arguments,
+                                    false,
+                                    Some(bound.parameter_types),
+                                )
+                            }
+                        };
+                        let captured = if capture_locals {
+                            scope.cursor_locals(
+                                context.storage(),
+                                context.txn.txid,
+                                context.arena,
+                            )?
+                        } else {
+                            &[]
+                        };
+                        let PlpgsqlExecHost::Routine {
+                            engine,
+                            guc,
+                            cursors,
+                            ..
+                        } = &mut context.host
+                        else {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SQL cursors are not available in trigger execution"
+                            ));
+                        };
+                        let mut open = || {
+                            engine.materialize_cursor(
+                                name,
+                                source,
+                                source,
+                                statement.scroll,
+                                false,
+                                false,
+                                arguments,
+                                captured,
+                                context.txn,
+                                cursors,
+                                guc,
+                            )
+                        };
+                        match parameter_types {
+                            Some(types) => with_bound_parameter_types(types, open),
+                            None => open(),
+                        }?;
+                        *completed = true;
+                        assign_trigger_local(
+                            context,
+                            locals,
+                            local_values,
+                            statement.variable,
+                            Datum::Text(name),
+                        )?;
+                        status.assign_output_local(local, local_values[local]);
+
+                        Ok(())
+                    },
+                )
+            }),
+            TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
+                let changed = context
+                    .arena
+                    .alloc_slice_with(statement.targets.len(), |_| 0usize)
+                    .map_err(|_| super::query::arena_full_pub())?;
+                for (local, target) in changed.iter_mut().zip(statement.targets) {
+                    *local = trigger_local_index(locals, *target)?;
                 }
-                let generated;
-                let name = match local_values[local] {
-                    Datum::Text(name) => name,
-                    Datum::Null => {
+                cursor_statement_effect(
+                    context,
+                    &invocation,
+                    CursorReceiptOperation::Motion {
+                        variable: statement.variable,
+                        motion: statement.motion,
+                        move_only: statement.move_only,
+                    },
+                    changed,
+                    local_values,
+                    status,
+                    |context, local_values, status, completed| {
+                        let local = trigger_local_index(locals, statement.variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "variable \"{}\" must be of type cursor or refcursor",
+                                statement.variable.as_str()
+                            ));
+                        }
+                        let Datum::Text(name) = local_values[local] else {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "cursor variable \"{}\" is null",
+                                statement.variable.as_str()
+                            ));
+                        };
+                        let arena = context.arena;
+                        let (count, rows) = {
+                            let PlpgsqlExecHost::Routine {
+                                engine, cursors, ..
+                            } = &mut context.host
+                            else {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "SQL cursors are not available in trigger execution"
+                                ));
+                            };
+                            let count = engine.fetch_cursor(
+                                name,
+                                statement.motion,
+                                statement.move_only,
+                                context.txn.txid,
+                                cursors,
+                            )?;
+                            *completed = true;
+                            let rows = arena
+                                .alloc_slice_copy(cursors.emitted())
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            (count, rows)
+                        };
+                        if !statement.move_only {
+                            if count > 1 {
+                                return Err(sql_err!(
+                                    sqlstate::CARDINALITY_VIOLATION,
+                                    "FETCH statement returned more than one row"
+                                ));
+                            }
+                            let target_local = statement
+                                .targets
+                                .first()
+                                .copied()
+                                .map(|target| trigger_local_index(locals, target))
+                                .transpose()?;
+                            let record_target = statement.targets.len() == 1
+                                && target_local.is_some_and(|target| {
+                                    matches!(
+                                        locals[target].ctype,
+                                        ColType::Record | ColType::Composite(_)
+                                    )
+                                });
+                            let mut column_names = [None; MAX_COLUMNS];
+                            let mut column_type_oids = [0; MAX_COLUMNS];
+                            let column_count = {
+                                let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                                    unreachable!("cursor host cannot change during execution")
+                                };
+                                let description = cursors.description(name).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_CURSOR,
+                                        "cursor \"{}\" does not exist",
+                                        name
+                                    )
+                                })?;
+                                let mut borrowed_names = [None; MAX_COLUMNS];
+                                let count = super::cursor::description_columns(
+                                    description,
+                                    &mut borrowed_names,
+                                    &mut column_type_oids,
+                                )?;
+                                for (target, source) in column_names[..count]
+                                    .iter_mut()
+                                    .zip(&borrowed_names[..count])
+                                {
+                                    *target = Some(
+                                        context
+                                            .arena
+                                            .alloc_str(
+                                                source.expect("description name initialized"),
+                                            )
+                                            .map_err(|_| super::query::arena_full_pub())?,
+                                    );
+                                }
+                                count
+                            };
+                            if !record_target && column_count != statement.targets.len() {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "cursor returned {} columns but FETCH INTO expects {}",
+                                    column_count,
+                                    statement.targets.len()
+                                ));
+                            }
+                            let mut values = [Datum::Null; MAX_COLUMNS];
+                            let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            if let Some(row) = rows.first().copied() {
+                                let width = {
+                                    let PlpgsqlExecHost::Routine { cursors, .. } = &context.host
+                                    else {
+                                        unreachable!("cursor host cannot change during execution")
+                                    };
+                                    cursors.copy_row(name, row, arena, &mut decoded)?
+                                };
+                                if width != column_count {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "cursor row has {} columns but its description has {}",
+                                        width,
+                                        column_count
+                                    ));
+                                }
+                                if !record_target {
+                                    values[..width].copy_from_slice(&decoded[..width]);
+                                }
+                            }
+                            if record_target {
+                                let mut fields = [RecordField {
+                                    name: "",
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }; MAX_COLUMNS];
+                                for index in 0..column_count {
+                                    let value = decoded[index];
+                                    let value = match catalog_column_type(
+                                        context.storage(),
+                                        context.txn.txid,
+                                        column_type_oids[index],
+                                    ) {
+                                        Some((ctype, _)) => cast_to(value, ctype, arena)?,
+                                        None => value,
+                                    };
+                                    fields[index] = RecordField {
+                                        name: column_names[index]
+                                            .expect("cursor description name initialized"),
+                                        type_oid: column_type_oids[index],
+                                        value,
+                                    };
+                                }
+                                let fields = arena
+                                    .alloc_slice_copy(&fields[..column_count])
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                values[0] = Datum::Record(&*fields);
+                            }
+                            for (index, target) in statement.targets.iter().copied().enumerate() {
+                                assign_trigger_local(
+                                    context,
+                                    locals,
+                                    local_values,
+                                    target,
+                                    values[index],
+                                )?;
+                                let assigned = trigger_local_index(locals, target)?;
+                                status.assign_output_local(assigned, local_values[assigned]);
+                            }
+                        }
+                        status.set_rows(count as u64)?;
+
+                        Ok(())
+                    },
+                )
+            }),
+            TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
+                let changed: &[usize] = &[];
+                cursor_statement_effect(
+                    context,
+                    &invocation,
+                    CursorReceiptOperation::Close { variable },
+                    changed,
+                    local_values,
+                    status,
+                    |context, local_values, _status, _completed| {
+                        let local = trigger_local_index(locals, variable)?;
+                        if locals[local].ctype != ColType::Refcursor {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "variable \"{}\" must be of type cursor or refcursor",
+                                variable.as_str()
+                            ));
+                        }
+                        let Datum::Text(name) = local_values[local] else {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "cursor variable \"{}\" is null",
+                                variable.as_str()
+                            ));
+                        };
                         let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
                             return Err(sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "SQL cursors are not available in trigger execution"
                             ));
                         };
-                        generated = cursors.unnamed_name()?;
-                        context
-                            .arena
-                            .alloc_str(generated.as_str())
-                            .map_err(|_| super::query::arena_full_pub())?
-                    }
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "variable \"{}\" must be of type cursor or refcursor",
-                            statement.variable.as_str()
-                        ));
-                    }
-                };
-                let transition = TriggerTransition {
-                    definition: crate::storage::RelationDefinition::from_definition(definition),
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let (source, arguments, capture_locals, parameter_types) = match statement.query {
-                    PlpgsqlCursorQuery::Static(source) => {
-                        let parsed = super::parser::parse_stored_statement(source, context.arena)?;
-                        match parsed {
-                            Stmt::Select(_) | Stmt::SetQuery(_) => {
-                                (source, context.params, true, None)
-                            }
-                            _ => {
-                                return Err(sql_err!(
-                                    sqlstate::SYNTAX_ERROR,
-                                    "OPEN requires a SELECT"
-                                ));
-                            }
-                        }
-                    }
-                    PlpgsqlCursorQuery::Dynamic(query) => {
-                        let bound = bind_plpgsql_dynamic_query(
-                            context,
-                            query,
-                            &scope,
-                            DynamicCommandKind::Cursor,
-                        )?;
-                        let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
-                        if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
-                            return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
-                        }
-                        (
-                            bound.source,
-                            bound.arguments,
-                            false,
-                            Some(bound.parameter_types),
-                        )
-                    }
-                };
-                let captured = if capture_locals {
-                    scope.cursor_locals(context.storage(), context.txn.txid, context.arena)?
-                } else {
-                    &[]
-                };
-                let PlpgsqlExecHost::Routine {
-                    engine,
-                    guc,
-                    cursors,
-                    ..
-                } = &mut context.host
-                else {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL cursors are not available in trigger execution"
-                    ));
-                };
-                let mut open = || {
-                    engine.materialize_cursor(
-                        name,
-                        source,
-                        source,
-                        statement.scroll,
-                        false,
-                        false,
-                        arguments,
-                        captured,
-                        context.txn,
-                        cursors,
-                        guc,
-                    )
-                };
-                match parameter_types {
-                    Some(types) => with_bound_parameter_types(types, open),
-                    None => open(),
-                }?;
-                assign_trigger_local(
-                    context,
-                    locals,
-                    local_values,
-                    statement.variable,
-                    Datum::Text(name),
-                )?;
-                status.assign_output_local(local, local_values[local]);
-
-                Ok(None)
-            }),
-            TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
-                let local = trigger_local_index(locals, statement.variable)?;
-                if locals[local].ctype != ColType::Refcursor {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "variable \"{}\" must be of type cursor or refcursor",
-                        statement.variable.as_str()
-                    ));
-                }
-                let Datum::Text(name) = local_values[local] else {
-                    return Err(sql_err!(
-                        sqlstate::NULL_VALUE_NOT_ALLOWED,
-                        "cursor variable \"{}\" is null",
-                        statement.variable.as_str()
-                    ));
-                };
-                let arena = context.arena;
-                let (count, rows) = {
-                    let PlpgsqlExecHost::Routine {
-                        engine, cursors, ..
-                    } = &mut context.host
-                    else {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL cursors are not available in trigger execution"
-                        ));
-                    };
-                    let count = engine.fetch_cursor(
-                        name,
-                        statement.motion,
-                        statement.move_only,
-                        context.txn.txid,
-                        cursors,
-                    )?;
-                    let rows = arena
-                        .alloc_slice_copy(cursors.emitted())
-                        .map_err(|_| super::query::arena_full_pub())?;
-                    (count, rows)
-                };
-                if !statement.move_only {
-                    if count > 1 {
-                        return Err(sql_err!(
-                            sqlstate::CARDINALITY_VIOLATION,
-                            "FETCH statement returned more than one row"
-                        ));
-                    }
-                    let target_local = statement
-                        .targets
-                        .first()
-                        .copied()
-                        .map(|target| trigger_local_index(locals, target))
-                        .transpose()?;
-                    let record_target = statement.targets.len() == 1
-                        && target_local.is_some_and(|target| {
-                            matches!(
-                                locals[target].ctype,
-                                ColType::Record | ColType::Composite(_)
-                            )
-                        });
-                    let mut column_names = [None; MAX_COLUMNS];
-                    let mut column_type_oids = [0; MAX_COLUMNS];
-                    let column_count = {
-                        let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
-                            unreachable!("cursor host cannot change during execution")
-                        };
-                        let description = cursors.description(name).ok_or_else(|| {
-                            sql_err!(
+                        if !cursors.close(name) {
+                            return Err(sql_err!(
                                 sqlstate::UNDEFINED_CURSOR,
                                 "cursor \"{}\" does not exist",
                                 name
-                            )
-                        })?;
-                        let mut borrowed_names = [None; MAX_COLUMNS];
-                        let count = super::cursor::description_columns(
-                            description,
-                            &mut borrowed_names,
-                            &mut column_type_oids,
-                        )?;
-                        for (target, source) in column_names[..count]
-                            .iter_mut()
-                            .zip(&borrowed_names[..count])
-                        {
-                            *target = Some(
-                                context
-                                    .arena
-                                    .alloc_str(source.expect("description name initialized"))
-                                    .map_err(|_| super::query::arena_full_pub())?,
-                            );
-                        }
-                        count
-                    };
-                    if !record_target && column_count != statement.targets.len() {
-                        return Err(sql_err!(
-                            sqlstate::DATATYPE_MISMATCH,
-                            "cursor returned {} columns but FETCH INTO expects {}",
-                            column_count,
-                            statement.targets.len()
-                        ));
-                    }
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    let mut decoded = [Datum::Null; MAX_COLUMNS];
-                    if let Some(row) = rows.first().copied() {
-                        let width = {
-                            let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
-                                unreachable!("cursor host cannot change during execution")
-                            };
-                            cursors.copy_row(name, row, arena, &mut decoded)?
-                        };
-                        if width != column_count {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "cursor row has {} columns but its description has {}",
-                                width,
-                                column_count
                             ));
                         }
-                        if !record_target {
-                            values[..width].copy_from_slice(&decoded[..width]);
-                        }
-                    }
-                    if record_target {
-                        let mut fields = [RecordField {
-                            name: "",
-                            type_oid: 0,
-                            value: Datum::Null,
-                        }; MAX_COLUMNS];
-                        for index in 0..column_count {
-                            let value = decoded[index];
-                            let value = match catalog_column_type(
-                                context.storage(),
-                                context.txn.txid,
-                                column_type_oids[index],
-                            ) {
-                                Some((ctype, _)) => cast_to(value, ctype, arena)?,
-                                None => value,
-                            };
-                            fields[index] = RecordField {
-                                name: column_names[index]
-                                    .expect("cursor description name initialized"),
-                                type_oid: column_type_oids[index],
-                                value,
-                            };
-                        }
-                        let fields = arena
-                            .alloc_slice_copy(&fields[..column_count])
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        values[0] = Datum::Record(&*fields);
-                    }
-                    for (index, target) in statement.targets.iter().copied().enumerate() {
-                        assign_trigger_local(context, locals, local_values, target, values[index])?;
-                        let assigned = trigger_local_index(locals, target)?;
-                        status.assign_output_local(assigned, local_values[assigned]);
-                    }
-                }
-                status.set_rows(count as u64)?;
 
-                Ok(None)
-            }),
-            TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
-                let local = trigger_local_index(locals, variable)?;
-                if locals[local].ctype != ColType::Refcursor {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "variable \"{}\" must be of type cursor or refcursor",
-                        variable.as_str()
-                    ));
-                }
-                let Datum::Text(name) = local_values[local] else {
-                    return Err(sql_err!(
-                        sqlstate::NULL_VALUE_NOT_ALLOWED,
-                        "cursor variable \"{}\" is null",
-                        variable.as_str()
-                    ));
-                };
-                let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL cursors are not available in trigger execution"
-                    ));
-                };
-                if !cursors.close(name) {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_CURSOR,
-                        "cursor \"{}\" does not exist",
-                        name
-                    ));
-                }
-
-                Ok(None)
+                        Ok(())
+                    },
+                )
             }),
             TriggerStatement::LoopControl(control) => execute_trigger_statement(|| {
                 let (condition, unwind) = match control {
@@ -27232,6 +27547,273 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
     Ok(None)
 }
 
+#[derive(Clone, Copy)]
+enum CursorReceiptOperation {
+    Open {
+        variable: SqlName,
+        scroll: super::cursor::CursorScroll,
+    },
+    Motion {
+        variable: SqlName,
+        motion: super::cursor::FetchMotion,
+        move_only: bool,
+    },
+    Close {
+        variable: SqlName,
+    },
+}
+
+fn cursor_statement_effect<'s, 'a, 'b>(
+    context: &mut TriggerExecContext<'s, 'a, 'b>,
+    invocation: &TriggerInvocation<'a>,
+    operation: CursorReceiptOperation,
+    changed: &[usize],
+    local_values: &mut [Datum<'a>],
+    status: &mut TriggerExecutionStatus<'a>,
+    execute: impl FnOnce(
+        &mut TriggerExecContext<'s, 'a, 'b>,
+        &mut [Datum<'a>],
+        &mut TriggerExecutionStatus<'a>,
+        &mut bool,
+    ) -> Result<(), SqlError>,
+) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    let (variable, operation, mode, amount, move_only, retry) = match operation {
+        CursorReceiptOperation::Open { variable, scroll } => (
+            variable,
+            0,
+            match scroll {
+                super::cursor::CursorScroll::Default => 0,
+                super::cursor::CursorScroll::Scroll => 1,
+                super::cursor::CursorScroll::NoScroll => 2,
+            },
+            0,
+            false,
+            super::sequence::StatementEffectRetry::Restart,
+        ),
+        CursorReceiptOperation::Motion {
+            variable,
+            motion,
+            move_only,
+        } => {
+            let (mode, amount) = match motion {
+                super::cursor::FetchMotion::Count(amount) => (0, amount),
+                super::cursor::FetchMotion::All => (1, 0),
+                super::cursor::FetchMotion::BackwardAll => (2, 0),
+                super::cursor::FetchMotion::Absolute(amount) => (3, amount),
+                super::cursor::FetchMotion::Relative(amount) => (4, amount),
+            };
+            (
+                variable,
+                1,
+                mode,
+                amount,
+                move_only,
+                super::sequence::StatementEffectRetry::Continue,
+            )
+        }
+        CursorReceiptOperation::Close { variable } => (
+            variable,
+            2,
+            0,
+            0,
+            false,
+            super::sequence::StatementEffectRetry::Restart,
+        ),
+    };
+    let key = [
+        Datum::Int4(invocation.routine_oid),
+        Datum::Text(variable.as_str()),
+        Datum::Int4(operation),
+        Datum::Int4(mode),
+        Datum::Int4(amount),
+        Datum::Bool(move_only),
+    ];
+    let arena = context.arena;
+    let result = super::sequence::statement_effect(
+        super::sequence::StatementEffectKind::Cursor,
+        &key,
+        retry,
+        arena,
+        || {
+            let mark = context.txn.transaction_effect_mark();
+            let advisory = context.storage().advisory_statement_mark();
+            let settings = match &context.host {
+                PlpgsqlExecHost::Routine { guc, .. } => Some(guc.statement_settings()),
+                PlpgsqlExecHost::Atomic { .. } => None,
+            };
+            let descriptors = match context.txn.statement_large_object_descriptors(arena) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    return super::sequence::StatementEffectAttempt {
+                        result: Err(error),
+                        rewound_state: false,
+                    };
+                }
+            };
+            let mut completed = false;
+            let result = execute(context, local_values, status, &mut completed);
+            let changed_settings = match (&context.host, settings) {
+                (PlpgsqlExecHost::Routine { guc, .. }, Some(settings)) => {
+                    !guc.matches_statement_settings(&settings)
+                }
+                _ => false,
+            };
+            let rewound_state = context.txn.transaction_effect_mark() != mark
+                || changed_settings
+                || !context
+                    .txn
+                    .matches_statement_large_object_descriptors(descriptors)
+                || context.storage().advisory_statement_mark() != advisory
+                || completed
+                    && result.as_ref().is_err_and(|error| {
+                        matches!(
+                            error.sqlstate.as_str(),
+                            sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT
+                        )
+                    });
+            let result = (|| {
+                if result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::INTERNAL_IO_WAIT
+                            | sqlstate::INTERNAL_LOCK_WAIT
+                            | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    )
+                }) {
+                    return if completed {
+                        Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "a completed cursor operation cannot suspend while converting its outputs"
+                        ))
+                    } else {
+                        result.map(|()| &[][..])
+                    };
+                }
+                let count = changed
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|count| count.checked_add(6))
+                    .ok_or_else(|| super::query::arena_full_pub())?;
+                let output = arena
+                    .alloc_slice_with(count, |_| Datum::Null)
+                    .map_err(|_| super::query::arena_full_pub())?;
+                if let Err(error) = result {
+                    cursor_effect_error_fields(arena, output, error)?;
+                }
+                output[4] = status.found.map_or(Datum::Null, Datum::Bool);
+                output[5] = Datum::Int8(status.row_count);
+                for (at, local) in changed.iter().copied().enumerate() {
+                    output[6 + at * 2] = Datum::Int4(
+                        i32::try_from(local).map_err(|_| super::query::arena_full_pub())?,
+                    );
+                    output[7 + at * 2] = *local_values.get(local).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "cursor output local is unavailable"
+                        )
+                    })?;
+                }
+                Ok(&*output)
+            })();
+            super::sequence::StatementEffectAttempt {
+                result,
+                rewound_state,
+            }
+        },
+    )?;
+    if result.len() != changed.len() * 2 + 6 {
+        return Err(sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "cursor output changed while waiting"
+        ));
+    }
+    status.found = match result[4] {
+        Datum::Null => None,
+        Datum::Bool(value) => Some(value),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor replay has an invalid FOUND value"
+            ));
+        }
+    };
+    let Datum::Int8(row_count) = result[5] else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor replay has an invalid row count"
+        ));
+    };
+    status.row_count = row_count;
+    for (at, local) in changed.iter().copied().enumerate() {
+        if !matches!(result[6 + at * 2], Datum::Int4(index) if usize::try_from(index).ok() == Some(local))
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "cursor output target changed while waiting"
+            ));
+        }
+        local_values[local] = result[7 + at * 2];
+        status.assign_output_local(local, local_values[local]);
+    }
+    cursor_effect_result(result)?;
+    Ok(None)
+}
+
+#[inline(never)]
+fn cursor_effect_error_fields<'a>(
+    arena: &'a Arena,
+    output: &mut [Datum<'a>],
+    error: SqlError,
+) -> Result<(), SqlError> {
+    let copy = |text: &str| {
+        arena
+            .alloc_str(text)
+            .map(|text| Datum::Text(&*text))
+            .map_err(|_| super::query::arena_full_pub())
+    };
+    output[0] = copy(error.sqlstate.as_str())?;
+    output[1] = copy(error.message.as_str())?;
+    if let Some(diagnostic) = eval::take_diagnostic() {
+        output[2] = copy(diagnostic.detail.as_str())?;
+        output[3] = diagnostic
+            .hint
+            .map(|hint| copy(hint.as_str()))
+            .transpose()?
+            .unwrap_or(Datum::Null);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
+    let Datum::Text(state) = output[0] else {
+        return Ok(());
+    };
+    let state = eval::SqlState::parse(state).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor replay SQLSTATE is invalid"
+        )
+    })?;
+    let Datum::Text(message) = output[1] else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor replay error is invalid"
+        ));
+    };
+    if let Datum::Text(detail) = output[2] {
+        let hint = match output[3] {
+            Datum::Text(hint) => Some(StackStr::from_str(hint)),
+            _ => None,
+        };
+        eval::stash_diagnostic(StackStr::from_str(detail), hint);
+    }
+    Err(SqlError {
+        sqlstate: state,
+        message: StackStr::from_str(message),
+    })
+}
+
 // Keep statement-specific scratch off every nested procedural dispatch frame.
 #[inline(never)]
 fn execute_trigger_statement<'a>(
@@ -28986,10 +29568,39 @@ fn policy_expression_source(
         .transpose()
 }
 
+fn policy_literal_inputs<'a>(
+    using: Option<&str>,
+    with_check: Option<&str>,
+    previous: Option<&crate::storage::StoredTypeInputs>,
+    arena: &'a Arena,
+) -> Result<[&'a [super::type_inputs::Binding<'a>]; 2], SqlError> {
+    let mut inputs = [&[][..]; 2];
+    for (index, raw) in [using, with_check].into_iter().enumerate() {
+        inputs[index] = match raw {
+            Some(source) => {
+                super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[])
+            }
+            None => match previous {
+                Some(previous) => previous.detached_bindings(
+                    if index == 0 {
+                        crate::storage::StoredInputSection::PolicyUsing
+                    } else {
+                        crate::storage::StoredInputSection::PolicyCheck
+                    },
+                    arena,
+                )?,
+                None => &[],
+            },
+        };
+    }
+    Ok(inputs)
+}
+
 fn validate_policy_definition(
     storage: &Storage,
     table: usize,
     definition: &crate::storage::PolicyDefinition,
+    inputs: [&[super::type_inputs::Binding<'_>]; 2],
     txid: u32,
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
@@ -29008,12 +29619,19 @@ fn validate_policy_definition(
     let mut sql = crate::util::StackStr::<2304>::new();
     sql.write_str("SELECT ").map_err(|_| arena_full())?;
     let mut expressions = 0usize;
-    for source in [definition.using.as_ref(), definition.with_check.as_ref()]
+    let mut query_inputs = ArenaList::new(arena);
+    for (index, source) in [definition.using.as_ref(), definition.with_check.as_ref()]
         .into_iter()
-        .flatten()
+        .enumerate()
+        .filter_map(|(index, source)| source.map(|source| (index, source)))
     {
         let expression_source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
-        let expression = crate::sql::parser::parse_expr(expression_source, arena)?;
+        let expression = crate::sql::parser::parse_expression_with_type_inputs(
+            expression_source,
+            inputs[index],
+            arena,
+            |parser| super::type_inputs::validate_restored(parser, storage, txid),
+        )?;
         if super::query::expr_has_aggregate(expression, storage, txid, &aggregate_columns)? {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -29035,6 +29653,16 @@ fn validate_policy_definition(
         if expressions != 0 {
             sql.write_str(", ").map_err(|_| arena_full())?;
         }
+        let offset = sql.len().checked_add(1).ok_or_else(arena_full)?;
+        for input in inputs[index] {
+            query_inputs
+                .push(super::type_inputs::Binding {
+                    start: input.start.checked_add(offset).ok_or_else(arena_full)?,
+                    end: input.end.checked_add(offset).ok_or_else(arena_full)?,
+                    ..*input
+                })
+                .map_err(|_| arena_full())?;
+        }
         write!(sql, "({})", source.as_str()).map_err(|_| arena_full())?;
         expressions += 1;
     }
@@ -29053,7 +29681,15 @@ fn validate_policy_definition(
     }
     let sql = arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?;
     let mut columns = [ColDesc::new("", 0, 0); 2];
-    let count = super::query::describe_query(sql, storage, txid, arena, &mut columns)?;
+    let count = super::query::describe_query_under(
+        sql,
+        storage,
+        txid,
+        storage.path(),
+        query_inputs.as_slice(),
+        arena,
+        &mut columns,
+    )?;
     for column in &columns[..count] {
         if column.type_oid != crate::sql::types::oid::BOOL {
             return Err(sql_err!(
@@ -29062,8 +29698,32 @@ fn validate_policy_definition(
             ));
         }
     }
-    let dependencies =
-        super::query::stored_query_dependencies(sql, storage, txid, storage.path(), None, arena)?;
+    let mut dependencies = super::query::collect_query_dependencies(
+        sql,
+        storage,
+        txid,
+        storage.path(),
+        None,
+        query_inputs.as_slice(),
+        arena,
+    )?;
+    let sources = [
+        crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::PolicyUsing,
+            sql: definition.using.as_ref().map_or("", |sql| sql.as_str()),
+            bindings: inputs[0],
+        },
+        crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::PolicyCheck,
+            sql: definition
+                .with_check
+                .as_ref()
+                .map_or("", |sql| sql.as_str()),
+            bindings: inputs[1],
+        },
+    ];
+    let literals = storage.capture_stored_type_inputs(&sources, dependencies.view())?;
+    dependencies.set_type_inputs(literals);
     if storage.table_def(table, txid).persistence != crate::storage::RelationPersistence::Temporary
         && stored_query_uses_temporary_relation(storage, dependencies.view(), txid)
     {
@@ -29144,8 +29804,17 @@ pub fn create_policy(
             Err(error) => return sql_fail(error),
         },
     };
+    let inputs = match policy_literal_inputs(
+        using.map(|expression| expression.source),
+        with_check.map(|expression| expression.source),
+        None,
+        arena,
+    ) {
+        Ok(inputs) => inputs,
+        Err(error) => return sql_fail(error),
+    };
     let dependencies =
-        match validate_policy_definition(storage, table, &definition, txn.txid, arena) {
+        match validate_policy_definition(storage, table, &definition, inputs, txn.txid, arena) {
             Ok(dependencies) => dependencies,
             Err(error) => return sql_fail(error),
         };
@@ -29282,8 +29951,21 @@ pub fn alter_policy(
             Err(error) => return sql_fail(error),
         };
     }
+    let previous_inputs = match storage.snapshot_policy_dependencies(slot, txn.txid, arena) {
+        Ok(dependencies) => dependencies,
+        Err(error) => return sql_fail(error),
+    };
+    let inputs = match policy_literal_inputs(
+        alteration.using.map(|expression| expression.source),
+        alteration.with_check.map(|expression| expression.source),
+        Some(previous_inputs.type_inputs()),
+        arena,
+    ) {
+        Ok(inputs) => inputs,
+        Err(error) => return sql_fail(error),
+    };
     let dependencies =
-        match validate_policy_definition(storage, table, &definition, txn.txid, arena) {
+        match validate_policy_definition(storage, table, &definition, inputs, txn.txid, arena) {
             Ok(dependencies) => dependencies,
             Err(error) => return sql_fail(error),
         };
@@ -33947,6 +34629,15 @@ pub fn create_routine(
         super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
         super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
     };
+    let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
+        &[][..]
+    } else {
+        match super::type_inputs::bindings_for_active_source(body_text, arena) {
+            Ok(Some(inputs)) => inputs,
+            Ok(None) => &[],
+            Err(error) => return sql_fail(error),
+        }
+    };
     let language = match routine.language {
         RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
         RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
@@ -34301,6 +34992,8 @@ pub fn create_routine(
                     returns_void,
                     routine.name.name,
                     &arguments[..argument_count],
+                    body_inputs,
+                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
                     Err(error) => return sql_fail(error),
@@ -34387,6 +35080,8 @@ pub fn create_routine(
                     returns_void,
                     routine.name.name,
                     &arguments[..argument_count],
+                    body_inputs,
+                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
                     Err(error) => return sql_fail(error),
@@ -34473,6 +35168,8 @@ pub fn create_routine(
                     true,
                     routine.name.name,
                     &arguments[..argument_count],
+                    body_inputs,
+                    |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
                     Err(error) => return sql_fail(error),
@@ -34496,6 +35193,38 @@ pub fn create_routine(
         }
     }
     drop(formal_scope);
+    let input_sources = match arena.alloc_slice_with(routine.arguments.len() + 1, |_| {
+        crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::RoutineBody,
+            sql: "",
+            bindings: &[],
+        }
+    }) {
+        Ok(sources) => sources,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    input_sources[0] = crate::storage::StoredInputSource {
+        section: crate::storage::StoredInputSection::RoutineBody,
+        sql: body_text,
+        bindings: body_inputs,
+    };
+    for (index, argument) in routine.arguments.iter().enumerate() {
+        let text = argument.mode.default_text().unwrap_or("");
+        let inputs = if text.is_empty() {
+            &[][..]
+        } else {
+            match super::type_inputs::bindings_for_active_source(text, arena) {
+                Ok(Some(inputs)) => inputs,
+                Ok(None) => &[],
+                Err(error) => return sql_fail(error),
+            }
+        };
+        input_sources[index + 1] = crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::ParameterDefault(index as u16),
+            sql: text,
+            bindings: inputs,
+        };
+    }
     if parameters[..routine.arguments.len()]
         .iter()
         .any(|parameter| parameter.mode.has_default())
@@ -34505,6 +35234,7 @@ pub fn create_routine(
         let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
         if let Err(error) = super::query::collect_routine_parameter_defaults(
             &parameters[..routine.arguments.len()],
+            input_sources,
             storage,
             txn.txid,
             path,
@@ -34514,6 +35244,11 @@ pub fn create_routine(
             return sql_fail(error);
         }
     }
+    let type_inputs = match storage.capture_stored_type_inputs(input_sources, dependencies.view()) {
+        Ok(inputs) => inputs,
+        Err(error) => return sql_fail(error),
+    };
+    dependencies.set_type_inputs(type_inputs);
     if creation_path.is_truncated() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -37498,6 +38233,11 @@ pub fn create_view(
         sql,
         raw_path,
     } = command;
+    let literal_inputs = match super::type_inputs::bindings_for_active_source(sql, arena) {
+        Ok(Some(inputs)) => inputs,
+        Ok(None) => &[],
+        Err(error) => return sql_fail(error),
+    };
     use core::fmt::Write;
     let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
@@ -37512,10 +38252,11 @@ pub fn create_view(
     let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
     let described_count = match super::query::describe_query_under(
-        buffer.as_str(),
+        sql,
         storage,
         txn.txid,
         path,
+        literal_inputs,
         arena,
         &mut described,
     ) {
@@ -37556,11 +38297,12 @@ pub fn create_view(
         }
     };
     let mut dependencies = match super::query::stored_query_dependencies(
-        buffer.as_str(),
+        sql,
         storage,
         txn.txid,
         path,
         None,
+        literal_inputs,
         arena,
     ) {
         Ok(dependencies) => dependencies,
@@ -37721,6 +38463,7 @@ pub fn create_view(
         sqlname,
         crate::storage::ViewDefinition {
             persistence,
+            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
             columns,
             query: crate::storage::StoredQueryDefinition {
                 sql: buffer,
@@ -37999,7 +38742,7 @@ pub fn alter_view(
             return sql_fail(error);
         }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-            crate::storage::ViewPublication::Altered(prior),
+            crate::storage::ViewPublication::Altered(prior.clone()),
         )) {
             storage.rollback_view_alter(prior);
             return sql_fail(error);
@@ -38145,7 +38888,7 @@ pub fn alter_view(
                 return sql_fail(error);
             }
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior),
+                crate::storage::ViewPublication::Altered(prior.clone()),
             )) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
@@ -38195,7 +38938,7 @@ pub fn alter_view(
                 return sql_fail(error);
             }
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior),
+                crate::storage::ViewPublication::Altered(prior.clone()),
             )) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
@@ -38250,7 +38993,7 @@ pub fn alter_view(
                 return sql_fail(error);
             }
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior),
+                crate::storage::ViewPublication::Altered(prior.clone()),
             )) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
@@ -38313,7 +39056,7 @@ pub fn alter_view(
                 return sql_fail(error);
             }
             if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior),
+                crate::storage::ViewPublication::Altered(prior.clone()),
             )) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
@@ -38359,7 +39102,7 @@ pub fn alter_view(
         return sql_fail(error);
     }
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-        crate::storage::ViewPublication::Altered(prior),
+        crate::storage::ViewPublication::Altered(prior.clone()),
     )) {
         storage.rollback_view_alter(prior);
         return sql_fail(error);
@@ -38493,12 +39236,21 @@ fn publish_rewritten_view(
     let creation_path = query.creation_path;
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
+    let literal_inputs = super::query::rebase_stored_query_inputs(
+        query.sql.as_str(),
+        rewritten.as_str(),
+        query.dependencies.view(),
+        storage,
+        txn.txid,
+        arena,
+    )?;
     let rebound = super::query::stored_query_dependencies(
         rewritten.as_str(),
         storage,
         txn.txid,
         path,
         Some(query.dependencies.view()),
+        literal_inputs,
         arena,
     )?;
     let previous = query.dependencies.entries();
@@ -38524,6 +39276,7 @@ fn publish_rewritten_view(
         storage.view_edit_target(view_slot, &view, txn.txid),
         crate::storage::ViewDefinition {
             persistence: view.persistence,
+            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
             columns: dependent_columns,
             query: crate::storage::StoredQueryDefinition {
                 sql: rewritten,
@@ -39075,8 +39828,20 @@ fn stored_rule_definition(
         }
     }
     let mut source = crate::util::StackStr::<{ crate::storage::RULE_SQL_MAX }>::new();
+    let mut source_inputs = ArenaList::new(arena);
     let condition = if let Some(sql) = rule.condition_sql {
         let start = source.as_str().len();
+        if let Some(inputs) = super::type_inputs::bindings_for_active_source(sql, arena)? {
+            for input in inputs {
+                source_inputs
+                    .push(super::type_inputs::Binding {
+                        start: input.start.checked_add(start).ok_or_else(arena_full)?,
+                        end: input.end.checked_add(start).ok_or_else(arena_full)?,
+                        ..*input
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+        }
         let _ = source.write_str(sql);
         let len = source.as_str().len().saturating_sub(start);
         let _ = source.write_char('\n');
@@ -39091,6 +39856,17 @@ fn stored_rule_definition(
         [crate::storage::RuleTextSpan { start: 0, len: 0 }; crate::storage::MAX_RULE_ACTIONS];
     for (index, action) in rule.actions.iter().enumerate() {
         let start = source.as_str().len();
+        if let Some(inputs) = super::type_inputs::bindings_for_active_source(action.sql, arena)? {
+            for input in inputs {
+                source_inputs
+                    .push(super::type_inputs::Binding {
+                        start: input.start.checked_add(start).ok_or_else(arena_full)?,
+                        end: input.end.checked_add(start).ok_or_else(arena_full)?,
+                        ..*input
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+        }
         let _ = source.write_str(action.sql);
         let len = source.as_str().len().saturating_sub(start);
         let _ = source.write_char('\n');
@@ -39119,14 +39895,24 @@ fn stored_rule_definition(
         super::eval::funcs::system::session_user_owned().as_str(),
         txn.txid,
     );
-    let dependencies = super::query::stored_rule_dependencies(
+    let mut dependencies = super::query::stored_rule_dependencies(
         rule.actions,
+        rule.condition,
         storage,
         txn.txid,
         path,
         arena,
         &condition_columns,
     )?;
+    let inputs = storage.capture_stored_type_inputs(
+        &[crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::RuleSource,
+            sql: source.as_str(),
+            bindings: source_inputs.as_slice(),
+        }],
+        dependencies.view(),
+    )?;
+    dependencies.set_type_inputs(inputs);
     if !storage.access_object_is_temporary(target.access_object(), txn.txid)
         && stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid)
     {
@@ -40637,8 +41423,19 @@ pub fn create_table_as(
     let dependencies = if materialized {
         let user = super::eval::funcs::system::session_user_owned();
         let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+        let literal_inputs = match super::type_inputs::bindings_for_active_source(sql, arena) {
+            Ok(Some(inputs)) => inputs,
+            Ok(None) => &[],
+            Err(error) => return sql_fail(error),
+        };
         let dependencies = match super::query::stored_query_dependencies(
-            sql, storage, txn.txid, path, None, arena,
+            sql,
+            storage,
+            txn.txid,
+            path,
+            None,
+            literal_inputs,
+            arena,
         ) {
             Ok(dependencies) => dependencies,
             Err(error) => return sql_fail(error),
@@ -40771,7 +41568,7 @@ pub fn create_table_as(
         return sql_fail(error);
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
-    let table_index = match storage.create_table_in(def, txn.txid) {
+    let table_index = match storage.create_table_in(def.clone(), txn.txid) {
         Ok(slot) => {
             let wal_result = if def.persistence == crate::storage::RelationPersistence::Temporary {
                 Ok(())
@@ -42208,6 +43005,7 @@ pub(super) fn column_default_dependencies(
         transaction,
         storage.path(),
         None,
+        &[],
         arena,
     )
 }
@@ -42677,6 +43475,7 @@ fn build_domain_spec(
         not_null_name,
         not_null_identity: None,
         default_expr,
+        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
         checks,
         n_checks: n,
     })
@@ -43588,7 +44387,7 @@ pub fn alter_domain(
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
@@ -43609,6 +44408,7 @@ pub fn alter_domain(
         not_null_name: current.not_null_name,
         not_null_identity: current.not_null_identity,
         default_expr: current.default_expr,
+        default_inputs: current.default_inputs.clone(),
         checks: current.checks,
         n_checks: current.n_checks,
     };
@@ -43847,7 +44647,7 @@ pub fn alter_domain(
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
+    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
@@ -47754,12 +48554,14 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
             continue;
         }
         let mut definition = policy.definition_for(txn.txid);
+        let original_definition = definition;
+        let old_dependencies = storage.snapshot_policy_dependencies(slot, txn.txid, arena)?;
         let mut shape = TableDefBuilder::from_definition(original);
         for &(from, to) in renames {
             let Some(column) = shape.column_index(from.as_str()) else {
                 continue;
             };
-            let mut renamed = shape;
+            let mut renamed = shape.clone();
             renamed.columns[column].name = to;
             let rename = CompositeFieldRename { from, to };
             definition.using = definition
@@ -47776,8 +48578,41 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
                 .transpose()?;
             shape = renamed;
         }
+        let mut inputs = [&[][..]; 2];
+        for (index, (old, new)) in [
+            (
+                original_definition.using.as_ref(),
+                definition.using.as_ref(),
+            ),
+            (
+                original_definition.with_check.as_ref(),
+                definition.with_check.as_ref(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let (Some(old), Some(new)) = (old, new) {
+                let section = if index == 0 {
+                    crate::storage::StoredInputSection::PolicyUsing
+                } else {
+                    crate::storage::StoredInputSection::PolicyCheck
+                };
+                let previous = old_dependencies
+                    .type_inputs()
+                    .detached_bindings(section, arena)?;
+                inputs[index] = super::type_inputs::rebase(
+                    old.as_str(),
+                    new.as_str(),
+                    super::parser::StoredSqlKind::Expression,
+                    previous,
+                    |name| Ok(super::type_inputs::target_oid(storage, txn.txid, name)),
+                    arena,
+                )?;
+            }
+        }
         let dependencies =
-            validate_policy_definition(storage, table, &definition, txn.txid, arena)?;
+            validate_policy_definition(storage, table, &definition, inputs, txn.txid, arena)?;
         let current_roles = storage.policy_roles(slot, txn.txid);
         let copied_roles = arena.alloc_slice_copy(&current_roles);
         drop(current_roles);
@@ -47846,7 +48681,7 @@ fn rewrite_table_statistics_column_references<Definition0: crate::storage::Defin
             let Some(column) = shape.column_index(from.as_str()) else {
                 continue;
             };
-            let mut renamed = shape;
+            let mut renamed = shape.clone();
             renamed.columns[column].name = to;
             let rename = CompositeFieldRename { from, to };
             for key in &mut keys[..usize::from(statistics.n_keys)] {
@@ -48004,7 +48839,7 @@ fn rewrite_table_publication_column_references<Definition0: crate::storage::Defi
                 let Some(column) = shape.column_index(from.as_str()) else {
                     continue;
                 };
-                let mut renamed = shape;
+                let mut renamed = shape.clone();
                 renamed.columns[column].name = to;
                 let rewritten = rewrite_table_column_reference(
                     filter.as_str(),
@@ -48255,6 +49090,7 @@ fn rewrite_composite_dependent_domains(
             not_null_name: current.not_null_name,
             not_null_identity: current.not_null_identity,
             default_expr: current.default_expr,
+            default_inputs: current.default_inputs.clone(),
             checks: current.checks,
             n_checks: current.n_checks,
         };
@@ -48295,7 +49131,7 @@ fn rewrite_composite_dependent_domains(
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior)) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
@@ -48477,18 +49313,28 @@ fn rewrite_composite_dependent_views(
         if rewritten == view_sql {
             continue;
         }
+        let literal_inputs = super::query::rebase_stored_query_inputs(
+            view_sql.as_str(),
+            rewritten.as_str(),
+            dependencies.view(),
+            storage,
+            txn.txid,
+            arena,
+        )?;
         let dependencies = super::query::stored_query_dependencies(
             rewritten.as_str(),
             storage,
             txn.txid,
             path,
             Some(dependencies.view()),
+            literal_inputs,
             arena,
         )?;
         let undo = storage.replace_view_definition(
             storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
+                default_inputs: view.default_inputs.clone(),
                 columns: view.columns,
                 query: crate::storage::StoredQueryDefinition {
                     sql: rewritten,
@@ -54790,7 +55636,7 @@ pub(crate) fn copy_row(
     }
     let checks = parse_checks(def, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
-    let generated_exprs = parse_generated(def, arena)?;
+    let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
@@ -54902,7 +55748,7 @@ pub(crate) fn copy_row_binary(
     }
     let checks = parse_checks(def, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
-    let generated_exprs = parse_generated(def, arena)?;
+    let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
     for i in 0..setup.n_targets {
@@ -55013,7 +55859,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             let generated = if target == logical_table {
                 generated
             } else {
-                leaf_generated = parse_generated(physical, arena)?;
+                leaf_generated = parse_generated(physical, arena, storage, txn.txid)?;
                 &leaf_generated
             };
             if !fire_partition_row_triggers(
@@ -55251,7 +56097,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
 ) -> Result<(), SqlError> {
     let table_index = logical_target.table();
     let checks = parse_checks(definition, arena)?;
-    let generated = parse_generated(definition, arena)?;
+    let generated = parse_generated(definition, arena, storage, txn.txid)?;
     partition_insert::with_partition_insert_row(
         storage,
         logical_target,
@@ -55272,7 +56118,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
             let generated = if target_table == table_index {
                 &generated
             } else {
-                leaf_generated = parse_generated(definition, arena)?;
+                leaf_generated = parse_generated(definition, arena, storage, txn.txid)?;
                 &leaf_generated
             };
             if !fire_partition_row_triggers(
@@ -55868,7 +56714,7 @@ pub(crate) fn apply_replication_update(
     let mut new_values = old_values;
     mapping.overlay(&logical_new, &mut new_values);
     let checks = parse_checks(definition, arena)?;
-    let generated = parse_generated(definition, arena)?;
+    let generated = parse_generated(definition, arena, storage, txn.txid)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -58370,6 +59216,7 @@ pub fn describe_merge_returning<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: RelationInheritance::Descendants,
@@ -59254,6 +60101,8 @@ pub(crate) fn merge<'a>(
                 command: txn.command_id(),
             },
             arena,
+            storage,
+            txn.txid,
         ) {
             return sql_fail(error);
         }
@@ -59420,7 +60269,7 @@ pub(crate) fn merge<'a>(
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
-    let generated = match parse_generated(def, arena) {
+    let generated = match parse_generated(def, arena, storage, txn.txid) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
@@ -60530,7 +61379,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
             let generated = if target_table == table_index {
                 generated
             } else {
-                leaf_generated = parse_generated(def, arena)?;
+                leaf_generated = parse_generated(def, arena, storage, txn.txid)?;
                 &leaf_generated
             };
             if !fire_partition_row_triggers(
@@ -60727,7 +61576,7 @@ where
             let generated = if table_index == logical_table_index {
                 generated
             } else {
-                leaf_generated = match parse_generated(definition, arena) {
+                leaf_generated = match parse_generated(definition, arena, storage, txn.txid) {
                     Ok(generated) => generated,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -62349,7 +63198,7 @@ where
                 Ok(d) => d,
                 Err(e) => return sql_fail(e),
             };
-        let generated_exprs = match parse_generated(def, arena) {
+        let generated_exprs = match parse_generated(def, arena, storage, txn.txid) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
         };
@@ -62553,7 +63402,7 @@ where
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
-    let generated_exprs = match parse_generated(def, arena) {
+    let generated_exprs = match parse_generated(def, arena, storage, txn.txid) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
@@ -65916,7 +66765,7 @@ fn drop_dependent_foreign_keys(
         }
         let (edit_target, live_definition) = storage.select_table_definition(table_slot, txn.txid);
         let current = if table_slot == target_table {
-            *target
+            target.clone()
         } else {
             TableDefBuilder::from_definition(&live_definition)
         };
@@ -68390,7 +69239,7 @@ fn alter_table_relation(
         if let Err(error) = txn.write_table_definition(
             storage,
             edit_target,
-            new_def,
+            new_def.clone(),
             &mapping,
             false,
             crate::storage::ColumnSet::EMPTY,
@@ -69004,7 +69853,7 @@ fn alter_table_relation(
         if let Err(error) = txn.write_table_definition(
             storage,
             edit_target,
-            new_def,
+            new_def.clone(),
             &mapping,
             false,
             crate::storage::ColumnSet::EMPTY,
@@ -69057,6 +69906,7 @@ fn alter_table_relation(
     // reference a column ADDed earlier in the pass-ordered list.
     let mut invalidated_statistics = ColumnSet::EMPTY;
     let mut new_def = TableDefBuilder::from_definition(&def);
+    let mut input_overrides = ArenaList::new(arena);
     let mut source = [ColSource::Keep(0usize); MAX_COLUMNS];
     for (i, s) in source.iter_mut().enumerate().take(def.n_columns) {
         *s = ColSource::Keep(i);
@@ -69350,6 +70200,12 @@ fn alter_table_relation(
                     new_def.set_not_null_constraint_name(index, name);
                 }
                 source[index] = ColSource::FillDefault(index);
+                if let Some(raw) = c.default_text.or(c.generated_text)
+                    && let Err(error) =
+                        record_table_input_override(&mut input_overrides, index, raw, arena)
+                {
+                    return sql_fail(error);
+                }
                 added_any = true;
             }
             AlterAction::DropColumn {
@@ -69472,6 +70328,17 @@ fn alter_table_relation(
                 new_def.not_null_names[new_def.n_columns - 1] = None;
                 new_def.not_null_name_edits = name_edits;
                 new_def.n_columns -= 1;
+                let overrides = match input_overrides.as_mut_slice() {
+                    Ok(overrides) => overrides,
+                    Err(_) => return sql_fail(arena_full()),
+                };
+                for input in overrides {
+                    if input.column == i {
+                        input.column = usize::MAX;
+                    } else if input.column > i && input.column != usize::MAX {
+                        input.column -= 1;
+                    }
+                }
                 dropped_any = true;
             }
             AlterAction::SetDefault {
@@ -69515,6 +70382,11 @@ fn alter_table_relation(
                     Err(e) => return sql_fail(e),
                 };
                 new_def.columns[i].default = default;
+                if let Err(error) =
+                    record_table_input_override(&mut input_overrides, i, value_text, arena)
+                {
+                    return sql_fail(error);
+                }
                 new_def.columns[i].auto_increment = false;
             }
             AlterAction::DropDefault { column } => {
@@ -69538,6 +70410,10 @@ fn alter_table_relation(
                     ));
                 }
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
+                if let Err(error) = record_table_input_override(&mut input_overrides, i, "", arena)
+                {
+                    return sql_fail(error);
+                }
                 // SERIAL is an ordinary nextval default; ownership remains unchanged.
                 new_def.columns[i].auto_increment = false;
             }
@@ -69735,6 +70611,11 @@ fn alter_table_relation(
                     Err(error) => return sql_fail(error),
                 };
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                if let Err(error) =
+                    record_table_input_override(&mut input_overrides, i, expression_text, arena)
+                {
+                    return sql_fail(error);
+                }
                 generated_changed = true;
                 validate_definition = true;
             }
@@ -69767,6 +70648,10 @@ fn alter_table_relation(
                 // the catalog expression changes, so later writes use the
                 // ordinary-column path without a recomputing rewrite.
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
+                if let Err(error) = record_table_input_override(&mut input_overrides, i, "", arena)
+                {
+                    return sql_fail(error);
+                }
             }
             AlterAction::SetNotNull { column } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -70382,6 +71267,16 @@ fn alter_table_relation(
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) = refresh_table_type_inputs(
+        storage,
+        &def,
+        &mut new_def,
+        input_overrides.as_slice(),
+        txn.txid,
+        arena,
+    ) {
+        return sql_fail(error);
+    }
     for (column, destination) in column_mapping[..def.n_columns].iter().enumerate() {
         if destination.is_none()
             && let Err(error) = stage_comment(
@@ -70447,7 +71342,7 @@ fn alter_table_relation(
     };
     // Generated columns are recomputed for every rewritten row — an ADD COLUMN
     // of a generated column backfills, and a type change of a dependency reflows.
-    let new_generated = match parse_generated(&new_def, arena) {
+    let new_generated = match parse_generated(&new_def, arena, storage, txn.txid) {
         Ok(g) => g,
         Err(e) => return sql_fail(e),
     };
@@ -70893,7 +71788,7 @@ fn alter_table_relation(
     let row_write_target = match txn.write_table_definition(
         storage,
         edit_target,
-        new_def,
+        new_def.clone(),
         &column_mapping,
         has_rewrite,
         invalidated_statistics,
@@ -72083,7 +72978,7 @@ pub(super) fn collect_matches<'a>(
     let mut images = DmlRowImages::new(arena);
     let def = (*storage.table_def(table_index, txid)).clone();
     if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, &def, &def, capture, arena)?;
+        images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
             storage,
             table_index,
@@ -72158,7 +73053,7 @@ pub(super) fn collect_matches<'a>(
             )?;
         }
         let physical = (*storage.table_def(leaf, txid)).clone();
-        let layout = images.capture_layout(leaf, &def, &physical, capture, arena)?;
+        let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
@@ -72247,7 +73142,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena)?;
+        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
             storage,
             table_index,
@@ -72309,7 +73204,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = (*storage.table_def(leaf, txid)).clone();
-        let layout = images.capture_layout(leaf, def, &physical, capture, arena)?;
+        let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(
             leaf,
@@ -72411,7 +73306,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena)?;
+        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
         crate::sql::foreign::visit_mutable_rows(
             storage,
             table_index,
@@ -72477,7 +73372,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
         let physical = (*storage.table_def(leaf, txid)).clone();
-        let layout = images.capture_layout(leaf, def, &physical, capture, arena)?;
+        let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(
             leaf,

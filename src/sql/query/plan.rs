@@ -225,11 +225,13 @@ fn predicate_strength(expression: &Expr) -> u32 {
                 operator: BinaryOp::Or,
                 left,
                 right,
+                ..
             } => equality_alternatives(left)?.checked_add(equality_alternatives(right)?),
             Expr::Binary {
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } if left.is_constant(false) != right.is_constant(false) => Some(1),
             _ => None,
         }
@@ -288,6 +290,7 @@ pub(super) fn flatten_and<'e, 'a>(
         operator: crate::sql::ast::BinaryOp::And,
         left,
         right,
+        ..
     } = e
     {
         return flatten_and(left, out, n) && flatten_and(right, out, n);
@@ -329,13 +332,14 @@ pub(super) fn is_error_safe(e: &Expr) -> bool {
             operator,
             left,
             right,
+            ..
         } => match operator {
             Add | Sub | Mul | Div | Mod => false,
             _ => is_error_safe(left) && is_error_safe(right),
         },
-        Expr::Unary { operator, operand } => {
-            matches!(operator, UnaryOp::Not) && is_error_safe(operand)
-        }
+        Expr::Unary {
+            operator, operand, ..
+        } => matches!(operator, UnaryOp::Not) && is_error_safe(operand),
         Expr::IsNull { operand, .. } => is_error_safe(operand),
         Expr::InList { operand, list, .. } => {
             is_error_safe(operand) && list.iter().all(|e| is_error_safe(e))
@@ -426,6 +430,7 @@ pub(super) fn fold_null<'a>(
                 operator: BinaryOp::Or,
                 left,
                 right,
+                ..
             } => or_spine_has_true(left, scope) || or_spine_has_true(right, scope),
             other => not_null_test(other, scope) == Some(true),
         }
@@ -480,6 +485,7 @@ pub(super) fn fold_null<'a>(
     for &c in &kept[1..n_kept] {
         acc = arena
             .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operator: BinaryOp::And,
                 left: acc,
                 right: c,
@@ -553,6 +559,7 @@ pub(super) fn reorder_qual<'a>(
     for &i in &order[1..n] {
         acc = arena
             .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operator: crate::sql::ast::BinaryOp::And,
                 left: acc,
                 right: conjunct[i],
@@ -578,6 +585,7 @@ pub(super) fn factor_common_or_terms<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } = x
         {
             return flatten_or(left, out, n) && flatten_or(right, out, n);
@@ -594,6 +602,7 @@ pub(super) fn factor_common_or_terms<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } = x
         {
             return and_terms(left, out, n) && and_terms(right, out, n);
@@ -652,6 +661,7 @@ pub(super) fn factor_common_or_terms<'a>(
                 None => t,
                 Some(acc) => arena
                     .alloc(Expr::Binary {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         operator: BinaryOp::And,
                         left: acc,
                         right: t,
@@ -666,6 +676,7 @@ pub(super) fn factor_common_or_terms<'a>(
                 for &c in &common[1..kept] {
                     acc = arena
                         .alloc(Expr::Binary {
+                            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                             operator: BinaryOp::And,
                             left: acc,
                             right: c,
@@ -685,6 +696,7 @@ pub(super) fn factor_common_or_terms<'a>(
     for &x in &residues[1..n_res] {
         or_acc = arena
             .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operator: BinaryOp::Or,
                 left: or_acc,
                 right: x,
@@ -695,6 +707,7 @@ pub(super) fn factor_common_or_terms<'a>(
     for &c in &common[1..kept] {
         acc = arena
             .alloc(Expr::Binary {
+                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 operator: BinaryOp::And,
                 left: acc,
                 right: c,
@@ -703,6 +716,7 @@ pub(super) fn factor_common_or_terms<'a>(
     }
     Ok(&*arena
         .alloc(Expr::Binary {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operator: BinaryOp::And,
             left: acc,
             right: or_acc,
@@ -731,6 +745,7 @@ pub(crate) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             if plan_time_bool(left, arena) == Some(false)
                 || plan_time_bool(right, arena) == Some(false)
@@ -744,6 +759,7 @@ pub(crate) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             if plan_time_bool(left, arena) == Some(true)
                 || plan_time_bool(right, arena) == Some(true)
@@ -756,6 +772,7 @@ pub(crate) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
         Expr::Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
+            ..
         } => plan_time_bool(operand, arena).map(|b| !b),
         _ => None,
     }
@@ -783,6 +800,7 @@ pub(super) fn simplify_qual<'a>(
             operator: operator @ (BinaryOp::And | BinaryOp::Or),
             left,
             right,
+            ..
         } => {
             let keep_true = matches!(operator, BinaryOp::And);
             let l = simplify_qual(left, arena)?;
@@ -800,6 +818,7 @@ pub(super) fn simplify_qual<'a>(
             } else {
                 arena
                     .alloc(Expr::Binary {
+                        source_position: e.source_position(),
                         operator: *operator,
                         left: l,
                         right: r,
@@ -818,27 +837,32 @@ pub(super) fn simplify_qual<'a>(
         Expr::Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
+            ..
         } => {
             let negated: &Expr = match *operand {
                 Expr::Binary {
                     operator: BinaryOp::Or,
                     left,
                     right,
+                    ..
                 } => {
                     let nl = arena
                         .alloc(Expr::Unary {
+                            source_position: e.source_position(),
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: left,
                         })
                         .map_err(|_| arena_full())?;
                     let nr = arena
                         .alloc(Expr::Unary {
+                            source_position: e.source_position(),
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: right,
                         })
                         .map_err(|_| arena_full())?;
                     arena
                         .alloc(Expr::Binary {
+                            source_position: e.source_position(),
                             operator: BinaryOp::And,
                             left: nl,
                             right: nr,
@@ -849,21 +873,25 @@ pub(super) fn simplify_qual<'a>(
                     operator: BinaryOp::And,
                     left,
                     right,
+                    ..
                 } => {
                     let nl = arena
                         .alloc(Expr::Unary {
+                            source_position: e.source_position(),
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: left,
                         })
                         .map_err(|_| arena_full())?;
                     let nr = arena
                         .alloc(Expr::Unary {
+                            source_position: e.source_position(),
                             operator: crate::sql::ast::UnaryOp::Not,
                             operand: right,
                         })
                         .map_err(|_| arena_full())?;
                     arena
                         .alloc(Expr::Binary {
+                            source_position: e.source_position(),
                             operator: BinaryOp::Or,
                             left: nl,
                             right: nr,
@@ -873,6 +901,7 @@ pub(super) fn simplify_qual<'a>(
                 Expr::Unary {
                     operator: crate::sql::ast::UnaryOp::Not,
                     operand: inner,
+                    ..
                 } => inner,
                 Expr::IsNull {
                     operand: inner,
@@ -900,6 +929,7 @@ pub(super) fn simplify_qual<'a>(
                         | BinaryOp::GtEq),
                     left,
                     right,
+                    ..
                 } => {
                     let negator = match operator {
                         BinaryOp::Eq => BinaryOp::NotEq,
@@ -912,6 +942,7 @@ pub(super) fn simplify_qual<'a>(
                     };
                     arena
                         .alloc(Expr::Binary {
+                            source_position: e.source_position(),
                             operator: negator,
                             left,
                             right,
@@ -979,6 +1010,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | NumericLit(_)
         | Str(_)
         | BitLit(_)
+        | BoundLiteral { .. }
         | Param(_)
         | RoutineParam { .. }
         | DefaultMarker
@@ -988,6 +1020,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
+            ..
         } => postpone_cost(operand, scope, arena),
         Unary { operand, .. } => postpone_cost(operand, scope, arena) + 2,
         IsNull { operand, .. } => postpone_cost(operand, scope, arena),
@@ -998,6 +1031,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
             operator: crate::sql::ast::BinaryOp::And | crate::sql::ast::BinaryOp::Or,
             left,
             right,
+            ..
         } => postpone_cost(left, scope, arena) + postpone_cost(right, scope, arena),
         Binary { left, right, .. } => {
             postpone_cost(left, scope, arena)

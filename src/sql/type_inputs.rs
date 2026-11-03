@@ -13,7 +13,7 @@ pub(crate) enum Source {
     RootCommand {
         statement: usize,
     },
-    SqlStringCallSite {
+    SqlRoutineCallSite {
         routine_oid: i32,
         definition_version: u64,
         callsite: usize,
@@ -22,6 +22,10 @@ pub(crate) enum Source {
         routine_oid: i32,
         definition_version: u64,
         expression: usize,
+    },
+    UnlocatedRoutineBody {
+        routine_oid: i32,
+        definition_version: u64,
     },
 }
 
@@ -93,6 +97,15 @@ pub(crate) fn bindings_for_active_source<'a>(
     // SAFETY: enter_source borrows these values until its non-Send guard is
     // dropped. No reference into that scoped owner escapes this function.
     let (text, bindings) = unsafe { (&*active.text, &*active.bindings) };
+    let start = text.as_ptr() as usize;
+    let end = start.checked_add(text.len()).ok_or_else(invalid)?;
+    let selected_start = source_slice.as_ptr() as usize;
+    let selected_end = selected_start
+        .checked_add(source_slice.len())
+        .ok_or_else(invalid)?;
+    if selected_start < start || selected_end > end {
+        return Ok(None);
+    }
     let selected = bindings_for_source(text, bindings, source_slice, arena)?;
     let output = arena
         .alloc_slice_with(selected.len(), |_| Binding {
@@ -203,21 +216,21 @@ pub(crate) fn candidate_target_oid(
 
 pub(crate) fn contextual_candidate<'a>(
     literals: &[(&'a Expr<'a>, super::parser::NamespaceSource)],
-    expression: &'a Expr<'a>,
+    expression: &Expr<'_>,
     type_oid: i32,
     type_mod: i32,
 ) -> Result<Option<Candidate<'a>>, SqlError> {
     let Expr::Str(value) = expression else {
         return Ok(None);
     };
-    let source = literals
+    let (expression, source) = literals
         .iter()
         .find_map(|(literal, source)| {
             let Expr::Str(candidate) = literal else {
                 return None;
             };
             (core::ptr::eq(value.as_ptr(), candidate.as_ptr()) && value.len() == candidate.len())
-                .then_some(*source)
+                .then_some((*literal, *source))
         })
         .ok_or_else(|| {
             sql_err!(
@@ -249,15 +262,21 @@ pub(crate) fn validate_restored_with(
     parser: &super::parser::Parser<'_>,
     mut resolve: impl FnMut(&str) -> Result<Option<i32>, SqlError>,
 ) -> Result<(), SqlError> {
+    validate_restored_candidates(parser, |candidate| match candidate.target {
+        CandidateTarget::TypeName(name) => resolve(name),
+        CandidateTarget::ContextualOid(oid) => Ok(Some(oid)),
+    })
+}
+
+pub(crate) fn validate_restored_candidates(
+    parser: &super::parser::Parser<'_>,
+    mut resolve: impl FnMut(&Candidate<'_>) -> Result<Option<i32>, SqlError>,
+) -> Result<(), SqlError> {
     if !parser.type_inputs_complete() {
         return Err(invalid());
     }
     for candidate in parser.type_input_candidates() {
-        let target = match candidate.target {
-            CandidateTarget::TypeName(name) => resolve(name)?,
-            CandidateTarget::ContextualOid(oid) => Some(oid),
-        };
-        if target.is_some() {
+        if resolve(candidate)?.is_some() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "SQL type input has no admitted value"
@@ -265,11 +284,7 @@ pub(crate) fn validate_restored_with(
         }
     }
     for (candidate, binding) in parser.restored_type_inputs() {
-        let target = match candidate.target {
-            CandidateTarget::TypeName(name) => resolve(name)?,
-            CandidateTarget::ContextualOid(oid) => Some(oid),
-        };
-        if target != Some(binding.type_oid) {
+        if resolve(candidate)? != Some(binding.type_oid) {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "bound SQL type input target identity changed"
@@ -622,7 +637,7 @@ pub(crate) fn rebase<'a>(
         .map_err(|_| super::query::arena_full_pub())?;
     let old = super::parser::type_input_sources(old_source, kind, arena)?;
     let new = super::parser::type_input_sources(new_source, kind, arena)?;
-    if old.casts.len() != new.casts.len() || old.literals.len() != new.literals.len() {
+    if old.literals.len() != new.literals.len() {
         return Err(invalid());
     }
     let output = arena
@@ -631,15 +646,25 @@ pub(crate) fn rebase<'a>(
     for binding in output.iter_mut() {
         match binding.kind {
             InputKind::ExplicitCast => {
-                let index = old
+                let prior = old
                     .casts
                     .iter()
-                    .position(|candidate| {
+                    .find(|candidate| {
                         (candidate.start, candidate.end) == (binding.start, binding.end)
                     })
                     .ok_or_else(invalid)?;
-                let old = old.casts[index];
-                let new = new.casts[index];
+                let Expr::Cast { operand, .. } = prior.expression else {
+                    return Err(invalid());
+                };
+                let literal = old
+                    .literals
+                    .iter()
+                    .position(|(literal, _)| core::ptr::eq(*literal, *operand))
+                    .ok_or_else(invalid)?;
+                let next_literal = new.literals[literal].0;
+                let next = new.casts.iter().find(|candidate|
+                    matches!(candidate.expression, Expr::Cast { operand, .. } if core::ptr::eq(*operand, next_literal)))
+                    .ok_or_else(invalid)?;
                 let (
                     Expr::Cast {
                         operand: Expr::Str(old_value),
@@ -649,23 +674,29 @@ pub(crate) fn rebase<'a>(
                         operand: Expr::Str(new_value),
                         ..
                     },
-                ) = (old.expression, new.expression)
+                ) = (prior.expression, next.expression)
                 else {
                     return Err(invalid());
                 };
-                let target = match new.target {
-                    CandidateTarget::TypeName(name) => resolve(name)?,
-                    CandidateTarget::ContextualOid(oid) => Some(oid),
+                let target = if prior.target == next.target {
+                    // An unchanged written name belongs to the captured type,
+                    // even after that name has been renamed or reused.
+                    Some(binding.type_oid)
+                } else {
+                    match next.target {
+                        CandidateTarget::TypeName(name) => resolve(name)?,
+                        CandidateTarget::ContextualOid(oid) => Some(oid),
+                    }
                 };
                 if old_value != new_value
-                    || old.type_mod != binding.type_mod
-                    || new.type_mod != binding.type_mod
+                    || prior.type_mod != binding.type_mod
+                    || next.type_mod != binding.type_mod
                     || target != Some(binding.type_oid)
                 {
                     return Err(invalid());
                 }
-                binding.start = new.start;
-                binding.end = new.end;
+                binding.start = next.start;
+                binding.end = next.end;
             }
             InputKind::ImplicitLiteral => {
                 let index = old
@@ -706,6 +737,51 @@ mod tests {
         parser::Parser,
         types::{ArrElem, ColType},
     };
+
+    #[test]
+    fn source_rebase_keeps_captured_types_when_uncached_casts_are_inserted() {
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "rebase captured type input", 64 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let old = "SELECT 'a', '{7}'::integer[]";
+            let kind = super::super::parser::StoredSqlKind::Statements;
+            let syntax = super::super::parser::type_input_sources(old, kind, &arena).unwrap();
+            let raw = super::super::array::build(&[Datum::Int4(7)], &arena).unwrap();
+            let binding = capture_value(
+                syntax.casts[0],
+                ColType::Array(ArrElem::Int4).oid(),
+                None,
+                Datum::Array {
+                    element: ArrElem::Int4,
+                    raw,
+                },
+                &arena,
+            )
+            .unwrap();
+            let new = "SELECT 'a'::text, '{7}'::integer[]";
+            let rebased = rebase(
+                old,
+                new,
+                kind,
+                &[binding],
+                |_| panic!("unchanged target uses captured lifetime"),
+                &arena,
+            )
+            .unwrap();
+            let syntax = super::super::parser::type_input_sources(new, kind, &arena).unwrap();
+            assert_eq!(rebased[0].start, syntax.casts[1].start);
+            assert_eq!(rebased[0].end, syntax.casts[1].end);
+            assert_eq!(rebased[0].type_oid, binding.type_oid);
+            assert_eq!(rebased[0].encoded, binding.encoded);
+            let changed = "SELECT 'a'::text, '{8}'::integer[]";
+            assert_eq!(
+                rebase(old, changed, kind, &[binding], |_| Ok(None), &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+        });
+    }
 
     #[test]
     fn input_images_restore_distinct_occurrences_and_nominal_metadata_without_allocating() {
@@ -907,7 +983,7 @@ mod tests {
         let mut source = Arena::new(&mut budget, "source", 4096).unwrap();
         let destination = Arena::new(&mut budget, "destination", 4096).unwrap();
         let root = Source::RootCommand { statement: 2 };
-        let nested = Source::SqlStringCallSite {
+        let nested = Source::SqlRoutineCallSite {
             routine_oid: 62001,
             definition_version: 3,
             callsite: 1,
@@ -937,6 +1013,12 @@ mod tests {
                     assert_eq!(active_source(), Some(nested))
                 });
                 assert_eq!(active_source(), Some(root));
+                let foreign = destination.alloc_str(text).unwrap();
+                assert!(
+                    bindings_for_active_source(foreign, &destination)
+                        .unwrap()
+                        .is_none()
+                );
                 bindings_for_active_source(&text[7..], &destination)
                     .unwrap()
                     .unwrap()

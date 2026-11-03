@@ -510,6 +510,8 @@ fn column_metadata_stays_within_recovery_stack_budget() {
 
 #[test]
 fn schema_sql_rewrite_leaves_literals_and_comments_opaque() {
+    let mut budget = Budget::new(1024);
+    let arena = crate::mem::arena::Arena::new(&mut budget, "schema rewrite", 1024).unwrap();
     let old = SqlName::parse("old_schema").unwrap();
     let new = SqlName::parse("new_schema").unwrap();
     let mut source = StackStr::<256>::from_str(
@@ -520,7 +522,7 @@ fn schema_sql_rewrite_leaves_literals_and_comments_opaque() {
         &mut [],
         old,
         new,
-        NamespaceRewriteScope::Lexical,
+        NamespaceRewriteScope::Lexical { arena: &arena },
     )
     .unwrap();
     assert_eq!(
@@ -531,6 +533,8 @@ fn schema_sql_rewrite_leaves_literals_and_comments_opaque() {
 
 #[test]
 fn schema_sql_rewrite_preserves_escape_and_dollar_strings_and_identifier_spelling() {
+    let mut budget = Budget::new(1024);
+    let arena = crate::mem::arena::Arena::new(&mut budget, "schema rewrite", 1024).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let old = SqlName::parse("old_schema").unwrap();
         let new = SqlName::parse("new_schema").unwrap();
@@ -542,7 +546,7 @@ fn schema_sql_rewrite_preserves_escape_and_dollar_strings_and_identifier_spellin
             &mut [],
             old,
             new,
-            NamespaceRewriteScope::Lexical,
+            NamespaceRewriteScope::Lexical { arena: &arena },
         )
         .unwrap();
         assert_eq!(
@@ -556,7 +560,7 @@ fn schema_sql_rewrite_preserves_escape_and_dollar_strings_and_identifier_spellin
             &mut [],
             SqlName::parse("old\"schema").unwrap(),
             SqlName::parse("new space").unwrap(),
-            NamespaceRewriteScope::Lexical,
+            NamespaceRewriteScope::Lexical { arena: &arena },
         )
         .unwrap();
         assert_eq!(
@@ -569,7 +573,7 @@ fn schema_sql_rewrite_preserves_escape_and_dollar_strings_and_identifier_spellin
             &mut [],
             SqlName::parse("café").unwrap(),
             new,
-            NamespaceRewriteScope::Lexical,
+            NamespaceRewriteScope::Lexical { arena: &arena },
         )
         .unwrap();
         assert_eq!(
@@ -629,6 +633,8 @@ fn schema_sql_rewrite_remaps_view_and_rule_spans_for_shorter_and_longer_names() 
 
 #[test]
 fn schema_sql_rewrite_rejects_invalid_spans_and_exhaustion_without_partial_edits() {
+    let mut budget = Budget::new(1024);
+    let arena = crate::mem::arena::Arena::new(&mut budget, "schema rewrite", 1024).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let old = SqlName::parse("old_schema").unwrap();
         let new = SqlName::parse("new_schema").unwrap();
@@ -644,7 +650,7 @@ fn schema_sql_rewrite_rejects_invalid_spans_and_exhaustion_without_partial_edits
                 &mut spans,
                 old,
                 new,
-                NamespaceRewriteScope::Lexical,
+                NamespaceRewriteScope::Lexical { arena: &arena },
             )
             .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
@@ -663,7 +669,7 @@ fn schema_sql_rewrite_rejects_invalid_spans_and_exhaustion_without_partial_edits
             &mut spans,
             old,
             SqlName::parse("a_schema_name_that_cannot_fit").unwrap(),
-            NamespaceRewriteScope::Lexical,
+            NamespaceRewriteScope::Lexical { arena: &arena },
         )
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);

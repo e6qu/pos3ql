@@ -75,6 +75,8 @@ pub struct Config {
     pub max_prepared: usize,
     /// Stored query text and metadata per wire or SQL prepared statement.
     pub prepared_bytes: usize,
+    /// Checked routine-input plans retained by each backend session.
+    pub routine_input_slots: usize,
     /// Portal slots per connection.
     pub max_portals: usize,
     /// Rows one transaction may touch. Each connection also reserves this
@@ -416,6 +418,7 @@ impl Config {
             work_arena_bytes: 64 * MIB,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,
+            routine_input_slots: 128,
             max_portals: 4,
             portal_bytes: 4 * KIB,
             portal_result_bytes: 64 * KIB,
@@ -766,6 +769,10 @@ impl Config {
                 "prepared_bytes" => {
                     config.prepared_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "routine_input_slots" => {
+                    config.routine_input_slots =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_portals" => {
                     config.max_portals =

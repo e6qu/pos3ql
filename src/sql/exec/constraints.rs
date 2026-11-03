@@ -1681,25 +1681,58 @@ pub(crate) fn parse_defaults<'a>(
     txid: u32,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    let input_sections = def.type_inputs.as_ref().detached_sections(arena)?;
     for (i, c) in def.columns().iter().enumerate() {
-        if c.default.is_generated() {
+        if c.default.is_generated() || c.default.constant().is_some() {
             continue;
         }
         if let Some(text) = c.default.expression() {
-            let text = if c.default.constant().is_none() {
-                super::super::enum_values::checks::resolve_default(
-                    text.as_str(),
-                    c.ctype,
-                    storage,
-                    txid,
+            let original = crate::sql::enum_values::checks::default_display(text.as_str(), arena)?;
+            let text = super::super::enum_values::checks::resolve_default(
+                text.as_str(),
+                c.ctype,
+                storage,
+                txid,
+                arena,
+            )?;
+            let section = crate::storage::StoredInputSection::TableDefault(def.attribute_number(i));
+            let inputs = input_sections
+                .binary_search_by_key(&section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| input_sections[index].1);
+            let inputs = if original == text {
+                inputs
+            } else {
+                crate::sql::type_inputs::rebase(
+                    original,
+                    text,
+                    crate::sql::parser::StoredSqlKind::Expression,
+                    inputs,
+                    |name| Ok(crate::sql::type_inputs::target_oid(storage, txid, name)),
                     arena,
                 )?
-            } else {
-                arena
-                    .alloc_str(text.as_str())
-                    .map_err(|_| crate::sql::query::arena_full_pub())?
             };
-            out[i] = Some(crate::sql::parser::parse_expr(text, arena)?);
+            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+                text,
+                inputs,
+                arena,
+                |parser| {
+                    crate::sql::type_inputs::validate_restored_candidates(parser, |candidate| {
+                        Ok(inputs
+                            .iter()
+                            .find(|input| {
+                                (input.start, input.end, input.kind)
+                                    == (candidate.start, candidate.end, candidate.kind)
+                            })
+                            .map(|input| input.type_oid)
+                            .or_else(|| {
+                                crate::sql::type_inputs::candidate_target_oid(
+                                    storage, txid, candidate,
+                                )
+                            }))
+                    })
+                },
+            )?);
         }
     }
     Ok(out)
@@ -1711,15 +1744,43 @@ pub(crate) fn parse_defaults<'a>(
 pub(crate) fn parse_generated<'a>(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    let input_sections = def.type_inputs.as_ref().detached_sections(arena)?;
     for (i, c) in def.columns().iter().enumerate() {
         if c.default.is_generated() {
             let text = c.default.expression().expect("generated column has expr");
             let source = arena
                 .alloc_str(text.as_str())
                 .map_err(|_| crate::sql::eval::arena_full())?;
-            out[i] = Some(crate::sql::parser::parse_expr(source, arena)?);
+            let section = crate::storage::StoredInputSection::TableDefault(def.attribute_number(i));
+            let inputs = input_sections
+                .binary_search_by_key(&section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| input_sections[index].1);
+            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+                source,
+                inputs,
+                arena,
+                |parser| {
+                    crate::sql::type_inputs::validate_restored_candidates(parser, |candidate| {
+                        Ok(inputs
+                            .iter()
+                            .find(|input| {
+                                (input.start, input.end, input.kind)
+                                    == (candidate.start, candidate.end, candidate.kind)
+                            })
+                            .map(|input| input.type_oid)
+                            .or_else(|| {
+                                crate::sql::type_inputs::candidate_target_oid(
+                                    storage, txid, candidate,
+                                )
+                            }))
+                    })
+                },
+            )?);
         }
     }
     Ok(out)

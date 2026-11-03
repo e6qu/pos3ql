@@ -200,8 +200,22 @@ pub(crate) fn plan_row_security<'a>(
         match expression {
             Some(source) => {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
-                let expression = crate::sql::parser::parse_expr(source, arena)?;
                 let dependencies = storage.snapshot_policy_dependencies(slot, txid, arena)?;
+                let section = if matches!(expression_kind, RowSecurityExpression::Using)
+                    || policy_definition.with_check.is_none()
+                {
+                    crate::storage::StoredInputSection::PolicyUsing
+                } else {
+                    crate::storage::StoredInputSection::PolicyCheck
+                };
+                let expression = super::parse_stored_expression(
+                    source,
+                    section,
+                    storage,
+                    txid,
+                    dependencies.view(),
+                    arena,
+                )?;
                 predicates[count] = PolicyPredicate {
                     expression: super::cte::expand_stored_expression(
                         expression,
@@ -1518,6 +1532,7 @@ where
         operator: BinaryOp::TextSearchPhrase,
         left,
         right,
+        ..
     } = target
     else {
         return None;
@@ -1566,6 +1581,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = expression
     {
         collect_index_constraints(left, resolve_column, operand_is_invariant, constraints);
@@ -1576,6 +1592,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         operator,
         left,
         right,
+        ..
     } = expression
     else {
         return;
@@ -1647,10 +1664,12 @@ where
             Expr::Unary {
                 operator: left_op,
                 operand: left,
+                ..
             },
             Expr::Unary {
                 operator: right_op,
                 operand: right,
+                ..
             },
         ) => {
             left_op == right_op
@@ -1661,11 +1680,13 @@ where
                 operator: left_op,
                 left: left_lhs,
                 right: left_rhs,
+                ..
             },
             Expr::Binary {
                 operator: right_op,
                 left: right_lhs,
                 right: right_rhs,
+                ..
             },
         ) => {
             left_op == right_op
@@ -1792,6 +1813,7 @@ where
         operator: BinaryOp::Eq,
         left,
         right,
+        ..
     } = query
     {
         if matches!(**right, Expr::Bool(true))
@@ -1804,6 +1826,7 @@ where
         if let Expr::Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
+            ..
         } = required
             && (matches!(**right, Expr::Bool(false))
                 && index_expression_matches(operand, left, definition, resolve_candidate)
@@ -1821,6 +1844,7 @@ where
             operator: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
             left,
             right,
+            ..
         } = query
     {
         return index_expression_matches(operand, left, definition, resolve_candidate)
@@ -1831,11 +1855,13 @@ where
             operator: required_op,
             left: required_lhs,
             right: required_rhs,
+            ..
         },
         Expr::Binary {
             operator: query_op,
             left: query_lhs,
             right: query_rhs,
+            ..
         },
     ) = (required, query)
     else {
@@ -1879,6 +1905,7 @@ where
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = query
     {
         any_conjunct_implies(left, required, definition, resolve_candidate)
@@ -1901,6 +1928,7 @@ where
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = required
     {
         return predicate_is_implied(left, queries, definition, resolve_candidate)
@@ -4691,6 +4719,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             kind: crate::sql::ast::CallKind::Routine,
             bound_oid: None,
             bound_strict: None,
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             name: written_name,
             args: arguments,
             argument_names: tref.func_argument_names,
@@ -5278,6 +5307,7 @@ fn hash_join_keys<'a>(
             operator: BinaryOp::Eq,
             left,
             right,
+            ..
         } = c
         else {
             continue;
@@ -5783,6 +5813,7 @@ fn scan_source_mode<'a>(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } = expression
             {
                 collect(
@@ -5796,6 +5827,7 @@ fn scan_source_mode<'a>(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } = expression
             else {
                 return Ok(());

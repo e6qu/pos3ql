@@ -95,12 +95,14 @@ fn retained_expression(
         Expr::Unary {
             operator: UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot,
             operand,
+            ..
         }
         | Expr::IsNull { operand, .. } => retained_expression(operand, catalog, statement),
         Expr::Binary {
             operator,
             left,
             right,
+            ..
         } => {
             operator
                 .operator_name()
@@ -212,6 +214,7 @@ fn retained_bound(expression: &Expr<'_>, catalog: &dyn super::super::eval::Catal
         Expr::Unary {
             operator: crate::sql::ast::UnaryOp::Neg,
             operand,
+            ..
         } => retained_bound(operand, catalog),
         Expr::Binary { left, right, .. } => {
             retained_expression(expression, catalog, None)
@@ -301,7 +304,10 @@ fn bind_expression<'a>(
         )
     };
     let bound = match expression {
-        Expr::Unary { operator, operand } => Expr::Unary {
+        Expr::Unary {
+            operator, operand, ..
+        } => Expr::Unary {
+            source_position: expression.source_position(),
             operator: *operator,
             operand: bind_expression(operand, arena, columns, defaults)?,
         },
@@ -313,6 +319,7 @@ fn bind_expression<'a>(
             operator,
             left,
             right,
+            ..
         } => {
             let left = bind_expression(left, arena, columns, defaults)?;
             let right = bind_expression(right, arena, columns, defaults)?;
@@ -329,6 +336,7 @@ fn bind_expression<'a>(
                     kind: crate::sql::ast::CallKind::SqlSyntax,
                     bound_oid: None,
                     bound_strict: None,
+                    source_position: expression.source_position(),
                     name,
                     args,
                     argument_names: &[],
@@ -341,6 +349,7 @@ fn bind_expression<'a>(
                 }
             } else {
                 Expr::Binary {
+                    source_position: expression.source_position(),
                     operator: *operator,
                     left,
                     right,
@@ -399,6 +408,7 @@ fn bind_expression<'a>(
             type_name,
             type_mod,
             binding,
+            ..
         } if columns.is_some() => {
             let operand = bind_expression(operand, arena, columns, defaults)?;
             let columns = columns.expect("statement type resolver");
@@ -444,6 +454,7 @@ fn bind_expression<'a>(
                 None => *binding,
             };
             Expr::Cast {
+                source_position: expression.source_position(),
                 operand,
                 type_name,
                 type_mod: *type_mod,
@@ -642,6 +653,14 @@ fn bind_defaults<'a>(
         })?;
         let expression = bind_routine_parameter_default(
             source.as_str(),
+            declared
+                .parameters()
+                .iter()
+                .enumerate()
+                .filter(|(_, parameter)| parameter.mode.is_input())
+                .nth(index)
+                .expect("selected input parameter")
+                .0,
             storage,
             txid,
             dependencies.view(),

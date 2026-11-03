@@ -169,15 +169,30 @@ impl<'a> CteNames<'a> {
     }
 }
 
-pub(super) fn collect(
+pub(crate) fn collect(
     sql: &str,
     storage: &Storage,
     txid: u32,
     path: PathContext,
     bindings: Option<crate::storage::StoredQueryDependencyView<'_>>,
+    literal_inputs: &[crate::sql::type_inputs::Binding<'_>],
     arena: &Arena,
 ) -> Result<StoredQueryDependencies, SqlError> {
-    let select = crate::sql::parser::parse_query(sql, arena)?;
+    let select =
+        crate::sql::parser::parse_query_with_type_inputs(sql, literal_inputs, arena, |parser| {
+            crate::sql::type_inputs::validate_restored_with(parser, |name| {
+                if let Some(oid) = bindings
+                    .and_then(|dependencies| super::cte::captured_type_oid(name, dependencies))
+                {
+                    return Ok(matches!(
+                        crate::storage::NamedTypeKind::from_oid(oid),
+                        Some((crate::storage::NamedTypeKind::Domain, _, true))
+                    )
+                    .then_some(oid));
+                }
+                Ok(crate::sql::type_inputs::target_oid(storage, txid, name))
+            })
+        })?;
     let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     collect_select(
         select,
@@ -193,20 +208,32 @@ pub(super) fn collect(
 
 pub(crate) fn collect_routine_parameter_defaults(
     parameters: &[crate::storage::RoutineParameterDef],
+    inputs: &[crate::storage::StoredInputSource<'_>],
     storage: &Storage,
     txid: u32,
     path: PathContext,
     dependencies: &mut StoredQueryDependencies,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    for parameter in parameters {
+    for (index, parameter) in parameters.iter().enumerate() {
         let Some(default) = parameter.mode.default() else {
             continue;
         };
         let source = arena
             .alloc_str(default.as_str())
             .map_err(|_| arena_full())?;
-        let expression = crate::sql::parser::parse_expression(source, arena)?;
+        let literals = inputs
+            .iter()
+            .find(|input| {
+                input.section == crate::storage::StoredInputSection::ParameterDefault(index as u16)
+            })
+            .map_or(&[][..], |input| input.bindings);
+        let expression = crate::sql::parser::parse_expression_with_type_inputs(
+            source,
+            literals,
+            arena,
+            |parser| crate::sql::type_inputs::validate_restored(parser, storage, txid),
+        )?;
         let items = arena
             .alloc_slice_copy(&[SelectItem::Expr {
                 expression,
@@ -286,6 +313,7 @@ pub(super) fn collect_routine_program(
 
 pub(super) fn collect_rule_actions(
     actions: &[crate::sql::ast::RuleAction<'_>],
+    condition: Option<&Expr<'_>>,
     storage: &Storage,
     txid: u32,
     path: PathContext,
@@ -293,6 +321,17 @@ pub(super) fn collect_rule_actions(
     transition: &dyn ColTypeResolver,
 ) -> Result<StoredQueryDependencies, SqlError> {
     let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
+    if let Some(condition) = condition {
+        collect_expression(
+            condition,
+            storage,
+            txid,
+            CteNames::EMPTY,
+            &mut dependencies,
+            arena,
+            CollectionContext::rule(&path, transition),
+        )?;
+    }
     for action in actions {
         collect_statement(
             action.statement,
@@ -1410,6 +1449,55 @@ pub(super) fn visit_dml_assignment_contexts(
         &dyn ColTypeResolver,
     ) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    visit_dml_assignment_inputs(
+        statement,
+        storage,
+        txid,
+        arena,
+        outer,
+        false,
+        &mut |group, columns| {
+            for assignment in group {
+                if !matches!(assignment.expression, Expr::DefaultMarker) {
+                    visit(assignment.expression, assignment.column, columns)?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct AssignmentInput<'a> {
+    pub expression: &'a Expr<'a>,
+    pub column: &'a crate::storage::ColumnMeta,
+    ordinal: usize,
+}
+
+pub(super) fn visit_dml_assignment_groups(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    visit: &mut dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    visit_dml_assignment_inputs(statement, storage, txid, arena, outer, true, visit)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared schema authority for streaming and grouped assignment analysis"
+)]
+fn visit_dml_assignment_inputs(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    grouped: bool,
+    visit: &mut dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
         let (statement, with) = match statement {
@@ -1450,10 +1538,9 @@ pub(super) fn visit_dml_assignment_contexts(
             returning_output: None,
             arena,
         };
+        let mut assignments = crate::mem::arena::ArenaList::new(arena);
         for_each_dml_assignment(statement, &mut |name, index, expression| {
-            if matches!(expression, Expr::DefaultMarker) {
-                return Ok(());
-            }
+            let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
                     sql_err!(
@@ -1471,8 +1558,28 @@ pub(super) fn visit_dml_assignment_contexts(
                     "INSERT has more expressions than target columns"
                 )
             })?;
-            visit(expression, column, &columns)
-        })
+            let assignment = AssignmentInput {
+                expression,
+                column,
+                ordinal,
+            };
+            if grouped {
+                assignments.push(assignment).map_err(|_| arena_full())
+            } else {
+                visit(core::slice::from_ref(&assignment), &columns)
+            }
+        })?;
+        let assignments = assignments.as_slice();
+        let mut start = 0;
+        while start < assignments.len() {
+            let end = assignments[start + 1..]
+                .iter()
+                .position(|assignment| assignment.ordinal == 0)
+                .map_or(assignments.len(), |offset| start + 1 + offset);
+            visit(&assignments[start..end], &columns)?;
+            start = end;
+        }
+        Ok(())
     })();
     // Only Copy cast snapshots, allocated in the persistent tail, may escape.
     unsafe { arena.rewind_to(mark) };
@@ -1688,6 +1795,7 @@ pub(super) fn dml_dependency_scope<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: RelationInheritance::Descendants,
@@ -2731,6 +2839,7 @@ fn collect_routine_dependencies_with_resolver(
             operator,
             left,
             right,
+            ..
         } = expression
             && let Some(name) = operator.operator_name()
         {
@@ -3234,8 +3343,12 @@ fn collect_expression<'a>(
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
     let path = context.path;
-    if let Expr::BoundLiteral { source, .. } = expression {
-        return collect_expression(source, storage, txid, ctes, dependencies, arena, context);
+    if let Expr::BoundLiteral {
+        source, type_oid, ..
+    } = expression
+    {
+        collect_type_oid(*type_oid, source, storage, txid, dependencies, arena)?;
+        return Ok(());
     }
     if let Expr::Cast { type_name, .. } = expression {
         collect_type(type_name, storage, txid, path, dependencies)?;
@@ -3467,6 +3580,119 @@ fn collect_expression<'a>(
         }
         _ => Ok(()),
     }
+}
+
+fn collect_type_oid(
+    type_oid: i32,
+    source: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some((kind, creation, _)) = crate::storage::NamedTypeKind::from_oid(type_oid) else {
+        return Ok(());
+    };
+    let crate::storage::TypeDefinitionTarget::Bound(reference) =
+        crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?
+    else {
+        unreachable!("creation lookup returns a captured source");
+    };
+    let written = if let Expr::Cast { type_name, .. } = source {
+        let bare = type_name.strip_suffix("[]").unwrap_or(type_name);
+        let (schema, name) = bare.split_once('.').unwrap_or(("", bare));
+        Some((SqlName::parse(schema)?, SqlName::parse(name)?))
+    } else {
+        None
+    };
+    let mut pending = crate::mem::arena::ArenaList::new(arena);
+    pending.push(reference).map_err(|_| arena_full())?;
+    let mut index = 0;
+    while index < pending.len() {
+        let reference = pending.as_slice()[index];
+        index += 1;
+        let identity = StoredDependencyIdentity::Type(reference);
+        let target = crate::storage::TypeDefinitionTarget::Bound(reference);
+        let mut queue_child = |name: crate::storage::UserTypeName| -> Result<(), SqlError> {
+            let child = crate::storage::TypeReference::from_bound_name(name)?;
+            if !pending.as_slice().contains(&child) {
+                pending.push(child).map_err(|_| arena_full())?;
+            }
+            Ok(())
+        };
+        let (class, schema, name) = match reference.kind() {
+            crate::storage::NamedTypeKind::Domain => {
+                let definition =
+                    storage
+                        .read_domain_definition(target, txid)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "captured domain input type no longer exists"
+                            )
+                        })?;
+                for child in [definition.base_domain, definition.base_user_type]
+                    .into_iter()
+                    .flatten()
+                {
+                    queue_child(child)?;
+                }
+                (DependencyClass::Domain, definition.schema, definition.name)
+            }
+            crate::storage::NamedTypeKind::Enum => {
+                let definition = storage.read_enum_definition(target, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "captured enum input type no longer exists"
+                    )
+                })?;
+                (DependencyClass::Enum, definition.schema, definition.name)
+            }
+            crate::storage::NamedTypeKind::Composite => {
+                let definition = storage
+                    .read_composite_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "captured record input type no longer exists"
+                        )
+                    })?;
+                for field in definition.fields() {
+                    if let Some(child) = field.user_type {
+                        queue_child(child)?;
+                    }
+                }
+                (
+                    DependencyClass::Composite,
+                    definition.schema,
+                    definition.name,
+                )
+            }
+        };
+        let (referenced_schema, referenced_name) =
+            if reference.creation() == creation && reference.kind() == kind {
+                written.unwrap_or((schema, name))
+            } else {
+                (schema, name)
+            };
+        if !dependencies.entries().iter().any(|dependency| {
+            dependency.identity == identity
+                && dependency.referenced_schema == referenced_schema
+                && dependency.referenced_name == referenced_name
+        }) {
+            dependencies.push(StoredQueryDependency {
+                class,
+                slot: reference.catalog_slot(),
+                identity,
+                referenced_columns: crate::storage::ColumnSet::EMPTY,
+                schema,
+                name,
+                referenced_schema,
+                referenced_name,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_type(

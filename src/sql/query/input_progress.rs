@@ -680,6 +680,7 @@ thread_local! {
     static AVAILABLE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static CURRENT_CALL: Cell<Option<usize>> = const { Cell::new(None) };
+    static CURRENT_SOURCE_POSITION: Cell<Option<usize>> = const { Cell::new(None) };
     static IN_BODY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -711,12 +712,14 @@ pub(super) fn evaluation(
 
 pub(crate) struct ExpressionPosition {
     previous: Option<usize>,
+    previous_source: Option<usize>,
     pub(crate) target: Option<i32>,
     _thread: core::marker::PhantomData<*const ()>,
 }
 impl Drop for ExpressionPosition {
     fn drop(&mut self) {
         CURRENT_CALL.with(|current| current.set(self.previous));
+        CURRENT_SOURCE_POSITION.with(|current| current.set(self.previous_source));
     }
 }
 
@@ -741,19 +744,35 @@ pub(super) fn selected_target() -> Option<i32> {
 
 pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPosition, SqlError> {
     let previous = CURRENT_CALL.with(Cell::get);
+    let source = match expression {
+        Expr::Call {
+            source_position, ..
+        }
+        | Expr::Cast {
+            source_position, ..
+        }
+        | Expr::Binary {
+            source_position, ..
+        }
+        | Expr::Unary {
+            source_position, ..
+        } => source_position
+            .get()
+            .or_else(|| CURRENT_SOURCE_POSITION.with(Cell::get)),
+        _ => CURRENT_SOURCE_POSITION.with(Cell::get),
+    };
+    let previous_source = CURRENT_SOURCE_POSITION.with(|current| current.replace(source));
+    let mut position = ExpressionPosition {
+        previous,
+        previous_source,
+        target: None,
+        _thread: core::marker::PhantomData,
+    };
     if !matches!(expression, Expr::Call { .. }) {
-        return Ok(ExpressionPosition {
-            previous,
-            target: None,
-            _thread: core::marker::PhantomData,
-        });
+        return Ok(position);
     }
     let Some((invocations, _)) = active_routine_invocations() else {
-        return Ok(ExpressionPosition {
-            previous,
-            target: None,
-            _thread: core::marker::PhantomData,
-        });
+        return Ok(position);
     };
     let registry = &invocations.inputs;
     let ordinal = registry.next.get();
@@ -770,11 +789,12 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
             .and_then(|index| saved.borrowed_slice()[index].frames.first())
             .and_then(|frame| definition_oid(**frame))
     };
-    Ok(ExpressionPosition {
-        previous,
-        target,
-        _thread: core::marker::PhantomData,
-    })
+    position.target = target;
+    Ok(position)
+}
+
+pub(crate) fn source_position() -> Option<usize> {
+    CURRENT_SOURCE_POSITION.with(Cell::get)
 }
 
 pub(crate) struct InputScope {

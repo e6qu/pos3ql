@@ -1,6 +1,7 @@
 //! Schema-only discovery of UNKNOWN inputs whose destination runs array input.
 
 use crate::mem::arena::Arena;
+use crate::sql::type_inputs::InputKind;
 use crate::sql::{
     ast::{self, Expr, Select, SelectItem, Stmt},
     eval::{ColumnLookup, RuntimeColumnTypes, SqlError},
@@ -8,11 +9,109 @@ use crate::sql::{
     types::oid,
 };
 use crate::sql_err;
-use crate::storage::{ColumnMeta, NamedTypeKind, RoutineCallKind, RoutineCallSelection, Storage};
+use crate::storage::{NamedTypeKind, RoutineCallKind, RoutineCallSelection, Storage};
 
-type Visit<'a> = dyn FnMut(&Expr<'_>, i32, i32) -> Result<(), SqlError> + 'a;
+type Visit<'a> = dyn FnMut(&Expr<'_>, i32, i32, InputKind) -> Result<(), SqlError> + 'a;
 
-pub(super) fn discover(
+pub(crate) fn capture_contextual_type_inputs(
+    parser: &crate::sql::parser::Parser<'_>,
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let literals = parser.string_literals();
+    if literals.is_empty()
+        || !(0..storage.domain_count()).any(|slot| storage.domain_slot_visible_to(slot, txid))
+    {
+        return Ok(());
+    }
+    let found = arena
+        .alloc_slice_with(literals.len(), |_| None)
+        .map_err(|_| super::arena_full())?;
+    let mark = arena.mark();
+    let mut count = 0;
+    let result = discover(
+        statement,
+        storage,
+        txid,
+        arena,
+        &mut |expression, target, type_mod, kind| {
+            let expression = match expression {
+                Expr::Cast { operand, .. } => *operand,
+                expression => expression,
+            };
+            let Expr::Str(value) = expression else {
+                return Ok(());
+            };
+            let Some(index) = literals
+                .iter()
+                .position(|(expression, _)| match expression {
+                    Expr::Str(source) => {
+                        value.len() == source.len()
+                            && core::ptr::eq(value.as_ptr(), source.as_ptr())
+                    }
+                    _ => false,
+                })
+            else {
+                // A stored source owns its own admitted inputs, rather than the
+                // raw statement currently being analyzed.
+                return Ok(());
+            };
+            if let Some(previous) =
+                found[..count]
+                    .iter()
+                    .flatten()
+                    .find(|(previous, _, _, previous_kind)| {
+                        *previous == index && *previous_kind == kind
+                    })
+            {
+                if *previous != (index, target, type_mod, kind) {
+                    return Err(sql_err!(
+                        super::sqlstate::DATATYPE_MISMATCH,
+                        "SQL input occurrence has conflicting destination types"
+                    ));
+                }
+                return Ok(());
+            }
+            found[count] = Some((index, target, type_mod, kind));
+            count += 1;
+            Ok(())
+        },
+    );
+    // Only copied source ordinals and type identities escape schema scratch.
+    unsafe { arena.rewind_to(mark) };
+    result?;
+    let keys = arena
+        .alloc_slice_with(count, |_| (0usize, 0usize, InputKind::ExplicitCast))
+        .map_err(|_| super::arena_full())?;
+    for (key, (index, target, type_mod, kind)) in keys
+        .iter_mut()
+        .zip(found[..count].iter().flatten().copied())
+    {
+        let source = literals[index].1;
+        if kind == InputKind::ImplicitLiteral {
+            parser.add_contextual_type_input(literals[index].0, target, type_mod)?;
+            *key = (source.start, source.end, kind);
+        } else {
+            let candidate = parser
+                .type_input_candidates()
+                .iter()
+                .find(|candidate| candidate.start == source.start && candidate.kind == kind)
+                .ok_or_else(|| {
+                    sql_err!(
+                        super::sqlstate::DATA_EXCEPTION,
+                        "explicit SQL input occurrence is missing"
+                    )
+                })?;
+            *key = (candidate.start, candidate.end, kind);
+        }
+    }
+    parser.reorder_type_input_candidates(keys)?;
+    Ok(())
+}
+
+fn discover(
     statement: &Stmt<'_>,
     storage: &Storage,
     txid: u32,
@@ -28,14 +127,14 @@ pub(super) fn discover(
     walker.statement(statement)
 }
 
-struct Walker<'a, 'v> {
+struct Walker<'a, 'v, 'callback> {
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-    visit: &'v mut Visit<'v>,
+    visit: &'v mut Visit<'callback>,
 }
 
-impl Walker<'_, '_> {
+impl Walker<'_, '_, '_> {
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
         if matches!(expression, Expr::Str(_))
             && matches!(
@@ -43,7 +142,7 @@ impl Walker<'_, '_> {
                 Some((NamedTypeKind::Domain, _, true))
             )
         {
-            (self.visit)(expression, target, type_mod)?;
+            (self.visit)(expression, target, type_mod, InputKind::ImplicitLiteral)?;
         }
         Ok(())
     }
@@ -62,6 +161,21 @@ impl Walker<'_, '_> {
             .iter()
             .any(|argument| matches!(argument, Expr::Str(_)))
         {
+            return Ok(());
+        }
+        let has_stored_name = (0..self.storage.routine_count()).any(|slot| {
+            let Some(identity) = self.storage.routine_identity_for(slot, self.txid) else {
+                return false;
+            };
+            if let Some(oid) = bound_oid {
+                return identity.oid == oid;
+            }
+            name == identity.name.as_str()
+                || name
+                    .strip_suffix(identity.name.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        });
+        if !has_stored_name {
             return Ok(());
         }
         if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
@@ -201,6 +315,17 @@ impl Walker<'_, '_> {
         super::walk_children(expression, &mut |child| {
             self.expression(child, columns, row)
         })?;
+        if let Expr::Cast {
+            operand: Expr::Str(_),
+            type_name,
+            type_mod,
+            ..
+        } = expression
+            && let Some(target) =
+                crate::sql::type_inputs::target_oid(self.storage, self.txid, type_name)
+        {
+            (self.visit)(expression, target, *type_mod, InputKind::ExplicitCast)?;
+        }
         if let Expr::Call {
             kind: ast::CallKind::Routine,
             name,
@@ -266,7 +391,7 @@ impl Walker<'_, '_> {
         &mut self,
         select: &Select<'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
-        targets: Option<&[ColumnMeta]>,
+        targets: Option<&[(i32, i32)]>,
     ) -> Result<(), SqlError> {
         let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
         if let Some(tree) = select.set_body {
@@ -293,36 +418,6 @@ impl Walker<'_, '_> {
             row: &row,
             catalog: Some(&catalog),
         };
-        for (index, item) in select.items.iter().enumerate() {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                if let Some(column) = targets.and_then(|targets| targets.get(index)) {
-                    let target = self
-                        .storage
-                        .routine_type_oid(column.ctype, column.user_type, self.txid)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                super::sqlstate::UNDEFINED_OBJECT,
-                                "assignment input type is unavailable"
-                            )
-                        })?;
-                    self.input(expression, target, column.type_mod)?;
-                }
-                self.expression(expression, &columns, &row)?;
-            }
-        }
-        for expression in select
-            .distinct_on
-            .iter()
-            .copied()
-            .chain(select.where_clause)
-            .chain(select.group_by.iter().copied())
-            .chain(select.having)
-            .chain(select.order_by.iter().map(|order| order.expression))
-            .chain(select.limit)
-            .chain(select.offset)
-        {
-            self.expression(expression, &columns, &row)?;
-        }
         if let Some(from) = select.from {
             self.table_ref(&from.base, &columns, &row)?;
             for join in from.joins {
@@ -331,6 +426,71 @@ impl Walker<'_, '_> {
                     self.expression(expression, &columns, &row)?;
                 }
             }
+        }
+        let mut output_index = 0usize;
+        let mut target_inputs = crate::mem::arena::ArenaList::new(self.arena);
+        for item in select.items {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+                if matches!(item, SelectItem::Expr { .. })
+                    && let Some((target, type_mod)) =
+                        targets.and_then(|targets| targets.get(output_index))
+                {
+                    if matches!(expression, Expr::Str(_))
+                        && matches!(
+                            NamedTypeKind::from_oid(*target),
+                            Some((NamedTypeKind::Domain, _, true))
+                        )
+                    {
+                        target_inputs
+                            .push((*expression, *target, *type_mod))
+                            .map_err(|_| super::arena_full())?;
+                    }
+                }
+                self.expression(expression, &columns, &row)?;
+            }
+            if targets.is_some() {
+                let width = match item {
+                    SelectItem::Expr { .. } => 1,
+                    SelectItem::Wildcard => scope.as_ref().map_or(0, |scope| scope.star_columns()),
+                    SelectItem::TableWildcard(name) => scope
+                        .as_ref()
+                        .ok_or_else(|| {
+                            sql_err!(
+                                super::sqlstate::UNDEFINED_TABLE,
+                                "missing FROM-clause entry for table \"{}\"",
+                                name
+                            )
+                        })?
+                        .qualified_star_columns(name)?,
+                    SelectItem::RecordStar(expression) => {
+                        crate::sql::exec::record_shape(expression, &columns, |_, _| {})?
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    super::sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "record output shape is unavailable"
+                                )
+                            })?
+                    }
+                };
+                output_index = output_index
+                    .checked_add(width)
+                    .ok_or_else(super::arena_full)?;
+            }
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.group_by.iter().copied())
+            .chain(select.distinct_on.iter().copied())
+            .chain(select.offset)
+            .chain(select.limit)
+        {
+            self.expression(expression, &columns, &row)?;
+        }
+        for (expression, target, type_mod) in target_inputs.as_slice() {
+            self.input(expression, *target, *type_mod)?;
         }
         Ok(())
     }
@@ -409,25 +569,9 @@ impl Walker<'_, '_> {
     }
 
     fn dml(&mut self, statement: &Stmt<'_>) -> Result<(), SqlError> {
-        super::dependencies::visit_dml_assignment_contexts(
-            statement,
-            self.storage,
-            self.txid,
-            self.arena,
-            None,
-            &mut |expression, column, _columns| {
-                let target = self
-                    .storage
-                    .routine_type_oid(column.ctype, column.user_type, self.txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            super::sqlstate::UNDEFINED_OBJECT,
-                            "assignment input type is unavailable"
-                        )
-                    })?;
-                self.input(expression, target, column.type_mod)
-            },
-        )?;
+        let storage = self.storage;
+        let txid = self.txid;
+        let arena = self.arena;
         let (target, alias, extra, returning) = match statement {
             Stmt::Insert(insert) => (insert.table, None, None, insert.returning),
             Stmt::Update(update) => (update.table, update.alias, update.from, update.returning),
@@ -463,21 +607,6 @@ impl Walker<'_, '_> {
             row: &row,
             catalog: Some(&catalog),
         };
-        super::for_each_dml_assignment(statement, &mut |_, _, expression| {
-            self.expression(expression, &columns, &row)
-        })?;
-        let filter = match statement {
-            Stmt::Update(update) => update.where_clause,
-            Stmt::Delete(delete) => delete.where_clause,
-            Stmt::Merge(merge) => Some(merge.on),
-            Stmt::Insert(insert) => insert
-                .on_conflict
-                .and_then(|conflict| conflict.update_where),
-            _ => None,
-        };
-        if let Some(expression) = filter {
-            self.expression(expression, &columns, &row)?;
-        }
         if let Some(from) = extra {
             self.table_ref(&from.base, &columns, &row)?;
             for join in from.joins {
@@ -487,35 +616,90 @@ impl Walker<'_, '_> {
                 }
             }
         }
-        for item in returning.items {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                self.expression(expression, &columns, &row)?;
-            }
-        }
         if let Stmt::Insert(insert) = statement
             && let Some(select) = insert.select
         {
             let definition = scope.defs.get(0).expect("assignment target resolved");
-            let targets = if insert.columns.is_empty() {
-                definition.columns()
+            let count = if insert.columns.is_empty() {
+                definition.columns().len()
             } else {
-                let targets = self
-                    .arena
-                    .alloc_slice_with(insert.columns.len(), |_| ColumnMeta::EMPTY)
-                    .map_err(|_| super::arena_full())?;
-                for (column, name) in targets.iter_mut().zip(insert.columns) {
-                    let index = definition.column_index(name).ok_or_else(|| {
-                        sql_err!(
-                            super::sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" does not exist",
-                            name
-                        )
-                    })?;
-                    *column = definition.columns()[index];
-                }
-                targets
+                insert.columns.len()
             };
+            let targets = arena
+                .alloc_slice_with(count, |_| (0, -1))
+                .map_err(|_| super::arena_full())?;
+            for (index, target) in targets.iter_mut().enumerate() {
+                let index = if insert.columns.is_empty() {
+                    index
+                } else {
+                    definition
+                        .column_index(insert.columns[index])
+                        .ok_or_else(|| {
+                            sql_err!(
+                                super::sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" does not exist",
+                                insert.columns[index]
+                            )
+                        })?
+                };
+                let column = &definition.columns()[index];
+                *target = (
+                    storage
+                        .routine_type_oid(column.ctype, column.user_type, txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                super::sqlstate::UNDEFINED_OBJECT,
+                                "assignment input type is unavailable"
+                            )
+                        })?,
+                    column.type_mod,
+                );
+            }
             self.select(select, None, Some(targets))?;
+        }
+        if let Stmt::Merge(merge) = statement {
+            self.expression(merge.on, &columns, &row)?;
+        }
+        super::dependencies::visit_dml_assignment_groups(
+            statement,
+            storage,
+            txid,
+            arena,
+            None,
+            &mut |group, assignment_columns| {
+                for assignment in group {
+                    self.expression(assignment.expression, assignment_columns, &row)?;
+                }
+                for assignment in group {
+                    let column = assignment.column;
+                    let target = storage
+                        .routine_type_oid(column.ctype, column.user_type, txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                super::sqlstate::UNDEFINED_OBJECT,
+                                "assignment input type is unavailable"
+                            )
+                        })?;
+                    self.input(assignment.expression, target, column.type_mod)?;
+                }
+                Ok(())
+            },
+        )?;
+        let filter = match statement {
+            Stmt::Update(update) => update.where_clause,
+            Stmt::Delete(delete) => delete.where_clause,
+            Stmt::Insert(insert) => insert
+                .on_conflict
+                .and_then(|conflict| conflict.update_where),
+            _ => None,
+        };
+        if let Some(expression) = filter {
+            self.expression(expression, &columns, &row)?;
+        }
+        for item in returning.items {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+                self.expression(expression, &columns, &row)?;
+            }
         }
         Ok(())
     }

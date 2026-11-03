@@ -246,6 +246,7 @@ fn same_domain(image: &DomainDef, source: &DomainDef, transaction: u32) -> bool 
         && image.not_null_name == source.not_null_name
         && image.not_null_identity == source.not_null_identity
         && image.default_expr == source.default_expr
+        && image.default_inputs.bytes() == source.default_inputs.bytes()
         && image.checks().len() == source.checks().len()
         && image
             .checks()
@@ -1410,6 +1411,7 @@ mod tests {
                     not_null_name: None,
                     not_null_identity: None,
                     default_expr: None,
+                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
                 },
@@ -1502,6 +1504,7 @@ mod tests {
             not_null_name: None,
             not_null_identity: None,
             default_expr: None,
+            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
             checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
             n_checks: 0,
         };
@@ -1646,6 +1649,7 @@ mod tests {
                                 not_null_name: None,
                                 not_null_identity: None,
                                 default_expr: None,
+                                default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                                 checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                                 n_checks: 0,
                             };
@@ -1903,6 +1907,7 @@ mod tests {
                                     not_null_name: None,
                                     not_null_identity: None,
                                     default_expr: None,
+                                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                                     n_checks: 0,
                                 },
@@ -2100,6 +2105,7 @@ mod tests {
                         not_null_name: None,
                         not_null_identity: None,
                         default_expr: Some(crate::util::StackStr::from_str(marker)),
+                        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
                     },

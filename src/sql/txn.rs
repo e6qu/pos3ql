@@ -78,6 +78,9 @@ pub(crate) struct StatementMark {
     pub deferred_trigger_bytes: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransactionEffectMark([usize; 15]);
+
 pub const DEFAULT_MAX_SAVEPOINTS: usize = 16;
 pub const DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS: usize = 64;
 
@@ -87,7 +90,7 @@ pub(crate) struct LargeObjectDescriptorMode {
     pub writable: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LargeObjectDescriptor {
     pub oid: crate::storage::LargeObjectOid,
     pub position: i64,
@@ -353,7 +356,7 @@ pub struct TxnState {
 }
 
 /// How to undo one DDL statement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(
     clippy::large_enum_variant,
     reason = "CommentSet carries its payload inline (no heap after startup); the undo list is a small fixed pool"
@@ -1092,6 +1095,16 @@ impl TxnState {
         assert!(descriptors.len() <= self.large_object_descriptors.len());
         self.large_object_descriptors[..descriptors.len()].copy_from_slice(descriptors);
         self.large_object_descriptors[descriptors.len()..].fill(LargeObjectDescriptor::EMPTY);
+    }
+
+    pub(crate) fn matches_statement_large_object_descriptors(
+        &self,
+        saved: &[LargeObjectDescriptor],
+    ) -> bool {
+        self.large_object_descriptors.get(..saved.len()) == Some(saved)
+            && self.large_object_descriptors[saved.len()..]
+                .iter()
+                .all(|descriptor| !descriptor.active)
     }
 
     pub(crate) fn open_large_object_descriptor(
@@ -2453,6 +2466,26 @@ impl TxnState {
         }
     }
 
+    pub(crate) fn transaction_effect_mark(&self) -> TransactionEffectMark {
+        TransactionEffectMark([
+            self.touched.len(),
+            self.truncates.len(),
+            self.ddl.len(),
+            self.statistics_undo.len(),
+            self.pending_notifies.len(),
+            self.notify_payloads.mark(),
+            self.pending_listen_ops.len(),
+            self.subscription_advances.len(),
+            self.deferred_constraints.len(),
+            self.completed_constraints.len(),
+            self.constraint_modes.len(),
+            self.constraint_renames.len(),
+            self.deferred_triggers.len(),
+            self.completed_deferred_triggers.len(),
+            self.deferred_trigger_bytes.mark(),
+        ])
+    }
+
     pub(crate) fn owns_statement_mark(&self, mark: StatementMark) -> bool {
         self.is_active() && self.txid == mark.txid
     }
@@ -2709,7 +2742,7 @@ impl TxnState {
         storage: &mut crate::storage::Storage,
         undo: DdlUndo,
     ) -> Result<(), SqlError> {
-        if let Err(error) = self.record_ddl(undo) {
+        if let Err(error) = self.record_ddl(undo.clone()) {
             super::rollback_catalog_change(storage, undo, self.txid);
             return Err(error);
         }

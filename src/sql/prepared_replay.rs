@@ -63,7 +63,16 @@ pub(super) fn stage_catalog_record(
             let change = storage.replay_routine_definition(
                 identity,
                 *definition,
-                dependencies.materialize()?,
+                dependencies.materialize(storage, txid, |section| match section {
+                    crate::storage::StoredInputSection::RoutineBody => {
+                        Some(definition.body.as_str())
+                    }
+                    crate::storage::StoredInputSection::ParameterDefault(index) => definition
+                        .parameters()
+                        .get(usize::from(index))
+                        .and_then(|parameter| parameter.mode.default_sql()),
+                    _ => None,
+                })?,
                 txid,
             )?;
             transaction.record_routine_change(storage, change)?;

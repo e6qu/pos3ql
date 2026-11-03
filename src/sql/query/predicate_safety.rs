@@ -267,6 +267,7 @@ pub(super) fn expression_properties(
             operator,
             left,
             right,
+            ..
         } => Some(match operator.operator_name() {
             Some(name) => operator_properties(
                 storage,
@@ -278,7 +279,9 @@ pub(super) fn expression_properties(
             )?,
             None => ProcedureProperties::UNKNOWN,
         }),
-        Expr::Unary { operator, operand } => {
+        Expr::Unary {
+            operator, operand, ..
+        } => {
             let name = match operator {
                 UnaryOp::Neg => "-",
                 UnaryOp::BitNot => "~",
@@ -577,6 +580,7 @@ pub(super) fn expression_properties(
             type_name,
             binding,
             type_mod,
+            ..
         } => {
             let target = columns.named_type_oid(type_name);
             // ARRAY constructors receive their element type from an explicit

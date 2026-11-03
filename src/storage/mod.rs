@@ -5774,6 +5774,7 @@ impl ViewOptions {
 pub(crate) struct ViewDefinition {
     pub persistence: RelationPersistence,
     pub columns: ViewColumns,
+    pub default_inputs: StoredTypeInputs,
     pub query: StoredQueryDefinition,
     pub options: ViewOptions,
 }
@@ -6008,6 +6009,7 @@ pub struct ViewDef {
     pub(crate) return_rule: u16,
     pub options: ViewOptions,
     pub columns: ViewColumns,
+    pub(crate) default_inputs: StoredTypeInputs,
     pub ownership: Ownership,
     version: u64,
     ddl_version: u64,
@@ -6025,6 +6027,7 @@ impl ViewDef {
         return_rule: u16::MAX,
         options: ViewOptions::DEFAULT,
         columns: ViewColumns::EMPTY,
+        default_inputs: StoredTypeInputs::EMPTY,
         ownership: Ownership::BOOTSTRAP,
         version: 0,
         ddl_version: 0,
@@ -6079,9 +6082,16 @@ impl ViewDef {
             _ => &self.columns,
         }
     }
+
+    pub(crate) fn default_inputs_for(&self, txid: u32) -> &StoredTypeInputs {
+        match self.pending_definition.as_ref() {
+            Some(pending) if pending.txid == txid => &pending.default_inputs,
+            _ => &self.default_inputs,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PendingViewDefinition {
     txid: u32,
     version: u64,
@@ -6089,6 +6099,7 @@ pub(crate) struct PendingViewDefinition {
     name: SqlName,
     options: ViewOptions,
     columns: ViewColumns,
+    default_inputs: StoredTypeInputs,
 }
 
 /// A logical publication.  Publications are database-scoped catalog objects;
@@ -8606,7 +8617,7 @@ impl Iterator for DomainIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let catalog = self.catalog.lock().expect("type catalog lock poisoned");
         let slot = self.next_slot;
-        let definition = catalog.domains.get(slot).copied()?;
+        let definition = catalog.domains.get(slot).cloned()?;
         self.next_slot += 1;
         Some((slot, definition))
     }
@@ -10303,7 +10314,7 @@ pub(crate) const MAX_DOMAIN_CHECKS: usize = MAX_DEFINITION_ITEMS;
 /// value is coerced into a column of the domain (or cast to it). Its
 /// *existence* is transactional catalog state, mirroring [`SequenceDef`];
 /// a domain carries no per-value state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DomainDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
@@ -10325,13 +10336,14 @@ pub struct DomainDef {
     pub not_null_name: Option<SqlName>,
     pub(crate) not_null_identity: Option<ConstraintIdentity>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    pub(crate) default_inputs: StoredTypeInputs,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
     pub(crate) pending_definition: Option<PendingDomainDefinition>,
     pub ddl_state: CatalogDdlState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct PendingDomainDefinition {
     pub txid: u32,
     pub version: u64,
@@ -10364,6 +10376,7 @@ impl DomainDef {
         not_null_name: None,
         not_null_identity: None,
         default_expr: None,
+        default_inputs: StoredTypeInputs::EMPTY,
         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
         n_checks: 0,
         pending_definition: None,
@@ -10380,31 +10393,36 @@ impl DomainDef {
 
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
         self.pending_definition
+            .as_ref()
             .filter(|pending| pending.txid == txid)
-            .map_or(*self, |pending| Self {
-                schema: pending
-                    .identity
-                    .map_or(self.schema, |identity| identity.schema),
-                name: pending.identity.map_or(self.name, |identity| identity.name),
-                base_domain: pending.spec.base_domain,
-                base_user_type: pending.spec.base_user_type,
-                base: pending.spec.base,
-                base_type_mod: pending.spec.base_type_mod,
-                not_null: pending.spec.not_null,
-                not_null_name: pending.spec.not_null_name,
-                not_null_identity: pending.spec.not_null_identity,
-                default_expr: pending.spec.default_expr,
-                checks: pending.spec.checks,
-                n_checks: pending.spec.n_checks,
-                pending_definition: None,
-                ..*self
-            })
+            .map_or_else(
+                || self.clone(),
+                |pending| Self {
+                    schema: pending
+                        .identity
+                        .map_or(self.schema, |identity| identity.schema),
+                    name: pending.identity.map_or(self.name, |identity| identity.name),
+                    base_domain: pending.spec.base_domain,
+                    base_user_type: pending.spec.base_user_type,
+                    base: pending.spec.base,
+                    base_type_mod: pending.spec.base_type_mod,
+                    not_null: pending.spec.not_null,
+                    not_null_name: pending.spec.not_null_name,
+                    not_null_identity: pending.spec.not_null_identity,
+                    default_expr: pending.spec.default_expr,
+                    default_inputs: pending.spec.default_inputs.clone(),
+                    checks: pending.spec.checks,
+                    n_checks: pending.spec.n_checks,
+                    pending_definition: None,
+                    ..self.clone()
+                },
+            )
     }
 }
 
 /// The validated parameters of a `CREATE DOMAIN` / `ALTER DOMAIN`, computed by
 /// the executor and handed to storage (apart from the `live`/`pending` state).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DomainSpec {
     pub base_domain: Option<UserTypeName>,
     pub base_user_type: Option<UserTypeName>,
@@ -10414,6 +10432,7 @@ pub(crate) struct DomainSpec {
     pub not_null_name: Option<SqlName>,
     pub(crate) not_null_identity: Option<ConstraintIdentity>,
     pub default_expr: Option<StackStr<DEFAULT_EXPR_MAX>>,
+    pub default_inputs: StoredTypeInputs,
     pub checks: [CheckConstraint; MAX_DOMAIN_CHECKS],
     pub n_checks: usize,
 }
@@ -10956,6 +10975,10 @@ pub(crate) struct SequenceReplaySource {
 }
 
 impl SequenceReplaySource {
+    pub(crate) fn session_identity(self) -> (usize, u64) {
+        (self.slot, self.created_at)
+    }
+
     pub(crate) fn recreates(self, previous: Self) -> bool {
         self.private_version.is_some()
             && previous.private_version.is_some()
@@ -16703,10 +16726,17 @@ enum NamespaceRewriteScope<'a> {
         arena: &'a crate::mem::arena::Arena,
     },
     #[cfg(test)]
-    Lexical,
+    Lexical { arena: &'a crate::mem::arena::Arena },
 }
 
 impl NamespaceRewriteScope<'_> {
+    fn arena(&self) -> &crate::mem::arena::Arena {
+        match self {
+            Self::Parsed { arena, .. } => arena,
+            #[cfg(test)]
+            Self::Lexical { arena } => arena,
+        }
+    }
     fn rewrite_catalog_literal<const N: usize>(
         &self,
         start: usize,
@@ -16799,7 +16829,7 @@ impl NamespaceRewriteScope<'_> {
                 .iter()
                 .any(|source| source.start == start && source.end == end),
             #[cfg(test)]
-            Self::Lexical => _followed_by_dot,
+            Self::Lexical { .. } => _followed_by_dot,
         }
     }
 }
@@ -16838,14 +16868,11 @@ fn rewrite_schema_sql_tokens<const N: usize>(
     }
 
     let text = source.as_str();
-    if spans.len() > MAX_RULE_ACTIONS + 1 {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "schema rename exceeds the saved SQL span limit"
-        ));
-    }
-    let mut boundaries = [[0_isize; 2]; MAX_RULE_ACTIONS + 1];
-    for (span, boundaries) in spans.iter().zip(&mut boundaries) {
+    let boundaries = namespaces
+        .arena()
+        .alloc_slice_with(spans.len(), |_| [0_isize; 2])
+        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    for (span, boundaries) in spans.iter().zip(boundaries.iter_mut()) {
         let start = usize::from(span.start);
         let end = start + usize::from(span.len);
         if text.get(start..end).is_none() {
@@ -16858,7 +16885,7 @@ fn rewrite_schema_sql_tokens<const N: usize>(
     }
     let mut remap = |start: usize, end: usize, replacement: usize| -> Result<(), SqlError> {
         let shift = replacement as isize - (end - start) as isize;
-        for (span, boundaries) in spans.iter().zip(&mut boundaries) {
+        for (span, boundaries) in spans.iter().zip(boundaries.iter_mut()) {
             let original = [
                 usize::from(span.start),
                 usize::from(span.start) + usize::from(span.len),
@@ -16990,8 +17017,11 @@ fn rewrite_schema_sql_tokens<const N: usize>(
             "schema rename exceeds a stored SQL definition limit"
         ));
     }
-    let mut adjusted = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS + 1];
-    for (boundaries, adjusted) in boundaries.iter().zip(&mut adjusted).take(spans.len()) {
+    let adjusted = namespaces
+        .arena()
+        .alloc_slice_with(spans.len(), |_| RuleTextSpan::EMPTY)
+        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    for (boundaries, adjusted) in boundaries.iter().zip(adjusted.iter_mut()) {
         let start = u16::try_from(boundaries[0]).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -17016,13 +17046,14 @@ fn rewrite_schema_sql_tokens<const N: usize>(
         }
         *adjusted = RuleTextSpan { start, len };
     }
-    spans.copy_from_slice(&adjusted[..spans.len()]);
+    spans.copy_from_slice(adjusted);
     *source = rewritten;
     Ok(true)
 }
 
 fn rename_column_default_schema(
     default: &mut ColumnDefault,
+    spans: &mut [RuleTextSpan],
     old: SqlName,
     new: SqlName,
     arena: &crate::mem::arena::Arena,
@@ -17031,14 +17062,11 @@ fn rename_column_default_schema(
         ColumnDefault::None => Ok(false),
         ColumnDefault::Constant { expression, .. }
         | ColumnDefault::Expression(expression)
-        | ColumnDefault::Generated(expression) => rename_schema_qualified_sql(
-            expression,
-            &mut [],
-            old,
-            new,
-            crate::sql::parser::StoredSqlKind::Expression,
-            arena,
-        ),
+        | ColumnDefault::Generated(expression) => {
+            crate::sql::enum_values::checks::rename_default_schema(
+                expression, spans, old, new, arena,
+            )
+        }
     }
 }
 
@@ -17047,29 +17075,57 @@ fn rename_table_sql_identity(
     old: SqlName,
     new: SqlName,
     arena: &crate::mem::arena::Arena,
+    pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
 ) -> Result<bool, SqlError> {
-    let mut changed = false;
-    for column in definition.columns.iter_mut().take(definition.n_columns) {
-        changed |= rename_column_default_schema(&mut column.default, old, new, arena)?;
-    }
-    for constraint in definition.checks.iter_mut().take(definition.n_checks) {
-        changed |= rename_schema_qualified_sql(
-            &mut constraint.expression,
-            &mut [],
-            old,
-            new,
-            crate::sql::parser::StoredSqlKind::Expression,
-            arena,
-        )?;
-    }
-    for exclusion in definition
-        .exclusions
-        .iter_mut()
-        .take(definition.n_exclusions)
-    {
-        if let Some(predicate) = &mut exclusion.predicate {
+    let mark = arena.mark();
+    let result = (|| {
+        let mut changed = false;
+        let original_inputs = definition.type_inputs.clone();
+        let input_sections = original_inputs.borrowed_sections(arena)?;
+        let sources = arena
+            .alloc_slice_with(definition.n_columns, |column| StoredInputSource {
+                section: StoredInputSection::TableDefault(definition.attribute_number(column)),
+                sql: "",
+                bindings: &[],
+            })
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+        for (column, output) in definition
+            .columns
+            .iter_mut()
+            .take(definition.n_columns)
+            .zip(sources.iter_mut())
+        {
+            let inputs = input_sections
+                .binary_search_by_key(&output.section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| input_sections[index].1);
+            let updated = arena
+                .alloc_slice_copy(inputs)
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            let spans = arena
+                .alloc_slice_with(inputs.len(), |index| RuleTextSpan {
+                    start: u16::try_from(inputs[index].start)
+                        .expect("validated default source span"),
+                    len: u16::try_from(inputs[index].end - inputs[index].start)
+                        .expect("validated default source span"),
+                })
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            changed |= rename_column_default_schema(&mut column.default, spans, old, new, arena)?;
+            for (input, span) in updated.iter_mut().zip(spans.iter()) {
+                input.start = usize::from(span.start);
+                input.end = input.start + usize::from(span.len);
+            }
+            if let Some(source) = column.default.expression() {
+                output.sql =
+                    crate::sql::enum_values::checks::default_display(source.as_str(), arena)?;
+            }
+            output.bindings = updated;
+        }
+        sources.sort_unstable_by_key(|source| source.section);
+        definition.type_inputs = original_inputs.relocated_sources(sources, pool)?;
+        for constraint in definition.checks.iter_mut().take(definition.n_checks) {
             changed |= rename_schema_qualified_sql(
-                predicate,
+                &mut constraint.expression,
                 &mut [],
                 old,
                 new,
@@ -17077,8 +17133,27 @@ fn rename_table_sql_identity(
                 arena,
             )?;
         }
-    }
-    Ok(changed)
+        for exclusion in definition
+            .exclusions
+            .iter_mut()
+            .take(definition.n_exclusions)
+        {
+            if let Some(predicate) = &mut exclusion.predicate {
+                changed |= rename_schema_qualified_sql(
+                    predicate,
+                    &mut [],
+                    old,
+                    new,
+                    crate::sql::parser::StoredSqlKind::Expression,
+                    arena,
+                )?;
+            }
+        }
+        Ok(changed)
+    })();
+    // Only inline SQL and immutable pool-owned bytes leave this scratch scope.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 impl Storage {
@@ -30990,7 +31065,13 @@ impl Storage {
                     for key in changed.fkeys.iter_mut().take(changed.n_fkeys) {
                         renamed |= rename_schema_name(&mut key.parent_schema, prior, name);
                     }
-                    renamed |= rename_table_sql_identity(&mut changed, prior, name, arena)?;
+                    renamed |= rename_table_sql_identity(
+                        &mut changed,
+                        prior,
+                        name,
+                        arena,
+                        &self.metadata_pool,
+                    )?;
                     if renamed {
                         Ok(Some(changed.freeze(&self.metadata_pool)?))
                     } else {
@@ -42687,6 +42768,7 @@ impl Storage {
             .lock()
             .expect("type catalog lock poisoned")
             .domains[slot]
+            .clone()
     }
 
     pub(crate) fn domain_count(&self) -> usize {
@@ -42870,6 +42952,7 @@ impl Storage {
             not_null_name: spec.not_null_name,
             not_null_identity: spec.not_null_identity,
             default_expr: spec.default_expr,
+            default_inputs: spec.default_inputs.clone(),
             checks: spec.checks,
             n_checks: spec.n_checks,
             pending_definition: None,
@@ -43121,7 +43204,7 @@ impl Storage {
         let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
-        let prior = domain.pending_definition;
+        let prior = domain.pending_definition.clone();
         constraint_names::domain(domain.definition_for(txid).name, &mut spec)?;
         self.reserve_domain_constraint_identities(&mut spec)?;
         validate_constraint_lifetimes(spec.constraint_identities(), domain.created_at)?;
@@ -43135,7 +43218,7 @@ impl Storage {
             txid,
             version,
             spec,
-            identity: prior.and_then(|pending| pending.identity),
+            identity: prior.as_ref().and_then(|pending| pending.identity),
         });
         Ok(DomainAlterUndo {
             source,
@@ -43174,15 +43257,15 @@ impl Storage {
         let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
-        let prior = domain.pending_definition;
+        let prior = domain.pending_definition.clone();
         let source = type_references::TypeIdentity::new(
             origin,
             domain.database,
             NamedTypeSlot::Domain(slot),
             domain.created_at,
         );
-        let spec = prior.map_or(
-            DomainSpec {
+        let spec = prior.as_ref().map_or_else(
+            || DomainSpec {
                 base_domain: domain.base_domain,
                 base_user_type: domain.base_user_type,
                 base: domain.base,
@@ -43191,10 +43274,11 @@ impl Storage {
                 not_null_name: domain.not_null_name,
                 not_null_identity: domain.not_null_identity,
                 default_expr: domain.default_expr,
+                default_inputs: domain.default_inputs.clone(),
                 checks: domain.checks,
                 n_checks: domain.n_checks,
             },
-            |pending| pending.spec,
+            |pending| pending.spec.clone(),
         );
         domain.pending_definition = Some(PendingDomainDefinition {
             txid,
@@ -43241,9 +43325,10 @@ impl Storage {
             if !catalog.matches_type_edit(target) {
                 return Ok(());
             }
-            let domain = catalog.domains[slot];
+            let domain = catalog.domains[slot].clone();
             if domain
                 .pending_definition
+                .as_ref()
                 .filter(|pending| pending.txid == txid)
                 .is_none()
             {
@@ -43289,6 +43374,7 @@ impl Storage {
         }
         if catalog.domains[slot]
             .pending_definition
+            .as_ref()
             .is_some_and(|pending| {
                 pending.txid == undo.transaction && pending.version == undo.version
             })
@@ -44711,6 +44797,7 @@ impl Storage {
             return_rule: rule as u16,
             options: definition.options,
             columns: definition.columns,
+            default_inputs: definition.default_inputs.clone(),
             ownership,
             version: created_at,
             ddl_version: created_at,
@@ -45694,20 +45781,34 @@ impl Storage {
     }
 
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
+        if NamedTypeKind::from_oid(type_oid).is_none() {
+            return Self::builtin_routine_result_for_oid(type_oid);
+        }
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        Self::routine_result_for_oid_in(&catalog, type_oid, txid)
+    }
+
+    fn builtin_routine_result_for_oid(type_oid: i32) -> Option<RoutineResult> {
         if let Some(kind) = PolymorphicType::from_oid(type_oid) {
             return Some(RoutineResult {
                 ctype: ColType::Text,
                 user_type: Some(UserTypeName::polymorphic(kind)),
             });
         }
+        ColType::from_oid(type_oid).map(RoutineResult::builtin)
+    }
 
+    fn routine_result_for_oid_in(
+        catalog: &TypeCatalog,
+        type_oid: i32,
+        txid: u32,
+    ) -> Option<RoutineResult> {
         let Some((kind, creation, array)) = NamedTypeKind::from_oid(type_oid) else {
-            return ColType::from_oid(type_oid).map(RoutineResult::builtin);
+            return Self::builtin_routine_result_for_oid(type_oid);
         };
-        let catalog = self
-            .type_catalog
-            .lock()
-            .expect("type catalog lock poisoned");
         let reference = catalog.source_reference_by_creation(kind, creation, current_database())?;
         let snapshot = catalog
             .resolve_source_reference(reference, current_database(), txid)
@@ -50427,6 +50528,12 @@ impl Storage {
     pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
         let connection_id = self.current_connection_id();
         self.lock_state().advisory.begin_statement(connection_id)
+    }
+
+    pub(crate) fn advisory_statement_mark(&self) -> crate::sql::lock::AdvisoryStatementMark {
+        self.lock_state()
+            .advisory
+            .statement_mark(self.current_connection_id())
     }
 
     pub(crate) fn preserve_advisory_statement(&self) {
@@ -55714,6 +55821,7 @@ mod tests {
         ViewDefinition {
             persistence: RelationPersistence::Permanent,
             columns: ViewColumns::EMPTY,
+            default_inputs: StoredTypeInputs::EMPTY,
             query: StoredQueryDefinition {
                 sql: StackStr::from_str("SELECT 1"),
                 creation_path: StackStr::from_str("public"),

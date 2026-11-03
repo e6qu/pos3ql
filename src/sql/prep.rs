@@ -50,6 +50,9 @@ pub struct SqlPreparedPool {
     slots: Vec<Slot>,
     request: FixedBuf,
     request_owner: Option<RequestInputOwner>,
+    pub(crate) routine_inputs: super::type_input_plans::RoutineInputPlans,
+    transient_plan: Option<u64>,
+    next_plan: u64,
 }
 
 struct RequestInputOwner {
@@ -86,6 +89,7 @@ struct Slot {
     custom_plans: i64,
     n_results: usize,
     input_bytes: usize,
+    plan: u64,
 }
 
 thread_local! {
@@ -148,6 +152,9 @@ impl SqlPreparedPool {
             .max_prepared
             .saturating_add(1)
             .saturating_mul(config.prepared_bytes)
+            .saturating_add(super::type_input_plans::RoutineInputPlans::budget_bytes(
+                config,
+            ))
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -163,13 +170,18 @@ impl SqlPreparedPool {
                 custom_plans: 0,
                 n_results: 0,
                 input_bytes: 0,
+                plan: 0,
             });
         }
         let request = FixedBuf::new(budget, "sql_request_type_inputs", config.prepared_bytes)?;
+        let routine_inputs = super::type_input_plans::RoutineInputPlans::new(config, budget)?;
         Ok(Self {
             slots,
             request,
             request_owner: None,
+            routine_inputs,
+            transient_plan: None,
+            next_plan: 1,
         })
     }
 
@@ -201,6 +213,7 @@ impl SqlPreparedPool {
                 "too many prepared-statement result columns"
             ));
         }
+        let plan = self.new_plan()?;
         let Some(slot) = self.slots.iter_mut().find(|s| !s.active) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -240,6 +253,7 @@ impl SqlPreparedPool {
         slot.prepared_at = crate::sql::datetime::now_micros();
         slot.custom_plans = 0;
         slot.active = true;
+        slot.plan = plan;
         Ok(())
     }
 
@@ -340,6 +354,45 @@ impl SqlPreparedPool {
     pub(crate) fn clear_request_type_inputs(&mut self) {
         self.request_owner = None;
         self.request.clear();
+        if let Some(generation) = self.transient_plan.take() {
+            self.routine_inputs.retire_transient(generation);
+        }
+    }
+
+    pub(crate) fn new_plan(&mut self) -> Result<u64, SqlError> {
+        let id = self.next_plan;
+        self.next_plan = id.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL plan identities exhausted"
+            )
+        })?;
+        Ok(id)
+    }
+
+    pub(crate) fn transient_owner(
+        &mut self,
+        statement: usize,
+    ) -> Result<super::type_input_plans::Owner, SqlError> {
+        let generation = match self.transient_plan {
+            Some(generation) => generation,
+            None => {
+                let generation = self.new_plan()?;
+                self.transient_plan = Some(generation);
+                generation
+            }
+        };
+        Ok(super::type_input_plans::Owner::Transient {
+            generation,
+            statement,
+        })
+    }
+
+    pub(crate) fn plan_owner(&self, name: &str) -> Option<super::type_input_plans::Owner> {
+        self.slots
+            .iter()
+            .find(|slot| slot.active && slot.name.as_str() == name)
+            .map(|slot| super::type_input_plans::Owner::SqlPrepared(slot.plan))
     }
 
     /// Returns whether the statement existed.
@@ -350,6 +403,8 @@ impl SqlPreparedPool {
             .find(|s| s.active && s.name.as_str() == name)
         {
             s.active = false;
+            self.routine_inputs
+                .retire(super::type_input_plans::Owner::SqlPrepared(s.plan));
             true
         } else {
             false
@@ -358,6 +413,10 @@ impl SqlPreparedPool {
 
     pub fn clear(&mut self) {
         for s in &mut self.slots {
+            if s.active {
+                self.routine_inputs
+                    .retire(super::type_input_plans::Owner::SqlPrepared(s.plan));
+            }
             s.active = false;
         }
     }

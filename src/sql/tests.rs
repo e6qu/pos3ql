@@ -34,6 +34,8 @@ mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_input_binding;
+mod type_input_positions;
 mod virtual_search_path;
 
 #[test]
@@ -93954,14 +93956,18 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         "SELECT 0 UNION ALL SELECT nextval('s')",
         "SELECT currval('s'); SELECT 0",
     ] {
-        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
         assert!(
             query::routine_program_requires_mutable_execution(&program),
             "{body}"
         );
     }
     for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
-        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
         assert!(
             !query::routine_program_requires_mutable_execution(&program),
             "{body}"

@@ -1027,6 +1027,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             argument_names,
             variadic,
             bound_oid,
+            source_position,
             ..
         } = expression
         else {
@@ -1074,6 +1075,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         func_args: Some(args),
                         func_argument_names: argument_names,
                         func_variadic: *variadic,
+                        func_source_position: *source_position,
                         rows_from: None,
                         col_alias: None,
                         inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -4406,6 +4408,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         name: "information_schema._pg_expandarray",
                         bound_oid: None,
                         bound_strict: None,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         args,
                         argument_names: &[],
                         variadic: effective_variadic,
@@ -5779,7 +5782,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let _config = (!routine.configs().is_empty())
                 .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
                 .transpose()?;
-            if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            if invocations.is_some()
+                || super::active_routine_invocations().is_some()
+                || routine.language == crate::storage::RoutineLanguage::PlPgSql
+            {
                 let (invocations, statement_arena) = match (invocations, statement_arena) {
                     (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
                     (None, None) => super::active_routine_invocations().ok_or_else(|| {
@@ -5800,6 +5806,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         routine,
                         &routine_params[..routine.argument_count],
                         statement_arena,
+                        tref.func_source_position.get(),
                     )?
                     .ok_or_else(|| {
                         sql_err!(
@@ -5808,6 +5815,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         )
                     });
             }
+            let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
+            let inputs = if routine.body_kind == crate::storage::RoutineBodyKind::String {
+                &[][..]
+            } else {
+                dependencies
+                    .type_inputs()
+                    .detached_bindings(crate::storage::StoredInputSection::RoutineBody, arena)?
+            };
             let program = super::parse_stored_routine_function_program(
                 routine.body_kind,
                 routine.body.as_str(),
@@ -5815,6 +5830,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 scalar_result == Some(ColType::Void),
                 routine.name.as_str(),
                 routine.arguments(),
+                inputs,
+                |parser| {
+                    super::validate_stored_type_inputs(parser, storage, txid, dependencies.view())
+                },
             )?;
             if super::routine_program_requires_mutable_execution(&program) {
                 let (invocations, statement_arena) = match (invocations, statement_arena) {
@@ -5837,6 +5856,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         routine,
                         &routine_params[..routine.argument_count],
                         statement_arena,
+                        tref.func_source_position.get(),
                     )?
                     .ok_or_else(|| {
                         sql_err!(

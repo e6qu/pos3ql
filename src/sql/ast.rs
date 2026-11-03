@@ -3430,6 +3430,28 @@ pub struct TableSample<'a> {
     pub repeatable: Option<&'a Expr<'a>>,
 }
 
+/// Source provenance does not participate in SQL expression equality. Runtime
+/// plan keys must extract the actual offset, never compare this annotation.
+#[derive(Debug, Clone, Copy)]
+pub struct SourcePosition(Option<usize>);
+
+impl SourcePosition {
+    pub const UNKNOWN: Self = Self(None);
+    pub const fn new(offset: Option<usize>) -> Self {
+        Self(offset)
+    }
+    pub const fn get(self) -> Option<usize> {
+        self.0
+    }
+}
+
+impl PartialEq for SourcePosition {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SourcePosition {}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TableRef<'a> {
     /// Optional schema qualifier (pg_catalog / information_schema / public).
@@ -3447,6 +3469,8 @@ pub struct TableRef<'a> {
     pub func_argument_names: &'a [Option<&'a str>],
     /// The last function-source argument is an already-packed array.
     pub func_variadic: bool,
+    /// Actual function-name token offset in the owning SQL source.
+    pub func_source_position: SourcePosition,
     /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
     /// reference. The outer source owns the shared alias and ordinality, so a
     /// parsed table source is either one function or one non-empty function
@@ -5583,15 +5607,18 @@ pub enum Expr<'a> {
     },
     Param(u32),
     Unary {
+        source_position: SourcePosition,
         operator: UnaryOp,
         operand: &'a Expr<'a>,
     },
     Binary {
+        source_position: SourcePosition,
         operator: BinaryOp,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
     },
     Cast {
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         type_name: &'a str,
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
@@ -5633,6 +5660,8 @@ pub enum Expr<'a> {
         bound_oid: Option<i32>,
         /// Null-input behavior selected while preparing this query.
         bound_strict: Option<bool>,
+        /// Byte offset in the exact SQL source owned by this execution plan.
+        source_position: SourcePosition,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.
@@ -5884,6 +5913,24 @@ fn is_nonimmutable_function(name: &str) -> bool {
 }
 
 impl Expr<'_> {
+    pub(crate) const fn source_position(&self) -> SourcePosition {
+        match self {
+            Self::Call {
+                source_position, ..
+            }
+            | Self::Cast {
+                source_position, ..
+            }
+            | Self::Binary {
+                source_position, ..
+            }
+            | Self::Unary {
+                source_position, ..
+            } => *source_position,
+            _ => SourcePosition::UNKNOWN,
+        }
+    }
+
     /// Whether this expression is an aggregate-function call.
     pub fn is_aggregate(&self) -> bool {
         matches!(

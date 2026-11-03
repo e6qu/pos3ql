@@ -580,6 +580,7 @@ fn rule_relation_ref<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -648,6 +649,7 @@ fn coerce_rule_transition<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     let cast = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand: expression,
             type_name: target.type_name,
             type_mod: target.type_mod,
@@ -965,6 +967,7 @@ pub(crate) fn rule_transition_source<'a>(
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: Some(input_columns),
                 inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -1032,6 +1035,7 @@ pub(crate) fn rule_transition_source<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -1614,6 +1618,7 @@ fn filter_set_view_rows<'a>(
         operator: super::super::ast::BinaryOp::And,
         left,
         right,
+        ..
     } = predicate
     {
         let (body, left_keep) = filter_set_view_rows(
@@ -1856,6 +1861,7 @@ fn split_view_predicate<'a>(
         operator: super::super::ast::BinaryOp::And,
         left,
         right,
+        ..
     } = predicate
     {
         let (left_push, left_keep) = split_view_predicate(Some(left), context, safety, arena)?;
@@ -5239,6 +5245,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: t.col_alias,
             inheritance: t.inheritance,
@@ -5271,6 +5278,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: renames,
             inheritance: t.inheritance,
@@ -5395,10 +5403,16 @@ fn subst_tableref<'a>(
             context
                 .storage
                 .compute_path(query.creation_path.as_str(), user.as_str(), context.txid);
-        let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
         let dependencies = query.dependencies;
+        let vsel = super::parse_stored_query(
+            view_sql,
+            context.storage,
+            context.txid,
+            dependencies.view(),
+            arena,
+        )?;
         let expanded = if let Some(execution) = context.execution {
             with_exec_context(
                 vsel.with,
@@ -5440,6 +5454,7 @@ fn subst_tableref<'a>(
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: None,
                 inheritance: t.inheritance,
@@ -5473,6 +5488,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: aliases.map(|aliases| &*aliases),
             inheritance: t.inheritance,
@@ -5933,6 +5949,7 @@ fn rewrite_stored_text_search_arguments<'a>(
         .map_err(|_| arena_full())?;
     let first = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand,
             type_name: "regconfig",
             type_mod: -1,
@@ -5979,6 +5996,7 @@ fn rewrite_stored_sequence_arguments<'a>(
     let operand = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
     let first = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand,
             type_name: "regclass",
             type_mod: -1,
@@ -6151,7 +6169,10 @@ fn subst_expr<'a>(
             select: subst_select(select, context, arena)?,
             all: *all,
         },
-        Expr::Unary { operator, operand } => Expr::Unary {
+        Expr::Unary {
+            operator, operand, ..
+        } => Expr::Unary {
+            source_position: e.source_position(),
             operator: *operator,
             operand: subst_expr(operand, context, arena)?,
         },
@@ -6159,7 +6180,9 @@ fn subst_expr<'a>(
             operator,
             left,
             right,
+            ..
         } => Expr::Binary {
+            source_position: e.source_position(),
             operator: *operator,
             left: subst_expr(left, context, arena)?,
             right: subst_expr(right, context, arena)?,
@@ -6169,9 +6192,11 @@ fn subst_expr<'a>(
             type_name,
             type_mod,
             binding,
+            ..
         } => {
             let operand = subst_expr(operand, context, arena)?;
             Expr::Cast {
+                source_position: e.source_position(),
                 operand: rewrite_stored_regcollation_operand(operand, type_name, context, arena)?,
                 type_name: rewrite_stored_type_name(type_name, context, arena)?,
                 type_mod: *type_mod,
@@ -6205,6 +6230,7 @@ fn subst_expr<'a>(
             filter,
             bound_strict,
             kind,
+            source_position,
             ..
         } => {
             let name = if *kind == crate::sql::ast::CallKind::SqlSyntax {
@@ -6261,6 +6287,7 @@ fn subst_expr<'a>(
                 kind: *kind,
                 bound_oid,
                 bound_strict: *bound_strict,
+                source_position: *source_position,
                 args,
                 argument_names,
                 variadic: *variadic,

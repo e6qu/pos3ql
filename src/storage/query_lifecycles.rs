@@ -83,7 +83,7 @@ impl RulePublication {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ViewAlterUndo {
     pub(super) target: CatalogEditTarget,
     pub(super) prior: Option<PendingViewDefinition>,
@@ -91,7 +91,7 @@ pub(crate) struct ViewAlterUndo {
 }
 
 impl ViewAlterUndo {
-    pub(crate) fn slot(self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         self.target.slot()
     }
 }
@@ -100,14 +100,14 @@ impl ViewAlterUndo {
     clippy::large_enum_variant,
     reason = "View undo stays inline in the startup-reserved transaction log"
 )]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum ViewPublication {
     Created(CatalogDdlUndo),
     Altered(ViewAlterUndo),
 }
 
 impl ViewPublication {
-    pub(crate) fn slot(self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         match self {
             Self::Created(undo) => undo.slot(),
             Self::Altered(undo) => undo.slot(),
@@ -297,6 +297,7 @@ impl Storage {
             persistence: definition.persistence,
             return_rule: rule_slot as u16,
             options: definition.options,
+            default_inputs: definition.default_inputs.clone(),
             columns: definition.columns,
             ownership: if replacing {
                 view.ownership
@@ -889,7 +890,7 @@ impl Storage {
         publication: ViewPublication,
         transaction: u32,
     ) -> Result<(), SqlError> {
-        let (source, owner) = match publication {
+        let (source, owner) = match &publication {
             ViewPublication::Created(undo) => (undo.source, undo.transaction),
             ViewPublication::Altered(undo) => (undo.target.source, undo.target.transaction),
         };
@@ -1444,6 +1445,7 @@ impl Storage {
             schema: current.schema_for(transaction),
             name: current.name_for(transaction),
             options: definition.options,
+            default_inputs: definition.default_inputs.clone(),
             columns: definition.columns,
         });
         Ok(ViewAlterUndo {
@@ -1477,13 +1479,14 @@ impl Storage {
         );
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
         let current = owners.catalog.views[slot].clone();
-        let prior = current.pending_definition;
-        let mut pending = prior.unwrap_or(PendingViewDefinition {
+        let prior = current.pending_definition.clone();
+        let mut pending = prior.clone().unwrap_or(PendingViewDefinition {
             txid: transaction,
             version: current.version,
             schema: current.schema,
             name: current.name,
             options: current.options,
+            default_inputs: current.default_inputs.clone(),
             columns: current.columns,
         });
         let before = (pending.schema, pending.name);
@@ -1505,12 +1508,10 @@ impl Storage {
             (pending.schema, pending.name),
             transaction,
         );
+        let version = pending.version;
         owners.catalog.views[slot].pending_definition = Some(pending);
         Ok(ViewAlterUndo {
-            target: CatalogEditTarget {
-                version: pending.version,
-                ..target
-            },
+            target: CatalogEditTarget { version, ..target },
             prior,
             return_rule: None,
         })
@@ -1656,6 +1657,7 @@ impl Storage {
         current.name = pending.name;
         current.options = pending.options;
         current.columns = pending.columns;
+        current.default_inputs = pending.default_inputs;
         current.version = pending.version;
         current.pending_definition = None;
         for comment in owners

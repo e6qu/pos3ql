@@ -165,6 +165,52 @@ pub(crate) fn execute(
     arguments: &[Datum<'_>],
     engine: &mut super::Engine,
     txn: &TxnState,
+    arena: &Arena,
+) -> Result<Datum<'static>, SqlError> {
+    let key = arena
+        .alloc_slice_with(
+            arguments.len().checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statistics replay argument count overflow"
+                )
+            })?,
+            |index| {
+                if index == 0 {
+                    Datum::Int4(intrinsic_oid)
+                } else {
+                    arguments[index - 1]
+                }
+            },
+        )
+        .map_err(|_| super::query::arena_full_pub())?;
+    super::sequence::statement_effect(
+        super::sequence::StatementEffectKind::StatisticsVoid,
+        key,
+        super::sequence::StatementEffectRetry::Restart,
+        arena,
+        || {
+            let result =
+                execute_unrecorded(intrinsic_oid, arguments, engine, txn).and_then(|value| {
+                    arena
+                        .alloc_slice_copy(&[value])
+                        .map(|values| &*values)
+                        .map_err(|_| super::query::arena_full_pub())
+                });
+            super::sequence::StatementEffectAttempt {
+                result,
+                rewound_state: false,
+            }
+        },
+    )?;
+    Ok(Datum::Text(""))
+}
+
+fn execute_unrecorded(
+    intrinsic_oid: i32,
+    arguments: &[Datum<'_>],
+    engine: &mut super::Engine,
+    txn: &TxnState,
 ) -> Result<Datum<'static>, SqlError> {
     match intrinsic_oid {
         // pos3ql publishes counters synchronously and never holds a collector

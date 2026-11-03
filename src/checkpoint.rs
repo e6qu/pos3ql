@@ -18915,6 +18915,7 @@ fn load_view(
     let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let definition = crate::storage::ViewDefinition {
         persistence: crate::storage::RelationPersistence::Permanent,
+        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
         columns,
         query: crate::storage::StoredQueryDefinition {
             sql: buffer,

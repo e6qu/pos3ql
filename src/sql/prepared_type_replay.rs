@@ -305,7 +305,7 @@ pub(super) fn stage_type_record(
             transaction.write_table_definition(
                 storage,
                 target,
-                definition,
+                definition.clone(),
                 &mapping,
                 false,
                 crate::storage::ColumnSet::EMPTY,
@@ -356,7 +356,7 @@ pub(super) fn stage_type_record(
                 crate::wal::TableDefinitionSource::Stored(value) => {
                     TableDefBuilder::from_definition(value)
                 }
-                crate::wal::TableDefinitionSource::Builder(value) => **value,
+                crate::wal::TableDefinitionSource::Builder(value) => (*value).clone(),
             };
             let table = storage.restore_table(
                 *identity,
@@ -412,6 +412,7 @@ fn stage_domain(
                 not_null_name: definition.not_null_name,
                 not_null_identity: definition.not_null_identity,
                 default_expr: definition.default_expr,
+                default_inputs: definition.default_inputs.clone(),
                 checks: definition.checks,
                 n_checks: definition.n_checks,
             },

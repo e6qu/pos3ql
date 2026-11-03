@@ -4989,7 +4989,9 @@ pub fn infer_type_res(
             }
             Err(e) => return Err(e),
         },
-        Expr::Unary { operator, operand } => match operator {
+        Expr::Unary {
+            operator, operand, ..
+        } => match operator {
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
             crate::sql::ast::UnaryOp::Neg => {
                 let inferred = infer_type_res(operand, columns)?;
@@ -5035,6 +5037,7 @@ pub fn infer_type_res(
             operator,
             left,
             right,
+            ..
         } => {
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;

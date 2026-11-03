@@ -512,6 +512,7 @@ fn projection_type_visits_keep_selected_cast_snapshots() {
             .execute_bound_cast(
                 selected.expect("retained cast"),
                 Datum::Null,
+                -1,
                 ast::Collation::None,
                 &arena,
             )

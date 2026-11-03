@@ -20,6 +20,7 @@ mod key_preparation;
 mod nested_planner_inputs;
 mod object_reads;
 mod oid_alias_comparisons;
+mod owner_role_inheritance;
 mod prepared_object_capacity;
 mod procedural_expression_calls;
 mod query_execution;

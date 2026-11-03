@@ -271,6 +271,11 @@ No representative deployment run or qualified production size/TPS/bandwidth
 claim has been published. Theoretical addressability and calculated examples
 are not acceptance evidence.
 
+Cached function inputs must retain their original attempt while a lock or storage
+request is pending. Compare casts with declared size limits, operator calls,
+reached procedural statements and inherited ownership against PostgreSQL;
+validate runtime effects as well as parsing and compilation.
+
 ## Rules throughout
 
 Fix encountered defects in the same complete PR unless an actual blocker

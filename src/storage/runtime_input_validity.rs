@@ -237,6 +237,52 @@ impl Storage {
 }
 
 impl RuntimeInputValidity {
+    pub(crate) fn finish_preparation(
+        &mut self,
+        storage: &Storage,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        if self.scope != storage.runtime_input_scope() {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "SQL input source changed databases during preparation"
+            ));
+        }
+        let path = storage.path();
+        if self.explicit_catalog != path.explicit_catalog() || self.namespaces.len() != path.entries().len()
+            || self.namespaces.iter().zip(path.entries()).any(|(selected, entry)| {
+                selected.entry != *entry || matches!(entry, PathEntry::Schema(slot)
+                    if storage.schema_def_for(usize::from(*slot), transaction).created_at != selected.created_at)
+            })
+        {
+            let full = |error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error);
+            let mut namespaces = storage.metadata_pool.lease::<Namespace>(path.entries().len()).map_err(full)?;
+            for entry in path.entries() {
+                let created_at = match entry {
+                    PathEntry::Schema(slot) => storage.schema_def_for(usize::from(*slot), transaction).created_at,
+                    _ => 0,
+                };
+                namespaces.push_reserved(Namespace { entry: *entry, created_at }).map_err(full)?;
+            }
+            self.namespaces = namespaces.freeze();
+            self.explicit_catalog = path.explicit_catalog();
+        }
+        if let Some((role, row_security)) = &mut self.role {
+            let current = storage.current_role_slot(transaction).ok_or_else(|| {
+                sql_err!(sqlstate::UNDEFINED_OBJECT, "SQL plan role no longer exists")
+            })?;
+            *role = storage.role(current).oid();
+            *row_security = crate::sql::guc::active_row_security();
+        }
+        // Parsing can execute a CHECK that changes settings or namespaces.
+        // Those become this completed plan's environment. Selected-definition
+        // revisions and selective-event receipts remain the original inputs.
+        self.global = storage
+            .plan_invalidations
+            .stamp(self.scope.database, self.role.is_some())?;
+        self.local.finish_environment()
+    }
+
     pub(crate) fn matches(&self, storage: &Storage, transaction: u32) -> Result<bool, SqlError> {
         if !storage.plan_invalidations.matches(self.global)? || !self.local.matches()? {
             return Ok(false);

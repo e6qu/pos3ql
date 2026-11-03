@@ -347,7 +347,7 @@ fn builtin_constant(
     Ok(children_safe)
 }
 
-fn cast_source_oid(
+pub(super) fn cast_source_oid(
     operand: &Expr<'_>,
     target: i32,
     columns: &dyn ColTypeResolver,
@@ -585,6 +585,9 @@ pub(crate) fn literal_argument(
 pub(crate) fn cast_source_argument(mut argument: ArgumentFacts, leaf_source: i32) -> ArgumentFacts {
     if argument.type_oid != leaf_source {
         argument.constant = None;
+        // An array's nullness says nothing about the planner's per-element
+        // placeholder, which is analyzed even for an empty or NULL array.
+        argument.known_null = false;
     }
     argument.type_oid = leaf_source;
     argument

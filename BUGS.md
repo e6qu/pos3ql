@@ -27,6 +27,8 @@ across schema changes and transaction boundaries.
 Invalidation regressions also cover retained object identities, pending drops,
 slot reuse and allocation-free delivery; nominally passing compiler checks
 cannot substitute for those runtime comparisons.
+Cast-size arguments, inherited ownership and procedural input retries also need
+regressions that check visible values and effects, rather than compiler success.
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

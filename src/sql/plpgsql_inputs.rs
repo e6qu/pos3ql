@@ -110,23 +110,34 @@ pub(super) fn parse<'a>(
     txid: u32,
     row: &dyn super::eval::ColumnLookup<'a>,
     arena: &'a Arena,
+    mut dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
 ) -> Result<super::parser::Parser<'a>, SqlError> {
     let mut parser = super::parser::Parser::new(site.text, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.capture_type_inputs();
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let columns = super::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&catalog),
+    };
     match site.kind {
         Kind::Expression => {
             let expression = parser
                 .expression(0)
                 .map_err(|error| super::parse_error_to_sql(&error))?;
-            let catalog = super::query::storage_catalog(storage, arena, txid);
-            let columns = super::eval::RuntimeColumnTypes {
-                row,
-                catalog: Some(&catalog),
-            };
             super::query::capture_contextual_expression_type_inputs(
                 &parser, expression, storage, txid, arena, &columns, row,
             )?;
+            if let Some(dependencies) = dependencies.as_mut() {
+                super::query::collect_runtime_expression(
+                    expression,
+                    storage,
+                    txid,
+                    dependencies,
+                    arena,
+                    &columns,
+                )?;
+            }
         }
         Kind::Query | Kind::Statement => {
             while let Some(statement) = parser
@@ -139,6 +150,16 @@ pub(super) fn parse<'a>(
                 super::query::capture_procedural_statement_type_inputs(
                     &parser, statement, storage, txid, arena, row,
                 )?;
+                if let Some(dependencies) = dependencies.as_mut() {
+                    super::query::collect_runtime_statement(
+                        statement,
+                        storage,
+                        txid,
+                        dependencies,
+                        arena,
+                        Some(&columns),
+                    )?;
+                }
             }
         }
     }
@@ -154,7 +175,7 @@ pub(super) fn reject_atomic<'a>(
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let parser = parse(site, storage, txid, row, arena)?;
+        let parser = parse(site, storage, txid, row, arena, None)?;
         if parser.type_input_candidates().iter().any(|candidate| {
             super::type_inputs::candidate_target_oid(storage, txid, candidate).is_some()
         }) {

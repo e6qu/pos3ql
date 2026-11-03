@@ -15693,7 +15693,7 @@ impl Engine {
                             return Err(error);
                         }
                     };
-                    sqlprep.routine_inputs.set_body_validity(plan, validity)?;
+                    sqlprep.routine_inputs.set_plan_validity(plan, validity)?;
                     sqlprep.routine_inputs.complete(
                         plan,
                         InputImage::Runtime(crate::mem::lease_pool::SharedSlice::EMPTY),
@@ -15725,19 +15725,69 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
+        if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
+            return Ok(Err(error));
+        }
         let source = key.source;
-        let ready = match sqlprep.routine_inputs.find(key) {
-            Ok(Some(type_input_plans::Lookup::Ready(_, _))) => true,
-            Ok(_) => false,
+        let prior = match sqlprep
+            .routine_inputs
+            .find_validated(key, |validity| match validity {
+                Some(validity) => validity.matches(&self.storage, txn.txid),
+                None => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "PL/pgSQL statement plan has no validity image"
+                )),
+            }) {
+            Ok(prior) => prior,
             Err(error) => return Ok(Err(error)),
+        };
+        let ready = matches!(prior, Some(type_input_plans::Lookup::Ready(_, _)));
+        let reserved = if prior.is_none() {
+            match sqlprep.routine_inputs.reserve(key) {
+                Ok(plan) => Some(plan),
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            None
         };
         let parser = if ready {
             None
         } else {
-            let parsed = plpgsql_inputs::parse(site, &self.storage, txn.txid, row, arena);
+            let parsed = (|| {
+                let mut dependencies = reserved
+                    .map(|_| self.storage.empty_stored_query_dependencies(arena))
+                    .transpose()?;
+                let parser = plpgsql_inputs::parse(
+                    site,
+                    &self.storage,
+                    txn.txid,
+                    row,
+                    arena,
+                    dependencies.as_mut(),
+                )?;
+                if let Some(plan) = reserved {
+                    let dependencies = dependencies
+                        .as_ref()
+                        .expect("new PL plans captured dependencies");
+                    let validity = self.storage.capture_runtime_input_validity(
+                        dependencies,
+                        txn,
+                        source.routine_definition().map(|(oid, _)| oid),
+                    )?;
+                    sqlprep.routine_inputs.set_plan_validity(plan, validity)?;
+                }
+                Ok(parser)
+            })();
             match parsed {
                 Ok(parser) => Some(parser),
-                Err(error) => return Ok(Err(error)),
+                Err(error) => {
+                    if let Some(plan) = reserved
+                        && let Err(abandon) = sqlprep.routine_inputs.abandon(plan)
+                    {
+                        return Ok(Err(abandon));
+                    }
+                    return Ok(Err(error));
+                }
             }
         };
         let candidates = parser
@@ -15746,7 +15796,7 @@ impl Engine {
         let prepared = match self.prepare_type_input_plan(
             TypeInputPlanSource {
                 key: Some(key),
-                reserved: None,
+                reserved,
                 source,
                 text: site.text,
                 candidates,
@@ -15949,6 +15999,7 @@ impl Engine {
                             txn.txid,
                             &mut dependencies,
                             arena,
+                            None,
                         )?;
                     }
                     if let Some(plan) = reserved {
@@ -15957,7 +16008,7 @@ impl Engine {
                             txn,
                             Some(routine_oid),
                         )?;
-                        sqlprep.routine_inputs.set_body_validity(plan, validity)?;
+                        sqlprep.routine_inputs.set_plan_validity(plan, validity)?;
                     }
                     Ok(parser)
                 })();
@@ -16042,7 +16093,7 @@ impl Engine {
                     "reserved SQL inputs have no plan key"
                 )));
             };
-            if let Err(error) = sqlprep.routine_inputs.adopt_body(plan, key) {
+            if let Err(error) = sqlprep.routine_inputs.adopt_preparing(plan, key) {
                 return Ok(Err(error));
             }
             (Some(plan), None)
@@ -16138,6 +16189,9 @@ impl Engine {
                                 )
                             }
                         };
+                        sqlprep
+                            .routine_inputs
+                            .finish_preparation(plan, &self.storage, txn.txid)?;
                         sqlprep.routine_inputs.complete(plan, image)
                     },
                 );

@@ -277,6 +277,7 @@ pub(crate) fn parse_stored_rule_statement<'a>(
 
 pub(crate) use dependencies::collect as collect_query_dependencies;
 pub(crate) use dependencies::collect_routine_parameter_defaults;
+pub(crate) use dependencies::collect_runtime_expression;
 pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
     for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
@@ -2200,6 +2201,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 && let Some(value) = self.execute_defined_cast(
                     source,
                     expected,
+                    -1,
                     value,
                     super::eval::DefinedCastContext::Implicit,
                     input_collation,
@@ -2550,10 +2552,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cast execution preserves target type modifier and input collation"
+    )]
     fn execute_defined_cast<'a>(
         &self,
         source_oid: i32,
         target_oid: i32,
+        target_type_mod: i32,
         value: Datum<'a>,
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
@@ -2562,15 +2569,20 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let Some(cast) = self.bind_defined_cast(source_oid, target_oid, context)? else {
             return Ok(None);
         };
-        self.execute_bound_cast(&cast, value, input_collation, arena)
+        self.execute_bound_cast(&cast, value, target_type_mod, input_collation, arena)
             .map(Some)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected cast execution preserves target type modifier and input collation"
+    )]
     fn execute_cast_path<'a>(
         &self,
         selected: &super::eval::BoundCast,
         source_oid: i32,
         target_oid: i32,
+        target_type_mod: i32,
         value: Datum<'a>,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
@@ -2579,15 +2591,32 @@ impl StorageCatalog<'_, '_, '_, '_> {
             .storage
             .domain_base_type_for_oid(source_oid, self.txid)
             .map(ColType::oid);
-        let target_base = self
-            .storage
-            .domain_base_type_for_oid(target_oid, self.txid)
-            .map(ColType::oid);
+        let target_base = match crate::storage::NamedTypeKind::from_oid(target_oid) {
+            Some((crate::storage::NamedTypeKind::Domain, creation, false)) => {
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    self.storage,
+                    crate::storage::NamedTypeKind::Domain,
+                    creation,
+                )?;
+                let domain = self
+                    .storage
+                    .read_domain_definition(target, self.txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "cast target domain is unavailable"
+                        )
+                    })?;
+                Some((domain.base.oid(), domain.base_type_mod))
+            }
+            _ => None,
+        };
         if source_base.is_some() || target_base.is_some() {
             let value = self.execute_cast_path(
                 selected,
                 source_base.unwrap_or(source_oid),
-                target_base.unwrap_or(target_oid),
+                target_base.map_or(target_oid, |(oid, _)| oid),
+                target_base.map_or(target_type_mod, |(_, type_mod)| type_mod),
                 value,
                 input_collation,
                 arena,
@@ -2641,6 +2670,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         selected,
                         source.element_oid(),
                         target.element_oid(),
+                        target_type_mod,
                         input,
                         input_collation,
                         arena,
@@ -2678,7 +2708,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 arguments[0] = value;
                 if routine.argument_count >= 2 {
-                    arguments[1] = Datum::Int4(-1);
+                    arguments[1] = Datum::Int4(target_type_mod);
                 }
                 if routine.argument_count == 3 {
                     arguments[2] =
@@ -2818,6 +2848,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             } else if let Some(value) = self.execute_defined_cast(
                 argument_type_oids[index],
                 expected_oid,
+                -1,
                 arguments[index],
                 super::eval::DefinedCastContext::Implicit,
                 argument_collations[index],
@@ -4376,6 +4407,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     && let Some(value) = self.execute_defined_cast(
                         source,
                         target,
+                        -1,
                         arguments[index],
                         super::eval::DefinedCastContext::Implicit,
                         input_collation,
@@ -4521,6 +4553,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         cast: &super::eval::BoundCast,
         value: Datum<'a>,
+        target_type_mod: i32,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -4528,16 +4561,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             cast,
             cast.source_oid,
             cast.target_oid,
+            target_type_mod,
             value,
             input_collation,
             arena,
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cast execution preserves target type modifier and input collation"
+    )]
     fn cast_defined<'a>(
         &self,
         source_oid: i32,
         target_oid: i32,
+        target_type_mod: i32,
         value: Datum<'a>,
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
@@ -4546,6 +4585,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_defined_cast(
             source_oid,
             target_oid,
+            target_type_mod,
             value,
             context,
             input_collation,

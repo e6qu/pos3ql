@@ -11,9 +11,15 @@ on:
       - 'tests/external/differential/206_runtime_input_collations.sql'
       - 'tests/external/differential/207_plpgsql_input_instances.sql'
       - 'tests/external/differential/208_routine_parameter_collations.sql'
+      - 'tests/external/differential/214_owner_role_inheritance.sql'
+      - 'tests/external/differential/213_cast_type_modifiers.sql'
 
 permissions:
   contents: read
+
+concurrency:
+  group: routine-input-oracle-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   source:
@@ -31,7 +37,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
-      - name: Check all Rust targets while required native gates run separately
+      - name: Type-check every target before linting
+        run: cargo check --locked --all-targets --jobs 1
+      - name: Lint all Rust targets while required native gates run separately
         env:
           RUSTFLAGS: -Dwarnings
         run: cargo clippy --locked --all-targets --jobs 1 -- -Dwarnings
@@ -65,7 +73,7 @@ jobs:
           docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
             < tests/external/routine-input-oracle.sql 2>&1 | tee oracle-evidence/postgres.log
           python3 tests/external/routine-input-oracle.py "$POSTGRES_CONTAINER" oracle-evidence/sessions.jsonl
-          for fixture in tests/external/differential/205_planner_checked_inputs.sql tests/external/differential/206_runtime_input_collations.sql tests/external/differential/207_plpgsql_input_instances.sql tests/external/differential/208_routine_parameter_collations.sql; do
+          for fixture in tests/external/differential/205_planner_checked_inputs.sql tests/external/differential/206_runtime_input_collations.sql tests/external/differential/207_plpgsql_input_instances.sql tests/external/differential/208_routine_parameter_collations.sql tests/external/differential/213_cast_type_modifiers.sql tests/external/differential/214_owner_role_inheritance.sql; do
             sha256sum "$fixture" >> oracle-evidence/inputs.sha256
             docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
               < "$fixture" 2>&1 | tee "oracle-evidence/$(basename "$fixture").log"

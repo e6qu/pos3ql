@@ -3187,3 +3187,55 @@ fn auto_updatable_views_map_public_columns_under_target_aliases() {
         );
     }
 }
+
+#[test]
+fn function_casts_receive_target_type_modifiers_and_conversion_context() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cast-type-modifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE FUNCTION target_varchar(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS \
+               $$SELECT (CASE WHEN $2=9 THEN CASE WHEN $3 THEN 'e9' ELSE 'a9' END ELSE 'none' END)::varchar$$; \
+             CREATE CAST(integer AS varchar) WITH FUNCTION target_varchar(integer,integer,boolean) AS ASSIGNMENT; \
+             CREATE DOMAIN target_short AS varchar(5); \
+             CREATE TABLE target_modifiers(value varchar(5),items varchar(5)[],domain_value target_short)", true);
+        for (statement, expected) in [
+            ("SELECT 7::varchar(5)", "e9"),
+            ("SELECT 7::varchar", "none"),
+            ("SELECT ARRAY[7,8]::varchar(5)[]", "{e9,e9}"),
+            ("SELECT (ARRAY[7,8]::integer[])::varchar(5)[]", "{e9,e9}"),
+            (
+                "SELECT ARRAY[ARRAY[7],ARRAY[8]]::varchar(5)[]",
+                "{{e9},{e9}}",
+            ),
+            ("SELECT 7::target_short", "e9"),
+            ("SELECT ARRAY[7,8]::target_short[]", "{e9,e9}"),
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, statement, true)),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+        session.success(
+            &mut engine,
+            "INSERT INTO target_modifiers VALUES(7,ARRAY[7,8],7)",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value,items,domain_value FROM target_modifiers",
+                true
+            )),
+            ["a9|{a9,a9}|a9"],
+            "{mode:?}"
+        );
+    }
+}

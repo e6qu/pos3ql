@@ -336,10 +336,6 @@ impl TypeReference {
         self.slot().kind()
     }
 
-    pub(super) fn creation(self) -> super::TypeCreation {
-        self.stored().created_at
-    }
-
     pub(crate) fn catalog_slot(self) -> u16 {
         u16::try_from(self.slot().index()).expect("captured type catalog slot fits")
     }

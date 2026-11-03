@@ -103,7 +103,7 @@ impl LocalPlanInvalidations {
     pub(crate) fn change(&self, change: CatalogPlanChange) {
         for (changed, generation) in [(change.global, &self.global), (change.roles, &self.roles)] {
             if changed {
-                let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     Some(value.saturating_add(1))
                 });
             }
@@ -212,6 +212,13 @@ impl LocalPlanInvalidations {
 }
 
 impl LocalPlanStamp {
+    pub(crate) fn finish_environment(&mut self) -> Result<(), SqlError> {
+        let (global, roles) = self.owner.generations(self.roles.is_some())?;
+        self.global = global;
+        self.roles = roles;
+        Ok(())
+    }
+
     pub(crate) fn matches(&self) -> Result<bool, SqlError> {
         let (global, roles) = self.owner.generations(self.roles.is_some())?;
         if global != self.global || roles != self.roles {
@@ -342,10 +349,10 @@ mod tests {
         let scope = RuntimeInputScope::test_scope(crate::storage::DatabaseOid::POSTGRES);
         let unrelated = RuntimeInputScope::test_scope(crate::storage::DatabaseOid::POSTGRES);
         crate::mem::guard::forbid_alloc(|| {
-            let first = owner
+            let mut first = owner
                 .watch(false, scope, SharedSlice::EMPTY, Some(100_001))
                 .unwrap();
-            let other = owner
+            let mut other = owner
                 .watch(false, scope, SharedSlice::EMPTY, Some(100_002))
                 .unwrap();
             let error = owner
@@ -359,6 +366,18 @@ mod tests {
             owner.selected_changed(scope, SelectedPlanTarget::Routine { oid: 100_001 });
             assert!(!first.matches().unwrap());
             assert!(other.matches().unwrap());
+            owner.change(CatalogPlanChange {
+                global: true,
+                roles: false,
+            });
+            assert!(!other.matches().unwrap());
+            other.finish_environment().unwrap();
+            assert!(other.matches().unwrap());
+            first.finish_environment().unwrap();
+            assert!(
+                !first.matches().unwrap(),
+                "finishing settings must preserve selected-definition invalidation"
+            );
             let stale = first.watch.unwrap();
             drop(first);
             let replacement = owner

@@ -97,10 +97,7 @@ impl Storage {
             DdlUndo::RoutineChanged(change) => Some(SelectedPlanTarget::Routine {
                 oid: super::routine_oid(&self.routine_for(change.slot(), transaction)),
             }),
-            DdlUndo::IndexCreated(slot)
-            | DdlUndo::IndexDropped(slot)
-            | DdlUndo::IndexRenamed { slot, .. }
-            | DdlUndo::IndexAltered { slot, .. } => {
+            DdlUndo::IndexCreated(slot) | DdlUndo::IndexDropped(slot) => {
                 let binding = self.index(*slot as usize).table_binding.ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -182,6 +179,7 @@ impl Storage {
                 self.column_acl_entry(*slot as usize).target.relation,
                 transaction,
             )?,
+            DdlUndo::IndexRenamed { .. } | DdlUndo::IndexAltered { .. } => None,
             _ => None,
         };
         Ok(selected)

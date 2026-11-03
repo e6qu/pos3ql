@@ -106,3 +106,87 @@ fn accepted_inline_bodies_use_normalized_constants_without_guessing_unknown_valu
         );
     }
 }
+
+#[test]
+fn registered_cast_and_operator_inputs_follow_planning_and_runtime_phases() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cast-operator-input-phases-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE operator_checks; CREATE TYPE operator_choice AS ENUM('a'); \
+             CREATE DOMAIN operator_checked AS operator_choice CHECK(nextval('operator_checks')>0); \
+             CREATE TABLE operator_empty(value integer); \
+             CREATE FUNCTION operator_cast(integer) RETURNS text LANGUAGE sql STRICT AS \
+               $$SELECT format('%s',$1) WHERE cardinality('{a}'::operator_checked[])=1$$; \
+             CREATE CAST(integer AS text) WITH FUNCTION operator_cast(integer); \
+             CREATE FUNCTION operator_rejected(integer,integer) RETURNS integer LANGUAGE sql AS \
+               $$SELECT $1+$2 WHERE cardinality('{a}'::operator_checked[])=1$$; \
+             CREATE FUNCTION operator_accepted(integer,integer) RETURNS integer LANGUAGE sql AS \
+               $$SELECT $1+$2+CASE WHEN cardinality('{a}'::operator_checked[])=1 THEN 0 ELSE 0 END$$; \
+             CREATE FUNCTION operator_opaque(integer,integer) RETURNS integer LANGUAGE sql SET search_path=public AS \
+               $$SELECT $1+$2 WHERE cardinality('{a}'::operator_checked[])=1$$; \
+             CREATE FUNCTION operator_strict(integer,integer) RETURNS integer LANGUAGE sql STRICT AS \
+               $$SELECT $1+$2 WHERE cardinality('{a}'::operator_checked[])=1$$; \
+             CREATE FUNCTION operator_unary(integer) RETURNS integer LANGUAGE sql AS \
+               $$SELECT $1 WHERE cardinality('{a}'::operator_checked[])=1$$; \
+             CREATE OPERATOR #+ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=operator_rejected); \
+             CREATE OPERATOR #* (LEFTARG=integer,RIGHTARG=integer,FUNCTION=operator_accepted); \
+             CREATE OPERATOR #/ (LEFTARG=integer,RIGHTARG=integer,FUNCTION=operator_opaque); \
+             CREATE OPERATOR #? (LEFTARG=integer,RIGHTARG=integer,FUNCTION=operator_strict); \
+             CREATE OPERATOR ~# (RIGHTARG=integer,FUNCTION=operator_unary)", true);
+        let counter = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM operator_checks";
+        // The owning differential fixture compares these counts with PostgreSQL.
+        for (sql, declared, fetched) in [
+            ("SELECT CAST(11 AS text)", "1", "2"),
+            ("SELECT 11::text", "1", "2"),
+            ("SELECT value::text FROM operator_empty", "1", "1"),
+            (
+                "SELECT CASE WHEN false THEN 11::text ELSE NULL END",
+                "0",
+                "0",
+            ),
+            ("SELECT NULL::integer::text", "0", "0"),
+            ("SELECT NULL::integer[]::text[]", "1", "1"),
+            ("SELECT ARRAY[]::integer[]::text[]", "1", "1"),
+            ("SELECT (ARRAY[11,22]::integer[])::text[]", "1", "2"),
+            ("SELECT ARRAY[11,22]::text[]", "2", "3"),
+            ("SELECT 1 #+ 2", "1", "2"),
+            ("SELECT 1 OPERATOR(public.#+) 2", "1", "2"),
+            ("SELECT 1 #* 2", "1", "1"),
+            ("SELECT 1 #/ 2", "0", "1"),
+            ("SELECT NULL::integer #? 2", "0", "0"),
+            ("SELECT value #+ 2 FROM operator_empty", "1", "1"),
+            ("SELECT CASE WHEN false THEN 1 #+ 2 ELSE 0 END", "0", "0"),
+            ("SELECT ~# 11", "1", "2"),
+        ] {
+            session.success(
+                &mut engine,
+                "DISCARD PLANS; ALTER SEQUENCE operator_checks RESTART WITH 1; BEGIN",
+                true,
+            );
+            session.success(
+                &mut engine,
+                &format!("DECLARE operator_cursor NO SCROLL CURSOR FOR {sql}"),
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                [declared],
+                "DECLARE {sql}"
+            );
+            session.success(&mut engine, "FETCH ALL FROM operator_cursor", true);
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                [fetched],
+                "FETCH {sql}"
+            );
+            session.success(&mut engine, "CLOSE operator_cursor; COMMIT", true);
+        }
+    }
+}

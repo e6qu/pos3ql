@@ -7620,7 +7620,7 @@ pub fn alter_owner(
     if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
         return sql_fail(error);
     }
-    if object.class == AccessClass::Schema && storage.object_owner(object, txn.txid) == new_owner {
+    if storage.object_owner(object, txn.txid) == new_owner {
         responder.command_complete(tag)?;
         return sql_ok();
     }
@@ -7633,7 +7633,13 @@ pub fn alter_owner(
         ));
     };
     let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
-    if !superuser && storage.object_owner(object, txn.txid) != current_role {
+    if !superuser
+        && !storage.role_has_privileges_of(
+            current_role,
+            storage.object_owner(object, txn.txid),
+            txn.txid,
+        )
+    {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be owner of {} {}",
@@ -17024,7 +17030,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::owner()?,
-            input_collation: input_collation,
+            input_collation,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -17061,7 +17067,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::owner()?,
-            input_collation: input_collation,
+            input_collation,
             input_sites: &[],
             nargs: i32::try_from(routine.arguments().len())
                 .expect("routine argument capacity fits int4"),
@@ -74765,6 +74771,7 @@ pub(crate) fn coerce<'a>(
                 &catalog,
                 source_oid,
                 target_oid,
+                col.type_mod,
                 v,
                 crate::sql::eval::DefinedCastContext::Assignment,
                 crate::sql::ast::Collation::None,
@@ -75120,6 +75127,7 @@ fn coerce_assignment<'a>(
                 &catalog,
                 cast,
                 value,
+                column.type_mod,
                 cast_input_collation,
                 arena,
             )?

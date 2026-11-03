@@ -265,3 +265,30 @@ SELECT 'reentrant checked namespace first pair',last_value FROM reentrant_checks
 DROP SCHEMA reentrant_created;
 SELECT reentrant_body(),reentrant_body();
 SELECT 'reentrant checked namespace second pair',last_value FROM reentrant_checks;
+
+CREATE SEQUENCE pl_dependency_checks;
+CREATE DOMAIN pl_dependency_checked AS text CHECK(nextval('validity_probe.pl_dependency_checks')>0);
+CREATE FUNCTION pl_dependency_body(take_anchor boolean) RETURNS pl_dependency_checked[] LANGUAGE plpgsql AS $$
+BEGIN IF take_anchor THEN RETURN (SELECT '{a}'::pl_dependency_checked[] FROM anchor LIMIT 1);
+ELSE RETURN (SELECT '{b}'::pl_dependency_checked[] FROM unrelated LIMIT 1); END IF; END $$;
+SELECT pl_dependency_body(true),pl_dependency_body(true);
+SELECT 'pl selected first arm reuse',last_value FROM pl_dependency_checks;
+SELECT pl_dependency_body(false),pl_dependency_body(true);
+SELECT 'pl selected second arm',last_value FROM pl_dependency_checks;
+ALTER TABLE anchor ADD COLUMN pl_dependency_note text;
+SELECT pl_dependency_body(false);
+SELECT 'pl selected untouched arm',last_value FROM pl_dependency_checks;
+SELECT pl_dependency_body(true),pl_dependency_body(true);
+SELECT 'pl selected changed arm',last_value FROM pl_dependency_checks;
+CREATE FUNCTION pl_dependency_static(take_anchor boolean) RETURNS pl_dependency_checked[] LANGUAGE plpgsql AS $$
+DECLARE answer pl_dependency_checked[]; BEGIN IF take_anchor THEN
+SELECT '{a}'::pl_dependency_checked[] INTO answer FROM anchor WHERE take_anchor LIMIT 1;
+ELSE SELECT '{b}'::pl_dependency_checked[] INTO answer FROM unrelated WHERE NOT take_anchor LIMIT 1;
+END IF; RETURN answer; END $$;
+SELECT pl_dependency_static(true),pl_dependency_static(false);
+SELECT 'pl static both arms',last_value FROM pl_dependency_checks;
+ALTER TABLE anchor ADD COLUMN pl_dependency_static_note text;
+SELECT pl_dependency_static(false);
+SELECT 'pl static untouched arm',last_value FROM pl_dependency_checks;
+SELECT pl_dependency_static(true),pl_dependency_static(true);
+SELECT 'pl static changed arm',last_value FROM pl_dependency_checks;

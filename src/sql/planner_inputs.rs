@@ -213,6 +213,22 @@ fn capture<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<Candidate<'a>>, SqlError> {
+    match expression {
+        Expr::Cast { .. } => {
+            return capture_explicit_cast(expression, columns, storage, txid, arena);
+        }
+        Expr::Binary { .. } | Expr::Unary { .. } => {
+            return capture_operator(expression, columns, storage, txid, arena);
+        }
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name,
+            ..
+        } if super::ast::catalog_operator_call(name).is_some() => {
+            return capture_operator(expression, columns, storage, txid, arena);
+        }
+        _ => {}
+    }
     let Expr::Call {
         kind: CallKind::Routine,
         name,
@@ -414,13 +430,84 @@ fn capture_assignment<'a>(
     else {
         return Ok(None);
     };
+    capture_cast_function(
+        expression,
+        columns,
+        &cast,
+        (InvocationSite::Assignment(site), type_mod),
+        storage,
+        txid,
+        arena,
+    )
+}
+
+fn capture_explicit_cast<'a>(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<Candidate<'a>>, SqlError> {
+    let Expr::Cast {
+        source_position,
+        operand,
+        type_mod,
+        binding,
+        ..
+    } = expression
+    else {
+        return Ok(None);
+    };
+    if *binding != super::ast::CastBinding::Resolve {
+        return Ok(None);
+    }
+    let Some(position) = source_position.get() else {
+        return Ok(None);
+    };
+    let target = infer_routine_argument_oid(expression, columns)?;
+    let source = inline::cast_source_oid(operand, target, columns, storage, txid)?;
+    if source == target || source == super::types::oid::UNKNOWN {
+        return Ok(None);
+    }
+    let catalog = query::storage_catalog(storage, arena, txid);
+    let Some(cast) = super::eval::CatalogAccess::bind_defined_cast(
+        &catalog,
+        source,
+        target,
+        super::eval::DefinedCastContext::Explicit,
+    )?
+    else {
+        return Ok(None);
+    };
+    capture_cast_function(
+        operand,
+        columns,
+        &cast,
+        (InvocationSite::Expression(position), *type_mod),
+        storage,
+        txid,
+        arena,
+    )
+}
+
+fn capture_cast_function<'a>(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    cast: &super::eval::BoundCast,
+    site: (InvocationSite, i32),
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<Candidate<'a>>, SqlError> {
+    let (site, type_mod) = site;
     let crate::storage::CastMethod::Function(oid) = cast.definition.method else {
         return Ok(None);
     };
-    let slot = storage
-        .routine_slot_by_oid(oid, txid)
-        .ok_or_else(missing_contract)?;
-    let routine = storage.routine_for(slot, txid);
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let mut routine = storage.routine_for(slot, txid);
+    routine.attributes.strict = cast.strict;
     if routine.body_kind != RoutineBodyKind::String
         || !inline::declaration(
             &routine,
@@ -431,16 +518,16 @@ fn capture_assignment<'a>(
     {
         return Ok(None);
     }
-    let source_facts = inline::argument_facts(&[expression], columns, storage, txid, arena)?[0];
+    let source_facts = inline::cast_source_argument(
+        inline::argument_facts(&[expression], columns, storage, txid, arena)?[0],
+        cast.leaf_source_oid,
+    );
     if routine.attributes.strict && source_facts.known_null {
         return Ok(None);
     }
     let mut arguments = ArenaList::new(arena);
     arguments
-        .push(inline::cast_source_argument(
-            source_facts,
-            cast.leaf_source_oid,
-        ))
+        .push(source_facts)
         .map_err(|_| super::eval::arena_full())?;
     if routine.argument_count >= 2 {
         arguments
@@ -454,7 +541,10 @@ fn capture_assignment<'a>(
     if routine.argument_count == 3 {
         arguments
             .push(inline::literal_argument(
-                super::types::Datum::Bool(false),
+                super::types::Datum::Bool(matches!(
+                    cast.context,
+                    super::eval::DefinedCastContext::Explicit
+                )),
                 super::types::oid::BOOL,
                 arena,
             )?)
@@ -463,9 +553,153 @@ fn capture_assignment<'a>(
     Candidate::detach(
         oid,
         routine.version,
-        InvocationSite::Assignment(site),
+        site,
         inline::cast_collation(expression, columns, storage, txid, arena)?,
         arguments.as_slice(),
+        arena,
+    )
+    .map(Some)
+}
+
+fn capture_operator<'a>(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<Candidate<'a>>, SqlError> {
+    let Some(position) = expression.source_position().get() else {
+        return Ok(None);
+    };
+    let pair;
+    let (schema, symbol, arguments): (_, _, &[&Expr<'_>]) = match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            let Some(symbol) = operator.operator_name() else {
+                return Ok(None);
+            };
+            pair = [*left, *right];
+            (None, symbol, &pair)
+        }
+        Expr::Unary {
+            operator, operand, ..
+        } => {
+            let symbol = match operator {
+                super::ast::UnaryOp::Neg => "-",
+                super::ast::UnaryOp::BitNot => "~",
+                super::ast::UnaryOp::SquareRoot => "|/",
+                super::ast::UnaryOp::CubeRoot => "||/",
+                super::ast::UnaryOp::AbsoluteValue => "@",
+                super::ast::UnaryOp::TextSearchNot => "!!",
+                super::ast::UnaryOp::Not => return Ok(None),
+            };
+            pair = [*operand, *operand];
+            (None, symbol, &pair[..1])
+        }
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } => {
+            let Some((schema, symbol)) = super::ast::catalog_operator_call(name) else {
+                return Ok(None);
+            };
+            (schema, symbol, *args)
+        }
+        _ => return Ok(None),
+    };
+    if !(1..=2).contains(&arguments.len()) {
+        return Err(missing_contract());
+    }
+    let mut actual = [super::types::oid::UNKNOWN; 2];
+    for (oid, expression) in actual.iter_mut().zip(arguments) {
+        *oid = infer_routine_argument_oid(expression, columns)?;
+    }
+    let (left, right) = if arguments.len() == 1 {
+        (None, Some(actual[0]))
+    } else {
+        (Some(actual[0]), Some(actual[1]))
+    };
+    let Some(slot) = storage.operator_slot_for_oids(schema, symbol, left, right, txid)? else {
+        return Ok(None);
+    };
+    let operator = storage.operator_for(slot, txid);
+    let Some(oid) = operator.implementation.routine() else {
+        return Ok(None);
+    };
+    let Some(routine_slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(None);
+    };
+    let mut expected = [super::types::oid::UNKNOWN; 2];
+    for (expected, parameter) in expected.iter_mut().zip(
+        [operator.signature.left, operator.signature.right]
+            .into_iter()
+            .flatten(),
+    ) {
+        *expected = storage
+            .routine_type_oid(parameter.ctype, parameter.user_type, txid)
+            .ok_or_else(missing_contract)?;
+    }
+    let names = [None; 2];
+    let routine = storage
+        .function_for_captured_call(
+            oid,
+            &names[..arguments.len()],
+            &expected[..arguments.len()],
+            false,
+            txid,
+        )
+        .ok_or_else(missing_contract)?;
+    if routine.body_kind != RoutineBodyKind::String
+        || !inline::declaration(
+            &routine,
+            routine.argument_count,
+            false,
+            storage.require_routine_execute(routine_slot, txid).is_ok(),
+        )
+    {
+        return Ok(None);
+    }
+    if routine.argument_count != arguments.len() {
+        return Err(missing_contract());
+    }
+    let written = inline::argument_facts(arguments, columns, storage, txid, arena)?;
+    let mut normalized = ArenaList::new(arena);
+    for (facts, expected) in written.iter().zip(expected) {
+        normalized
+            .push(inline::convert_argument(
+                *facts, expected, storage, txid, arena,
+            )?)
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    if routine.attributes.strict
+        && normalized
+            .as_slice()
+            .iter()
+            .any(|argument| argument.known_null)
+    {
+        return Ok(None);
+    }
+    let mapping = [0, 1];
+    Candidate::detach(
+        oid,
+        routine.version,
+        InvocationSite::Expression(position),
+        inline::call_collation(
+            arguments,
+            &mapping[..arguments.len()],
+            &routine,
+            columns,
+            storage,
+            txid,
+            arena,
+        )?,
+        normalized.as_slice(),
         arena,
     )
     .map(Some)

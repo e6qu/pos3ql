@@ -158,6 +158,11 @@ impl RoutineInputPlans {
             self.slot(parent)?;
         }
         for (index, slot) in self.slots.iter().enumerate() {
+            // Runtime instance keys already contain the exact generation;
+            // executing frames may still inspect that pinned obsolete image.
+            if slot.invalidated && !matches!(key.source, Source::RuntimeRoutineInstance { .. }) {
+                continue;
+            }
             match &slot.state {
                 State::Ready { key: found, inputs } if *found == key => {
                     return Ok(Some(Lookup::Ready(
@@ -190,6 +195,40 @@ impl RoutineInputPlans {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn find_validated(
+        &mut self,
+        key: Key,
+        mut valid: impl FnMut(Option<&crate::storage::RuntimeInputValidity>) -> Result<bool, SqlError>,
+    ) -> Result<Option<Lookup>, SqlError> {
+        if matches!(key.source, Source::RuntimeRoutineInstance { .. }) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "runtime routine instances require specialized lookup"
+            ));
+        }
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            let found = match slot.state {
+                State::Vacant => continue,
+                State::Preparing { key, .. } | State::Ready { key, .. } => key,
+            };
+            if found == key
+                && !matches!(slot.state, State::Preparing { .. })
+                && (slot.invalidated || !valid(slot.validity.as_ref())?)
+            {
+                let plan = PlanId {
+                    slot: index,
+                    generation: slot.generation,
+                };
+                self.slots[index].invalidated = true;
+                if !plan_is_active(plan) {
+                    self.abandon(plan)?;
+                }
+            }
+        }
+        self.find(key)
     }
 
     pub(crate) fn reserve(&mut self, key: Key) -> Result<PlanId, SqlError> {
@@ -240,7 +279,11 @@ impl RoutineInputPlans {
                 && version == definition_version
                 && slot.specialization.as_ref() == canonical
             {
-                if !slot.invalidated && valid(slot.validity.as_ref())? {
+                // An unfinished input owns its retry receipt until completion.
+                // Catalog changes affect the next admission, not its identity.
+                if matches!(slot.state, State::Preparing { .. })
+                    || (!slot.invalidated && valid(slot.validity.as_ref())?)
+                {
                     current = Some(key);
                 } else {
                     let plan = PlanId {
@@ -284,11 +327,17 @@ impl RoutineInputPlans {
         })
     }
 
-    pub(crate) fn adopt_body(&self, plan: PlanId, key: Key) -> Result<(), SqlError> {
+    pub(crate) fn adopt_preparing(&self, plan: PlanId, key: Key) -> Result<(), SqlError> {
         let slot = self.slot(plan)?;
         if matches!(slot.state, State::Preparing { key: found, waiting: false } if found == key)
-            && matches!(key, Key { owner: Owner::Backend, source: Source::RuntimeRoutineInstance { kind: RoutineInputKind::Sql, specialization, .. } } if specialization == plan.generation)
-            && !slot.specialization.is_empty()
+            && match key.source {
+                Source::RuntimeRoutineInstance { specialization, .. } => {
+                    key.owner == Owner::Backend
+                        && specialization == plan.generation
+                        && !slot.specialization.is_empty()
+                }
+                _ => slot.specialization.is_empty(),
+            }
         {
             Ok(())
         } else {
@@ -296,16 +345,32 @@ impl RoutineInputPlans {
         }
     }
 
-    pub(crate) fn set_body_validity(
+    pub(crate) fn set_plan_validity(
         &mut self,
         plan: PlanId,
         validity: crate::storage::RuntimeInputValidity,
     ) -> Result<(), SqlError> {
         let slot = self.slot_mut(plan)?;
-        if slot.specialization.is_empty() || !matches!(slot.state, State::Preparing { .. }) {
+        if !matches!(slot.state, State::Preparing { .. }) {
             return Err(stale());
         }
         slot.validity = Some(validity);
+        Ok(())
+    }
+
+    pub(crate) fn finish_preparation(
+        &mut self,
+        plan: PlanId,
+        storage: &crate::storage::Storage,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let slot = self.slot_mut(plan)?;
+        if !matches!(slot.state, State::Preparing { .. }) {
+            return Err(stale());
+        }
+        if let Some(validity) = &mut slot.validity {
+            validity.finish_preparation(storage, transaction)?;
+        }
         Ok(())
     }
 
@@ -829,7 +894,7 @@ mod tests {
                 )
                 .unwrap();
             let first_id = first.reserved.unwrap();
-            plans.adopt_body(first_id, first.key).unwrap();
+            plans.adopt_preparing(first_id, first.key).unwrap();
             assert_eq!(
                 plans.find(first.key).err().unwrap().sqlstate,
                 sqlstate::OBJECT_IN_USE
@@ -847,7 +912,7 @@ mod tests {
                 .unwrap();
             let waiting = changed.reserved.unwrap();
             assert_ne!(changed.key, first.key);
-            plans.adopt_body(waiting, changed.key).unwrap();
+            plans.adopt_preparing(waiting, changed.key).unwrap();
             plans.set_waiting(waiting, true).unwrap();
             let reused = plans
                 .runtime_routine_key(
@@ -864,7 +929,7 @@ mod tests {
             assert!(
                 matches!(plans.find(changed.key).unwrap(), Some(Lookup::Waiting(id)) if id == waiting)
             );
-            assert!(plans.adopt_body(waiting, changed.key).is_err());
+            assert!(plans.adopt_preparing(waiting, changed.key).is_err());
             plans
                 .complete(
                     first_id,
@@ -885,7 +950,7 @@ mod tests {
                 )
                 .unwrap();
             plans
-                .adopt_body(other.reserved.unwrap(), other.key)
+                .adopt_preparing(other.reserved.unwrap(), other.key)
                 .unwrap();
             assert_ne!(other.key, first.key);
             assert_eq!(pool.lease::<u8>(1).unwrap_err().available_leases, 0);
@@ -919,11 +984,84 @@ mod tests {
             assert!(
                 matches!(plans.find(other.key).err(), Some(error) if error.sqlstate == sqlstate::OBJECT_IN_USE)
             );
-            assert!(plans.adopt_body(first_id, first.key).is_err());
+            assert!(plans.adopt_preparing(first_id, first.key).is_err());
             plans.clear();
             assert_eq!(pool.lease::<u8>(256).unwrap_err().free_bytes, 192);
             drop(pinned);
             assert!(pool.lease::<u8>(256).is_ok());
+        });
+    }
+
+    #[test]
+    fn waiting_input_attempts_preserve_their_generation_across_environment_changes() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 1;
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(128, 2));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 128, 2).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let admission = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"int4",
+                    |_| Ok(true),
+                    freeze,
+                )
+                .unwrap();
+            let plan = admission.reserved.unwrap();
+            plans.set_waiting(plan, true).unwrap();
+            let resumed = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"int4",
+                    |_| panic!("an unfinished input still owns its original retry receipt"),
+                    |_| panic!("resuming an input must not allocate another generation"),
+                )
+                .unwrap();
+            assert_eq!(resumed.key, admission.key);
+            assert!(resumed.reserved.is_none());
+            assert!(
+                matches!(plans.find(admission.key).unwrap(), Some(Lookup::Waiting(found)) if found == plan)
+            );
+            plans
+                .complete(plan, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
+            let replacement = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"int4",
+                    |_| Ok(false),
+                    freeze,
+                )
+                .unwrap();
+            assert_ne!(replacement.reserved.unwrap(), plan);
+            plans.abandon(replacement.reserved.unwrap()).unwrap();
+            let key = Key {
+                owner: Owner::SqlPrepared(1),
+                source: source(31),
+            };
+            let plan = plans.reserve(key).unwrap();
+            plans.set_waiting(plan, true).unwrap();
+            assert!(
+                matches!(plans.find_validated(key, |_| panic!("a waiting statement keeps its receipt")).unwrap(),
+                Some(Lookup::Waiting(found)) if found == plan)
+            );
+            plans
+                .complete(plan, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
+            assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
+            assert_ne!(plans.reserve(key).unwrap(), plan);
         });
     }
 
@@ -951,7 +1089,7 @@ mod tests {
                 )
                 .unwrap();
             let id = first.reserved.unwrap();
-            plans.adopt_body(id, first.key).unwrap();
+            plans.adopt_preparing(id, first.key).unwrap();
             plans
                 .complete(id, InputImage::Runtime(SharedSlice::EMPTY))
                 .unwrap();
@@ -991,7 +1129,7 @@ mod tests {
                 )
                 .unwrap();
             assert_ne!(replacement.key, first.key);
-            assert!(plans.adopt_body(id, replacement.key).is_err());
+            assert!(plans.adopt_preparing(id, replacement.key).is_err());
             plans.clear();
             plans.next_generation = u64::MAX;
             let error = plans

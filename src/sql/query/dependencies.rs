@@ -41,7 +41,7 @@ impl<'a> CollectionContext<'a> {
         }
     }
 
-    fn rule(path: &'a PathContext, transition: &'a dyn ColTypeResolver) -> Self {
+    fn with_columns(path: &'a PathContext, transition: &'a dyn ColTypeResolver) -> Self {
         Self {
             path,
             transition: Some(transition),
@@ -212,6 +212,7 @@ pub(crate) fn collect_runtime_statement(
     txid: u32,
     dependencies: &mut StoredQueryDependencies,
     arena: &Arena,
+    columns: Option<&dyn ColTypeResolver>,
 ) -> Result<(), SqlError> {
     let path = storage.path();
     collect_statement(
@@ -220,8 +221,51 @@ pub(crate) fn collect_runtime_statement(
         txid,
         dependencies,
         arena,
-        CollectionContext::ordinary(&path, None),
+        match columns {
+            Some(columns) => CollectionContext::with_columns(&path, columns),
+            None => CollectionContext::ordinary(&path, None),
+        },
     )?;
+    expand_runtime_view_dependencies(storage, txid, dependencies)
+}
+
+pub(crate) fn collect_runtime_expression(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    columns: &dyn ColTypeResolver,
+) -> Result<(), SqlError> {
+    let path = storage.path();
+    let context = CollectionContext::with_columns(&path, columns);
+    collect_expression(
+        expression,
+        storage,
+        txid,
+        CteNames::EMPTY,
+        dependencies,
+        arena,
+        context,
+    )?;
+    collect_dml_routine_calls(
+        expression,
+        storage,
+        txid,
+        None,
+        None,
+        dependencies,
+        context,
+        arena,
+    )?;
+    expand_runtime_view_dependencies(storage, txid, dependencies)
+}
+
+fn expand_runtime_view_dependencies(
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
     // Rewriting a view brings its selected base definitions into the caller's
     // plan. Stored definitions retain only their direct dependencies.
     let mut next = 0;
@@ -362,7 +406,7 @@ pub(super) fn collect_rule_actions(
             CteNames::EMPTY,
             &mut dependencies,
             arena,
-            CollectionContext::rule(&path, transition),
+            CollectionContext::with_columns(&path, transition),
         )?;
     }
     for action in actions {
@@ -372,7 +416,7 @@ pub(super) fn collect_rule_actions(
             txid,
             &mut dependencies,
             arena,
-            CollectionContext::rule(&path, transition),
+            CollectionContext::with_columns(&path, transition),
         )?;
     }
     Ok(dependencies)

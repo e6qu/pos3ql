@@ -1702,6 +1702,7 @@ pub trait CatalogAccess {
         &self,
         _cast: &BoundCast,
         _value: Datum<'a>,
+        _target_type_mod: i32,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -1711,10 +1712,15 @@ pub trait CatalogAccess {
         ))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cast execution preserves target type modifier and input collation"
+    )]
     fn cast_defined<'a>(
         &self,
         _source_oid: i32,
         _target_oid: i32,
+        _target_type_mod: i32,
         _value: Datum<'a>,
         _context: DefinedCastContext,
         _input_collation: super::ast::Collation,
@@ -3702,7 +3708,16 @@ fn eval_full_inner<'a>(
             };
             let mut v = if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
             {
-                eval_array_constructor(items, Some(element), binding, arena, params, row, hooks)?
+                eval_array_constructor(
+                    items,
+                    Some(element),
+                    type_mod,
+                    binding,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                )?
             } else {
                 eval_full(operand, arena, params, row, hooks)?
             };
@@ -3741,6 +3756,7 @@ fn eval_full_inner<'a>(
                     && let Some(value) = catalog.cast_defined(
                         source_oid,
                         target_oid,
+                        type_mod,
                         v,
                         DefinedCastContext::Explicit,
                         coercion_input_collation(operand, row, hooks.catalog)?,
@@ -4450,9 +4466,16 @@ fn eval_full_inner<'a>(
                 "EXISTS is not allowed in this context"
             ))
         }
-        Expr::Array(items) => {
-            eval_array_constructor(items, None, CastBinding::Resolve, arena, params, row, hooks)
-        }
+        Expr::Array(items) => eval_array_constructor(
+            items,
+            None,
+            -1,
+            CastBinding::Resolve,
+            arena,
+            params,
+            row,
+            hooks,
+        ),
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
@@ -5600,11 +5623,13 @@ struct ArrayConstructorPlan<'a> {
     multidimensional: bool,
     inputs: &'a [ArrayConstructorInput<'a>],
     named_type: Option<&'a str>,
+    target_type_mod: i32,
 }
 
 fn prepare_array_constructor<'a>(
     items: &[&'a Expr<'a>],
     expected: Option<ArrElem>,
+    target_type_mod: i32,
     binding: CastBinding,
     arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
@@ -5643,7 +5668,15 @@ fn prepare_array_constructor<'a>(
     // Each leaf then evaluates and converts before the following leaf.
     for (input, expression) in inputs.iter_mut().zip(items) {
         let nested = if let Expr::Array(children) = expression {
-            let child = prepare_array_constructor(children, expected, binding, arena, row, hooks)?;
+            let child = prepare_array_constructor(
+                children,
+                expected,
+                target_type_mod,
+                binding,
+                arena,
+                row,
+                hooks,
+            )?;
             Some(&*arena.alloc(child).map_err(|_| arena_full())?)
         } else {
             None
@@ -5696,19 +5729,26 @@ fn prepare_array_constructor<'a>(
         multidimensional: types.multidimensional,
         inputs,
         named_type,
+        target_type_mod,
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "array execution preserves explicit element type modifier and evaluation context"
+)]
 fn eval_array_constructor<'a>(
     items: &[&'a Expr<'a>],
     expected: Option<ArrElem>,
+    target_type_mod: i32,
     binding: CastBinding,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let plan = prepare_array_constructor(items, expected, binding, arena, row, hooks)?;
+    let plan =
+        prepare_array_constructor(items, expected, target_type_mod, binding, arena, row, hooks)?;
     execute_array_constructor(&plan, arena, params, row, hooks)
 }
 
@@ -5733,6 +5773,7 @@ fn execute_array_constructor<'a>(
                 .execute_bound_cast(
                     cast,
                     value,
+                    plan.target_type_mod,
                     coercion_input_collation(input.expression, row, hooks.catalog)?,
                     arena,
                 )?,
@@ -6272,6 +6313,7 @@ pub(crate) fn builtin_operator_function<'a>(
                 && let Some(value) = catalog.cast_defined(
                     source,
                     target.oid(),
+                    -1,
                     value,
                     DefinedCastContext::Implicit,
                     coercion_input_collation(expression, row, hooks.catalog)?,
@@ -10251,10 +10293,15 @@ mod tests {
         use crate::sql::ast::Collation;
         struct Cast(core::cell::Cell<Collation>);
         impl CatalogAccess for Cast {
+            #[expect(
+                clippy::too_many_arguments,
+                reason = "cast execution preserves target type modifier and input collation"
+            )]
             fn cast_defined<'a>(
                 &self,
                 source: i32,
                 target: i32,
+                target_type_mod: i32,
                 _: Datum<'a>,
                 context: DefinedCastContext,
                 collation: Collation,
@@ -10266,6 +10313,7 @@ mod tests {
                 assert_eq!(source, crate::sql::types::oid::TEXT);
                 assert_eq!(target, crate::sql::types::oid::INT4);
                 assert_eq!(context, DefinedCastContext::Explicit);
+                assert_eq!(target_type_mod, -1);
                 self.0.set(collation);
                 Ok(Some(Datum::Int4(42)))
             }

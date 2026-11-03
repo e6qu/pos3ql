@@ -28800,7 +28800,7 @@ impl Storage {
         let owner = self.object_owner(object, txid);
         if self.role(role).attributes_to(txid).superuser
             || owner == role
-            || self.role_can_set(role, owner, txid)
+            || self.role_has_privileges_of(role, owner, txid)
         {
             return Ok(());
         }
@@ -28865,7 +28865,7 @@ impl Storage {
         let owner = routine.ownership.owner_to(txid) as usize;
         if self.role(role).attributes_to(txid).superuser
             || owner == role
-            || self.role_can_set(role, owner, txid)
+            || self.role_has_privileges_of(role, owner, txid)
         {
             return Ok(());
         }
@@ -28900,7 +28900,7 @@ impl Storage {
         })?;
         if self.role(role).attributes_to(txid).superuser
             || owner == role
-            || self.role_can_set(role, owner, txid)
+            || self.role_has_privileges_of(role, owner, txid)
         {
             Ok(())
         } else {
@@ -40320,7 +40320,7 @@ impl Storage {
         };
         if self.role(role).attributes_to(txid).superuser
             || owner == role
-            || self.role_can_set(role, owner, txid)
+            || self.role_has_privileges_of(role, owner, txid)
         {
             return Ok(());
         }

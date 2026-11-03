@@ -751,8 +751,18 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 Expr::Call {
                     kind: ast::CallKind::Routine,
                     ..
-                }
+                } | Expr::Cast { .. }
+                    | Expr::Binary { .. }
+                    | Expr::Unary { .. }
             ) {
+                planner(expression, columns, None)?;
+            } else if let Expr::Call {
+                kind: ast::CallKind::SqlSyntax,
+                name,
+                ..
+            } = expression
+                && ast::catalog_operator_call(name).is_some()
+            {
                 planner(expression, columns, None)?;
             }
             return Ok(());

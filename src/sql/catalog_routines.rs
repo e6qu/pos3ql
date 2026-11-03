@@ -222,15 +222,29 @@ fn argument_default<'a>(
             .transpose()
             .map(|value| value.unwrap_or(Datum::Null));
     }
-    let Some((count, source)) = super::intrinsic_routine_defaults(oid) else {
+    let Some(signature) = super::builtin_callable_by_oid(oid) else {
         return Ok(Datum::Null);
     };
-    let routine = super::INTRINSIC_ROUTINES
-        .iter()
-        .find(|routine| routine.oid == oid)
-        .expect("intrinsic defaults name an intrinsic routine");
-    let first = routine.argument_count as usize - count;
-    if index < first || index >= routine.argument_count as usize {
+    let Some(source) = signature.defaults else {
+        return Ok(Datum::Null);
+    };
+    let modes = signature.catalog.modes;
+    let index = if modes.is_empty() {
+        index
+    } else {
+        if !modes
+            .get(index)
+            .is_some_and(|mode| matches!(*mode, b'i' | b'b' | b'v'))
+        {
+            return Ok(Datum::Null);
+        }
+        modes[..index]
+            .iter()
+            .filter(|&&mode| matches!(mode, b'i' | b'b' | b'v'))
+            .count()
+    };
+    let first = signature.required_arguments;
+    if index < first || index >= signature.arguments.len() {
         return Ok(Datum::Null);
     }
     let wanted = index - first;

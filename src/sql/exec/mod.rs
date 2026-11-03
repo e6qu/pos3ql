@@ -27935,17 +27935,56 @@ pub fn create_event_trigger(
         Ok(owner) => owner,
         Err(error) => return sql_fail(error),
     };
-    let function = if let Some(schema) = command.function.schema {
-        storage.routine_slot_by_signature(schema, command.function.name, &[], txn.txid)
-    } else {
-        storage.event_trigger_slot_for_call(command.function.name, txn.txid)
-    };
-    let Some(function) = function else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "function {}() does not exist",
-            command.function.name
-        ));
+    let qualified = qualified_catalog_name(command.function);
+    let function = match storage.select_routine_call(
+        qualified.as_str(),
+        &[],
+        &[],
+        false,
+        txn.txid,
+        crate::storage::RoutineCallKind::EventTrigger,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+            let declaration = super::catalog::builtin_callable_by_oid(oid)
+                .expect("selected builtin has a callable declaration");
+            return sql_fail(
+                if declaration.result_oid == super::types::oid::EVENT_TRIGGER {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "builtin event trigger function {} is not implemented",
+                        qualified.as_str()
+                    )
+                } else {
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "function {}() must return type event_trigger",
+                        qualified.as_str()
+                    )
+                },
+            );
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            return sql_fail(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "function {}() is not unique",
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "function {}() must return type event_trigger",
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::Absent => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {}() does not exist",
+                qualified.as_str()
+            ));
+        }
     };
     if !matches!(
         storage.routine(function).definition_for(txn.txid).kind,
@@ -28248,20 +28287,57 @@ pub fn create_trigger(
         Ok(arguments) => arguments,
         Err(error) => return sql_fail(error),
     };
-    let function = if let Some(schema) = trigger.function.schema {
-        storage.routine_slot_by_signature(schema, trigger.function.name, &[], txn.txid)
-    } else {
-        storage.trigger_slot_for_call(trigger.function.name, txn.txid)
-    };
-    let Some(function) = function else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "function \"{}\" does not exist",
-            trigger.function.name
-        ));
+    let qualified = qualified_catalog_name(trigger.function);
+    let function = match storage.select_routine_call(
+        qualified.as_str(),
+        &[],
+        &[],
+        false,
+        txn.txid,
+        crate::storage::RoutineCallKind::Trigger,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+            let declaration = super::catalog::builtin_callable_by_oid(oid)
+                .expect("selected builtin has a callable declaration");
+            return sql_fail(if declaration.result_oid == super::types::oid::TRIGGER {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "builtin trigger function {} is not implemented",
+                    qualified.as_str()
+                )
+            } else {
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "function {}() must return type trigger",
+                    qualified.as_str()
+                )
+            });
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            return sql_fail(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "function {}() is not unique",
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "function {}() must return type trigger",
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::Absent => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {}() does not exist",
+                qualified.as_str()
+            ));
+        }
     };
     if !matches!(
-        storage.routine(function).kind,
+        storage.routine_for(function, txn.txid).kind,
         crate::storage::RoutineKind::Trigger
     ) {
         return sql_fail(sql_err!(

@@ -13933,8 +13933,14 @@ pub fn trigger_def_text<'a>(
         .write_str("EXECUTE FUNCTION ")
         .map_err(|_| super::eval::arena_full())?;
     let routine = storage.routine_for(usize::from(trigger.function), txid);
-    if storage.trigger_slot_for_call(routine.name.as_str(), txid)
-        != Some(usize::from(trigger.function))
+    if storage.select_routine_call(
+        routine.name.as_str(),
+        &[],
+        &[],
+        false,
+        txid,
+        crate::storage::RoutineCallKind::Trigger,
+    ) != crate::storage::RoutineCallSelection::Stored(usize::from(trigger.function))
     {
         write_identifier(&mut output, routine.schema.as_str());
         output

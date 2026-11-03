@@ -5211,7 +5211,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Ok(&*rows);
             }
             // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
-            if regex_name == Some("regexp_split_to_table") {
+            if tref.table == "regexp_split_to_table" {
                 if !(2..=3).contains(&args.len()) {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
@@ -5312,7 +5312,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
             // regexp_matches(string, pattern [, flags]): one row per match, each a
             // text[] of the capture groups (or the whole match when there are no groups).
-            if regex_name == Some("regexp_matches") {
+            if tref.table == "regexp_matches" {
                 if !(2..=3).contains(&args.len()) {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,

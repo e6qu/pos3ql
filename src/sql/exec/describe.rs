@@ -3080,11 +3080,8 @@ pub(crate) fn resolved_set_call(
     storage: &crate::storage::Storage,
     txid: u32,
 ) -> Result<bool, SqlError> {
-    if crate::sql::eval::is_sql_syntax_call(expression) {
-        return Ok(false);
-    }
     let Expr::Call {
-        kind,
+        kind: crate::sql::ast::CallKind::Routine,
         name,
         bound_oid,
         args,

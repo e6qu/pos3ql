@@ -141,6 +141,14 @@ analysis must pin snapshots at PostgreSQL's boundary; utility preparation must
 permit transaction settings, and protocol errors must preserve correct rollback
 and failed-block recovery. Aggregate support functions use the aggregate owner's
 permission to call them while their bodies retain ordinary invoker identity.
+Keep session plan ownership with its frontend while work moves into commit
+workers or prepared slots. A suspended command must retain its original arena
+and resume after a conflicting lock is released. Temporary argument tracking
+must fit the original bounded-memory proofs without enlarging their arenas.
+Match each standalone utility's publication boundary with PostgreSQL: creating a
+database publishes before protocol `Sync`, while concurrent index commands have
+intermediate committed catalog states and a final transaction. A common
+"commit every utility immediately" rule is incorrect.
 
 ### Share fixed memory and disk capacity according to demand
 

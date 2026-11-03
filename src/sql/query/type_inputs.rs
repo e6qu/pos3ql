@@ -243,6 +243,38 @@ fn discover_defaults(
     arena: &Arena,
     visit: &mut Visit<'_>,
 ) -> Result<(), SqlError> {
+    let table = match statement {
+        Stmt::CreateTable(table) => Some(table),
+        Stmt::CreateForeignTable(table) => Some(&table.relation),
+        _ => None,
+    };
+    if let Some(table) = table {
+        for column in table.columns {
+            let Some(source) = column.default_text else {
+                continue;
+            };
+            let target = crate::sql::exec::resolve_routine_type(storage, txid, column.type_name)?;
+            let target = storage
+                .routine_type_oid(target.ctype, target.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        super::sqlstate::UNDEFINED_OBJECT,
+                        "default input type is unavailable"
+                    )
+                })?;
+            discover_default_source(
+                parser,
+                source,
+                target,
+                column.type_mod,
+                storage,
+                txid,
+                arena,
+                visit,
+            )?;
+        }
+        return Ok(());
+    }
     let (source, target, type_mod) = match statement {
         Stmt::CreateDomain(domain) => {
             let Some(source) = domain.default_text else {
@@ -325,6 +357,25 @@ fn discover_defaults(
             "default input type is unavailable"
         ));
     };
+    discover_default_source(
+        parser, source, target, type_mod, storage, txid, arena, visit,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "default discovery keeps its original source, declared type, catalog and admission callback explicit"
+)]
+fn discover_default_source(
+    parser: &crate::sql::parser::Parser<'_>,
+    source: &str,
+    target: i32,
+    type_mod: i32,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut Visit<'_>,
+) -> Result<(), SqlError> {
     let (offset, _) = parser.source_range(source).ok_or_else(|| {
         sql_err!(
             super::sqlstate::INTERNAL_ERROR,

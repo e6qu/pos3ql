@@ -228,6 +228,7 @@ pub(crate) fn validate_isolation_mode(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitTarget {
     Ordinary,
+    Utility(super::UtilityCommand),
     Prepare {
         slot: usize,
         gid: super::ast::PreparedTransactionId,
@@ -2927,12 +2928,37 @@ impl TxnState {
         )
     }
 
-    pub(crate) fn detach_prepared_plan_invalidations(&mut self) {
-        if let Some(owner) = self.plan_invalidations.take() {
+    pub(crate) fn invalidate_prepared_plan_inputs(&self) {
+        if let Some(owner) = &self.plan_invalidations {
             for event in self.plan_events() {
                 owner.apply(event);
             }
         }
+    }
+
+    /// Prepared transaction data has no backend. Moving it cannot exchange
+    /// the frontend's plan ownership with a reused detached slot.
+    pub(crate) fn swap_prepared_state(&mut self, detached: &mut Self) {
+        assert!(detached.plan_invalidations.is_none());
+        core::mem::swap(self, detached);
+        core::mem::swap(
+            &mut self.plan_invalidations,
+            &mut detached.plan_invalidations,
+        );
+    }
+
+    /// A queued commit and its waiting frontend share the same backend until
+    /// the frontend collects its durable result.
+    pub(crate) fn stage_commit_state(&mut self, worker: &mut Self) {
+        let owner = self.plan_invalidations.clone();
+        core::mem::swap(self, worker);
+        self.plan_invalidations = owner;
+    }
+
+    pub(crate) fn finish_commit_state(&mut self, worker: &mut Self) {
+        core::mem::swap(self, worker);
+        worker.clear();
+        worker.plan_invalidations = None;
     }
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {

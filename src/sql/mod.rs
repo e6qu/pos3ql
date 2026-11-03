@@ -1826,6 +1826,7 @@ pub(crate) const SUPPORTED_EVENT_TRIGGER_TAGS: &[&str] = &[
     "ALTER DEFAULT PRIVILEGES",
     "ALTER DOMAIN",
     "ALTER EXTENSION",
+    "ALTER FOREIGN DATA WRAPPER",
     "ALTER FUNCTION",
     "ALTER INDEX",
     "ALTER LANGUAGE",
@@ -1841,6 +1842,7 @@ pub(crate) const SUPPORTED_EVENT_TRIGGER_TAGS: &[&str] = &[
     "ALTER RULE",
     "ALTER ROUTINE",
     "ALTER SEQUENCE",
+    "ALTER SERVER",
     "ALTER STATISTICS",
     "ALTER SUBSCRIPTION",
     "ALTER TABLE",
@@ -1915,35 +1917,117 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(tag))
 }
 
-fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
-    match statement {
-        Stmt::Vacuum { .. } => Some("VACUUM"),
+#[derive(Clone, Copy)]
+enum TopLevelCommand {
+    // These preserve PostgreSQL's immediate-commit flag. Commands that
+    // commit internally leave a final transaction open until Sync.
+    Utility(UtilityCommand),
+    Vacuum,
+    Cluster,
+    AlterDatabaseTablespace,
+    CreateIndexConcurrently,
+    DropIndexConcurrently,
+    ReindexConcurrently,
+    CommitPrepared,
+    RollbackPrepared,
+}
+
+impl TopLevelCommand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Utility(command) => command.label(),
+            Self::Vacuum => "VACUUM",
+            Self::Cluster => "CLUSTER",
+            Self::AlterDatabaseTablespace => "ALTER DATABASE SET TABLESPACE",
+            Self::CreateIndexConcurrently => "CREATE INDEX CONCURRENTLY",
+            Self::DropIndexConcurrently => "DROP INDEX CONCURRENTLY",
+            Self::ReindexConcurrently => "REINDEX CONCURRENTLY",
+            Self::CommitPrepared => "COMMIT PREPARED",
+            Self::RollbackPrepared => "ROLLBACK PREPARED",
+        }
+    }
+
+    fn utility(self) -> Option<UtilityCommand> {
+        match self {
+            Self::Utility(command) => Some(command),
+            Self::Vacuum
+            | Self::Cluster
+            | Self::AlterDatabaseTablespace
+            | Self::CreateIndexConcurrently
+            | Self::DropIndexConcurrently
+            | Self::ReindexConcurrently
+            | Self::CommitPrepared
+            | Self::RollbackPrepared => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UtilityCommand {
+    AlterSystem,
+    DiscardAll,
+    CreateDatabase,
+    DropDatabase,
+    CreateTablespace,
+    DropTablespace,
+    AlterSubscriptionOptions,
+}
+
+impl UtilityCommand {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AlterSystem => "ALTER SYSTEM",
+            Self::DiscardAll => "DISCARD ALL",
+            Self::CreateDatabase => "CREATE DATABASE",
+            Self::DropDatabase => "DROP DATABASE",
+            Self::CreateTablespace => "CREATE TABLESPACE",
+            Self::DropTablespace => "DROP TABLESPACE",
+            Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION SET",
+        }
+    }
+
+    fn completion(self) -> &'static str {
+        match self {
+            Self::AlterSystem => "ALTER SYSTEM",
+            Self::DiscardAll => "DISCARD ALL",
+            Self::CreateDatabase => "CREATE DATABASE",
+            Self::DropDatabase => "DROP DATABASE",
+            Self::CreateTablespace => "CREATE TABLESPACE",
+            Self::DropTablespace => "DROP TABLESPACE",
+            Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION",
+        }
+    }
+}
+
+fn top_level_only_command(statement: &Stmt<'_>) -> Option<TopLevelCommand> {
+    Some(TopLevelCommand::Utility(match statement {
+        Stmt::Vacuum { .. } => return Some(TopLevelCommand::Vacuum),
         // A relation-specific CLUSTER is transactional; the all-relations
         // form controls its own work across relations and is not.
         Stmt::Cluster {
             target: ast::ClusterTarget::All,
             ..
-        } => Some("CLUSTER"),
-        Stmt::AlterSystem { .. } => Some("ALTER SYSTEM"),
-        Stmt::Discard(ast::DiscardTarget::All) => Some("DISCARD ALL"),
-        Stmt::CommitPrepared(_) => Some("COMMIT PREPARED"),
-        Stmt::RollbackPrepared(_) => Some("ROLLBACK PREPARED"),
-        Stmt::CreateDatabase { .. } => Some("CREATE DATABASE"),
-        Stmt::DropDatabase { .. } => Some("DROP DATABASE"),
-        Stmt::CreateTablespace { .. } => Some("CREATE TABLESPACE"),
-        Stmt::DropTablespace { .. } => Some("DROP TABLESPACE"),
+        } => return Some(TopLevelCommand::Cluster),
+        Stmt::AlterSystem { .. } => UtilityCommand::AlterSystem,
+        Stmt::Discard(ast::DiscardTarget::All) => UtilityCommand::DiscardAll,
+        Stmt::CommitPrepared(_) => return Some(TopLevelCommand::CommitPrepared),
+        Stmt::RollbackPrepared(_) => return Some(TopLevelCommand::RollbackPrepared),
+        Stmt::CreateDatabase { .. } => UtilityCommand::CreateDatabase,
+        Stmt::DropDatabase { .. } => UtilityCommand::DropDatabase,
+        Stmt::CreateTablespace { .. } => UtilityCommand::CreateTablespace,
+        Stmt::DropTablespace { .. } => UtilityCommand::DropTablespace,
         Stmt::AlterDatabase {
             action: ast::AlterDatabaseAction::SetTablespace(_),
             ..
-        } => Some("ALTER DATABASE SET TABLESPACE"),
+        } => return Some(TopLevelCommand::AlterDatabaseTablespace),
         Stmt::CreateIndex {
             build: ast::IndexBuildMode::Concurrent,
             ..
-        } => Some("CREATE INDEX CONCURRENTLY"),
+        } => return Some(TopLevelCommand::CreateIndexConcurrently),
         Stmt::DropIndex {
             build: ast::IndexBuildMode::Concurrent,
             ..
-        } => Some("DROP INDEX CONCURRENTLY"),
+        } => return Some(TopLevelCommand::DropIndexConcurrently),
         Stmt::Reindex {
             options:
                 ast::ReindexOptions {
@@ -1951,15 +2035,15 @@ fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
                     ..
                 },
             ..
-        } => Some("REINDEX CONCURRENTLY"),
+        } => return Some(TopLevelCommand::ReindexConcurrently),
         Stmt::AlterSubscription {
             action: ast::AlterSubscriptionAction::SetOptions(patch),
             ..
         } if patch.failover.is_some() || patch.two_phase.is_some() => {
-            Some("ALTER SUBSCRIPTION SET")
+            UtilityCommand::AlterSubscriptionOptions
         }
-        _ => None,
-    }
+        _ => return None,
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -5656,9 +5740,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Journals every final transaction image and either commits it or leaves
-    /// its typed batch prepared. Only an ordinary commit promotes the
-    /// transaction-owned storage overlays here.
+    /// Journals every final transaction image. PREPARE retains its overlays;
+    /// completed commits publish them at the captured durable boundary.
     fn finish_txn(
         &mut self,
         txn: &mut TxnState,
@@ -6728,7 +6811,11 @@ impl Engine {
             };
         // ROLLBACK leaves an empty protocol transaction. Only a durable
         // change needs writer ownership at this final commit boundary.
-        if (staged_bytes != 0 || target != txn::CommitTarget::Ordinary)
+        if (staged_bytes != 0
+            || !matches!(
+                target,
+                txn::CommitTarget::Ordinary | txn::CommitTarget::Utility(_)
+            ))
             && let Err(error) = self.check_writer_fence()
         {
             self.rollback_txn(txn, guc);
@@ -7037,9 +7124,8 @@ impl Engine {
                         .expect("prepared transaction owns its database-scope WAL record");
                     self.prepared_transactions
                         .set_lsn_range(slot, first_lsn, staged.lsn);
-                    txn.detach_prepared_plan_invalidations();
-                    core::mem::swap(
-                        txn,
+                    txn.invalidate_prepared_plan_inputs();
+                    txn.swap_prepared_state(
                         &mut self.prepared_transactions.slot_mut(slot).transaction,
                     );
                     txn.clear();
@@ -7054,7 +7140,7 @@ impl Engine {
                     );
                     let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
                     match target {
-                        txn::CommitTarget::Ordinary => own,
+                        txn::CommitTarget::Ordinary | txn::CommitTarget::Utility(_) => own,
                         txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
                             self.complete_prepared_resolution(slot, true, txn, staged.lsn)
                         }),
@@ -7805,6 +7891,7 @@ impl Engine {
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
+        target: txn::CommitTarget,
         mut cursors: Option<CursorCommitContext<'_>>,
         arena: &Arena,
         responder: &mut Responder,
@@ -7813,7 +7900,17 @@ impl Engine {
         let _active_cursors = cursors
             .as_ref()
             .map(|context| cursor::enter_active(&*context.cursors as *const _));
-        if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+        if let Some(pending) = txn
+            .staged_commit()
+            .map(|staged| staged.target)
+            .or(txn.commit_admission())
+        {
+            if pending != target {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "commit completion target changed"
+                ));
+            }
             self.finish_pending_transaction(txn, guc)?;
             if let Some(mut context) = cursors {
                 context.on_commit();
@@ -7861,7 +7958,7 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        let result = self.commit_txn(txn, guc);
+        let result = self.finish_txn(txn, guc, target);
         if let Some(mut context) = cursors {
             if result.is_ok() {
                 context.on_commit();
@@ -7887,6 +7984,7 @@ impl Engine {
             self.commit_txn_with_triggers(
                 txn,
                 guc,
+                crate::sql::txn::CommitTarget::Ordinary,
                 Some(CursorCommitContext {
                     cursors,
                     plans: sqlprep,
@@ -8262,10 +8360,7 @@ impl Engine {
             }
         };
         if commit {
-            core::mem::swap(
-                txn,
-                &mut self.prepared_transactions.slot_mut(slot).transaction,
-            );
+            txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
             let prepared_transaction = txn.txid;
             let preparation = (|| {
                 self.prepare_transaction_bindings(txn)?;
@@ -8294,10 +8389,7 @@ impl Engine {
                         .map(|&(table, rowid, _)| (table as usize, rowid)),
                 )
             })();
-            core::mem::swap(
-                txn,
-                &mut self.prepared_transactions.slot_mut(slot).transaction,
-            );
+            txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
             if let Err(error) = preparation {
                 self.storage
                     .rollback_definition_publication(prepared_transaction);
@@ -8329,10 +8421,7 @@ impl Engine {
         // The resolution record is durable before the detached transaction is
         // released. Recovery therefore reaches the same outcome if the process
         // stops anywhere in the in-memory promotion below.
-        core::mem::swap(
-            txn,
-            &mut self.prepared_transactions.slot_mut(slot).transaction,
-        );
+        txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
         let result = if commit {
             self.storage
                 .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
@@ -9718,9 +9807,6 @@ impl Engine {
         ) {
             return Ok(Err(error));
         }
-        if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
-            return Ok(Err(error));
-        }
         let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         let bindings = match self.bind_type_inputs(
             parser.type_input_candidates(),
@@ -9788,6 +9874,9 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         let statement = if bindings.is_empty() {
+            if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
+                return Ok(Err(error));
+            }
             statement
         } else {
             let mut restored = match Parser::new(sql, arena) {
@@ -10628,7 +10717,14 @@ impl Engine {
         if transaction_boundary {
             if let Some(context) = cursors {
                 let arena = context.arena;
-                return self.commit_txn_with_triggers(txn, guc, Some(context), arena, responder);
+                return self.commit_txn_with_triggers(
+                    txn,
+                    guc,
+                    crate::sql::txn::CommitTarget::Ordinary,
+                    Some(context),
+                    arena,
+                    responder,
+                );
             }
             return self.commit_txn(txn, guc);
         }
@@ -11537,6 +11633,7 @@ impl Engine {
                     && let Err(error) = self.commit_txn_with_triggers(
                         txn,
                         guc,
+                        crate::sql::txn::CommitTarget::Ordinary,
                         Some(CursorCommitContext {
                             cursors,
                             plans: sqlprep,
@@ -11774,6 +11871,7 @@ impl Engine {
                 && let Err(e) = self.commit_txn_with_triggers(
                     txn,
                     guc,
+                    crate::sql::txn::CommitTarget::Ordinary,
                     Some(CursorCommitContext {
                         cursors,
                         plans: sqlprep,
@@ -11998,8 +12096,28 @@ impl Engine {
                                 return Ok(ExtendedExecutionStatus::Complete(false));
                             }
                         };
-                        if let Err(error) =
-                            type_inputs::validate_restored(&parser, &self.storage, txn.txid)
+                        let immediate =
+                            top_level_only_command(&statement).and_then(TopLevelCommand::utility);
+                        // A utility commit target records completed SQL. Retrying
+                        // durability must not run its DDL or callbacks again.
+                        let pending = txn
+                            .staged_commit()
+                            .map(|staged| staged.target)
+                            .or(txn.commit_admission());
+                        let resuming_utility =
+                            matches!(pending, Some(txn::CommitTarget::Utility(_)))
+                                || (immediate.is_some() && pending.is_some());
+                        if resuming_utility && pending != immediate.map(txn::CommitTarget::Utility)
+                        {
+                            responder.error(
+                                sqlstate::INTERNAL_ERROR,
+                                "extended command changed pending utility commit",
+                            )?;
+                            return Ok(ExtendedExecutionStatus::Complete(false));
+                        }
+                        if !resuming_utility
+                            && let Err(error) =
+                                type_inputs::validate_restored(&parser, &self.storage, txn.txid)
                         {
                             responder.error(error.sqlstate, error.message.as_str())?;
                             return Ok(ExtendedExecutionStatus::Complete(false));
@@ -12030,14 +12148,18 @@ impl Engine {
                             datetime::transaction_micros(),
                             backend_xid,
                         );
-                        match self.wait_for_cache_capacity(
-                            &statement,
-                            txn,
-                            sqlprep,
-                            arena,
-                            guc,
-                            routine_transaction_context,
-                        ) {
+                        match if resuming_utility {
+                            Ok(false)
+                        } else {
+                            self.wait_for_cache_capacity(
+                                &statement,
+                                txn,
+                                sqlprep,
+                                arena,
+                                guc,
+                                routine_transaction_context,
+                            )
+                        } {
                             Ok(true) => {
                                 return Ok(ExtendedExecutionStatus::Blocked {
                                     wait: StatementWait::CacheCapacity,
@@ -12067,57 +12189,104 @@ impl Engine {
                         );
                         emit_parse_warnings(&mut parser, responder)?;
                         let output_mark = responder.buffer.mark();
-                        let outcome = match self.storage.begin_advisory_statement() {
-                            Ok(()) => {
-                                match self.execute_stmt(
-                                    &statement,
-                                    arena,
-                                    params,
-                                    txn,
-                                    sqlprep,
-                                    cursors,
-                                    guc,
-                                    routine_transaction_context,
-                                    responder,
-                                ) {
-                                    Ok(outcome) => outcome,
-                                    Err(WireFull) => {
-                                        sequence_scope.discard(guc.seq_session());
-                                        txn.release_suspended_statement();
-                                        if txn.is_explicit() {
-                                            txn.failed = true;
-                                        } else {
-                                            cursors.on_rollback();
-                                            self.rollback_txn(txn, guc);
-                                        }
-                                        responder.replace_with_overflow_error(output_mark)?;
-                                        return Ok(ExtendedExecutionStatus::Complete(false));
-                                    }
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
-                        .and_then(|()| {
-                            exec::constraints::validate_deferred_constraints(
-                                &self.storage,
-                                txn,
-                                true,
-                                arena,
-                            )
-                        })
-                        .and_then(|()| {
-                            self.fire_constraint_trigger_boundary(
+                        let outcome = if resuming_utility {
+                            self.commit_txn_with_triggers(
                                 txn,
                                 guc,
+                                txn::CommitTarget::Utility(
+                                    immediate.expect("validated utility target"),
+                                ),
+                                Some(CursorCommitContext {
+                                    cursors,
+                                    plans: sqlprep,
+                                    arena,
+                                }),
                                 arena,
                                 responder,
-                                exec::TriggerQueueBoundary::Statement,
                             )
-                        })
-                        .and_then(|()| query::check_timeout())
-                        .and_then(|()| sequence_scope.finish(guc.seq_session()));
+                            .and_then(|()| sequence_scope.finish(guc.seq_session()))
+                        } else {
+                            match self.storage.begin_advisory_statement() {
+                                Ok(()) => {
+                                    let mut execute = |responder: &mut Responder<'_>| {
+                                        self.execute_stmt(
+                                            &statement,
+                                            arena,
+                                            params,
+                                            txn,
+                                            sqlprep,
+                                            cursors,
+                                            guc,
+                                            routine_transaction_context,
+                                            responder,
+                                        )
+                                    };
+                                    let executed = if immediate.is_some() {
+                                        responder.without_command_complete(execute)
+                                    } else {
+                                        execute(responder)
+                                    };
+                                    match executed {
+                                        Ok(outcome) => outcome,
+                                        Err(WireFull) => {
+                                            sequence_scope.discard(guc.seq_session());
+                                            txn.release_suspended_statement();
+                                            if txn.is_explicit() {
+                                                txn.failed = true;
+                                            } else {
+                                                cursors.on_rollback();
+                                                self.rollback_txn(txn, guc);
+                                            }
+                                            responder.replace_with_overflow_error(output_mark)?;
+                                            return Ok(ExtendedExecutionStatus::Complete(false));
+                                        }
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
+                            .and_then(|()| {
+                                exec::constraints::validate_deferred_constraints(
+                                    &self.storage,
+                                    txn,
+                                    true,
+                                    arena,
+                                )
+                            })
+                            .and_then(|()| {
+                                self.fire_constraint_trigger_boundary(
+                                    txn,
+                                    guc,
+                                    arena,
+                                    responder,
+                                    exec::TriggerQueueBoundary::Statement,
+                                )
+                            })
+                            .and_then(|()| query::check_timeout())
+                            .and_then(|()| sequence_scope.finish(guc.seq_session()))
+                            .and_then(|()| {
+                                if let Some(command) = immediate {
+                                    self.commit_txn_with_triggers(
+                                        txn,
+                                        guc,
+                                        txn::CommitTarget::Utility(command),
+                                        Some(CursorCommitContext {
+                                            cursors,
+                                            plans: sqlprep,
+                                            arena,
+                                        }),
+                                        arena,
+                                        responder,
+                                    )
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                        };
                         match outcome {
                             Ok(()) => {
+                                if let Some(command) = immediate {
+                                    responder.command_complete(command.completion())?;
+                                }
                                 if txn.take_concurrent_partition_detach() {
                                     if let Err(error) = self.commit_partition_detach_phase(
                                         txn, guc, cursors, sqlprep, arena, responder,
@@ -12145,7 +12314,7 @@ impl Engine {
                                     });
                                 }
                                 txn.compact_completed_constraints();
-                                if top_level_only_command(&statement).is_none()
+                                if immediate.is_none()
                                     && !matches!(
                                         statement,
                                         Stmt::Begin(_)
@@ -12388,6 +12557,7 @@ impl Engine {
                 && let Err(error) = self.commit_txn_with_triggers(
                     txn,
                     guc,
+                    crate::sql::txn::CommitTarget::Ordinary,
                     Some(CursorCommitContext {
                         cursors,
                         plans: sqlprep,
@@ -18003,6 +18173,7 @@ impl Engine {
             self.commit_txn_with_triggers(
                 txn,
                 guc,
+                crate::sql::txn::CommitTarget::Ordinary,
                 Some(CursorCommitContext {
                     cursors,
                     plans: sqlprep,
@@ -18296,7 +18467,7 @@ impl Engine {
             return Ok(Err(sql_err!(
                 sqlstate::ACTIVE_SQL_TRANSACTION,
                 "{} cannot run inside a transaction block",
-                command
+                command.label()
             )));
         }
         if txn.read_only && statement_writes(statement) {
@@ -18558,7 +18729,7 @@ impl Engine {
             return Ok(Err(sql_err!(
                 sqlstate::ACTIVE_SQL_TRANSACTION,
                 "{} cannot run inside a transaction block",
-                command
+                command.label()
             )));
         }
         if txn.read_only && statement_writes(statement) {
@@ -20621,6 +20792,7 @@ impl Engine {
                     if let Err(e) = self.commit_txn_with_triggers(
                         txn,
                         guc,
+                        crate::sql::txn::CommitTarget::Ordinary,
                         Some(CursorCommitContext {
                             cursors,
                             plans: sqlprep,

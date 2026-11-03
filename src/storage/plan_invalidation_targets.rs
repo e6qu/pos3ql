@@ -444,7 +444,7 @@ mod tests {
                 assert_eq!(event.selected, Some(target));
             }
             storage.publish_plan_invalidations(transaction.plan_events());
-            transaction.detach_prepared_plan_invalidations();
+            transaction.invalidate_prepared_plan_inputs();
             transaction.clear();
             assert_eq!(transaction.plan_events().count(), 0);
         });

@@ -2294,12 +2294,12 @@ fn cursor_typed_rows_use_exact_capacity_and_release_failed_declarations() {
     for _ in 0..2 {
         session.success(
             &mut engine,
-            "BEGIN; DECLARE fits CURSOR FOR SELECT; FETCH ALL FROM fits; COMMIT",
+            "BEGIN; DECLARE fits CURSOR FOR SELECT FROM (VALUES(1)) source(id) GROUP BY id; FETCH ALL FROM fits; COMMIT",
             true,
         );
         let failed = session.execute(
             &mut engine,
-            "BEGIN; DECLARE too_wide CURSOR FOR SELECT 1",
+            "BEGIN; DECLARE too_wide CURSOR FOR SELECT id FROM (VALUES(1)) source(id) GROUP BY id",
             true,
         );
         assert_eq!(error_sqlstates(&failed), ["54000"]);

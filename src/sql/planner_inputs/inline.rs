@@ -91,6 +91,9 @@ pub(super) fn call_collation(
     let mut derived = None;
     // Only supplied arguments contribute; defaults are inserted afterwards.
     for (expression, mapped) in arguments.iter().zip(mapping) {
+        if matches!(expression, Expr::BoundDefault { .. }) {
+            continue;
+        }
         let input = routine.arguments()[usize::from(*mapped)];
         let collation =
             crate::sql::eval::routine_argument_collation(expression, &row, Some(&catalog))?;

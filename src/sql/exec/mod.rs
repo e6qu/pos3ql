@@ -19997,7 +19997,7 @@ fn parse_trigger_statement<'a>(
         });
     }
     if [
-        "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset",
+        "create", "alter", "drop", "comment", "grant", "revoke", "set", "reset", "discard",
     ]
     .iter()
     .any(|keyword| strip_trigger_keyword(segment, keyword).is_some())
@@ -22474,6 +22474,7 @@ impl PlpgsqlExecHost<'_> {
                 match engine.commit_txn_with_triggers(
                     txn,
                     guc,
+                    crate::sql::txn::CommitTarget::Ordinary,
                     Some(super::CursorCommitContext {
                         cursors,
                         plans: sqlprep,

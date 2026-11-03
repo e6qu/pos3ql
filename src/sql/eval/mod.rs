@@ -5437,6 +5437,9 @@ fn expression_collation<'a>(
         {
             let mut derived = None;
             for argument in *args {
+                if matches!(argument, Expr::BoundDefault { .. }) {
+                    continue;
+                }
                 derived = merge_derived_collations(
                     derived,
                     expression_collation(argument, row, catalog)?,
@@ -5458,6 +5461,9 @@ fn expression_collation<'a>(
             }
             let mut derived = None;
             for argument in *args {
+                if matches!(argument, Expr::BoundDefault { .. }) {
+                    continue;
+                }
                 derived = merge_derived_collations(
                     derived,
                     routine_argument_collation(argument, row, catalog)?,

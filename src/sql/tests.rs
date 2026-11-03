@@ -516,6 +516,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                 engine.commit_txn_with_triggers(
                     &mut editor.transaction,
                     &editor.guc,
+                    crate::sql::txn::CommitTarget::Ordinary,
                     Some(CursorCommitContext {
                         cursors: &mut editor.cursors,
                         plans: &mut editor.pool,
@@ -18287,7 +18288,9 @@ impl ConfiguredTransactionSession {
         fixed_memory: bool,
     ) -> ExecutionStatus {
         self.send.clear();
-        self.arena.reset();
+        if self.transaction.suspended_statement_context().is_none() {
+            self.arena.reset();
+        }
         let mut responder = Responder::new(&mut self.send);
         let mut execute = || {
             engine.execute_simple(

@@ -701,9 +701,24 @@ fn procedural_sites_recheck_only_reached_statements_with_changed_dependencies() 
             data_rows(&second.success(&mut engine, counter, true)),
             ["5"]
         );
+        // ADD COLUMN holds ACCESS EXCLUSIVE until rollback; an existing plan
+        // cannot bypass that lock even when its checked inputs remain valid.
+        let status = first.execute_status(&mut engine, "SELECT pl_valid_body(true)", true);
+        assert!(
+            matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::Lock,
+                    ..
+                }
+            ),
+            "{mode:?}: {status:?}: {}",
+            String::from_utf8_lossy(first.send.readable())
+        );
+        second.success(&mut engine, "ROLLBACK", true);
         first.success(&mut engine, "SELECT pl_valid_body(true)", true);
         assert_eq!(data_rows(&first.success(&mut engine, counter, true)), ["5"]);
-        second.success(&mut engine, "ROLLBACK; SELECT pl_valid_body(true)", true);
+        second.success(&mut engine, "SELECT pl_valid_body(true)", true);
         assert_eq!(
             data_rows(&second.success(&mut engine, counter, true)),
             ["6"]

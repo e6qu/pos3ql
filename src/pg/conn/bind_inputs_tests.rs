@@ -276,6 +276,163 @@ fn prepared_resolution_distinguishes_bind_from_an_executed_pipeline() {
 }
 
 #[test]
+fn immediate_utilities_publish_before_sync_with_postgresql_completion_tags() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("immediate-utility-publication", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        observer.id = 2;
+        conn.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        for (sql, tag, observation, expected) in [
+            (
+                "CREATE DATABASE utility_database",
+                "CREATE DATABASE",
+                "SELECT count(*) FROM pg_database WHERE datname='utility_database'",
+                "1",
+            ),
+            (
+                "DROP DATABASE utility_database",
+                "DROP DATABASE",
+                "SELECT count(*) FROM pg_database WHERE datname='utility_database'",
+                "0",
+            ),
+        ] {
+            bind_command(&mut conn, &mut engine, sql);
+            let response = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+            assert_eq!(command_completion_in(&response), Some(tag), "{sql}");
+            assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle, "{sql}");
+            assert_eq!(
+                first_row(&query(&mut observer, &mut engine, observation)),
+                expected,
+                "{sql}"
+            );
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        }
+    }
+}
+
+#[test]
+fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
+    let mut config = config(
+        "immediate-utility-wait",
+        crate::config::TransactionMode::Mvcc,
+    );
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("immediate-utility-wait-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut conn = Conn::new(&config, &mut budget).unwrap();
+    conn.id = 1;
+    conn.phase = Phase::Ready;
+    query(
+        &mut conn,
+        &mut engine,
+        "CREATE TABLE utility_wait_rows(id integer); INSERT INTO utility_wait_rows VALUES(1)",
+    );
+    engine.commit_wal().unwrap();
+    engine.enable_async_durability();
+    bind_command(
+        &mut conn,
+        &mut engine,
+        "CREATE DATABASE utility_wait_database",
+    );
+    conn.send.clear();
+    assert!(conn.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+    let mut transaction = None;
+    for _ in 0..3 {
+        assert!(
+            matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+                Step::Parked
+            ),
+            "{}",
+            String::from_utf8_lossy(conn.send.readable())
+        );
+        let staged = conn
+            .txn
+            .staged_commit()
+            .expect("completed utility retains its commit");
+        assert_eq!(
+            staged.target,
+            crate::sql::txn::CommitTarget::Utility(crate::sql::UtilityCommand::CreateDatabase)
+        );
+        assert_eq!(*transaction.get_or_insert(conn.txn.txid), conn.txn.txid);
+        assert!(!has_message(
+            conn.send.readable(),
+            wire::MSG_COMMAND_COMPLETE
+        ));
+        assert!(!has_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE));
+    }
+    let wrong_target = crate::mem::guard::forbid_alloc(|| {
+        engine.commit_txn_with_triggers(
+            &mut conn.txn,
+            &conn.guc,
+            crate::sql::txn::CommitTarget::Ordinary,
+            None,
+            &conn.arena,
+            &mut Responder::new(&mut conn.send),
+        )
+    })
+    .unwrap_err();
+    assert_eq!(wrong_target.sqlstate, sqlstate::INTERNAL_ERROR);
+    assert!(conn.txn.staged_commit().is_some());
+    engine.commit_wal().unwrap();
+    assert!(
+        matches!(
+            crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+            Step::Continue
+        ),
+        "{}",
+        String::from_utf8_lossy(conn.send.readable())
+    );
+    assert_eq!(
+        command_completion_in(conn.send.readable()),
+        Some("CREATE DATABASE")
+    );
+    assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+    assert_eq!(
+        first_row(&query(
+            &mut conn,
+            &mut engine,
+            "SELECT count(*) FROM pg_database WHERE datname='utility_wait_database'"
+        )),
+        "1"
+    );
+    drop(conn);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let mut recovered_conn = Conn::new(&config, &mut recovered_budget).unwrap();
+    recovered_conn.id = 1;
+    recovered_conn.phase = Phase::Ready;
+    assert_eq!(
+        first_row(&query(
+            &mut recovered_conn,
+            &mut recovered,
+            "SELECT count(*) FROM pg_database WHERE datname='utility_wait_database'"
+        )),
+        "1"
+    );
+    drop(recovered_conn);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn extended_parse_errors_abort_implicit_work_and_preserve_explicit_failure() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

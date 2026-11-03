@@ -409,12 +409,13 @@ mod tests {
     fn transaction_workspaces_share_backend_lineage_and_prepared_work_detaches() {
         let mut budget = Budget::new(
             2 * LocalPlanInvalidations::budget_bytes(0)
-                + 2 * super::super::txn::TxnState::budget_bytes(8),
+                + 3 * super::super::txn::TxnState::budget_bytes(8),
         );
         let first = LocalPlanInvalidations::new(0, &mut budget).unwrap();
         let other = LocalPlanInvalidations::new(0, &mut budget).unwrap();
         let mut transaction = super::super::txn::TxnState::new(&mut budget, 8).unwrap();
         let mut replacement = super::super::txn::TxnState::new(&mut budget, 8).unwrap();
+        let mut detached = super::super::txn::TxnState::new(&mut budget, 8).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             transaction.bind_plan_invalidations(&first).unwrap();
             let old = transaction.plan_invalidation_stamp(false).unwrap();
@@ -440,10 +441,13 @@ mod tests {
                 sqlstate::OBJECT_IN_USE
             );
             let before_prepare = first.stamp(false).unwrap();
-            transaction.detach_prepared_plan_invalidations();
+            transaction.invalidate_prepared_plan_inputs();
+            transaction.swap_prepared_state(&mut detached);
             assert!(before_prepare.matches().unwrap());
+            transaction.bind_plan_invalidations(&first).unwrap();
+            assert!(detached.is_active());
             assert_eq!(
-                transaction
+                detached
                     .plan_invalidation_stamp(false)
                     .err()
                     .unwrap()
@@ -451,10 +455,24 @@ mod tests {
                 sqlstate::INTERNAL_ERROR
             );
             let after_prepare = first.stamp(false).unwrap();
-            transaction.clear();
+            detached.clear();
             assert!(
                 after_prepare.matches().unwrap(),
                 "resolving prepared work cannot invalidate its former backend locally"
+            );
+            replacement.bind_plan_invalidations(&other).unwrap();
+            replacement.mode = super::super::txn::TxnMode::Explicit;
+            replacement.swap_prepared_state(&mut detached);
+            replacement.bind_plan_invalidations(&other).unwrap();
+            assert!(detached.plan_invalidation_owner().is_none());
+            replacement.swap_prepared_state(&mut detached);
+            replacement.bind_plan_invalidations(&other).unwrap();
+            assert_eq!(
+                replacement
+                    .bind_plan_invalidations(&first)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_IN_USE
             );
         });
     }

@@ -358,6 +358,26 @@ fn domain_and_view_defaults_retain_checked_inputs_across_edits_and_rollback() {
             data_rows(&session.success(&mut engine, counter, true)),
             ["2|2"]
         );
+        let default = engine.storage.find_domain("default_array", 0).unwrap();
+        let scratch = Arena::new(&mut budget, "domain default SQL identity", 64 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let source = crate::sql::enum_values::checks::resolve_default(
+                default.default_expr.as_ref().unwrap().as_str(),
+                default.base,
+                &engine.storage,
+                0,
+                &scratch,
+            )
+            .unwrap();
+            let expression = parser::parse_expression(source, &scratch).unwrap();
+            assert_eq!(
+                exec::infer_type_catalog(expression, None, &engine.storage, 0, &scratch)
+                    .unwrap()
+                    .0,
+                default.base.oid(),
+                "generated SQL must retain the checked domain-array type"
+            );
+        });
         session.success(
             &mut engine,
             "INSERT INTO domain_defaults(id) VALUES(1),(2); \

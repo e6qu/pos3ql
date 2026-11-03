@@ -260,7 +260,7 @@ impl Queue {
             .staged_commit()
             .expect("journal commit is staged");
         assert!(staged.queue.is_none());
-        core::mem::swap(transaction, &mut work.transaction);
+        transaction.stage_commit_state(&mut work.transaction);
         staged.queue = Some(ticket);
         transaction.install_commit_wait(control, staged);
         slot.phase = Phase::Staged(work);
@@ -358,8 +358,7 @@ impl Queue {
             !work.transaction.is_active(),
             "completed commit released transaction data"
         );
-        core::mem::swap(transaction, &mut work.transaction);
-        work.transaction.clear();
+        transaction.finish_commit_state(&mut work.transaction);
         guc.commit_transaction();
         slot.phase = Phase::Free(work);
         Ok(true)
@@ -425,6 +424,7 @@ mod tests {
         let mut budget = Budget::new(
             Queue::budget_bytes(&config)
                 + 2 * TxnState::budget_bytes_with_config(&config)
+                + 2 * crate::sql::plan_invalidations::LocalPlanInvalidations::budget_bytes(0)
                 + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
                 + SeqSession::extra_budget_bytes(config.max_sequences),
         );
@@ -438,6 +438,12 @@ mod tests {
         .unwrap();
         let mut first = TxnState::new_with_config(&mut budget, &config).unwrap();
         let mut second = TxnState::new_with_config(&mut budget, &config).unwrap();
+        let first_owner =
+            crate::sql::plan_invalidations::LocalPlanInvalidations::new(0, &mut budget).unwrap();
+        let second_owner =
+            crate::sql::plan_invalidations::LocalPlanInvalidations::new(0, &mut budget).unwrap();
+        first.bind_plan_invalidations(&first_owner).unwrap();
+        second.bind_plan_invalidations(&second_owner).unwrap();
         first.txid = 7;
         first.mode = TxnMode::Implicit;
         second.txid = 8;
@@ -450,12 +456,24 @@ mod tests {
             second.stage_commit(10, CommitTarget::Ordinary, CommitBarrier::Journal);
             queue.stage(late, &mut first);
             queue.stage(early, &mut second);
+            first.bind_plan_invalidations(&first_owner).unwrap();
+            second.bind_plan_invalidations(&second_owner).unwrap();
+            assert_eq!(
+                first
+                    .bind_plan_invalidations(&second_owner)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_IN_USE
+            );
             assert_eq!(first.staged_commit().unwrap().queue, Some(late));
             assert_eq!(queue.first_staged_lsn(), Some(10));
             assert_eq!(queue.next_ready(9), None);
             assert_eq!(queue.next_ready(20), Some(early));
             assert!(!queue.receipt(late, &mut first, &guc).unwrap());
             let mut work = queue.take_work(early);
+            work.transaction
+                .bind_plan_invalidations(&second_owner)
+                .unwrap();
             assert_eq!(work.transaction.txid, 8);
             assert_eq!(work.transaction.staged_commit().unwrap().queue, None);
             work.transaction.clear();
@@ -469,10 +487,28 @@ mod tests {
             // disconnect after its data has already become durable and visible.
             assert!(queue.receipt(late, &mut first, &guc).unwrap());
             assert!(!first.is_active());
+            let Phase::Free(work) = &queue.slot(late).unwrap().phase else {
+                panic!("collected commit worker is free");
+            };
+            assert!(work.transaction.plan_invalidation_owner().is_none());
             let reused = queue.reserve(&guc, identity).unwrap();
             queue.cancel_reservation(reused);
             assert!(queue.receipt(early, &mut second, &guc).unwrap());
             assert!(!second.is_active());
+            let reused = queue.reserve(&guc, identity).unwrap();
+            second.txid = 9;
+            second.mode = TxnMode::Implicit;
+            second.stage_commit(30, CommitTarget::Ordinary, CommitBarrier::Journal);
+            queue.stage(reused, &mut second);
+            second.bind_plan_invalidations(&second_owner).unwrap();
+            let mut work = queue.take_work(reused);
+            work.transaction
+                .bind_plan_invalidations(&second_owner)
+                .unwrap();
+            work.transaction.clear();
+            queue.finish_work(reused, work, Ok(()));
+            assert!(queue.receipt(reused, &mut second, &guc).unwrap());
+            second.bind_plan_invalidations(&second_owner).unwrap();
         });
     }
 

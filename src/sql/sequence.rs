@@ -454,6 +454,14 @@ pub(crate) struct StatementReplayStart {
 #[derive(Clone, Copy)]
 pub(crate) struct StatementReplayCursor(Option<StatementReplayEnd>);
 
+impl StatementReplayCursor {
+    pub(crate) const EMPTY: Self = Self(None);
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0.is_none()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StatementReplayEnd {
     boundary: StatementReplayStart,

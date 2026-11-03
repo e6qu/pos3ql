@@ -327,7 +327,7 @@ enum InputState<'a> {
         next_input: usize,
         next_invocation: usize,
         next_call: usize,
-        replay: super::super::sequence::StatementReplayCursor,
+        replay: Option<&'a super::super::sequence::StatementReplayCursor>,
     },
     Definition(&'a InputDefinition<'a>),
     CastDefinition(Option<&'a super::super::eval::BoundCast>),
@@ -340,21 +340,17 @@ struct InputFrame<'a> {
 }
 
 #[derive(Clone, Copy)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "temporary input frames stay on the stack; boxing would allocate during evaluation"
-)]
 enum AttemptFrame<'statement, 'query> {
     // retain is the only constructor: saved values are encoded statement bytes.
     Saved(&'statement InputFrame<'statement>),
-    Temporary(InputFrame<'query>),
+    Temporary(&'query Cell<InputFrame<'query>>),
 }
 
 impl<'statement: 'query, 'query> AttemptFrame<'statement, 'query> {
     fn frame(self) -> InputFrame<'query> {
         match self {
             Self::Saved(frame) => *frame,
-            Self::Temporary(frame) => frame,
+            Self::Temporary(frame) => frame.get(),
         }
     }
 }
@@ -475,10 +471,14 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 },
             };
             frames
-                .push(AttemptFrame::Temporary(InputFrame {
-                    site,
-                    state: InputState::Pending,
-                }))
+                .push(AttemptFrame::Temporary(
+                    self.arena
+                        .alloc(Cell::new(InputFrame {
+                            site,
+                            state: InputState::Pending,
+                        }))
+                        .map_err(|_| full())?,
+                ))
                 .map_err(|_| full())?;
         }
         let frame = frames
@@ -499,6 +499,24 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         Ok((ordinal, frame))
     }
 
+    fn update_frame(&self, ordinal: usize, frame: InputFrame<'query>) -> Result<(), SqlError> {
+        let mut frames = self.frames.borrow_mut();
+        let selected = frames
+            .as_mut_slice()
+            .map_err(|_| full())?
+            .get_mut(ordinal)
+            .ok_or_else(changed)?;
+        match selected {
+            AttemptFrame::Temporary(current) => current.set(frame),
+            AttemptFrame::Saved(_) => {
+                *selected = AttemptFrame::Temporary(
+                    self.arena.alloc(Cell::new(frame)).map_err(|_| full())?,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn value<'value: 'query>(
         &self,
         site: InputSite<'_>,
@@ -514,7 +532,11 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 next_call,
                 replay,
             } => {
-                super::super::sequence::restore_replay_cursor(replay)?;
+                super::super::sequence::restore_replay_cursor(
+                    replay
+                        .copied()
+                        .unwrap_or(super::super::sequence::StatementReplayCursor::EMPTY),
+                )?;
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
@@ -535,6 +557,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         let before = super::super::sequence::begin_replay_cursor()?;
         let result = evaluate()?;
         let replay = super::super::sequence::finish_replay_cursor(before, self.arena)?;
+        // Ordinary arguments without a replay context need no cursor payload.
+        // Keep large live cursors outside the geometrically grown frame list.
+        let replay = if replay.is_empty() {
+            None
+        } else {
+            Some(&*self.arena.alloc(replay).map_err(|_| full())?)
+        };
         frame.state = InputState::Value {
             value: InputValue::Evaluated(self.arena.alloc(result).map_err(|_| full())?),
             next_input: self.next.get(),
@@ -542,10 +571,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             next_call: self.registry.next.get(),
             replay,
         };
-        self.frames
-            .borrow_mut()
-            .as_mut_slice()
-            .map_err(|_| full())?[ordinal] = AttemptFrame::Temporary(frame);
+        self.update_frame(ordinal, frame)?;
         Ok(result)
     }
 
@@ -567,10 +593,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     )?)
                     .map_err(|_| full())?;
                 frame.state = InputState::Definition(definition);
-                self.frames
-                    .borrow_mut()
-                    .as_mut_slice()
-                    .map_err(|_| full())?[ordinal] = AttemptFrame::Temporary(frame);
+                self.update_frame(ordinal, frame)?;
                 definition
             }
             InputState::Definition(definition) => definition,
@@ -600,10 +623,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                     None => None,
                 };
                 frame.state = InputState::CastDefinition(definition);
-                self.frames
-                    .borrow_mut()
-                    .as_mut_slice()
-                    .map_err(|_| full())?[ordinal] = AttemptFrame::Temporary(frame);
+                self.update_frame(ordinal, frame)?;
                 Ok(selected)
             }
             InputState::CastDefinition(selected) => Ok(selected.copied()),
@@ -618,6 +638,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             let saved = match *frame {
                 AttemptFrame::Saved(frame) => frame,
                 AttemptFrame::Temporary(frame) => {
+                    let frame = frame.get();
                     let state = match frame.state {
                         InputState::Pending => InputState::Pending,
                         InputState::Value {
@@ -639,7 +660,14 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                             next_input,
                             next_invocation,
                             next_call,
-                            replay,
+                            replay: replay
+                                .map(|cursor| {
+                                    arena
+                                        .alloc_persistent_slice_with(1, |_| *cursor)
+                                        .map(|saved| &saved[0])
+                                        .map_err(|_| full())
+                                })
+                                .transpose()?,
                         },
                         InputState::Definition(definition) => {
                             let definition = definition.retain(arena)?;

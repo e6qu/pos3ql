@@ -484,8 +484,21 @@ fn resolve_expression<'a>(
             write!(output, "{}", SqlString(text))
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
             if !explicit_cast {
-                write!(output, "::{}[]", name.as_str())
-                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+                if matches!(
+                    base,
+                    ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+                ) {
+                    // Preserve an admitted domain-array value through the
+                    // generated cast; lowering it to enum[] repeats its checks.
+                    let target =
+                        crate::sql::catalog::user_type_name_text(storage, txid, base.oid(), arena)?
+                            .ok_or_else(corrupt)?;
+                    write!(output, "::{target}")
+                        .map_err(|_| crate::sql::query::arena_full_pub())?;
+                } else {
+                    write!(output, "::{}[]", name.as_str())
+                        .map_err(|_| crate::sql::query::arena_full_pub())?;
+                }
             }
             output
                 .write_char(' ')

@@ -135,6 +135,11 @@ or an explicit `BEGIN`, still prevents that command with `25001`. Query analysis
 pins the data snapshot; preparing a transaction-setting utility does not. Errors
 roll back implicit work, while an explicit failed block remains failed until a
 transaction-exit command such as `ROLLBACK`.
+Standalone utilities with an immediate commit boundary, such as `CREATE DATABASE`,
+complete durable publication before their Execute response. A storage wait resumes
+that publication without executing the utility again. Prepared resolution retains
+its dedicated completion path. Utilities that restart internal transactions need
+their own publication boundaries; a blanket immediate commit is incorrect.
 
 `DISCARD PLANS` makes future query admissions prepare again. Running calls and
 bound portals or cursors retain their checked images; a compiled PL/pgSQL

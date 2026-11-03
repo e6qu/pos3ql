@@ -2295,6 +2295,15 @@ impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        let mark = self.arena.mark();
+        let result =
+            super::subquery_expression_type(expression, self.storage, self.txid, self.arena, self);
+        // Only the declared OID escapes; nested schema descriptions are scratch.
+        unsafe { self.arena.rewind_to(mark) };
+        result.map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
+    }
+
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         crate::sql::catalog::validate_enum_input_literal(
             self.storage,

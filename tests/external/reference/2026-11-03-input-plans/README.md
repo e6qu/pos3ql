@@ -54,3 +54,12 @@ role can also appear in the source list; reassigning a role's objects to itself
 finishes without changing their owner. SQL, commands, hashes, raw output and
 `verify-owner-reassignment.py` are retained inside the archive. Extract it and
 run `python3 verify-owner-reassignment.py .` to verify the recorded observations.
+
+[protocol-reference.zip](protocol-reference.zip), SHA256
+`dd67b2c53d7795b1d6f25ced1aa8393d02600a8de07db98edd4741cf415aba49`,
+retains 69 raw protocol exchanges on that PostgreSQL build, their runner and
+provenance. A duplicate portal Bind fails the explicit transaction. Database
+creation publishes before `Sync`; concurrent index commands expose intermediate
+catalog states before their final transaction ends. Bound integer and text
+parameters skip unreached function checks. Extract it and run
+`python3 verify-protocol-reference.py .` to check file hashes and these observations.

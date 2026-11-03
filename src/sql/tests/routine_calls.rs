@@ -164,6 +164,29 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
             )),
             ["19"]
         );
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION body_collation_echo(first_input text DEFAULT ('a' COLLATE \"POSIX\"), \
+               second_input text DEFAULT ('b' COLLATE \"POSIX\")) RETURNS text \
+               LANGUAGE sql SET search_path=public AS 'SELECT first_input'",
+            true,
+        );
+        for expression in [
+            "body_collation_echo(value)",
+            "body_collation_echo(first_input=>value)",
+            "body_collation_echo()",
+            "body_collation_echo('a' COLLATE \"C\")",
+        ] {
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    &format!("SELECT {expression} = ('a' COLLATE \"C\") FROM body_collation_texts"),
+                    true
+                )),
+                ["t"],
+                "{expression}, {mode:?}"
+            );
+        }
     }
 }
 

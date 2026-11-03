@@ -133,42 +133,100 @@ fn changed_relation_estimates_invalidate_other_sessions_before_commit() {
         let mut second =
             ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
         first.success(&mut engine, r#"CREATE SEQUENCE cross_analyze_checks; CREATE TYPE cross_analyze_choice AS ENUM('a'); CREATE DOMAIN cross_analyze_checked AS cross_analyze_choice CHECK(nextval('cross_analyze_checks')>0); CREATE TABLE cross_analyze_anchor(id integer); CREATE TABLE cross_analyze_unrelated(id integer); INSERT INTO cross_analyze_anchor VALUES(1); CREATE FUNCTION cross_analyze_body() RETURNS cross_analyze_checked[] LANGUAGE sql SET search_path=public AS $$SELECT '{a}'::cross_analyze_checked[] FROM cross_analyze_anchor LIMIT 1$$; ALTER SEQUENCE cross_analyze_checks RESTART WITH 1;"#, true);
-        for (use_second, statement, expected) in [
-            (false, "SELECT cross_analyze_body()", "1"),
-            (true, "SELECT cross_analyze_body()", "2"),
-            (
-                false,
-                "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
-                "3",
-            ),
-            (true, "SELECT cross_analyze_body()", "4"),
-            (false, "ROLLBACK; SELECT cross_analyze_body()", "5"),
-            (true, "SELECT cross_analyze_body()", "5"),
-            (
-                false,
-                "ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
-                "6",
-            ),
-            (true, "SELECT cross_analyze_body()", "7"),
-            (
-                false,
-                "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
-                "8",
-            ),
-            (true, "SELECT cross_analyze_body()", "9"),
-            (false, "COMMIT; SELECT cross_analyze_body()", "10"),
-            (true, "SELECT cross_analyze_body()", "11"),
-            (
-                false,
-                "ANALYZE cross_analyze_unrelated; SELECT cross_analyze_body()",
-                "11",
-            ),
-        ] {
+        let steps: &[(bool, &str, &str)] = if mode == crate::config::TransactionMode::Mvcc {
+            &[
+                (false, "SELECT cross_analyze_body()", "1"),
+                (true, "SELECT cross_analyze_body()", "2"),
+                (
+                    false,
+                    "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "3",
+                ),
+                (true, "SELECT cross_analyze_body()", "4"),
+                (false, "ROLLBACK; SELECT cross_analyze_body()", "5"),
+                (true, "SELECT cross_analyze_body()", "5"),
+                (
+                    false,
+                    "ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "6",
+                ),
+                (true, "SELECT cross_analyze_body()", "7"),
+                (
+                    false,
+                    "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "8",
+                ),
+                (true, "SELECT cross_analyze_body()", "9"),
+                (false, "COMMIT; SELECT cross_analyze_body()", "10"),
+                (true, "SELECT cross_analyze_body()", "11"),
+                (
+                    false,
+                    "ANALYZE cross_analyze_unrelated; SELECT cross_analyze_body()",
+                    "11",
+                ),
+            ]
+        } else {
+            // Locking mode cannot read this relation while its writer is open.
+            // Statistics still invalidate the other backend before it can read.
+            &[
+                (false, "SELECT cross_analyze_body()", "1"),
+                (true, "SELECT cross_analyze_body()", "2"),
+                (
+                    false,
+                    "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "3",
+                ),
+                (false, "ROLLBACK; SELECT cross_analyze_body()", "4"),
+                (true, "SELECT cross_analyze_body()", "5"),
+                (
+                    false,
+                    "ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "6",
+                ),
+                (true, "SELECT cross_analyze_body()", "7"),
+                (
+                    false,
+                    "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                    "8",
+                ),
+                (false, "COMMIT; SELECT cross_analyze_body()", "9"),
+                (true, "SELECT cross_analyze_body()", "10"),
+                (
+                    false,
+                    "ANALYZE cross_analyze_unrelated; SELECT cross_analyze_body()",
+                    "10",
+                ),
+            ]
+        };
+        for &(use_second, statement, expected) in steps {
+            if mode == crate::config::TransactionMode::Locking
+                && (statement.starts_with("ROLLBACK;") || statement.starts_with("COMMIT;"))
+            {
+                let status =
+                    second.execute_status(&mut engine, "SELECT id FROM cross_analyze_anchor", true);
+                assert!(
+                    matches!(
+                        status,
+                        ExecutionStatus::Blocked {
+                            wait: StatementWait::Lock,
+                            ..
+                        }
+                    ),
+                    "{mode:?} {statement}: {status:?}: {}",
+                    String::from_utf8_lossy(second.send.readable())
+                );
+            }
             let session = if use_second { &mut second } else { &mut first };
             // Match psql's separate messages while BEGIN keeps explicit transactions open.
             for command in statement.split(';') {
                 session.success(&mut engine, command.trim(), true);
             }
+            if mode == crate::config::TransactionMode::Locking
+                && (statement.starts_with("ROLLBACK;") || statement.starts_with("COMMIT;"))
+            {
+                second.success(&mut engine, "SELECT id FROM cross_analyze_anchor", true);
+            }
+            let session = if use_second { &mut second } else { &mut first };
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,

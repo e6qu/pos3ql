@@ -1978,6 +1978,7 @@ impl Conn {
                             engine.commit_txn_with_triggers(
                                 &mut self.txn,
                                 &self.guc,
+                                crate::sql::txn::CommitTarget::Ordinary,
                                 Some(crate::sql::CursorCommitContext {
                                     cursors: &mut self.cursors,
                                     plans: &mut self.sqlprep,

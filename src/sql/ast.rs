@@ -5638,7 +5638,8 @@ pub enum Expr<'a> {
         source: &'a Expr<'a>,
     },
     /// A planned routine default keeps its declared input type without an
-    /// extra conversion. Routine input preparation performs its one coercion.
+    /// extra conversion. Routine input preparation performs its one coercion;
+    /// inserted defaults do not contribute to the enclosing call's collation.
     BoundDefault {
         expression: &'a Expr<'a>,
         type_oid: i32,

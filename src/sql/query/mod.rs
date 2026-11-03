@@ -969,7 +969,7 @@ pub(super) fn require_routine_call_access(
         Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied for function {}",
-            storage.routine_for(slot, txid).name
+            storage.routine_for(slot, txid).name.as_str()
         ))
     }
 }
@@ -2252,8 +2252,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             })?;
         let routine = &*declared;
         for (input_index, argument) in routine.arguments().iter().enumerate() {
-            for (call_index, _) in arguments.iter().enumerate() {
-                if usize::from(mapping[call_index]) == input_index {
+            for (call_index, expression) in arguments.iter().enumerate() {
+                if usize::from(mapping[call_index]) == input_index
+                    && !matches!(expression, Expr::BoundDefault { .. })
+                {
                     let derived = super::eval::DerivedCollation::for_input_type(
                         argument_collations[call_index],
                         argument.ctype,

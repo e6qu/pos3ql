@@ -204,6 +204,10 @@ polygon to a path column is allowed; assigning a box to a point column needs
 an explicit `::point` cast. Those rules also apply to typed NULL values and
 arrays. Converting an open path to a polygon fails with `22023`, whether written
 as `polygon(value)` or `value::polygon`.
+Explicit array conversions honor a registered whole-array cast first, then
+element conversions when applicable. Element conversions run once in array
+order and preserve dimensions and starting subscripts. A user function that
+accepts NULL may convert a NULL element; a NULL array has no elements to convert.
 
 `array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
 `btarraycmp` use the array comparison rules of the SQL operators. They accept

@@ -67,13 +67,17 @@ fn geometric_casts_share_function_results_and_postgresql_contexts() {
             "polygon('<(1,1),2>'::circle)",
         ] {
             let sql = format!(
-                "SELECT npoints(value),round(area(value)::numeric,8),box(value) FROM (SELECT {conversion} AS value) converted"
+                "SELECT npoints(value),round(area(value::path)::numeric,8),box(value) FROM (SELECT {conversion} AS value) converted"
             );
             assert_eq!(
                 data_rows(&session.success(&mut engine, &sql, true)),
                 ["12|12.00000000|(3,3),(-1,-1)"]
             );
         }
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "SELECT area(NULL::polygon)", true)),
+            ["42883"]
+        );
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT count(*),count(DISTINCT oid),count(*) FILTER(WHERE castcontext='a'),count(*) FILTER(WHERE castcontext='i') \
                FROM pg_cast WHERE castsource IN(600,601,602,603,604,628,718) AND casttarget IN(600,601,602,603,604,628,718); \

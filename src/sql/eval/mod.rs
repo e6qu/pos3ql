@@ -328,6 +328,41 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Resolves declared types and scope errors without reading a row value.
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.col_type(qualifier, name)
+            .or_else(|| {
+                qualifier
+                    .is_none()
+                    .then(|| self.whole_row_type(name))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                if let Some(qualifier) = qualifier
+                    && self.whole_row_type(qualifier).is_some()
+                {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    )
+                } else if self.is_empty_scope() {
+                    empty_scope_column_error(qualifier, name)
+                } else {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                }
+            })
+    }
+
     /// True only when this lookup has no relation scope, including outer scopes.
     fn is_empty_scope(&self) -> bool {
         false
@@ -705,21 +740,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.row
-            .col_type(qualifier, name)
-            .or_else(|| {
-                qualifier
-                    .is_none()
-                    .then(|| self.row.whole_row_type(name))
-                    .flatten()
-            })
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                )
-            })
+        self.row.resolve_column_type(qualifier, name)
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -890,6 +911,14 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        (**self).resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         (**self).is_empty_scope()
     }
@@ -1638,8 +1667,29 @@ pub trait CatalogAccess {
     ) -> Result<Option<ExpressionEvaluation>, SqlError> {
         Ok(None)
     }
-    /// Applies a catalog-defined cast in the context that selected it.
-    /// `None` means no visible cast has this exact source/target identity.
+    /// Selects a registered cast or array-element conversion before effects.
+    /// `None` means no applicable registered conversion exists in this context.
+    fn bind_defined_cast(
+        &self,
+        _source_oid: i32,
+        _target_oid: i32,
+        _context: DefinedCastContext,
+    ) -> Result<Option<BoundCast>, SqlError> {
+        Ok(None)
+    }
+
+    fn execute_bound_cast<'a>(
+        &self,
+        _cast: &BoundCast,
+        _value: Datum<'a>,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "selected cast execution is unavailable"
+        ))
+    }
+
     fn cast_defined<'a>(
         &self,
         _source_oid: i32,
@@ -2190,6 +2240,21 @@ pub enum DefinedCastContext {
     Implicit,
 }
 
+/// A selected conversion retains its catalog definition while an array source
+/// or an earlier element runs. Execution must not resolve its name again.
+#[derive(Clone, Copy)]
+pub struct BoundCast {
+    pub(crate) source_oid: i32,
+    pub(crate) target_oid: i32,
+    pub(crate) leaf_source_oid: i32,
+    pub(crate) leaf_target_oid: i32,
+    pub(crate) definition: crate::storage::CastDef,
+    pub(crate) context: DefinedCastContext,
+    pub(crate) strict: bool,
+    pub(crate) volatility: crate::storage::RoutineVolatility,
+    pub(crate) leakproof: bool,
+}
+
 #[derive(Clone, Copy)]
 pub enum PrivilegeColumn<'a> {
     Name(&'a str),
@@ -2438,6 +2503,28 @@ fn catalog_evaluation(
             } else {
                 None
             };
+            if *binding == CastBinding::Resolve
+                && let Some(ColType::Array(element)) =
+                    constructor_type_from_oid(target, &|oid| catalog.domain_base_type(oid))
+            {
+                let columns = RuntimeColumnTypes {
+                    row: &NoColumns,
+                    catalog: Some(catalog),
+                };
+                super::exec::visit_array_constructor_conversions(
+                    operand,
+                    element,
+                    &columns,
+                    &mut |source, target| {
+                        if found != Some(ExpressionEvaluation::Runtime)
+                            && let Some(evaluation) = catalog.cast_evaluation(source, target)?
+                        {
+                            found = Some(evaluation);
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
         }
     }
     super::query::walk_children(expression, &mut |child| {
@@ -3502,7 +3589,7 @@ fn eval_full_inner<'a>(
             };
             let mut v = if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
             {
-                eval_array_constructor(items, Some(element), arena, params, row, hooks)?
+                eval_array_constructor(items, Some(element), *binding, arena, params, row, hooks)?
             } else {
                 eval_full(operand, arena, params, row, hooks)?
             };
@@ -4248,7 +4335,9 @@ fn eval_full_inner<'a>(
                 "EXISTS is not allowed in this context"
             ))
         }
-        Expr::Array(items) => eval_array_constructor(items, None, arena, params, row, hooks),
+        Expr::Array(items) => {
+            eval_array_constructor(items, None, CastBinding::Resolve, arena, params, row, hooks)
+        }
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
@@ -5229,15 +5318,31 @@ pub(crate) fn unify_arr_elem(
     super::types::common_array_element(a, b).map_err(|error| common_type_error(error, "ARRAY"))
 }
 
-fn eval_array_constructor<'a>(
-    items: &[&Expr<'a>],
+#[derive(Clone, Copy)]
+struct ArrayConstructorInput<'a> {
+    expression: &'a Expr<'a>,
+    nested: Option<&'a ArrayConstructorPlan<'a>>,
+    cast: Option<&'a BoundCast>,
+    named_conversion: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ArrayConstructorPlan<'a> {
+    element: ArrElem,
+    multidimensional: bool,
+    inputs: &'a [ArrayConstructorInput<'a>],
+    named_type: Option<&'a str>,
+}
+
+fn prepare_array_constructor<'a>(
+    items: &[&'a Expr<'a>],
     expected: Option<ArrElem>,
+    binding: CastBinding,
     arena: &'a Arena,
-    params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
-) -> Result<Datum<'a>, SqlError> {
-    let plan = array_constructor_type(
+) -> Result<ArrayConstructorPlan<'a>, SqlError> {
+    let types = array_constructor_type(
         items,
         expected,
         &|item| Ok(expression_type_identity(item, row, hooks)?.record_field_oid()),
@@ -5247,13 +5352,136 @@ fn eval_array_constructor<'a>(
                 .and_then(|catalog| catalog.domain_base_type(oid))
         },
     )?;
-    let element = plan.element;
-    let vals = super::array::alloc_items(arena, items.len())?;
-    for (target, expression) in vals.iter_mut().zip(items) {
-        *target = if let Expr::Array(children) = expression {
-            eval_array_constructor(children, expected, arena, params, row, hooks)?
+    let target_oid = if types.multidimensional {
+        types.element.array_oid()
+    } else {
+        types.element.element_oid()
+    };
+    let context = if expected.is_some() {
+        DefinedCastContext::Explicit
+    } else {
+        DefinedCastContext::Implicit
+    };
+    let mut named_type = None;
+    let inputs = arena
+        .alloc_slice_with(items.len(), |_| ArrayConstructorInput {
+            expression: &Expr::Null,
+            nested: None,
+            cast: None,
+            named_conversion: false,
+        })
+        .map_err(|_| arena_full())?;
+    // Select every leaf conversion before the first source expression runs.
+    // Each leaf then evaluates and converts before the following leaf.
+    for (input, expression) in inputs.iter_mut().zip(items) {
+        let nested = if let Expr::Array(children) = expression {
+            let child = prepare_array_constructor(children, expected, binding, arena, row, hooks)?;
+            Some(&*arena.alloc(child).map_err(|_| arena_full())?)
         } else {
-            eval_full(expression, arena, params, row, hooks)?
+            None
+        };
+        let source_oid = match nested {
+            Some(child) => child.element.array_oid(),
+            None => expression_type_identity(expression, row, hooks)?.record_field_oid(),
+        };
+        let cast = if binding == CastBinding::Resolve && source_oid != target_oid {
+            match hooks.catalog {
+                Some(catalog) => catalog
+                    .bind_defined_cast(source_oid, target_oid, context)?
+                    .map(|cast| {
+                        arena
+                            .alloc(cast)
+                            .map(|cast| &*cast)
+                            .map_err(|_| arena_full())
+                    })
+                    .transpose()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let named_conversion = !types.multidimensional
+            && types.element.is_named()
+            && source_oid != target_oid
+            && cast.is_none();
+        if named_conversion && named_type.is_none() {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "array constructor named type catalog access is unavailable"
+                )
+            })?;
+            named_type = Some(
+                catalog
+                    .type_name(types.element.element_oid(), arena)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "array element has no declared type name"
+                        )
+                    })?,
+            );
+        }
+        *input = ArrayConstructorInput {
+            expression,
+            nested,
+            cast,
+            named_conversion,
+        };
+    }
+    Ok(ArrayConstructorPlan {
+        element: types.element,
+        multidimensional: types.multidimensional,
+        inputs,
+        named_type,
+    })
+}
+
+fn eval_array_constructor<'a>(
+    items: &[&'a Expr<'a>],
+    expected: Option<ArrElem>,
+    binding: CastBinding,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let plan = prepare_array_constructor(items, expected, binding, arena, row, hooks)?;
+    execute_array_constructor(&plan, arena, params, row, hooks)
+}
+
+fn execute_array_constructor<'a>(
+    plan: &ArrayConstructorPlan<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let element = plan.element;
+    let vals = super::array::alloc_items(arena, plan.inputs.len())?;
+    for (target, input) in vals.iter_mut().zip(plan.inputs) {
+        let value = match input.nested {
+            Some(nested) => execute_array_constructor(nested, arena, params, row, hooks)?,
+            None => eval_full(input.expression, arena, params, row, hooks)?,
+        };
+        let value = match input.cast {
+            Some(cast) => hooks
+                .catalog
+                .expect("selected cast has a catalog")
+                .execute_bound_cast(cast, value, arena)?,
+            None => value,
+        };
+        *target = if plan.multidimensional {
+            value
+        } else {
+            coerce_array_constructor_element(
+                value,
+                input.named_conversion,
+                element,
+                plan.named_type,
+                arena,
+                hooks,
+            )?
         };
     }
     if plan.multidimensional {
@@ -5300,7 +5528,7 @@ fn eval_array_constructor<'a>(
                 super::array::MAX_DIMENSIONS
             ));
         }
-        let shape = child.with_first(items.len(), 1)?;
+        let shape = child.with_first(plan.inputs.len(), 1)?;
         let flattened = super::array::alloc_items(arena, shape.element_count())?;
         let mut count = 0;
         for value in vals.iter() {
@@ -5318,72 +5546,56 @@ fn eval_array_constructor<'a>(
             raw: super::array::build_shaped(flattened, shape, arena)?,
         });
     }
-    // Coerce each element to the unified type.
+    Ok(Datum::Array {
+        element,
+        raw: super::array::build(vals, arena)?,
+    })
+}
+
+fn coerce_array_constructor_element<'a>(
+    mut value: Datum<'a>,
+    named_conversion: bool,
+    element: ArrElem,
+    named_type: Option<&str>,
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
     let ct = element.to_coltype();
-    let mut named_type = None;
-    for (v, expression) in vals.iter_mut().zip(items) {
-        if element.is_named()
-            && expression_type_identity(expression, row, hooks)?.record_field_oid()
-                != element.element_oid()
-        {
-            let catalog = hooks.catalog.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "array constructor named type catalog access is unavailable"
-                )
-            })?;
-            let name = match named_type {
-                Some(name) => name,
-                None => {
-                    let name = catalog
-                        .type_name(element.element_oid(), arena)?
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "array element has no declared type name"
-                            )
-                        })?;
-                    named_type = Some(name);
-                    name
-                }
-            };
-            *v = catalog.cast_user_type(name, *v, arena)?.ok_or_else(|| {
+    if named_conversion {
+        value = hooks
+            .catalog
+            .expect("named conversion has a catalog")
+            .cast_user_type(named_type.expect("prepared named conversion"), value, arena)?
+            .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "array element type has no catalog conversion"
                 )
             })?;
-        } else if element.is_catalog_reference() {
-            *v = if ct == ColType::Regtype {
-                regtype_cast(*v, hooks.catalog, arena)?
-            } else {
-                regobject_cast(*v, ct, hooks.catalog, arena)?
-            };
-            continue;
-        }
-        if !v.is_null() {
-            *v = match *v {
-                // A bpchar element keeps its padding in the array
-                // value, as PostgreSQL's array_out shows it.
-                Datum::Bpchar(s) if ct == ColType::Bpchar => Datum::Text(s),
-                Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields: 0,
-                        text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
-                    }
-                }
-                value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-                    value
-                }
-                other => cast_to(other, ct, arena)?,
-            };
-        }
+    } else if element.is_catalog_reference() {
+        return if ct == ColType::Regtype {
+            regtype_cast(value, hooks.catalog, arena)
+        } else {
+            regobject_cast(value, ct, hooks.catalog, arena)
+        };
     }
-    Ok(Datum::Array {
-        element,
-        raw: super::array::build(&vals[..items.len()], arena)?,
-    })
+    if value.is_null() {
+        return Ok(value);
+    }
+    match value {
+        Datum::Bpchar(text) if ct == ColType::Bpchar => Ok(Datum::Text(text)),
+        Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            Ok(Datum::CompositeText {
+                slot,
+                physical_fields: 0,
+                text: arena.alloc_str_display(value).map_err(|_| arena_full())?,
+            })
+        }
+        value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            Ok(value)
+        }
+        other => cast_to(other, ct, arena),
+    }
 }
 
 fn array_constructor_shape_error() -> SqlError {

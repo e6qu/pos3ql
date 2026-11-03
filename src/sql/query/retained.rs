@@ -237,10 +237,30 @@ fn validate_statement_casts(
         } else {
             super::super::exec::infer_routine_argument_oid(operand, columns)?
         };
-        *safe &= columns
-            .storage
-            .cast_for_oids(source, target.oid(), columns.txid)
-            .is_none();
+        *safe &= crate::sql::catalog::defined_cast_path(
+            columns.storage,
+            columns.txid,
+            source,
+            target.oid(),
+        )
+        .is_none();
+        if let ColType::Array(element) = target {
+            crate::sql::exec::visit_array_constructor_conversions(
+                operand,
+                element,
+                columns,
+                &mut |source, target| {
+                    *safe &= crate::sql::catalog::defined_cast_path(
+                        columns.storage,
+                        columns.txid,
+                        source,
+                        target,
+                    )
+                    .is_none();
+                    Ok(())
+                },
+            )?;
+        }
     }
     walk_children(expression, &mut |child| {
         validate_statement_casts(child, columns, safe)
@@ -389,11 +409,31 @@ fn bind_expression<'a>(
                     } else {
                         super::super::exec::infer_routine_argument_oid(operand, columns)?
                     };
-                    if columns
-                        .storage
-                        .cast_for_oids(source, target.oid(), columns.txid)
-                        .is_none()
-                    {
+                    let mut defined = crate::sql::catalog::defined_cast_path(
+                        columns.storage,
+                        columns.txid,
+                        source,
+                        target.oid(),
+                    )
+                    .is_some();
+                    if let ColType::Array(element) = target {
+                        crate::sql::exec::visit_array_constructor_conversions(
+                            operand,
+                            element,
+                            columns,
+                            &mut |source, target| {
+                                defined |= crate::sql::catalog::defined_cast_path(
+                                    columns.storage,
+                                    columns.txid,
+                                    source,
+                                    target,
+                                )
+                                .is_some();
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    if !defined {
                         crate::sql::ast::CastBinding::Builtin
                     } else {
                         *binding

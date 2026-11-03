@@ -915,6 +915,24 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.is_none_or(|scope| scope.n == 0)
             && self.outer.is_none_or(|outer| outer.is_empty_scope())
@@ -2456,9 +2474,17 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
+                if qualifier.is_some_and(|qualifier| {
+                    self.scope.map_or_else(
+                        || self.catalog.is_whole_row(qualifier),
+                        |scope| scope.qualified_star_columns(qualifier).is_ok(),
+                    )
+                }) {
+                    return Err(error);
+                }
                 self.outer
-                    .and_then(|outer| outer.col_type(qualifier, name))
-                    .ok_or(error)
+                    .ok_or(error)?
+                    .resolve_column_type(qualifier, name)
             }
             Err(error) => Err(error),
         }
@@ -2470,6 +2496,16 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         name: &str,
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         if let Some(scope) = self.scope
+            && scope.find_column(qualifier, name).is_err_and(|error| {
+                !matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            })
+        {
+            return None;
+        }
+        if let Some(scope) = self.scope
             && scope.find_column(qualifier, name).is_ok()
         {
             return CatalogScopeCols {
@@ -2480,6 +2516,14 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                 arena: self.catalog.arena,
             }
             .column_meta(qualifier, name);
+        }
+        if qualifier.is_some_and(|qualifier| {
+            self.scope.map_or_else(
+                || self.catalog.is_whole_row(qualifier),
+                |scope| scope.qualified_star_columns(qualifier).is_ok(),
+            )
+        }) {
+            return None;
         }
         let outer = self.outer?;
         let ctype = outer.col_type(qualifier, name)?;

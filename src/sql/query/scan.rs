@@ -487,6 +487,76 @@ mod tests {
     }
 
     #[test]
+    fn chained_qualified_columns_keep_the_innermost_alias_owner() {
+        use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
+        use crate::sql::types::{ColType, Datum};
+        struct Scope(bool);
+        impl<'a> ColumnLookup<'a> for Scope {
+            fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+                if self.col_type(qualifier, name).is_some() {
+                    Ok(Datum::Int4(7))
+                } else {
+                    Err(crate::sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column selected.value does not exist"
+                    ))
+                }
+            }
+            fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+                (self.0 && qualifier == Some("selected") && name == "value")
+                    .then_some(ColType::Int4)
+            }
+            fn whole_row_type(&self, table: &str) -> Option<ColType> {
+                (table == "selected").then_some(ColType::Record)
+            }
+        }
+        struct Hidden;
+        impl<'a> ColumnLookup<'a> for Hidden {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("column typing must not read values");
+            }
+            fn resolve_column_type(&self, _: Option<&str>, _: &str) -> Result<ColType, SqlError> {
+                Err(crate::sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"source\""
+                ))
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let inner = Scope(false);
+            let outer = Scope(true);
+            let row = super::Chained {
+                inner: &inner,
+                outer: Some(&outer),
+            };
+            assert!(row.col_type(Some("selected"), "value").is_none());
+            assert_eq!(
+                row.resolve_column_type(Some("selected"), "value")
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_COLUMN
+            );
+            assert_eq!(
+                row.lookup(Some("selected"), "value").unwrap_err().sqlstate,
+                sqlstate::UNDEFINED_COLUMN
+            );
+            let empty = crate::sql::eval::NoColumns;
+            let hidden = Hidden;
+            let row = super::Chained {
+                inner: &empty,
+                outer: Some(&hidden),
+            };
+            assert_eq!(
+                row.resolve_column_type(Some("reference_scope.source"), "value")
+                    .unwrap_err()
+                    .message
+                    .as_str(),
+                "invalid reference to FROM-clause entry for table \"source\""
+            );
+        });
+    }
+
+    #[test]
     fn gist_operator_matrix_matches_postgresql_18_search_strategies() {
         use BinaryOp::*;
         use GistOperatorClass::*;
@@ -4078,6 +4148,14 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.n == 0
     }
@@ -4287,6 +4365,28 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        match self.inner.resolve_column_type(qualifier, name) {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !qualifier
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                match self.outer {
+                    Some(outer) => outer.resolve_column_type(qualifier, name),
+                    None => Err(error),
+                }
+            }
+            result => result,
+        }
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.inner.is_empty_scope() && self.outer.is_none_or(|outer| outer.is_empty_scope())
     }
@@ -4342,6 +4442,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         match self.inner.lookup(q, name) {
             Ok(v) => Ok(v),
+            Err(e)
+                if !matches!(
+                    e.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                Err(e)
+            }
+            Err(e) if q.is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) => {
+                Err(e)
+            }
             Err(e) => match self.outer {
                 Some(o) => o.lookup(q, name),
                 None => Err(e),
@@ -4349,29 +4460,44 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
     fn col_type(&self, q: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.inner
-            .col_type(q, name)
-            .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
+        self.resolve_column_type(q, name).ok()
     }
     fn column_user_type(
         &self,
         q: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if self.inner.col_type(q, name).is_some() {
-            self.inner.column_user_type(q, name)
-        } else {
-            self.outer.and_then(|outer| outer.column_user_type(q, name))
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.column_user_type(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer.and_then(|outer| outer.column_user_type(q, name))
+            }
+            Err(_) => None,
         }
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if self.inner.col_type(q, name).is_some() {
-            self.inner.collation(q, name)
-        } else {
-            self.outer
-                .map(|outer| outer.collation(q, name))
-                .unwrap_or(crate::sql::ast::Collation::None)
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.collation(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer
+                    .map_or(crate::sql::ast::Collation::None, |outer| {
+                        outer.collation(q, name)
+                    })
+            }
+            Err(_) => crate::sql::ast::Collation::None,
         }
     }
 

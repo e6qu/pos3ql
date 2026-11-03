@@ -394,6 +394,14 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.0.is_empty_scope()
     }
@@ -424,6 +432,14 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        super::ScopeSchema(self.0).resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.0.n == 0
     }
@@ -1056,6 +1072,8 @@ impl<'d> QueryScope<'d> {
         )?;
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, definition);
+        self.authorization_roles[self.n] = tref.authorization_role;
+        self.view_accesses[self.n] = tref.view_access;
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);

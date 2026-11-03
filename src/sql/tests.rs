@@ -18,6 +18,7 @@ mod geometric_casts;
 mod geometry_assignments;
 mod key_preparation;
 mod object_reads;
+mod oid_alias_comparisons;
 mod prepared_object_capacity;
 mod query_execution;
 mod routine_calls;
@@ -291,9 +292,10 @@ fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_wr
             true,
         );
         let sql = "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_large CHECK (VALUE > 10)";
-        let blocked = editor.execute(&mut engine, sql, true);
+        let status = editor.execute_status(&mut engine, sql, true);
+        assert!(matches!(status, ExecutionStatus::Blocked { .. }));
         assert!(
-            blocked.is_empty(),
+            editor.send.is_empty(),
             "a waiting domain edit must not emit a response"
         );
         assert!(editor.transaction.ddl().is_empty());
@@ -12736,8 +12738,10 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
             (commands[1], locking, "C42809\0"),
             (table_command, locking, "ALTER TABLE"),
         ] {
-            let initial = writer.execute(&mut engine, command, true);
+            let status = writer.execute_status(&mut engine, command, true);
+            let initial = writer.send.readable();
             if waits {
+                assert!(matches!(status, ExecutionStatus::Blocked { .. }));
                 assert!(initial.is_empty(), "{mode:?}: {command}: {initial:?}");
                 // Deliver the scheduler's timeout notification to the parked command.
                 let completed = crate::mem::guard::forbid_alloc(|| {
@@ -12762,8 +12766,9 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
                     writer.send.readable()
                 );
             } else {
+                assert_eq!(status, ExecutionStatus::Complete);
                 assert!(
-                    String::from_utf8_lossy(&initial).contains(completion),
+                    String::from_utf8_lossy(initial).contains(completion),
                     "{mode:?}: {command}: {initial:?}"
                 );
             }
@@ -18261,7 +18266,12 @@ impl ConfiguredTransactionSession {
         self
     }
 
-    fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+    fn execute_status(
+        &mut self,
+        engine: &mut Engine,
+        sql: &str,
+        fixed_memory: bool,
+    ) -> ExecutionStatus {
         self.send.clear();
         self.arena.reset();
         let mut responder = Responder::new(&mut self.send);
@@ -18282,7 +18292,12 @@ impl ConfiguredTransactionSession {
         } else {
             execute()
         }
-        .unwrap();
+        .unwrap()
+    }
+
+    fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        let status = self.execute_status(engine, sql, fixed_memory);
+        assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
     }
 
@@ -95000,6 +95015,10 @@ fn check_cleanup_during_download(
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
     engine.enable_async_block_reads();
     assert!(blocks.lock().unwrap().async_gets_enabled());
+    // The suspended reader is a different backend from the cached commands.
+    let download_owner =
+        ExecutionIdentity::new(2, engine.execution_identity().database_oid).read_owner();
+    let foreground_owner = engine.replace_read_owner(Some(download_owner));
     let payload = b"the download still belongs to its waiting reader";
     let mut framed = [0u8; crate::store::BLOCK_SIZE];
     let (id, framed_len) =
@@ -95009,6 +95028,7 @@ fn check_cleanup_during_download(
         crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&id, &mut output)),
         Err(StoreError::NotReady)
     );
+    let _ = engine.replace_read_owner(foreground_owner);
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let (mut stream, _) = loop {
@@ -95116,7 +95136,9 @@ fn check_cleanup_during_download(
                 break;
             }
         }
+        let prior_owner = engine.replace_read_owner(Some(download_owner));
         let result = blocks.lock().unwrap().get(&id, &mut output);
+        let _ = engine.replace_read_owner(prior_owner);
         if fail_read {
             assert_eq!(result, Err(StoreError::NotFound));
         } else {

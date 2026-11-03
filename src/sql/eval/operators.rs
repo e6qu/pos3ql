@@ -760,6 +760,20 @@ pub(crate) fn hash_key_identified(values: &[Datum], columns: &[u16]) -> Option<u
     Some(hasher.finish())
 }
 
+fn hash_integer(value: i64, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
+    use core::hash::Hasher as _;
+    // int2/int4 convert to OID through their unsigned 32-bit representation.
+    // Equal integer widths and OID aliases must share a hash. The overlap of
+    // negative signed values and positive OIDs introduces permitted collisions.
+    let value = if (i64::from(i32::MIN)..0).contains(&value) {
+        i64::from(value as u32)
+    } else {
+        value
+    };
+    hasher.write(&[2]);
+    hasher.write(&value.to_le_bytes());
+}
+
 fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
     use core::hash::Hasher as _;
     // Canonical float bits: -0.0 and 0.0 are equal, and PostgreSQL's btree
@@ -785,18 +799,9 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(node.as_str().as_bytes());
         }
         Datum::Bool(b) => hasher.write(&[1, *b as u8]),
-        Datum::Int2(v) => {
-            hasher.write(&[2]);
-            hasher.write(&(*v as i64).to_le_bytes());
-        }
-        Datum::Int4(v) => {
-            hasher.write(&[2]);
-            hasher.write(&(*v as i64).to_le_bytes());
-        }
-        Datum::Oid(v) => {
-            hasher.write(&[35]);
-            hasher.write(&v.to_le_bytes());
-        }
+        Datum::Int2(v) => hash_integer(i64::from(*v), hasher),
+        Datum::Int4(v) => hash_integer(i64::from(*v), hasher),
+        Datum::Oid(v) => hash_integer(i64::from(*v), hasher),
         Datum::Xid8(v) => {
             hasher.write(&[44]);
             hasher.write(&v.to_le_bytes());
@@ -819,10 +824,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[48]);
             hasher.write(&v.to_le_bytes());
         }
-        Datum::Int8(v) => {
-            hasher.write(&[2]);
-            hasher.write(&v.to_le_bytes());
-        }
+        Datum::Int8(v) => hash_integer(*v, hasher),
         Datum::Float4(f) => {
             hasher.write(&[3]);
             hasher.write(&canon_float(*f as f64).to_le_bytes());
@@ -847,18 +849,8 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[4]);
             hasher.write(s.trim_end_matches(' ').as_bytes());
         }
-        Datum::Regtype { referenced_oid, .. } => {
-            hasher.write(&[33]);
-            hasher.write(&referenced_oid.to_le_bytes());
-        }
-        Datum::RegObject {
-            type_oid,
-            referenced_oid,
-            ..
-        } => {
-            hasher.write(&[34]);
-            hasher.write(&type_oid.to_le_bytes());
-            hasher.write(&referenced_oid.to_le_bytes());
+        Datum::Regtype { referenced_oid, .. } | Datum::RegObject { referenced_oid, .. } => {
+            hash_integer(i64::from(*referenced_oid as u32), hasher)
         }
         Datum::Date(v) => {
             hasher.write(&[5]);
@@ -953,6 +945,25 @@ pub(crate) fn compare_datums_as(
     r: &Datum,
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
+    if l.catalog_oid().is_some() || r.catalog_oid().is_some() {
+        let operand =
+            |value: &Datum| -> Result<Option<u32>, SqlError> {
+                if let Some(oid) = value.catalog_oid() {
+                    return Ok(Some(oid));
+                }
+                Ok(match value {
+                    Datum::Int2(value) => Some(*value as u32),
+                    Datum::Int4(value) => Some(*value as u32),
+                    Datum::Int8(value) => Some(u32::try_from(*value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                    })?),
+                    _ => None,
+                })
+            };
+        if let (Some(left), Some(right)) = (operand(l)?, operand(r)?) {
+            return Ok(left.cmp(&right));
+        }
+    }
     let ord = match (l, r) {
         (
             Datum::Int2Vector {
@@ -1016,66 +1027,6 @@ pub(crate) fn compare_datums_as(
         }
         (Datum::Bpchar(a), Datum::Text(b)) => a.trim_end_matches(' ').cmp(*b),
         (Datum::Text(a), Datum::Bpchar(b)) => (*a).cmp(b.trim_end_matches(' ')),
-        (
-            Datum::Regtype {
-                referenced_oid: a, ..
-            },
-            Datum::Regtype {
-                referenced_oid: b, ..
-            },
-        ) => a.cmp(b),
-        (Datum::Regtype { referenced_oid, .. }, Datum::Oid(value)) => {
-            referenced_oid.cmp(&(*value as i32))
-        }
-        (Datum::Oid(value), Datum::Regtype { referenced_oid, .. }) => {
-            (*value as i32).cmp(referenced_oid)
-        }
-        (Datum::Regtype { referenced_oid, .. }, Datum::Int2(value)) => {
-            referenced_oid.cmp(&i32::from(*value))
-        }
-        (Datum::Int2(value), Datum::Regtype { referenced_oid, .. }) => {
-            i32::from(*value).cmp(referenced_oid)
-        }
-        (Datum::Regtype { referenced_oid, .. }, Datum::Int4(value)) => referenced_oid.cmp(value),
-        (Datum::Int4(value), Datum::Regtype { referenced_oid, .. }) => value.cmp(referenced_oid),
-        (Datum::Regtype { referenced_oid, .. }, Datum::Int8(value)) => {
-            i64::from(*referenced_oid).cmp(value)
-        }
-        (Datum::Int8(value), Datum::Regtype { referenced_oid, .. }) => {
-            value.cmp(&i64::from(*referenced_oid))
-        }
-        (
-            Datum::RegObject {
-                type_oid: at,
-                referenced_oid: a,
-                ..
-            },
-            Datum::RegObject {
-                type_oid: bt,
-                referenced_oid: b,
-                ..
-            },
-        ) if at == bt => a.cmp(b),
-        (Datum::RegObject { referenced_oid, .. }, Datum::Oid(value)) => {
-            referenced_oid.cmp(&(*value as i32))
-        }
-        (Datum::Oid(value), Datum::RegObject { referenced_oid, .. }) => {
-            (*value as i32).cmp(referenced_oid)
-        }
-        (Datum::RegObject { referenced_oid, .. }, Datum::Int2(value)) => {
-            referenced_oid.cmp(&i32::from(*value))
-        }
-        (Datum::Int2(value), Datum::RegObject { referenced_oid, .. }) => {
-            i32::from(*value).cmp(referenced_oid)
-        }
-        (Datum::RegObject { referenced_oid, .. }, Datum::Int4(value)) => referenced_oid.cmp(value),
-        (Datum::Int4(value), Datum::RegObject { referenced_oid, .. }) => value.cmp(referenced_oid),
-        (Datum::RegObject { referenced_oid, .. }, Datum::Int8(value)) => {
-            i64::from(*referenced_oid).cmp(value)
-        }
-        (Datum::Int8(value), Datum::RegObject { referenced_oid, .. }) => {
-            value.cmp(&i64::from(*referenced_oid))
-        }
         (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
         (Datum::Timestamp(a), Datum::Timestamp(b))
         | (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a.cmp(b),
@@ -3138,6 +3089,35 @@ mod hash_tests {
             assert!(compare_datums(&a, &b).unwrap().is_eq(), "{a:?} == {b:?}");
             assert_eq!(h(a), h(b));
         }
+    }
+
+    #[test]
+    fn catalog_oid_hashes_follow_cross_alias_and_integer_equality() {
+        crate::mem::guard::forbid_alloc(|| {
+            for value in [1_u32, i32::MAX as u32, 1_u32 << 31, u32::MAX] {
+                let oid = Datum::Oid(value);
+                let regtype = Datum::Regtype {
+                    referenced_oid: value as i32,
+                    name: "type",
+                };
+                for type_oid in [24, 2202, 2203, 2204, 2205, 4089, 4096, 3734, 3769, 4191] {
+                    let alias = Datum::RegObject {
+                        type_oid,
+                        referenced_oid: value as i32,
+                        name: "object",
+                    };
+                    for other in [
+                        oid,
+                        regtype,
+                        Datum::Int4(value as i32),
+                        Datum::Int8(i64::from(value)),
+                    ] {
+                        assert!(compare_datums(&alias, &other).unwrap().is_eq());
+                        assert_eq!(h(alias), h(other));
+                    }
+                }
+            }
+        });
     }
 
     #[test]

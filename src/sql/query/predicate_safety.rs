@@ -67,21 +67,23 @@ fn cast_properties(
     target: i32,
     binding: CastBinding,
     type_mod: i32,
-) -> ProcedureProperties {
+    context: crate::sql::eval::DefinedCastContext,
+) -> Result<ProcedureProperties, SqlError> {
     if source == target && type_mod < 0 && ColType::from_oid(target).is_some() {
-        return ProcedureProperties::BINARY;
+        return Ok(ProcedureProperties::BINARY);
     }
     let mut properties = if binding == CastBinding::Resolve
-        && let Some((_, cast)) = storage.cast_for_oids(source, target, txid)
-    {
-        match cast.method {
-            crate::storage::CastMethod::Function(function) => {
-                routine_properties(storage, txid, function)
-            }
-            crate::storage::CastMethod::Binary => ProcedureProperties::BINARY,
-            crate::storage::CastMethod::InOut => ProcedureProperties::from_builtin(
-                crate::sql::catalog::builtin_inout_cast_properties(source, target),
-            ),
+        && let Some(selected) = super::selected_cast(
+            storage,
+            txid,
+            source,
+            target,
+            context,
+            super::CastSelectionPhase::Analysis,
+        )? {
+        ProcedureProperties {
+            volatile: selected.volatility == RoutineVolatility::Volatile,
+            leakproof: selected.leakproof,
         }
     } else {
         ProcedureProperties::from_builtin(crate::sql::catalog::builtin_cast_properties(
@@ -95,7 +97,7 @@ fn cast_properties(
         properties.volatile |= modifier.volatile;
         properties.leakproof &= modifier.leakproof;
     }
-    properties
+    Ok(properties)
 }
 
 fn operator_properties(
@@ -122,8 +124,15 @@ fn operator_properties(
                 && let Some(expected) =
                     storage.routine_type_oid(expected.ctype, expected.user_type, txid)
             {
-                let conversion =
-                    cast_properties(storage, txid, actual, expected, CastBinding::Resolve, -1);
+                let conversion = cast_properties(
+                    storage,
+                    txid,
+                    actual,
+                    expected,
+                    CastBinding::Resolve,
+                    -1,
+                    crate::sql::eval::DefinedCastContext::Implicit,
+                )?;
                 result.volatile |= conversion.volatile;
                 result.leakproof &= conversion.leakproof;
             }
@@ -351,7 +360,8 @@ pub(super) fn expression_properties(
                             target,
                             CastBinding::Resolve,
                             -1,
-                        );
+                            crate::sql::eval::DefinedCastContext::Implicit,
+                        )?;
                         result.volatile |= conversion.volatile;
                         result.leaks_columns |=
                             !conversion.leakproof && contains_columns(argument)?;
@@ -540,7 +550,7 @@ pub(super) fn expression_properties(
                                 types[position],
                                 expected_oid,
                                 expected.ctype,
-                            );
+                            )?;
                             result.volatile |= conversion.volatile;
                             result.leaks_columns |=
                                 !conversion.leakproof && contains_columns(argument)?;
@@ -585,9 +595,46 @@ pub(super) fn expression_properties(
             } else {
                 type_of(operand)?
             };
-            Some(target.map_or(ProcedureProperties::UNKNOWN, |target| {
-                cast_properties(storage, txid, source, target, *binding, *type_mod)
-            }))
+            let mut properties = match target {
+                Some(target) => cast_properties(
+                    storage,
+                    txid,
+                    source,
+                    target,
+                    *binding,
+                    *type_mod,
+                    crate::sql::eval::DefinedCastContext::Explicit,
+                )?,
+                None => ProcedureProperties::UNKNOWN,
+            };
+            if *binding == CastBinding::Resolve
+                && let Some(ColType::Array(element)) = target.and_then(|target| {
+                    crate::sql::eval::constructor_type_from_oid(target, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                })
+            {
+                crate::sql::exec::visit_array_constructor_conversions(
+                    operand,
+                    element,
+                    columns,
+                    &mut |source, target| {
+                        let conversion = cast_properties(
+                            storage,
+                            txid,
+                            source,
+                            target,
+                            *binding,
+                            -1,
+                            crate::sql::eval::DefinedCastContext::Explicit,
+                        )?;
+                        properties.volatile |= conversion.volatile;
+                        properties.leakproof &= conversion.leakproof;
+                        Ok(())
+                    },
+                )?;
+            }
+            Some(properties)
         }
         Expr::Like {
             operand,
@@ -689,7 +736,7 @@ fn parameter_conversion_properties(
     source: i32,
     target: i32,
     ctype: ColType,
-) -> ProcedureProperties {
+) -> Result<ProcedureProperties, SqlError> {
     // Domain checks, including those in named arrays/composites, are executable
     // expressions. Equal outer OIDs do not establish a binary-only conversion.
     if matches!(
@@ -703,7 +750,15 @@ fn parameter_conversion_properties(
                     | crate::sql::types::ArrElem::Composite(_)
             )
     ) {
-        return ProcedureProperties::UNKNOWN;
+        return Ok(ProcedureProperties::UNKNOWN);
     }
-    cast_properties(storage, txid, source, target, CastBinding::Resolve, -1)
+    cast_properties(
+        storage,
+        txid,
+        source,
+        target,
+        CastBinding::Resolve,
+        -1,
+        crate::sql::eval::DefinedCastContext::Implicit,
+    )
 }

@@ -12,7 +12,7 @@ use crate::sql::MAX_PROJ;
 use crate::sql::ast::{Expr, SelectItem};
 use crate::sql::datetime;
 use crate::sql::eval::{ColumnLookup, SqlError, described_expression_collation, sqlstate};
-use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum, oid};
+use crate::sql::types::{ArrElem, ColDesc, ColType, CollationDerivation, Datum, oid};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
@@ -3970,6 +3970,19 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        match ColTypeResolver::resolve(self, qualifier, name) {
+            Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                self.whole_row_type(name).ok_or(error)
+            }
+            result => result,
+        }
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
     }
@@ -4057,6 +4070,19 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        match ColTypeResolver::resolve(self, qualifier, name) {
+            Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                self.whole_row_type(name).ok_or(error)
+            }
+            result => result,
+        }
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
     }
@@ -4133,6 +4159,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let catalog_object = |t: ColType| t == ColType::Regtype || t.is_reg_object();
     let oid_integer = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8);
     (numeric(a) && numeric(b))
+        || (catalog_object(a) && catalog_object(b))
         || (catalog_object(a) && oid_integer(b))
         || (oid_integer(a) && catalog_object(b))
         || (datetime(a) && datetime(b))
@@ -4203,10 +4230,39 @@ pub(crate) fn infer_type_catalog(
     )
 }
 
-/// Static type inference with operator/aggregate validation, matching
-/// PostgreSQL's plan-time analysis: comparisons and arithmetic over
-/// incompatible types raise 42883 here, before any row is scanned. String
-/// literals and parameters are UNKNOWN and coerce to the other operand.
+/// Visits contextual ARRAY conversions in evaluation order without computing
+/// any value. Runtime planning and expression admission share these types.
+pub(crate) fn visit_array_constructor_conversions(
+    expression: &Expr<'_>,
+    target: ArrElem,
+    columns: &dyn ColTypeResolver,
+    visit: &mut dyn FnMut(i32, i32) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let Expr::Array(items) = expression else {
+        return Ok(());
+    };
+    let plan = crate::sql::eval::array_constructor_type(
+        items,
+        Some(target),
+        &|item| infer_routine_argument_oid(item, columns),
+        &|oid| columns.domain_base_type(oid),
+    )?;
+    let target_oid = if plan.multidimensional {
+        target.array_oid()
+    } else {
+        target.element_oid()
+    };
+    for item in *items {
+        if matches!(item, Expr::Array(_)) {
+            visit_array_constructor_conversions(item, target, columns, visit)?;
+        } else {
+            visit(infer_routine_argument_oid(item, columns)?, target_oid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Retain a call argument's declared identity through static type validation.
 pub(crate) fn infer_routine_argument_oid(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -4989,17 +5045,31 @@ pub fn infer_type_res(
                     &|item| infer_routine_argument_oid(item, columns),
                     &|oid| columns.domain_base_type(oid),
                 )?;
+                visit_array_constructor_conversions(
+                    operand,
+                    element,
+                    columns,
+                    &mut |source, target_oid| {
+                        if let Some(target) =
+                            crate::sql::eval::constructor_type_from_oid(target_oid, &|oid| {
+                                columns.domain_base_type(oid)
+                            })
+                        {
+                            columns.validate_explicit_cast(source, target_oid, target)?;
+                        }
+                        Ok(())
+                    },
+                )?;
             } else {
                 infer_type_res(operand, columns)?;
             }
             if let (Some(target), Some(target_oid)) = (target, target_oid) {
-                let source_oid = if matches!(*operand, Expr::Array(items) if items.is_empty())
-                    && matches!(target, ColType::Array(_))
-                {
-                    target_oid
-                } else {
-                    infer_routine_argument_oid(operand, columns)?
-                };
+                let source_oid =
+                    if matches!(*operand, Expr::Array(_)) && matches!(target, ColType::Array(_)) {
+                        target_oid
+                    } else {
+                        infer_routine_argument_oid(operand, columns)?
+                    };
                 columns.validate_explicit_cast(source_oid, target_oid, target)?;
             }
             if let Some(type_oid) = target_oid {

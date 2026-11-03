@@ -3126,16 +3126,35 @@ impl Conn {
             // format state for execution.
             self.arena.reset();
             let text = self.prepared[stmt_slot].query();
+            let param_oids = match engine.infer_param_types(
+                text,
+                &self.arena,
+                &self.txn,
+                n_params,
+                self.prepared[stmt_slot].parameter_oid_bytes(),
+            ) {
+                Ok(oids) => oids,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
             let mark = self.send.mark();
             let described = {
                 let mut responder = Responder::for_describe(&mut self.send, result_formats);
-                engine.describe(
-                    text,
-                    &self.arena,
-                    &self.txn,
-                    Some(&self.cursors),
-                    &mut responder,
-                )
+                crate::sql::exec::with_bound_parameter_types(param_oids, || {
+                    engine.describe(
+                        text,
+                        &self.arena,
+                        &self.txn,
+                        Some(&self.cursors),
+                        &mut responder,
+                    )
+                })
             };
             match described {
                 Ok(true) => {}
@@ -7216,6 +7235,96 @@ mod tests {
             drop(writer);
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn binary_bind_shape_uses_declared_polymorphic_parameter_types() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let response = conn.send.readable().to_vec();
+            assert!(
+                !has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            response
+        }
+        let mut config = Config::default_dev();
+        config.data_dir = std::env::temp_dir()
+            .join(format!(
+                "pos3ql-polymorphic-binary-bind-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        config.max_tables = 8;
+        config.row_overlay_slots = 128;
+        config.remove_test_data_dir_on_drop();
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.phase = Phase::Ready;
+        message(&mut conn, &mut engine, wire::FMSG_QUERY,
+            b"CREATE FUNCTION bind_first_state(anyelement,anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT coalesce($1,$2)'; CREATE AGGREGATE bind_first(anyelement)(SFUNC=bind_first_state,STYPE=anyelement)\0");
+        for (name, oid, input) in [
+            (
+                "integer",
+                crate::sql::types::oid::INT4,
+                9i32.to_be_bytes().to_vec(),
+            ),
+            ("text", crate::sql::types::oid::TEXT, b"typed".to_vec()),
+        ] {
+            let mut parse = Vec::new();
+            parse.extend_from_slice(name.as_bytes());
+            parse.push(0);
+            parse.extend_from_slice(b"SELECT bind_first($1)\0");
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&oid.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &parse);
+            assert!(has_backend_message(&response, wire::MSG_PARSE_COMPLETE));
+            let mut bind = Vec::new();
+            bind.extend_from_slice(name.as_bytes());
+            bind.push(0);
+            bind.extend_from_slice(name.as_bytes());
+            bind.push(0);
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&(input.len() as i32).to_be_bytes());
+            bind.extend_from_slice(&input);
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_BIND, &bind);
+            assert!(has_backend_message(&response, wire::MSG_BIND_COMPLETE));
+            let mut describe = vec![b'P'];
+            describe.extend_from_slice(name.as_bytes());
+            describe.push(0);
+            let response = message(&mut conn, &mut engine, wire::FMSG_DESCRIBE, &describe);
+            assert_eq!(response[0], wire::MSG_ROW_DESCRIPTION);
+            let start = 7 + response[7..].iter().position(|byte| *byte == 0).unwrap() + 1;
+            assert_eq!(
+                i32::from_be_bytes(response[start + 6..start + 10].try_into().unwrap()),
+                oid
+            );
+            assert_eq!(&response[start + 16..start + 18], &1i16.to_be_bytes());
+            let mut execute = Vec::new();
+            execute.extend_from_slice(name.as_bytes());
+            execute.push(0);
+            execute.extend_from_slice(&0i32.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &execute);
+            let mut expected = vec![wire::MSG_DATA_ROW];
+            expected.extend_from_slice(&((input.len() + 10) as i32).to_be_bytes());
+            expected.extend_from_slice(&1i16.to_be_bytes());
+            expected.extend_from_slice(&(input.len() as i32).to_be_bytes());
+            expected.extend_from_slice(&input);
+            assert!(response.starts_with(&expected));
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
         }
     }
 

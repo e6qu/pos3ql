@@ -4879,6 +4879,16 @@ pub struct RecordField<'a> {
 }
 
 impl<'a> Datum<'a> {
+    pub(crate) fn catalog_oid(&self) -> Option<u32> {
+        match self {
+            Self::Oid(value) => Some(*value),
+            Self::Regtype { referenced_oid, .. } | Self::RegObject { referenced_oid, .. } => {
+                Some(*referenced_oid as u32)
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Datum::Null)
     }

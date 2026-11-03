@@ -4137,6 +4137,82 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
     }
 }
 
+/// Resolve a user-defined conversion, including PostgreSQL's element-wise
+/// array coercion. Domains use their base conversion and retain their checks
+/// at the destination boundary; casts declared on a domain are ignored.
+pub(crate) fn defined_cast_path(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+) -> Option<(usize, crate::storage::CastDef)> {
+    let source_base = storage
+        .domain_base_type_for_oid(source, txid)
+        .map(ColType::oid);
+    let target_base = storage
+        .domain_base_type_for_oid(target, txid)
+        .map(ColType::oid);
+    if source_base.is_some() || target_base.is_some() {
+        return defined_cast_path(
+            storage,
+            txid,
+            source_base.unwrap_or(source),
+            target_base.unwrap_or(target),
+        );
+    }
+    if source == target {
+        return None;
+    }
+    if let Some(cast) = storage.cast_for_oids(source, target, txid) {
+        return Some(cast);
+    }
+    let ColType::Array(source) = storage.routine_result_for_oid(source, txid)?.ctype else {
+        return None;
+    };
+    let ColType::Array(target) = storage.routine_result_for_oid(target, txid)?.ctype else {
+        return None;
+    };
+    defined_cast_path(storage, txid, source.element_oid(), target.element_oid())
+}
+
+pub(crate) fn require_cast_context(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+    declared: crate::storage::CastContext,
+    requested: super::eval::DefinedCastContext,
+) -> Result<(), SqlError> {
+    let permitted = match requested {
+        super::eval::DefinedCastContext::Explicit => true,
+        super::eval::DefinedCastContext::Assignment => declared.permits_assignment(),
+        super::eval::DefinedCastContext::Implicit => declared.permits_implicit(),
+    };
+    if permitted {
+        return Ok(());
+    }
+    let type_name = |oid| {
+        user_type_name_fixed(storage, txid, oid)?
+            .or_else(|| super::exec::builtin_type_name_fixed(oid))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "cast type identity is unavailable"
+                )
+            })
+    };
+    Err(sql_err!(
+        if matches!(requested, super::eval::DefinedCastContext::Assignment) {
+            sqlstate::DATATYPE_MISMATCH
+        } else {
+            sqlstate::CANNOT_COERCE
+        },
+        "cannot cast type {} to {}",
+        type_name(source)?.as_str(),
+        type_name(target)?.as_str()
+    ))
+}
+
 pub(crate) fn validate_explicit_cast(
     storage: &Storage,
     txid: u32,
@@ -4144,7 +4220,7 @@ pub(crate) fn validate_explicit_cast(
     target_oid: i32,
     target: ColType,
 ) -> Result<(), SqlError> {
-    if storage.cast_for_oids(source, target_oid, txid).is_some() {
+    if defined_cast_path(storage, txid, source, target_oid).is_some() {
         return Ok(());
     }
     if let Some(contract) = storage.routine_result_for_oid(source, txid) {

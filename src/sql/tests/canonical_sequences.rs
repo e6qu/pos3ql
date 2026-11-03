@@ -500,10 +500,43 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
     }
     assert!(session.transaction.commit_admission().is_none());
     assert!(!engine.block_reads_pending());
-    assert_eq!(
-        data_rows(&session.success(&mut engine, "SELECT id FROM cold_commit_rows", true)),
-        ["2"]
-    );
+    let query = "SELECT id FROM cold_commit_rows";
+    let mut status = session.execute_status(&mut engine, query, true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait,
+    } = status
+    {
+        assert_eq!(wait, StatementWait::ObjectIo);
+        assert!(Instant::now() < deadline, "cold SELECT did not finish");
+        session.send.truncate_to(output_mark);
+        engine.bind_query_connection(session.connection_id);
+        status = crate::mem::guard::forbid_alloc(|| {
+            for slot in 0..engine.block_read_slots() {
+                engine.advance_pending_block_read(slot).unwrap();
+            }
+            engine
+                .execute_simple_from(
+                    query,
+                    completed_statements,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &mut session.guc,
+                    &mut Responder::new(&mut session.send),
+                    session.connection_id,
+                    false,
+                )
+                .unwrap()
+        });
+        std::thread::yield_now();
+    }
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert_eq!(data_rows(session.send.readable()), ["2"]);
     let mut truncates = 0;
     let mut updates = 0;
     let mut sequence_advances = 0;

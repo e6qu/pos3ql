@@ -29,6 +29,11 @@ pub(crate) enum InputSite<'a> {
         written: Option<usize>,
     },
     Definition(i32),
+    CastDefinition {
+        source: i32,
+        target: i32,
+        context: super::super::eval::DefinedCastContext,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +137,15 @@ impl InputSite<'_> {
             Self::Query(kind) => InputSite::Query(kind),
             Self::Expression(kind) => InputSite::Expression(kind),
             Self::Definition(oid) => InputSite::Definition(oid),
+            Self::CastDefinition {
+                source,
+                target,
+                context,
+            } => InputSite::CastDefinition {
+                source,
+                target,
+                context,
+            },
             Self::Classification {
                 routine,
                 parameter,
@@ -314,6 +328,7 @@ enum InputState<'a> {
         next_call: usize,
     },
     Definition(&'a InputDefinition<'a>),
+    CastDefinition(Option<&'a super::super::eval::BoundCast>),
 }
 
 #[derive(Clone, Copy)]
@@ -344,11 +359,35 @@ struct SavedInputs<'a> {
     frames: &'a [&'a InputFrame<'a>],
 }
 
+#[derive(Clone, Copy)]
+struct CastSelection<'a> {
+    source: i32,
+    target: i32,
+    context: super::super::eval::DefinedCastContext,
+    cast: Option<&'a super::super::eval::BoundCast>,
+}
+
+impl CastSelection<'_> {
+    fn key(self) -> (i32, i32, u8) {
+        use super::super::eval::DefinedCastContext;
+        (
+            self.source,
+            self.target,
+            match self.context {
+                DefinedCastContext::Implicit => 0,
+                DefinedCastContext::Assignment => 1,
+                DefinedCastContext::Explicit => 2,
+            },
+        )
+    }
+}
+
 pub(super) struct RoutineInputs<'a> {
     arena: &'a Arena,
     next: Cell<usize>,
     saved: RefCell<ArenaList<'a, SavedInputs<'a>>>,
     evaluations: RefCell<ArenaList<'a, (i32, super::super::eval::ExpressionEvaluation)>>,
+    cast_selections: RefCell<ArenaList<'a, CastSelection<'a>>>,
 }
 
 impl<'a> RoutineInputs<'a> {
@@ -358,6 +397,7 @@ impl<'a> RoutineInputs<'a> {
             next: Cell::new(0),
             saved: RefCell::new(ArenaList::new_persistent(arena)),
             evaluations: RefCell::new(ArenaList::new_persistent(arena)),
+            cast_selections: RefCell::new(ArenaList::new_persistent(arena)),
         }
     }
     pub(super) fn begin_attempt(&self) {
@@ -409,6 +449,15 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 InputSite::Query(kind) => InputSite::Query(kind),
                 InputSite::Expression(kind) => InputSite::Expression(kind),
                 InputSite::Definition(oid) => InputSite::Definition(oid),
+                InputSite::CastDefinition {
+                    source,
+                    target,
+                    context,
+                } => InputSite::CastDefinition {
+                    source,
+                    target,
+                    context,
+                },
                 InputSite::Classification {
                     routine,
                     parameter,
@@ -472,7 +521,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 };
             }
             InputState::Pending => {}
-            InputState::Definition(_) => return Err(changed()),
+            InputState::Definition(_) | InputState::CastDefinition(_) => return Err(changed()),
         }
         // A nested expression may append frames; never hold a borrow across it.
         let result = evaluate()?;
@@ -514,10 +563,41 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 definition
             }
             InputState::Definition(definition) => definition,
-            InputState::Value { .. } => return Err(changed()),
+            InputState::Value { .. } | InputState::CastDefinition(_) => return Err(changed()),
         };
         definition.restore(routine)?;
         Ok(*definition)
+    }
+
+    fn cast_definition(
+        &self,
+        source: i32,
+        target: i32,
+        context: super::super::eval::DefinedCastContext,
+        select: impl FnOnce() -> Result<Option<super::super::eval::BoundCast>, SqlError>,
+    ) -> Result<Option<super::super::eval::BoundCast>, SqlError> {
+        let (ordinal, mut frame) = self.frame(InputSite::CastDefinition {
+            source,
+            target,
+            context,
+        })?;
+        match frame.state {
+            InputState::Pending => {
+                let selected = select()?;
+                let definition = match selected {
+                    Some(definition) => Some(&*self.arena.alloc(definition).map_err(|_| full())?),
+                    None => None,
+                };
+                frame.state = InputState::CastDefinition(definition);
+                self.frames
+                    .borrow_mut()
+                    .as_mut_slice()
+                    .map_err(|_| full())?[ordinal] = AttemptFrame::Temporary(frame);
+                Ok(selected)
+            }
+            InputState::CastDefinition(selected) => Ok(selected.copied()),
+            InputState::Value { .. } | InputState::Definition(_) => Err(changed()),
+        }
     }
 
     fn retain(&self, ordinal: usize) -> Result<(), SqlError> {
@@ -555,6 +635,16 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                                     .alloc_persistent_slice_with(1, |_| definition)
                                     .map_err(|_| full())?[0],
                             )
+                        }
+                        InputState::CastDefinition(definition) => {
+                            InputState::CastDefinition(match definition {
+                                Some(definition) => Some(
+                                    &arena
+                                        .alloc_persistent_slice_with(1, |_| *definition)
+                                        .map_err(|_| full())?[0],
+                                ),
+                                None => None,
+                            })
                         }
                     };
                     let site = frame.site.retain(arena)?;
@@ -817,6 +907,81 @@ pub(super) fn definition<'a>(
     attempt.definition(routine, slot, storage, txid).map(Some)
 }
 
+/// Planning keeps one selected path per type/context without advancing an
+/// executing expression's input cursor. New function bodies get fresh choices.
+pub(super) fn cast_selection(
+    source: i32,
+    target: i32,
+    context: super::super::eval::DefinedCastContext,
+    select: impl FnOnce() -> Result<Option<super::super::eval::BoundCast>, SqlError>,
+) -> Result<Option<super::super::eval::BoundCast>, SqlError> {
+    if IN_BODY.with(Cell::get) {
+        return select();
+    }
+    let Some((invocations, arena)) = active_routine_invocations() else {
+        return select();
+    };
+    let key = CastSelection {
+        source,
+        target,
+        context,
+        cast: None,
+    }
+    .key();
+    {
+        let entries = invocations.inputs.cast_selections.borrow();
+        if let Ok(index) = entries
+            .borrowed_slice()
+            .binary_search_by_key(&key, |entry| entry.key())
+        {
+            return Ok(entries.borrowed_slice()[index].cast.copied());
+        }
+    }
+    let selected = select()?;
+    let cast = selected
+        .map(|cast| {
+            arena
+                .alloc_persistent_slice_with(1, |_| cast)
+                .map(|cast| &cast[0])
+                .map_err(|_| full())
+        })
+        .transpose()?;
+    let mut entries = invocations.inputs.cast_selections.borrow_mut();
+    let index = match entries
+        .borrowed_slice()
+        .binary_search_by_key(&key, |entry| entry.key())
+    {
+        Ok(index) => return Ok(entries.borrowed_slice()[index].cast.copied()),
+        Err(index) => index,
+    };
+    entries
+        .push(CastSelection {
+            source,
+            target,
+            context,
+            cast,
+        })
+        .map_err(|_| full())?;
+    entries.as_mut_slice().map_err(|_| full())?[index..].rotate_right(1);
+    Ok(selected)
+}
+
+pub(super) fn cast_definition(
+    source: i32,
+    target: i32,
+    context: super::super::eval::DefinedCastContext,
+    select: impl FnOnce() -> Result<Option<super::super::eval::BoundCast>, SqlError>,
+) -> Result<Option<super::super::eval::BoundCast>, SqlError> {
+    let select = || cast_selection(source, target, context, select);
+    let Some(active) = ACTIVE_INPUT.with(Cell::get) else {
+        return select();
+    };
+    // Execution has its own ordinal frames; the type/context selection is
+    // shared with planning and cannot change after a source effect.
+    let attempt = unsafe { &*(active as *const InputAttempt<'_, '_>) };
+    attempt.cast_definition(source, target, context, select)
+}
+
 fn full() -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -834,6 +999,133 @@ fn changed() -> SqlError {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    fn captured_cast(function: i32) -> crate::sql::eval::BoundCast {
+        crate::sql::eval::BoundCast {
+            source_oid: 23,
+            target_oid: 25,
+            leaf_source_oid: 23,
+            leaf_target_oid: 25,
+            context: crate::sql::eval::DefinedCastContext::Explicit,
+            strict: false,
+            volatility: crate::storage::RoutineVolatility::Volatile,
+            leakproof: false,
+            definition: crate::storage::CastDef {
+                created_at: 1,
+                source: crate::storage::RoutineResult::builtin(crate::sql::types::ColType::Int4),
+                target: crate::storage::RoutineResult::builtin(crate::sql::types::ColType::Text),
+                method: crate::storage::CastMethod::Function(function),
+                ddl_state: crate::storage::CatalogDdlState::Present,
+                ..crate::storage::CastDef::EMPTY
+            },
+        }
+    }
+
+    #[test]
+    fn retained_input_ownership_keeps_cast_selections_and_builtin_absence_after_work_reset() {
+        use crate::sql::eval::DefinedCastContext::Explicit;
+        let mut budget = Budget::new(32768);
+        let statement = Arena::new(&mut budget, "cast input statement", 16384).unwrap();
+        let mut work = Arena::new(&mut budget, "cast input work", 8192).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        let selections = Cell::new(0);
+        for attempt in 0..2 {
+            work.reset();
+            invocations.begin_attempt();
+            crate::mem::guard::forbid_alloc(|| {
+                let result = call(&work, || {
+                    let _input = enter();
+                    let selected = cast_definition(23, 25, Explicit, || {
+                        selections.set(selections.get() + 1);
+                        Ok(Some(captured_cast(if attempt == 0 { 111 } else { 222 })))
+                    })?
+                    .unwrap();
+                    assert_eq!(
+                        selected.definition.method,
+                        crate::storage::CastMethod::Function(111)
+                    );
+                    assert_eq!(selected.definition.created_at, 1);
+                    let absent = cast_definition(25, 23, Explicit, || {
+                        selections.set(selections.get() + 1);
+                        Ok(if attempt == 0 {
+                            None
+                        } else {
+                            Some(captured_cast(333))
+                        })
+                    })?;
+                    assert!(absent.is_none());
+                    if attempt == 0 {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "test cast suspension"
+                        ))
+                    } else {
+                        Ok(Datum::Int4(7))
+                    }
+                });
+                if attempt == 0 {
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), Datum::Int4(7));
+                }
+                assert_eq!(selections.get(), 2);
+            });
+        }
+        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn retained_input_ownership_rejects_changed_cast_definition_keys() {
+        use crate::sql::eval::DefinedCastContext::{Assignment, Explicit};
+        for changed_key in [(24, 25, Explicit), (23, 26, Explicit), (23, 25, Assignment)] {
+            let mut budget = Budget::new(32768);
+            let statement = Arena::new(&mut budget, "cast key statement", 16384).unwrap();
+            let mut work = Arena::new(&mut budget, "cast key work", 8192).unwrap();
+            let invocations = RoutineInvocationState::new(&statement);
+            let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+                &invocations,
+                &statement,
+            )));
+            for attempt in 0..2 {
+                work.reset();
+                invocations.begin_attempt();
+                crate::mem::guard::forbid_alloc(|| {
+                    let key = if attempt == 0 {
+                        (23, 25, Explicit)
+                    } else {
+                        changed_key
+                    };
+                    let result: Result<(), SqlError> = call(&work, || {
+                        let _input = enter();
+                        cast_definition(key.0, key.1, key.2, || {
+                            assert_eq!(attempt, 0, "changed keys must fail before selecting");
+                            Ok(Some(captured_cast(111)))
+                        })?;
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "test cast suspension"
+                        ))
+                    });
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        if attempt == 0 {
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        } else {
+                            sqlstate::SERIALIZATION_FAILURE
+                        }
+                    );
+                });
+            }
+        }
+    }
 
     #[test]
     fn retained_input_ownership_keeps_nested_values_and_ordinals_after_work_reset() {
@@ -1071,15 +1363,66 @@ mod tests {
         )));
         crate::mem::guard::forbid_alloc(|| {
             assert!(evaluation(42, Runtime).unwrap() == Runtime);
+            let context = crate::sql::eval::DefinedCastContext::Explicit;
+            assert_eq!(
+                cast_selection(23, 25, context, || Ok(Some(captured_cast(42))))
+                    .unwrap()
+                    .unwrap()
+                    .definition
+                    .method,
+                crate::storage::CastMethod::Function(42)
+            );
+            assert!(
+                cast_selection(25, 23, context, || Ok(None))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(invocations.inputs.next.get(), 0);
             let before = statement.used();
             invocations.begin_attempt();
             assert!(evaluation(42, Immutable).unwrap() == Runtime);
+            assert_eq!(
+                cast_selection(23, 25, context, || panic!(
+                    "outer planning must keep its cast"
+                ))
+                .unwrap()
+                .unwrap()
+                .definition
+                .method,
+                crate::storage::CastMethod::Function(42)
+            );
+            assert!(
+                cast_selection(25, 23, context, || panic!(
+                    "outer planning must keep builtin absence"
+                ))
+                .unwrap()
+                .is_none()
+            );
             {
                 let _body = enter_body();
                 assert!(evaluation(42, Immutable).unwrap() == Immutable);
+                assert_eq!(
+                    cast_selection(23, 25, context, || Ok(Some(captured_cast(99))))
+                        .unwrap()
+                        .unwrap()
+                        .definition
+                        .method,
+                    crate::storage::CastMethod::Function(99)
+                );
             }
+            assert_eq!(
+                cast_selection(23, 25, context, || panic!(
+                    "body must not replace outer planning"
+                ))
+                .unwrap()
+                .unwrap()
+                .definition
+                .method,
+                crate::storage::CastMethod::Function(42)
+            );
             assert!(evaluation(42, Immutable).unwrap() == Runtime);
             assert_eq!(statement.used(), before);
+            assert_eq!(invocations.inputs.next.get(), 0);
         });
     }
 
@@ -1096,6 +1439,12 @@ mod tests {
         let error = crate::mem::guard::forbid_alloc(|| {
             call(&work, || {
                 let _scope = enter();
+                cast_definition(
+                    23,
+                    25,
+                    crate::sql::eval::DefinedCastContext::Explicit,
+                    || Ok(None),
+                )?;
                 value(InputSite::Query(InputQuery::Scalar), &work, || {
                     Err(sql_err!(
                         sqlstate::INTERNAL_ROUTINE_INVOCATION,

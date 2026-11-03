@@ -10895,18 +10895,7 @@ impl Engine {
         let output_mark = responder.buffer.mark();
         let result = self.execute_simple_from(
             text, 0, arena, txn, sqlprep, cursors, guc, responder, conn_id, false,
-        );
-        let retains_reads = matches!(
-            &result,
-            Ok(ExecutionStatus::Blocked {
-                wait: StatementWait::ObjectIo,
-                ..
-            })
-        ) && txn.staged_commit().is_none();
-        if !retains_reads {
-            self.cancel_read_owner(read_owner);
-        }
-        let result = result?;
+        )?;
         if let Err(error) = self.commit_wal() {
             responder.buffer.truncate_to(output_mark);
             responder.error(error.sqlstate, error.message.as_str())?;
@@ -10930,7 +10919,7 @@ impl Engine {
     ) -> Result<ExecutionStatus, WireFull> {
         let workspace = self.work.for_connection(conn_id);
         self.select_query_workspace(workspace);
-        self.execute_simple_from_selected(
+        let result = self.execute_simple_from_selected(
             text,
             resume_statement,
             arena,
@@ -10941,7 +10930,20 @@ impl Engine {
             responder,
             conn_id,
             lock_timeout_expired,
-        )
+        );
+        let retains_reads = matches!(
+            &result,
+            Ok(ExecutionStatus::Blocked {
+                wait: StatementWait::ObjectIo,
+                ..
+            })
+        ) && txn.staged_commit().is_none();
+        if !retains_reads {
+            self.cancel_read_owner(
+                ExecutionIdentity::new(conn_id, execution_database_oid()).read_owner(),
+            );
+        }
+        result
     }
 
     pub(crate) fn check_commit_admission_wait(

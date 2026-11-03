@@ -96,7 +96,10 @@ pub(crate) fn stored_query_dependencies(
 }
 
 pub(crate) use dependencies::collect_routine_parameter_defaults;
-pub(crate) use dependencies::validate_dml_assignment_casts;
+pub(crate) use dependencies::{
+    for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
+    visit_projection_types,
+};
 
 pub(crate) fn stored_routine_dependencies(
     program: &RoutineFunctionProgram<'_>,
@@ -1587,8 +1590,97 @@ fn execute_routine_query_under<'a>(
     }
 }
 
-/// Bridges `EvalHooks`' abstract `CatalogAccess` to the concrete `Storage`, so
-/// `pg_get_indexdef` can reconstruct an index's definition during evaluation.
+enum CastSelectionPhase {
+    Analysis,
+    Execution,
+}
+
+fn selected_cast(
+    storage: &Storage,
+    txid: u32,
+    source_oid: i32,
+    target_oid: i32,
+    context: super::eval::DefinedCastContext,
+    phase: CastSelectionPhase,
+) -> Result<Option<super::eval::BoundCast>, SqlError> {
+    let select = || {
+        let Some((_, definition)) =
+            super::catalog::defined_cast_path(storage, txid, source_oid, target_oid)
+        else {
+            return Ok(None);
+        };
+        super::catalog::require_cast_context(
+            storage,
+            txid,
+            source_oid,
+            target_oid,
+            definition.context,
+            context,
+        )?;
+        let identity = |result: crate::storage::RoutineResult| {
+            storage
+                .routine_type_oid(result.ctype, result.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "selected cast type identity is unavailable"
+                    )
+                })
+        };
+        let leaf_source_oid = identity(definition.source)?;
+        let leaf_target_oid = identity(definition.target)?;
+        let (strict, volatility, leakproof) = match definition.method {
+            crate::storage::CastMethod::Binary => {
+                (true, crate::storage::RoutineVolatility::Immutable, true)
+            }
+            crate::storage::CastMethod::InOut => {
+                let properties =
+                    super::catalog::builtin_inout_cast_properties(leaf_source_oid, leaf_target_oid);
+                (
+                    true,
+                    if properties.is_some_and(|(volatile, _)| !volatile) {
+                        crate::storage::RoutineVolatility::Stable
+                    } else {
+                        crate::storage::RoutineVolatility::Volatile
+                    },
+                    properties.is_some_and(|(_, leakproof)| leakproof),
+                )
+            }
+            crate::storage::CastMethod::Function(oid) => {
+                let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
+                })?;
+                let attributes = storage.routine_for(slot, txid).attributes;
+                (
+                    attributes.strict,
+                    attributes.volatility,
+                    attributes.leakproof,
+                )
+            }
+        };
+        Ok(Some(super::eval::BoundCast {
+            source_oid,
+            target_oid,
+            leaf_source_oid,
+            leaf_target_oid,
+            definition,
+            context,
+            strict,
+            volatility,
+            leakproof,
+        }))
+    };
+    match phase {
+        CastSelectionPhase::Analysis => {
+            input_progress::cast_selection(source_oid, target_oid, context, select)
+        }
+        CastSelectionPhase::Execution => {
+            input_progress::cast_definition(source_oid, target_oid, context, select)
+        }
+    }
+}
+
+/// Bridges expression evaluation to the catalog without retaining its locks.
 pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> {
     storage: &'storage Storage,
     routine_workspace: &'workspace Arena,
@@ -2145,35 +2237,104 @@ impl StorageCatalog<'_, '_, '_, '_> {
         context: super::eval::DefinedCastContext,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        let Some((_, cast)) = self
+        let Some(cast) = self.bind_defined_cast(source_oid, target_oid, context)? else {
+            return Ok(None);
+        };
+        self.execute_bound_cast(&cast, value, arena).map(Some)
+    }
+
+    fn execute_cast_path<'a>(
+        &self,
+        selected: &super::eval::BoundCast,
+        source_oid: i32,
+        target_oid: i32,
+        value: Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        let source_base = self
             .storage
-            .cast_for_oids(source_oid, target_oid, self.txid)
-        else {
-            return Ok(None);
-        };
-        if [cast.source, cast.target].into_iter().any(|result| {
-            result.user_type.is_some_and(|identity| {
-                self.storage
-                    .domain_identity_slot(
-                        identity.schema.as_str(),
-                        identity.name.as_str(),
-                        self.txid,
-                    )
-                    .is_some()
-            })
-        }) {
-            return Ok(None);
+            .domain_base_type_for_oid(source_oid, self.txid)
+            .map(ColType::oid);
+        let target_base = self
+            .storage
+            .domain_base_type_for_oid(target_oid, self.txid)
+            .map(ColType::oid);
+        if source_base.is_some() || target_base.is_some() {
+            let value = self.execute_cast_path(
+                selected,
+                source_base.unwrap_or(source_oid),
+                target_base.unwrap_or(target_oid),
+                value,
+                arena,
+            )?;
+            return if target_base.is_some() {
+                let target = self
+                    .storage
+                    .routine_result_for_oid(target_oid, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "cast target type is unavailable"
+                        )
+                    })?;
+                self.coerce_result(value, target, arena)
+            } else {
+                Ok(value)
+            };
         }
-        let permitted = match context {
-            super::eval::DefinedCastContext::Explicit => true,
-            super::eval::DefinedCastContext::Assignment => cast.context.permits_assignment(),
-            super::eval::DefinedCastContext::Implicit => cast.context.permits_implicit(),
-        };
-        if !permitted {
-            return Ok(None);
+        if source_oid != selected.leaf_source_oid || target_oid != selected.leaf_target_oid {
+            let source = self.storage.routine_result_for_oid(source_oid, self.txid);
+            let target = self.storage.routine_result_for_oid(target_oid, self.txid);
+            if let (
+                Some(crate::storage::RoutineResult {
+                    ctype: ColType::Array(source),
+                    ..
+                }),
+                Some(crate::storage::RoutineResult {
+                    ctype: ColType::Array(target),
+                    ..
+                }),
+            ) = (source, target)
+            {
+                let (raw, stored_element) = match value {
+                    Datum::Null => return Ok(Datum::Null),
+                    Datum::Array { element, raw } => (raw, element),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "selected array cast source is not an array"
+                        ));
+                    }
+                };
+                let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+                let items = crate::sql::array::alloc_items(arena, shape.element_count())?;
+                for (out, input) in items
+                    .iter_mut()
+                    .zip(crate::sql::array::elements(raw, stored_element))
+                {
+                    *out = self.execute_cast_path(
+                        selected,
+                        source.element_oid(),
+                        target.element_oid(),
+                        input,
+                        arena,
+                    )?;
+                }
+                return Ok(Datum::Array {
+                    element: target,
+                    raw: crate::sql::array::build_shaped(items, shape, arena)?,
+                });
+            }
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected cast path no longer matches its declared types"
+            ));
         }
+        let cast = selected.definition;
+        let context = selected.context;
         let result = match cast.method {
             crate::storage::CastMethod::Binary => value,
+            crate::storage::CastMethod::InOut if value.is_null() => Datum::Null,
             crate::storage::CastMethod::InOut => {
                 let text = super::eval::datum_to_text(value, arena)?;
                 self.coerce_result(Datum::Text(text), cast.target, arena)?
@@ -2186,7 +2347,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
                     })?;
                 self.storage.require_routine_execute(slot, self.txid)?;
-                let routine = self.storage.routine_for(slot, self.txid);
+                let mut routine = self.storage.routine_for(slot, self.txid);
+                routine.attributes.strict = selected.strict;
                 let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 arguments[0] = value;
                 if routine.argument_count >= 2 {
@@ -2200,7 +2362,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     .unwrap_or(Datum::Null)
             }
         };
-        self.coerce_result(result, cast.target, arena).map(Some)
+        self.coerce_result(result, cast.target, arena)
     }
 
     fn execute_catalog_operator<'a>(
@@ -3838,38 +4000,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         source_oid: i32,
         target_oid: i32,
     ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
-        let Some((_, cast)) = self
-            .storage
-            .cast_for_oids(source_oid, target_oid, self.txid)
+        let Some(selected) = selected_cast(
+            self.storage,
+            self.txid,
+            source_oid,
+            target_oid,
+            super::eval::DefinedCastContext::Explicit,
+            CastSelectionPhase::Analysis,
+        )?
         else {
             return Ok(None);
         };
-        let immutable = match cast.method {
-            crate::storage::CastMethod::Binary => true,
-            crate::storage::CastMethod::InOut => false,
-            crate::storage::CastMethod::Function(oid) => {
-                let slot = self
-                    .storage
-                    .routine_slot_by_oid(oid, self.txid)
-                    .ok_or_else(|| {
-                        sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
-                    })?;
-                let immutable = self
-                    .storage
-                    .routine_for(slot, self.txid)
-                    .attributes
-                    .volatility
-                    == crate::storage::RoutineVolatility::Immutable;
-                input_progress::evaluation(
-                    oid,
-                    if immutable {
-                        super::eval::ExpressionEvaluation::Immutable
-                    } else {
-                        super::eval::ExpressionEvaluation::Runtime
-                    },
-                )? == super::eval::ExpressionEvaluation::Immutable
-            }
-        };
+        let immutable = selected.volatility == crate::storage::RoutineVolatility::Immutable;
         Ok(Some(if immutable {
             super::eval::ExpressionEvaluation::Immutable
         } else {
@@ -3930,6 +4072,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             }
             crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => Ok(None),
         }
+    }
+
+    fn bind_defined_cast(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        context: super::eval::DefinedCastContext,
+    ) -> Result<Option<super::eval::BoundCast>, SqlError> {
+        selected_cast(
+            self.storage,
+            self.txid,
+            source_oid,
+            target_oid,
+            context,
+            CastSelectionPhase::Execution,
+        )
+    }
+
+    fn execute_bound_cast<'a>(
+        &self,
+        cast: &super::eval::BoundCast,
+        value: Datum<'a>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.execute_cast_path(cast, cast.source_oid, cast.target_oid, value, arena)
     }
 
     fn cast_defined<'a>(
@@ -11463,6 +11630,11 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
+                if qualifier
+                    .is_some_and(|qualifier| self.scope.qualified_star_columns(qualifier).is_ok())
+                {
+                    return Err(error);
+                }
                 let outer_scope = self.outer_scope.ok_or(error)?;
                 let entry = outer_scope.find_column(qualifier, name)?;
                 Ok(outer_scope.output_type(entry))
@@ -11478,7 +11650,17 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     ) -> Option<super::exec::StaticTypeMeta> {
         match self.scope.find_column(qualifier, name) {
             Ok(entry) => scope_column_metadata(self.scope, entry, self.storage, self.txid),
-            Err(_) => {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                if qualifier
+                    .is_some_and(|qualifier| self.scope.qualified_star_columns(qualifier).is_ok())
+                {
+                    return None;
+                }
                 let outer = self.outer_scope?;
                 scope_column_metadata(
                     outer,
@@ -11487,6 +11669,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     self.txid,
                 )
             }
+            Err(_) => None,
         }
     }
 

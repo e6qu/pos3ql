@@ -59,8 +59,10 @@ sql::cursor::query::tests::cursor_owned_query_retains_wide_records_after_input_m
 sql::lock::tests::lock_wait_handoff_handles_release_before_or_after_parking_and_generation_wrap
 sql::query::input_progress::tests::retained_input_ownership_borrows_wide_values_until_suspension
 sql::query::input_progress::tests::retained_input_ownership_capacity_failure_restores_scopes
+sql::query::input_progress::tests::retained_input_ownership_keeps_cast_selections_and_builtin_absence_after_work_reset
 sql::query::input_progress::tests::retained_input_ownership_keeps_nested_values_and_ordinals_after_work_reset
 sql::query::input_progress::tests::retained_input_ownership_keeps_outer_planning_separate_from_new_bodies
+sql::query::input_progress::tests::retained_input_ownership_rejects_changed_cast_definition_keys
 sql::query::input_progress::tests::retained_input_ownership_successful_inputs_do_not_grow_statement_memory_per_row
 sql::query::input_progress::tests::retained_input_ownership_tracks_all_arguments_in_bounded_scratch
 sql::query::routine_contract_tests::pending_routine_contract_reports_fixed_capacity_exhaustion

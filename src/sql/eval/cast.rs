@@ -440,15 +440,21 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Oid(referenced_oid as u32)
             }
             Datum::RegObject { referenced_oid, .. } => Datum::Oid(referenced_oid as u32),
+            Datum::Int2(value) if target == ColType::Oid => Datum::Oid(value as u32),
+            Datum::Int4(value) if target == ColType::Oid => Datum::Oid(value as u32),
             Datum::Int2(value) => {
                 Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
             }
             Datum::Int4(value) => {
                 Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
             }
-            Datum::Int8(value) => {
-                Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
-            }
+            Datum::Int8(value) => Datum::Oid(u32::try_from(value).map_err(|_| {
+                if target == ColType::Oid {
+                    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")
+                } else {
+                    overflow(target.name())
+                }
+            })?),
             _ => return Err(cast_unsupported(&v, target.name())),
         },
         ColType::PgLsn => match v {

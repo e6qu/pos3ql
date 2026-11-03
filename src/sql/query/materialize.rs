@@ -36,6 +36,14 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.n == 0
     }
@@ -371,6 +379,20 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        match self.0.find_column(qualifier, name) {
+            Ok(column) => Ok(self.0.output_type(column)),
+            Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                self.whole_row_type(name).ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.0.n == 0
     }

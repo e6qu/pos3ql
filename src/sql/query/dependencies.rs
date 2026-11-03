@@ -1323,6 +1323,229 @@ fn validate_insert_projection(
     Ok(())
 }
 
+pub(crate) fn for_each_dml_assignment<'a>(
+    statement: &Stmt<'a>,
+    visit: &mut dyn FnMut(Option<&'a str>, usize, &'a Expr<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    match statement {
+        Stmt::Insert(insert) => {
+            for row in insert.rows {
+                for (index, expression) in row.iter().enumerate() {
+                    visit(insert.columns.get(index).copied(), index, expression)?;
+                }
+            }
+            for (index, (name, expression)) in insert
+                .on_conflict
+                .and_then(|value| value.update)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                visit(Some(name), index, expression)?;
+            }
+        }
+        Stmt::Update(update) => {
+            for (index, (name, expression)) in update.assignments.iter().enumerate() {
+                visit(Some(name), index, expression)?;
+            }
+        }
+        Stmt::Merge(merge) => {
+            for when in merge.whens {
+                match when.action() {
+                    crate::sql::ast::MergeActionRef::Update(assignments) => {
+                        for (index, (name, expression)) in assignments.iter().enumerate() {
+                            visit(Some(name), index, expression)?;
+                        }
+                    }
+                    crate::sql::ast::MergeActionRef::Insert {
+                        columns, values, ..
+                    } => {
+                        for (index, expression) in values.iter().enumerate() {
+                            visit(columns.get(index).copied(), index, expression)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn visit_dml_assignment_types(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    visit: &mut dyn FnMut(i32, &crate::storage::ColumnMeta) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let (statement, with) = match statement {
+            Stmt::With { ctes, statement } => (*statement, *ctes),
+            _ => (statement, &[][..]),
+        };
+        let statement = super::cte::expand_dml_ctes_schema(statement, with, storage, txid, arena)?;
+        let (target, alias, extra) = match statement {
+            Stmt::Insert(insert) => (insert.table, None, None),
+            Stmt::Update(update) => (update.table, update.alias, update.from),
+            Stmt::Merge(merge) => {
+                let source = arena
+                    .alloc(FromClause {
+                        base: merge.source,
+                        joins: &[],
+                    })
+                    .map_err(|_| arena_full())?;
+                (merge.target, merge.target_alias, Some(&*source))
+            }
+            _ => return Ok(()),
+        };
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        let target = scope.defs.get(0).expect("assignment target resolved");
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
+            row,
+            catalog: Some(&catalog),
+        });
+        let columns = DependencyTypes {
+            scope: Some(&scope),
+            excluded: Some(target),
+            transition: transition
+                .as_ref()
+                .map(|columns| columns as &dyn ColTypeResolver),
+            storage,
+            txid,
+            returning_output: None,
+            arena,
+        };
+        for_each_dml_assignment(statement, &mut |name, index, expression| {
+            if matches!(expression, Expr::DefaultMarker) {
+                return Ok(());
+            }
+            let index = match name {
+                Some(name) => target.column_index(name).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                })?,
+                None => index,
+            };
+            let column = target.columns().get(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "INSERT has more expressions than target columns"
+                )
+            })?;
+            visit(
+                crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
+                column,
+            )
+        })
+    })();
+    // Only Copy cast snapshots, allocated in the persistent tail, may escape.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+/// Visit declared output identities before a DML source can execute.
+pub(crate) fn visit_projection_types(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    visit: &mut dyn FnMut(i32) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let select = super::expand_ctes(select, storage, txid, arena)?;
+    if let Some(tree) = select.set_body {
+        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+        let mut oids = [0; crate::sql::exec::MAX_PROJ];
+        let count =
+            super::describe_set_body(storage, tree, txid, &mut columns, arena, Some(&mut oids))?;
+        for oid in &oids[..count] {
+            visit(*oid)?;
+        }
+        return Ok(());
+    }
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, outer))
+        .transpose()?;
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
+        row,
+        catalog: Some(&catalog),
+    });
+    let columns = DependencyTypes {
+        scope: scope.as_ref(),
+        excluded: None,
+        transition: transition
+            .as_ref()
+            .map(|columns| columns as &dyn ColTypeResolver),
+        storage,
+        txid,
+        returning_output: None,
+        arena,
+    };
+    for item in select.items {
+        match item {
+            SelectItem::Expr { expression, .. } => visit(
+                crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
+            )?,
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                if let Some(scope) = &scope {
+                    let count = match item {
+                        SelectItem::TableWildcard(name) => scope.qualified_star_columns(name)?,
+                        _ => scope.star_columns(),
+                    };
+                    for index in 0..count {
+                        let entry = match item {
+                            SelectItem::TableWildcard(name) => {
+                                scope.qualified_star_entry(name, index)?
+                            }
+                            _ => scope.star_entry(index),
+                        };
+                        let metadata = super::scope_column_metadata(scope, entry, storage, txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "source column type identity is unavailable"
+                                )
+                            })?;
+                        visit(metadata.type_oid)?;
+                    }
+                }
+            }
+            SelectItem::RecordStar(expression) => {
+                let mut result = Ok(());
+                let shape = crate::sql::exec::record_shape_metadata(
+                    expression,
+                    &columns,
+                    |_, metadata| {
+                        if result.is_ok() {
+                            result = visit(metadata.type_oid);
+                        }
+                    },
+                )?;
+                result?;
+                if shape.is_none() {
+                    let oid = crate::sql::exec::infer_routine_argument_oid(expression, &columns)?;
+                    return Err(crate::sql::exec::not_composite(
+                        "*",
+                        ColType::from_oid(oid).map_or("unknown", ColType::name),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn geometry_assignment_type(ctype: ColType) -> Option<ColType> {
     match ctype {
         ColType::Geometry(_) => Some(ctype),
@@ -1372,25 +1595,26 @@ fn validate_assignment_type(
                 "column type identity is unavailable"
             )
         })?;
-    if source_oid == target_oid
-        || storage
-            .cast_for_oids(source_oid, target_oid, txid)
-            .is_some_and(|(_, cast)| cast.context.permits_assignment())
-    {
+    if source_oid == target_oid {
         return Ok(());
+    }
+    if let Some((_, cast)) =
+        crate::sql::catalog::defined_cast_path(storage, txid, source_oid, target_oid)
+    {
+        return crate::sql::catalog::require_cast_context(
+            storage,
+            txid,
+            source_oid,
+            target_oid,
+            cast.context,
+            crate::sql::eval::DefinedCastContext::Assignment,
+        );
     }
     let Some(source) = storage.routine_result_for_oid(source_oid, txid) else {
         return Ok(());
     };
     let source = match source.ctype {
         ColType::Array(element) => {
-            if let ColType::Array(target_element) = column.ctype
-                && storage
-                    .cast_for_oids(element.element_oid(), target_element.element_oid(), txid)
-                    .is_some_and(|(_, cast)| cast.context.permits_assignment())
-            {
-                return Ok(());
-            }
             geometry_assignment_type(ColType::Array(element)).unwrap_or(source.ctype)
         }
         ctype => ctype,
@@ -1453,6 +1677,7 @@ fn dml_dependency_scope<'a>(
     let from = arena
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
+    let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
     super::QueryScope::resolve_schema(storage, from, txid, arena, None)
 }
 
@@ -2817,17 +3042,18 @@ fn mark_resolved_column(
     resolved: super::ResolvedColumn,
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
+    let mut mark = |table: usize, column| {
+        let (class, slot) = match scope.view_accesses[table] {
+            Some(view) => (DependencyClass::View, usize::from(view)),
+            None => (DependencyClass::Table, scope.slots[table]),
+        };
+        dependencies.mark_referenced_column(class, slot, column)
+    };
     match resolved {
-        super::ResolvedColumn::Table(table, column) => {
-            dependencies.mark_referenced_column(DependencyClass::Table, scope.slots[table], column)
-        }
+        super::ResolvedColumn::Table(table, column) => mark(table, column),
         super::ResolvedColumn::Merged(merged) => {
             for &(table, column) in scope.merged[merged].parts {
-                dependencies.mark_referenced_column(
-                    DependencyClass::Table,
-                    scope.slots[table],
-                    column,
-                )?;
+                mark(table, column)?;
             }
             Ok(())
         }

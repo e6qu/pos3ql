@@ -173,9 +173,10 @@ fn sorted_and_paged_projection_effects(external: bool) {
     );
     let waiting_query = "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
             FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected";
-    let blocked = other.execute(&mut engine, waiting_query, true);
+    let status = other.execute_status(&mut engine, waiting_query, true);
+    assert!(matches!(status, ExecutionStatus::Blocked { .. }));
     assert!(
-        blocked.is_empty(),
+        other.send.is_empty(),
         "nested lock wait emitted a partial result: external={external}"
     );
     session.success(&mut engine, "ROLLBACK", true);
@@ -2622,6 +2623,8 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
         "SELECT reference_scope.source.value FROM reference_scope.source",
         "SELECT selected.value FROM reference_scope.source AS selected",
         "SELECT (SELECT selected.value) FROM reference_scope.source AS selected",
+        "SELECT (SELECT reference_scope.source.value) FROM reference_scope.source",
+        "SELECT (SELECT selected.value FROM (VALUES(8)) AS inner_row(other)) FROM reference_scope.source AS selected",
     ] {
         assert_eq!(
             data_rows(&session.success(&mut engine, query, true)),
@@ -2646,6 +2649,10 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
             "SELECT (SELECT selected.missing) FROM reference_scope.source AS selected",
             "42703",
         ),
+        (
+            "SELECT (SELECT selected.value FROM (VALUES(8)) AS selected(other)) FROM reference_scope.source AS selected",
+            "42703",
+        ),
     ] {
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, query, true)),
@@ -2653,16 +2660,25 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
             "{query}"
         );
     }
-    let hidden = session.execute(
+    let missing = session.execute(
         &mut engine,
-        "SELECT reference_scope.source.value FROM reference_scope.source AS selected",
+        "SELECT (SELECT selected.missing) FROM reference_scope.source AS selected",
         true,
     );
-    assert_eq!(error_sqlstates(&hidden), ["42P01"]);
-    assert!(
-        String::from_utf8_lossy(&hidden)
-            .contains("invalid reference to FROM-clause entry for table \"source\"")
-    );
+    assert_eq!(error_sqlstates(&missing), ["42703"]);
+    assert!(String::from_utf8_lossy(&missing).contains("column selected.missing does not exist"));
+    for query in [
+        "SELECT reference_scope.source.value FROM reference_scope.source AS selected",
+        "SELECT (SELECT reference_scope.source.value) FROM reference_scope.source AS selected",
+    ] {
+        let hidden = session.execute(&mut engine, query, true);
+        assert_eq!(error_sqlstates(&hidden), ["42P01"], "{query}");
+        assert!(
+            String::from_utf8_lossy(&hidden)
+                .contains("invalid reference to FROM-clause entry for table \"source\""),
+            "{query}"
+        );
+    }
     for (query, table) in [
         ("SELECT (SELECT pg_catalog.pg_class.relname)", "pg_class"),
         ("SELECT (SELECT \"a.b\".value)", "a.b"),

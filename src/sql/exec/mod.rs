@@ -447,6 +447,19 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        describe::AliasedDefCols {
+            definition: self.def,
+            alias: self.alias,
+            output_aliases: &[],
+        }
+        .resolve_column_type(qualifier, name)
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
             .then_some(ColType::Record)
@@ -732,7 +745,8 @@ pub use describe::{
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
-    record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower, wire_column_description,
+    record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
+    visit_array_constructor_conversions, wire_column_description,
 };
 pub(crate) use describe::{
     bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
@@ -3790,14 +3804,21 @@ fn resolve_partition_bound<Definition0: crate::storage::DefinitionBacking>(
 ) -> Result<StoredPartitionBound, SqlError> {
     let constant =
         |expression: &Expr, column: usize| -> Result<crate::storage::OwnedDatum, SqlError> {
-            let value = eval_full(
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..NO_HOOKS
+            };
+            let value = eval_assignment(
                 expression,
+                &parent.columns()[column],
+                storage,
+                txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
                 &NoColumns,
-                &NO_HOOKS,
+                &hooks,
             )?;
-            let value = coerce(value, &parent.columns()[column], storage, txid, arena)?;
             crate::storage::OwnedDatum::from_datum(&value)
         };
     match (strategy, bound) {
@@ -5330,6 +5351,7 @@ fn handle_conflict<
 >(
     storage: &mut Storage,
     txn: &mut TxnState,
+    assignment_casts: AssignmentCasts<'a>,
     row_target: crate::storage::TableDefinitionTarget,
     logical_table_index: usize,
     def: &crate::storage::TableDefinition<Definition0>,
@@ -5580,9 +5602,19 @@ where
                     sequences: Some(&sequences),
                     ..NO_HOOKS
                 };
-                eval_full(expression, arena, params, &context, &hooks)?
+                eval_prepared_assignment(
+                    assignment_casts,
+                    expression,
+                    &def.columns()[target],
+                    storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    &context,
+                    &hooks,
+                )?
             };
-            new_values[target] = coerce(v, &def.columns()[target], storage, txn.txid, arena)?;
+            new_values[target] = v;
         }
     }
     let mut updated_columns = ColumnSet::EMPTY;
@@ -16651,7 +16683,11 @@ static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 #[derive(Clone, Copy)]
 pub enum InsertSource<'a> {
     Statement,
-    MaterializedSelect(&'a [&'a [u8]]),
+    MaterializedSelect {
+        rows: &'a [&'a [u8]],
+        casts: &'a [Option<&'a super::eval::BoundCast>],
+        assignments: AssignmentCasts<'a>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -21846,6 +21882,24 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     };
     match statement {
         Stmt::Insert(statement) => {
+            let assignment_casts = prepare_dml_assignment_casts(
+                &Stmt::Insert(*statement),
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+                None,
+            )?;
+            let source_casts = match statement.select {
+                Some(select) => Some(prepare_insert_select_casts(
+                    statement,
+                    select,
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    None,
+                )?),
+                None => None,
+            };
             let prepared_select = match statement.select {
                 Some(select) => Some(materialize_trigger_insert_source(
                     context.storage(),
@@ -21884,8 +21938,13 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     None,
                     transition_relations,
                     None,
-                    prepared_select
-                        .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
+                    prepared_select.map_or(InsertSource::Statement, |rows| {
+                        InsertSource::MaterializedSelect {
+                            rows,
+                            casts: source_casts.expect("prepared SELECT has a cast plan"),
+                            assignments: assignment_casts,
+                        }
+                    }),
                 )
             });
             drop(command);
@@ -24148,15 +24207,23 @@ fn coerce_plpgsql_table_rowtype<'a>(
         value: Datum::Null,
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
+        let cast = prepare_assignment_cast(
+            source.type_oid,
+            column,
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+        )?;
         coerced[index] = RecordField {
             name: context
                 .arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             type_oid: column.ctype.oid(),
-            value: coerce(
+            value: coerce_assignment(
                 source.value,
                 column,
+                cast.as_ref(),
                 context.storage(),
                 context.txn.txid,
                 context.arena,
@@ -24793,10 +24860,30 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
+                let catalog = super::query::storage_catalog(
+                    context.storage(),
+                    context.arena,
+                    context.txn.txid,
+                );
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    ..NO_HOOKS
+                };
+                let source =
+                    super::eval::expression_type_identity(assignment.expression, &scope, &hooks)?
+                        .routine_argument_oid();
+                let cast = prepare_assignment_cast(
+                    source,
+                    &definition.columns()[column],
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                )?;
                 let value = eval_trigger_expression(context, assignment.expression, &scope)?;
-                let value = coerce(
+                let value = coerce_assignment(
                     value,
                     &definition.columns()[column],
+                    cast.as_ref(),
                     context.storage(),
                     context.txn.txid,
                     context.arena,
@@ -26029,6 +26116,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         context.arena,
                         Some(&scope),
                     )?;
+                    let assignment_casts = prepare_dml_assignment_casts(
+                        &Stmt::Insert(statement),
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                        Some(&scope),
+                    )?;
                     let prepared_select = match statement.select {
                         Some(select) => {
                             let select = match transition_relations {
@@ -26041,18 +26135,29 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 )?,
                                 None => select,
                             };
-                            Some(materialize_trigger_insert_source(
-                                context.storage(),
+                            let casts = prepare_insert_select_casts(
+                                &statement,
                                 select,
-                                context.arena,
-                                context.arena,
+                                context.storage(),
                                 context.txn.txid,
-                                TriggerQueryExecution {
-                                    params: context.params,
-                                    seq_session: context.seq_session(),
-                                },
+                                context.arena,
                                 Some(&scope),
-                            )?)
+                            )?;
+                            Some((
+                                casts,
+                                materialize_trigger_insert_source(
+                                    context.storage(),
+                                    select,
+                                    context.arena,
+                                    context.arena,
+                                    context.txn.txid,
+                                    TriggerQueryExecution {
+                                        params: context.params,
+                                        seq_session: context.seq_session(),
+                                    },
+                                    Some(&scope),
+                                )?,
+                            ))
                         }
                         None => None,
                     };
@@ -26092,8 +26197,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             Some(&scope),
                             transition_relations,
                             conflict_scope,
-                            prepared_select
-                                .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
+                            prepared_select.map_or(InsertSource::Statement, |(casts, rows)| {
+                                InsertSource::MaterializedSelect {
+                                    rows,
+                                    casts,
+                                    assignments: assignment_casts,
+                                }
+                            }),
                         )
                     });
                     drop(command);
@@ -40655,7 +40765,7 @@ pub fn create_table_as(
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
                 let v = decode_projected_pub(bytes, i);
-                match coerce(v, &def.columns()[i], storage, txn.txid, arena) {
+                match coerce_assignment(v, &def.columns()[i], None, storage, txn.txid, arena) {
                     Ok(v) => *slot = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -40947,7 +41057,7 @@ pub fn refresh_materialized_view(
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
             let v = decode_projected_pub(bytes, i);
-            match coerce(v, &def.columns()[i], storage, txn.txid, arena) {
+            match coerce_assignment(v, &def.columns()[i], None, storage, txn.txid, arena) {
                 Ok(v) => *slot_v = v,
                 Err(e) => return sql_fail(e),
             }
@@ -57559,8 +57669,16 @@ fn compute_generated<'a, Definition0: crate::storage::DefinitionBacking>(
     };
     for (i, g) in generated.iter().enumerate() {
         if let Some(expr) = g {
-            let v = eval_full(expr, arena, crate::sql::eval::NO_PARAMS, &context, &hooks)?;
-            values[i] = coerce(v, &def.columns()[i], storage, txid, arena)?;
+            values[i] = eval_assignment(
+                expr,
+                &def.columns()[i],
+                storage,
+                txid,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                &context,
+                &hooks,
+            )?;
         }
     }
     Ok(())
@@ -57617,14 +57735,16 @@ where
     let Some(expression) = expression else {
         return Ok(Datum::Null);
     };
-    let value = super::eval::eval_full(
+    eval_assignment(
         expression,
+        column,
+        storage,
+        txid,
         arena,
         crate::sql::eval::NO_PARAMS,
         &NoColumns,
         hooks,
-    )?;
-    coerce(value, column, storage, txid, arena)
+    )
 }
 
 /// Parses only expression-backed defaults installed on an auto-updatable view.
@@ -57725,14 +57845,16 @@ where
     let Some(expression) = expression else {
         return Ok(Datum::Null);
     };
-    let value = super::eval::eval_full(
+    eval_assignment(
         expression,
+        column,
+        storage,
+        txid,
         arena,
         crate::sql::eval::NO_PARAMS,
         &NoColumns,
         hooks,
-    )?;
-    coerce(value, column, storage, txid, arena)
+    )
 }
 
 /// What to do with an explicitly supplied value for a column, given the
@@ -57948,6 +58070,10 @@ impl<'d> MergeLookup<'d, '_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MERGE expression and assignment context"
+)]
 fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
     expression: &'a Expr<'a>,
     storage: &Storage,
@@ -57956,6 +58082,7 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &R,
+    assignment: Option<(&ColumnMeta, Option<&super::eval::BoundCast>)>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = {
         let expressions = [Some(expression)];
@@ -57981,6 +58108,10 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
             ..NO_HOOKS
         };
         eval_full(expression, arena, params, row, &hooks)?
+    };
+    let value = match assignment {
+        Some((column, cast)) => coerce_assignment(value, column, cast, storage, txid, arena)?,
+        None => value,
     };
     detached_trigger_datum(value, arena)
 }
@@ -58321,6 +58452,16 @@ pub(crate) fn merge<'a>(
     ) {
         return sql_fail(error);
     }
+    let assignment_casts = match prepare_dml_assignment_casts(
+        &Stmt::Merge(*statement),
+        storage,
+        txn.txid,
+        arena,
+        None,
+    ) {
+        Ok(casts) => casts,
+        Err(error) => return sql_fail(error),
+    };
     let capturing = capture.is_some();
     let target_qual = crate::sql::ast::QualName {
         schema: statement.target.schema,
@@ -59210,6 +59351,7 @@ pub(crate) fn merge<'a>(
                     arena,
                     params,
                     &lookup,
+                    None,
                 ) {
                     Ok(Datum::Bool(true)) => {}
                     Ok(_) => continue,
@@ -59268,6 +59410,7 @@ pub(crate) fn merge<'a>(
                         arena,
                         params,
                         &lookup,
+                        None,
                     ) {
                         Ok(Datum::Bool(true)) => {}
                         Ok(_) => continue,
@@ -59537,17 +59680,20 @@ pub(crate) fn merge<'a>(
                                     arena,
                                     params,
                                     &lookup,
-                                ) {
-                                    Ok(value) => match coerce(
-                                        value,
+                                    Some((
                                         &def.columns()[ci],
-                                        storage,
-                                        txn.txid,
-                                        arena,
-                                    ) {
-                                        Ok(value) => value,
-                                        Err(error) => return sql_fail(error),
-                                    },
+                                        match assignment_casts.selected(
+                                            expression,
+                                            &def.columns()[ci],
+                                            storage,
+                                            txn.txid,
+                                        ) {
+                                            Ok(cast) => cast,
+                                            Err(error) => return sql_fail(error),
+                                        },
+                                    )),
+                                ) {
+                                    Ok(value) => value,
                                     Err(error) => return sql_fail(error),
                                 }
                             };
@@ -59939,6 +60085,7 @@ pub(crate) fn merge<'a>(
                         arena,
                         params,
                         &source_ctx,
+                        None,
                     ) {
                         Ok(Datum::Bool(true)) => {}
                         Ok(_) => continue,
@@ -59956,6 +60103,7 @@ pub(crate) fn merge<'a>(
                         match merge_insert(
                             storage,
                             txn,
+                            assignment_casts,
                             table_target,
                             def,
                             columns,
@@ -60114,6 +60262,7 @@ fn merge_cardinality() -> SqlError {
 fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &mut Storage,
     txn: &mut TxnState,
+    assignment_casts: AssignmentCasts<'a>,
     logical_target: crate::storage::TableDefinitionTarget,
     def: &'a crate::storage::TableDefinition<Definition0>,
     columns: &[&str],
@@ -60177,8 +60326,17 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
                 IdentityAction::UseSequence => continue,
                 IdentityAction::Accept => {}
             }
-            let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
-            row[targets[i]] = coerce(v, &def.columns()[targets[i]], storage, txn.txid, arena)?;
+            row[targets[i]] = eval_prepared_assignment(
+                assignment_casts,
+                expression,
+                &def.columns()[targets[i]],
+                storage,
+                txn.txid,
+                arena,
+                params,
+                source_ctx,
+                &hooks,
+            )?;
             explicit[targets[i]] = true;
         }
     }
@@ -60198,14 +60356,16 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
             if let Some(d) = col.default.constant() {
                 row[i] = super::enum_values::materialize(d.as_datum(), storage, txn.txid, arena)?;
             } else if let Some(expr) = defaults[i] {
-                let v = super::eval::eval_full(
+                row[i] = eval_assignment(
                     expr,
+                    col,
+                    storage,
+                    txn.txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
                     &NoColumns,
                     &hooks,
                 )?;
-                row[i] = coerce(v, col, storage, txn.txid, arena)?;
             }
         }
     }
@@ -60387,6 +60547,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
 fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::DefinitionBacking>(
     storage: &mut Storage,
     txn: &mut TxnState,
+    assignment_casts: AssignmentCasts<'a>,
     logical_target: crate::storage::TableDefinitionTarget,
     definition: &crate::storage::TableDefinition<Definition0>,
     values: &mut [Datum<'a>; MAX_COLUMNS],
@@ -60558,6 +60719,7 @@ where
                 match handle_conflict(
                     storage,
                     txn,
+                    assignment_casts,
                     row_target,
                     logical_table_index,
                     definition,
@@ -60877,6 +61039,11 @@ pub(crate) fn instead_of_view_dml<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let assignment_casts =
+        match prepare_dml_assignment_casts(statement, storage, txn.txid, arena, None) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        };
     let view = storage.view(view_slot);
     let def = match view_trigger_definition(storage, view_slot, txn.txid, arena) {
         Ok(definition) => definition,
@@ -60996,6 +61163,12 @@ pub(crate) fn instead_of_view_dml<'a>(
                         "INSERT has wrong number of expressions"
                     ));
                 }
+                let source_casts = match prepare_insert_select_casts(
+                    insert, select, storage, txn.txid, arena, None,
+                ) {
+                    Ok(casts) => casts,
+                    Err(error) => return sql_fail(error),
+                };
                 let mut rows = match scratch.pool().lease::<&[u8]>(0) {
                     Ok(rows) => rows,
                     Err(error) => {
@@ -61046,11 +61219,17 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 None => return sql_fail(undefined_column(insert.columns[source])),
                             }
                         };
-                        values[column] =
-                            match coerce(*value, &def.columns[column], storage, txn.txid, arena) {
-                                Ok(value) => value,
-                                Err(error) => return sql_fail(error),
-                            };
+                        values[column] = match coerce_assignment(
+                            *value,
+                            &def.columns[column],
+                            source_casts[source],
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -61106,15 +61285,20 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 None => return sql_fail(undefined_column(insert.columns[index])),
                             }
                         };
-                        let value = match eval_full(expression, arena, params, &NoColumns, &hooks) {
+                        values[column] = match eval_prepared_assignment(
+                            assignment_casts,
+                            expression,
+                            &def.columns[column],
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &NoColumns,
+                            &hooks,
+                        ) {
                             Ok(value) => value,
                             Err(error) => return sql_fail(error),
                         };
-                        values[column] =
-                            match coerce(value, &def.columns[column], storage, txn.txid, arena) {
-                                Ok(value) => value,
-                                Err(error) => return sql_fail(error),
-                            };
                     }
                     match finish_instead_of_view_new_row(
                         storage,
@@ -61198,10 +61382,17 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 let Some(column) = def.column_index(name) else {
                                     return Err(undefined_column(name));
                                 };
-                                let value =
-                                    eval_full(expression, arena, params, &combined, &hooks)?;
-                                new[column] =
-                                    coerce(value, &def.columns[column], storage, txn.txid, arena)?;
+                                new[column] = eval_prepared_assignment(
+                                    assignment_casts,
+                                    expression,
+                                    &def.columns[column],
+                                    storage,
+                                    txn.txid,
+                                    arena,
+                                    params,
+                                    &combined,
+                                    &hooks,
+                                )?;
                             }
                             Ok(())
                         },
@@ -61249,15 +61440,20 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let Some(column) = def.column_index(name) else {
                             return sql_fail(undefined_column(name));
                         };
-                        let value = match eval_full(expression, arena, params, &context, &hooks) {
+                        new[column] = match eval_prepared_assignment(
+                            assignment_casts,
+                            expression,
+                            &def.columns[column],
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &context,
+                            &hooks,
+                        ) {
                             Ok(value) => value,
                             Err(error) => return sql_fail(error),
                         };
-                        new[column] =
-                            match coerce(value, &def.columns[column], storage, txn.txid, arena) {
-                                Ok(value) => value,
-                                Err(error) => return sql_fail(error),
-                            };
                     }
                 }
                 // A joined source can expose storage-backed datums. Detach the
@@ -61650,6 +61846,19 @@ where
     ) {
         return sql_fail(error);
     }
+    let assignment_casts = match source {
+        InsertSource::MaterializedSelect { assignments, .. } => assignments,
+        InsertSource::Statement => match prepare_dml_assignment_casts(
+            &Stmt::Insert(*statement),
+            storage,
+            txn.txid,
+            arena,
+            transition,
+        ) {
+            Ok(casts) => casts,
+            Err(error) => return sql_fail(error),
+        },
+    };
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -61695,6 +61904,18 @@ where
             targets[i] = column;
         }
         statement.columns.len()
+    };
+    let source_assignment_casts = match source {
+        InsertSource::MaterializedSelect { casts, .. } => Some(casts),
+        InsertSource::Statement => match statement.select {
+            Some(select) => match prepare_insert_select_casts(
+                statement, select, storage, txn.txid, arena, transition,
+            ) {
+                Ok(casts) => Some(casts),
+                Err(error) => return sql_fail(error),
+            },
+            None => None,
+        },
     };
     let insert_columns = targets[..n_targets]
         .iter()
@@ -61932,7 +62153,7 @@ where
     // read the very table being written, so the two phases must not overlap.
     if let Some(sel) = statement.select {
         let (rows_bytes, count): (&[&[u8]], usize) =
-            if let InsertSource::MaterializedSelect(rows) = source {
+            if let InsertSource::MaterializedSelect { rows, .. } = source {
                 (rows, rows.len())
             } else {
                 let sel = match transition_relations {
@@ -62038,7 +62259,20 @@ where
                 }
                 let v = decode_projected_pub(bytes, i);
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, storage, txn.txid, arena) {
+                let cast = source_assignment_casts
+                    .expect("SELECT has a cast plan")
+                    .get(i)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "SELECT assignment cast plan is incomplete"
+                        )
+                    });
+                let cast = match cast {
+                    Ok(cast) => *cast,
+                    Err(error) => return sql_fail(error),
+                };
+                match coerce_assignment(v, col, cast, storage, txn.txid, arena) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -62089,6 +62323,7 @@ where
             match finish_insert_row(
                 storage,
                 txn,
+                assignment_casts,
                 table_target,
                 def,
                 &mut values,
@@ -62167,7 +62402,7 @@ where
         }
         return sql_ok();
     }
-    if matches!(source, InsertSource::MaterializedSelect(_)) {
+    if matches!(source, InsertSource::MaterializedSelect { .. }) {
         return sql_fail(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "materialized INSERT source requires INSERT ... SELECT"
@@ -62283,13 +62518,18 @@ where
                 if matches!(expression, Expr::DefaultMarker) || ignore[targets[i]] {
                     continue; // filled from the default / identity below
                 }
-                let v =
-                    match super::eval::eval_full(expression, arena, params, &value_scope, &hooks) {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
                 let col = &def.columns()[targets[i]];
-                match coerce(v, col, storage, txn.txid, arena) {
+                match eval_prepared_assignment(
+                    assignment_casts,
+                    expression,
+                    col,
+                    storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    &value_scope,
+                    &hooks,
+                ) {
                     Ok(v) => values[targets[i]] = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -62329,6 +62569,7 @@ where
         match finish_insert_row(
             storage,
             txn,
+            assignment_casts,
             table_target,
             def,
             &mut values,
@@ -62943,6 +63184,16 @@ pub(crate) fn update<'a>(
         return sql_fail(error);
     }
     let outer_lookup = outer;
+    let assignment_casts = match prepare_dml_assignment_casts(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+        outer,
+    ) {
+        Ok(casts) => casts,
+        Err(error) => return sql_fail(error),
+    };
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -63484,14 +63735,16 @@ pub(crate) fn update<'a>(
                                         &hooks,
                                     )?;
                                 } else {
-                                    let v =
-                                        eval_full(expression, arena, params, &combined, &hooks)?;
-                                    logical_new[targets[a]] = coerce(
-                                        v,
+                                    logical_new[targets[a]] = eval_prepared_assignment(
+                                        assignment_casts,
+                                        expression,
                                         &def.columns()[targets[a]],
                                         storage,
                                         txn.txid,
                                         arena,
+                                        params,
+                                        &combined,
+                                        &hooks,
                                     )?;
                                 }
                             }
@@ -63578,23 +63831,39 @@ pub(crate) fn update<'a>(
                         };
                         continue;
                     }
+                    let col = &def.columns()[targets[a]];
                     let value = if let Some(outer) = outer_lookup {
                         let scope = TriggerDmlScope {
                             row: &context,
                             outer,
                         };
-                        super::eval::eval_full(expression, arena, params, &scope, &hooks)
+                        eval_prepared_assignment(
+                            assignment_casts,
+                            expression,
+                            col,
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &scope,
+                            &hooks,
+                        )
                     } else {
-                        super::eval::eval_full(expression, arena, params, &context, &hooks)
+                        eval_prepared_assignment(
+                            assignment_casts,
+                            expression,
+                            col,
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &context,
+                            &hooks,
+                        )
                     };
-                    let v = match value {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
-                    let col = &def.columns()[targets[a]];
-                    match coerce(v, col, storage, txn.txid, arena) {
-                        Ok(v) => logical_new[targets[a]] = v,
-                        Err(e) => return sql_fail(e),
+                    match value {
+                        Ok(value) => logical_new[targets[a]] = value,
+                        Err(error) => return sql_fail(error),
                     }
                 }
             }
@@ -70150,17 +70419,16 @@ fn alter_table_relation(
                                     sequences: Some(&seq),
                                     ..super::eval::NO_HOOKS
                                 };
-                                let v = match super::eval::eval_full(
+                                match eval_assignment(
                                     expr,
+                                    &new_def.columns[fi],
+                                    storage,
+                                    txn.txid,
                                     arena,
                                     crate::sql::eval::NO_PARAMS,
                                     &NoColumns,
                                     &hooks,
                                 ) {
-                                    Ok(v) => v,
-                                    Err(e) => return sql_fail(e),
-                                };
-                                match coerce(v, &new_def.columns[fi], storage, txn.txid, arena) {
                                     Ok(v) => v,
                                     Err(e) => return sql_fail(e),
                                 }
@@ -72215,6 +72483,309 @@ pub(crate) fn coerce<'a>(
             }
         }
     }
+    coerce_column_value(v, col, storage, txid, arena)
+}
+
+#[derive(Clone, Copy)]
+struct AssignmentCastEntry<'a> {
+    expression: &'a Expr<'a>,
+    target_oid: i32,
+    cast: Option<&'a super::eval::BoundCast>,
+}
+
+#[derive(Clone, Copy)]
+pub struct AssignmentCasts<'a>(&'a [AssignmentCastEntry<'a>]);
+
+impl<'a> AssignmentCasts<'a> {
+    fn selected(
+        self,
+        expression: &Expr<'a>,
+        column: &ColumnMeta,
+        storage: &Storage,
+        txid: u32,
+    ) -> Result<Option<&'a super::eval::BoundCast>, SqlError> {
+        let target = storage
+            .routine_type_oid(column.ctype, column.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "column type identity is unavailable"
+                )
+            })?;
+        self.0
+            .iter()
+            .find(|entry| core::ptr::eq(entry.expression, expression) && entry.target_oid == target)
+            .map(|entry| entry.cast)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "assignment expression has no prepared cast contract"
+                )
+            })
+    }
+}
+
+fn prepare_dml_assignment_casts<'a>(
+    statement: &Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'_>>,
+) -> Result<AssignmentCasts<'a>, SqlError> {
+    let mut entries = crate::mem::arena::ArenaList::new_persistent(arena);
+    super::query::for_each_dml_assignment(statement, &mut |_, _, expression| {
+        if !matches!(expression, Expr::DefaultMarker) {
+            entries
+                .push(AssignmentCastEntry {
+                    expression,
+                    target_oid: 0,
+                    cast: None,
+                })
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        Ok(())
+    })?;
+    if entries.is_empty() {
+        return Ok(AssignmentCasts(&[]));
+    }
+    let mut index = 0;
+    super::query::visit_dml_assignment_types(
+        statement,
+        storage,
+        txid,
+        arena,
+        outer,
+        &mut |source, column| {
+            let cast = prepare_assignment_cast(source, column, storage, txid, arena)?;
+            let cast = cast
+                .map(|cast| {
+                    arena
+                        .alloc_persistent_slice_with(1, |_| cast)
+                        .map(|values| &values[0])
+                        .map_err(|_| super::eval::arena_full())
+                })
+                .transpose()?;
+            let entry = entries
+                .as_mut_slice()
+                .map_err(|_| super::eval::arena_full())?
+                .get_mut(index)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "assignment cast preparation changed the source shape"
+                    )
+                })?;
+            entry.target_oid = storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "column type identity is unavailable"
+                    )
+                })?;
+            entry.cast = cast;
+            index += 1;
+            Ok(())
+        },
+    )?;
+    if index != entries.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "assignment cast preparation changed the source shape"
+        ));
+    }
+    Ok(AssignmentCasts(entries.as_slice()))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "prepared assignment execution context"
+)]
+fn eval_prepared_assignment<'a>(
+    casts: AssignmentCasts<'a>,
+    expression: &Expr<'a>,
+    column: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let cast = casts.selected(expression, column, storage, txid)?;
+    let value = eval_full(expression, arena, params, row, hooks)?;
+    coerce_assignment(value, column, cast, storage, txid, arena)
+}
+
+fn prepare_assignment_cast(
+    source_oid: i32,
+    column: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<super::eval::BoundCast>, SqlError> {
+    let target_oid = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "column type identity is unavailable"
+            )
+        })?;
+    if source_oid == target_oid {
+        return Ok(None);
+    }
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    super::eval::CatalogAccess::bind_defined_cast(
+        &catalog,
+        source_oid,
+        target_oid,
+        super::eval::DefinedCastContext::Assignment,
+    )
+}
+
+fn prepare_insert_select_casts<'a>(
+    statement: &Insert<'_>,
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'_>>,
+) -> Result<&'a [Option<&'a super::eval::BoundCast>], SqlError> {
+    let relation = storage
+        .resolve_relation(statement.table.schema, statement.table.name, txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "relation does not exist"))?;
+    let (table_definition, view_definition) = match relation {
+        crate::storage::ResolvedRelation::Table(table) => {
+            (Some(storage.table_def(table, txid)), None)
+        }
+        crate::storage::ResolvedRelation::View(view) => (
+            None,
+            Some(view_trigger_definition(storage, view, txid, arena)?),
+        ),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "INSERT target is not a table or view"
+            ));
+        }
+    };
+    let definition = match (&table_definition, &view_definition) {
+        (Some(definition), _) => crate::storage::RelationDefinition::from_definition(&**definition),
+        (_, Some(definition)) => crate::storage::RelationDefinition::from_definition(definition),
+        _ => unreachable!("resolved INSERT target"),
+    };
+    let count = if statement.columns.is_empty() {
+        definition.n_columns
+    } else {
+        statement.columns.len()
+    };
+    let casts = arena
+        .alloc_slice_with(count, |_| None)
+        .map_err(|_| super::eval::arena_full())?;
+    let mut index = 0;
+    super::query::visit_projection_types(select, storage, txid, arena, outer, &mut |source| {
+        let target = if statement.columns.is_empty() {
+            index
+        } else {
+            let name = statement.columns.get(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "INSERT has more expressions than target columns"
+                )
+            })?;
+            definition
+                .column_index(name)
+                .ok_or_else(|| undefined_column(name))?
+        };
+        let column = definition.columns().get(target).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INSERT has more expressions than target columns"
+            )
+        })?;
+        let selected = prepare_assignment_cast(source, column, storage, txid, arena)?;
+        let out = casts.get_mut(index).ok_or_else(|| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "INSERT has more expressions than target columns"
+            )
+        })?;
+        *out = selected
+            .map(|cast| {
+                arena
+                    .alloc(cast)
+                    .map(|cast| &*cast)
+                    .map_err(|_| super::eval::arena_full())
+            })
+            .transpose()?;
+        index += 1;
+        Ok(())
+    })?;
+    Ok(casts)
+}
+
+fn coerce_assignment<'a>(
+    value: Datum<'a>,
+    column: &ColumnMeta,
+    cast: Option<&super::eval::BoundCast>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let value = match cast {
+        Some(cast) => {
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            super::eval::CatalogAccess::execute_bound_cast(&catalog, cast, value, arena)?
+        }
+        None => value,
+    };
+    // The selected path has already checked every destination domain element.
+    if cast.is_some()
+        && matches!(
+            column.ctype,
+            ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+        )
+    {
+        return apply_typmod(value, column.ctype, column.type_mod, arena);
+    }
+    coerce_column_value(value, column, storage, txid, arena)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "typed assignment execution context"
+)]
+fn eval_assignment<'a>(
+    expression: &Expr<'a>,
+    column: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let source =
+        super::eval::expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+    let cast = prepare_assignment_cast(source, column, storage, txid, arena)?;
+    let value = eval_full(expression, arena, params, row, hooks)?;
+    coerce_assignment(value, column, cast.as_ref(), storage, txid, arena)
+}
+
+fn coerce_column_value<'a>(
+    v: Datum<'a>,
+    col: &ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if !v.is_null() && col.ctype == ColType::PgStatisticArray {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "storing non-null pg_statistic[] values is not supported"
+        ));
+    }
     if let ColType::Composite(slot) = col.ctype {
         let slot = crate::storage::TypeCreation::require(slot)?;
         let typed = match v {
@@ -72747,7 +73318,16 @@ fn coerce_composite_value_inner<'a>(
             | crate::storage::DeclaredColumnType::UserDefined { oid, .. } => oid,
         };
         out.value = if encoding == CompositeEncoding::Input {
-            let value = coerce(input[index].value, &column, storage, txid, arena)?;
+            let cast =
+                prepare_assignment_cast(input[index].type_oid, &column, storage, txid, arena)?;
+            let value = coerce_assignment(
+                input[index].value,
+                &column,
+                cast.as_ref(),
+                storage,
+                txid,
+                arena,
+            )?;
             match constraints::column_domain_target(storage, &column, txid)? {
                 Some(domain) => constraints::coerce_domain_value(
                     storage,

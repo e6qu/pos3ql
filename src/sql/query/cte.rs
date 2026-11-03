@@ -278,6 +278,22 @@ pub(crate) fn expand_dml_ctes_schema<'a>(
     })
 }
 
+/// Expand stored-view sources for metadata-only DML target/source lookup.
+pub(super) fn expand_from_schema<'a>(
+    from: &'a FromClause<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a FromClause<'a>, SqlError> {
+    if !storage.has_any_view() {
+        return Ok(from);
+    }
+    with_schema_context(&[], storage, txid, None, None, 0, None, arena, |context| {
+        let expanded = subst_from(from, context, arena)?;
+        Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
+    })
+}
+
 /// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is
 /// materialized to a fixpoint (base term, then the recursive term iterated with
 /// the CTE name bound to the previous iteration's rows) and its references

@@ -1378,6 +1378,10 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "record fields require the explicit bound call contract and field index"
+    )]
     fn routine_record_field(
         &self,
         _name: &str,

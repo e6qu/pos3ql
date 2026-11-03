@@ -7750,16 +7750,16 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         };
         let mut grouped_aggs = ArenaList::new(arena);
         for item in statement.items {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                if let Err(e) = collect_grouped_aggs(
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
+                && let Err(e) = collect_grouped_aggs(
                     expression,
                     &mut grouped_aggs,
                     storage,
                     txid,
                     &analysis_columns,
-                ) {
-                    return sql_fail(e);
-                }
+                )
+            {
+                return sql_fail(e);
             }
         }
         for key in statement.order_by {

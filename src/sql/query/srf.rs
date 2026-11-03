@@ -1125,7 +1125,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             let oid = builtin_oid.expect("builtin project-set target was selected");
             let arguments = crate::sql::eval::bind_builtin_arguments(
                 oid,
-                *args,
+                args,
                 argument_names,
                 *variadic,
                 arena,
@@ -1585,7 +1585,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
         };
         let arguments = crate::sql::eval::bind_builtin_arguments(
             selected_oid,
-            *args,
+            args,
             argument_names,
             *variadic,
             arena,
@@ -3012,7 +3012,8 @@ pub(super) fn sql_table_constructor(tref: &TableRef<'_>) -> bool {
     let Some(args) = tref.func_args else {
         return false;
     };
-    match (tref.table, args) {
+    matches!(
+        (tref.table, args),
         (
             "json_table",
             [
@@ -3027,8 +3028,7 @@ pub(super) fn sql_table_constructor(tref: &TableRef<'_>) -> bool {
                 },
                 _,
             ],
-        ) => true,
-        (
+        ) | (
             "xmltable",
             [
                 _,
@@ -3040,9 +3040,8 @@ pub(super) fn sql_table_constructor(tref: &TableRef<'_>) -> bool {
                 },
                 _,
             ],
-        ) => true,
-        _ => false,
-    }
+        )
+    )
 }
 
 pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(

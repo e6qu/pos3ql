@@ -41,7 +41,7 @@ pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
 mod routine_resolution;
-pub(crate) use routine_resolution::RoutineCallSelection;
+pub use routine_resolution::RoutineCallSelection;
 mod sequence_lifecycles;
 mod table_lifecycles;
 pub(crate) use query_lifecycles::{
@@ -8159,14 +8159,6 @@ struct TextSearchIter<'a> {
     next_slot: usize,
 }
 
-struct RoutineLookup<'a> {
-    database: DatabaseOid,
-    schema: &'a str,
-    name: &'a str,
-    transaction: u32,
-    kind: RoutineCallKind,
-}
-
 /// Overload checks need input types and default admission, not bodies,
 /// configuration values or the reserved result-column buffers.
 struct RoutineInputSignature {
@@ -8174,7 +8166,6 @@ struct RoutineInputSignature {
     argument_count: usize,
     parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
     parameter_count: usize,
-    required_argument_count: usize,
     is_procedure: bool,
 }
 
@@ -8188,23 +8179,10 @@ impl RoutineInputSignature {
             argument_count: arguments.len(),
             parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
             parameter_count: parameters.len(),
-            required_argument_count: parameters
-                .iter()
-                .filter(|parameter| parameter.mode.is_input())
-                .take_while(|parameter| !parameter.mode.has_default())
-                .count(),
         };
         signature.arguments[..arguments.len()].copy_from_slice(arguments);
         signature.parameters[..parameters.len()].copy_from_slice(parameters);
         signature
-    }
-
-    fn arguments(&self) -> &[RoutineArgumentDef] {
-        &self.arguments[..self.argument_count]
-    }
-
-    fn accepts_input_arity(&self, arity: usize) -> bool {
-        self.required_argument_count <= arity && arity <= self.argument_count
     }
 
     fn parameter_for_input(&self, input_index: usize) -> Option<&RoutineParameterDef> {
@@ -8254,16 +8232,6 @@ impl RoutineStringPreferences {
         } else {
             !self.string[index] || crate::sql::types::type_category(argument.ctype) == "S"
         }
-    }
-}
-
-impl RoutineLookup<'_> {
-    fn matches(&self, routine: &RoutineDef) -> bool {
-        routine.database == self.database
-            && routine.visible_to(self.transaction)
-            && self.kind.accepts(routine.kind_for(self.transaction))
-            && routine.schema_for(self.transaction).as_str() == self.schema
-            && routine.name_for(self.transaction).as_str() == self.name
     }
 }
 
@@ -44791,36 +44759,6 @@ impl Storage {
         }
     }
 
-    fn routine_candidates<'a>(
-        &'a self,
-        schema: &'a str,
-        name: &'a str,
-        transaction: u32,
-        kind: RoutineCallKind,
-    ) -> impl Iterator<Item = (usize, RoutineInputSignature)> + 'a {
-        let lookup = RoutineLookup {
-            database: current_database(),
-            schema,
-            name,
-            transaction,
-            kind,
-        };
-        let mut next_slot = 0;
-        std::iter::from_fn(move || {
-            let catalog = self.routines.lock().expect("routine catalog lock poisoned");
-            while let Some(routine) = catalog.get(next_slot) {
-                let slot = next_slot;
-                next_slot += 1;
-                if !lookup.matches(routine) {
-                    continue;
-                }
-                let signature = RoutineInputSignature::from_definition(routine, transaction);
-                return Some((slot, signature));
-            }
-            None
-        })
-    }
-
     pub(crate) fn routine_identity_for(
         &self,
         slot: usize,
@@ -45455,30 +45393,6 @@ impl Storage {
         self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Procedure)
     }
 
-    fn routine_slot_on_path(
-        &self,
-        name: &str,
-        argument_types: &[ColType],
-        txid: u32,
-        kind: RoutineCallKind,
-    ) -> Option<usize> {
-        if let Some((schema, name)) = name.split_once('.') {
-            return self.routine_slot_in(schema, name, argument_types, txid, kind);
-        }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            self.routine_slot_in(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-                argument_types,
-                txid,
-                kind,
-            )
-        })
-    }
-
     fn routine_slot_on_path_oids(
         &self,
         name: &str,
@@ -45495,25 +45409,6 @@ impl Storage {
             | RoutineCallSelection::Ambiguous
             | RoutineCallSelection::WrongKind { .. } => None,
         }
-    }
-
-    fn routine_slot_in(
-        &self,
-        schema: &str,
-        name: &str,
-        argument_types: &[ColType],
-        txid: u32,
-        kind: RoutineCallKind,
-    ) -> Option<usize> {
-        self.routine_candidates(schema, name, txid, kind)
-            .find_map(|(slot, definition)| {
-                (definition.accepts_input_arity(argument_types.len())
-                    && definition.arguments()[..argument_types.len()]
-                        .iter()
-                        .zip(argument_types)
-                        .all(|(parameter, value)| parameter.ctype == *value))
-                .then_some(slot)
-            })
     }
 
     // Exact signature dispatch happens first. Ambiguous calls compare domain

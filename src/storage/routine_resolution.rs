@@ -8,7 +8,8 @@ use crate::sql::catalog::{BuiltinCallableSignature, builtin_callable_signatures}
 use crate::sql::types::{ColType, oid, type_category};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RoutineCallSelection {
+/// The selected callable identity, or the reason no unique callable was selected.
+pub enum RoutineCallSelection {
     Stored(usize),
     Builtin { oid: i32, schema: &'static str },
     Absent,
@@ -426,10 +427,10 @@ impl Storage {
         let mut binding = PolymorphicBinding::EMPTY;
         for (actual, input) in actual_oids.iter().zip(mapping) {
             let declared = candidate.parameter_oid(usize::from(input), !explicit_variadic);
-            if let Some(kind) = polymorphic(declared) {
-                if *actual != oid::UNKNOWN {
-                    binding.bind(kind, base_oid(self, txid, *actual))?;
-                }
+            if let Some(kind) = polymorphic(declared)
+                && *actual != oid::UNKNOWN
+            {
+                binding.bind(kind, base_oid(self, txid, *actual))?;
             }
         }
         let mut expected = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
@@ -463,10 +464,10 @@ impl Storage {
         let mut binding = PolymorphicBinding::EMPTY;
         for (actual, input) in argument_oids.iter().zip(mapping) {
             let expected = candidate.parameter_oid(usize::from(input), !explicit_variadic);
-            if let Some(kind) = polymorphic(expected) {
-                if *actual != oid::UNKNOWN {
-                    binding.bind(kind, base_oid(self, transaction, *actual))?;
-                }
+            if let Some(kind) = polymorphic(expected)
+                && *actual != oid::UNKNOWN
+            {
+                binding.bind(kind, base_oid(self, transaction, *actual))?;
             }
         }
         binding.concrete_oid(result_kind)

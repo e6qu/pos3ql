@@ -40,6 +40,15 @@ pos3ql. For example, an identity column in a non-default schema must still be
 discovered correctly when an inspector queries the catalogs. These fixtures
 cover the recorded workflows, not every application or library feature.
 
+Create application objects in an ordinary schema such as `public`. pos3ql cannot
+store user objects in its built-in `pg_catalog`, `information_schema` or `pg_toast`
+schemas.
+For example, an authorized `CREATE TABLE information_schema.orders (id integer)`
+fails with `0A000`; it is never redirected to `public`. Creating a table, view,
+sequence or composite type in `pg_catalog` or `pg_toast` keeps PostgreSQL's `42501`
+protection.
+Missing CREATE permission also returns `42501`.
+
 `CREATE TABLE ... LIKE ... INCLUDING IDENTITY` creates independently owned
 sequences with the source's settings and declared starting value. Copying a
 `serial` default with `INCLUDING DEFAULTS` or `INCLUDING ALL` instead shares
@@ -63,6 +72,9 @@ explicit rules for their evaluation context. Named arguments and omitted default
 input order. Defaults share the caller's session: a default using `nextval('order_numbers')` updates that
 connection's `currval('order_numbers')`. Function lookup and missing-function
 errors do not run arguments to discover their types.
+Aggregate support functions can refer to supported built-ins by their selected
+identifier. Using a built-in as the implementation of `CREATE CAST` or
+`CREATE OPERATOR` remains unsupported and fails explicitly with `0A000`.
 Stored defaults keep the objects and helper overloads chosen at creation, even
 after renames, schema moves or new overloads. Explicit text sequence inputs,
 such as `nextval('order_numbers'::text)`, request lookup when the call runs.
@@ -75,6 +87,13 @@ For example, this form works when an application spells out every name:
 ```sql
 SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class;
 ```
+
+Queries can read the modeled `information_schema` views, but their numeric
+relation identifiers are unsupported. For example,
+`to_regclass('information_schema.columns')` and
+`'information_schema.columns'::regclass` fail with `0A000`:
+`relation OIDs for information_schema views are not supported`.
+A later user table named `columns` cannot supply its identifier instead.
 
 Array and `CASE` result types come from their declarations, including subqueries
 and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and

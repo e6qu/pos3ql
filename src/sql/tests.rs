@@ -7,6 +7,8 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod builtin_aggregate_resolution;
+mod builtin_argument_binding;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
@@ -17,6 +19,7 @@ mod object_reads;
 mod prepared_object_capacity;
 mod query_execution;
 mod routine_calls;
+mod routine_selection;
 mod row_history;
 mod row_layout;
 mod sequence_inheritance;
@@ -27,6 +30,7 @@ mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod virtual_search_path;
 
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
@@ -68700,6 +68704,9 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
     // observable while their replacements take fresh slots above the old cap.
     config.max_tables = TABLES + 2;
     config.row_overlay_slots = TABLES + 2;
+    // Each one-column ANALYZE retains one aligned record and one pool lease.
+    config.statistics_bytes = TABLES * 64;
+    config.statistics_leases = TABLES;
     config.definition_image_slots = TABLES + 4;
     config.txn_rows = 8;
     config.memtable_bytes = 16 << 20;

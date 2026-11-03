@@ -40,6 +40,8 @@ mod schema_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
+mod routine_resolution;
+pub(crate) use routine_resolution::RoutineCallSelection;
 mod sequence_lifecycles;
 mod table_lifecycles;
 pub(crate) use query_lifecycles::{
@@ -7260,6 +7262,24 @@ impl PolymorphicType {
         }
     }
 
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        [
+            Self::Element,
+            Self::Array,
+            Self::NonArray,
+            Self::Enum,
+            Self::Range,
+            Self::Multirange,
+            Self::Compatible,
+            Self::CompatibleArray,
+            Self::CompatibleNonArray,
+            Self::CompatibleRange,
+            Self::CompatibleMultirange,
+        ]
+        .into_iter()
+        .find(|kind| kind.oid() == oid)
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "anyelement" => Self::Element,
@@ -7292,17 +7312,25 @@ impl PolymorphicType {
 #[derive(Debug, Clone, Copy)]
 struct PolymorphicBinding {
     simple: Option<i32>,
+    simple_array: Option<i32>,
     compatible: Option<i32>,
 }
 
 impl PolymorphicBinding {
     const EMPTY: Self = Self {
         simple: None,
+        simple_array: None,
         compatible: None,
     };
 
     fn bind(&mut self, kind: PolymorphicType, actual_oid: i32) -> Option<()> {
         let key = polymorphic_element_oid(kind, actual_oid)?;
+        if kind == PolymorphicType::Array {
+            if self.simple_array.is_some_and(|prior| prior != actual_oid) {
+                return None;
+            }
+            self.simple_array = Some(actual_oid);
+        }
         let compatible = matches!(
             kind,
             PolymorphicType::Compatible
@@ -7344,9 +7372,8 @@ impl PolymorphicBinding {
             | PolymorphicType::Enum
             | PolymorphicType::Compatible
             | PolymorphicType::CompatibleNonArray => key,
-            PolymorphicType::Array | PolymorphicType::CompatibleArray => {
-                array_oid_for_element(key)?
-            }
+            PolymorphicType::Array => self.simple_array.or_else(|| array_oid_for_element(key))?,
+            PolymorphicType::CompatibleArray => array_oid_for_element(key)?,
             PolymorphicType::Range | PolymorphicType::CompatibleRange => {
                 range_oid_for_element(key)?.0
             }
@@ -7415,15 +7442,15 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
             Some(ColType::Void | ColType::Internal | ColType::Record)
         ) && actual_oid != oid::UNKNOWN)
             .then_some(actual_oid),
-        PolymorphicType::NonArray | PolymorphicType::CompatibleNonArray => {
-            (!matches!(actual, Some(ColType::Array(_)))
-                && !matches!(
-                    actual,
-                    Some(ColType::Void | ColType::Internal | ColType::Record)
-                )
-                && actual_oid != oid::UNKNOWN)
-                .then_some(actual_oid)
-        }
+        PolymorphicType::NonArray | PolymorphicType::CompatibleNonArray => (!matches!(
+            actual,
+            Some(ColType::Array(_) | ColType::Int2Vector | ColType::OidVector)
+        ) && !matches!(
+            actual,
+            Some(ColType::Void | ColType::Internal | ColType::Record)
+        ) && actual_oid
+            != oid::UNKNOWN)
+            .then_some(actual_oid),
         PolymorphicType::Array | PolymorphicType::CompatibleArray => {
             if let Some((NamedTypeKind::Domain, creation, true)) =
                 NamedTypeKind::from_oid(actual_oid)
@@ -7432,6 +7459,8 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
             } else {
                 match actual? {
                     ColType::Array(element) => Some(element.element_oid()),
+                    ColType::Int2Vector => Some(oid::INT2),
+                    ColType::OidVector => Some(oid::OID),
                     _ => None,
                 }
             }
@@ -8146,6 +8175,7 @@ struct RoutineInputSignature {
     parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
     parameter_count: usize,
     required_argument_count: usize,
+    is_procedure: bool,
 }
 
 impl RoutineInputSignature {
@@ -8153,6 +8183,7 @@ impl RoutineInputSignature {
         let arguments = routine.arguments_for(txid);
         let parameters = routine.parameters_for(txid);
         let mut signature = Self {
+            is_procedure: matches!(routine.kind_for(txid), RoutineKind::Procedure),
             arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
             argument_count: arguments.len(),
             parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
@@ -9270,7 +9301,7 @@ impl RoutineKind {
 }
 
 #[derive(Clone, Copy)]
-enum RoutineCallKind {
+pub(crate) enum RoutineCallKind {
     Function,
     Scalar,
     Trigger,
@@ -11014,6 +11045,7 @@ pub struct SequenceOwner {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GeneratedSequenceScope {
     Owned,
+    Identity,
     PartitionRoot,
 }
 
@@ -14144,12 +14176,20 @@ impl CommentEntry {
     }
 }
 
-/// One element of the effective search path: a live schema slot, or the
-/// implicit/explicit `pg_catalog` position.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// One effective namespace: a live user schema or a built-in virtual schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathEntry {
     Schema(u16),
     Catalog,
+    InformationSchema,
+    Toast,
+}
+
+/// PostgreSQL protects relation-backed objects in pg_catalog separately from schema ACLs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectKind {
+    Relation,
+    NonRelation,
 }
 
 /// A canonical search path cannot contain more non-empty names than this:
@@ -14166,9 +14206,8 @@ pub(crate) const MAX_PATH_ENTRIES: usize = crate::sql::guc::SEARCH_PATH_BYTES.di
 pub struct PathContext {
     entries: [PathEntry; MAX_PATH_ENTRIES],
     n: usize,
-    /// Whether the path names pg_catalog explicitly. An explicit first
-    /// pg_catalog is the creation target (which then fails with permission
-    /// denied, as PostgreSQL); the implicit one never is.
+    /// An explicit pg_catalog participates in current_schema and creation;
+    /// the implicit prefix is only a lookup namespace.
     explicit_catalog: bool,
 }
 
@@ -14204,12 +14243,42 @@ impl PathContext {
         self.explicit_catalog
     }
 
-    /// The first schema entry: creation target and `current_schema()`.
-    pub fn first_schema(&self) -> Option<u16> {
-        self.entries().iter().find_map(|e| match e {
-            PathEntry::Schema(slot) => Some(*slot),
-            PathEntry::Catalog => None,
-        })
+    /// The first explicit namespace is the creation target, including read-only schemas.
+    pub fn creation_target(&self) -> Option<PathEntry> {
+        self.entries()
+            .get(usize::from(!self.explicit_catalog))
+            .copied()
+    }
+
+    /// Catalog sources retain which virtual namespace won name resolution.
+    pub(crate) fn catalog_namespace(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<&'static str> {
+        match qualifier {
+            Some("pg_catalog") => Some("pg_catalog"),
+            Some("information_schema")
+                if crate::sql::catalog::is_catalog_relation(qualifier, name) =>
+            {
+                Some("information_schema")
+            }
+            Some(_) => None,
+            None => self.entries().iter().find_map(|entry| match entry {
+                PathEntry::Catalog if crate::sql::catalog::is_catalog_relation(None, name) => {
+                    Some("pg_catalog")
+                }
+                PathEntry::InformationSchema
+                    if crate::sql::catalog::is_catalog_relation(
+                        Some("information_schema"),
+                        name,
+                    ) =>
+                {
+                    Some("information_schema")
+                }
+                _ => None,
+            }),
+        }
     }
 }
 
@@ -14241,6 +14310,12 @@ impl VisibilityContext {
 
 fn execution_path() -> PathContext {
     EXECUTION_PATH.with(Cell::get)
+}
+
+pub(crate) fn information_schema_on_path() -> bool {
+    execution_path()
+        .entries()
+        .contains(&PathEntry::InformationSchema)
 }
 
 fn replace_execution_path(path: PathContext) -> PathContext {
@@ -17660,10 +17735,14 @@ impl Storage {
         self.cumulative_statistics().reset_times
     }
 
-    pub(crate) fn reset_shared_statistics(&self, target: &str) -> bool {
+    pub(crate) fn reset_shared_statistics(&self, target: Option<&str>) -> bool {
         let now = crate::sql::datetime::now_micros();
         let mut cumulative = self.cumulative_statistics();
         let reset = &mut cumulative.reset_times;
+        let Some(target) = target else {
+            *reset = SharedStatisticsResetTimes::new(now);
+            return true;
+        };
         match target {
             "archiver" => reset.archiver = now,
             "bgwriter" => reset.background_writer = now,
@@ -32155,6 +32234,24 @@ impl Storage {
                 }
                 continue;
             }
+            let virtual_entry = match name {
+                "information_schema" => Some(PathEntry::InformationSchema),
+                "pg_toast" => {
+                    if !role.is_some_and(|role| self.role_has_privileges_of(role, 0, txid)) {
+                        continue;
+                    }
+                    Some(PathEntry::Toast)
+                }
+                _ => None,
+            };
+            if let Some(entry) = virtual_entry {
+                if !entries[..n].contains(&entry) {
+                    assert!(n < MAX_PATH_ENTRIES, "bounded search path fits resolver");
+                    entries[n] = entry;
+                    n += 1;
+                }
+                continue;
+            }
             if let Some(slot) = self.find_schema_visible(name, txid)
                 && role.is_some_and(|role| {
                     self.has_object_privilege(
@@ -32198,6 +32295,17 @@ impl Storage {
         execution_path()
     }
 
+    pub(crate) fn path_namespace_rank(&self, schema: &str, txid: u32) -> Option<usize> {
+        self.path().entries().iter().position(|entry| match entry {
+            PathEntry::Catalog => schema == "pg_catalog",
+            PathEntry::InformationSchema => schema == "information_schema",
+            PathEntry::Toast => schema == "pg_toast",
+            PathEntry::Schema(slot) => {
+                self.schema_def_for(usize::from(*slot), txid).name.as_str() == schema
+            }
+        })
+    }
+
     /// Installs the running statement's path, returning the previous one so a
     /// nested resolution context (a view body under its creator's path) can
     /// restore it.
@@ -32227,7 +32335,7 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<ResolvedRelation> {
-        if crate::sql::catalog::is_catalog_relation(qualifier, name) {
+        if qualifier.is_some() && crate::sql::catalog::is_catalog_relation(qualifier, name) {
             return Some(ResolvedRelation::Catalog);
         }
         if let Some(schema) = qualifier {
@@ -32254,6 +32362,12 @@ impl Storage {
                         return Some(ResolvedRelation::Catalog);
                     }
                 }
+                PathEntry::InformationSchema => {
+                    if crate::sql::catalog::is_catalog_relation(Some("information_schema"), name) {
+                        return Some(ResolvedRelation::Catalog);
+                    }
+                }
+                PathEntry::Toast => {}
                 PathEntry::Schema(slot) => {
                     let schema_name = self.schema_def_for(*slot as usize, txid).name;
                     if let Some(found) = self.relation_in(schema_name.as_str(), name, txid) {
@@ -32266,9 +32380,7 @@ impl Storage {
     }
 
     pub(crate) fn schema_is_on_path(&self, schema: SqlName, txid: u32) -> bool {
-        self.path().entries().iter().any(|entry| {
-            matches!(entry, PathEntry::Schema(slot) if self.schema_def_for(*slot as usize, txid).name == schema)
-        })
+        self.path_namespace_rank(schema.as_str(), txid).is_some()
     }
 
     fn relation_in(&self, schema: &str, name: &str, txid: u32) -> Option<ResolvedRelation> {
@@ -32380,23 +32492,48 @@ impl Storage {
             .map(|i| u32::from(def.attribute_number(i)))
     }
 
-    /// The schema a new relation lands in: the qualifier if it names a
-    /// visible schema, else the first schema of the path. `relation` is only
-    /// for the error message.
+    /// The qualifier or first explicit namespace is the creation target.
+    /// A read-only virtual target cannot redirect creation to a later schema.
     pub fn creation_schema(
         &self,
         qualifier: Option<&str>,
         relation: &str,
         txid: u32,
+        kind: SchemaObjectKind,
     ) -> Result<SqlName, SqlError> {
-        if let Some(schema) = qualifier {
-            if schema == "pg_catalog" || schema == "information_schema" {
-                return Err(sql_err!(
-                    crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
+        let virtual_schema_error = |schema: &str| {
+            if matches!(schema, "pg_catalog" | "pg_toast") && kind == SchemaObjectKind::Relation {
+                return sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
                     "permission denied to create \"{}.{}\"",
                     schema,
                     relation
-                ));
+                );
+            }
+            let Some(role) = self.current_role_slot(txid) else {
+                return sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                );
+            };
+            if self.role_has_privileges_of(role, 0, txid) {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "creating objects in read-only virtual schema \"{}\" is not supported",
+                    schema
+                )
+            } else {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to create \"{}.{}\"",
+                    schema,
+                    relation
+                )
+            }
+        };
+        if let Some(schema) = qualifier {
+            if matches!(schema, "pg_catalog" | "information_schema" | "pg_toast") {
+                return Err(virtual_schema_error(schema));
             }
             if self.find_schema_visible(schema, txid).is_none() {
                 return Err(sql_err!(
@@ -32407,23 +32544,16 @@ impl Storage {
             }
             return SqlName::parse(schema);
         }
-        // An explicit pg_catalog at the head of the path is the creation
-        // target, which PostgreSQL then refuses.
-        let path = self.path();
-        if path.explicit_catalog && path.entries().first() == Some(&PathEntry::Catalog) {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to create \"pg_catalog.{}\"",
-                relation
-            ));
-        }
-        let Some(slot) = path.first_schema() else {
-            return Err(sql_err!(
+        match self.path().creation_target() {
+            Some(PathEntry::Schema(slot)) => Ok(self.schema_def_for(usize::from(slot), txid).name),
+            Some(PathEntry::Catalog) => Err(virtual_schema_error("pg_catalog")),
+            Some(PathEntry::InformationSchema) => Err(virtual_schema_error("information_schema")),
+            Some(PathEntry::Toast) => Err(virtual_schema_error("pg_toast")),
+            None => Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "no schema has been selected to create in"
-            ));
-        };
-        Ok(self.schema_def_for(slot as usize, txid).name)
+            )),
+        }
     }
 
     /// Live SQL tables with their slot indices, excluding internal storage.
@@ -41982,6 +42112,49 @@ impl Storage {
         slot
     }
 
+    pub(crate) fn sequence_owned_by_table(
+        &self,
+        sequence: usize,
+        table: usize,
+        transaction: u32,
+    ) -> bool {
+        let raw = self.sequence(sequence);
+        if raw.database != current_database() || !raw.visible_to(transaction) {
+            return false;
+        }
+        let Some(owner) = raw.definition_for(transaction).owner else {
+            return false;
+        };
+        let current = self.table_def(table, transaction);
+        if owner.table_schema == current.schema
+            && owner.table == current.name
+            && current.column_index(owner.column.as_str()).is_some()
+        {
+            return true;
+        }
+        // A newly assigned owner names the transaction-visible target already.
+        if raw
+            .pending_definition
+            .is_some_and(|pending| pending.txid == transaction && pending.owner != raw.owner)
+        {
+            return false;
+        }
+        let Some(pending) = self
+            .pending_table_def(table)
+            .filter(|pending| pending.txid == transaction)
+        else {
+            return false;
+        };
+        let committed = self.tables[table].definition();
+        if owner.table_schema != committed.schema || owner.table != committed.name {
+            return false;
+        }
+        committed
+            .column_index(owner.column.as_str())
+            .and_then(|index| pending.column_mapping[index])
+            .is_some_and(|name| current.column_index(name.as_str()).is_some())
+    }
+
     pub fn generated_sequence_slot(
         &self,
         table_schema: &str,
@@ -41995,7 +42168,7 @@ impl Storage {
                 table_schema,
                 table,
                 column,
-                GeneratedSequenceScope::Owned,
+                GeneratedSequenceScope::Identity,
                 txid,
             ) {
                 return Some(sequence);
@@ -42021,7 +42194,7 @@ impl Storage {
                     definition.schema.as_str(),
                     definition.name.as_str(),
                     column,
-                    GeneratedSequenceScope::Owned,
+                    GeneratedSequenceScope::Identity,
                     txid,
                 ) {
                     return Some(sequence);
@@ -42038,7 +42211,11 @@ impl Storage {
                 sequence.database == current_database()
                     && sequence.visible_to(txid)
                     && matches!(
-                        sequence.definition_for(txid).owner,
+                        match scope {
+                            GeneratedSequenceScope::Owned => sequence.definition_for(txid).owner,
+                            GeneratedSequenceScope::Identity => sequence.definition_for(txid).generator_for,
+                            GeneratedSequenceScope::PartitionRoot => unreachable!("partition traversal returns before direct lookup"),
+                        },
                         Some(owner)
                             if owner.table_schema.as_str() == table_schema
                                 && owner.table.as_str() == table
@@ -42079,7 +42256,11 @@ impl Storage {
                 sequence.database == current_database()
                     && sequence.visible_to(txid)
                     && matches!(
-                        sequence.definition_for(txid).owner,
+                        match scope {
+                            GeneratedSequenceScope::Owned => sequence.definition_for(txid).owner,
+                            GeneratedSequenceScope::Identity => sequence.definition_for(txid).generator_for,
+                            GeneratedSequenceScope::PartitionRoot => unreachable!("partition traversal returns before direct lookup"),
+                        },
                         Some(owner)
                             if owner.table_schema == committed.schema
                                 && owner.table == committed.name
@@ -44745,42 +44926,24 @@ impl Storage {
     /// identities. Domains deliberately use their base representation at
     /// runtime, so their OID belongs at this boundary rather than being
     /// inferred from an erased datum.
+    #[cfg(test)]
     pub(crate) fn routine_slot_for_call_oids(
         &self,
         name: &str,
         argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
-        self.routine_slot_for_call_syntax_oids(name, argument_type_oids, false, txid)
-    }
-
-    pub(crate) fn routine_slot_for_call_syntax_oids(
-        &self,
-        name: &str,
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<usize> {
-        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS {
-            return None;
-        }
-        if !explicit_variadic
-            && let Some(slot) = self.routine_slot_on_path_oids(
-                name,
-                argument_type_oids,
-                txid,
-                RoutineCallKind::Scalar,
-            )
-        {
-            return Some(slot);
-        }
-        self.variadic_routine_slot_on_path_oids(
+        match self.select_routine_call(
             name,
+            &[],
             argument_type_oids,
-            explicit_variadic,
+            false,
             txid,
             RoutineCallKind::Scalar,
-        )
+        ) {
+            RoutineCallSelection::Stored(slot) => Some(slot),
+            _ => None,
+        }
     }
 
     pub(crate) fn routine_slot_for_function_call_syntax_oids(
@@ -44790,120 +44953,20 @@ impl Storage {
         explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
-        if !explicit_variadic
-            && let Some(slot) =
-                self.routine_slot_for_function_call_oids(name, argument_type_oids, txid)
-        {
-            return Some(slot);
-        }
-        self.variadic_routine_slot_on_path_oids(
+        match self.select_routine_call(
             name,
+            &[],
             argument_type_oids,
             explicit_variadic,
             txid,
             RoutineCallKind::Function,
-        )
-    }
-
-    fn variadic_routine_slot_on_path_oids(
-        &self,
-        name: &str,
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-        kind: RoutineCallKind,
-    ) -> Option<usize> {
-        let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self
-                .routine_candidates(schema, routine_name, txid, kind)
-                .filter_map(|(slot, definition)| {
-                    let variadic_index = definition.arguments().len().checked_sub(1)?;
-                    let variadic_parameter = definition.parameter_for_input(variadic_index)?;
-                    let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
-                        return None;
-                    };
-                    let ColType::Array(element) = variadic_parameter.ctype else {
-                        return None;
-                    };
-                    let fixed = &definition.arguments()[..variadic_index];
-                    if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
-                        || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
-                        || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid)
-                                .is_some_and(|expected| {
-                                    self.routine_implicit_cast(*oid, expected, txid)
-                                })
-                        })
-                    {
-                        return None;
-                    }
-                    let expected = if explicit_variadic {
-                        self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
-                    } else {
-                        element.element_oid()
-                    };
-                    argument_type_oids[variadic_index..]
-                        .iter()
-                        .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
-                        .then_some(slot)
-                });
-            let first = candidates.next();
-            if first.is_some() && candidates.next().is_none() {
-                first
-            } else {
-                None
-            }
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
+        ) {
+            RoutineCallSelection::Stored(slot) => Some(slot),
+            RoutineCallSelection::Builtin { .. }
+            | RoutineCallSelection::Absent
+            | RoutineCallSelection::Ambiguous
+            | RoutineCallSelection::WrongKind { .. } => None,
         }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            resolve(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-            )
-        })
-    }
-
-    pub(crate) fn routine_slot_for_named_call_oids(
-        &self,
-        name: &str,
-        argument_names: &[Option<&str>],
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<usize> {
-        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
-            || argument_names.len() != argument_type_oids.len()
-        {
-            return None;
-        }
-        let resolve = |schema: &str, routine_name: &str| {
-            self.routine_slot_in_named_oids(
-                schema,
-                routine_name,
-                argument_names,
-                argument_type_oids,
-                explicit_variadic,
-                txid,
-                RoutineCallKind::Scalar,
-            )
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
-        }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            resolve(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-            )
-        })
     }
 
     pub(crate) fn routine_slot_for_named_function_call_oids(
@@ -44914,36 +44977,23 @@ impl Storage {
         explicit_variadic: bool,
         txid: u32,
     ) -> Option<usize> {
-        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
-            || argument_names.len() != argument_type_oids.len()
-        {
-            return None;
+        match self.select_routine_call(
+            name,
+            argument_names,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Function,
+        ) {
+            RoutineCallSelection::Stored(slot) => Some(slot),
+            RoutineCallSelection::Builtin { .. }
+            | RoutineCallSelection::Absent
+            | RoutineCallSelection::Ambiguous
+            | RoutineCallSelection::WrongKind { .. } => None,
         }
-        let resolve = |schema: &str, routine_name: &str| {
-            self.routine_slot_in_named_oids(
-                schema,
-                routine_name,
-                argument_names,
-                argument_type_oids,
-                explicit_variadic,
-                txid,
-                RoutineCallKind::Function,
-            )
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
-        }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            resolve(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-            )
-        })
     }
 
+    #[cfg(test)]
     pub(crate) fn routine_for_call_oids(
         &self,
         name: &str,
@@ -44979,16 +45029,6 @@ impl Storage {
         })
     }
 
-    pub(crate) fn function_for_call_oids(
-        &self,
-        name: &str,
-        argument_type_oids: &[i32],
-        txid: u32,
-    ) -> Option<RoutineDef> {
-        self.routine_slot_for_function_call_oids(name, argument_type_oids, txid)
-            .and_then(|slot| self.routine_for_bound_call(slot, argument_type_oids, txid))
-    }
-
     pub(crate) fn function_for_call_syntax_oids(
         &self,
         name: &str,
@@ -44996,24 +45036,18 @@ impl Storage {
         explicit_variadic: bool,
         txid: u32,
     ) -> Option<RoutineDef> {
-        if !explicit_variadic
-            && let Some(routine) = self.function_for_call_oids(name, argument_type_oids, txid)
-        {
-            return Some(routine);
-        }
-        let slot = self.variadic_routine_slot_on_path_oids(
+        let RoutineCallSelection::Stored(slot) = self.select_routine_call(
             name,
+            &[],
             argument_type_oids,
             explicit_variadic,
             txid,
             RoutineCallKind::Function,
-        )?;
-        let routine = self.routine_for(slot, txid);
-        let mut declared_oids = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-        for (index, argument) in routine.arguments().iter().enumerate() {
-            declared_oids[index] = self.routine_argument_oid(argument, txid)?;
-        }
-        self.routine_for_bound_call(slot, &declared_oids[..routine.argument_count], txid)
+        ) else {
+            return None;
+        };
+        let oid = routine_oid(&self.routine_for(slot, txid));
+        self.function_for_captured_call(oid, &[], argument_type_oids, explicit_variadic, txid)
     }
 
     pub(crate) fn captured_routine_slot_for_call(
@@ -45349,21 +45383,8 @@ impl Storage {
         self.has_routine_candidate(name, arity, txid, |kind, _| kind.is_set_returning())
     }
 
-    pub(crate) fn has_function_routine_candidate(
-        &self,
-        name: &str,
-        arity: usize,
-        txid: u32,
-    ) -> bool {
-        self.has_routine_candidate(name, arity, txid, |kind, _| {
-            matches!(
-                kind,
-                RoutineKind::Function { .. }
-                    | RoutineKind::SetFunction { .. }
-                    | RoutineKind::RecordFunction { .. }
-                    | RoutineKind::TableFunction
-            )
-        })
+    pub(crate) fn has_callable_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
+        self.has_routine_candidate(name, arity, txid, |_, _| true)
     }
 
     pub(crate) fn has_volatile_function_routine_candidate(
@@ -45424,6 +45445,7 @@ impl Storage {
         self.routine_type_oid(result.ctype, result.user_type, txid)
     }
 
+    #[cfg(test)]
     pub(crate) fn procedure_slot_for_call_oids(
         &self,
         name: &str,
@@ -45431,243 +45453,6 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Procedure)
-    }
-
-    pub(crate) fn procedure_slot_for_call_syntax_oids(
-        &self,
-        name: &str,
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<usize> {
-        if !explicit_variadic
-            && let Some(slot) = self.procedure_slot_for_call_oids(name, argument_type_oids, txid)
-        {
-            return Some(slot);
-        }
-        self.variadic_routine_slot_on_path_oids(
-            name,
-            argument_type_oids,
-            explicit_variadic,
-            txid,
-            RoutineCallKind::Procedure,
-        )
-    }
-
-    pub(crate) fn procedure_slot_for_named_call_oids(
-        &self,
-        name: &str,
-        argument_names: &[Option<&str>],
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<usize> {
-        let resolve = |schema: &str, routine_name: &str| {
-            self.routine_slot_in_named_oids(
-                schema,
-                routine_name,
-                argument_names,
-                argument_type_oids,
-                explicit_variadic,
-                txid,
-                RoutineCallKind::Procedure,
-            )
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
-        }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            resolve(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-            )
-        })
-    }
-
-    pub(crate) fn procedure_slot_for_call_shape(
-        &self,
-        name: &str,
-        argument_names: &[Option<&str>],
-        argument_count: usize,
-        explicit_variadic: bool,
-        txid: u32,
-    ) -> Option<usize> {
-        let resolve = |schema: &str, routine_name: &str| {
-            let mut candidates = self.routine_entries().filter_map(|(slot, routine)| {
-                let definition = routine.definition_for(txid);
-                (routine.database == current_database()
-                    && routine.visible_to(txid)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == routine_name
-                    && definition
-                        .procedure_call_mapping(argument_names, argument_count, explicit_variadic)
-                        .is_some())
-                .then_some(slot)
-            });
-            let first = candidates.next();
-            if first.is_some() && candidates.next().is_none() {
-                first
-            } else {
-                None
-            }
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
-        }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            resolve(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-            )
-        })
-    }
-
-    /// Resolves protocol parameter OIDs for a CALL before its Bind values
-    /// exist. OUT placeholders and input arguments both derive their type from
-    /// the unique procedure declaration.
-    pub(crate) fn procedure_call_parameter_oids(
-        &self,
-        name: &str,
-        argument_names: &[Option<&str>],
-        explicit_variadic: bool,
-        actual_oids: &[i32],
-        txid: u32,
-    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
-        if actual_oids.len() > MAX_ROUTINE_ARGUMENTS
-            || (!argument_names.is_empty() && argument_names.len() != actual_oids.len())
-        {
-            return None;
-        }
-        let resolve = |schema: &str, routine_name: &str| {
-            let mut found = None;
-            for (_, stored) in self.routine_entries() {
-                let routine = stored.definition_for(txid);
-                if stored.database != current_database()
-                    || !stored.visible_to(txid)
-                    || !matches!(routine.kind, RoutineKind::Procedure)
-                    || routine.schema_for(txid).as_str() != schema
-                    || routine.name_for(txid).as_str() != routine_name
-                {
-                    continue;
-                }
-                let output_call = routine
-                    .parameters()
-                    .iter()
-                    .any(|parameter| parameter.mode.is_output());
-                let input_mapping = if output_call {
-                    let Some(mapping) = routine.procedure_call_mapping(
-                        argument_names,
-                        actual_oids.len(),
-                        explicit_variadic,
-                    ) else {
-                        continue;
-                    };
-                    mapping
-                } else {
-                    let Some(mapping) = routine.call_input_mapping(
-                        argument_names,
-                        actual_oids.len(),
-                        explicit_variadic,
-                    ) else {
-                        continue;
-                    };
-                    mapping
-                };
-                let variadic_input =
-                    routine
-                        .arguments()
-                        .iter()
-                        .enumerate()
-                        .find_map(|(input_index, _)| {
-                            matches!(
-                                routine.parameter_for_input(input_index)?.mode,
-                                RoutineParameterMode::Variadic { .. }
-                            )
-                            .then_some(input_index)
-                        });
-                let mut expected = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-                let mut matches = true;
-                for (call_index, actual_oid) in actual_oids.iter().copied().enumerate() {
-                    let (polymorphic, expected_oid) =
-                        if output_call && input_mapping[call_index] == u8::MAX {
-                            let parameter_index =
-                                match argument_names.get(call_index).copied().flatten() {
-                                    Some(name) => routine
-                                        .parameters()
-                                        .iter()
-                                        .position(|parameter| parameter.name.as_str() == name)?,
-                                    None => call_index,
-                                };
-                            let parameter = *routine.parameters().get(parameter_index)?;
-                            let expected_oid =
-                                self.routine_type_oid(parameter.ctype, parameter.user_type, txid)?;
-                            (
-                                polymorphic_type(parameter.ctype, parameter.user_type),
-                                expected_oid,
-                            )
-                        } else {
-                            let input_index = usize::from(input_mapping[call_index]);
-                            let argument = routine.arguments()[input_index];
-                            let expected_oid =
-                                if !explicit_variadic && variadic_input == Some(input_index) {
-                                    match argument.ctype {
-                                        ColType::Array(element) => element.element_oid(),
-                                        _ => return None,
-                                    }
-                                } else {
-                                    self.routine_argument_oid(&argument, txid)?
-                                };
-                            (argument.polymorphic_type(), expected_oid)
-                        };
-                    expected[call_index] = if polymorphic.is_some() {
-                        actual_oid
-                    } else {
-                        expected_oid
-                    };
-                    if actual_oid != crate::sql::types::oid::UNKNOWN
-                        && polymorphic.is_none()
-                        && !self.routine_implicit_cast(actual_oid, expected_oid, txid)
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                if !matches {
-                    continue;
-                }
-                if found.replace(expected).is_some() {
-                    return None;
-                }
-            }
-            found
-        };
-        if let Some((schema, routine_name)) = name.split_once('.') {
-            return resolve(schema, routine_name);
-        }
-        for entry in self.path().entries() {
-            let PathEntry::Schema(schema_slot) = entry else {
-                continue;
-            };
-            let schema = self.schema_def_for(*schema_slot as usize, txid).name;
-            if let Some(expected) = resolve(schema.as_str(), name) {
-                return Some(expected);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
-        self.routine_slot_on_path(name, &[], txid, RoutineCallKind::Trigger)
-    }
-
-    pub(crate) fn event_trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
-        self.routine_slot_on_path(name, &[], txid, RoutineCallKind::EventTrigger)
     }
 
     fn routine_slot_on_path(
@@ -45701,21 +45486,15 @@ impl Storage {
         txid: u32,
         kind: RoutineCallKind,
     ) -> Option<usize> {
-        if let Some((schema, name)) = name.split_once('.') {
-            return self.routine_slot_in_oids(schema, name, argument_type_oids, txid, kind);
+        match self.select_routine_call(name, &[], argument_type_oids, false, txid, kind) {
+            RoutineCallSelection::Stored(slot) => kind
+                .accepts(self.routine_for(slot, txid).kind)
+                .then_some(slot),
+            RoutineCallSelection::Builtin { .. }
+            | RoutineCallSelection::Absent
+            | RoutineCallSelection::Ambiguous
+            | RoutineCallSelection::WrongKind { .. } => None,
         }
-        self.path().entries().iter().find_map(|entry| {
-            let PathEntry::Schema(slot) = entry else {
-                return None;
-            };
-            self.routine_slot_in_oids(
-                self.schema_def_for(*slot as usize, txid).name.as_str(),
-                name,
-                argument_type_oids,
-                txid,
-                kind,
-            )
-        })
     }
 
     fn routine_slot_in(
@@ -45755,133 +45534,6 @@ impl Storage {
             _ => Some(actual),
         };
         actual.is_some_and(|actual| self.routine_argument_oid(expected, txid) == Some(actual))
-    }
-
-    fn routine_slot_in_oids(
-        &self,
-        schema: &str,
-        name: &str,
-        argument_type_oids: &[i32],
-        txid: u32,
-        kind: RoutineCallKind,
-    ) -> Option<usize> {
-        let exact =
-            self.routine_candidates(schema, name, txid, kind)
-                .find_map(|(slot, definition)| {
-                    (definition.argument_count == argument_type_oids.len()
-                        && definition.arguments().iter().zip(argument_type_oids).all(
-                            |(argument, oid)| {
-                                self.routine_argument_oid(argument, txid) == Some(*oid)
-                            },
-                        ))
-                    .then_some(slot)
-                });
-        if exact.is_some() {
-            return exact;
-        }
-        let accepts = |definition: &RoutineInputSignature| {
-            definition.accepts_input_arity(argument_type_oids.len())
-                && definition.arguments()[..argument_type_oids.len()]
-                    .iter()
-                    .zip(argument_type_oids)
-                    .all(|(argument, oid)| {
-                        self.routine_argument_oid(argument, txid)
-                            .is_some_and(|expected| {
-                                self.routine_implicit_cast(*oid, expected, txid)
-                            })
-                    })
-        };
-        let score = |definition: &RoutineInputSignature| {
-            definition
-                .arguments()
-                .iter()
-                .zip(argument_type_oids)
-                .filter(|(argument, oid)| self.routine_best_match_input(**oid, argument, txid))
-                .count()
-        };
-        let best_score = self
-            .routine_candidates(schema, name, txid, kind)
-            .filter_map(|(_, definition)| accepts(&definition).then(|| score(&definition)))
-            .max();
-        let mut preferences = RoutineStringPreferences::EMPTY;
-        if argument_type_oids.contains(&crate::sql::types::oid::UNKNOWN) {
-            for (_, definition) in self.routine_candidates(schema, name, txid, kind) {
-                if !accepts(&definition) || Some(score(&definition)) != best_score {
-                    continue;
-                }
-                for (index, (argument, oid)) in definition
-                    .arguments()
-                    .iter()
-                    .zip(argument_type_oids)
-                    .enumerate()
-                {
-                    if *oid == crate::sql::types::oid::UNKNOWN {
-                        preferences.observe(index, argument);
-                    }
-                }
-            }
-        }
-        let concrete = self
-            .routine_candidates(schema, name, txid, kind)
-            .filter_map(|(slot, definition)| {
-                (accepts(&definition)
-                    && Some(score(&definition)) == best_score
-                    && definition
-                        .arguments()
-                        .iter()
-                        .take(argument_type_oids.len())
-                        .enumerate()
-                        .all(|(index, argument)| preferences.accepts(index, argument)))
-                .then_some(slot)
-            });
-        let mut concrete = concrete;
-        let first = concrete.next();
-        if first.is_some() && concrete.next().is_none() {
-            return first;
-        }
-        let polymorphic = self
-            .routine_candidates(schema, name, txid, kind)
-            .filter_map(|(slot, definition)| {
-                (definition.accepts_input_arity(argument_type_oids.len())
-                    && self
-                        .polymorphic_call_binding(
-                            &definition.arguments()[..argument_type_oids.len()],
-                            argument_type_oids,
-                            txid,
-                        )
-                        .is_some())
-                .then_some(slot)
-            });
-        let mut polymorphic = polymorphic;
-        let first = polymorphic.next();
-        if first.is_some() && polymorphic.next().is_none() {
-            first
-        } else {
-            None
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "named routine lookup keeps variadic syntax explicit"
-    )]
-    fn routine_slot_in_named_oids(
-        &self,
-        schema: &str,
-        name: &str,
-        argument_names: &[Option<&str>],
-        argument_type_oids: &[i32],
-        explicit_variadic: bool,
-        txid: u32,
-        call_kind: RoutineCallKind,
-    ) -> Option<usize> {
-        self.routine_slot_in_candidates(
-            argument_names,
-            argument_type_oids,
-            explicit_variadic,
-            txid,
-            || self.routine_candidates(schema, name, txid, call_kind),
-        )
     }
 
     fn routine_slot_in_candidates<F, I>(
@@ -46089,6 +45741,13 @@ impl Storage {
     }
 
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
+        if let Some(kind) = PolymorphicType::from_oid(type_oid) {
+            return Some(RoutineResult {
+                ctype: ColType::Text,
+                user_type: Some(UserTypeName::polymorphic(kind)),
+            });
+        }
+
         let Some((kind, creation, array)) = NamedTypeKind::from_oid(type_oid) else {
             return ColType::from_oid(type_oid).map(RoutineResult::builtin);
         };
@@ -47725,7 +47384,7 @@ impl Storage {
                 name,
                 txid,
             ),
-            PathEntry::Catalog => None,
+            PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
         })
     }
 
@@ -48405,7 +48064,7 @@ impl Storage {
                 name,
                 txid,
             ),
-            PathEntry::Catalog => None,
+            PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
         })
     }
 
@@ -52215,6 +51874,7 @@ impl Storage {
                     txid,
                 ),
                 PathEntry::Catalog => self.text_search_slot(kind, "pg_catalog", name, txid),
+                PathEntry::InformationSchema | PathEntry::Toast => None,
             }),
         }
     }
@@ -52267,7 +51927,7 @@ impl Storage {
                     name,
                     txid,
                 ),
-                PathEntry::Catalog => None,
+                PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
             }),
         }
     }
@@ -52332,7 +51992,7 @@ impl Storage {
                     name,
                     txid,
                 ),
-                PathEntry::Catalog => None,
+                PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
             }),
         }
     }
@@ -54417,7 +54077,7 @@ impl Storage {
     fn operator_schema_matches_path(&self, schema: SqlName, txid: u32) -> bool {
         self.path().entries().iter().any(|entry| match entry {
             PathEntry::Schema(slot) => self.schema_def_for(*slot as usize, txid).name == schema,
-            PathEntry::Catalog => false,
+            PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => false,
         })
     }
 

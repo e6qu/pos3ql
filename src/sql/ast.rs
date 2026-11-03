@@ -5546,6 +5546,13 @@ pub enum CastBinding {
     Builtin,
 }
 
+/// Distinguishes SQL grammar constructs from ordinary namespace-resolved calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Routine,
+    SqlSyntax,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5611,6 +5618,7 @@ pub enum Expr<'a> {
     /// `count(DISTINCT x)`; `order_by` carries an aggregate's `ORDER BY`
     /// (e.g. `string_agg(x, ',' ORDER BY y)`), empty otherwise.
     Call {
+        kind: CallKind,
         name: &'a str,
         /// Captured catalog identity for a stored call; SQL text carries names only.
         bound_oid: Option<i32>,
@@ -5871,8 +5879,8 @@ impl Expr<'_> {
     pub fn is_aggregate(&self) -> bool {
         matches!(
             self,
-            Expr::Call { name, .. }
-                if name.starts_with("__json_arrayagg_") || name.starts_with("__json_objectagg_") || matches!(name.strip_prefix("pg_catalog.").unwrap_or(name), "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "xmlagg" | "json_agg" | "json_agg_strict" | "jsonb_agg" | "jsonb_agg_strict" | "json_object_agg" | "json_object_agg_strict" | "json_object_agg_unique" | "json_object_agg_unique_strict" | "jsonb_object_agg" | "jsonb_object_agg_strict" | "jsonb_object_agg_unique" | "jsonb_object_agg_unique_strict" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy" | "range_agg" | "range_intersect_agg")
+            Expr::Call { kind, name, .. }
+                if (*kind == CallKind::SqlSyntax && (name.starts_with("__json_arrayagg_") || name.starts_with("__json_objectagg_"))) || matches!(name.strip_prefix("pg_catalog.").unwrap_or(name), "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "xmlagg" | "json_agg" | "json_agg_strict" | "jsonb_agg" | "jsonb_agg_strict" | "json_object_agg" | "json_object_agg_strict" | "json_object_agg_unique" | "json_object_agg_unique_strict" | "jsonb_object_agg" | "jsonb_object_agg_strict" | "jsonb_object_agg_unique" | "jsonb_object_agg_unique_strict" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy" | "range_agg" | "range_intersect_agg")
         )
     }
 

@@ -920,22 +920,26 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "make_interval" => {
-                // Seven positional fields (the parser desugars named arguments):
+                // Selected builtin input binding supplies seven positional fields:
                 // years, months, weeks, days, hours, mins (integers) and secs
                 // (double precision). Years fold into months and weeks into days,
                 // matching PostgreSQL's interval field composition.
                 arity(7)?;
+                let Some(values) =
+                    super::super::args::strict_arguments::<7>(args, arena, params, row, hooks)?
+                else {
+                    return Ok(Datum::Null);
+                };
                 let mut ints = [0i64; 6];
                 for (i, slot) in ints.iter_mut().enumerate() {
-                    match int_arg(name, args, i, arena, params, row, hooks)? {
-                        Some(v) => *slot = v,
-                        None => return Ok(Datum::Null),
-                    }
+                    *slot = match values[i] {
+                        Datum::Int2(value) => i64::from(value),
+                        Datum::Int4(value) => i64::from(value),
+                        Datum::Int8(value) => value,
+                        other => return Err(type_mismatch(name, &other)),
+                    };
                 }
-                let secs = match num_f64(name, args, 6, arena, params, row, hooks)? {
-                    Some(v) => v,
-                    None => return Ok(Datum::Null),
-                };
+                let secs = super::super::args::datum_f64(name, values[6])?;
                 let months = ints[0]
                     .checked_mul(12)
                     .and_then(|y| y.checked_add(ints[1]))

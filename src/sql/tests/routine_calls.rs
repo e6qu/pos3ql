@@ -2610,3 +2610,135 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
         );
     }
 }
+
+#[test]
+fn qualified_set_routines_preserve_namespaces_records_and_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("qualified-set-routine-records");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential_exact/61_qualified_set_routines.sql"
+        );
+        let requests = fixture.split("-- next request").collect::<Vec<_>>();
+        let output = session.success(&mut engine, requests[0], true);
+        assert_eq!(
+            data_rows(&output),
+            [
+                "10|1",
+                "NULL|2",
+                "30|3",
+                "x|1",
+                "NULL|2",
+                "z|3",
+                "0",
+                "0",
+                "1|1",
+                "2|2",
+                "3|3",
+                "4|4",
+                "40|1",
+                "50|2",
+                "2",
+                "3",
+                "4",
+                "5",
+                "host|localhost",
+                "port|5432",
+                "a",
+                "a",
+                "1|1",
+                "2|2",
+            ]
+        );
+        for request in &requests[1..4] {
+            let output = session.execute(&mut engine, request, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["42883"],
+                "{}: {}",
+                request,
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, requests[4], true)),
+            [
+                "1",
+                "8|1",
+                "9|2",
+                "102|3|103|104|(5)",
+                "1|3",
+                "2|4",
+                "99",
+                "1",
+                "2"
+            ]
+        );
+        for request in &requests[5..] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, request, true)),
+                ["42601"],
+                "{}",
+                request
+            );
+        }
+        let output = session.success(
+            &mut engine,
+            "SELECT (information_schema._pg_expandarray(ARRAY['typed'])).*",
+            true,
+        );
+        assert_eq!(row_description_type_oids(&output), [25, 23]);
+        assert_eq!(data_rows(&output), ["typed|1"]);
+    }
+}
+
+#[test]
+fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
+    use crate::sql::eval::CatalogAccess as _;
+    let config = test_config("bound-builtin-support-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let arena = Arena::new(&mut budget, "bound builtin arguments", 64 << 10).unwrap();
+    let catalog = query::storage_catalog(&engine.storage, &arena, 0);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    177,
+                    &[Datum::Int2(1), Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Int4(3))
+        );
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    141,
+                    &[Datum::Int2(3), Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Int4(6))
+        );
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    177,
+                    &[Datum::Null, Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT4, crate::sql::types::oid::INT4],
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Null)
+        );
+    });
+}

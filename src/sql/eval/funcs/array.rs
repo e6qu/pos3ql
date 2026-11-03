@@ -19,6 +19,19 @@ use super::super::{
     load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
 };
 
+/// Compatible-array declarations promote PostgreSQL's catalog vectors to
+/// ordinary arrays; the existing conversion preserves their zero lower bound.
+fn compatible_array_input<'a>(
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        Datum::Int2Vector { .. } => cast_to(value, ColType::Array(ArrElem::Int2), arena),
+        Datum::OidVector { .. } => cast_to(value, ColType::Array(ArrElem::Oid), arena),
+        _ => Ok(value),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ComparisonFunction {
     Equal,
@@ -358,7 +371,8 @@ pub(crate) fn dispatch<'a>(
                         if star { 1 } else { args.len() }
                     ));
                 }
-                let a = eval_full(args[0], arena, params, row, hooks)?;
+                let a =
+                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
                 let target = eval_full(args[1], arena, params, row, hooks)?;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
@@ -423,7 +437,8 @@ pub(crate) fn dispatch<'a>(
                 // 1-based indices of every element equal to the target (NULL-safe),
                 // as an int[] (`{}` when none); NULL only for a NULL array argument.
                 arity(2)?;
-                let a = eval_full(args[0], arena, params, row, hooks)?;
+                let a =
+                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
                 let target = eval_full(args[1], arena, params, row, hooks)?;
                 let (element, raw) = match a {
                     Datum::Array { element, raw } => (element, raw),
@@ -485,7 +500,10 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     (1, 0)
                 };
-                let arr = eval_full(args[array_index], arena, params, row, hooks)?;
+                let arr = compatible_array_input(
+                    eval_full(args[array_index], arena, params, row, hooks)?,
+                    arena,
+                )?;
                 let elem = eval_full(args[elem_index], arena, params, row, hooks)?;
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, Some(raw)),
@@ -554,8 +572,10 @@ pub(crate) fn dispatch<'a>(
             // `array_cat(a, b)`: concatenate two arrays of the same element type.
             "array_cat" => {
                 arity(2)?;
-                let a = eval_full(args[0], arena, params, row, hooks)?;
-                let b = eval_full(args[1], arena, params, row, hooks)?;
+                let a =
+                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
+                let b =
+                    compatible_array_input(eval_full(args[1], arena, params, row, hooks)?, arena)?;
                 match (a, b) {
                     (Datum::Array { .. }, Datum::Array { .. }) => {
                         super::super::array_concat(a, b, arena)
@@ -573,7 +593,8 @@ pub(crate) fn dispatch<'a>(
             "array_remove" | "array_replace" => {
                 let is_replace = name == "array_replace";
                 arity(if is_replace { 3 } else { 2 })?;
-                let arr = eval_full(args[0], arena, params, row, hooks)?;
+                let arr =
+                    compatible_array_input(eval_full(args[0], arena, params, row, hooks)?, arena)?;
                 let target = eval_full(args[1], arena, params, row, hooks)?;
                 let (source, raw) = match arr {
                     Datum::Array { element, raw } => (element, raw),

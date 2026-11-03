@@ -867,6 +867,7 @@ fn collect_dml_routine_calls_with_output<'a>(
         needs_scope: &mut bool,
     ) -> Result<(), SqlError> {
         if let Expr::Call {
+            kind,
             name,
             args,
             argument_names,
@@ -875,6 +876,7 @@ fn collect_dml_routine_calls_with_output<'a>(
         } = expression
         {
             record_routine_call(
+                *kind,
                 name,
                 args,
                 argument_names,
@@ -1386,14 +1388,47 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        use crate::storage::RoutineCallSelection;
+        Some(if kind == crate::sql::ast::CallKind::SqlSyntax {
+            RoutineCallSelection::Absent
+        } else if let Some(oid) = bound_oid {
+            match self.storage.routine_slot_by_oid(oid, self.txid) {
+                Some(slot) => RoutineCallSelection::Stored(slot),
+                None => RoutineCallSelection::Absent,
+            }
+        } else {
+            self.storage.select_routine_call(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            )
+        })
+    }
+
     fn routine_result(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<StaticTypeMeta> {
+        if kind == crate::sql::ast::CallKind::SqlSyntax {
+            return None;
+        }
         let routine = if let Some(oid) = bound_oid {
             self.storage.function_for_captured_call(
                 oid,
@@ -1402,12 +1437,22 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 variadic,
                 self.txid,
             )?
-        } else if argument_names.is_empty() {
-            self.storage
-                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)?
         } else {
-            self.storage.function_for_named_call_oids(
-                name,
+            let crate::storage::RoutineCallSelection::Stored(slot) =
+                self.storage.select_routine_call(
+                    name,
+                    argument_names,
+                    arguments,
+                    variadic,
+                    self.txid,
+                    crate::storage::RoutineCallKind::Function,
+                )
+            else {
+                return None;
+            };
+            let oid = crate::storage::routine_oid(&self.storage.routine_for(slot, self.txid));
+            self.storage.function_for_captured_call(
+                oid,
                 argument_names,
                 arguments,
                 variadic,
@@ -1432,35 +1477,35 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if bound_oid.is_none()
-            && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
-        {
-            return Some(field);
+        if kind == crate::sql::ast::CallKind::SqlSyntax {
+            return None;
         }
         let slot = if let Some(oid) = bound_oid {
             self.storage.routine_slot_by_oid(oid, self.txid)?
-        } else if argument_names.is_empty() {
-            if variadic {
-                self.storage
-                    .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
-            } else {
-                self.storage
-                    .routine_slot_for_function_call_oids(name, arguments, self.txid)?
-            }
         } else {
-            self.storage.routine_slot_for_named_function_call_oids(
+            match self.storage.select_routine_call(
                 name,
                 argument_names,
                 arguments,
                 variadic,
                 self.txid,
-            )?
+                crate::storage::RoutineCallKind::Function,
+            ) {
+                crate::storage::RoutineCallSelection::Stored(slot) => slot,
+                crate::storage::RoutineCallSelection::Builtin { .. } => {
+                    return intrinsic_record_field_meta(name, arguments, index);
+                }
+                crate::storage::RoutineCallSelection::Absent
+                | crate::storage::RoutineCallSelection::Ambiguous
+                | crate::storage::RoutineCallSelection::WrongKind { .. } => return None,
+            }
         };
         crate::sql::exec::catalog_routine_record_field(
             self.storage,
@@ -1770,6 +1815,7 @@ pub(super) fn stored_operator_dependency_for_call(
     reason = "routine dependency binding carries call syntax and catalog context"
 )]
 fn record_routine_call(
+    kind: crate::sql::ast::CallKind,
     name: &str,
     args: &[&Expr<'_>],
     argument_names: &[Option<&str>],
@@ -1780,7 +1826,10 @@ fn record_routine_call(
     dependencies: &mut StoredQueryDependencies,
     needs_scope: &mut bool,
 ) -> Result<(), SqlError> {
-    if !storage.has_function_routine_candidate(name, args.len(), txid) {
+    if kind == crate::sql::ast::CallKind::SqlSyntax {
+        return Ok(());
+    }
+    if !storage.has_callable_candidate(name, args.len(), txid) {
         return Ok(());
     }
     if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
@@ -1800,19 +1849,38 @@ fn record_routine_call(
         }
     }
     let argument_oids = &argument_oids[..args.len()];
-    let resolved = if argument_names.is_empty() {
-        storage.routine_slot_for_function_call_syntax_oids(name, argument_oids, variadic, txid)
-    } else {
-        storage.routine_slot_for_named_function_call_oids(
-            name,
-            argument_names,
-            argument_oids,
-            variadic,
-            txid,
-        )
-    };
-    let Some(slot) = resolved else {
-        return Ok(());
+    let slot = match storage.select_routine_call(
+        name,
+        argument_names,
+        argument_oids,
+        variadic,
+        txid,
+        crate::storage::RoutineCallKind::Function,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Builtin { .. } => return Ok(()),
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "function {} is not unique",
+                name
+            ));
+        }
+        crate::storage::RoutineCallSelection::WrongKind { is_procedure } => {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} {} cannot be used in a function call",
+                if is_procedure { "procedure" } else { "routine" },
+                name
+            ));
+        }
+        crate::storage::RoutineCallSelection::Absent => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist for these argument types",
+                name
+            ));
+        }
     };
     let routine = storage.routine_for(slot, txid);
     let (referenced_schema, referenced_name) = name
@@ -1910,6 +1978,7 @@ fn collect_routine_dependencies_with_resolver(
         needs_scope: &mut bool,
     ) -> Result<(), SqlError> {
         if let Expr::Call {
+            kind,
             name,
             args,
             argument_names,
@@ -1917,7 +1986,10 @@ fn collect_routine_dependencies_with_resolver(
             ..
         } = expression
         {
-            if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+            if let Some((schema, operator)) = (*kind == crate::sql::ast::CallKind::SqlSyntax)
+                .then(|| crate::sql::ast::catalog_operator_call(name))
+                .flatten()
+            {
                 if (1..=2).contains(&args.len())
                     && !schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
                 {
@@ -1936,6 +2008,7 @@ fn collect_routine_dependencies_with_resolver(
                 }
             } else {
                 record_routine_call(
+                    *kind,
                     name,
                     args,
                     argument_names,
@@ -1993,6 +2066,7 @@ fn collect_routine_dependencies_with_resolver(
             table.table
         };
         record_routine_call(
+            crate::sql::ast::CallKind::Routine,
             name,
             args,
             table.func_argument_names,
@@ -2478,7 +2552,7 @@ fn collect_expression<'a>(
                     name.name,
                     txid,
                 ),
-                PathEntry::Catalog => None,
+                PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => None,
             }),
         };
         let slot = found.ok_or_else(|| {
@@ -2500,12 +2574,22 @@ fn collect_expression<'a>(
             referenced_name: SqlName::parse(name.name)?,
         })?;
     }
-    if let Expr::Call { name, args, .. } = expression
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        args,
+        ..
+    } = expression
         && let Some(sequence_name) = bound_sequence_literal(name, args)
     {
         collect_sequence(sequence_name, storage, txid, path, dependencies)?;
     }
-    if let Expr::Call { name, args, .. } = expression
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        args,
+        ..
+    } = expression
         && let Some(configuration_name) = text_search_config_literal(name, args)
     {
         collect_text_search_configuration(configuration_name, storage, txid, dependencies)?;
@@ -2514,7 +2598,12 @@ fn collect_expression<'a>(
     // synthetic calls. Those names are every bit as durable as an ordinary
     // cast and must therefore participate in DROP/rename/rebind dependency
     // handling.
-    if let Expr::Call { name, args, .. } = expression
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = expression
         && matches!(
             *name,
             "__json_table_value" | "__json_table_exists" | "__json_record_column"
@@ -2731,7 +2820,7 @@ fn collect_type(
     for entry in path.entries() {
         match entry {
             PathEntry::Catalog if ColType::from_sql_name(bare).is_some() => return Ok(()),
-            PathEntry::Catalog => {}
+            PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => {}
             PathEntry::Schema(schema_slot) => {
                 let schema = storage.schema_def(*schema_slot as usize).name;
                 if let Some(slot) = storage.domain_slot(schema.as_str(), bare, txid) {
@@ -2950,7 +3039,9 @@ fn collect_sequence(
                                         storage.schema_def_for(*schema_slot as usize, txid).name;
                                     storage.sequence_slot(schema.as_str(), name, txid)
                                 }
-                                PathEntry::Catalog => None,
+                                PathEntry::Catalog
+                                | PathEntry::InformationSchema
+                                | PathEntry::Toast => None,
                             })
                         })
                 };

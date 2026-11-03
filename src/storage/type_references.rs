@@ -1221,6 +1221,7 @@ impl super::Storage {
         for entry in self.path().entries() {
             let slot = match entry {
                 super::PathEntry::Schema(slot) => slot,
+                super::PathEntry::InformationSchema | super::PathEntry::Toast => continue,
                 super::PathEntry::Catalog => {
                     if let Some(builtin) = ColType::from_sql_name(name.as_str()) {
                         return Err(sql_err!(

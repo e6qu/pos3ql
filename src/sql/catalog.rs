@@ -195,6 +195,135 @@ macro_rules! intrinsic {
     };
 }
 
+#[path = "catalog_callable_signatures.rs"]
+mod callable_signatures;
+
+/// Catalog properties and executable input declarations share one PG snapshot.
+pub(crate) struct BuiltinCallableCatalog {
+    pub volatility: &'static str,
+    pub parallel: &'static str,
+    pub strict: bool,
+    pub leakproof: bool,
+    pub security_definer: bool,
+    pub language: i32,
+    pub source: &'static str,
+    pub cost: f64,
+    pub rows: f64,
+    pub support: i32,
+    pub support_name: &'static str,
+    pub all_arguments: &'static [i32],
+    pub modes: &'static [u8],
+    pub all_argument_names: &'static [&'static str],
+}
+
+/// Names and declared input types come from already modeled or executed families.
+pub(crate) struct BuiltinCallableSignature {
+    pub oid: i32,
+    pub schema: &'static str,
+    pub name: &'static str,
+    pub arguments: &'static [i32],
+    pub argument_names: &'static [&'static str],
+    pub required_arguments: usize,
+    pub defaults: Option<&'static str>,
+    pub variadic_element: Option<i32>,
+    pub kind: u8,
+    pub returns_set: bool,
+    pub result_oid: i32,
+    pub catalog: BuiltinCallableCatalog,
+}
+
+impl BuiltinCallableSignature {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "generated PostgreSQL callable declarations preserve independent catalog fields"
+    )]
+    const fn new(
+        oid: i32,
+        schema: &'static str,
+        name: &'static str,
+        arguments: &'static [i32],
+        argument_names: &'static [&'static str],
+        required_arguments: usize,
+        defaults: Option<&'static str>,
+        variadic_element: Option<i32>,
+        kind: u8,
+        returns_set: bool,
+        result_oid: i32,
+        catalog: BuiltinCallableCatalog,
+    ) -> Self {
+        Self {
+            oid,
+            schema,
+            name,
+            arguments,
+            argument_names,
+            required_arguments,
+            defaults,
+            variadic_element,
+            kind,
+            returns_set,
+            result_oid,
+            catalog,
+        }
+    }
+}
+
+pub(crate) fn builtin_callable_signatures(
+    name: &str,
+) -> impl Iterator<Item = &'static BuiltinCallableSignature> + '_ {
+    let first = callable_signatures::CALLABLES.partition_point(|candidate| candidate.name < name);
+    callable_signatures::CALLABLES[first..]
+        .iter()
+        .take_while(move |candidate| candidate.name == name)
+}
+
+pub(crate) fn builtin_callable_schema(name: &str) -> Option<&'static str> {
+    builtin_callable_signatures(name)
+        .next()
+        .map(|signature| signature.schema)
+}
+
+pub(crate) fn builtin_callable_by_oid(oid: i32) -> Option<&'static BuiltinCallableSignature> {
+    let index = callable_signatures::CALLABLE_OIDS
+        .binary_search_by_key(&oid, |(oid, _)| *oid)
+        .ok()?;
+    Some(&callable_signatures::CALLABLES[callable_signatures::CALLABLE_OIDS[index].1])
+}
+
+#[cfg(test)]
+mod callable_contract_tests {
+    use super::*;
+
+    #[test]
+    fn every_modeled_intrinsic_has_a_shared_callable_contract() {
+        for intrinsic in INTRINSIC_ROUTINES {
+            let signature = builtin_callable_by_oid(intrinsic.oid).unwrap_or_else(|| {
+                panic!(
+                    "modeled routine {} is missing its callable contract",
+                    intrinsic.oid
+                )
+            });
+            assert!(signature.arguments.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS);
+            assert!(signature.required_arguments <= signature.arguments.len());
+        }
+        for (oid, name, result, arguments, volatility) in [
+            (540000, "postgres_fdw_handler", 3115, &[][..], "v"),
+            (540001, "postgres_fdw_validator", 2278, &[1009, 26][..], "s"),
+        ] {
+            let declaration = builtin_callable_by_oid(oid).unwrap();
+            assert_eq!(declaration.name, name);
+            assert_eq!(declaration.result_oid, result);
+            assert_eq!(declaration.arguments, arguments);
+            assert_eq!(declaration.catalog.volatility, volatility);
+            assert_eq!(declaration.catalog.source, name);
+            assert!(declaration.catalog.strict);
+            assert_eq!(declaration.catalog.language, 12);
+            assert_eq!(declaration.catalog.parallel, "s");
+            assert!(declaration.defaults.is_none());
+        }
+    }
+}
+
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     // PostgreSQL 18.6 pg_proc.dat: both operands share the anyarray type.
     // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
@@ -4312,110 +4441,6 @@ fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {
     }
 }
 
-fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
-    !matches!(
-        routine.oid,
-        376 | 394
-            | 1081
-            | 1271
-            | 1289
-            | 1290
-            | 1304
-            | 1305
-            | 1306
-            | 1307
-            | 1308
-            | 1309
-            | 1310
-            | 1311
-            | 1843
-            | 1844
-            | 2041
-            | 2042
-            | 2043
-            | 2044
-            | 2078
-            | 2106
-            | 2112
-            | 2113
-            | 2122
-            | 2123
-            | 2124
-            | 2125
-            | 2126
-            | 2127
-            | 2128
-            | 2137
-            | 2138
-            | 2139
-            | 2140
-            | 2141
-            | 2142
-            | 2143
-            | 2144
-            | 2230
-            | 2242
-            | 2243
-            | 2274
-            | 2307
-            | 2797
-            | 2798
-            | 2900
-            | 2901
-            | 3058
-            | 3059
-            | 3205
-            | 3209
-            | 3325
-            | 3434
-            | 3475
-            | 3491
-            | 3539
-            | 3540
-            | 3543
-            | 3544
-            | 3545
-            | 3549
-            | 3564
-            | 3565
-            | 3775
-            | 3840
-            | 3841
-            | 3844
-            | 3845
-            | 3933
-            | 3934
-            | 3937
-            | 3938
-            | 3941
-            | 3942
-            | 3945
-            | 3946
-            | 3960
-            | 3961
-            | 4189
-            | 4190
-            | 4299
-            | 4300
-            | 4301
-            | 4389
-            | 4450
-            | 6160
-            | 6161
-            | 6167
-            | 6170
-            | 6225
-            | 6226
-            | 6227
-            | 6232
-            | 6299
-            | 6326
-            | 6338
-            | 6395
-            | 6396
-    )
-}
-
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
@@ -4452,359 +4477,6 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 2511
             | 3035
     )
-}
-
-fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
-    match routine.oid {
-        715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
-        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
-        | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
-        1181
-        | 2137
-        | 2230
-        | 1598
-        | 1599
-        | 1641
-        | 2026
-        | 3035
-        | 3296
-        | 2511
-        | 2880..=2892
-        | 3089..=3096
-        | 3566
-        | 4568
-        | 6212
-        | 3952
-        | 3999
-        | 4014
-        | 6339
-        | 6340
-        | 6341 => "r",
-        _ => "s",
-    }
-}
-
-fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
-    match routine.oid {
-        1191 => "generate_subscripts",
-        1192 => "generate_subscripts_nodir",
-        1066 => "generate_series_step_int4",
-        1067 => "generate_series_int4",
-        1068 => "generate_series_step_int8",
-        1069 => "generate_series_int8",
-        3259 => "generate_series_step_numeric",
-        3260 => "generate_series_numeric",
-        938 => "generate_series_timestamp",
-        939 => "generate_series_timestamptz",
-        6274 => "generate_series_timestamptz_at_zone",
-        2026 => "pg_backend_pid",
-        2561 => "pg_blocking_pids",
-        2171 => "pg_cancel_backend",
-        2096 => "pg_terminate_backend",
-        2880 => "pg_advisory_lock_int8",
-        2881 => "pg_advisory_lock_shared_int8",
-        2882 => "pg_try_advisory_lock_int8",
-        2883 => "pg_try_advisory_lock_shared_int8",
-        2884 => "pg_advisory_unlock_int8",
-        2885 => "pg_advisory_unlock_shared_int8",
-        2886 => "pg_advisory_lock_int4",
-        2887 => "pg_advisory_lock_shared_int4",
-        2888 => "pg_try_advisory_lock_int4",
-        2889 => "pg_try_advisory_lock_shared_int4",
-        2890 => "pg_advisory_unlock_int4",
-        2891 => "pg_advisory_unlock_shared_int4",
-        2892 => "pg_advisory_unlock_all",
-        3089 => "pg_advisory_xact_lock_int8",
-        3090 => "pg_advisory_xact_lock_shared_int8",
-        3091 => "pg_try_advisory_xact_lock_int8",
-        3092 => "pg_try_advisory_xact_lock_shared_int8",
-        3093 => "pg_advisory_xact_lock_int4",
-        3094 => "pg_advisory_xact_lock_shared_int4",
-        3095 => "pg_try_advisory_xact_lock_int4",
-        3096 => "pg_try_advisory_xact_lock_shared_int4",
-        1062 => "aclitem_eq",
-        3000 => "has_foreign_data_wrapper_privilege_name_name",
-        3001 => "has_foreign_data_wrapper_privilege_name_id",
-        3002 => "has_foreign_data_wrapper_privilege_id_name",
-        3003 => "has_foreign_data_wrapper_privilege_id_id",
-        3004 => "has_foreign_data_wrapper_privilege_name",
-        3005 => "has_foreign_data_wrapper_privilege_id",
-        3006 => "has_server_privilege_name_name",
-        3007 => "has_server_privilege_name_id",
-        3008 => "has_server_privilege_id_name",
-        3009 => "has_server_privilege_id_id",
-        3010 => "has_server_privilege_name",
-        3011 => "has_server_privilege_id",
-        3943 => "acldefault_sql",
-        4189 | 4190 => "aggregate_dummy",
-        5023 => "",
-        6103 => "numeric_pg_lsn",
-        6348 => "has_largeobject_privilege_name_id",
-        6349 => "has_largeobject_privilege_id",
-        6350 => "has_largeobject_privilege_id_id",
-        89 => "pgsql_version",
-        376 => "text_to_array_null",
-        394 => "text_to_array",
-        720 | 2010 => "byteaoctetlen",
-        749 => "byteaoverlay",
-        752 => "byteaoverlay_no_len",
-        849 | 868 => "textpos",
-        877 | 936 => "text_substr",
-        879 | 880 | 1810 | 1811 | 1812 | 2074 => "",
-        881 => "ltrim1",
-        882 => "rtrim1",
-        883 | 937 => "text_substr_no_len",
-        885 => "btrim1",
-        1285 => "select pg_catalog.quote_literal($1::pg_catalog.text)",
-        1290 => "select pg_catalog.quote_nullable($1::pg_catalog.text)",
-        1317 | 1369 | 1381 => "textlen",
-        1318 | 1367 | 1372 => "bpcharlen",
-        1374 => "textoctetlen",
-        1375 => "bpcharoctetlen",
-        1404 => "textoverlay",
-        1405 => "textoverlay_no_len",
-        1530 => "lseg_length",
-        1531 => "path_length",
-        1680 => "bitsubstr",
-        1681 => "bitlength",
-        1682 => "bitoctetlength",
-        1698 => "bitposition",
-        1699 => "bitsubstr_no_len",
-        1845 => "to_ascii_default",
-        1846 => "to_ascii_enc",
-        1847 => "to_ascii_encname",
-        2012 => "bytea_substr",
-        2013 => "bytea_substr_no_len",
-        2014 => "byteapos",
-        2015 => "byteatrim",
-        2073 => "textregexsubstr",
-        1986 => "similar_to_escape_2",
-        1987 => "similar_to_escape_1",
-        2284 => "textregexreplace_noopt",
-        2285 => "textregexreplace",
-        2763 => "regexp_matches_no_flags",
-        2764 => "regexp_matches",
-        2765 => "regexp_split_to_table_no_flags",
-        2766 => "regexp_split_to_table",
-        2767 => "regexp_split_to_array_no_flags",
-        2768 => "regexp_split_to_array",
-        3396 => "regexp_match_no_flags",
-        3397 => "regexp_match",
-        6251 => "textregexreplace_extended",
-        6252 => "textregexreplace_extended_no_flags",
-        6253 => "textregexreplace_extended_no_n",
-        6254 => "regexp_count_no_start",
-        6255 => "regexp_count_no_flags",
-        6256 => "regexp_count",
-        6257 => "regexp_instr_no_start",
-        6258 => "regexp_instr_no_n",
-        6259 => "regexp_instr_no_endoption",
-        6260 => "regexp_instr_no_flags",
-        6261 => "regexp_instr_no_subexpr",
-        6262 => "regexp_instr",
-        6263 => "regexp_like_no_flags",
-        6264 => "regexp_like",
-        6265 => "regexp_substr_no_start",
-        6266 => "regexp_substr_no_n",
-        6267 => "regexp_substr_no_flags",
-        6268 => "regexp_substr_no_subexpr",
-        6269 => "regexp_substr",
-        2087 => "replace_text",
-        2085 => "bytea_substr",
-        2086 => "bytea_substr_no_len",
-        2089 => "to_hex32",
-        2090 => "to_hex64",
-        3030 => "bitoverlay",
-        3031 => "bitoverlay_no_len",
-        3058 => "text_concat",
-        3059 => "text_concat_ws",
-        3060 => "text_left",
-        3061 => "text_right",
-        3062 => "text_reverse",
-        3539 => "text_format",
-        3540 => "text_format_nv",
-        3696 => "text_starts_with",
-        3711 => "tsvector_length",
-        3848 => "range_lower",
-        3849 => "range_upper",
-        4235 => "multirange_lower",
-        4236 => "multirange_upper",
-        4350 => "unicode_normalize_func",
-        4351 => "unicode_is_normalized",
-        6160 => "text_to_table",
-        6161 => "text_to_table_null",
-        6195 => "bytealtrim",
-        6196 => "byteartrim",
-        6330 => "to_bin32",
-        6331 => "to_bin64",
-        6332 => "to_oct32",
-        6333 => "to_oct64",
-        6382 => "bytea_reverse",
-        320 => "width_bucket_float8",
-        3281 => "numeric_scale",
-        4112 => "macaddr8_trunc",
-        5042 => "numeric_min_scale",
-        5043 => "numeric_trim_scale",
-        5044 => "int4gcd",
-        5045 => "int8gcd",
-        5046 => "int4lcm",
-        5047 => "int8lcm",
-        5048 => "numeric_gcd",
-        5049 => "numeric_lcm",
-        6212 => "drandom_normal",
-        6219 => "derf",
-        6220 => "derfc",
-        6339 => "int4random",
-        6340 => "int8random",
-        6341 => "numeric_random",
-        6383 => "dgamma",
-        6384 => "dlgamma",
-        6428 => "gen_random_uuid",
-        6430 => "uuidv7_interval",
-        753 => "macaddr_trunc",
-        940 => "int2mod",
-        941 => "int4mod",
-        947 => "int8mod",
-        1194 | 1340 => "dlog10",
-        1341 => "dlog1",
-        1342 => "dround",
-        1343 => "dtrunc",
-        1344 => "dsqrt",
-        1345 => "dcbrt",
-        1346 | 1368 => "dpow",
-        1347 => "dexp",
-        1376 => "numeric_fac",
-        1394 => "float4abs",
-        1395 => "float8abs",
-        1396 => "int8abs",
-        1397 => "int4abs",
-        1398 => "int2abs",
-        1481 | 1708 | 1710 | 1741 => "",
-        1598 => "drandom",
-        1600 => "dasin",
-        1601 => "dacos",
-        1602 => "datan",
-        1603 => "datan2",
-        1604 => "dsin",
-        1605 => "dcos",
-        1606 => "dtan",
-        1607 => "dcot",
-        1610 => "dpi",
-        1705 => "numeric_abs",
-        1706 => "numeric_sign",
-        1707 => "numeric_round",
-        1709 => "numeric_trunc",
-        1711 => "numeric_ceil",
-        1712 => "numeric_floor",
-        1728 => "numeric_mod",
-        1730 => "numeric_sqrt",
-        1732 => "numeric_exp",
-        1734 => "numeric_ln",
-        1736 => "numeric_log",
-        1738 | 2169 => "numeric_power",
-        1973 => "numeric_div_trunc",
-        2167 => "numeric_ceil",
-        2170 => "width_bucket_numeric",
-        2308 | 2320 => "dceil",
-        2309 => "dfloor",
-        2310 => "dsign",
-        2462 => "dsinh",
-        2463 => "dcosh",
-        2464 => "dtanh",
-        2465 => "dasinh",
-        2466 => "dacosh",
-        2467 => "datanh",
-        2731 => "dasind",
-        2732 => "dacosd",
-        2733 => "datand",
-        2734 => "datan2d",
-        2735 => "dsind",
-        2736 => "dcosd",
-        2737 => "dtand",
-        2738 => "dcotd",
-        3218 => "width_bucket_array",
-        1026 => "timestamptz_izone",
-        1152 => "timestamp_eq",
-        1153 => "timestamp_ne",
-        1154 => "timestamp_lt",
-        1155 => "timestamp_le",
-        1156 => "timestamp_ge",
-        1157 => "timestamp_gt",
-        1159 => "timestamptz_zone",
-        1171 => "timestamptz_part",
-        1172 => "interval_part",
-        1174 => "date_timestamptz",
-        1175 => "interval_justify_hours",
-        1178 => "timestamptz_date",
-        1188 => "timestamp_mi",
-        1195 => "timestamp_smaller",
-        1196 => "timestamp_larger",
-        1199 => "timestamptz_age",
-        1200 => "interval_scale",
-        1217 => "timestamptz_trunc",
-        1218 => "interval_trunc",
-        1271 => "overlaps_timetz",
-        1272 => "datetime_timestamp",
-        1273 => "timetz_part",
-        1284 => "timestamptz_trunc_zone",
-        1295 => "interval_justify_days",
-        1176 | 1296 | 1298 | 1305 | 1306 | 1307 | 1309 | 1310 | 1311 | 1384 | 1386 | 1848
-        | 2042 | 2043 | 2044 | 2059 | 2546 | 2547 | 2548 | 2549 | 2550 => "",
-        1297 => "datetimetz_timestamptz",
-        1304 | 2041 => "overlaps_timestamp",
-        1308 => "overlaps_time",
-        1314 => "timestamp_cmp",
-        1316 => "timestamp_time",
-        1370 => "time_interval",
-        1373 => "date_finite",
-        1385 => "time_part",
-        1388 => "timestamptz_timetz",
-        1389 => "timestamp_finite",
-        1390 => "interval_finite",
-        1419 => "interval_time",
-        1961 => "timestamp_scale",
-        1967 => "timestamptz_scale",
-        1968 => "time_scale",
-        1969 => "timetz_scale",
-        2019 => "timestamptz_time",
-        2020 => "timestamp_trunc",
-        2021 => "timestamp_part",
-        2024 => "date_timestamp",
-        2025 => "datetime_timestamp",
-        2027 => "timestamptz_timestamp",
-        2028 => "timestamp_timestamptz",
-        2029 => "timestamp_date",
-        2037 => "timetz_zone",
-        2038 => "timetz_izone",
-        2046 => "timetz_time",
-        2047 => "time_timetz",
-        2048 => "timestamp_finite",
-        1359 => "datetimetz_timestamptz",
-        2058 => "timestamp_age",
-        2069 => "timestamp_zone",
-        2070 => "timestamp_izone",
-        2647 => "now",
-        2711 => "interval_justify_interval",
-        3463 => "make_timestamptz_at_timezone",
-        6177 => "timestamp_bin",
-        6178 => "timestamptz_bin",
-        6199 => "extract_date",
-        6200 => "extract_time",
-        6201 => "extract_timetz",
-        6202 => "extract_timestamp",
-        6203 => "extract_timestamptz",
-        6204 => "extract_interval",
-        6221 => "timestamptz_pl_interval",
-        6222 => "timestamptz_pl_interval_at_zone",
-        6223 => "timestamptz_mi_interval",
-        6273 => "timestamptz_mi_interval_at_zone",
-        6334 => "timestamptz_at_local",
-        6335 => "timestamp_at_local",
-        6336 => "timetz_at_local",
-        2106 | 2113 | 2122 | 2123 | 2124 | 2126 | 2127 | 2128 | 2138 | 2139 | 2140 | 2142
-        | 2143 | 2144 => "aggregate_dummy",
-        _ => routine.name,
-    }
 }
 
 const DDL_COMMAND_OUTPUT_OIDS: &[i32] = &[26, 26, 23, 25, 25, 25, 25, 16, 32];
@@ -4856,47 +4528,6 @@ const IDENTIFY_ADDRESS_OUTPUT_OIDS: &[i32] = &[25, 1009, 1009];
 const IDENTIFY_ADDRESS_OUTPUT_NAMES: &[&str] = &["type", "object_names", "object_args"];
 const OBJECT_ADDRESS_OUTPUT_OIDS: &[i32] = &[26, 26, 23];
 const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
-
-fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
-    match oid {
-        2289 => Some(&["options_array"]),
-        2307 | 3775 => Some(&["target"]),
-        2096 => Some(&["pid", "timeout"]),
-        2171 => Some(&["pid"]),
-        6119 => Some(&["pubname"]),
-        3382 | 3839 => Some(&["classid", "objid", "objsubid"]),
-        3954 => Some(&["type", "object_names", "object_args"]),
-        2284 => Some(&["string", "pattern", "replacement"]),
-        2285 => Some(&["string", "pattern", "replacement", "flags"]),
-        2763 | 2765 | 2767 | 3396 | 6254 | 6257 | 6263 | 6265 => Some(&["string", "pattern"]),
-        2764 | 2766 | 2768 | 3397 | 6264 => Some(&["string", "pattern", "flags"]),
-        6251 => Some(&["string", "pattern", "replacement", "start", "N", "flags"]),
-        6252 => Some(&["string", "pattern", "replacement", "start", "N"]),
-        6253 => Some(&["string", "pattern", "replacement", "start"]),
-        6255 | 6258 | 6266 => Some(&["string", "pattern", "start"]),
-        6256 => Some(&["string", "pattern", "start", "flags"]),
-        6259 | 6267 => Some(&["string", "pattern", "start", "N"]),
-        6260 => Some(&["string", "pattern", "start", "N", "endoption"]),
-        6261 => Some(&["string", "pattern", "start", "N", "endoption", "flags"]),
-        6262 => Some(&[
-            "string",
-            "pattern",
-            "start",
-            "N",
-            "endoption",
-            "flags",
-            "subexpr",
-        ]),
-        6268 => Some(&["string", "pattern", "start", "N", "flags"]),
-        6269 => Some(&["string", "pattern", "start", "N", "flags", "subexpr"]),
-        3461 | 3462 => Some(&["year", "month", "mday", "hour", "min", "sec"]),
-        3463 => Some(&["year", "month", "mday", "hour", "min", "sec", "timezone"]),
-        3464 => Some(&["years", "months", "weeks", "days", "hours", "mins", "secs"]),
-        3846 => Some(&["year", "month", "day"]),
-        3847 => Some(&["hour", "min", "sec"]),
-        _ => None,
-    }
-}
 
 fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
@@ -12279,7 +11910,7 @@ pub(crate) fn index_maintenance_target(
     schema: Option<&str>,
     name: &str,
 ) -> Result<Option<IndexMaintenanceTarget>, SqlError> {
-    let Some(oid) = relation_oid_for_name(storage, txid, schema, name) else {
+    let Some(oid) = relation_oid_for_name(storage, txid, schema, name).require_supported()? else {
         return Ok(None);
     };
     let mut found = None;
@@ -12334,7 +11965,7 @@ pub fn relname_text<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     let reference = |schema: &str, name: &str| {
         let mut output = StackStr::<260>::new();
-        if relation_oid_for_name(storage, txid, None, name) != Some(oid) {
+        if !relation_oid_for_name(storage, txid, None, name).matches_oid(oid) {
             write_identifier(&mut output, schema);
             let _ = output.write_char('.');
         }
@@ -12392,12 +12023,37 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
             {
                 storage.require_schema_usage(schema.as_str(), txid)?;
             }
-            Ok(relation_oid_for_name(
+            relation_oid_for_name(
                 storage,
                 txid,
                 parsed.schema.as_ref().map(SqlName::as_str),
                 parsed.name.as_str(),
-            ))
+            )
+            .require_supported()
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelationOidLookup {
+    Found(i32),
+    Missing,
+    UnsupportedInformationSchema,
+}
+
+impl RelationOidLookup {
+    fn matches_oid(self, oid: i32) -> bool {
+        matches!(self, Self::Found(selected) if selected == oid)
+    }
+
+    pub(super) fn require_supported(self) -> Result<Option<i32>, SqlError> {
+        match self {
+            Self::Found(oid) => Ok(Some(oid)),
+            Self::Missing => Ok(None),
+            Self::UnsupportedInformationSchema => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "relation OIDs for information_schema views are not supported"
+            )),
         }
     }
 }
@@ -12407,31 +12063,40 @@ pub(super) fn relation_oid_for_name(
     txid: u32,
     schema: Option<&str>,
     name: &str,
-) -> Option<i32> {
+) -> RelationOidLookup {
+    let ordinary =
+        |oid: Option<i32>| oid.map_or(RelationOidLookup::Missing, RelationOidLookup::Found);
     if let Some(schema) = schema {
+        if schema == "information_schema" && is_catalog_relation(Some(schema), name) {
+            return RelationOidLookup::UnsupportedInformationSchema;
+        }
         if schema == "pg_temp" {
-            return relation_oid_in_schema(
-                storage,
-                txid,
-                storage.temporary_schema().ok()?.as_str(),
-                name,
-            );
+            return ordinary(storage.temporary_schema().ok().and_then(|temporary| {
+                relation_oid_in_schema(storage, txid, temporary.as_str(), name)
+            }));
         }
         if schema.starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema) {
-            return None;
+            return RelationOidLookup::Missing;
         }
-        return relation_oid_in_schema(storage, txid, schema, name);
+        return ordinary(relation_oid_in_schema(storage, txid, schema, name));
     }
     if let Ok(temporary) = storage.temporary_schema()
         && let Some(oid) = relation_oid_in_schema(storage, txid, temporary.as_str(), name)
     {
-        return Some(oid);
+        return RelationOidLookup::Found(oid);
     }
     for entry in storage.path().entries() {
         let schema = match entry {
             crate::storage::PathEntry::Catalog => {
                 SqlName::parse("pg_catalog").expect("catalog name fits")
             }
+            crate::storage::PathEntry::InformationSchema => {
+                if is_catalog_relation(Some("information_schema"), name) {
+                    return RelationOidLookup::UnsupportedInformationSchema;
+                }
+                continue;
+            }
+            crate::storage::PathEntry::Toast => continue,
             crate::storage::PathEntry::Schema(slot) => {
                 let definition = storage.schema_def_for(usize::from(*slot), txid);
                 if !definition.visible_to(txid) {
@@ -12441,10 +12106,10 @@ pub(super) fn relation_oid_for_name(
             }
         };
         if let Some(oid) = relation_oid_in_schema(storage, txid, schema.as_str(), name) {
-            return Some(oid);
+            return RelationOidLookup::Found(oid);
         }
     }
-    None
+    RelationOidLookup::Missing
 }
 
 fn relation_oid_in_schema(
@@ -12476,41 +12141,29 @@ fn relation_oid_in_schema(
         .map(|slot| named_composite_relation_oid(storage, slot))
 }
 
-fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
-    let (written_schema, written_table) = split_qualified_name(written)?;
-    let in_schema = |schema: &str| {
-        (0..storage.table_count()).find(|slot| {
-            storage.table_slot_visible_to(*slot, txid)
-                && storage.table_def(*slot, txid).schema.as_str() == schema
-                && identifier_spelling_matches(
-                    written_table,
-                    storage.table_def(*slot, txid).name.as_str(),
-                )
-        })
-    };
-    if let Some(written_schema) = written_schema {
-        let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def_for(slot, txid);
-            (definition.visible_to(txid)
-                && identifier_spelling_matches(written_schema, definition.name.as_str()))
-            .then_some(definition.name)
-        })?;
-        return in_schema(schema.as_str());
-    }
-    if let Ok(schema) = storage.temporary_schema()
-        && let Some(slot) = in_schema(schema.as_str())
+fn table_slot_by_written_name(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<Option<usize>, SqlError> {
+    let parsed = crate::sql::identifiers::QualifiedObjectName::parse(written)?;
+    if parsed
+        .database
+        .is_some_and(|database| database != storage.current_database_name(txid))
     {
-        return Some(slot);
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cross-database relation references are not supported"
+        ));
     }
-    for entry in storage.path().entries() {
-        if let crate::storage::PathEntry::Schema(schema) = entry
-            && let Some(slot) =
-                in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
-        {
-            return Some(slot);
-        }
-    }
-    None
+    let oid = relation_oid_for_name(
+        storage,
+        txid,
+        parsed.schema.as_ref().map(SqlName::as_str),
+        parsed.name.as_str(),
+    )
+    .require_supported()?;
+    Ok(oid.and_then(|oid| table_slot_by_oid(storage, txid, oid)))
 }
 
 pub(crate) fn serial_sequence_name<'a>(
@@ -12520,7 +12173,7 @@ pub(crate) fn serial_sequence_name<'a>(
     column: &str,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let table_slot = table_slot_by_written_name(storage, txid, table).ok_or_else(|| {
+    let table_slot = table_slot_by_written_name(storage, txid, table)?.ok_or_else(|| {
         sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "relation \"{}\" does not exist",
@@ -12580,32 +12233,32 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     if let Some(name) = catalog_relation_name(oid) {
-        return Some(relation_oid_for_name(storage, txid, None, name) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name).matches_oid(oid));
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid {
             let table = storage.table_def(slot, txid);
             return Some(
-                relation_oid_for_name(storage, txid, None, table.name.as_str()) == Some(oid),
+                relation_oid_for_name(storage, txid, None, table.name.as_str()).matches_oid(oid),
             );
         }
     }
     if let Some((_, name)) = index_identity_by_oid(storage, txid, oid) {
-        return Some(index_oid_by_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     for slot in 0..storage.sequence_count() {
         if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid {
             let sequence = storage.sequence_for(slot, txid);
             return Some(
-                relation_oid_for_name(storage, txid, None, sequence.name.as_str()) == Some(oid),
+                relation_oid_for_name(storage, txid, None, sequence.name.as_str()).matches_oid(oid),
             );
         }
     }
     if let Some((_, name)) = storage.view_relation_name(oid, txid) {
-        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     if let Some((_, name)) = storage.composite_relation_name(oid, txid) {
-        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     None
 }
@@ -12662,7 +12315,7 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
         {
             return Some(
                 relation_oid_for_name(storage, txid, None, table.name.as_str())
-                    == Some(user_table_oid(storage, slot)),
+                    .matches_oid(user_table_oid(storage, slot)),
             );
         }
     }
@@ -12679,7 +12332,8 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
                     txid,
                     None,
                     storage.view(slot).name_for(txid).as_str(),
-                ) == Some(view_oid(storage, slot)),
+                )
+                .matches_oid(view_oid(storage, slot)),
             );
         }
     }
@@ -12740,22 +12394,6 @@ pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
         oid,
         764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
     ))
-}
-
-fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
-    Some(match oid {
-        2096 => (1, "0"),
-        3577 | 3578 | 3960 | 3961 => (1, "false"),
-        3786 => (3, "false, false, false"),
-        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
-            (2, "'{}'::jsonb, false")
-        }
-        6212 => (2, "0, 1"),
-        1268 => (1, "true"),
-        4350 | 4351 => (1, "'NFC'::text"),
-        3464 => (7, "0, 0, 0, 0, 0, 0, 0.0"),
-        _ => return None,
-    })
 }
 
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -13625,6 +13263,7 @@ pub(crate) fn operator_oid_by_name(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin()?,
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -13640,6 +13279,21 @@ pub(crate) fn operator_oid_by_name(
 }
 
 /// Exact operator contracts used by executable catalog declarations.
+pub(crate) fn builtin_operator_function(
+    function_oid: i32,
+) -> Option<(crate::sql::ast::BinaryOp, ColType, ColType)> {
+    CATALOG_OPERATORS.iter().find_map(|operator| {
+        if operator.procedure_oid != function_oid {
+            return None;
+        }
+        Some((
+            crate::sql::ast::BinaryOp::from_operator_name(operator.name)?,
+            operator.left?,
+            operator.right?,
+        ))
+    })
+}
+
 pub(crate) fn builtin_operator_contract(
     oid: i32,
 ) -> Option<(crate::storage::OperatorSignature, ColType)> {
@@ -13731,6 +13385,7 @@ pub(crate) fn operator_oid_for_signature(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -14603,6 +14258,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -16839,7 +16495,8 @@ pub fn index_def_text<'a>(
     if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
             Some(
-                if pretty && relation_oid_for_name(storage, txid, None, name) == Some(relation) {
+                if pretty && relation_oid_for_name(storage, txid, None, name).matches_oid(relation)
+                {
                     let (before, after) = definition
                         .split_once("pg_catalog.")
                         .expect("builtin definition names its schema");
@@ -27207,219 +26864,122 @@ fn pg_language<'a>(
     finish(definition, &[internal, c, sql, plpgsql], arena)
 }
 
+fn builtin_proc_row<'a>(
+    signature: &BuiltinCallableSignature,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let metadata = &signature.catalog;
+    let namespace = schema_oid_by_name(storage, txid, signature.schema).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "builtin callable namespace is unavailable"
+        )
+    })?;
+    let all_types = if metadata.all_arguments.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.all_arguments.len(), |index| {
+                Datum::Oid(metadata.all_arguments[index] as u32)
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Oid,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    let modes = if metadata.modes.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.modes.len(), |index| {
+                Datum::Char(metadata.modes[index])
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Char,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    let names = if metadata.all_argument_names.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.all_argument_names.len(), |index| {
+                Datum::Text(metadata.all_argument_names[index])
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    row(
+        &[
+            Datum::Int4(1255),
+            Datum::Int4(signature.oid),
+            Datum::Text(signature.name),
+            Datum::Int4(namespace),
+            Datum::Int4(signature.arguments.len() as i32),
+            Datum::Int4(signature.result_oid),
+            Datum::Bool(signature.returns_set),
+            Datum::Char(signature.kind),
+            oidvector(signature.arguments, arena)?,
+            Datum::Bpchar(metadata.volatility),
+            Datum::Bpchar(metadata.parallel),
+            Datum::Int4(10),
+            Datum::Bool(metadata.security_definer),
+            if intrinsic_routine_public_execute(signature.oid) == Some(false) {
+                builtin_acl(&["postgres=X/postgres"], arena)?
+            } else {
+                Datum::Null
+            },
+            Datum::Int4(metadata.language),
+            Datum::Text(metadata.source),
+            Datum::Null,
+            Datum::Bool(metadata.strict),
+            Datum::Bool(metadata.leakproof),
+            Datum::Null,
+            Datum::Float8(metadata.cost),
+            Datum::Float8(metadata.rows),
+            Datum::Null,
+            Datum::RegObject {
+                type_oid: super::types::oid::REGPROC,
+                referenced_oid: metadata.support,
+                name: metadata.support_name,
+            },
+            Datum::Int4((signature.arguments.len() - signature.required_arguments) as i32),
+            Datum::Int4(signature.variadic_element.unwrap_or(0)),
+            all_types,
+            modes,
+            names,
+            signature.defaults.map_or(Datum::Null, Datum::Text),
+            Datum::Null,
+        ],
+        arena,
+    )
+}
+
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_proc", false);
-    // The routine inventory is fixed at startup, so size the synthesized row
-    // index from that same bound instead of coupling it to the built-in count.
-    let row_capacity = INTRINSIC_ROUTINES
+    let row_capacity = callable_signatures::CALLABLES
         .len()
         .checked_add(storage.routine_count())
         .ok_or_else(|| catalog_capacity_exceeded("pg_proc"))?;
     let rows = arena
         .alloc_slice_with(row_capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
-        let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut argument_count = 0usize;
-        for written in routine.argument_types.split_ascii_whitespace() {
-            if argument_count == argument_oids.len() {
-                return Err(catalog_capacity_exceeded("pg_proc.proargtypes"));
-            }
-            argument_oids[argument_count] = written.parse().map_err(|_| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "intrinsic routine has an invalid argument OID"
-                )
-            })?;
-            argument_count += 1;
+    let mut count = 0;
+    for signature in callable_signatures::CALLABLES {
+        // A retained stored definition is the executable owner of its OID.
+        if storage.routine_slot_by_oid(signature.oid, txid).is_some() {
+            continue;
         }
-        if argument_count != routine.argument_count as usize {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "intrinsic routine argument count does not match its OID vector"
-            ));
-        }
-        let record_outputs = intrinsic_record_outputs(*routine);
-        let mut all_types = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let mut modes = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let mut names = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let intrinsic_names = intrinsic_routine_argument_names(routine.oid);
-        if let Some(argument_names) = intrinsic_names {
-            for (index, name) in argument_names.iter().enumerate() {
-                names[index] = Datum::Text(name);
-            }
-        }
-        let record_input_count = if record_outputs.is_some() {
-            argument_count
-        } else {
-            0
-        };
-        for input in 0..record_input_count {
-            all_types[input] = Datum::Oid(argument_oids[input] as u32);
-            modes[input] = Datum::Char(if routine.oid == 6119 { b'v' } else { b'i' });
-        }
-        if let Some((output_oids, output_names)) = record_outputs {
-            for output in 0..output_oids.len() {
-                let index = record_input_count + output;
-                all_types[index] = Datum::Oid(output_oids[output] as u32);
-                modes[index] = Datum::Char(b'o');
-                names[index] = Datum::Text(output_names[output]);
-            }
-        }
-        rows[index] = row(
-            &[
-                Datum::Int4(1255),
-                Datum::Int4(routine.oid),
-                text(routine.name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(routine.argument_count),
-                Datum::Int4(routine.result_oid),
-                Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar(intrinsic_routine_kind(*routine)),
-                oidvector(&argument_oids[..argument_count], arena)?,
-                Datum::Bpchar(routine.volatility),
-                Datum::Bpchar(intrinsic_routine_parallel(*routine)),
-                Datum::Int4(10),
-                Datum::Bool(false),
-                if intrinsic_routine_public_execute(routine.oid) == Some(false) {
-                    builtin_acl(&["postgres=X/postgres"], arena)?
-                } else {
-                    Datum::Null
-                },
-                Datum::Int4(
-                    if matches!(
-                        routine.oid,
-                        879 | 880
-                            | 1285
-                            | 1290
-                            | 1481
-                            | 1708
-                            | 1710
-                            | 1741
-                            | 1810
-                            | 1811
-                            | 1812
-                            | 2074
-                    ) {
-                        14
-                    } else {
-                        12
-                    },
-                ),
-                text(intrinsic_routine_source(*routine), arena)?,
-                Datum::Null,
-                Datum::Bool(intrinsic_routine_is_strict(*routine)),
-                Datum::Bool(builtin_procedure_is_leakproof(routine.oid)),
-                Datum::Null,
-                Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
-                Datum::Float8(match routine.oid {
-                    2289 => 3.0,
-                    2763 => 1.0,
-                    2764 => 10.0,
-                    2765 | 2766 => 1000.0,
-                    2947 | 5064 => 50.0,
-                    6119 => 1000.0,
-                    _ => 0.0,
-                }),
-                Datum::Null,
-                match routine.oid {
-                    79 | 1254 => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 1364,
-                        name: "textregexeq_support",
-                    },
-                    1238 | 1240 => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 1024,
-                        name: "texticregexeq_support",
-                    },
-                    _ => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 0,
-                        name: "-",
-                    },
-                },
-                Datum::Int4(
-                    intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32),
-                ),
-                Datum::Int4(match routine.oid {
-                    6119 => super::types::oid::TEXT,
-                    3058 | 3059 | 3539 => 2276,
-                    4282 => 3904,
-                    4285 => 3906,
-                    4288 => 3908,
-                    4291 => 3910,
-                    4294 => 3912,
-                    4297 => 3926,
-                    _ => 0,
-                }),
-                match record_outputs {
-                    Some((output_oids, _)) => Datum::Array {
-                        element: super::types::ArrElem::Oid,
-                        raw: super::array::build(
-                            &all_types[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    None => Datum::Null,
-                },
-                match record_outputs {
-                    Some((output_oids, _)) => Datum::Array {
-                        element: super::types::ArrElem::Char,
-                        raw: super::array::build(
-                            &modes[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    None => Datum::Null,
-                },
-                match (routine.oid, record_outputs) {
-                    (6430, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&[Datum::Text("shift")], arena)?,
-                    },
-                    (6212, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &[Datum::Text("mean"), Datum::Text("stddev")],
-                            arena,
-                        )?,
-                    },
-                    (6339..=6341, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&[Datum::Text("min"), Datum::Text("max")], arena)?,
-                    },
-                    (1268, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &[Datum::Text("str"), Datum::Text("strict")],
-                            arena,
-                        )?,
-                    },
-                    (_, Some((output_oids, _))) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &names[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    (_, _) if intrinsic_names.is_some() => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &names[..intrinsic_names.expect("checked").len()],
-                            arena,
-                        )?,
-                    },
-                    (_, None) => Datum::Null,
-                },
-                intrinsic_routine_defaults(routine.oid)
-                    .map_or(Datum::Null, |(_, source)| Datum::Text(source)),
-                Datum::Null,
-            ],
-            arena,
-        )?;
+        rows[count] = builtin_proc_row(signature, storage, txid, arena)?;
+        count += 1;
     }
-    let mut count = INTRINSIC_ROUTINES.len();
     for slot in 0..storage.routine_count() {
         if !storage.routine_slot_visible_to(slot, txid) {
             continue;

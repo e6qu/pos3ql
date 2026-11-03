@@ -700,7 +700,8 @@ pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
 pub(crate) use describe::{
-    CatalogCols, builtin_binary_type, catalog_composite_field,
+    CatalogCols, builtin_binary_type, builtin_call, builtin_record_srf_call,
+    catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
     numeric_log_type, resolved_set_call, visit_catalog_composite_fields,
     visit_catalog_rowtype_fields,
@@ -1112,7 +1113,12 @@ fn create_table_kind(
                 .and_then(|()| storage.temporary_schema())
         }
     } else {
-        storage.creation_schema(statement.name.schema, statement.name.name, txn.txid)
+        storage.creation_schema(
+            statement.name.schema,
+            statement.name.name,
+            txn.txid,
+            crate::storage::SchemaObjectKind::Relation,
+        )
     } {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -3032,8 +3038,12 @@ fn build_partitioned_table_def(
             }
             let mut def = TableDefBuilder::from_definition(&parent_def);
             def.name = SqlName::parse(statement.name.name)?;
-            def.schema =
-                storage.creation_schema(statement.name.schema, statement.name.name, txid)?;
+            def.schema = storage.creation_schema(
+                statement.name.schema,
+                statement.name.name,
+                txid,
+                crate::storage::SchemaObjectKind::Relation,
+            )?;
             def.not_null_names = [None; MAX_COLUMNS];
             for column in def.columns.iter_mut().take(def.n_columns) {
                 column.not_null = if column.not_null.is_required() {
@@ -13146,6 +13156,8 @@ pub(crate) fn drop_schema(
                     == schema
             }
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+            crate::storage::PathEntry::InformationSchema => schema == "information_schema",
+            crate::storage::PathEntry::Toast => schema == "pg_toast",
         })
     };
     let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
@@ -17679,6 +17691,7 @@ fn parse_plpgsql_assignment_target<'a>(
     let args = arg_list.as_slice();
     let expression = arena
         .alloc(Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name: "__jsonb_subscript_set",
@@ -28637,6 +28650,16 @@ fn validate_policy_definition(
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     use core::fmt::Write as _;
     let table_def = storage.table_def(table, txid);
+    let aggregate_columns = CatalogCols {
+        definition: Some(crate::storage::RelationDefinition::from_definition(
+            &table_def,
+        )),
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     let mut sql = crate::util::StackStr::<2304>::new();
     sql.write_str("SELECT ").map_err(|_| arena_full())?;
     let mut expressions = 0usize;
@@ -28646,7 +28669,7 @@ fn validate_policy_definition(
     {
         let expression_source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
         let expression = crate::sql::parser::parse_expr(expression_source, arena)?;
-        if super::query::expr_has_aggregate(expression) {
+        if super::query::expr_has_aggregate(expression, storage, txid, &aggregate_columns)? {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
                 "aggregate functions are not allowed in policy expressions"
@@ -29474,20 +29497,55 @@ fn resolve_function_slot_exact(
             })?;
     }
     let qualified = qualified_catalog_name(name);
-    storage
-        .routine_slot_for_function_call_syntax_oids(
-            qualified.as_str(),
-            &oids[..argument_types.len()],
-            false,
-            txid,
-        )
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "function {} does not exist for the required argument types",
-                qualified.as_str()
-            )
-        })
+    match storage.select_routine_call(
+        qualified.as_str(),
+        &[],
+        &oids[..argument_types.len()],
+        false,
+        txid,
+        crate::storage::RoutineCallKind::Scalar,
+    ) {
+        crate::storage::RoutineCallSelection::Stored(slot) => {
+            let routine = storage.routine_for(slot, txid);
+            if routine.argument_count != argument_types.len()
+                || !routine
+                    .arguments()
+                    .iter()
+                    .zip(&oids)
+                    .all(|(argument, expected)| {
+                        storage.routine_type_oid(argument.ctype, argument.user_type, txid)
+                            == Some(*expected)
+                    })
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {} does not exist for the required argument types",
+                    qualified.as_str()
+                ));
+            }
+            Ok(slot)
+        }
+        crate::storage::RoutineCallSelection::Builtin { .. } => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "builtin function {} is unavailable as a stored implementation",
+            qualified.as_str()
+        )),
+        crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "function {} is not unique",
+            qualified.as_str()
+        )),
+        crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is not a function",
+            qualified.as_str()
+        )),
+        crate::storage::RoutineCallSelection::Absent => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {} does not exist for the required argument types",
+            qualified.as_str()
+        )),
+    }
 }
 
 fn resolve_operator_signature(
@@ -29620,6 +29678,9 @@ fn resolve_cast_function_name(
     for entry in storage.path().entries() {
         let schema_name = match entry {
             crate::storage::PathEntry::Catalog => None,
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => {
+                continue;
+            }
             crate::storage::PathEntry::Schema(slot) => {
                 Some(storage.schema_def_for(usize::from(*slot), txid).name)
             }
@@ -30014,7 +30075,12 @@ pub(crate) fn create_operator(
         Ok(owner) => owner,
         Err(error) => return sql_fail(error),
     };
-    let schema = match storage.creation_schema(operator.name.schema, operator.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        operator.name.schema,
+        operator.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -30290,7 +30356,12 @@ pub fn create_collation(
 ) -> Outcome {
     use crate::sql::ast::CreateCollationDefinition;
     use crate::storage::{CollationBehavior, CollationDefinition, CollationProvider};
-    let schema = match storage.creation_schema(command.name.schema, command.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        command.name.schema,
+        command.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -30520,7 +30591,12 @@ pub fn create_conversion(
             ));
         }
     };
-    let schema = match storage.creation_schema(command.name.schema, command.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        command.name.schema,
+        command.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -30629,7 +30705,12 @@ fn text_search_schema_name(
     txid: u32,
 ) -> Result<(SqlName, SqlName), SqlError> {
     Ok((
-        storage.creation_schema(name.schema, name.name, txid)?,
+        storage.creation_schema(
+            name.schema,
+            name.name,
+            txid,
+            crate::storage::SchemaObjectKind::NonRelation,
+        )?,
         SqlName::parse(name.name)?,
     ))
 }
@@ -32414,7 +32495,12 @@ fn empty_operator_family(
     txn: &mut TxnState,
     name: crate::sql::ast::QualName<'_>,
 ) -> Result<usize, SqlError> {
-    let schema = storage.creation_schema(name.schema, name.name, txn.txid)?;
+    let schema = storage.creation_schema(
+        name.schema,
+        name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    )?;
     let definition = crate::storage::OperatorFamilyDefinition {
         schema,
         name: SqlName::parse(name.name)?,
@@ -33053,7 +33139,12 @@ pub(crate) fn create_operator_class(
         Ok(owner) => owner,
         Err(error) => return sql_fail(error),
     };
-    let schema = match storage.creation_schema(class.name.schema, class.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        class.name.schema,
+        class.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -33530,7 +33621,12 @@ pub fn create_routine(
             "trigger functions require LANGUAGE plpgsql"
         ));
     }
-    let schema = match storage.creation_schema(routine.name.schema, routine.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        routine.name.schema,
+        routine.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -34299,20 +34395,19 @@ fn aggregate_support_name(name: super::ast::QualName<'_>) -> StackStr<130> {
     qualified
 }
 
+struct AggregateSupportFunction {
+    oid: i32,
+    strict: bool,
+    result: crate::storage::RoutineResult,
+}
+
 fn aggregate_support_function(
     storage: &Storage,
     txid: u32,
     name: super::ast::QualName<'_>,
     arguments: &[crate::storage::RoutineResult],
     purpose: &'static str,
-) -> Result<
-    (
-        usize,
-        crate::storage::RoutineDef,
-        crate::storage::RoutineResult,
-    ),
-    SqlError,
-> {
+) -> Result<AggregateSupportFunction, SqlError> {
     let mut argument_oids = [0_i32; MAX_ROUTINE_ARGUMENTS];
     for (index, argument) in arguments.iter().enumerate() {
         argument_oids[index] = storage
@@ -34326,16 +34421,90 @@ fn aggregate_support_function(
             })?;
     }
     let qualified = aggregate_support_name(name);
-    let slot = storage
-        .routine_slot_for_call_oids(qualified.as_str(), &argument_oids[..arguments.len()], txid)
-        .ok_or_else(|| {
-            sql_err!(
+    let selection = storage.select_routine_call(
+        qualified.as_str(),
+        &[],
+        &argument_oids[..arguments.len()],
+        false,
+        txid,
+        crate::storage::RoutineCallKind::Scalar,
+    );
+    let slot = match selection {
+        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+            let signature = super::catalog::builtin_callable_by_oid(oid)
+                .expect("selected builtin has a callable declaration");
+            if signature.kind != b'f' || signature.returns_set {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} function {} must be a scalar function",
+                    purpose,
+                    qualified.as_str()
+                ));
+            }
+            let result_oid = if arguments
+                .iter()
+                .any(|argument| argument.polymorphic_type().is_some())
+            {
+                signature.result_oid
+            } else {
+                storage
+                    .builtin_call_result_oid(
+                        oid,
+                        &[],
+                        &argument_oids[..arguments.len()],
+                        false,
+                        txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "{} function {} has an unresolved result type",
+                            purpose,
+                            qualified.as_str()
+                        )
+                    })?
+            };
+            let result = storage
+                .routine_result_for_oid(result_oid, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} function {} has an unsupported result type",
+                        purpose,
+                        qualified.as_str()
+                    )
+                })?;
+            return Ok(AggregateSupportFunction {
+                oid,
+                strict: signature.catalog.strict,
+                result,
+            });
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "{} function {} is not unique",
+                purpose,
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} is not a function",
+                qualified.as_str()
+            ));
+        }
+        crate::storage::RoutineCallSelection::Absent => {
+            return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "{} function {} does not exist with the required argument types",
                 purpose,
                 qualified.as_str()
-            )
-        })?;
+            ));
+        }
+    };
     storage.require_routine_execute(slot, txid)?;
     let routine = storage.routine_for(slot, txid);
     let result = match routine.kind {
@@ -34349,7 +34518,11 @@ fn aggregate_support_function(
             ));
         }
     };
-    Ok((slot, routine, result))
+    Ok(AggregateSupportFunction {
+        oid: crate::storage::routine_oid(&routine),
+        strict: routine.attributes.strict,
+        result,
+    })
 }
 
 fn aggregate_final_modify(
@@ -34408,14 +34581,14 @@ fn resolve_aggregate_final(
             count += 1;
         }
     }
-    let (_, routine, result) = aggregate_support_function(
+    let routine = aggregate_support_function(
         storage,
         txid,
         final_function.function,
         &signature[..count],
         "final",
     )?;
-    if final_function.extra && routine.attributes.strict {
+    if final_function.extra && routine.strict {
         return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "final function with extra arguments must not be strict"
@@ -34423,11 +34596,11 @@ fn resolve_aggregate_final(
     }
     Ok((
         crate::storage::AggregateFinalRoutine {
-            function_oid: crate::storage::routine_oid(&routine),
+            function_oid: routine.oid,
             extra: final_function.extra,
             modify: aggregate_final_modify(final_function.modify),
         },
-        result,
+        routine.result,
     ))
 }
 
@@ -34445,8 +34618,12 @@ pub fn create_aggregate(
         AggregateSerde,
     };
 
-    let schema = match storage.creation_schema(aggregate.name.schema, aggregate.name.name, txn.txid)
-    {
+    let schema = match storage.creation_schema(
+        aggregate.name.schema,
+        aggregate.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -34565,7 +34742,7 @@ pub fn create_aggregate(
     }
     transition_signature[0] = state_type;
     transition_signature[1..1 + aggregated_types.len()].copy_from_slice(aggregated_types);
-    let (_, transition, transition_result) = match aggregate_support_function(
+    let transition = match aggregate_support_function(
         storage,
         txn.txid,
         aggregate.definition.transition,
@@ -34575,13 +34752,13 @@ pub fn create_aggregate(
         Ok(function) => function,
         Err(error) => return sql_fail(error),
     };
-    if transition_result != state_type {
+    if transition.result != state_type {
         return sql_fail(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "transition function must return the aggregate state type"
         ));
     }
-    if transition.attributes.strict
+    if transition.strict
         && aggregate.definition.initial_condition.is_none()
         && aggregated_types.first() != Some(&state_type)
     {
@@ -34607,7 +34784,7 @@ pub fn create_aggregate(
     let partial = match aggregate.definition.partial {
         Some(partial) => {
             let combine_signature = [state_type, state_type];
-            let (_, combine, combine_result) = match aggregate_support_function(
+            let combine = match aggregate_support_function(
                 storage,
                 txn.txid,
                 partial.combine,
@@ -34617,13 +34794,13 @@ pub fn create_aggregate(
                 Ok(function) => function,
                 Err(error) => return sql_fail(error),
             };
-            if combine_result != state_type {
+            if combine.result != state_type {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "combine function must return the aggregate state type"
                 ));
             }
-            if state_type.ctype == ColType::Internal && combine.attributes.strict {
+            if state_type.ctype == ColType::Internal && combine.strict {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "combine function with internal transition type must not be strict"
@@ -34637,7 +34814,7 @@ pub fn create_aggregate(
                             "serialization functions may be specified only when STYPE is internal"
                         ));
                     }
-                    let (_, serial, serial_result) = match aggregate_support_function(
+                    let serial = match aggregate_support_function(
                         storage,
                         txn.txid,
                         serial,
@@ -34647,7 +34824,7 @@ pub fn create_aggregate(
                         Ok(function) => function,
                         Err(error) => return sql_fail(error),
                     };
-                    if serial_result.ctype != ColType::Bytea || serial_result.user_type.is_some() {
+                    if serial.result.ctype != ColType::Bytea || serial.result.user_type.is_some() {
                         return sql_fail(sql_err!(
                             sqlstate::INVALID_FUNCTION_DEFINITION,
                             "serialization function must return bytea"
@@ -34655,7 +34832,7 @@ pub fn create_aggregate(
                     }
                     let bytea = crate::storage::RoutineResult::builtin(ColType::Bytea);
                     let internal = crate::storage::RoutineResult::builtin(ColType::Internal);
-                    let (_, deserial, deserial_result) = match aggregate_support_function(
+                    let deserial = match aggregate_support_function(
                         storage,
                         txn.txid,
                         deserial,
@@ -34665,23 +34842,23 @@ pub fn create_aggregate(
                         Ok(function) => function,
                         Err(error) => return sql_fail(error),
                     };
-                    if deserial_result != state_type {
+                    if deserial.result != state_type {
                         return sql_fail(sql_err!(
                             sqlstate::INVALID_FUNCTION_DEFINITION,
                             "deserialization function must return the aggregate state type"
                         ));
                     }
                     Some(AggregateSerde {
-                        serialize_oid: crate::storage::routine_oid(&serial),
-                        deserialize_oid: crate::storage::routine_oid(&deserial),
+                        serialize_oid: serial.oid,
+                        deserialize_oid: deserial.oid,
                     })
                 }
                 (None, None) => None,
                 _ => unreachable!("parser constructs complete serialization pairs"),
             };
             Some(AggregatePartialRoutine {
-                combine_oid: crate::storage::routine_oid(&combine),
-                combine_strict: combine.attributes.strict,
+                combine_oid: combine.oid,
+                combine_strict: combine.strict,
                 serde,
             })
         }
@@ -34709,7 +34886,7 @@ pub fn create_aggregate(
             }
             signature[0] = moving_state;
             signature[1..1 + aggregated_types.len()].copy_from_slice(aggregated_types);
-            let (_, transition, transition_result) = match aggregate_support_function(
+            let transition = match aggregate_support_function(
                 storage,
                 txn.txid,
                 moving.transition,
@@ -34719,7 +34896,7 @@ pub fn create_aggregate(
                 Ok(function) => function,
                 Err(error) => return sql_fail(error),
             };
-            let (_, inverse, inverse_result) = match aggregate_support_function(
+            let inverse = match aggregate_support_function(
                 storage,
                 txn.txid,
                 moving.inverse,
@@ -34729,19 +34906,19 @@ pub fn create_aggregate(
                 Ok(function) => function,
                 Err(error) => return sql_fail(error),
             };
-            if transition_result != moving_state || inverse_result != moving_state {
+            if transition.result != moving_state || inverse.result != moving_state {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "moving transition and inverse functions must return the moving state type"
                 ));
             }
-            if transition.attributes.strict != inverse.attributes.strict {
+            if transition.strict != inverse.strict {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "moving transition and inverse functions must have the same strictness"
                 ));
             }
-            if transition.attributes.strict
+            if transition.strict
                 && moving.initial_condition.is_none()
                 && aggregated_types.first() != Some(&moving_state)
             {
@@ -34809,8 +34986,8 @@ pub fn create_aggregate(
                 None => None,
             };
             Some(AggregateMovingRoutine {
-                transition_oid: crate::storage::routine_oid(&transition),
-                inverse_oid: crate::storage::routine_oid(&inverse),
+                transition_oid: transition.oid,
+                inverse_oid: inverse.oid,
                 state_type: moving_state,
                 state_space: moving.state_space,
                 final_function,
@@ -34908,7 +35085,7 @@ pub fn create_aggregate(
         state_type,
         state_space: aggregate.definition.state_space,
         result_type,
-        transition_oid: crate::storage::routine_oid(&transition),
+        transition_oid: transition.oid,
         final_function,
         partial,
         moving,
@@ -35414,8 +35591,22 @@ pub(crate) fn prepare_create_extension(
     }
     let fixed_schema_name = fixed_schema.as_ref().map(SqlName::as_str);
     let target_schema = fixed_schema_name.or(schema).map_or_else(
-        || storage.creation_schema(None, name, txn.txid),
-        |schema| storage.creation_schema(Some(schema), name, txn.txid),
+        || {
+            storage.creation_schema(
+                None,
+                name,
+                txn.txid,
+                crate::storage::SchemaObjectKind::NonRelation,
+            )
+        },
+        |schema| {
+            storage.creation_schema(
+                Some(schema),
+                name,
+                txn.txid,
+                crate::storage::SchemaObjectKind::NonRelation,
+            )
+        },
     )?;
     storage.require_schema_create(target_schema.as_str(), txn.txid)?;
     let namespace = storage
@@ -37059,7 +37250,12 @@ pub fn create_view(
                 .and_then(|()| storage.temporary_schema())
         }
     } else {
-        storage.creation_schema(name.schema, name.name, txn.txid)
+        storage.creation_schema(
+            name.schema,
+            name.name,
+            txn.txid,
+            crate::storage::SchemaObjectKind::Relation,
+        )
     } {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
@@ -38076,6 +38272,7 @@ struct RuleConditionColumns<'a> {
     count: usize,
     old: bool,
     new: bool,
+    catalog: CatalogCols<'a>,
 }
 
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
@@ -38119,6 +38316,93 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
 }
 
 impl ColTypeResolver for RuleConditionColumns<'_> {
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        self.catalog.routine_call_selection(
+            name,
+            kind,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+        )
+    }
+
+    fn operator_first_argument_type(
+        &self,
+        name: &str,
+        left: i32,
+        right: i32,
+    ) -> Result<Option<StaticTypeMeta>, SqlError> {
+        self.catalog.operator_first_argument_type(name, left, right)
+    }
+
+    fn validate_explicit_cast(&self, source: i32, target: ColType) -> Result<(), SqlError> {
+        self.catalog.validate_explicit_cast(source, target)
+    }
+
+    fn domain_base_type(&self, oid: i32) -> Option<ColType> {
+        self.catalog.domain_base_type(oid)
+    }
+
+    fn named_type_oid(&self, name: &str) -> Option<i32> {
+        self.catalog.named_type_oid(name)
+    }
+
+    fn routine_result(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        oid: Option<i32>,
+        names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
+        self.catalog
+            .routine_result(name, kind, oid, names, variadic, arguments)
+    }
+
+    fn operator_result(&self, name: &str, left: i32, right: i32) -> Option<StaticTypeMeta> {
+        self.catalog.operator_result(name, left, right)
+    }
+
+    fn routine_record_field(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        oid: Option<i32>,
+        names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        self.catalog
+            .routine_record_field(name, kind, oid, names, variadic, arguments, index)
+    }
+
+    fn visit_composite_fields(
+        &self,
+        source: Option<crate::storage::TypeCreation>,
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Option<usize> {
+        self.catalog.visit_composite_fields(source, visit)
+    }
+
+    fn visit_named_composite_fields(
+        &self,
+        name: &str,
+        visit: &mut dyn FnMut(&str, StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        self.catalog.visit_named_composite_fields(name, visit)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         self.col_type(qualifier, name).ok_or_else(|| {
             if qualifier.is_some_and(|value| {
@@ -38218,6 +38502,14 @@ fn stored_rule_definition(
         count: 0,
         old: !matches!(event, crate::storage::RewriteEvent::Insert),
         new: !matches!(event, crate::storage::RewriteEvent::Delete),
+        catalog: CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid: txn.txid,
+            arena,
+        },
     };
     match target {
         crate::storage::RuleTarget::Table(slot) => {
@@ -38358,7 +38650,7 @@ fn stored_rule_definition(
                 "cannot use subquery in rule condition"
             ));
         }
-        if super::query::expr_has_aggregate(condition) {
+        if super::query::expr_has_aggregate(condition, storage, txn.txid, &condition_columns)? {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
                 "aggregate functions are not allowed in rule conditions"
@@ -40025,7 +40317,12 @@ pub fn create_table_as(
                 .and_then(|()| storage.temporary_schema())
         }
     } else {
-        storage.creation_schema(name.schema, name.name, txn.txid)
+        storage.creation_schema(
+            name.schema,
+            name.name,
+            txn.txid,
+            crate::storage::SchemaObjectKind::Relation,
+        )
     } {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -40954,7 +41251,12 @@ pub fn create_sequence(
                 .and_then(|()| storage.temporary_schema())
         }
     } else {
-        storage.creation_schema(name.schema, name.name, txn.txid)
+        storage.creation_schema(
+            name.schema,
+            name.name,
+            txn.txid,
+            crate::storage::SchemaObjectKind::Relation,
+        )
     } {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -41522,15 +41824,22 @@ pub(super) fn column_default_dependencies(
     if column.default.constant().is_some() || column.default.is_generated() {
         return Ok(crate::storage::StoredQueryDependencies::EMPTY);
     }
-    let Some(expression) = super::enum_values::default_expression(
-        &column.default,
-        Some(column.ctype),
-        storage,
-        transaction,
-        arena,
-    )?
-    else {
+    let Some(source) = column.default.expression() else {
         return Ok(crate::storage::StoredQueryDependencies::EMPTY);
+    };
+    // Dependency binding consumes executable SQL, never display text that may
+    // intentionally omit a catalog qualifier under the current search path.
+    let expression = if super::enum_values::checks::is_bound(source.as_str()) {
+        super::enum_values::default_expression(
+            &column.default,
+            Some(column.ctype),
+            storage,
+            transaction,
+            arena,
+        )?
+        .expect("bound default has expression text")
+    } else {
+        source.as_str()
     };
     let mut query = StackStr::<{ crate::storage::DEFAULT_EXPR_MAX + 8 }>::new();
     write!(query, "SELECT {}", expression).map_err(|_| arena_full())?;
@@ -42047,7 +42356,12 @@ pub fn create_domain(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let schema = match storage.creation_schema(d.name.schema, d.name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        d.name.schema,
+        d.name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -43471,7 +43785,12 @@ pub fn create_enum(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        name.schema,
+        name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::NonRelation,
+    ) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -43680,7 +43999,12 @@ pub fn create_composite(
     fields: &[crate::sql::ast::CompositeField<'_>],
     responder: &mut Responder,
 ) -> Outcome {
-    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+    let schema = match storage.creation_schema(
+        name.schema,
+        name.name,
+        txn.txid,
+        crate::storage::SchemaObjectKind::Relation,
+    ) {
         Ok(schema) => schema,
         Err(error) => return sql_fail(error),
     };
@@ -45685,6 +46009,8 @@ fn report_stored_query_dependents(
                 storage.schema_def_for(*slot as usize, txid).name.as_str() == schema
             }
             crate::storage::PathEntry::Catalog => schema == "pg_catalog",
+            crate::storage::PathEntry::InformationSchema => schema == "information_schema",
+            crate::storage::PathEntry::Toast => schema == "pg_toast",
         })
     };
     let write_name = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
@@ -48629,7 +48955,12 @@ pub fn create_statistics(
             name,
             if_not_exists,
         } => {
-            let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+            let schema = match storage.creation_schema(
+                name.schema,
+                name.name,
+                txn.txid,
+                crate::storage::SchemaObjectKind::NonRelation,
+            ) {
                 Ok(schema) => schema,
                 Err(error) => return sql_fail(error),
             };
@@ -55277,17 +55608,10 @@ fn restart_owned_sequences(
     txn: &mut TxnState,
     table: usize,
 ) -> Result<(), SqlError> {
-    let definition = (*storage.table_def(table, txn.txid)).clone();
-    for column in definition.columns() {
-        let Some(slot) = storage.generated_sequence_slot(
-            definition.schema.as_str(),
-            definition.name.as_str(),
-            column.name.as_str(),
-            crate::storage::GeneratedSequenceScope::Owned,
-            txn.txid,
-        ) else {
+    for slot in 0..storage.sequence_count() {
+        if !storage.sequence_owned_by_table(slot, table, txn.txid) {
             continue;
-        };
+        }
         let sequence = storage.sequence_for(slot, txn.txid);
         let change = storage.stage_sequence_alter(
             storage.prepare_sequence_edit(slot, txn.txid)?,
@@ -67967,7 +68291,7 @@ fn alter_table_relation(
                         new_def.schema.as_str(),
                         new_def.name.as_str(),
                         identity_column.as_str(),
-                        crate::storage::GeneratedSequenceScope::Owned,
+                        crate::storage::GeneratedSequenceScope::Identity,
                         txn.txid,
                     ) else {
                         return sql_fail(sql_err!(
@@ -68747,7 +69071,7 @@ fn alter_table_relation(
                     def.schema.as_str(),
                     def.name.as_str(),
                     original_column.as_str(),
-                    crate::storage::GeneratedSequenceScope::Owned,
+                    crate::storage::GeneratedSequenceScope::Identity,
                     txn.txid,
                 ) && matches!(
                     storage.sequence_for(slot, txn.txid).owner,
@@ -68798,7 +69122,7 @@ fn alter_table_relation(
                     new_def.schema.as_str(),
                     new_def.name.as_str(),
                     identity_column.as_str(),
-                    crate::storage::GeneratedSequenceScope::Owned,
+                    crate::storage::GeneratedSequenceScope::Identity,
                     txn.txid,
                 ) else {
                     return sql_fail(sql_err!(

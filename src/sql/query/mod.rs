@@ -622,8 +622,8 @@ use aggregate::{AggState, fold_aggregates};
 
 mod srf;
 pub(crate) use srf::{
-    describe_derived_definition, expression_has_project_set, is_srf_name as is_builtin_set_routine,
-    table_func_rows_outer,
+    builtin_set_routine_name, describe_derived_definition, expression_has_project_set,
+    is_srf_name as is_builtin_set_routine, table_func_rows_outer,
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
@@ -1552,7 +1552,7 @@ fn execute_routine_query_under<'a>(
                 )?,
                 None => expand_ctes_exec(select, storage, txid, arena, params, &[], sequences)?,
             };
-            validate_locking(select)?;
+            validate_locking(select, storage, txid, arena)?;
             if recycling {
                 select_into_rows_recycling(
                     storage, txid, select, arena, params, None, sequences, emit,
@@ -3249,6 +3249,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -3266,6 +3267,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::exec::ColTypeResolver::routine_record_field(
             &columns,
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -3426,43 +3428,73 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_routine_candidate(&self, name: &str, arity: usize) -> bool {
-        self.storage
-            .has_function_routine_candidate(name, arity, self.txid)
+        self.storage.has_callable_candidate(name, arity, self.txid)
     }
 
     fn resolve_routine_call<'name>(
         &self,
         name: &'name str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
     ) -> Result<Option<super::eval::RoutineCallTarget<'name>>, SqlError> {
-        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+        if kind == super::ast::CallKind::SqlSyntax
+            && let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+        {
             return Ok(Some(super::eval::RoutineCallTarget::Operator {
                 schema,
                 name: operator,
             }));
         }
-        let Some(slot) = (if let Some(oid) = bound_oid {
-            self.storage.routine_slot_by_oid(oid, self.txid)
-        } else if argument_names.is_empty() {
-            self.storage.routine_slot_for_call_syntax_oids(
-                name,
-                argument_type_oids,
-                variadic,
-                self.txid,
+        if kind == super::ast::CallKind::SqlSyntax {
+            return Ok(None);
+        }
+        let selected = if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid).map_or(
+                crate::storage::RoutineCallSelection::Absent,
+                crate::storage::RoutineCallSelection::Stored,
             )
         } else {
-            self.storage.routine_slot_for_named_call_oids(
+            self.storage.select_routine_call(
                 name,
                 argument_names,
                 argument_type_oids,
                 variadic,
                 self.txid,
+                crate::storage::RoutineCallKind::Function,
             )
-        }) else {
-            return Ok(None);
+        };
+        let slot = match selected {
+            crate::storage::RoutineCallSelection::Stored(slot) => slot,
+            crate::storage::RoutineCallSelection::Builtin { oid, schema } => {
+                return Ok(Some(super::eval::RoutineCallTarget::Builtin {
+                    oid,
+                    schema,
+                }));
+            }
+            crate::storage::RoutineCallSelection::Ambiguous => {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function {}(...) is not unique",
+                    name
+                ));
+            }
+            crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is not a function",
+                    name
+                ));
+            }
+            crate::storage::RoutineCallSelection::Absent => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    name
+                ));
+            }
         };
         let (oid, argument_mapping) = self
             .storage
@@ -3490,6 +3522,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn routine_evaluation(
         &self,
         name: &str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -3497,6 +3530,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     ) -> Result<Option<super::eval::ExpressionEvaluation>, SqlError> {
         let Some(super::eval::RoutineCallTarget::Stored { oid, .. }) = self.resolve_routine_call(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -3604,6 +3638,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         let (oid, mapping, variadic, bound_strict) = match target {
+            super::eval::RoutineCallTarget::Builtin { .. } => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "builtin target must execute through expression evaluation"
+                ));
+            }
             super::eval::RoutineCallTarget::Stored {
                 oid,
                 argument_mapping,
@@ -3684,11 +3724,74 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "bound support function with OID {} does not exist",
-                oid
-            ));
+            let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "bound support function with OID {} does not exist",
+                    oid
+                )
+            })?;
+            if declaration.kind != b'f'
+                || declaration.returns_set
+                || arguments.len() != argument_type_oids.len()
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "bound support function argument contract changed"
+                ));
+            }
+            let expected = self
+                .storage
+                .builtin_call_input_oids(oid, &[], argument_type_oids, false, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "bound support function argument contract does not match its inputs"
+                    )
+                })?;
+            let values = arena
+                .alloc_slice_with(arguments.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (index, output) in values.iter_mut().enumerate() {
+                let source = argument_type_oids[index];
+                let target = expected[index];
+                let contract = self
+                    .storage
+                    .routine_result_for_oid(target, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "bound support function input type is unavailable"
+                        )
+                    })?;
+                *output = if source != target
+                    && let Some(value) = self.execute_defined_cast(
+                        source,
+                        target,
+                        arguments[index],
+                        super::eval::DefinedCastContext::Implicit,
+                        arena,
+                    )? {
+                    value
+                } else {
+                    self.coerce_result(arguments[index], contract, arena)?
+                };
+            }
+            if declaration.catalog.strict && values.iter().any(|value| value.is_null()) {
+                return Ok(Some(Datum::Null));
+            }
+            let hooks = EvalHooks {
+                catalog: Some(self),
+                ..super::eval::NO_HOOKS
+            };
+            return super::eval::call_builtin_oid(
+                oid,
+                values,
+                &expected[..arguments.len()],
+                arena,
+                &hooks,
+            )
+            .map(Some);
         };
         let routine = self.storage.routine_for(slot, self.txid);
         if arguments.len() != routine.argument_count || argument_type_oids.len() != arguments.len()
@@ -3867,15 +3970,46 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         result
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: super::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        Some(if kind == super::ast::CallKind::SqlSyntax {
+            crate::storage::RoutineCallSelection::Absent
+        } else if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid).map_or(
+                crate::storage::RoutineCallSelection::Absent,
+                crate::storage::RoutineCallSelection::Stored,
+            )
+        } else {
+            self.storage.select_routine_call(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            )
+        })
+    }
+
     fn routine_result_oid(
         &self,
         name: &str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         argument_type_oids: &[i32],
     ) -> Option<i32> {
-        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+        if kind == super::ast::CallKind::SqlSyntax
+            && let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+        {
             if !(1..=2).contains(&argument_type_oids.len()) {
                 return None;
             }
@@ -3907,6 +4041,27 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return self
                 .storage
                 .routine_type_oid(result.ctype, result.user_type, self.txid);
+        }
+        if kind == super::ast::CallKind::SqlSyntax {
+            return None;
+        }
+        if let Some(crate::storage::RoutineCallSelection::Builtin { oid, .. }) = self
+            .routine_call_selection(
+                name,
+                kind,
+                bound_oid,
+                argument_names,
+                variadic,
+                argument_type_oids,
+            )
+        {
+            return self.storage.builtin_call_result_oid(
+                oid,
+                argument_names,
+                argument_type_oids,
+                variadic,
+                self.txid,
+            );
         }
         let routine = if let Some(oid) = bound_oid {
             self.storage.function_for_captured_call(
@@ -5171,6 +5326,7 @@ fn privilege_relation_oid(
         parsed.schema.as_ref().map(crate::storage::SqlName::as_str),
         parsed.name.as_str(),
     )
+    .require_supported()?
     .ok_or_else(|| {
         sql_err!(
             sqlstate::UNDEFINED_TABLE,
@@ -5873,13 +6029,32 @@ fn resolve_group_ordinals<'a>(
     storage: &Storage,
     txid: u32,
 ) -> Result<&'a Select<'a>, SqlError> {
+    let scoped_columns = scope.map(|scope| CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let empty_columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn super::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
+        &empty_columns as &dyn super::exec::ColTypeResolver,
+        |columns| columns,
+    );
     // An aggregate cannot be a grouping key, however it got there — written
     // directly, nested in an expression, or named by a position. Checked after
     // resolution so `GROUP BY 1` naming an aggregate item is caught too.
     let refuse_aggregates = |keys: &[&'a Expr<'a>]| -> Result<(), SqlError> {
         for key in keys {
             let mut nodes = ArenaList::new(arena);
-            collect_aggs(key, &mut nodes, storage, txid)?;
+            collect_aggs(key, &mut nodes, storage, txid, columns)?;
             if !nodes.is_empty() {
                 return Err(sql_err!(
                     sqlstate::GROUPING_ERROR,
@@ -6507,6 +6682,188 @@ fn describe_set_tree<'a>(
     }
 }
 
+/// Classifies the selected routine without evaluating any of its inputs.
+pub(super) fn selected_aggregate_call(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<bool, SqlError> {
+    use crate::storage::{RoutineCallKind, RoutineCallSelection, RoutineKind};
+    let Expr::Call {
+        name,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        order_by,
+        star,
+        distinct,
+        filter,
+        over,
+        ..
+    } = expression
+    else {
+        return Ok(false);
+    };
+    if super::eval::is_sql_syntax_call(expression) {
+        return Ok(expression.is_aggregate());
+    }
+    let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > argument_oids.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine input count exceeds MAX_ROUTINE_ARGUMENTS ({})",
+            argument_oids.len()
+        ));
+    }
+    for (index, argument) in args.iter().enumerate() {
+        argument_oids[index] = super::exec::infer_routine_argument_oid(argument, columns)?;
+    }
+    let mut selected = if let Some(oid) = bound_oid {
+        storage.routine_slot_by_oid(*oid, txid).map_or_else(
+            || {
+                super::catalog::builtin_callable_by_oid(*oid).map_or(
+                    RoutineCallSelection::Absent,
+                    |signature| RoutineCallSelection::Builtin {
+                        oid: *oid,
+                        schema: signature.schema,
+                    },
+                )
+            },
+            RoutineCallSelection::Stored,
+        )
+    } else {
+        storage.select_routine_call(
+            name,
+            argument_names,
+            &argument_oids[..args.len()],
+            *variadic,
+            txid,
+            RoutineCallKind::Function,
+        )
+    };
+    // Ordered-set aggregates declare their WITHIN GROUP inputs as arguments.
+    // Ordinary aggregate ORDER BY keys are not additional function arguments.
+    if selected == RoutineCallSelection::Absent
+        && !order_by.is_empty()
+        && bound_oid.is_none()
+        && argument_names.is_empty()
+    {
+        let count = args
+            .len()
+            .checked_add(order_by.len())
+            .filter(|count| *count <= argument_oids.len())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine input count exceeds MAX_ROUTINE_ARGUMENTS ({})",
+                    argument_oids.len()
+                )
+            })?;
+        for (index, order) in order_by.iter().enumerate() {
+            argument_oids[args.len() + index] =
+                super::exec::infer_routine_argument_oid(order.expression, columns)?;
+        }
+        selected = storage.select_routine_call(
+            name,
+            &[],
+            &argument_oids[..count],
+            *variadic,
+            txid,
+            RoutineCallKind::Function,
+        );
+    }
+    let aggregate = match selected {
+        RoutineCallSelection::Stored(slot) => {
+            let kind = storage.routine_for(slot, txid).kind;
+            if over.is_some() && !matches!(kind, RoutineKind::Aggregate(_)) {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "OVER specified, but {} is not a window function nor an aggregate function",
+                    name
+                ));
+            }
+            match kind {
+                RoutineKind::Aggregate(_) => Ok(true),
+                RoutineKind::Procedure => Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is a procedure",
+                    name
+                )),
+                _ => Ok(false),
+            }
+        }
+        RoutineCallSelection::Builtin { oid, .. } => {
+            let signature = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected builtin declaration is unavailable"
+                )
+            })?;
+            if over.is_some() && !matches!(signature.kind, b'a' | b'w') {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "OVER specified, but {} is not a window function nor an aggregate function",
+                    name
+                ));
+            }
+            if over.is_none() && signature.kind == b'w' {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "window function {} requires an OVER clause",
+                    name
+                ));
+            }
+            Ok(signature.kind == b'a')
+        }
+        RoutineCallSelection::Ambiguous => Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "function {}(...) is not unique",
+            name
+        )),
+        RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is a procedure",
+            name
+        )),
+        RoutineCallSelection::Absent => {
+            if bound_oid.is_some()
+                || super::catalog::builtin_callable_schema(name.rsplit('.').next().unwrap_or(name))
+                    .is_some()
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    name
+                ));
+            }
+            Ok(false)
+        }
+    }?;
+    if !aggregate
+        && over.is_none()
+        && (*star || *distinct || !order_by.is_empty() || filter.is_some())
+    {
+        let decoration = if *distinct {
+            "DISTINCT"
+        } else if !order_by.is_empty() {
+            "ORDER BY"
+        } else if filter.is_some() {
+            "FILTER"
+        } else {
+            "*"
+        };
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} specified, but {} is not an aggregate function",
+            decoration,
+            name
+        ));
+    }
+    Ok(aggregate)
+}
+
 /// Walks an expression tree collecting aggregate call nodes. A windowed call
 /// (`sum(x) OVER (...)`) is not one: it is a window function, and counting it
 /// here would send the query down the grouped executor instead of the window
@@ -6516,14 +6873,11 @@ pub(super) fn collect_aggs<'a>(
     out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
     storage: &Storage,
     txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
 ) -> Result<(), SqlError> {
-    let catalog_aggregate = matches!(
-        expression,
-        Expr::Call { name, args, over: None, order_by, .. }
-            if storage.has_aggregate_candidate(name, args.len(), txid)
-                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
-    );
-    if expression.is_aggregate_use() || catalog_aggregate {
+    if matches!(expression, Expr::Call { over: None, .. })
+        && selected_aggregate_call(expression, storage, txid, columns)?
+    {
         if out
             .as_slice()
             .iter()
@@ -6536,7 +6890,7 @@ pub(super) fn collect_aggs<'a>(
         return Ok(()); // aggregate arguments evaluate per input row
     }
     walk_children(expression, &mut |child| {
-        collect_aggs(child, out, storage, txid)
+        collect_aggs(child, out, storage, txid, columns)
     })
 }
 
@@ -6546,6 +6900,7 @@ pub(super) fn collect_windows<'a>(
     out: &mut ArenaList<'a, &'a Expr<'a>>,
     storage: &Storage,
     txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
 ) -> Result<(), SqlError> {
     if let Expr::Call {
         over: Some(_),
@@ -6570,13 +6925,8 @@ pub(super) fn collect_windows<'a>(
                 "aggregate ORDER BY is not implemented for window functions"
             ));
         }
-        let catalog_aggregate = matches!(
-            expression,
-            Expr::Call { name, args, order_by, .. }
-                if storage.has_aggregate_candidate(name, args.len(), txid)
-                    || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
-        );
-        if filter.is_some() && !expression.is_aggregate() && !catalog_aggregate {
+        let aggregate = selected_aggregate_call(expression, storage, txid, columns)?;
+        if filter.is_some() && !aggregate {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "FILTER is not implemented for non-aggregate window functions"
@@ -6592,7 +6942,7 @@ pub(super) fn collect_windows<'a>(
         return Ok(());
     }
     walk_children(expression, &mut |child| {
-        collect_windows(child, out, storage, txid)
+        collect_windows(child, out, storage, txid, columns)
     })
 }
 
@@ -6621,6 +6971,7 @@ fn collect_grouped_aggs<'a>(
     out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
     storage: &Storage,
     txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
 ) -> Result<(), SqlError> {
     if let Expr::Call {
         over: Some(spec),
@@ -6630,39 +6981,34 @@ fn collect_grouped_aggs<'a>(
     } = e
     {
         for a in *args {
-            collect_grouped_aggs(a, out, storage, txid)?;
+            collect_grouped_aggs(a, out, storage, txid, columns)?;
         }
         for pk in spec.partition_by {
-            collect_grouped_aggs(pk, out, storage, txid)?;
+            collect_grouped_aggs(pk, out, storage, txid, columns)?;
         }
         for o in spec.order_by {
-            collect_grouped_aggs(o.expression, out, storage, txid)?;
+            collect_grouped_aggs(o.expression, out, storage, txid, columns)?;
         }
         if let Some(frame) = &spec.frame {
             for bound in [&frame.start, &frame.end] {
                 if let FrameBound::Preceding(x) | FrameBound::Following(x) = bound {
-                    collect_grouped_aggs(x, out, storage, txid)?;
+                    collect_grouped_aggs(x, out, storage, txid, columns)?;
                 }
             }
         }
         if let Some(f) = filter {
-            collect_grouped_aggs(f, out, storage, txid)?;
+            collect_grouped_aggs(f, out, storage, txid, columns)?;
         }
         return Ok(());
     }
-    let catalog_aggregate = matches!(
-        e,
-        Expr::Call { name, args, order_by, .. }
-            if storage.has_aggregate_candidate(name, args.len(), txid)
-                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
-    );
-    if e.is_aggregate() || catalog_aggregate {
-        return collect_aggs(e, out, storage, txid);
+    if selected_aggregate_call(e, storage, txid, columns)? {
+        return collect_aggs(e, out, storage, txid, columns);
     }
     // GROUPING() reads the current grouping-set mask, so it must evaluate in
     // the inner grouped select, like an aggregate.
     if let Expr::Call {
         name: "grouping",
+        kind: super::ast::CallKind::SqlSyntax,
         over: None,
         ..
     } = e
@@ -6674,7 +7020,7 @@ fn collect_grouped_aggs<'a>(
         return Ok(());
     }
     walk_children(e, &mut |child| {
-        collect_grouped_aggs(child, out, storage, txid)
+        collect_grouped_aggs(child, out, storage, txid, columns)
     })
 }
 
@@ -6863,6 +7209,7 @@ fn rewrite_grouped_expr<'a>(
             over,
             filter,
             bound_strict,
+            kind,
         } => {
             let mut rewritten = ArenaList::new(arena);
             for a in args.iter() {
@@ -6911,6 +7258,7 @@ fn rewrite_grouped_expr<'a>(
             };
             alloc(Expr::Call {
                 name,
+                kind: *kind,
                 bound_oid: *bound_oid,
                 bound_strict: *bound_strict,
                 args,
@@ -7089,18 +7437,25 @@ pub fn check_select_constants<'a>(
 /// engine).
 /// True if the expression tree contains an aggregate *use* (a bare aggregate
 /// call, not a window aggregate).
-pub(super) fn expr_has_aggregate(expression: &Expr) -> bool {
-    if expression.is_aggregate_use() {
-        return true;
+pub(super) fn expr_has_aggregate(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
+) -> Result<bool, SqlError> {
+    if matches!(expression, Expr::Call { over: None, .. })
+        && selected_aggregate_call(expression, storage, txid, columns)?
+    {
+        return Ok(true);
     }
     let mut found = false;
-    let _ = subquery::walk_children(expression, &mut |child| {
-        if expr_has_aggregate(child) {
+    subquery::walk_children(expression, &mut |child| {
+        if expr_has_aggregate(child, storage, txid, columns)? {
             found = true;
         }
         Ok(())
-    });
-    found
+    })?;
+    Ok(found)
 }
 
 /// True if the expression tree contains a window-function call (`OVER ...`).
@@ -7136,7 +7491,39 @@ fn from_binds_relation(from: Option<&FromClause>, name: &str) -> bool {
 /// `OF` target names no relation in the FROM clause. Returns `Ok(())` when there
 /// is no clause or every clause is well-formed.
 ///
-pub fn validate_locking(statement: &Select) -> Result<(), SqlError> {
+pub fn validate_locking(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if statement.locking.is_empty() {
+        return Ok(());
+    }
+    let scope = statement
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let scoped = scope.as_ref().map(|scope| CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let fromless = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn super::exec::ColTypeResolver = match scoped.as_ref() {
+        Some(columns) => columns,
+        None => &fromless,
+    };
     for clause in statement.locking {
         let keyword = clause.strength.keyword();
         if statement.set_body.is_some() {
@@ -7176,7 +7563,7 @@ pub fn validate_locking(statement: &Select) -> Result<(), SqlError> {
                         keyword
                     ));
                 }
-                if expr_has_aggregate(expression) {
+                if expr_has_aggregate(expression, storage, txid, columns)? {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "{} is not allowed with aggregate functions",
@@ -7345,26 +7732,57 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // Windows over a grouped query evaluate after GROUP BY / HAVING: rewrite
     // to the two-level form up front (before the result is described) and run
     // the rewritten statement instead.
-    {
-        let mut win_probe = ArenaList::new(arena);
+    let has_window = statement.items.iter().any(|item| matches!(item,
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) if expr_has_window(expression)))
+        || statement.order_by.iter().any(|key| expr_has_window(key.expression));
+    let has_srf = has_project_set(statement.items, storage, txid);
+    if has_window || has_srf {
+        let analysis_scope = match QueryScope::resolve_schema(storage, from, txid, arena, None) {
+            Ok(scope) => scope,
+            Err(error) => return sql_fail(error),
+        };
+        let analysis_columns = CatalogScopeCols {
+            scope: &analysis_scope,
+            outer_scope: None,
+            storage,
+            txid,
+            arena,
+        };
         let mut grouped_aggs = ArenaList::new(arena);
         for item in statement.items {
-            if let SelectItem::Expr { expression, .. } = item {
-                if let Err(e) = collect_windows(expression, &mut win_probe, storage, txid) {
-                    return sql_fail(e);
-                }
-                if let Err(e) = collect_grouped_aggs(expression, &mut grouped_aggs, storage, txid) {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+                if let Err(e) = collect_grouped_aggs(
+                    expression,
+                    &mut grouped_aggs,
+                    storage,
+                    txid,
+                    &analysis_columns,
+                ) {
                     return sql_fail(e);
                 }
             }
         }
-        let has_srf = has_project_set(statement.items, storage, txid);
-        if (!win_probe.is_empty() || has_srf)
-            && (!statement.group_by.is_empty()
-                || statement.having.is_some()
-                || !grouped_aggs.is_empty())
+        for key in statement.order_by {
+            if let Err(error) = collect_grouped_aggs(
+                key.expression,
+                &mut grouped_aggs,
+                storage,
+                txid,
+                &analysis_columns,
+            ) {
+                return sql_fail(error);
+            }
+        }
+        if !statement.group_by.is_empty() || statement.having.is_some() || !grouped_aggs.is_empty()
         {
-            let rewritten = match rewrite_grouped_windows(statement, storage, txid, arena) {
+            let rewritten = match rewrite_grouped_windows(
+                statement,
+                storage,
+                txid,
+                arena,
+                Some(&analysis_scope),
+                &analysis_columns,
+            ) {
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
@@ -7399,6 +7817,13 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // Relation locks are part of planning, before RowDescription. The scan
     // path repeats this idempotently for nested/correlated execution, but a
     // top-level wait must not leak a partial wire response.
+    let resolved_columns = CatalogScopeCols {
+        scope: &scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    };
     let relation_mode = if statement.locking.is_empty() {
         crate::sql::ast::TableLockMode::AccessShare
     } else {
@@ -7558,13 +7983,20 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     let mut win_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
-            && let Err(e) = collect_windows(expression, &mut win_nodes, storage, txid)
+            && let Err(e) =
+                collect_windows(expression, &mut win_nodes, storage, txid, &resolved_columns)
         {
             return sql_fail(e);
         }
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_windows(ob.expression, &mut win_nodes, storage, txid) {
+        if let Err(e) = collect_windows(
+            ob.expression,
+            &mut win_nodes,
+            storage,
+            txid,
+            &resolved_columns,
+        ) {
             return sql_fail(e);
         }
     }
@@ -7591,22 +8023,29 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     let mut agg_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
-            && let Err(e) = collect_aggs(expression, &mut agg_nodes, storage, txid)
+            && let Err(e) =
+                collect_aggs(expression, &mut agg_nodes, storage, txid, &resolved_columns)
         {
             return sql_fail(e);
         }
     }
     if let Some(h) = statement.having
-        && let Err(e) = collect_aggs(h, &mut agg_nodes, storage, txid)
+        && let Err(e) = collect_aggs(h, &mut agg_nodes, storage, txid, &resolved_columns)
     {
         return sql_fail(e);
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, storage, txid) {
+        if let Err(e) = collect_aggs(
+            ob.expression,
+            &mut agg_nodes,
+            storage,
+            txid,
+            &resolved_columns,
+        ) {
             return sql_fail(e);
         }
     }
-    if !agg_nodes.is_empty() || !statement.group_by.is_empty() {
+    if !agg_nodes.is_empty() || !statement.group_by.is_empty() || statement.having.is_some() {
         return grouped_select(
             storage,
             &scope,
@@ -7942,6 +8381,14 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         ..crate::sql::eval::NO_HOOKS
     };
 
+    let resolved_columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
         return sql_fail(e);
     }
@@ -7953,7 +8400,8 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut win_probe = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
-            && let Err(e) = collect_windows(expression, &mut win_probe, storage, txid)
+            && let Err(e) =
+                collect_windows(expression, &mut win_probe, storage, txid, &resolved_columns)
         {
             return sql_fail(e);
         }
@@ -8055,18 +8503,25 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut agg_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
-            && let Err(e) = collect_aggs(expression, &mut agg_nodes, storage, txid)
+            && let Err(e) =
+                collect_aggs(expression, &mut agg_nodes, storage, txid, &resolved_columns)
         {
             return sql_fail(e);
         }
     }
     if let Some(h) = statement.having
-        && let Err(e) = collect_aggs(h, &mut agg_nodes, storage, txid)
+        && let Err(e) = collect_aggs(h, &mut agg_nodes, storage, txid, &resolved_columns)
     {
         return sql_fail(e);
     }
     for ob in statement.order_by {
-        if let Err(e) = collect_aggs(ob.expression, &mut agg_nodes, storage, txid) {
+        if let Err(e) = collect_aggs(
+            ob.expression,
+            &mut agg_nodes,
+            storage,
+            txid,
+            &resolved_columns,
+        ) {
             return sql_fail(e);
         }
     }
@@ -8075,7 +8530,14 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
             // The set-returning function expands after aggregation: rewrite
             // to the two-level form (aggregates in a derived table) and run
             // through the FROM executor.
-            let rewritten = match rewrite_grouped_windows(statement, storage, txid, arena) {
+            let rewritten = match rewrite_grouped_windows(
+                statement,
+                storage,
+                txid,
+                arena,
+                None,
+                &resolved_columns,
+            ) {
                 Ok(r) => r,
                 Err(e) => return sql_fail(e),
             };
@@ -8427,11 +8889,9 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     sql_ok()
 }
 
-/// Runs a `SELECT` used as an INSERT source, invoking `emit` once per output
-/// row with that row's projected datums. The resulting table is unordered, so
-/// ORDER BY is ignored; DISTINCT/GROUP BY/aggregate sources are rejected loudly
-/// (not yet supported). Subqueries (including correlated) in the source are
-/// supported.
+/// Streams SELECT output to INSERT, subqueries and routine bodies, including
+/// grouping, ordering, windows and set-returning projections. The consumer
+/// copies each emitted row before returning.
 #[allow(clippy::too_many_arguments)]
 pub fn select_into_rows<'a>(
     storage: &'a Storage,
@@ -8479,6 +8939,45 @@ pub(super) fn select_into_rows_recycling<'a>(
     select_into_rows_mode(
         storage, txid, statement, arena, params, outer, seq, true, emit,
     )
+}
+
+/// This only gates schema work; the typed collector makes the semantic choice.
+fn expression_needs_aggregate_resolution(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    if let Expr::Call {
+        name,
+        args,
+        order_by,
+        bound_oid,
+        over: None,
+        star,
+        distinct,
+        filter,
+        ..
+    } = expression
+        && (bound_oid.is_some()
+            || *star
+            || *distinct
+            || filter.is_some()
+            || !order_by.is_empty()
+            || expression.is_aggregate_use()
+            || super::catalog::builtin_callable_signatures(name.rsplit('.').next().unwrap_or(name))
+                .any(|signature| matches!(signature.kind, b'a' | b'w'))
+            || storage.has_aggregate_candidate(name, args.len(), txid)
+            || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid))
+    {
+        return true;
+    }
+    let mut found = false;
+    walk_children(expression, &mut |child| {
+        found |= expression_needs_aggregate_resolution(child, storage, txid);
+        Ok(())
+    })
+    .expect("aggregate candidate visitor cannot fail");
+    found
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8582,26 +9081,76 @@ fn select_into_rows_mode<'a>(
         invocations: None,
         statement_arena: None,
     };
+    let aggregate_analysis = statement.items.iter().any(|item| {
+        matches!(item,
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression)
+            if expression_needs_aggregate_resolution(expression, storage, txid))
+    }) || statement
+        .having
+        .is_some_and(|expression| expression_needs_aggregate_resolution(expression, storage, txid))
+        || statement
+            .order_by
+            .iter()
+            .any(|key| expression_needs_aggregate_resolution(key.expression, storage, txid));
+    let has_srf = has_project_set(statement.items, storage, txid);
+    let analysis_scope = if aggregate_analysis
+        || (has_srf && (!statement.group_by.is_empty() || statement.having.is_some()))
+    {
+        statement
+            .from
+            .as_ref()
+            .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
+            .transpose()?
+    } else {
+        None
+    };
+    let analysis_columns = subquery::SubqueryColumns {
+        scope: analysis_scope.as_ref(),
+        outer,
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    };
     let mut agg_nodes = ArenaList::new(arena);
-    for item in statement.items {
-        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-            collect_aggs(expression, &mut agg_nodes, storage, txid)?;
+    if aggregate_analysis {
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+                collect_aggs(expression, &mut agg_nodes, storage, txid, &analysis_columns)?;
+            }
         }
-    }
-    if let Some(h) = statement.having {
-        collect_aggs(h, &mut agg_nodes, storage, txid)?;
-    }
-    for ob in statement.order_by {
-        collect_aggs(ob.expression, &mut agg_nodes, storage, txid)?;
+        if let Some(h) = statement.having {
+            collect_aggs(h, &mut agg_nodes, storage, txid, &analysis_columns)?;
+        }
+        for ob in statement.order_by {
+            collect_aggs(
+                ob.expression,
+                &mut agg_nodes,
+                storage,
+                txid,
+                &analysis_columns,
+            )?;
+        }
     }
     // GROUP BY or aggregates: run the grouped executor (which sorts by any
     // ORDER BY and dedups DISTINCT) and emit each output row, honoring
     // LIMIT/OFFSET. A set-returning function expands after aggregation —
     // rewrite to the two-level form first.
-    if (!statement.group_by.is_empty() || !agg_nodes.is_empty())
-        && has_project_set(statement.items, storage, txid)
+    if (!statement.group_by.is_empty() || !agg_nodes.is_empty() || statement.having.is_some())
+        && has_srf
     {
-        let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
+        let rewritten = rewrite_grouped_windows(
+            statement,
+            storage,
+            txid,
+            arena,
+            analysis_scope.as_ref(),
+            &analysis_columns,
+        )?;
         return select_into_rows_mode(
             storage,
             txid,
@@ -8614,7 +9163,7 @@ fn select_into_rows_mode<'a>(
             emit,
         );
     }
-    if !statement.group_by.is_empty() || !agg_nodes.is_empty() {
+    if !statement.group_by.is_empty() || !agg_nodes.is_empty() || statement.having.is_some() {
         let Some(from) = &statement.from else {
             // FROM-less aggregate: one virtual input row.
             let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
@@ -8790,7 +9339,7 @@ fn select_into_rows_mode<'a>(
         let mut win_probe = ArenaList::new(arena);
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_windows(expression, &mut win_probe, storage, txid)?;
+                collect_windows(expression, &mut win_probe, storage, txid, &analysis_columns)?;
             }
         }
         if !win_probe.is_empty() {
@@ -8917,6 +9466,18 @@ fn select_into_rows_mode<'a>(
         seq,
         outer,
     )?;
+    let resolved_columns = subquery::SubqueryColumns {
+        scope: Some(&scope),
+        outer,
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    };
     let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
@@ -8939,23 +9500,42 @@ fn select_into_rows_mode<'a>(
     let mut win_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            collect_windows(expression, &mut win_nodes, storage, txid)?;
+            collect_windows(expression, &mut win_nodes, storage, txid, &resolved_columns)?;
         }
     }
     for ob in statement.order_by {
-        collect_windows(ob.expression, &mut win_nodes, storage, txid)?;
+        collect_windows(
+            ob.expression,
+            &mut win_nodes,
+            storage,
+            txid,
+            &resolved_columns,
+        )?;
     }
     if !win_nodes.is_empty() {
         // Windows over a grouped query: rewrite to the two-level form.
         let mut grouped_aggs = ArenaList::new(arena);
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_grouped_aggs(expression, &mut grouped_aggs, storage, txid)?;
+                collect_grouped_aggs(
+                    expression,
+                    &mut grouped_aggs,
+                    storage,
+                    txid,
+                    &resolved_columns,
+                )?;
             }
         }
         if !statement.group_by.is_empty() || statement.having.is_some() || !grouped_aggs.is_empty()
         {
-            let rewritten = rewrite_grouped_windows(statement, storage, txid, arena)?;
+            let rewritten = rewrite_grouped_windows(
+                statement,
+                storage,
+                txid,
+                arena,
+                Some(&scope),
+                &resolved_columns,
+            )?;
             return select_into_rows_mode(
                 storage,
                 txid,
@@ -10092,9 +10672,14 @@ fn user_type_expression_description<'q>(
     if let Some(description) = user_type_cast_description(expression, name, storage, txid) {
         return Some(description);
     }
+    let mut selected_builtin = None;
     if let Expr::Call {
+        kind: super::ast::CallKind::Routine,
         name: routine_name,
+        bound_oid,
         args,
+        argument_names,
+        variadic,
         star: false,
         ..
     } = expression
@@ -10119,23 +10704,56 @@ fn user_type_expression_description<'q>(
                         .map(|(oid, _)| oid)
                 })?;
             }
-            if let Some(routine) =
-                storage.routine_for_call_oids(routine_name, &argument_type_oids[..args.len()], txid)
-            {
-                let result = routine.function_result_contract()?.ctype;
-                return Some(ColDesc::new(name, result.oid(), result.typlen()));
+            let selection = if let Some(oid) = bound_oid {
+                storage.routine_slot_by_oid(*oid, txid).map_or(
+                    crate::storage::RoutineCallSelection::Absent,
+                    crate::storage::RoutineCallSelection::Stored,
+                )
+            } else {
+                storage.select_routine_call(
+                    routine_name,
+                    argument_names,
+                    &argument_type_oids[..args.len()],
+                    *variadic,
+                    txid,
+                    crate::storage::RoutineCallKind::Function,
+                )
+            };
+            match selection {
+                crate::storage::RoutineCallSelection::Stored(slot) => {
+                    let result = storage.routine_for(slot, txid).function_result_contract()?;
+                    return Some(ColDesc::new(
+                        name,
+                        storage.routine_type_oid(result.ctype, result.user_type, txid)?,
+                        result.ctype.typlen(),
+                    ));
+                }
+                crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                    selected_builtin = Some(oid)
+                }
+                _ => return None,
             }
         }
     }
+    let mut normalized = *expression;
+    if let Expr::Call {
+        kind: super::ast::CallKind::Routine,
+        name,
+        ..
+    } = &mut normalized
+    {
+        *name = super::catalog::builtin_callable_by_oid(selected_builtin?)?.name;
+    }
+    let expression = &normalized;
     match expression {
         Expr::Call {
+            kind,
             name: function,
             args,
             ..
-        } if matches!(
-            *function,
-            "coalesce" | "greatest" | "least" | "min" | "max" | "nullif"
-        ) =>
+        } if (*kind == super::ast::CallKind::SqlSyntax
+            && matches!(*function, "coalesce" | "greatest" | "least" | "nullif"))
+            || (selected_builtin.is_some() && matches!(*function, "min" | "max")) =>
         {
             return matching_user_type_description(args, name, storage, txid);
         }
@@ -10449,7 +11067,11 @@ fn describe_scope_record_star<'q>(
         arena,
     };
     match base {
-        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.eq_ignore_ascii_case("row") => {
             super::exec::check_row_field_types(base, &resolver)?;
             let mut error = None;
             let mut index = 0usize;
@@ -10490,7 +11112,7 @@ fn describe_scope_record_star<'q>(
                 )?;
             }
         }
-        Expr::Call { name, .. } if super::exec::builtin_record_srf_field_pub(name, 0).is_some() => {
+        Expr::Call { name, .. } if super::exec::builtin_record_srf_call(base, &resolver)? => {
             let mut index = 0;
             while let Some((field, ctype)) = super::exec::builtin_record_srf_field_pub(name, index)
             {
@@ -10499,13 +11121,14 @@ fn describe_scope_record_star<'q>(
             }
         }
         Expr::Call { name, args, .. }
-            if matches!(
-                *name,
-                "json_populate_record"
-                    | "jsonb_populate_record"
-                    | "json_populate_recordset"
-                    | "jsonb_populate_recordset"
-            ) =>
+            if super::exec::builtin_call(base, &resolver)?
+                && matches!(
+                    *name,
+                    "json_populate_record"
+                        | "jsonb_populate_record"
+                        | "json_populate_recordset"
+                        | "jsonb_populate_recordset"
+                ) =>
         {
             return describe_scope_record_star(
                 args.first().copied().ok_or_else(|| {
@@ -10523,6 +11146,7 @@ fn describe_scope_record_star<'q>(
             );
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
@@ -10546,6 +11170,7 @@ fn describe_scope_record_star<'q>(
             while let Some((field_name, meta)) = super::exec::ColTypeResolver::routine_record_field(
                 &resolver,
                 name,
+                *kind,
                 *bound_oid,
                 argument_names,
                 *variadic,
@@ -10830,15 +11455,46 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
         })
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: super::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        Some(if kind == super::ast::CallKind::SqlSyntax {
+            crate::storage::RoutineCallSelection::Absent
+        } else if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid).map_or(
+                crate::storage::RoutineCallSelection::Absent,
+                crate::storage::RoutineCallSelection::Stored,
+            )
+        } else {
+            self.storage.select_routine_call(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            )
+        })
+    }
+
     fn routine_result(
         &self,
         name: &str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<super::exec::StaticTypeMeta> {
-        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+        if kind == super::ast::CallKind::SqlSyntax
+            && let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+        {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
@@ -10898,6 +11554,21 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 },
             });
         }
+        if kind == super::ast::CallKind::SqlSyntax {
+            return None;
+        }
+        if let Some(crate::storage::RoutineCallSelection::Builtin { oid, .. }) =
+            self.routine_call_selection(name, kind, bound_oid, argument_names, variadic, arguments)
+        {
+            return super::exec::catalog_builtin_call_result_metadata(
+                self.storage,
+                self.txid,
+                oid,
+                argument_names,
+                arguments,
+                variadic,
+            );
+        }
         let routine = if let Some(oid) = bound_oid {
             self.storage.function_for_captured_call(
                 oid,
@@ -10946,15 +11617,21 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: super::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        if bound_oid.is_none()
-            && let Some((field, type_oid, ctype)) =
-                super::catalog::intrinsic_record_field(name, arguments, index)
+        if kind == super::ast::CallKind::SqlSyntax {
+            return None;
+        }
+        if matches!(
+            self.routine_call_selection(name, kind, bound_oid, argument_names, variadic, arguments),
+            Some(crate::storage::RoutineCallSelection::Builtin { .. })
+        ) && let Some((field, type_oid, ctype)) =
+            super::catalog::intrinsic_record_field(name, arguments, index)
         {
             return Some((
                 crate::util::StackStr::from_str(field),

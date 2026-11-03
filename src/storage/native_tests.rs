@@ -389,13 +389,22 @@ fn visible_row_heap_ownership_deferred_snapshot_survives_relocation_and_rejects_
 fn execution_path_is_thread_private() {
     let prior = replace_execution_path(PathContext::public_schema(7));
     let child = std::thread::spawn(|| {
-        assert_eq!(execution_path().first_schema(), Some(0));
+        assert_eq!(
+            execution_path().creation_target(),
+            Some(PathEntry::Schema(0))
+        );
         let prior = replace_execution_path(PathContext::public_schema(11));
-        assert_eq!(prior.first_schema(), Some(0));
-        assert_eq!(execution_path().first_schema(), Some(11));
+        assert_eq!(prior.creation_target(), Some(PathEntry::Schema(0)));
+        assert_eq!(
+            execution_path().creation_target(),
+            Some(PathEntry::Schema(11))
+        );
     });
     child.join().expect("path worker completes");
-    assert_eq!(execution_path().first_schema(), Some(7));
+    assert_eq!(
+        execution_path().creation_target(),
+        Some(PathEntry::Schema(7))
+    );
     replace_execution_path(prior);
 }
 

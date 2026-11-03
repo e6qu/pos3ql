@@ -1604,6 +1604,7 @@ where
         }
         (
             Expr::Call {
+                kind: left_kind,
                 name: left_name,
                 bound_oid: left_bound_oid,
                 bound_strict: left_bound_strict,
@@ -1617,6 +1618,7 @@ where
                 filter: left_filter,
             },
             Expr::Call {
+                kind: right_kind,
                 name: right_name,
                 bound_oid: right_bound_oid,
                 bound_strict: right_bound_strict,
@@ -1630,7 +1632,8 @@ where
                 filter: right_filter,
             },
         ) => {
-            left_name.eq_ignore_ascii_case(right_name)
+            left_kind == right_kind
+                && left_name.eq_ignore_ascii_case(right_name)
                 && left_bound_oid == right_bound_oid
                 && left_bound_strict == right_bound_strict
                 && left_argument_names == right_argument_names
@@ -4480,11 +4483,21 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             .expect("lateral function run has a block store");
     }
 
+    let qualified_name;
+    let written_name = if let Some(schema) = tref.schema {
+        qualified_name = crate::stack_format!(128, "{}.{}", schema, tref.table);
+        arena
+            .alloc_str(qualified_name.as_str())
+            .map_err(|_| arena_full())?
+    } else {
+        tref.table
+    };
     let call = arena
         .alloc(Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
             bound_oid: None,
             bound_strict: None,
-            name: tref.table,
+            name: written_name,
             args: arguments,
             argument_names: tref.func_argument_names,
             variadic: tref.func_variadic,
@@ -4495,46 +4508,59 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             filter: None,
         })
         .map_err(|_| arena_full())?;
-    super::srf::with_bound_srf_inputs(call, arena, params, outer, &hooks, |bound, inputs| {
-        let count = super::srf::srf_count(bound, arena, inputs, outer, &hooks)?;
-        for index in 1..=count {
-            let mark = arena.mark();
-            let row_hooks = EvalHooks {
-                srf_index: Some(index),
-                ..hooks
-            };
-            let value = eval_full(bound, arena, inputs, outer, &row_hooks)?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            match (base_width, value) {
-                (1, value) => values[0] = value,
-                (_, Datum::Record(fields)) if fields.len() == base_width => {
-                    for (column, field) in fields.iter().enumerate() {
-                        values[column] = field.value;
+    super::srf::with_bound_srf_inputs(
+        &catalog,
+        call,
+        arena,
+        params,
+        outer,
+        &hooks,
+        |bound, inputs| {
+            let count = super::srf::srf_count(bound, arena, inputs, outer, &hooks)?;
+            for index in 1..=count {
+                let mark = arena.mark();
+                let row_hooks = EvalHooks {
+                    srf_index: Some(index),
+                    ..hooks
+                };
+                let value = eval_full(bound, arena, inputs, outer, &row_hooks)?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                match (base_width, value) {
+                    (1, value) => values[0] = value,
+                    (_, Datum::Record(fields)) if fields.len() == base_width => {
+                        for (column, field) in fields.iter().enumerate() {
+                            values[column] = field.value;
+                        }
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "set-returning function row width does not match its definition"
+                        ));
                     }
                 }
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "set-returning function row width does not match its definition"
-                    ));
+                if tref.with_ordinality {
+                    values[base_width] = Datum::Int8(index as i64);
                 }
-            }
-            if tref.with_ordinality {
-                values[base_width] = Datum::Int8(index as i64);
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(
+                            blocks,
+                            width,
+                            |column| values[column],
+                            &mut compare,
+                        )
+                    })
+                    .expect("lateral function run has a block store")?;
+                // SAFETY: the evaluated SRF row was encoded into the immutable run;
+                // no datum allocated after this mark is retained.
+                unsafe { arena.rewind_to(mark) };
             }
             storage
-                .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, width, |column| values[column], &mut compare)
-                })
-                .expect("lateral function run has a block store")?;
-            // SAFETY: the evaluated SRF row was encoded into the immutable run;
-            // no datum allocated after this mark is retained.
-            unsafe { arena.rewind_to(mark) };
-        }
-        storage
-            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
-            .expect("lateral function run has a block store")
-    })
+                .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+                .expect("lateral function run has a block store")
+        },
+    )
 }
 
 enum LateralRows<'a> {
@@ -4554,11 +4580,56 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     outer: &C,
     base_hooks: &EvalHooks<'_, 'a>,
 ) -> Result<LateralRows<'a>, SqlError> {
-    let external_function = tref.func_args.is_some()
-        && super::srf::is_srf_name(tref.table)
-        && !tref.table.eq_ignore_ascii_case("pg_options_to_table")
-        && !tref.table.eq_ignore_ascii_case("pg_get_sequence_data")
-        && !tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
+    let external_function = if tref.func_args.is_some() && !super::srf::sql_table_constructor(tref)
+    {
+        let (selection, _) = super::srf::select_table_func_routine(
+            tref,
+            storage,
+            txid,
+            arena,
+            outer,
+            Some(base_hooks),
+        )?;
+        match selection {
+            crate::storage::RoutineCallSelection::Builtin { schema, .. } => {
+                let qualified = crate::stack_format!(128, "{}.{}", schema, tref.table);
+                if qualified.is_truncated() {
+                    return Err(arena_full());
+                }
+                super::srf::is_srf_name(qualified.as_str())
+                    && !matches!(
+                        tref.table,
+                        "pg_options_to_table"
+                            | "pg_get_sequence_data"
+                            | "pg_get_publication_tables"
+                    )
+            }
+            crate::storage::RoutineCallSelection::Stored(_) => false,
+            crate::storage::RoutineCallSelection::Ambiguous => {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function {}(...) is not unique",
+                    tref.table
+                ));
+            }
+            crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is not a function",
+                    tref.table
+                ));
+            }
+            crate::storage::RoutineCallSelection::Absent => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    tref.table
+                ));
+            }
+        }
+    } else {
+        false
+    };
     if !storage.spill_attached() || (tref.subquery.is_none() && !external_function) {
         return Ok(LateralRows::Local(materialize_lateral(
             storage, txid, tref, arena, params, outer, base_hooks,

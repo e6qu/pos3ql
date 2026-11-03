@@ -35,6 +35,9 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "--definition-image-slots", "256",
             "--table-metadata-bytes", "67108864",
             "--table-metadata-leases", "8192",
+            "--statistics-bytes", "1048576",
+            "--statistics-leases", "1024",
+            "--index-statistics-slots", "4096",
             "--operations",
             "20",
             "--clients",
@@ -91,6 +94,12 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             self.assertEqual(result["schema_version"], 2)
             self.assertEqual(result["suite"]["table_metadata_bytes"], 67108864)
             self.assertEqual(result["suite"]["table_metadata_leases"], 8192)
+            self.assertEqual(
+                {field: result["suite"][field] for field in
+                 ("statistics_bytes", "statistics_leases", "index_statistics_slots")},
+                {"statistics_bytes": 1048576, "statistics_leases": 1024,
+                 "index_statistics_slots": 4096},
+            )
             self.assertEqual({name: result["suite"][name] for name in ["row_overlay_slots", "row_work_bytes", "row_work_leases", "definition_image_slots"]}, {"row_overlay_slots": 512, "row_work_bytes": 8388608, "row_work_leases": 128, "definition_image_slots": 256})
 
         self.assertEqual(result["hardware_description"], "fixed host type")
@@ -106,6 +115,30 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "58d2cc8bcded4f950c7ff22643544f2e8a92cf6c454858caf0e52b316054303f",
         )
         self.assertEqual(store["network_description"], "same-region private network")
+
+    def test_statistics_capacities_are_required_explicit_inputs(self):
+        for option in ("--statistics-bytes", "--statistics-leases", "--index-statistics-slots"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as temporary:
+                arguments = self.arguments(pathlib.Path(temporary))
+                index = arguments.index(option)
+                del arguments[index:index + 2]
+                completed = subprocess.run(arguments, text=True, capture_output=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(f"required: {option}", completed.stderr)
+
+    def test_rejects_invalid_statistics_capacities(self):
+        for option, value, message in (
+            ("--statistics-bytes", "0", "shared capacities must be positive"),
+            ("--statistics-leases", "0", "shared capacities must be positive"),
+            ("--index-statistics-slots", "-1", "shared capacities must be positive"),
+            ("--statistics-bytes", "65", "statistics-bytes must be multiples of 64"),
+        ):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as temporary:
+                arguments = self.arguments(pathlib.Path(temporary))
+                arguments[arguments.index(option) + 1] = value
+                completed = subprocess.run(arguments, text=True, capture_output=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
 
     def test_rejects_plaintext_independently_operated_service(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -12,7 +12,7 @@ use core::fmt::Write;
 use crate::mem::arena::{ArenaList, ArenaString};
 use crate::sql::ast::Expr;
 use crate::sql::json;
-use crate::sql::types::Datum;
+use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
@@ -1802,17 +1802,27 @@ pub(crate) fn dispatch<'a>(
                     jsonb: true,
                 })
             }
-            // `jsonb_strip_nulls` / `json_strip_nulls`: drop null-valued members.
+            // The selected declaration supplies the optional array flag.
             "jsonb_strip_nulls" | "json_strip_nulls" => {
-                arity(1)?;
-                let d = eval_full(args[0], arena, params, row, hooks)?;
-                if d.is_null() {
+                arity(2)?;
+                let Some(values) =
+                    super::super::args::strict_arguments::<2>(args, arena, params, row, hooks)?
+                else {
                     return Ok(Datum::Null);
-                }
+                };
+                let d = values[0];
+                let Datum::Bool(strip_arrays) =
+                    super::super::cast_to(values[1], ColType::Bool, arena)?
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "JSON strip flag lost its boolean input type"
+                    ));
+                };
                 check_json_family(name, &d)?;
                 let jsonb =
                     matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
-                let result = json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
+                let result = json::strip_nulls(json_tree_arg(d, arena)?, strip_arrays, arena)?;
                 // A json result re-serializes compactly, a jsonb one in the
                 // canonical spaced form — PostgreSQL's split exactly.
                 let text = if jsonb {

@@ -2878,6 +2878,14 @@ impl Engine {
                             published.catalog_pos = published.n;
                         }
                     }
+                    crate::storage::PathEntry::InformationSchema => {
+                        let _ = write!(published.names[published.n], "information_schema");
+                        published.n += 1;
+                    }
+                    crate::storage::PathEntry::Toast => {
+                        let _ = write!(published.names[published.n], "pg_toast");
+                        published.n += 1;
+                    }
                     crate::storage::PathEntry::Schema(slot) => {
                         let _ = write!(
                             published.names[published.n],
@@ -11982,19 +11990,19 @@ impl Engine {
                     Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
                     None => stack_format!(260, "{}", name.name),
                 };
-                let Some(slot) = self.storage.procedure_slot_for_call_shape(
+                let (slot, _) = match self.select_call_procedure(
                     qualified.as_str(),
                     argument_names,
-                    arguments.len(),
+                    arguments,
                     *variadic,
                     txn.txid,
-                ) else {
-                    responder.error(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        stack_format!(192, "procedure \"{}\" does not exist", qualified.as_str())
-                            .as_str(),
-                    )?;
-                    return Ok(false);
+                    arena,
+                ) {
+                    Ok(selected) => selected,
+                    Err(error) => {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(false);
+                    }
                 };
                 let routine = self.storage.routine_for(slot, txn.txid);
                 let mut columns =
@@ -14043,7 +14051,8 @@ impl Engine {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
         };
-        if let Err(error) = query::validate_locking(statement) {
+        if let Err(error) = query::validate_locking(statement, &self.storage, txn.txid, &self.work)
+        {
             return Ok(Err(error));
         }
         if statement.from.is_none() {
@@ -15084,6 +15093,57 @@ impl Engine {
         }
     }
 
+    fn select_call_procedure(
+        &self,
+        qualified: &str,
+        argument_names: &[Option<&str>],
+        arguments: &[&Expr<'_>],
+        variadic: bool,
+        txid: u32,
+        arena: &Arena,
+    ) -> Result<(usize, [i32; crate::storage::MAX_ROUTINE_ARGUMENTS]), SqlError> {
+        if arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many procedure arguments"
+            ));
+        }
+        let mut types = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (output, argument) in types.iter_mut().zip(arguments) {
+            *output = exec::infer_type_catalog(argument, None, &self.storage, txid, arena)?.0;
+        }
+        match self.storage.select_routine_call(
+            qualified,
+            argument_names,
+            &types[..arguments.len()],
+            variadic,
+            txid,
+            crate::storage::RoutineCallKind::Procedure,
+        ) {
+            crate::storage::RoutineCallSelection::Stored(slot) => Ok((slot, types)),
+            crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "procedure {} is not unique",
+                qualified
+            )),
+            crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} is not a procedure",
+                qualified
+            )),
+            crate::storage::RoutineCallSelection::Absent => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "procedure {} does not exist",
+                qualified
+            )),
+            crate::storage::RoutineCallSelection::Builtin { .. } => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "builtin procedure {} is not implemented",
+                qualified
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_call(
         &mut self,
@@ -15110,22 +15170,17 @@ impl Engine {
             Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
             None => stack_format!(260, "{}", name.name),
         };
-        let shape_slot = self.storage.procedure_slot_for_call_shape(
+        let (slot, type_oids) = match self.select_call_procedure(
             qualified.as_str(),
             argument_names,
-            arguments.len(),
+            arguments,
             variadic,
             txn.txid,
-        );
-        let shape_mapping = shape_slot.and_then(|slot| {
-            let routine = self.storage.routine_for(slot, txn.txid);
-            routine
-                .parameters()
-                .iter()
-                .any(|parameter| parameter.mode.is_output())
-                .then(|| routine.procedure_call_mapping(argument_names, arguments.len(), variadic))
-                .flatten()
-        });
+            arena,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => return Ok(Err(error)),
+        };
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
         let sequences = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let hooks = EvalHooks {
@@ -15133,48 +15188,10 @@ impl Engine {
             sequences: Some(&sequences),
             ..NO_HOOKS
         };
-        let mut type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (slot, argument) in arguments.iter().enumerate() {
-            if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
-                continue;
-            }
-            type_oids[slot] =
-                match exec::infer_type_catalog(argument, None, &self.storage, txn.txid, arena) {
-                    Ok((oid, _)) => oid,
-                    Err(error) => return Ok(Err(error)),
-                };
-        }
-        let slot = if shape_mapping.is_some() {
-            shape_slot
-        } else if argument_names.is_empty() {
-            self.storage.procedure_slot_for_call_syntax_oids(
-                qualified.as_str(),
-                &type_oids[..arguments.len()],
-                variadic,
-                txn.txid,
-            )
-        } else {
-            self.storage.procedure_slot_for_named_call_oids(
-                qualified.as_str(),
-                argument_names,
-                &type_oids[..arguments.len()],
-                variadic,
-                txn.txid,
-            )
-        };
-        let Some(slot) = slot else {
-            return Ok(Err(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "procedure \"{}\" does not exist",
-                qualified.as_str()
-            )));
-        };
         let mut declared = self.storage.routine_for(slot, txn.txid);
-        let mapping = shape_mapping.unwrap_or_else(|| {
-            declared
-                .call_input_mapping(argument_names, arguments.len(), variadic)
-                .expect("resolved procedure call has a valid argument mapping")
-        });
+        let mapping = declared
+            .procedure_call_mapping(argument_names, arguments.len(), variadic)
+            .expect("selected procedure has a complete CALL parameter mapping");
         let completed = match catalog.prepare_routine_inputs(
             slot,
             &mut declared,
@@ -19834,7 +19851,12 @@ impl Engine {
                     Ok(schema) => schema,
                     Err(error) => return Ok(Err(error)),
                 },
-                None => match self.storage.creation_schema(None, name, txn.txid) {
+                None => match self.storage.creation_schema(
+                    None,
+                    name,
+                    txn.txid,
+                    crate::storage::SchemaObjectKind::NonRelation,
+                ) {
                     Ok(schema) => schema,
                     Err(error) => return Ok(Err(error)),
                 },
@@ -20102,7 +20124,9 @@ impl Engine {
                                 return Ok(Err(error));
                             }
                         };
-                        if let Err(error) = query::validate_locking(select) {
+                        if let Err(error) =
+                            query::validate_locking(select, &self.storage, txn.txid, &self.work)
+                        {
                             return Ok(Err(error));
                         }
                         if select.from.is_none() {

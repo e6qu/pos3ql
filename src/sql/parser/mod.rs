@@ -688,6 +688,28 @@ pub(crate) fn parse_expression<'a>(
     Ok(expression)
 }
 
+pub(crate) fn parse_expression_list<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], super::eval::SqlError> {
+    let parse = || -> Result<_, ParseError> {
+        let mut parser = Parser::new(sql, arena)?;
+        let mut expressions = ArenaList::new(arena);
+        loop {
+            let expression = parser.expression(0)?;
+            parser.push(&mut expressions, expression)?;
+            if !parser.eat_op(",")? {
+                break;
+            }
+        }
+        if parser.peeked != Tok::Eof {
+            return Err(parser.err_here("trailing tokens after expression list"));
+        }
+        Ok(expressions.as_slice())
+    };
+    parse().map_err(|error| super::parse_error_to_sql(&error))
+}
+
 impl<'a> Parser<'a> {
     pub fn new(text: &'a str, arena: &'a Arena) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(text, arena);
@@ -3044,6 +3066,7 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let quoted_function_name = matches!(self.peeked, Tok::QuotedIdent(_));
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
@@ -3061,21 +3084,29 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let mut func_args =
-            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
-                Some(self.json_table_arguments()?)
-            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
-                Some(self.xml_table_arguments()?)
-            } else if self.peeked == Tok::Op("(") {
-                self.advance()?;
-                let mut args = ArenaList::new(self.arena);
-                let mut names = ArenaList::new(self.arena);
-                let mut saw_named = false;
-                if self.peeked != Tok::Op(")") {
-                    loop {
-                        let this_variadic = self.eat_ident("variadic")?;
-                        let first = self.expression(0)?;
-                        let (argument, argument_name) = if self.eat_op("=>")? {
+        let mut func_args = if schema.is_none()
+            && !quoted_function_name
+            && table == "json_table"
+            && self.peeked == Tok::Op("(")
+        {
+            Some(self.json_table_arguments()?)
+        } else if schema.is_none()
+            && !quoted_function_name
+            && table == "xmltable"
+            && self.peeked == Tok::Op("(")
+        {
+            Some(self.xml_table_arguments()?)
+        } else if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            let mut args = ArenaList::new(self.arena);
+            let mut names = ArenaList::new(self.arena);
+            let mut saw_named = false;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    let this_variadic = self.eat_ident("variadic")?;
+                    let first = self.expression(0)?;
+                    let (argument, argument_name) =
+                        if self.eat_op("=>")? {
                             let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
@@ -3096,28 +3127,28 @@ impl<'a> Parser<'a> {
                             }
                             (first, None)
                         };
-                        self.push(&mut args, argument)?;
-                        self.push(&mut names, argument_name)?;
-                        if this_variadic {
-                            func_variadic = true;
-                            if self.peeked != Tok::Op(")") {
-                                return Err(self.err_here("VARIADIC argument must be last"));
-                            }
-                            break;
+                    self.push(&mut args, argument)?;
+                    self.push(&mut names, argument_name)?;
+                    if this_variadic {
+                        func_variadic = true;
+                        if self.peeked != Tok::Op(")") {
+                            return Err(self.err_here("VARIADIC argument must be last"));
                         }
-                        if !self.eat_op(",")? {
-                            break;
-                        }
+                        break;
+                    }
+                    if !self.eat_op(",")? {
+                        break;
                     }
                 }
-                self.expect_op(")")?;
-                if saw_named {
-                    func_argument_names = names.as_slice();
-                }
-                Some(args.as_slice())
-            } else {
-                None
-            };
+            }
+            self.expect_op(")")?;
+            if saw_named {
+                func_argument_names = names.as_slice();
+            }
+            Some(args.as_slice())
+        } else {
+            None
+        };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -3164,7 +3195,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(TableRef {
+        let source = TableRef {
             schema,
             table,
             alias,
@@ -3182,7 +3213,41 @@ impl<'a> Parser<'a> {
             authorization_role: None,
             bound_table: None,
             view_access: None,
-        })
+        };
+        // PostgreSQL expands only an unqualified FROM UNNEST with multiple
+        // positional inputs into independent catalog calls in lockstep.
+        if source.schema.is_none()
+            && source.table == "unnest"
+            && !source.func_variadic
+            && source.func_argument_names.is_empty()
+            && let Some(arguments) = source.func_args
+            && arguments.len() > 1
+        {
+            let mut functions = ArenaList::new(self.arena);
+            for argument in arguments {
+                let input = self.arena_slice(&[*argument])?;
+                self.push(
+                    &mut functions,
+                    TableRef {
+                        schema: Some("pg_catalog"),
+                        table: "unnest",
+                        alias: None,
+                        func_args: Some(input),
+                        with_ordinality: false,
+                        lateral: false,
+                        col_alias: None,
+                        ..source
+                    },
+                )?;
+            }
+            return Ok(TableRef {
+                table: "unnest",
+                func_args: None,
+                rows_from: Some(functions.as_slice()),
+                ..source
+            });
+        }
+        Ok(source)
     }
 
     /// Parses `JSON_TABLE` into an ordinary bounded table-function source.

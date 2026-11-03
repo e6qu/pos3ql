@@ -12,7 +12,7 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
 use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
-use crate::sql::ast::{BinaryOp, CastBinding, Expr, UnaryOp};
+use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, UnaryOp};
 use crate::sql::types::ColType;
 
 impl<'a> Parser<'a> {
@@ -98,7 +98,7 @@ impl<'a> Parser<'a> {
                 if normalization_form.is_some() || self.peeked == Tok::Ident("normalized") {
                     self.expect_ident("normalized")?;
                     let form = self.arena_expr(Expr::Str(normalization_form.unwrap_or("nfc")))?;
-                    left = self.plain_call("is_normalized", &[left, form])?;
+                    left = self.plain_call("pg_catalog.is_normalized", &[left, form])?;
                     if negated {
                         left = self.arena_expr(Expr::Unary {
                             operator: UnaryOp::Not,
@@ -142,6 +142,7 @@ impl<'a> Parser<'a> {
                         _ => unreachable!(),
                     };
                     left = self.arena_expr(Expr::Call {
+                        kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
                         name,
@@ -248,9 +249,10 @@ impl<'a> Parser<'a> {
                 if self.peeked == Tok::Ident("local") {
                     self.advance()?;
                     left = self.arena_expr(Expr::Call {
+                        kind: CallKind::Routine,
                         bound_oid: None,
                         bound_strict: None,
-                        name: "timezone",
+                        name: "pg_catalog.timezone",
                         args: self.arena_slice(&[left])?,
                         argument_names: &[],
                         variadic: false,
@@ -266,9 +268,10 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
                 let zone = self.expression(8)?;
                 left = self.arena_expr(Expr::Call {
+                    kind: CallKind::Routine,
                     bound_oid: None,
                     bound_strict: None,
-                    name: "timezone",
+                    name: "pg_catalog.timezone",
                     args: self.arena_slice(&[zone, left])?,
                     argument_names: &[],
                     variadic: false,
@@ -457,6 +460,7 @@ impl<'a> Parser<'a> {
                         None => self.arena_slice(&[left, pattern])?,
                     };
                     let call = self.arena_expr(Expr::Call {
+                        kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
                         name: crate::sql::parser::SIMILAR_TO,
@@ -818,9 +822,10 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
                 let field_lit = self.arena_expr(Expr::Str(field))?;
                 self.arena_expr(Expr::Call {
+                    kind: CallKind::Routine,
                     bound_oid: None,
                     bound_strict: None,
-                    name: "extract",
+                    name: "pg_catalog.extract",
                     args: self.arena_slice(&[field_lit, source])?,
                     argument_names: &[],
                     variadic: false,
@@ -889,7 +894,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(kw @ ("left" | "right")) => {
                 self.advance()?;
                 if self.peeked == Tok::Op("(") {
-                    self.call(kw)
+                    self.call(kw, true)
                 } else {
                     Err(self.unexpected("expected an expression"))
                 }
@@ -995,7 +1000,7 @@ impl<'a> Parser<'a> {
                     return self.modified_typed_literal(name);
                 }
                 if self.peeked == Tok::Op("(") {
-                    return self.call(name);
+                    return self.call(name, true);
                 }
                 // The unmodified SQL-standard temporal spelling keeps its
                 // `WITH[OUT] TIME ZONE` words between the type name and the
@@ -1076,7 +1081,7 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
-                        return self.call(routine);
+                        return self.call(routine, false);
                     }
                     // A third part makes it `schema.table.column`.
                     if self.peeked == Tok::Op(".") {
@@ -1141,6 +1146,7 @@ impl<'a> Parser<'a> {
                         args = self.arena_slice(&[precision])?;
                     }
                     return self.arena_expr(Expr::Call {
+                        kind: CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
                         name,
@@ -1181,7 +1187,7 @@ impl<'a> Parser<'a> {
             Tok::QuotedIdent(name) => {
                 self.advance()?;
                 if self.peeked == Tok::Op("(") {
-                    return self.call(name);
+                    return self.call(name, false);
                 }
                 if self.peeked == Tok::Op(".") {
                     self.advance()?;
@@ -1197,7 +1203,7 @@ impl<'a> Parser<'a> {
                     if self.peeked == Tok::Op("(") {
                         self.record_namespace(namespace_source)?;
                         let routine = self.composed_qualifier(name, column)?;
-                        return self.call(routine);
+                        return self.call(routine, false);
                     }
                     if self.peeked == Tok::Op(".") {
                         self.record_namespace(namespace_source)?;
@@ -1259,6 +1265,7 @@ impl<'a> Parser<'a> {
     ) -> Result<&'a Expr<'a>, ParseError> {
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name,
@@ -1481,6 +1488,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_op(")")?;
         self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name: if unique { "__json_unique" } else { "__json" },
@@ -1958,6 +1966,11 @@ impl<'a> Parser<'a> {
     ) -> Result<&'a Expr<'a>, ParseError> {
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
+            kind: if crate::sql::eval::sql_syntax_call_name(name) {
+                CallKind::SqlSyntax
+            } else {
+                CallKind::Routine
+            },
             bound_oid: None,
             bound_strict: None,
             name,
@@ -1972,9 +1985,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
+    pub(super) fn call(&mut self, name: &'a str, syntax: bool) -> Result<&'a Expr<'a>, ParseError> {
+        let kind = if syntax
+            && matches!(
+                name,
+                "coalesce" | "greatest" | "least" | "nullif" | "row" | "grouping"
+            ) {
+            CallKind::SqlSyntax
+        } else {
+            CallKind::Routine
+        };
         self.expect_op("(")?;
-        if name.eq_ignore_ascii_case("normalize") {
+        if syntax && name.eq_ignore_ascii_case("normalize") {
             let target = self.expression(0)?;
             let form = if self.eat_op(",")? {
                 let form = self.any_ident("Unicode normalization form")?;
@@ -1987,18 +2009,18 @@ impl<'a> Parser<'a> {
             };
             self.expect_op(")")?;
             let form = self.arena_expr(Expr::Str(form))?;
-            return self.plain_call("normalize", &[target, form]);
+            return self.plain_call("pg_catalog.normalize", &[target, form]);
         }
-        if name.eq_ignore_ascii_case("json_arrayagg") {
+        if syntax && name.eq_ignore_ascii_case("json_arrayagg") {
             return self.sql_json_array_aggregate();
         }
-        if name.eq_ignore_ascii_case("json_objectagg") {
+        if syntax && name.eq_ignore_ascii_case("json_objectagg") {
             return self.sql_json_object_aggregate();
         }
         // SQL-standard `substring(str FROM start [FOR len])` and
         // `trim([both|leading|trailing] [chars] FROM str)` desugar to the plain
         // function forms.
-        if name.eq_ignore_ascii_case("substring") {
+        if syntax && name.eq_ignore_ascii_case("substring") {
             // Above the precedence `SIMILAR TO` binds at, so that the SIMILAR
             // in `substring(x SIMILAR p ESCAPE e)` is this form's keyword
             // rather than an infix operator applied to the target.
@@ -2012,7 +2034,7 @@ impl<'a> Parser<'a> {
                     cn = 3;
                 }
                 self.expect_op(")")?;
-                return self.plain_call("substring", &cargs[..cn]);
+                return self.plain_call("pg_catalog.substring", &cargs[..cn]);
             }
             // `substring(str SIMILAR pattern ESCAPE e)`: SQL:2003's spelling of
             // the SQL-regular-expression form that `FROM pattern FOR e` already
@@ -2023,14 +2045,14 @@ impl<'a> Parser<'a> {
                 self.expect_ident("escape")?;
                 let escape = self.expression(0)?;
                 self.expect_op(")")?;
-                return self.plain_call("substring", &[target, pattern, escape]);
+                return self.plain_call("pg_catalog.substring", &[target, pattern, escape]);
             }
             // `substring(str FOR len)` — no FROM; PostgreSQL implies FROM 1.
             if self.eat_ident("for")? {
                 let len = self.expression(0)?;
                 let one = self.arena_expr(Expr::Int(1))?;
                 self.expect_op(")")?;
-                return self.plain_call("substring", &[target, one, len]);
+                return self.plain_call("pg_catalog.substring", &[target, one, len]);
             }
             // Comma form `substring(str, start[, len])`.
             let mut cargs = [target, target, target];
@@ -2040,17 +2062,17 @@ impl<'a> Parser<'a> {
                 cn += 1;
             }
             self.expect_op(")")?;
-            return self.plain_call("substring", &cargs[..cn]);
+            return self.plain_call("pg_catalog.substring", &cargs[..cn]);
         }
-        if name.eq_ignore_ascii_case("trim") {
+        if syntax && name.eq_ignore_ascii_case("trim") {
             let dir = if self.eat_ident("both")? {
-                "btrim"
+                "pg_catalog.btrim"
             } else if self.eat_ident("leading")? {
-                "ltrim"
+                "pg_catalog.ltrim"
             } else if self.eat_ident("trailing")? {
-                "rtrim"
+                "pg_catalog.rtrim"
             } else {
-                "btrim"
+                "pg_catalog.btrim"
             };
             // Optional characters expression, then `FROM str` — or just `str`.
             let first = self.expression(0)?;
@@ -2062,7 +2084,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call(dir, &[first]);
         }
-        if name.eq_ignore_ascii_case("position") {
+        if syntax && name.eq_ignore_ascii_case("position") {
             // SQL-standard `position(substr IN string)` -> strpos(string, substr)
             // (strpos takes the haystack first, the needle second). Parse the
             // needle above IN's precedence (4) so the IN keyword is not consumed
@@ -2074,7 +2096,7 @@ impl<'a> Parser<'a> {
                 // Kept under its own name, not desugared to `strpos`: the two
                 // compute the same thing, but PostgreSQL labels the output
                 // column `position`, and the label comes from the call name.
-                return self.plain_call("position", &[haystack, needle]);
+                return self.plain_call("pg_catalog.position", &[haystack, needle]);
             }
             let mut cargs = [needle, needle];
             let mut cn = 1;
@@ -2087,7 +2109,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return self.plain_call(name, &cargs[..cn.min(cargs.len())]);
         }
-        if name.eq_ignore_ascii_case("overlay") {
+        if syntax && name.eq_ignore_ascii_case("overlay") {
             // SQL-standard `overlay(str PLACING sub FROM start [FOR len])`.
             let target = self.expression(0)?;
             self.expect_ident("placing")?;
@@ -2101,60 +2123,7 @@ impl<'a> Parser<'a> {
                 cn = 4;
             }
             self.expect_op(")")?;
-            return self.plain_call("overlay", &cargs[..cn]);
-        }
-        if name.eq_ignore_ascii_case("make_interval") || name == "pg_catalog.make_interval" {
-            // `make_interval([years =>] i, [months =>] i, [weeks =>] i,
-            //  [days =>] i, [hours =>] i, [mins =>] i, [secs =>] d)` — the seven
-            // named fields, any subset, positional or `field => value`. Desugar
-            // to a fixed seven-argument positional call (missing fields = 0) so
-            // the AST and evaluator stay unaware of argument names.
-            const FIELDS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
-            let zero = self.arena_expr(Expr::Int(0))?;
-            let mut slots: [&'a Expr<'a>; 7] = [zero; 7];
-            let mut pos = 0usize;
-            let mut seen_named = false;
-            if self.peeked != Tok::Op(")") {
-                loop {
-                    let first = self.expression(0)?;
-                    if self.eat_op("=>")? {
-                        // Named argument: the parsed expression must be a bare
-                        // field name; map it to its fixed slot.
-                        let field = match first {
-                            Expr::Column {
-                                qualifier: None,
-                                name,
-                            } => *name,
-                            _ => {
-                                return Err(
-                                    self.err_here("make_interval argument name must be a field")
-                                );
-                            }
-                        };
-                        let idx = FIELDS.iter().position(|f| f.eq_ignore_ascii_case(field));
-                        let idx = match idx {
-                            Some(i) => i,
-                            None => return Err(self.err_here("unknown make_interval field")),
-                        };
-                        slots[idx] = self.expression(0)?;
-                        seen_named = true;
-                    } else {
-                        if seen_named {
-                            return Err(self.err_here("positional argument after named argument"));
-                        }
-                        if pos >= FIELDS.len() {
-                            return Err(self.err_here("too many arguments to make_interval"));
-                        }
-                        slots[pos] = first;
-                        pos += 1;
-                    }
-                    if !self.eat_op(",")? {
-                        break;
-                    }
-                }
-            }
-            self.expect_op(")")?;
-            return self.plain_call(name, &slots);
+            return self.plain_call("pg_catalog.overlay", &cargs[..cn]);
         }
         // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
         let distinct = if self.peeked == Tok::Ident("distinct") {
@@ -2164,6 +2133,9 @@ impl<'a> Parser<'a> {
             false
         };
         if self.peeked == Tok::Op("*") {
+            if kind == CallKind::SqlSyntax {
+                return Err(self.err_here("SQL expression does not accept *"));
+            }
             if distinct {
                 return Err(self.err_here("DISTINCT cannot be used with *"));
             }
@@ -2172,6 +2144,7 @@ impl<'a> Parser<'a> {
             let filter = self.parse_filter()?;
             let over = self.parse_over()?;
             return self.arena_expr(Expr::Call {
+                kind,
                 bound_oid: None,
                 bound_strict: None,
                 name,
@@ -2257,6 +2230,22 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = args.as_slice();
+        if kind == CallKind::SqlSyntax {
+            if distinct
+                || variadic
+                || saw_named
+                || !order_by.is_empty()
+                || filter.is_some()
+                || over.is_some()
+            {
+                return Err(self.err_here("SQL expression does not accept function-call modifiers"));
+            }
+            if (matches!(name, "coalesce" | "greatest" | "least" | "grouping") && args.is_empty())
+                || (name == "nullif" && args.len() != 2)
+            {
+                return Err(self.err_here("invalid SQL expression argument count"));
+            }
+        }
         if matches!(name, "nextval" | "currval" | "setval")
             && let Some(first) = args.first()
         {
@@ -2268,6 +2257,7 @@ impl<'a> Parser<'a> {
             &[]
         };
         self.arena_expr(Expr::Call {
+            kind,
             bound_oid: None,
             bound_strict: None,
             name,
@@ -2307,6 +2297,7 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let aggregate = self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name: match (absent, result == "jsonb") {
@@ -2361,6 +2352,7 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let aggregate = self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name: match (absent, unique, result == "jsonb") {
@@ -2491,6 +2483,7 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let args = self.arena_slice(&[left, right])?;
         self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name,
@@ -2526,6 +2519,7 @@ impl<'a> Parser<'a> {
             .alloc_str(encoded.as_str())
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         self.arena_expr(Expr::Call {
+            kind: CallKind::SqlSyntax,
             bound_oid: None,
             bound_strict: None,
             name,

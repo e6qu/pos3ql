@@ -549,7 +549,11 @@ pub(crate) fn expression_type_identity<'a>(
     // ROW() determines the anonymous record identity from its constructor,
     // including `record.*` arguments whose individual expressions are not
     // scalar values. Do not recursively type those expansion sentinels.
-    if let Expr::Call { name, .. } = expression
+    if let Expr::Call {
+        kind: super::ast::CallKind::SqlSyntax,
+        name,
+        ..
+    } = expression
         && name.eq_ignore_ascii_case("row")
     {
         return Ok(ExpressionTypeIdentity::Known(super::types::oid::RECORD));
@@ -567,6 +571,7 @@ pub(crate) fn expression_type_identity<'a>(
         return expression_type_identity(base, row, hooks);
     }
     if let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -588,6 +593,7 @@ pub(crate) fn expression_type_identity<'a>(
         if resolved
             && let Some(result_oid) = catalog.routine_result_oid(
                 name,
+                *kind,
                 *bound_oid,
                 argument_names,
                 *variadic,
@@ -705,9 +711,29 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         }
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: super::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        self.catalog?.routine_call_selection(
+            name,
+            kind,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+        )
+    }
+
     fn routine_result(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -715,6 +741,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         let type_oid = self.catalog?.routine_result_oid(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -741,12 +768,20 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             super::ast::CATALOG_OPERATOR_CALL_PREFIX,
             name
         );
-        self.routine_result(encoded.as_str(), None, &[], false, &[left, right])
+        self.routine_result(
+            encoded.as_str(),
+            super::ast::CallKind::SqlSyntax,
+            None,
+            &[],
+            false,
+            &[left, right],
+        )
     }
 
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -755,6 +790,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         self.catalog?.routine_record_field(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -965,10 +1001,121 @@ pub enum DescriptionTarget<'a> {
     },
 }
 
+/// Parser-created SQL expressions are syntax, not namespace-resolved routines.
+pub(crate) fn is_sql_syntax_call(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            ..
+        }
+    )
+}
+
+pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
+    matches!(
+        name,
+        "coalesce"
+            | "greatest"
+            | "least"
+            | "nullif"
+            | "row"
+            | "grouping"
+            | "current_date"
+            | "current_timestamp"
+            | "current_time"
+            | "localtimestamp"
+            | "localtime"
+            | "current_user"
+            | "current_role"
+            | "session_user"
+            | "user"
+            | "current_catalog"
+            | "current_schema"
+            | "similar to"
+            | "overlaps periods"
+            | "__is_json_scalar"
+            | "__is_json_array"
+            | "__is_json_object"
+            | "__is_json_value"
+            | "__is_json_scalar_unique"
+            | "__is_json_array_unique"
+            | "__is_json_object_unique"
+            | "__is_json_value_unique"
+            | "__xmlparse_document"
+            | "__xmlparse_content"
+            | "__xmlserialize"
+            | "__xmlelement"
+            | "__xmlforest"
+            | "__xmlpi"
+            | "__xmlroot"
+            | "__xmlexists"
+            | "__json_unique"
+            | "__json"
+            | "__json_format"
+            | "__json_array_absent_json"
+            | "__json_array_absent_jsonb"
+            | "__json_array_absent_text"
+            | "__json_array_absent_bytea"
+            | "__json_array_null_json"
+            | "__json_array_null_jsonb"
+            | "__json_array_null_text"
+            | "__json_array_null_bytea"
+            | "__json_object_unique_json"
+            | "__json_object_unique_jsonb"
+            | "__json_object_unique_text"
+            | "__json_object_unique_bytea"
+            | "__json_object_json"
+            | "__json_object_jsonb"
+            | "__json_object_text"
+            | "__json_object_bytea"
+            | "__json_serialize_bytea"
+            | "__json_serialize_text"
+            | "__json_exists_true"
+            | "__json_exists_unknown"
+            | "__json_exists_error"
+            | "__json_exists_false"
+            | "__json_value"
+            | "__json_query_json"
+            | "__json_query_jsonb"
+            | "__json_query_text"
+            | "__json_query_bytea"
+            | "__json_arrayagg_absent_json"
+            | "__json_arrayagg_null_json"
+            | "__json_arrayagg_absent_jsonb"
+            | "__json_arrayagg_null_jsonb"
+            | "__json_objectagg_null_json"
+            | "__json_objectagg_absent_json"
+            | "__json_objectagg_null_unique_json"
+            | "__json_objectagg_absent_unique_json"
+            | "__json_objectagg_null_jsonb"
+            | "__json_objectagg_absent_jsonb"
+            | "__json_objectagg_null_unique_jsonb"
+            | "__json_objectagg_absent_unique_jsonb"
+            | "__json_table_passing"
+            | "__xml_namespaces"
+            | "__xml_table_ordinality"
+            | "__xml_table_column"
+            | "__xml_table_columns"
+            | "__json_record_column"
+            | "__json_record_columns"
+            | "__json_table_columns"
+            | "__json_table_nested"
+            | "__json_table_ordinality"
+            | "__json_table_exists"
+            | "__json_table_value"
+            | "__jsonb_subscript_set"
+    )
+}
+
 /// A callee chosen before evaluating its inputs. Stored functions keep their
 /// catalog identity and named/variadic input mapping through argument effects.
 #[derive(Clone, Copy)]
 pub enum RoutineCallTarget<'name> {
+    Builtin {
+        oid: i32,
+        schema: &'static str,
+    },
     Stored {
         oid: i32,
         argument_mapping: [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
@@ -1234,6 +1381,7 @@ pub trait CatalogAccess {
     fn routine_record_field(
         &self,
         _name: &str,
+        _kind: crate::sql::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1311,6 +1459,7 @@ pub trait CatalogAccess {
     fn resolve_routine_call<'name>(
         &self,
         _name: &'name str,
+        _kind: super::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1322,6 +1471,7 @@ pub trait CatalogAccess {
     fn routine_evaluation(
         &self,
         _name: &str,
+        _kind: super::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1429,9 +1579,22 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    fn routine_call_selection(
+        &self,
+        _name: &str,
+        _kind: super::ast::CallKind,
+        _bound_oid: Option<i32>,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        None
+    }
+
     fn routine_result_oid(
         &self,
         _name: &str,
+        _kind: crate::sql::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -2047,6 +2210,7 @@ fn catalog_evaluation(
 ) -> Result<Option<ExpressionEvaluation>, SqlError> {
     let mut found = None;
     if let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -2070,7 +2234,9 @@ fn catalog_evaluation(
                     expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
             }
             let types = &types[..args.len()];
-            if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+            if *kind == super::ast::CallKind::SqlSyntax
+                && let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+            {
                 found = catalog.operator_evaluation(schema, operator, types)?;
             } else {
                 found = super::catalog::intrinsic_routine_evaluation(name, types, |from, to| {
@@ -2084,6 +2250,7 @@ fn catalog_evaluation(
                 if found != Some(ExpressionEvaluation::Runtime)
                     && let Some(evaluation) = catalog.routine_evaluation(
                         name,
+                        *kind,
                         *bound_oid,
                         argument_names,
                         *variadic,
@@ -2758,12 +2925,14 @@ pub(crate) fn routine_input_handoff(
 ) -> bool {
     match expression {
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
             ..
         } => {
-            let builtin_operator = bound_oid.is_none()
+            let builtin_operator = *kind == super::ast::CallKind::SqlSyntax
+                && bound_oid.is_none()
                 && super::ast::catalog_operator_call(name).is_some_and(|(schema, symbol)| {
                     schema == Some("pg_catalog")
                         && catalog.is_none_or(|catalog| !catalog.has_operator_candidate(symbol))
@@ -2826,6 +2995,7 @@ pub fn eval_full<'a>(
         let expression = if let (
             Some(oid),
             Expr::Call {
+                kind,
                 name,
                 args,
                 argument_names,
@@ -2841,6 +3011,7 @@ pub fn eval_full<'a>(
         ) = (position.target, *expression)
         {
             bound = Expr::Call {
+                kind,
                 name,
                 bound_oid: Some(oid),
                 bound_strict,
@@ -3391,6 +3562,7 @@ fn eval_full_inner<'a>(
             Ok(Datum::Bool(v.is_null() != negated))
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             bound_strict,
@@ -3402,11 +3574,9 @@ fn eval_full_inner<'a>(
             over,
             ..
         } => {
-            let qualified_candidate = !star
-                && name.starts_with("pg_catalog.")
-                && hooks
-                    .catalog
-                    .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()));
+            let mut selected_builtin = None;
+            let qualified_candidate =
+                !star && !is_sql_syntax_call(expression) && hooks.catalog.is_some();
             if bound_oid.is_some() || qualified_candidate {
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -3428,6 +3598,7 @@ fn eval_full_inner<'a>(
                 let types = &types[..args.len()];
                 if let Some(mut target) = catalog.resolve_routine_call(
                     name,
+                    kind,
                     bound_oid,
                     argument_names,
                     variadic,
@@ -3440,15 +3611,21 @@ fn eval_full_inner<'a>(
                     {
                         *selected = bound_strict;
                     }
-                    return catalog.call_routine(
-                        target,
-                        args,
-                        types,
-                        &mut |argument| eval_full(argument, arena, params, row, hooks),
-                        arena,
-                    );
+                    if let RoutineCallTarget::Builtin { oid, schema } = target {
+                        selected_builtin = Some((oid, schema));
+                    } else {
+                        return catalog.call_routine(
+                            target,
+                            args,
+                            types,
+                            &mut |argument| eval_full(argument, arena, params, row, hooks),
+                            arena,
+                        );
+                    }
                 }
-                if let Some(oid) = bound_oid {
+                if let Some(oid) = bound_oid
+                    && selected_builtin.is_none()
+                {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
                         "captured function with OID {} does not exist",
@@ -3457,7 +3634,8 @@ fn eval_full_inner<'a>(
                 }
             }
 
-            if let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
+            if kind == super::ast::CallKind::SqlSyntax
+                && let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
                 && schema.eq_ignore_ascii_case("pg_catalog")
             {
                 if args.len() != 2 || star || !argument_names.is_empty() || variadic {
@@ -3517,6 +3695,8 @@ fn eval_full_inner<'a>(
                     argument_names,
                     variadic,
                     star,
+                    builtin: selected_builtin,
+                    kind,
                 },
                 arena,
                 params,
@@ -4380,7 +4560,12 @@ fn effective_quantified_collations<'a>(
         .alloc_slice_with(right.len(), |_| Collation::None)
         .map_err(|_| arena_full())?;
     let row_args = match operand {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(*args),
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => Some(*args),
         _ => None,
     };
     let whole_fields = match operand {
@@ -4736,7 +4921,12 @@ fn expression_collation<'a>(
             }))
         }
         Expr::Field { base, field } => match &**base {
-            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            Expr::Call {
+                kind: super::ast::CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("row") => {
                 let position = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(field));
@@ -5298,11 +5488,296 @@ pub(crate) fn undefined_function<'a, T>(
     })
 }
 
+/// Normalize only a catalog-selected builtin. Written arguments stay as AST
+/// nodes so each implementation retains its strictness and short-circuit rules.
+pub(crate) fn bind_builtin_arguments<'a, 'b>(
+    oid: i32,
+    args: &'b [&'a Expr<'a>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arena: &'a Arena,
+) -> Result<&'b [&'a Expr<'a>], SqlError>
+where
+    'a: 'b,
+{
+    let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected builtin function {} has no declaration",
+            oid
+        )
+    })?;
+    let mapping =
+        crate::storage::Storage::builtin_call_mapping(oid, argument_names, args.len(), variadic)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected builtin function {} has an invalid argument mapping",
+                    oid
+                )
+            })?;
+    let count = if declaration.variadic_element.is_some() && !variadic {
+        declaration.arguments.len().max(args.len())
+    } else {
+        declaration.arguments.len()
+    };
+    if count == args.len() && argument_names.iter().all(Option::is_none) {
+        return Ok(args);
+    }
+    let mut ordered = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let tail = declaration.arguments.len().checked_sub(1);
+    let mut expanded = 0;
+    for (argument, declared) in args.iter().zip(mapping) {
+        let mut position = usize::from(declared);
+        if declaration.variadic_element.is_some() && !variadic && Some(position) == tail {
+            position += expanded;
+            expanded += 1;
+        }
+        ordered[position] = Some(*argument);
+    }
+    if ordered[..count].iter().any(Option::is_none) {
+        let source = declaration.defaults.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "builtin function {} has no declared defaults",
+                oid
+            )
+        })?;
+        let defaults = super::parser::parse_expression_list(source, arena)?;
+        if defaults.len() != declaration.arguments.len() - declaration.required_arguments {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "builtin function {} has inconsistent defaults",
+                oid
+            ));
+        }
+        for (position, output) in ordered.iter_mut().enumerate().take(count) {
+            if output.is_some() {
+                continue;
+            }
+            let expression = defaults
+                .get(
+                    position
+                        .checked_sub(declaration.required_arguments)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "builtin function {} is missing a required input",
+                                oid
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "builtin function {} is missing an input default",
+                        oid
+                    )
+                })?;
+            let expression = bind_builtin_default(expression, arena)?;
+            *output = Some(
+                &*arena
+                    .alloc(Expr::BoundDefault {
+                        expression,
+                        type_oid: declaration.arguments[position],
+                    })
+                    .map_err(|_| arena_full())?,
+            );
+        }
+    }
+    arena
+        .alloc_slice_with(count, |index| {
+            ordered[index].expect("all selected builtin inputs are bound")
+        })
+        .map(|arguments| &*arguments)
+        .map_err(|_| arena_full())
+}
+
+fn bind_builtin_default<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    match *expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_) => Ok(expression),
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+            ..
+        } => {
+            if ColType::from_sql_name(type_name).is_none() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "builtin input default uses an unknown type"
+                ));
+            }
+            let operand = bind_builtin_default(operand, arena)?;
+            arena
+                .alloc(Expr::Cast {
+                    operand,
+                    type_name,
+                    type_mod,
+                    binding: super::ast::CastBinding::Builtin,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "builtin input default is not a catalog literal"
+        )),
+    }
+}
+
+pub(crate) fn builtin_operator_function<'a>(
+    oid: i32,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Option<Result<Datum<'a>, SqlError>> {
+    let (operator, left_type, right_type) = super::catalog::builtin_operator_function(oid)?;
+    let strict = super::catalog::builtin_callable_by_oid(oid)?.catalog.strict;
+    Some((|| {
+        let [left, right] = args else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "bound operator function argument contract changed"
+            ));
+        };
+        let comparison_collation = if operators::Comparison::from_binary(operator).is_some() {
+            Some(resolve_comparison_collation(
+                left,
+                right,
+                row,
+                hooks.catalog,
+            )?)
+        } else {
+            None
+        };
+        let convert = |expression, target: ColType| {
+            let value = eval_full(expression, arena, params, row, hooks)?;
+            let source = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+            if source == target.oid() {
+                Ok(value)
+            } else if let Some(catalog) = hooks.catalog
+                && let Some(value) = catalog.cast_defined(
+                    source,
+                    target.oid(),
+                    value,
+                    DefinedCastContext::Implicit,
+                    arena,
+                )?
+            {
+                Ok(value)
+            } else {
+                cast_to(value, target, arena)
+            }
+        };
+        let mut values = [Datum::Null; 2];
+        let mut constants = [false; 2];
+        let targets = [left_type, right_type];
+        for (index, expression) in args.iter().enumerate() {
+            constants[index] = constant_evaluation(expression, hooks.catalog)?
+                != Some(ExpressionEvaluation::Runtime);
+            if constants[index] {
+                values[index] = convert(*expression, targets[index])?;
+            }
+        }
+        if strict
+            && constants
+                .iter()
+                .zip(values)
+                .any(|(constant, value)| *constant && value.is_null())
+        {
+            return Ok(Datum::Null);
+        }
+        for (index, expression) in args.iter().enumerate() {
+            if !constants[index] {
+                values[index] = convert(*expression, targets[index])?;
+            }
+        }
+        if strict && values.iter().any(|value| value.is_null()) {
+            return Ok(Datum::Null);
+        }
+        Ok(eval_binary_values(
+            BinaryExpression {
+                operator,
+                left,
+                right,
+                search_catalog: false,
+                nulls: OperatorNulls::RoutineStrictness,
+            },
+            values[0],
+            values[1],
+            comparison_collation,
+            arena,
+            row,
+            hooks,
+        )?
+        .value)
+    })())
+}
+
+/// Execute an already selected builtin without another namespace lookup.
+pub(crate) fn call_builtin_oid<'a>(
+    oid: i32,
+    values: &[Datum<'a>],
+    types: &[i32],
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "bound builtin function with OID {} does not exist",
+            oid
+        )
+    })?;
+    if values.len() != types.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "bound builtin argument type count changed"
+        ));
+    }
+    let nodes: &'a [Expr<'a>] = arena
+        .alloc_slice_with(values.len(), |index| Expr::Param(index as u32 + 1))
+        .map_err(|_| arena_full())?;
+    let arguments = arena
+        .alloc_slice_with(values.len(), |index| &nodes[index])
+        .map_err(|_| arena_full())?;
+    super::exec::with_bound_parameter_types(types, || {
+        call(
+            declaration.name,
+            arguments,
+            CallSyntax {
+                argument_names: &[],
+                variadic: false,
+                star: false,
+                builtin: Some((oid, declaration.schema)),
+                kind: super::ast::CallKind::Routine,
+            },
+            arena,
+            values,
+            &NoColumns,
+            hooks,
+        )
+    })
+}
+
 #[derive(Clone, Copy)]
 struct CallSyntax<'slice, 'text> {
     argument_names: &'slice [Option<&'text str>],
     variadic: bool,
     star: bool,
+    builtin: Option<(i32, &'static str)>,
+    kind: super::ast::CallKind,
 }
 
 impl CallSyntax<'static, 'static> {
@@ -5311,6 +5786,8 @@ impl CallSyntax<'static, 'static> {
             argument_names: &[],
             variadic: false,
             star: false,
+            builtin: None,
+            kind: super::ast::CallKind::Routine,
         }
     }
 }
@@ -5328,37 +5805,18 @@ fn call<'a>(
         argument_names,
         variadic,
         star,
+        builtin,
+        kind,
     } = syntax;
-    let regex_srf_name = match written_name.split_once('.') {
-        Some(("pg_catalog", name))
-            if matches!(name, "regexp_matches" | "regexp_split_to_table") =>
-        {
-            Some(name)
-        }
-        None if matches!(written_name, "regexp_matches" | "regexp_split_to_table") => {
-            Some(written_name)
-        }
-        _ => None,
-    };
-    let mut reordered = [&Expr::Null; 3];
-    let args = if let Some(name) = regex_srf_name
-        && argument_names.iter().any(Option::is_some)
-    {
-        let parameters: &[&str] = match args.len() {
-            2 => &["string", "pattern"],
-            3 => &["string", "pattern", "flags"],
-            _ => return Err(arity_err(name, args.len())),
-        };
-        reorder_required_arguments(
-            name,
-            args,
-            argument_names,
-            parameters,
-            &mut reordered[..args.len()],
-        )?;
-        &reordered[..args.len()]
+    let args = if let Some((oid, _)) = builtin {
+        bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
     } else {
         args
+    };
+    let argument_names = if builtin.is_some() {
+        &[][..]
+    } else {
+        argument_names
     };
     if written_name.starts_with("pg_catalog.")
         && matches!(
@@ -5383,35 +5841,42 @@ fn call<'a>(
     {
         return undefined_function(written_name, args, arena, row, hooks);
     }
-    let name = written_name
-        .strip_prefix("pg_catalog.")
-        .unwrap_or(written_name);
+    if kind == super::ast::CallKind::Routine
+        && builtin.is_none()
+        && sql_syntax_call_name(written_name)
+        && super::catalog::builtin_callable_schema(written_name).is_none()
+    {
+        return undefined_function(written_name, args, arena, row, hooks);
+    }
+    if (written_name == "_pg_expandarray" || written_name == "pg_catalog._pg_expandarray")
+        && super::query::builtin_set_routine_name(written_name).is_none()
+    {
+        return undefined_function(written_name, args, arena, row, hooks);
+    }
+    let name = if let Some((oid, _)) = builtin {
+        super::catalog::builtin_callable_by_oid(oid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected builtin function {} has no declaration",
+                    oid
+                )
+            })?
+            .name
+    } else {
+        super::query::builtin_set_routine_name(written_name).unwrap_or_else(|| {
+            written_name
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(written_name)
+        })
+    };
     if super::ast::is_volatile_function(name) {
         super::query::protect_statement_effects();
     }
-    if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
-        if args.len() != 2 || star || variadic {
-            return undefined_function(written_name, args, arena, row, hooks);
-        }
-        let mut parse_ident_args = [&Expr::Null; 2];
-        reorder_required_arguments(
-            name,
-            args,
-            argument_names,
-            &["string", "strict"],
-            &mut parse_ident_args[..args.len()],
-        )?;
-        return funcs::string::dispatch(
-            name,
-            &parse_ident_args[..args.len()],
-            false,
-            false,
-            arena,
-            params,
-            row,
-            hooks,
-        )
-        .expect("parse_ident is a string builtin");
+    if let Some((oid, _)) = builtin
+        && let Some(result) = builtin_operator_function(oid, args, arena, params, row, hooks)
+    {
+        return result;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
@@ -5565,6 +6030,8 @@ fn call<'a>(
         });
     }
     if !star
+        && builtin.is_none()
+        && kind == super::ast::CallKind::Routine
         && let Some(catalog) = hooks.catalog
         && (catalog.has_routine_candidate(written_name, args.len())
             || crate::sql::ast::catalog_operator_call(written_name).is_some())
@@ -5591,11 +6058,15 @@ fn call<'a>(
         }
         if let Some(target) = catalog.resolve_routine_call(
             written_name,
+            kind,
             None,
             argument_names,
             variadic,
             argument_type_oids,
         )? {
+            if matches!(target, RoutineCallTarget::Builtin { .. }) {
+                return undefined_function(written_name, args, arena, row, hooks);
+            }
             return catalog.call_routine(
                 target,
                 args,
@@ -6446,7 +6917,12 @@ pub(crate) fn static_type_pub<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> 
 }
 
 fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType> {
-    if let Expr::Call { name, args, .. } = e
+    if let Expr::Call {
+        kind: super::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = e
         && let Some((Some("pg_catalog"), operator)) = super::ast::catalog_operator_call(name)
         && let [left, right] = *args
     {

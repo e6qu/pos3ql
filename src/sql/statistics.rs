@@ -200,8 +200,8 @@ pub(crate) fn execute(
         3775 => {
             engine.require_superuser(txn.txid, "pg_stat_reset_shared")?;
             let target = match arguments {
-                [Datum::Text(value)] => *value,
-                [Datum::Null] => return Ok(Datum::Text("")),
+                [Datum::Text(value)] => Some(*value),
+                [Datum::Null] => None,
                 [_] => {
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
@@ -219,7 +219,7 @@ pub(crate) fn execute(
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     "unrecognized reset target: \"{}\"",
-                    target
+                    target.expect("only a named target can be unrecognized")
                 ));
             }
             Ok(Datum::Text(""))

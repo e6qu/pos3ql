@@ -22,6 +22,22 @@ use super::{
     scan_source_with_pax_columns,
 };
 
+fn support_function_strict(storage: &Storage, oid: i32, txid: u32) -> Result<bool, SqlError> {
+    if let Some(slot) = storage.routine_slot_by_oid(oid, txid) {
+        return Ok(storage.routine_for(slot, txid).attributes.strict);
+    }
+    crate::sql::catalog::builtin_callable_by_oid(oid)
+        .filter(|signature| signature.kind == b'f' && !signature.returns_set)
+        .map(|signature| signature.catalog.strict)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "aggregate support function with OID {} does not exist",
+                oid
+            )
+        })
+}
+
 struct JsonAggregateDisplay<'a> {
     values: &'a [Datum<'a>],
     jsonb: bool,
@@ -667,7 +683,10 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
         let Expr::Call {
+            kind,
             name,
+            argument_names,
+            variadic,
             star,
             distinct,
             order_by,
@@ -679,6 +698,48 @@ impl<'a> AggState<'a> {
             return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
         self.init_order_collations(args.len().saturating_add(order_by.len()).max(2), arena)?;
+        let custom_aggregate = |inputs: &[i32]| -> Result<
+            Option<(usize, crate::storage::AggregateRoutine)>,
+            SqlError,
+        > {
+            if *kind == crate::sql::ast::CallKind::SqlSyntax {
+                return Ok(None);
+            }
+            match storage.select_routine_call(
+                name,
+                argument_names,
+                inputs,
+                *variadic,
+                txid,
+                crate::storage::RoutineCallKind::Aggregate,
+            ) {
+                crate::storage::RoutineCallSelection::Stored(slot) => {
+                    let Some((selected, _, aggregate)) =
+                        storage.aggregate_for_call_oids(name, inputs, txid)
+                    else {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "{} is not an aggregate",
+                            name
+                        ));
+                    };
+                    debug_assert_eq!(slot, selected);
+                    Ok(Some((slot, aggregate)))
+                }
+                crate::storage::RoutineCallSelection::Builtin { .. }
+                | crate::storage::RoutineCallSelection::Absent => Ok(None),
+                crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function {} is not unique",
+                    name
+                )),
+                crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is not an aggregate",
+                    name
+                )),
+            }
+        };
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if args.len() <= argument_oids.len() {
             let mut inferred = true;
@@ -689,8 +750,7 @@ impl<'a> AggState<'a> {
                 }
             }
             if inferred
-                && let Some((slot, _, aggregate)) =
-                    storage.aggregate_for_call_oids(name, &argument_oids[..args.len()], txid)
+                && let Some((slot, aggregate)) = custom_aggregate(&argument_oids[..args.len()])?
             {
                 storage.require_routine_execute(slot, txid)?;
                 if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
@@ -715,11 +775,8 @@ impl<'a> AggState<'a> {
                 }
             }
             if inferred
-                && let Some((slot, _, aggregate)) = storage.aggregate_for_call_oids(
-                    name,
-                    &argument_oids[..args.len() + order_by.len()],
-                    txid,
-                )
+                && let Some((slot, aggregate)) =
+                    custom_aggregate(&argument_oids[..args.len() + order_by.len()])?
             {
                 storage.require_routine_execute(slot, txid)?;
                 if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
@@ -778,11 +835,8 @@ impl<'a> AggState<'a> {
                     name
                 ));
             }
-            let transition_slot = storage
-                .routine_slot_by_oid(aggregate.transition_oid, txid)
-                .expect("aggregate transition dependency remains catalog-visible");
             self.custom_transition_strict =
-                storage.routine_for(transition_slot, txid).attributes.strict;
+                support_function_strict(storage, aggregate.transition_oid, txid)?;
             self.star = *star;
             self.distinct = *distinct;
             if *star && !args.is_empty() {
@@ -1003,15 +1057,9 @@ impl<'a> AggState<'a> {
         self.custom_moving = true;
         self.best = None;
         self.custom_state_initialized = false;
-        let transition_slot = storage
-            .routine_slot_by_oid(moving.transition_oid, txid)
-            .expect("moving transition dependency remains catalog-visible");
         self.custom_transition_strict =
-            storage.routine_for(transition_slot, txid).attributes.strict;
-        let inverse_slot = storage
-            .routine_slot_by_oid(moving.inverse_oid, txid)
-            .expect("moving inverse dependency remains catalog-visible");
-        self.custom_inverse_strict = storage.routine_for(inverse_slot, txid).attributes.strict;
+            support_function_strict(storage, moving.transition_oid, txid)?;
+        self.custom_inverse_strict = support_function_strict(storage, moving.inverse_oid, txid)?;
         if let Some(initial) = moving.initial_condition {
             let initial = arena
                 .alloc_str(initial.as_str())

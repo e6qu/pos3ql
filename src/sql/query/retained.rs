@@ -304,6 +304,7 @@ fn bind_expression<'a>(
                 let name = arena.alloc_str(encoded.as_str()).map_err(full)?;
                 let args = arena.alloc_slice_copy(&[left, right]).map_err(full)?;
                 Expr::Call {
+                    kind: crate::sql::ast::CallKind::SqlSyntax,
                     bound_oid: None,
                     bound_strict: None,
                     name,
@@ -408,6 +409,7 @@ fn bind_expression<'a>(
             }
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             bound_strict,
@@ -434,11 +436,18 @@ fn bind_expression<'a>(
             }
             let target = catalog.resolve_routine_call(
                 name,
+                *kind,
                 *bound_oid,
                 argument_names,
                 *variadic,
                 argument_oids,
             )?;
+            let builtin_schema = match &target {
+                Some(super::super::eval::RoutineCallTarget::Builtin { schema, .. }) => {
+                    Some(*schema)
+                }
+                _ => None,
+            };
             let (bound_oid, bound_strict, args, argument_names, variadic) = match target {
                 Some(super::super::eval::RoutineCallTarget::Stored {
                     oid,
@@ -490,17 +499,17 @@ fn bind_expression<'a>(
                     *variadic,
                 ),
             };
-            let name = if bound_oid.is_none()
+            let name = if let Some(schema) = builtin_schema
                 && !name.contains('.')
-                && crate::sql::catalog::intrinsic_routine_has_name(name)
             {
                 arena
-                    .alloc_str(crate::stack_format!(260, "pg_catalog.{}", name).as_str())
+                    .alloc_str(crate::stack_format!(260, "{}.{}", schema, name).as_str())
                     .map_err(full)?
             } else {
                 name
             };
             Expr::Call {
+                kind: *kind,
                 name,
                 bound_oid,
                 bound_strict,

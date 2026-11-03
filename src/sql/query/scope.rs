@@ -95,6 +95,14 @@ fn validate_table_sample<'a>(
     let Some(sample) = table.sample else {
         return Ok(());
     };
+    let columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     for expression in [Some(sample.percentage), sample.repeatable]
         .into_iter()
         .flatten()
@@ -124,7 +132,7 @@ fn validate_table_sample<'a>(
             });
         }
         let mut aggregates = ArenaList::new(arena);
-        collect_aggs(expression, &mut aggregates, storage, txid)?;
+        collect_aggs(expression, &mut aggregates, storage, txid, &columns)?;
         if !aggregates.is_empty() {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -132,7 +140,7 @@ fn validate_table_sample<'a>(
             ));
         }
         let mut windows = ArenaList::new(arena);
-        collect_windows(expression, &mut windows, storage, txid)?;
+        collect_windows(expression, &mut windows, storage, txid, &columns)?;
         if !windows.is_empty() {
             return Err(sql_err!(
                 sqlstate::WINDOWING_ERROR,
@@ -1056,10 +1064,27 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        let namespace = storage
+            .path()
+            .catalog_namespace(tref.schema, tref.table)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "catalog relation \"{}\" has no selected namespace",
+                    tref.table
+                )
+            })?;
         let synth = if materialize {
-            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, scan, arena)?
+            crate::sql::catalog::synthesize(
+                storage,
+                Some(namespace),
+                tref.table,
+                txid,
+                scan,
+                arena,
+            )?
         } else {
-            crate::sql::catalog::synthesize_definition(tref.schema, tref.table, arena)?
+            crate::sql::catalog::synthesize_definition(Some(namespace), tref.table, arena)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
@@ -1780,6 +1805,7 @@ impl<'d> QueryScope<'d> {
                 }
                 Ok(&*arena
                     .alloc(Expr::Call {
+                        kind: crate::sql::ast::CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
                         name: "coalesce",

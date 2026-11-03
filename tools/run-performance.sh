@@ -20,6 +20,9 @@ S3_PID=
 OBJECT_STORE_CONTAINER=
 POSTGRES_CONTAINER=
 REPLICA_PIDS=
+STATISTICS_BYTES=1048576
+STATISTICS_LEASES=1024
+INDEX_STATISTICS_SLOTS=4096
 
 cleanup() {
   if [ -n "$SERVER_PID" ] && server_alive "$SERVER_PID"; then
@@ -299,9 +302,9 @@ row_work_leases = 128
 definition_image_slots = 256
 table_metadata_bytes = 64MiB
 table_metadata_leases = 8192
-statistics_bytes = 1MiB
-statistics_leases = 1024
-index_statistics_slots = 4096
+statistics_bytes = $STATISTICS_BYTES
+statistics_leases = $STATISTICS_LEASES
+index_statistics_slots = $INDEX_STATISTICS_SLOTS
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16
@@ -638,6 +641,8 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --row-overlay-slots "$TABLE_CAPACITY" --row-work-bytes 8388608 \
   --row-work-leases 128 --definition-image-slots 256 \
   --table-metadata-bytes 67108864 --table-metadata-leases 8192 \
+  --statistics-bytes "$STATISTICS_BYTES" --statistics-leases "$STATISTICS_LEASES" \
+  --index-statistics-slots "$INDEX_STATISTICS_SLOTS" \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
   --catalog-relations "$CATALOG_RELATIONS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \

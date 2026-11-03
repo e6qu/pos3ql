@@ -16,6 +16,7 @@ pub(crate) enum InputSite<'a> {
     },
     Call {
         name: &'a str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         arity: usize,
         variadic: bool,
@@ -54,12 +55,14 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> InputSite<'a> {
     match expression {
         Expr::Call {
             name,
+            kind,
             bound_oid,
             args,
             variadic,
             ..
         } => InputSite::Call {
             name,
+            kind: *kind,
             bound_oid: *bound_oid,
             arity: args.len(),
             variadic: *variadic,
@@ -114,12 +117,14 @@ impl InputSite<'_> {
             },
             Self::Call {
                 name,
+                kind,
                 bound_oid,
                 arity,
                 variadic,
             } => InputSite::Call {
                 name: core::str::from_utf8(copy_bytes(name.as_bytes(), arena)?)
                     .expect("copied SQL identifier is UTF-8"),
+                kind,
                 bound_oid,
                 arity,
                 variadic,
@@ -390,11 +395,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 },
                 InputSite::Call {
                     name,
+                    kind,
                     bound_oid,
                     arity,
                     variadic,
                 } => InputSite::Call {
                     name: self.arena.alloc_str(name).map_err(|_| full())?,
+                    kind,
                     bound_oid,
                     arity,
                     variadic,
@@ -849,6 +856,7 @@ mod tests {
                         let first = value(
                             InputSite::Call {
                                 name: "input_effect",
+                                kind: crate::sql::ast::CallKind::Routine,
                                 bound_oid: None,
                                 arity: 0,
                                 variadic: false,
@@ -891,6 +899,74 @@ mod tests {
         }
         assert!(ACTIVE_INPUT.with(Cell::get).is_none());
         assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+    }
+
+    #[test]
+    fn retained_inputs_reject_a_syntax_node_replacing_an_ordinary_routine() {
+        let mut budget = Budget::new(32768);
+        let statement = Arena::new(&mut budget, "tagged input statement", 16384).unwrap();
+        let mut work = Arena::new(&mut budget, "tagged input work", 8192).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        let effects = Cell::new(0);
+        invocations.begin_attempt();
+        crate::mem::guard::forbid_alloc(|| {
+            let suspended: Result<Datum<'_>, SqlError> = call(&work, || {
+                let _scope = enter();
+                value(
+                    InputSite::Call {
+                        name: "__json_object_json",
+                        kind: crate::sql::ast::CallKind::Routine,
+                        bound_oid: None,
+                        arity: 0,
+                        variadic: false,
+                    },
+                    &work,
+                    || {
+                        effects.set(effects.get() + 1);
+                        invocations.next.set(1);
+                        Ok(Datum::Int4(7))
+                    },
+                )?;
+                Err(sql_err!(
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                    "test suspension"
+                ))
+            });
+            assert_eq!(
+                suspended.unwrap_err().sqlstate,
+                sqlstate::INTERNAL_ROUTINE_INVOCATION
+            );
+        });
+        work.reset();
+        invocations.begin_attempt();
+        crate::mem::guard::forbid_alloc(|| {
+            let resumed = call(&work, || {
+                let _scope = enter();
+                value(
+                    InputSite::Call {
+                        name: "__json_object_json",
+                        kind: crate::sql::ast::CallKind::SqlSyntax,
+                        bound_oid: None,
+                        arity: 0,
+                        variadic: false,
+                    },
+                    &work,
+                    || {
+                        effects.set(effects.get() + 1);
+                        Ok(Datum::Int4(9))
+                    },
+                )
+            });
+            assert_eq!(
+                resumed.unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(effects.get(), 1);
+        });
     }
 
     #[test]

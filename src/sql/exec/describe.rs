@@ -719,15 +719,46 @@ impl ColTypeResolver for CatalogCols<'_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        Some(if kind == crate::sql::ast::CallKind::SqlSyntax {
+            crate::storage::RoutineCallSelection::Absent
+        } else if let Some(oid) = bound_oid {
+            self.storage.routine_slot_by_oid(oid, self.txid).map_or(
+                crate::storage::RoutineCallSelection::Absent,
+                crate::storage::RoutineCallSelection::Stored,
+            )
+        } else {
+            self.storage.select_routine_call(
+                name,
+                argument_names,
+                arguments,
+                variadic,
+                self.txid,
+                crate::storage::RoutineCallKind::Function,
+            )
+        })
+    }
+
     fn routine_result(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<StaticTypeMeta> {
-        if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+        if kind == crate::sql::ast::CallKind::SqlSyntax
+            && let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name)
+        {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
@@ -784,6 +815,21 @@ impl ColTypeResolver for CatalogCols<'_> {
                     crate::sql::ast::Collation::None
                 },
             });
+        }
+        if kind == crate::sql::ast::CallKind::SqlSyntax {
+            return None;
+        }
+        if let Some(crate::storage::RoutineCallSelection::Builtin { oid, .. }) =
+            self.routine_call_selection(name, kind, bound_oid, argument_names, variadic, arguments)
+        {
+            return catalog_builtin_call_result_metadata(
+                self.storage,
+                self.txid,
+                oid,
+                argument_names,
+                arguments,
+                variadic,
+            );
         }
         let routine = if let Some(oid) = bound_oid {
             self.storage.function_for_captured_call(
@@ -867,14 +913,20 @@ impl ColTypeResolver for CatalogCols<'_> {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if bound_oid.is_none()
-            && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
+        if kind == crate::sql::ast::CallKind::SqlSyntax {
+            return None;
+        }
+        if matches!(
+            self.routine_call_selection(name, kind, bound_oid, argument_names, variadic, arguments),
+            Some(crate::storage::RoutineCallSelection::Builtin { .. })
+        ) && let Some(field) = intrinsic_record_field_meta(name, arguments, index)
         {
             return Some(field);
         }
@@ -978,8 +1030,32 @@ fn describe_record_star<'q>(
         txid,
         arena,
     } = context;
+    let catalog_columns = storage.map(|storage| CatalogCols {
+        definition: def,
+        alias: table_alias,
+        output_aliases,
+        storage,
+        txid,
+        arena,
+    });
+    let definition_columns = def.map(|definition| AliasedDefCols {
+        definition,
+        alias: table_alias,
+        output_aliases,
+    });
+    let columns: &dyn ColTypeResolver = if let Some(columns) = &catalog_columns {
+        columns
+    } else if let Some(columns) = &definition_columns {
+        columns
+    } else {
+        &NoCols
+    };
     match base {
-        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.eq_ignore_ascii_case("row") => {
             let catalog_resolver;
             let aliased_resolver;
             let resolver: &dyn ColTypeResolver = match (def, storage) {
@@ -1028,7 +1104,7 @@ fn describe_record_star<'q>(
             }
             Ok(())
         }
-        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+        Expr::Call { name, .. } if builtin_record_srf_call(base, columns)? => {
             let mut index = 0;
             while let Some((field, ctype)) = builtin_record_srf_field(name, index) {
                 push(ColDesc::of_type(field, ctype))?;
@@ -1037,7 +1113,8 @@ fn describe_record_star<'q>(
             Ok(())
         }
         Expr::Call { name, args, .. }
-            if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+            if builtin_call(base, columns)?
+                && args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
                 && crate::sql::catalog::intrinsic_record_field(
                     name,
                     &[oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS][..args.len()],
@@ -1056,13 +1133,14 @@ fn describe_record_star<'q>(
             Ok(())
         }
         Expr::Call { name, args, .. }
-            if matches!(
-                *name,
-                "json_populate_record"
-                    | "jsonb_populate_record"
-                    | "json_populate_recordset"
-                    | "jsonb_populate_recordset"
-            ) =>
+            if builtin_call(base, columns)?
+                && matches!(
+                    *name,
+                    "json_populate_record"
+                        | "jsonb_populate_record"
+                        | "json_populate_recordset"
+                        | "jsonb_populate_recordset"
+                ) =>
         {
             describe_record_star(
                 args.first().copied().ok_or_else(|| {
@@ -1386,57 +1464,101 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: crate::sql::parser::SIMILAR_TO,
             ..
         } => None,
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: crate::sql::parser::OVERLAPS_PERIODS,
             ..
         } => Some("overlaps"),
-        Expr::Call { name, .. }
-            if crate::sql::ast::catalog_operator_call(name).is_some()
-                || name.starts_with("__is_json_") =>
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if crate::sql::ast::catalog_operator_call(name).is_some()
+            || name.starts_with("__is_json_") =>
         {
             None
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__json" | "__json_unique",
             ..
         } => Some("json"),
-        Expr::Call { name, .. } if name.starts_with("__json_array_") => Some("json_array"),
-        Expr::Call { name, .. } if name.starts_with("__json_object_") => Some("json_object"),
-        Expr::Call { name, .. } if name.starts_with("__json_serialize_") => Some("json_serialize"),
-        Expr::Call { name, .. } if name.starts_with("__json_exists_") => Some("json_exists"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_array_") => Some("json_array"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_object_") => Some("json_object"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_serialize_") => Some("json_serialize"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_exists_") => Some("json_exists"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__json_value",
             ..
         } => Some("json_value"),
-        Expr::Call { name, .. } if name.starts_with("__json_query_") => Some("json_query"),
-        Expr::Call { name, .. } if name.starts_with("__json_arrayagg_") => Some("json_arrayagg"),
-        Expr::Call { name, .. } if name.starts_with("__json_objectagg_") => Some("json_objectagg"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_query_") => Some("json_query"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_arrayagg_") => Some("json_arrayagg"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.starts_with("__json_objectagg_") => Some("json_objectagg"),
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__xmlparse_content" | "__xmlparse_document",
             ..
         } => Some("xmlparse"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__xmlserialize",
             ..
         } => Some("xmlserialize"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__xmlelement",
             ..
         } => Some("xmlelement"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__xmlforest",
             ..
         } => Some("xmlforest"),
         Expr::Call {
-            name: "__xmlpi", ..
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__xmlpi",
+            ..
         } => Some("xmlpi"),
         Expr::Call {
-            name: "__xmlroot", ..
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__xmlroot",
+            ..
         } => Some("xmlroot"),
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name: "__xmlexists",
             ..
         } => Some("xmlexists"),
@@ -1602,6 +1724,29 @@ impl StaticTypeMeta {
     }
 }
 
+pub(crate) fn catalog_builtin_call_result_metadata(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    oid: i32,
+    names: &[Option<&str>],
+    arguments: &[i32],
+    variadic: bool,
+) -> Option<StaticTypeMeta> {
+    let type_oid = storage.builtin_call_result_oid(oid, names, arguments, variadic, txid)?;
+    let ctype =
+        coltype_of_oid(type_oid).or_else(|| storage.domain_base_type_for_oid(type_oid, txid))?;
+    Some(StaticTypeMeta {
+        type_oid,
+        ctype,
+        type_mod: -1,
+        collation: if ctype.is_collatable() {
+            crate::sql::ast::Collation::Default
+        } else {
+            crate::sql::ast::Collation::None
+        },
+    })
+}
+
 pub(crate) fn intrinsic_record_field_meta(
     name: &str,
     arguments: &[i32],
@@ -1710,6 +1855,20 @@ pub trait ColTypeResolver {
         ColType::from_sql_name(type_name).map(ColType::oid)
     }
 
+    /// None denotes a catalog-free resolver; a catalog lookup always returns
+    /// its explicit choice, including missing and ambiguous calls.
+    fn routine_call_selection(
+        &self,
+        _name: &str,
+        _kind: crate::sql::ast::CallKind,
+        _bound_oid: Option<i32>,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        None
+    }
+
     /// SQL-routine result type resolved from already-inferred argument type
     /// identities. OIDs retain a domain identity that its runtime value does
     /// not carry.
@@ -1717,6 +1876,7 @@ pub trait ColTypeResolver {
     fn routine_result(
         &self,
         _name: &str,
+        _kind: crate::sql::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1739,13 +1899,14 @@ pub trait ColTypeResolver {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if bound_oid.is_some() {
+        if bound_oid.is_some() || kind == crate::sql::ast::CallKind::SqlSyntax {
             return None;
         }
         let (field, type_oid, ctype) =
@@ -2388,6 +2549,7 @@ fn record_field_index_metadata(
     columns: &dyn ColTypeResolver,
 ) -> Result<Option<StaticTypeMeta>, SqlError> {
     if let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -2403,6 +2565,7 @@ fn record_field_index_metadata(
         }
         if let Some((_, metadata)) = columns.routine_record_field(
             name,
+            *kind,
             *bound_oid,
             argument_names,
             *variadic,
@@ -2507,7 +2670,11 @@ pub fn register_shape_for(
     }; MAX_SHAPE_FIELDS];
     let mut n = 0usize;
     match expr {
-        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            ..
+        } if name.eq_ignore_ascii_case("row") => {
             let count = record_shape_metadata(expr, columns, |name, meta| {
                 if n < MAX_SHAPE_FIELDS {
                     fields[n] = RecordShapeField {
@@ -2528,7 +2695,7 @@ pub fn register_shape_for(
                 return Ok(None);
             }
         }
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+        Expr::Call { args, .. } if builtin_expand_array_call(expr, columns)? => {
             let Some(element) = expand_array_element_metadata(args, columns) else {
                 return Ok(None);
             };
@@ -2549,7 +2716,7 @@ pub fn register_shape_for(
                 n += 1;
             }
         }
-        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+        Expr::Call { name, .. } if builtin_record_srf_call(expr, columns)? => {
             while let Some((field, ctype)) = builtin_record_srf_field(name, n) {
                 let mut field_name = crate::util::StackStr::new();
                 let _ = core::fmt::Write::write_str(&mut field_name, field);
@@ -2671,6 +2838,7 @@ fn json_each_value_type(name: &str) -> Option<ColType> {
 }
 
 fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, ColType)> {
+    let name = crate::sql::query::builtin_set_routine_name(name)?;
     if name.eq_ignore_ascii_case("pg_input_error_info") {
         return ["message", "detail", "hint", "sql_error_code"]
             .get(index)
@@ -2716,6 +2884,142 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
         };
     }
     None
+}
+
+fn selected_call(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+) -> Result<Option<crate::storage::RoutineCallSelection>, SqlError> {
+    let Expr::Call {
+        name,
+        kind,
+        bound_oid,
+        args,
+        argument_names,
+        variadic,
+        order_by,
+        star,
+        ..
+    } = expression
+    else {
+        return Ok(None);
+    };
+    if *kind == crate::sql::ast::CallKind::SqlSyntax {
+        return Ok(None);
+    }
+    let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    let count = if *star { 0 } else { args.len() };
+    if count > arguments.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "function has too many arguments"
+        ));
+    }
+    for (output, argument) in arguments.iter_mut().zip(args.iter().copied()) {
+        *output = infer_routine_argument_oid(argument, columns)?;
+    }
+    let mut selection = columns.routine_call_selection(
+        name,
+        *kind,
+        *bound_oid,
+        argument_names,
+        *variadic,
+        &arguments[..count],
+    );
+    if selection == Some(crate::storage::RoutineCallSelection::Absent) && !order_by.is_empty() {
+        let complete = count
+            .checked_add(order_by.len())
+            .filter(|complete| *complete <= arguments.len())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::TOO_MANY_ARGUMENTS,
+                    "function has too many arguments"
+                )
+            })?;
+        for (output, order) in arguments[count..complete].iter_mut().zip(*order_by) {
+            *output = infer_routine_argument_oid(order.expression, columns)?;
+        }
+        selection = columns.routine_call_selection(
+            name,
+            *kind,
+            *bound_oid,
+            argument_names,
+            *variadic,
+            &arguments[..complete],
+        );
+    }
+    match selection {
+        Some(crate::storage::RoutineCallSelection::Absent) => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}(...) does not exist",
+            name
+        )),
+        Some(crate::storage::RoutineCallSelection::Ambiguous) => Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "function {}(...) is not unique",
+            name
+        )),
+        Some(crate::storage::RoutineCallSelection::WrongKind { .. }) => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is not a function",
+            name
+        )),
+        _ => Ok(selection),
+    }
+}
+
+fn builtin_expand_array_call(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+) -> Result<bool, SqlError> {
+    let Expr::Call {
+        name,
+        kind,
+        bound_oid: None,
+        ..
+    } = expression
+    else {
+        return Ok(false);
+    };
+    if *kind != crate::sql::ast::CallKind::Routine {
+        return Ok(false);
+    }
+    Ok(match selected_call(expression, columns)? {
+        Some(crate::storage::RoutineCallSelection::Builtin { oid, .. }) => {
+            crate::sql::catalog::builtin_callable_by_oid(oid).is_some_and(|signature| {
+                signature.schema == "information_schema" && signature.name == "_pg_expandarray"
+            })
+        }
+        None => crate::sql::query::builtin_set_routine_name(name) == Some("_pg_expandarray"),
+        _ => false,
+    })
+}
+
+pub(crate) fn builtin_call(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+) -> Result<bool, SqlError> {
+    Ok(!crate::sql::eval::is_sql_syntax_call(expression)
+        && matches!(
+            selected_call(expression, columns)?,
+            None | Some(crate::storage::RoutineCallSelection::Builtin { .. })
+        ))
+}
+
+pub(crate) fn builtin_record_srf_call(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+) -> Result<bool, SqlError> {
+    let Expr::Call { name, kind, .. } = expression else {
+        return Ok(false);
+    };
+    if *kind != crate::sql::ast::CallKind::Routine || builtin_record_srf_field(name, 0).is_none() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        selected_call(expression, columns)?,
+        None | Some(crate::storage::RoutineCallSelection::Builtin { .. })
+    ))
 }
 
 fn expand_array_element_metadata(
@@ -2776,7 +3080,11 @@ pub(crate) fn resolved_set_call(
     storage: &crate::storage::Storage,
     txid: u32,
 ) -> Result<bool, SqlError> {
+    if crate::sql::eval::is_sql_syntax_call(expression) {
+        return Ok(false);
+    }
     let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -2787,30 +3095,64 @@ pub(crate) fn resolved_set_call(
     else {
         return Ok(false);
     };
-    if bound_oid.is_none() {
-        if crate::sql::query::is_builtin_set_routine(name) {
-            return Ok(true);
-        }
-        if !storage.has_set_routine_candidate(name, args.len(), txid) {
-            return Ok(false);
-        }
-    }
     let mut arguments = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
     if args.len() > arguments.len() {
-        return Ok(false);
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "function has too many arguments"
+        ));
     }
     for (output, argument) in arguments.iter_mut().zip(*args) {
         *output = infer_routine_argument_oid(argument, columns)?;
     }
-    let arguments = &arguments[..args.len()];
-    let routine = if let Some(oid) = bound_oid {
-        storage.function_for_captured_call(*oid, argument_names, arguments, *variadic, txid)
-    } else if argument_names.is_empty() {
-        storage.function_for_call_syntax_oids(name, arguments, *variadic, txid)
+    let selected = if let Some(oid) = bound_oid {
+        storage.routine_slot_by_oid(*oid, txid).map_or(
+            crate::storage::RoutineCallSelection::Absent,
+            crate::storage::RoutineCallSelection::Stored,
+        )
     } else {
-        storage.function_for_named_call_oids(name, argument_names, arguments, *variadic, txid)
+        storage.select_routine_call(
+            name,
+            argument_names,
+            &arguments[..args.len()],
+            *variadic,
+            txid,
+            crate::storage::RoutineCallKind::Function,
+        )
     };
-    Ok(routine.is_some_and(|routine| routine.kind.is_set_returning()))
+    match selected {
+        crate::storage::RoutineCallSelection::Stored(slot) => {
+            Ok(storage.routine_for(slot, txid).kind.is_set_returning())
+        }
+        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+            Ok(crate::sql::catalog::builtin_callable_by_oid(oid)
+                .is_some_and(|signature| signature.returns_set))
+        }
+        crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
+            sqlstate::AMBIGUOUS_FUNCTION,
+            "function {}(...) is not unique",
+            name
+        )),
+        crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is not a function",
+            name
+        )),
+        crate::storage::RoutineCallSelection::Absent => {
+            if bound_oid.is_some()
+                || crate::sql::query::is_builtin_set_routine(name)
+                || storage.has_set_routine_candidate(name, args.len(), txid)
+            {
+                Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    name
+                ))
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 /// PostgreSQL expands a record-valued call into independent field expressions
@@ -2920,7 +3262,12 @@ fn record_shape_metadata_dyn(
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Result<Option<usize>, SqlError> {
     match base {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => {
             let mut count = 0usize;
             for arg in *args {
                 let expansion = match arg {
@@ -2963,7 +3310,7 @@ fn record_shape_metadata_dyn(
             }
             Ok(Some(count))
         }
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+        Expr::Call { args, .. } if builtin_expand_array_call(base, columns)? => {
             let Some(element) = expand_array_element_metadata(args, columns) else {
                 return Ok(None);
             };
@@ -2971,7 +3318,7 @@ fn record_shape_metadata_dyn(
             visit("n", StaticTypeMeta::of(ColType::Int4));
             Ok(Some(2))
         }
-        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+        Expr::Call { name, .. } if builtin_record_srf_call(base, columns)? => {
             let mut count = 0;
             while let Some((field, ctype)) = builtin_record_srf_field(name, count) {
                 visit(field, StaticTypeMeta::of(ctype));
@@ -2980,7 +3327,8 @@ fn record_shape_metadata_dyn(
             Ok(Some(count))
         }
         Expr::Call { name, args, .. }
-            if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+            if builtin_call(base, columns)?
+                && args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
                 && crate::sql::catalog::intrinsic_record_field(
                     name,
                     &[oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS][..args.len()],
@@ -3011,13 +3359,14 @@ fn record_shape_metadata_dyn(
             Ok(Some(count))
         }
         Expr::Call { name, args, .. }
-            if matches!(
-                *name,
-                "json_populate_record"
-                    | "jsonb_populate_record"
-                    | "json_populate_recordset"
-                    | "jsonb_populate_recordset"
-            ) =>
+            if builtin_call(base, columns)?
+                && matches!(
+                    *name,
+                    "json_populate_record"
+                        | "jsonb_populate_record"
+                        | "json_populate_recordset"
+                        | "jsonb_populate_recordset"
+                ) =>
         {
             let Some(argument) = args.first() else {
                 return Ok(None);
@@ -3025,6 +3374,7 @@ fn record_shape_metadata_dyn(
             record_shape_metadata_dyn(argument, columns, visit)
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
@@ -3042,6 +3392,7 @@ fn record_shape_metadata_dyn(
             let mut count = 0usize;
             while let Some((field_name, meta)) = columns.routine_record_field(
                 name,
+                *kind,
                 *bound_oid,
                 argument_names,
                 *variadic,
@@ -3125,7 +3476,12 @@ fn shape_from_columns_metadata(
 /// fails — even for a well-typed sibling field. Mirror that so `(ROW(1,'x')).f1`
 /// errors exactly as PostgreSQL does.
 pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Result<(), SqlError> {
-    if let Expr::Call { name, args, .. } = base
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = base
         && name.eq_ignore_ascii_case("row")
     {
         for arg in *args {
@@ -3157,7 +3513,12 @@ pub fn record_field_metadata(
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only
     // selecting *that* field (star expansion checks every field elsewhere)
     // hits the failure; a typed sibling selects fine.
-    if let Expr::Call { name, args, .. } = base
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = base
         && name.eq_ignore_ascii_case("row")
         && let Some(position) = RECORD_FIELD_NAMES
             .iter()
@@ -3172,12 +3533,17 @@ pub fn record_field_metadata(
         ));
     }
     let precise = match base {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => RECORD_FIELD_NAMES
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => RECORD_FIELD_NAMES
             .iter()
             .position(|name| name.eq_ignore_ascii_case(field))
             .and_then(|position| args.get(position))
             .and_then(|argument| expression_static_metadata(argument, columns)),
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
+        Expr::Call { args, .. } if builtin_expand_array_call(base, columns)? => {
             if field.eq_ignore_ascii_case("x") {
                 expand_array_element_metadata(args, columns)
             } else if field.eq_ignore_ascii_case("n") {
@@ -3186,7 +3552,7 @@ pub fn record_field_metadata(
                 None
             }
         }
-        Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
+        Expr::Call { name, .. } if builtin_record_srf_call(base, columns)? => {
             let mut index = 0usize;
             let mut found = None;
             while let Some((name, ctype)) = builtin_record_srf_field(name, index) {
@@ -3199,13 +3565,14 @@ pub fn record_field_metadata(
             found
         }
         Expr::Call { name, args, .. }
-            if matches!(
-                *name,
-                "json_populate_record"
-                    | "jsonb_populate_record"
-                    | "json_populate_recordset"
-                    | "jsonb_populate_recordset"
-            ) =>
+            if builtin_call(base, columns)?
+                && matches!(
+                    *name,
+                    "json_populate_record"
+                        | "jsonb_populate_record"
+                        | "json_populate_recordset"
+                        | "jsonb_populate_recordset"
+                ) =>
         {
             return record_field_metadata(
                 args.first().copied().ok_or_else(|| {
@@ -3219,6 +3586,7 @@ pub fn record_field_metadata(
             );
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
@@ -3237,6 +3605,7 @@ pub fn record_field_metadata(
                 let mut found = None;
                 while let Some((name, meta)) = columns.routine_record_field(
                     name,
+                    *kind,
                     *bound_oid,
                     argument_names,
                     *variadic,
@@ -3714,6 +4083,7 @@ pub(crate) fn routine_result_metadata(
     columns: &dyn ColTypeResolver,
 ) -> Option<StaticTypeMeta> {
     let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -3725,6 +4095,11 @@ pub(crate) fn routine_result_metadata(
     else {
         return None;
     };
+    if *kind == crate::sql::ast::CallKind::SqlSyntax
+        && crate::sql::ast::catalog_operator_call(name).is_none()
+    {
+        return None;
+    }
     let mut argument_type_oids = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
     if args.len() > argument_type_oids.len() {
         return None;
@@ -3734,6 +4109,7 @@ pub(crate) fn routine_result_metadata(
     }
     if let Some(result) = columns.routine_result(
         name,
+        *kind,
         *bound_oid,
         argument_names,
         *variadic,
@@ -3750,6 +4126,7 @@ pub(crate) fn routine_result_metadata(
     }
     columns.routine_result(
         name,
+        *kind,
         *bound_oid,
         argument_names,
         *variadic,
@@ -4161,7 +4538,13 @@ pub fn infer_type_res(
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
     let of = |t: ColType| (t.oid(), t.typlen());
-    if let Expr::Call { name, args, .. } = expression
+    let selected = selected_call(expression, columns)?;
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = expression
         && let Some((Some("pg_catalog"), symbol)) = crate::sql::ast::catalog_operator_call(name)
         && let [left, right] = *args
         && let Some(operator) = crate::sql::ast::BinaryOp::from_operator_name(symbol)
@@ -4175,12 +4558,32 @@ pub fn infer_type_res(
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));
     }
+    if matches!(
+        selected,
+        Some(crate::storage::RoutineCallSelection::Stored(_))
+    ) {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "selected routine result type is unavailable"
+        ));
+    }
+    if let Expr::Call { name, .. } = expression
+        && name.rsplit('.').next() == Some("_pg_expandarray")
+        && crate::sql::query::builtin_set_routine_name(name).is_none()
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}(...) does not exist",
+            name
+        ));
+    }
     // Resolve stored targets with their original qualification first. The
     // remaining builtin descriptions use the runtime dispatcher's spelling.
     let mut builtin = *expression;
     if let Expr::Call { name, .. } = &mut builtin {
         let written = *name;
-        *name = written.strip_prefix("pg_catalog.").unwrap_or(written);
+        *name = crate::sql::query::builtin_set_routine_name(written)
+            .unwrap_or_else(|| written.strip_prefix("pg_catalog.").unwrap_or(written));
     }
     let expression = &builtin;
     if let Expr::Call {
@@ -4407,7 +4810,7 @@ pub fn infer_type_res(
                 if matches!(coltype_of_oid(type_oid), Some(ColType::Composite(_)))
                     && infer_type_res(operand, columns)?.0 == oid::RECORD
                     && !matches!(operand, Expr::WholeRow(_))
-                    && !matches!(operand, Expr::Call { name, .. } if name.eq_ignore_ascii_case("row"))
+                    && !matches!(operand, Expr::Call { kind: crate::sql::ast::CallKind::SqlSyntax, name, .. } if name.eq_ignore_ascii_case("row"))
                 {
                     return Err(sql_err!(
                         sqlstate::CANNOT_COERCE,

@@ -291,11 +291,13 @@ pub(super) fn expression_properties(
         // ROW is a structural constructor, not a procedure lookup. Its
         // effects are exactly those of its already-classified child nodes.
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             ..
         } if *name == "row" => None,
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -303,15 +305,13 @@ pub(super) fn expression_properties(
             star: false,
             variadic: false,
             ..
-        } if argument_names.is_empty()
-            && sql_value_expression(name)
-            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
-        {
+        } if argument_names.is_empty() && sql_value_expression(name) => {
             // SQL value expressions read transaction or session state; their
             // explicit precision expression was classified with the children.
             Some(ProcedureProperties::BINARY)
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -374,6 +374,7 @@ pub(super) fn expression_properties(
             }
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -381,10 +382,7 @@ pub(super) fn expression_properties(
             star: false,
             variadic: false,
             ..
-        } if argument_names.is_empty()
-            && sql_constructor(name).is_some()
-            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
-        {
+        } if argument_names.is_empty() && sql_constructor(name).is_some() => {
             // PostgreSQL's volatile-expression walk sees explicit children,
             // but not constructor-internal casts or output functions. Those
             // still execute at the original projection phase (PG 18.6).
@@ -394,6 +392,7 @@ pub(super) fn expression_properties(
             })
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
@@ -413,7 +412,10 @@ pub(super) fn expression_properties(
                 *slot = infer_routine_argument_oid(argument, columns)?;
             }
             let types = &types[..args.len()];
-            if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+            if let Some((schema, operator)) = (*kind == crate::sql::ast::CallKind::SqlSyntax)
+                .then(|| crate::sql::ast::catalog_operator_call(name))
+                .flatten()
+            {
                 let (left, right) = match types {
                     [right] => (None, Some(*right)),
                     [left, right] => (Some(*left), Some(*right)),
@@ -429,18 +431,58 @@ pub(super) fn expression_properties(
                     storage, txid, schema, operator, left, right,
                 )?)
             } else {
-                let routine = if let Some(oid) = bound_oid {
-                    storage.function_for_captured_call(*oid, argument_names, types, *variadic, txid)
-                } else if argument_names.is_empty() {
-                    storage.function_for_call_syntax_oids(name, types, *variadic, txid)
+                let (routine, builtin_oid) = if let Some(oid) = bound_oid {
+                    (
+                        storage.function_for_captured_call(
+                            *oid,
+                            argument_names,
+                            types,
+                            *variadic,
+                            txid,
+                        ),
+                        None,
+                    )
                 } else {
-                    storage.function_for_named_call_oids(
+                    match storage.select_routine_call(
                         name,
                         argument_names,
                         types,
                         *variadic,
                         txid,
-                    )
+                        crate::storage::RoutineCallKind::Function,
+                    ) {
+                        crate::storage::RoutineCallSelection::Stored(slot) => {
+                            let oid = crate::storage::routine_oid(&storage.routine_for(slot, txid));
+                            (
+                                storage.function_for_captured_call(
+                                    oid,
+                                    argument_names,
+                                    types,
+                                    *variadic,
+                                    txid,
+                                ),
+                                None,
+                            )
+                        }
+                        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                            (None, Some(oid))
+                        }
+                        crate::storage::RoutineCallSelection::Ambiguous => {
+                            return Err(sql_err!(
+                                sqlstate::AMBIGUOUS_FUNCTION,
+                                "function {} is not unique",
+                                name
+                            ));
+                        }
+                        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                            return Err(sql_err!(
+                                sqlstate::WRONG_OBJECT_TYPE,
+                                "{} is not a function",
+                                name
+                            ));
+                        }
+                        crate::storage::RoutineCallSelection::Absent => (None, None),
+                    }
                 };
                 Some(match routine {
                     Some(routine) => {
@@ -511,7 +553,11 @@ pub(super) fn expression_properties(
                         }
                     }
                     None => ProcedureProperties::from_builtin(
-                        crate::sql::catalog::builtin_routine_properties(name, *bound_oid, types),
+                        crate::sql::catalog::builtin_routine_properties(
+                            name,
+                            builtin_oid.or(*bound_oid),
+                            types,
+                        ),
                     ),
                 })
             }

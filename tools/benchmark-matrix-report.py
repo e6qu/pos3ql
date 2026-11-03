@@ -40,6 +40,11 @@ FULL_PAIRS = (
     ("scan", "analytical-scan", "postgresql18-scan", "postgresql18-matched-scan"),
     ("mixed", "mixed-baseline", "postgresql18-mixed", "postgresql18-matched-mixed"),
 )
+STATISTICS_CAPACITY_FIELDS = (
+    "statistics_bytes",
+    "statistics_leases",
+    "index_statistics_slots",
+)
 SUITE_IDENTITY_FIELDS = (
     "mode",
     "rows",
@@ -50,6 +55,7 @@ SUITE_IDENTITY_FIELDS = (
     "definition_image_slots",
     "table_metadata_bytes",
     "table_metadata_leases",
+    *STATISTICS_CAPACITY_FIELDS,
     "operations_per_client",
     "clients",
     "catalog_relations",
@@ -74,6 +80,11 @@ def load_run(directory):
     for field in SUITE_IDENTITY_FIELDS:
         if field not in suite:
             raise SystemExit(f"{directory.name} is missing suite {field}")
+    for field in STATISTICS_CAPACITY_FIELDS:
+        if type(suite[field]) is not int or suite[field] <= 0:
+            raise SystemExit(f"{directory.name} suite {field} must be a positive integer")
+    if suite["statistics_bytes"] % 64:
+        raise SystemExit(f"{directory.name} suite statistics_bytes must be a multiple of 64")
     results = {}
     for path in directory.glob("*.json"):
         value = json.loads(path.read_text(encoding="utf-8"))

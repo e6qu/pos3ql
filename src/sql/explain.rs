@@ -201,16 +201,23 @@ fn projected_shape<'a>(
     Ok((width, output))
 }
 
-fn has_aggregate(statement: &Select<'_>) -> bool {
-    !statement.group_by.is_empty()
-        || statement.having.is_some()
-        || statement.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Expr { expression, .. }
-                    if query::expr_has_aggregate(expression)
-            )
-        })
+fn has_aggregate(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+) -> Result<bool, SqlError> {
+    if !statement.group_by.is_empty() || statement.having.is_some() {
+        return Ok(true);
+    }
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
+            && query::expr_has_aggregate(expression, storage, txid, columns)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn has_window(statement: &Select<'_>) -> bool {
@@ -874,10 +881,30 @@ pub(super) fn plan_select<'a>(
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 2 + MAX_EXPLAIN_STAGES);
     let mut plan = Plan::new(arena, capacity)?;
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let empty_columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
+        &empty_columns as &dyn crate::sql::exec::ColTypeResolver,
+        |columns| columns,
+    );
+    let aggregate = has_aggregate(statement, storage, txid, columns)?;
     let ordered_index = if !statement.distinct
         && statement.distinct_on.is_empty()
         && !statement.order_by.is_empty()
-        && !has_aggregate(statement)
+        && !aggregate
         && !has_window(statement)
         && scope.as_ref().is_some_and(|scope| scope.n == 1)
         && statement
@@ -1056,7 +1083,6 @@ pub(super) fn plan_select<'a>(
         )?;
     }
 
-    let aggregate = has_aggregate(statement);
     if aggregate {
         estimated_rows = if statement.group_by.is_empty() {
             1

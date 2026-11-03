@@ -64,6 +64,19 @@ lookup never evaluates an argument as a probe. Defaults keep the object identiti
 captured when the routine was created. A renamed sequence therefore cannot be
 replaced accidentally by another sequence with its old name.
 
+Lookup retains explicit built-in namespaces and compares compatible user and
+built-in function signatures before selecting a call. An exact input-type match
+can beat a generic match in an earlier schema; identical signatures follow
+`search_path` order. Result fields come from the selected function's declaration,
+including empty table-function results used by client metadata queries.
+For example, with `search_path=public,pg_catalog`, a user's `sum(integer)`
+can produce one value per input row; selecting the built-in aggregate instead
+produces one value per group. Planning follows the selected declaration.
+SQL constructors carry an explicit syntax tag through parsing and rewrites;
+a quoted routine name cannot imitate an internal operator or JSON constructor.
+The callable declarations come from PostgreSQL 18.6. Static name/OID indexes
+and streamed candidates avoid a growing candidate list or runtime sort.
+
 When a mutable function needs the engine, input preparation preserves completed
 expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',

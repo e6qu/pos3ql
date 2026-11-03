@@ -1479,14 +1479,15 @@ pub(crate) fn filter_view_rows<'a>(
         arena,
     )?;
     let mut rewritten = *select;
-    let grouped = !select.group_by.is_empty()
-        || select.having.is_some()
-        || projected.iter().any(|expression| {
-            super::expr_has_aggregate(expression)
-                || expression_contains_function(expression, &|name, arity| {
-                    storage.has_aggregate_candidate(name, arity, txid)
-                })
-        });
+    let mut grouped = !select.group_by.is_empty() || select.having.is_some();
+    if !grouped {
+        for expression in projected {
+            if super::expr_has_aggregate(expression, storage, txid, source_columns)? {
+                grouped = true;
+                break;
+            }
+        }
+    }
     if grouped {
         rewritten.having = and_where(select.having, pushed, arena)?;
     } else {
@@ -1796,7 +1797,7 @@ fn split_view_predicate<'a>(
         ));
     }
     if expr_has_subquery(predicate)
-        || super::expr_has_aggregate(predicate)
+        || super::expr_has_aggregate(predicate, context.storage, context.txid, safety.columns)?
         || super::expr_has_window(predicate)
         || !view_predicate_columns_safe(
             predicate,
@@ -5934,6 +5935,9 @@ fn rewrite_stored_routine_name<'a>(
         ));
     };
     let bound_oid = *bound_oid;
+    if crate::sql::eval::is_sql_syntax_call(call) {
+        return Ok((name, bound_oid));
+    }
     let Some(dependencies) = context.dependencies else {
         return Ok((name, bound_oid));
     };
@@ -6125,9 +6129,14 @@ fn subst_expr<'a>(
             over,
             filter,
             bound_strict,
+            kind,
             ..
         } => {
-            let name = rewrite_stored_operator_name(name, args, context, arena)?;
+            let name = if *kind == crate::sql::ast::CallKind::SqlSyntax {
+                rewrite_stored_operator_name(name, args, context, arena)?
+            } else {
+                *name
+            };
             let (name, bound_oid) = rewrite_stored_routine_name(e, name, context, arena)?;
             let mut ob: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
             for o in order_by.iter() {
@@ -6174,6 +6183,7 @@ fn subst_expr<'a>(
             let args = rewrite_stored_sequence_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
+                kind: *kind,
                 bound_oid,
                 bound_strict: *bound_strict,
                 args,

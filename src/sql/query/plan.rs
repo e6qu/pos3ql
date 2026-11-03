@@ -76,6 +76,8 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
         AnyAll { operand, array, .. } => {
             Some(expr_tables(operand, scope)? | expr_tables(array, scope)?)
         }
+        // A possible aggregate conservatively disables this optimization;
+        // typed query analysis alone decides whether a call groups rows.
         Call {
             args, over: None, ..
         } if !expression.is_aggregate() => {

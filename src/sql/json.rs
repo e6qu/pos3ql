@@ -926,9 +926,13 @@ pub fn insert<'a>(
     }
 }
 
-/// `jsonb_strip_nulls`: removes object members whose value is JSON null,
-/// recursively (array elements that are null are kept, as in PostgreSQL).
-pub fn strip_nulls<'a>(root: Json<'a>, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+/// Remove JSON-null object members recursively, and array elements only when
+/// requested. A top-level JSON null remains a JSON null.
+pub fn strip_nulls<'a>(
+    root: Json<'a>,
+    strip_arrays: bool,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
     match root {
         Json::Object(members) => {
             let mut out = ArenaList::new(arena);
@@ -936,17 +940,26 @@ pub fn strip_nulls<'a>(root: Json<'a>, arena: &'a Arena) -> Result<Json<'a>, Sql
                 if matches!(v, Json::Null) {
                     continue;
                 }
-                let stripped = strip_nulls(*v, arena)?;
+                let stripped = strip_nulls(*v, strip_arrays, arena)?;
                 out.push((*k, stripped)).map_err(|_| full())?;
             }
             Ok(Json::Object(out.as_slice()))
         }
         Json::Array(items) => {
+            let count = items
+                .iter()
+                .filter(|value| !strip_arrays || !matches!(value, Json::Null))
+                .count();
             let buffer = arena
-                .alloc_slice_with(items.len(), |_| Json::Null)
+                .alloc_slice_with(count, |_| Json::Null)
                 .map_err(|_| full())?;
-            for (i, v) in items.iter().enumerate() {
-                buffer[i] = strip_nulls(*v, arena)?;
+            let mut position = 0;
+            for value in items {
+                if strip_arrays && matches!(value, Json::Null) {
+                    continue;
+                }
+                buffer[position] = strip_nulls(*value, strip_arrays, arena)?;
+                position += 1;
             }
             Ok(Json::Array(buffer))
         }

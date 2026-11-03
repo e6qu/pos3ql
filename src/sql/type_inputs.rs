@@ -9,7 +9,25 @@ use crate::mem::{arena::Arena, buffer::FixedBuf};
 use crate::sql_err;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentNode {
+    Values { row: usize, value: usize },
+    Update { assignment: usize },
+    OnConflict { assignment: usize },
+    Merge { when: usize, value: usize },
+    SelectOutput { output: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssignmentSite {
+    pub statement_position: usize,
+    pub node: AssignmentNode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
+    CreateRoutineValidation {
+        statement: usize,
+    },
     RootCommand {
         statement: usize,
     },
@@ -17,6 +35,11 @@ pub(crate) enum Source {
         routine_oid: i32,
         definition_version: u64,
         callsite: usize,
+    },
+    AssignmentRoutineCallSite {
+        routine_oid: i32,
+        definition_version: u64,
+        site: AssignmentSite,
     },
     PlpgsqlBodyExpression {
         routine_oid: i32,
@@ -27,6 +50,33 @@ pub(crate) enum Source {
         routine_oid: i32,
         definition_version: u64,
     },
+}
+
+impl Source {
+    pub(crate) fn routine_definition(self) -> Option<(i32, u64)> {
+        match self {
+            Self::SqlRoutineCallSite {
+                routine_oid,
+                definition_version,
+                ..
+            }
+            | Self::AssignmentRoutineCallSite {
+                routine_oid,
+                definition_version,
+                ..
+            }
+            | Self::PlpgsqlBodyExpression {
+                routine_oid,
+                definition_version,
+                ..
+            }
+            | Self::UnlocatedRoutineBody {
+                routine_oid,
+                definition_version,
+            } => Some((routine_oid, definition_version)),
+            Self::RootCommand { .. } | Self::CreateRoutineValidation { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

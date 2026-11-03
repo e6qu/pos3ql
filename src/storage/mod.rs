@@ -20158,7 +20158,7 @@ impl Storage {
         // Resolve identities without retaining the dependency mutex: catalog
         // publication writes dependencies while holding its definition guard.
         let mut snapshot = [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES];
-        let count = {
+        let (count, inputs) = {
             let catalog = self
                 .stored_query_dependencies
                 .lock()
@@ -20169,8 +20169,11 @@ impl Storage {
                 count,
                 self.stored_query_dependencies_per_image,
             ));
-            count
+            (count, catalog.type_inputs[image].clone())
         };
+        if let Some(source) = template_source {
+            self.validate_template_type_inputs(&inputs, source, txid)?;
+        }
         let dependencies = &mut snapshot[..usize::from(count)];
         for dependency in dependencies.iter_mut() {
             if let Some(source) = template_source {
@@ -23122,6 +23125,16 @@ impl Storage {
             self.redeclare_template_source_types(source, target)?;
             self.rebind_domain_base_types_to(txid)?;
             self.rebind_user_type_declarations_to(txid)?;
+            for (_, domain) in (DomainIter {
+                catalog: &self.type_catalog,
+                next_slot: 0,
+            })
+            .filter(|(_, domain)| {
+                domain.database == target
+                    && domain.ddl_state == (CatalogDdlState::PendingCreate { txid })
+            }) {
+                self.validate_template_type_inputs(&domain.default_inputs, source, txid)?;
+            }
 
             // The reserved large-object page table stores database-tagged rows
             // for all databases and has no user catalog identity to clone.
@@ -23158,6 +23171,7 @@ impl Storage {
                     }
                 }
                 self.rebind_template_table_types(&mut definition, source, target, txid)?;
+                self.validate_template_type_inputs(&definition.type_inputs, source, txid)?;
                 let created_at = self.tables[source_slot].created_at();
                 let ownership = self.tables[source_slot].ownership().committed();
                 let statistics = self.table_statistics(source_slot, 0);
@@ -24263,6 +24277,18 @@ impl Storage {
             self.rebind_routine_types_to(txid)?;
             self.rebind_cast_and_operator_types(txid)?;
             self.rebind_all_stored_query_dependencies_to(txid, Some(source))?;
+            for slot in 0..self.view_count() {
+                let view = self.view(slot);
+                if view.database == target
+                    && view.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                {
+                    self.validate_template_type_inputs(
+                        view.default_inputs_for(txid),
+                        source,
+                        txid,
+                    )?;
+                }
+            }
             self.copy_partition_trigger_images(source, txid)?;
             allocation.validate(self, target)
         })();
@@ -31187,6 +31213,7 @@ impl Storage {
             }
         }
 
+        let input_renames = self.prepare_schema_input_renames(prior, name, arena)?;
         let revision = self.reserve_table_definition_revision()?;
         schemas[slot].name = name;
         drop(schemas);
@@ -31292,12 +31319,11 @@ impl Storage {
             rename_user_type_schema(&mut definition.base_domain, prior, name);
             rename_user_type_schema(&mut definition.base_user_type, prior, name);
             if let Some(default) = &mut definition.default_expr {
-                rename_schema_qualified_sql(
+                crate::sql::enum_values::checks::rename_default_schema(
                     default,
                     &mut [],
                     prior,
                     name,
-                    crate::sql::parser::StoredSqlKind::Expression,
                     arena,
                 )?;
             }
@@ -31311,10 +31337,19 @@ impl Storage {
                     arena,
                 )?;
             }
-            if let Some(pending) = &mut definition.pending_definition
-                && let Some(identity) = &mut pending.identity
-            {
-                rename_schema_name(&mut identity.schema, prior, name);
+            if let Some(pending) = &mut definition.pending_definition {
+                if let Some(identity) = &mut pending.identity {
+                    rename_schema_name(&mut identity.schema, prior, name);
+                }
+                if let Some(default) = &mut pending.spec.default_expr {
+                    crate::sql::enum_values::checks::rename_default_schema(
+                        default,
+                        &mut [],
+                        prior,
+                        name,
+                        arena,
+                    )?;
+                }
             }
         }
         for definition in type_catalog.enums.iter_mut().filter(|definition| {
@@ -31518,6 +31553,17 @@ impl Storage {
                         crate::sql::parser::StoredSqlKind::Statements,
                         arena,
                     )?;
+                    if let Some(pending) = &mut definition.pending_query {
+                        rename_schema_path(&mut pending.creation_path, prior, name)?;
+                        rename_schema_qualified_sql(
+                            &mut pending.sql,
+                            &mut [],
+                            prior,
+                            name,
+                            crate::sql::parser::StoredSqlKind::Statements,
+                            arena,
+                        )?;
+                    }
                 }
             }
         }
@@ -31641,6 +31687,7 @@ impl Storage {
                 }
             }
         }
+        self.apply_schema_input_renames(input_renames);
         Ok(prior)
     }
 

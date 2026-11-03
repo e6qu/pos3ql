@@ -1,5 +1,147 @@
 use super::*;
 
+// PostgreSQL 18.6 phase oracle SQL SHA256:
+// e9f16455ade1b384282cc4a6ecdb3d49d782edf3853e760ce66cf0e40c8e8345.
+#[test]
+fn procedural_expression_inputs_are_lazy_backend_plans() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("pl-input-plans-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE pl_checks; CREATE TABLE pl_audit(label text); \
+             CREATE TYPE pl_choice AS ENUM('a'); \
+             CREATE FUNCTION pl_allowed(value pl_choice) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+               PERFORM nextval('pl_checks'); INSERT INTO pl_audit VALUES(value::text); RETURN true; END$$; \
+             CREATE DOMAIN pl_checked AS pl_choice CHECK(pl_allowed(VALUE)); \
+             CREATE FUNCTION pl_take(value pl_checked[]) RETURNS integer LANGUAGE sql AS 'SELECT cardinality(value)'; \
+             CREATE FUNCTION pl_assignment() RETURNS integer LANGUAGE plpgsql AS $$DECLARE v pl_checked[]; BEGIN v:='{a}'::pl_checked[]; RETURN cardinality(v); END$$; \
+             CREATE FUNCTION pl_return() RETURNS pl_checked[] LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::pl_checked[]; END$$; \
+             CREATE FUNCTION pl_call() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN pl_take('{a}'); END$$; \
+             CREATE FUNCTION pl_unreached() RETURNS integer LANGUAGE plpgsql AS $$BEGIN IF false THEN RETURN pl_take('{a}'); END IF; RETURN 0; END$$", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pl_unreached(),count(*) FROM pl_audit",
+                true
+            )),
+            ["0|0"]
+        );
+        for (query, count) in [
+            ("SELECT pl_assignment()", "1|1"),
+            ("SELECT pl_return()::text", "2|2"),
+            ("SELECT pl_call()", "3|3"),
+        ] {
+            session.success(&mut engine, query, true);
+            session.success(&mut engine, query, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT currval('pl_checks'),count(*) FROM pl_audit",
+                    true
+                )),
+                [count]
+            );
+        }
+    }
+}
+
+#[test]
+fn template_inputs_keep_copied_type_and_member_lifetimes_after_source_drop_and_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cloned-input-owners-{mode:?}"));
+        config.transaction_mode = mode;
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        engine
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE copied_input_checks; CREATE TYPE copied_choice AS ENUM('a','b'); \
+             CREATE DOMAIN copied_checked AS copied_choice CHECK(nextval('copied_input_checks')>0); \
+             CREATE DOMAIN copied_array AS copied_checked[] DEFAULT '{a}'; \
+             CREATE TABLE copied_defaults(id integer,value copied_checked[] DEFAULT '{b}'); \
+             CREATE TABLE copied_domain_defaults(id integer,value copied_array); \
+             CREATE VIEW copied_constant AS SELECT '{a}'::copied_checked[] AS value; \
+             CREATE VIEW copied_view_defaults AS SELECT id,value FROM copied_defaults; \
+             ALTER VIEW copied_view_defaults ALTER COLUMN value SET DEFAULT '{a}'; \
+             CREATE FUNCTION copied_atomic() RETURNS copied_checked[] LANGUAGE sql \
+               BEGIN ATOMIC SELECT '{b}'::copied_checked[]; END", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM copied_input_checks",
+                true
+            )),
+            ["5"]
+        );
+        engine
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .unwrap();
+        session.success(
+            &mut engine,
+            "CREATE DATABASE input_copy TEMPLATE template1",
+            true,
+        );
+        let copied = engine
+            .storage
+            .database_named("input_copy", 0)
+            .unwrap()
+            .1
+            .oid;
+        engine.select_database(copied).unwrap();
+        session.success(
+            &mut engine,
+            "INSERT INTO copied_defaults(id) VALUES(1); \
+             INSERT INTO copied_view_defaults(id) VALUES(2); \
+             INSERT INTO copied_domain_defaults(id) VALUES(1)",
+            true,
+        );
+        let verify = "SELECT value::text FROM copied_constant; SELECT copied_atomic()::text; \
+                      SELECT value::text FROM copied_defaults ORDER BY id; \
+                      SELECT value::text FROM copied_domain_defaults; SELECT last_value FROM copied_input_checks";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, verify, true)),
+            ["{a}", "{b}", "{b}", "{a}", "{a}", "5"]
+        );
+        engine
+            .select_database(crate::storage::DatabaseOid::TEMPLATE1)
+            .unwrap();
+        session.success(&mut engine, "DROP TYPE copied_choice CASCADE", true);
+        engine.select_database(copied).unwrap();
+        assert_eq!(
+            data_rows(&session.success(&mut engine, verify, true)),
+            ["{a}", "{b}", "{b}", "{a}", "{a}", "5"]
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+        drop((session, engine));
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut cold_budget = test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+        recovered.select_database(copied).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+        assert_eq!(
+            data_rows(&reader.success(&mut recovered, verify, true)),
+            ["{a}", "{b}", "{b}", "{a}", "{a}", "5"]
+        );
+        drop((reader, recovered));
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
 #[test]
 // PostgreSQL 18.6 reference SQL SHA256:
 // 143cf93eb9053325deab30b35e325ed0f56f4855a849e31f5cd22ab1e83d68a7.
@@ -355,5 +497,119 @@ fn routine_input_binding_uses_its_owner_and_settings_then_restores_the_caller() 
         ));
         let expected = format!("{owner}|input_context|routine-input");
         assert_eq!(audit, [expected.clone(), expected]);
+    }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// 5c64f93bcac58bdf82796ebe724256807e79bd0934d30b6137c33d7299652e7d.
+#[test]
+fn sql_string_validation_owns_inputs_separately_from_each_invocation_plan() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("create-input-validation-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE validation_checks; CREATE TYPE validation_choice AS ENUM('a'); \
+             CREATE DOMAIN validation_checked AS validation_choice CHECK(nextval('validation_checks')>0); \
+             CREATE FUNCTION checked_body() RETURNS validation_checked[] LANGUAGE sql \
+               AS 'SELECT ''{a}''::validation_checked[]'", true);
+        let counter = "SELECT last_value FROM validation_checks";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["1"]
+        );
+        for (sql, state) in [
+            (
+                "CREATE FUNCTION checked_body() RETURNS validation_checked[] LANGUAGE sql AS 'SELECT ''{a}''::validation_checked[]'",
+                "42723",
+            ),
+            (
+                "CREATE OR REPLACE FUNCTION checked_body() RETURNS text LANGUAGE sql AS 'SELECT ''{a}''::validation_checked[]'",
+                "42P13",
+            ),
+        ] {
+            let error = session.execute(&mut engine, sql, true);
+            assert!(
+                error.windows(5).any(|bytes| bytes == state.as_bytes()),
+                "{}",
+                String::from_utf8_lossy(&error)
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                ["1"]
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT checked_body() FROM generate_series(1,3)",
+                true
+            )),
+            ["{a}", "{a}", "{a}"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["2"]
+        );
+        session.success(&mut engine, "SELECT checked_body()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["3"]
+        );
+        session.success(
+            &mut engine,
+            "PREPARE cached_validation AS SELECT checked_body()",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["3"]
+        );
+        session.success(
+            &mut engine,
+            "EXECUTE cached_validation; EXECUTE cached_validation",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["4"]
+        );
+        session.success(
+            &mut engine,
+            "SET check_function_bodies=off; \
+             CREATE FUNCTION unchecked_body() RETURNS validation_checked[] LANGUAGE sql \
+               AS 'SELECT ''{a}''::validation_checked[]'; \
+             CREATE FUNCTION invalid_body() RETURNS int LANGUAGE sql AS 'SELECT unknown_column'; \
+             CREATE FUNCTION invalid_pl() RETURNS int LANGUAGE plpgsql AS 'malformed body'; \
+             SET check_function_bodies=on",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["4"]
+        );
+        session.success(&mut engine, "SELECT unchecked_body()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["5"]
+        );
+        session.success(&mut engine,
+            "CREATE SCHEMA private_validation; CREATE TYPE private_validation.choice AS ENUM('a'); \
+             CREATE DOMAIN private_validation.checked AS private_validation.choice CHECK(nextval('validation_checks')>0); \
+             CREATE FUNCTION configured_body() RETURNS private_validation.checked[] LANGUAGE sql \
+               SET search_path=private_validation,public AS 'SELECT ''{a}''::checked[]'", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["6"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SHOW search_path", true)),
+            ["\"$user\", public"]
+        );
     }
 }

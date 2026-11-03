@@ -1999,6 +1999,10 @@ impl GucState {
         })
     }
 
+    pub(crate) fn check_function_bodies(&self) -> bool {
+        self.store.borrow().current.check_function_bodies
+    }
+
     pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
         let value = self.get_owned(name).ok_or_else(|| {
             sql_err!(

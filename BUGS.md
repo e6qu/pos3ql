@@ -17,7 +17,9 @@ Unfinished resource policies and feature goals, with their acceptance criteria,
 belong in [PLAN.md](PLAN.md). Pending CI and uncollected measurements are
 acceptance work, not blocked defects.
 Repeated failures across native, coverage and PostgreSQL comparison jobs must
-be traced to their shared cause and repaired before acceptance.
+be traced to their shared cause and repaired before acceptance. Saved defaults
+and function inputs require recovery and effect-count regressions; passing a
+compiler gate alone does not establish their correctness.
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

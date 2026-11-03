@@ -7331,6 +7331,7 @@ impl<'a> Parser<'a> {
     }
 
     fn insert(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
@@ -7401,6 +7402,7 @@ impl<'a> Parser<'a> {
         let on_conflict = self.on_conflict()?;
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
+            source_position,
             table,
             columns: column_names.as_slice(),
             rows: rows.as_slice(),
@@ -7629,6 +7631,7 @@ impl<'a> Parser<'a> {
     }
 
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("update")?;
         let table = self.qual_name("table name")?;
         let alias =
@@ -7653,6 +7656,7 @@ impl<'a> Parser<'a> {
         let where_clause = self.where_clause()?;
         let returning = self.returning()?;
         Ok(Stmt::Update(Update {
+            source_position,
             table,
             alias,
             assignments,
@@ -7665,6 +7669,7 @@ impl<'a> Parser<'a> {
     /// `MERGE INTO [ONLY] target [*] [AS alias] USING source [AS alias] ON cond
     /// { WHEN MATCHED | WHEN NOT MATCHED [BY SOURCE | BY TARGET] ... }...`.
     fn merge(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         use crate::sql::ast::{Merge, MergeMatchKind, MergeWhen};
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
@@ -7745,6 +7750,7 @@ impl<'a> Parser<'a> {
         }
         let returning = self.returning()?;
         Ok(Stmt::Merge(Merge {
+            source_position,
             target,
             target_inheritance,
             target_alias,

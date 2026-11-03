@@ -16555,6 +16555,8 @@ struct TriggerInvocation<'a> {
     table_name: &'a str,
     relid: i32,
     routine_oid: i32,
+    routine_version: u64,
+    input_sites: &'a [super::plpgsql_inputs::Site<'a>],
     nargs: i32,
     when: &'static str,
     level: &'static str,
@@ -16720,6 +16722,8 @@ impl<'a> TriggerInvocation<'a> {
                 }
             },
             routine_oid: crate::storage::routine_oid(routine),
+            routine_version: routine.version,
+            input_sites: &[],
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
             when: match trigger.timing {
@@ -16749,6 +16753,8 @@ impl<'a> TriggerInvocation<'a> {
             table_name: "",
             relid: 0,
             routine_oid: 0,
+            routine_version: 0,
+            input_sites: &[],
             nargs: 0,
             when: "",
             level: "",
@@ -16774,6 +16780,8 @@ impl<'a> TriggerInvocation<'a> {
             table_name: "",
             relid: 0,
             routine_oid: crate::storage::routine_oid(routine),
+            routine_version: routine.version,
+            input_sites: &[],
             nargs: 0,
             when: "",
             level: "",
@@ -16803,6 +16811,8 @@ impl<'a> TriggerInvocation<'a> {
             table_name: "",
             relid: 0,
             routine_oid: crate::storage::routine_oid(routine),
+            routine_version: routine.version,
+            input_sites: &[],
             nargs: i32::try_from(routine.arguments().len())
                 .expect("routine argument capacity fits int4"),
             when: "",
@@ -16834,6 +16844,8 @@ impl<'a> TriggerInvocation<'a> {
             table_name: "",
             relid: 0,
             routine_oid: crate::storage::routine_oid(routine),
+            routine_version: routine.version,
+            input_sites: &[],
             nargs: 0,
             when: "",
             level: "",
@@ -16843,6 +16855,11 @@ impl<'a> TriggerInvocation<'a> {
             tag,
             exception: None,
         })
+    }
+
+    fn with_input_sites(mut self, sites: &'a [super::plpgsql_inputs::Site<'a>]) -> Self {
+        self.input_sites = sites;
+        self
     }
 
     fn with_exception(mut self, exception: TriggerExceptionDiagnostic<'a>) -> Self {
@@ -17252,12 +17269,14 @@ impl<'a, T: Copy + 'a> ProgramList<'a, T> {
 struct TriggerProgram<'a> {
     locals: &'a [TriggerLocalDecl<'a>],
     body: TriggerBlock<'a>,
+    input_sites: &'a [super::plpgsql_inputs::Site<'a>],
 }
 
 #[derive(Clone, Copy)]
 struct ParsedTriggerProgram<'a> {
     locals: &'a [ParsedTriggerLocalDecl<'a>],
     body: TriggerBlock<'a>,
+    input_sites: &'a [super::plpgsql_inputs::Site<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -18087,7 +18106,7 @@ fn parse_trigger_assignment<'a>(
     if target.is_empty() || expression.is_empty() {
         return Ok(None);
     }
-    let expression = super::parser::parse_expr(expression, arena)?;
+    let expression = parse_plpgsql_expression(expression, arena)?;
     let (qualifier, column, expression) =
         parse_plpgsql_assignment_target(target, expression, arena)?;
     if !qualifier.is_some_and(|record| record.eq_ignore_ascii_case("new")) {
@@ -18105,7 +18124,7 @@ fn parse_plpgsql_assignment_target<'a>(
     value: &'a Expr<'a>,
     arena: &'a Arena,
 ) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
-    let target = super::parser::parse_expr(target, arena)?;
+    let target = parse_plpgsql_expression(target, arena)?;
     let mut current = target;
     let mut subscripts = ArenaList::new(arena);
     while let Expr::Subscript { base, index } = current {
@@ -18166,7 +18185,7 @@ fn parse_trigger_local_assignment<'a>(
     if name.is_empty() || expression.is_empty() {
         return Ok(None);
     }
-    let expression = super::parser::parse_expr(expression, arena)?;
+    let expression = parse_plpgsql_expression(expression, arena)?;
     let (qualifier, name, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
     if qualifier.is_some() {
         return Ok(None);
@@ -18223,7 +18242,7 @@ fn parse_trigger_local<'a>(
         }
         (
             statement[..offset].trim(),
-            Some(super::parser::parse_expr(expression, arena)?),
+            Some(parse_plpgsql_expression(expression, arena)?),
         )
     } else {
         (statement.trim(), None)
@@ -18349,7 +18368,7 @@ fn parse_trigger_select_into<'a>(
             "trigger SELECT INTO exceeds the statement arena"
         )
     })?;
-    let query = super::parser::parse_query(source, arena)?;
+    let query = parse_plpgsql_query(source, statement, arena)?;
     let targets = arena.alloc_slice_copy(&targets[..count]).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -18412,7 +18431,7 @@ fn parse_plpgsql_dynamic_query<'a>(
     if command.is_empty() {
         return Err(unsupported_trigger_body());
     }
-    let command = super::parser::parse_expr(command, arena)?;
+    let command = parse_plpgsql_expression(command, arena)?;
     let mut arguments = [None; MAX_ROUTINE_ARGUMENTS];
     let count = match using {
         None => 0,
@@ -18425,7 +18444,7 @@ fn parse_plpgsql_dynamic_query<'a>(
                 ));
             }
             for (index, argument) in source[..count].iter().enumerate() {
-                arguments[index] = Some(super::parser::parse_expr(
+                arguments[index] = Some(parse_plpgsql_expression(
                     argument.expect("dynamic argument initialized"),
                     arena,
                 )?);
@@ -18518,11 +18537,11 @@ fn parse_trigger_assert<'a>(
         return Err(unsupported_trigger_body());
     }
     Ok(Some(TriggerAssert {
-        condition: super::parser::parse_expr(parts[0].expect("assert condition"), arena)?,
+        condition: parse_plpgsql_expression(parts[0].expect("assert condition"), arena)?,
         message: parts
             .get(1)
             .and_then(|part| *part)
-            .map(|message| super::parser::parse_expr(message, arena))
+            .map(|message| parse_plpgsql_expression(message, arena))
             .transpose()?,
     }))
 }
@@ -18621,7 +18640,7 @@ fn parse_trigger_raise<'a>(
             ));
         }
         let (parts, count) = split_trigger_arguments(format_body)?;
-        let format = match super::parser::parse_expr(parts[0].expect("RAISE format"), arena)? {
+        let format = match parse_plpgsql_expression(parts[0].expect("RAISE format"), arena)? {
             Expr::Str(format) => format,
             _ => return Err(unsupported_trigger_body()),
         };
@@ -18636,7 +18655,7 @@ fn parse_trigger_raise<'a>(
         }
         let mut parsed = [None; MAX_COLUMNS];
         for index in 0..count - 1 {
-            parsed[index] = Some(super::parser::parse_expr(
+            parsed[index] = Some(parse_plpgsql_expression(
                 parts[index + 1].expect("RAISE argument"),
                 arena,
             )?);
@@ -18689,7 +18708,7 @@ fn parse_trigger_raise_options<'a>(
             return Err(unsupported_trigger_body());
         };
         if name.trim().eq_ignore_ascii_case("errcode") {
-            let expression = super::parser::parse_expr(expression.trim(), arena)?;
+            let expression = parse_plpgsql_expression(expression.trim(), arena)?;
             let state = match expression {
                 Expr::Str(value) => TriggerRaiseSqlState::Parsed(
                     parse_trigger_raised_sqlstate(value)
@@ -18705,7 +18724,7 @@ fn parse_trigger_raise_options<'a>(
             }
             continue;
         }
-        let expression = super::parser::parse_expr(expression.trim(), arena)?;
+        let expression = parse_plpgsql_expression(expression.trim(), arena)?;
         let destination = if name.trim().eq_ignore_ascii_case("message") {
             &mut message
         } else if name.trim().eq_ignore_ascii_case("detail") {
@@ -18917,7 +18936,7 @@ fn parse_trigger_perform<'a>(
             "PL/pgSQL PERFORM exceeds the statement arena"
         )
     })?;
-    Ok(Some(super::parser::parse_query(source, arena)?))
+    Ok(Some(parse_plpgsql_query(source, statement, arena)?))
 }
 
 fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml<'a>, SqlError> {
@@ -18968,7 +18987,7 @@ fn parse_trigger_return<'a>(
             TriggerReturn::Void
         }
         PlpgsqlProgramKind::Function if !value.is_empty() => {
-            TriggerReturn::Value(super::parser::parse_expression(value, arena)?)
+            TriggerReturn::Value(parse_plpgsql_expression(value, arena)?)
         }
         PlpgsqlProgramKind::VoidFunction if value.is_empty() => TriggerReturn::Void,
         PlpgsqlProgramKind::OutputFunction if value.is_empty() => TriggerReturn::Void,
@@ -18996,7 +19015,7 @@ fn parse_trigger_set_return<'a>(
         let expression = expression.trim();
         return Ok(Some(TriggerStatement::ReturnNext(
             (!expression.is_empty())
-                .then(|| super::parser::parse_expression(expression, arena))
+                .then(|| parse_plpgsql_expression(expression, arena))
                 .transpose()?,
         )));
     }
@@ -19015,9 +19034,9 @@ fn parse_trigger_set_return<'a>(
                 )?,
             )));
         }
-        return Ok(Some(TriggerStatement::ReturnQuery(
-            super::parser::parse_query(query, arena)?,
-        )));
+        return Ok(Some(TriggerStatement::ReturnQuery(parse_plpgsql_query(
+            query, query, arena,
+        )?)));
     }
     Ok(None)
 }
@@ -19074,7 +19093,7 @@ fn parse_trigger_for_header<'a>(
     if strip_trigger_keyword(source, "select").is_some() {
         return Ok(Some((
             target,
-            TriggerForSource::Query(super::parser::parse_query(source, arena)?),
+            TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
     let reverse = if let Some(rest) = strip_trigger_keyword(source, "reverse") {
@@ -19098,9 +19117,9 @@ fn parse_trigger_for_header<'a>(
     Ok(Some((
         target,
         TriggerForSource::Numeric {
-            lower: super::parser::parse_expr(lower, arena)?,
-            upper: super::parser::parse_expr(upper, arena)?,
-            step: super::parser::parse_expr(step, arena)?,
+            lower: parse_plpgsql_expression(lower, arena)?,
+            upper: parse_plpgsql_expression(upper, arena)?,
+            step: parse_plpgsql_expression(step, arena)?,
             reverse,
         },
     )))
@@ -19140,7 +19159,7 @@ fn parse_trigger_foreach_header<'a>(
     Ok(Some((
         target,
         TriggerForSource::Array {
-            expression: super::parser::parse_expr(array, arena)?,
+            expression: parse_plpgsql_expression(array, arena)?,
             slice,
         },
     )))
@@ -19160,7 +19179,7 @@ fn parse_trigger_while_header<'a>(
     if condition.is_empty() {
         return Err(unsupported_trigger_body());
     }
-    Ok(Some(super::parser::parse_expr(condition, arena)?))
+    Ok(Some(parse_plpgsql_expression(condition, arena)?))
 }
 
 fn is_trigger_loop_header(segment: &str) -> bool {
@@ -19193,7 +19212,7 @@ fn parse_trigger_loop_control<'a>(
         if condition.is_empty() {
             return Err(unsupported_trigger_body());
         }
-        (None, Some(super::parser::parse_expr(condition, arena)?))
+        (None, Some(parse_plpgsql_expression(condition, arena)?))
     } else {
         let Some(space) = tail.find(char::is_whitespace) else {
             return Ok(Some(loop_control_for_label(
@@ -19215,7 +19234,7 @@ fn parse_trigger_loop_control<'a>(
             if condition.is_empty() {
                 return Err(unsupported_trigger_body());
             }
-            Some(super::parser::parse_expr(condition, arena)?)
+            Some(parse_plpgsql_expression(condition, arena)?)
         } else {
             return Err(unsupported_trigger_body());
         };
@@ -19399,6 +19418,12 @@ fn parse_plpgsql_cursor_open<'a>(
         let using = using_at.map(|at| &dynamic[at + 5..]);
         PlpgsqlCursorQuery::Dynamic(parse_plpgsql_dynamic_query(command, using, arena)?)
     } else {
+        super::plpgsql_inputs::record(
+            super::plpgsql_inputs::Kind::Statement,
+            query.as_ptr() as usize,
+            query,
+            query,
+        )?;
         PlpgsqlCursorQuery::Static(query)
     };
     Ok(Some(PlpgsqlCursorOpen {
@@ -19765,7 +19790,7 @@ fn parse_trigger_block<'a>(
                 return Err(unsupported_trigger_body());
             };
             let mut branches = ProgramList::new(arena);
-            let mut condition = Some(super::parser::parse_expr(condition, arena)?);
+            let mut condition = Some(parse_plpgsql_expression(condition, arena)?);
             loop {
                 let (block, ending) = parse_trigger_block(
                     segments,
@@ -19779,7 +19804,7 @@ fn parse_trigger_block<'a>(
                 branches.push(TriggerBranch { condition, block })?;
                 match ending {
                     TriggerBlockEnd::Elsif(next) => {
-                        condition = Some(super::parser::parse_expr(next, arena)?);
+                        condition = Some(parse_plpgsql_expression(next, arena)?);
                     }
                     TriggerBlockEnd::Else => {
                         let (block, ending) = parse_trigger_block(
@@ -19809,7 +19834,7 @@ fn parse_trigger_block<'a>(
             })
         } else if let Some(header) = strip_trigger_keyword(segment, "case") {
             let operand = (!header.trim().is_empty())
-                .then(|| super::parser::parse_expr(header.trim(), arena))
+                .then(|| parse_plpgsql_expression(header.trim(), arena))
                 .transpose()?;
             let mut branches = ProgramList::new(arena);
             let Some(&first) = segments.get(*at) else {
@@ -19821,7 +19846,7 @@ fn parse_trigger_block<'a>(
             let Some(first) = trigger_tail(first, "then") else {
                 return Err(unsupported_trigger_body());
             };
-            let mut when = super::parser::parse_expr(first, arena)?;
+            let mut when = parse_plpgsql_expression(first, arena)?;
             *at += 1;
             loop {
                 let (block, ending) = parse_trigger_block(
@@ -19836,7 +19861,7 @@ fn parse_trigger_block<'a>(
                 branches.push(TriggerCaseBranch { when, block })?;
                 match ending {
                     TriggerBlockEnd::When(next) => {
-                        when = super::parser::parse_expr(next, arena)?;
+                        when = parse_plpgsql_expression(next, arena)?;
                     }
                     TriggerBlockEnd::Else => {
                         let (otherwise, ending) = parse_trigger_block(
@@ -20016,7 +20041,48 @@ fn parse_trigger_block<'a>(
     Err(unsupported_trigger_body())
 }
 
+fn parse_plpgsql_expression<'a>(
+    source: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let expression = super::parser::parse_expr(source, arena)?;
+    super::plpgsql_inputs::record(
+        super::plpgsql_inputs::Kind::Expression,
+        core::ptr::from_ref(expression) as usize,
+        source,
+        source,
+    )?;
+    Ok(expression)
+}
+
+fn parse_plpgsql_query<'a>(
+    source: &'a str,
+    original: &str,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    let query = super::parser::parse_query(source, arena)?;
+    super::plpgsql_inputs::record(
+        super::plpgsql_inputs::Kind::Query,
+        core::ptr::from_ref(query) as usize,
+        source,
+        original,
+    )?;
+    Ok(query)
+}
+
 fn parse_plpgsql_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+    program_kind: PlpgsqlProgramKind,
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    let (mut program, sites) = super::plpgsql_inputs::capture(body, arena, || {
+        parse_plpgsql_program_inner(body, arena, program_kind)
+    })?;
+    program.input_sites = sites;
+    Ok(program)
+}
+
+fn parse_plpgsql_program_inner<'a>(
     body: &'a str,
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
@@ -20068,7 +20134,11 @@ fn parse_plpgsql_program<'a>(
     if !matches!(ending, TriggerBlockEnd::End) || at != segments.len() {
         return Err(unsupported_trigger_body());
     }
-    Ok(ParsedTriggerProgram { locals, body })
+    Ok(ParsedTriggerProgram {
+        locals,
+        body,
+        input_sites: &[],
+    })
 }
 
 /// Resolves every declaration once at the catalog boundary shared by stored
@@ -20131,6 +20201,7 @@ fn resolve_plpgsql_program_locals<'a>(
     let program = TriggerProgram {
         locals: resolved,
         body: program.body,
+        input_sites: program.input_sites,
     };
     validate_plpgsql_constant_assignments(&program)?;
     Ok(program)
@@ -20414,7 +20485,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         arena,
     )?;
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::anonymous();
+    let invocation = TriggerInvocation::anonymous().with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -20490,7 +20561,8 @@ pub(crate) fn execute_event_trigger<'a>(
         arena,
     )?;
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?;
+    let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?
+        .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -20641,7 +20713,8 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::procedure(routine, arena)?;
+    let invocation =
+        TriggerInvocation::procedure(routine, arena)?.with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -20810,7 +20883,8 @@ pub(crate) fn execute_plpgsql_function<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::function(routine, program_kind, arena)?;
+    let invocation = TriggerInvocation::function(routine, program_kind, arena)?
+        .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -20974,7 +21048,8 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::function(routine, PlpgsqlProgramKind::SetFunction, arena)?;
+    let invocation = TriggerInvocation::function(routine, PlpgsqlProgramKind::SetFunction, arena)?
+        .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -21588,7 +21663,7 @@ fn materialize_trigger_insert_source<'result, 'query>(
     storage: &'query Storage,
     statement: &Insert<'_>,
     select: &'query Select<'query>,
-    casts: &[Option<&super::eval::BoundCast>],
+    casts: &[PlannedAssignmentCast<'_>],
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
@@ -22077,37 +22152,87 @@ fn eval_procedural_expression<'a>(
         return eval_trigger_expression(context, expression, row);
     };
     let txid = context.txn.txid;
-    let snapshot = engine.storage.read_snapshot();
-    engine
-        .execute_retained_expression(
+    let site = row
+        .invocation
+        .input_sites
+        .iter()
+        .find(|site| {
+            site.kind == super::plpgsql_inputs::Kind::Expression
+                && site.key == core::ptr::from_ref(expression) as usize
+        })
+        .copied();
+    let prepared = match site {
+        Some(site) => Some(
+            engine
+                .prepare_plpgsql_inputs(
+                    site,
+                    row.invocation.routine_oid,
+                    row.invocation.routine_version,
+                    row,
+                    arena,
+                    context.txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    context.responder,
+                )
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "PL/pgSQL type input exceeds the send buffer"
+                    )
+                })??,
+        ),
+        None => None,
+    };
+    let expression = match (site, prepared.as_ref()) {
+        (Some(site), Some(prepared)) => super::parser::parse_expression_with_type_inputs(
+            site.text,
+            prepared.bindings,
             arena,
-            snapshot,
-            context.txn,
-            sqlprep,
-            cursors,
-            guc,
-            context.responder,
-            |storage, _work, sequences, invocations| {
-                let _scope = super::query::enter_routine_invocation_scope(Some(
-                    super::query::RoutineInvocationContext::new(invocations, arena),
-                ));
-                let catalog = super::query::storage_catalog(storage, arena, txid);
-                let subqueries = super::query::ProceduralSubqueries { storage, txid };
-                let hooks = EvalHooks {
-                    catalog: Some(&catalog),
-                    sequences: Some(sequences),
-                    subquery_executor: Some(&subqueries),
-                    ..NO_HOOKS
-                };
-                eval_full(expression, arena, params, row, &hooks)
-            },
-        )
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL expression exceeds the send buffer"
+            |parser| super::type_inputs::validate_restored(parser, &engine.storage, txid),
+        )?,
+        _ => expression,
+    };
+    let snapshot = engine.storage.read_snapshot();
+    let mut execute = || {
+        engine
+            .execute_retained_expression(
+                arena,
+                snapshot,
+                context.txn,
+                sqlprep,
+                cursors,
+                guc,
+                context.responder,
+                |storage, _work, sequences, invocations| {
+                    let _scope = super::query::enter_routine_invocation_scope(Some(
+                        super::query::RoutineInvocationContext::new(invocations, arena),
+                    ));
+                    let catalog = super::query::storage_catalog(storage, arena, txid);
+                    let subqueries = super::query::ProceduralSubqueries { storage, txid };
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(sequences),
+                        subquery_executor: Some(&subqueries),
+                        ..NO_HOOKS
+                    };
+                    eval_full(expression, arena, params, row, &hooks)
+                },
             )
-        })?
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "PL/pgSQL expression exceeds the send buffer"
+                )
+            })?
+    };
+    match (site, prepared) {
+        (Some(site), Some(prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
+            super::type_inputs::with_source(prepared.source, site.text, prepared.bindings, execute)
+        }),
+        _ => execute(),
+    }
 }
 
 use super::type_input_plans::DynamicCommandKind;
@@ -23114,14 +23239,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     *cascade,
                     responder,
                 ),
-                Stmt::CreateRoutine(routine) => super::exec::create_routine(
-                    &mut engine.storage,
-                    &mut engine.wal,
-                    txn,
-                    routine,
-                    guc,
-                    context.arena,
-                    responder,
+                Stmt::CreateRoutine(routine) => engine.execute_create_routine(
+                    routine, context.arena, txn, sqlprep, cursors, guc, responder,
                 ),
                 Stmt::CreateAggregate(aggregate) => super::exec::create_aggregate(
                     &mut engine.storage,
@@ -24711,7 +24830,10 @@ fn coerce_plpgsql_table_rowtype<'a>(
             value: coerce_assignment(
                 source.value,
                 column,
-                cast.as_ref(),
+                PlannedAssignmentCast {
+                    defined: cast.as_ref(),
+                    site: None,
+                },
                 context.storage(),
                 context.txn.txid,
                 context.arena,
@@ -25377,7 +25499,10 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 let value = coerce_assignment(
                     value,
                     &definition.columns()[column],
-                    cast.as_ref(),
+                    PlannedAssignmentCast {
+                        defined: cast.as_ref(),
+                        site: None,
+                    },
                     context.storage(),
                     context.txn.txid,
                     context.arena,
@@ -27902,7 +28027,7 @@ fn cursor_effect_error_fields<'a>(
     };
     output[0] = copy(error.sqlstate.as_str())?;
     output[1] = copy(error.message.as_str())?;
-    if let Some(diagnostic) = eval::take_diagnostic() {
+    if let Some(diagnostic) = super::eval::take_diagnostic() {
         output[2] = copy(diagnostic.detail.as_str())?;
         output[3] = diagnostic
             .hint
@@ -27918,7 +28043,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
     let Datum::Text(state) = output[0] else {
         return Ok(());
     };
-    let state = eval::SqlState::parse(state).ok_or_else(|| {
+    let state = super::eval::SqlState::parse(state).ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "cursor replay SQLSTATE is invalid"
@@ -27935,7 +28060,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
             Datum::Text(hint) => Some(StackStr::from_str(hint)),
             _ => None,
         };
-        eval::stash_diagnostic(StackStr::from_str(detail), hint);
+        super::eval::stash_diagnostic(StackStr::from_str(detail), hint);
     }
     Err(SqlError {
         sqlstate: state,
@@ -34744,28 +34869,33 @@ fn encode_routine_signature<'a>(
     Ok(&output[..at])
 }
 
-pub fn create_routine(
-    storage: &mut Storage,
-    wal: &mut Wal,
-    txn: &mut TxnState,
+pub(crate) struct ResolvedRoutineDeclaration {
+    pub(crate) schema: SqlName,
+    pub(crate) name: SqlName,
+    pub(crate) arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) argument_count: usize,
+    parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) kind: crate::storage::RoutineKind,
+    result_columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
+    result_column_count: usize,
+    language: crate::storage::RoutineLanguage,
+    attributes: crate::storage::RoutineAttributes,
+    pub(crate) configs: [crate::storage::RoutineConfig; crate::storage::MAX_ROUTINE_CONFIGS],
+    pub(crate) config_count: usize,
+    pub(crate) body_kind: crate::storage::RoutineBodyKind,
+    replaced: Option<usize>,
+}
+
+pub(crate) fn resolve_routine_declaration(
+    storage: &Storage,
+    txn: &TxnState,
     routine: &CreateRoutine<'_>,
     guc: &crate::sql::guc::GucState,
-    arena: &Arena,
-    responder: &mut Responder,
-) -> Outcome {
-    let (body_kind, body_text) = match routine.body {
+) -> Result<ResolvedRoutineDeclaration, SqlError> {
+    let (body_kind, _) = match routine.body {
         super::ast::RoutineBody::String(body) => (crate::storage::RoutineBodyKind::String, body),
         super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
         super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
-    };
-    let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
-        &[][..]
-    } else {
-        match super::type_inputs::bindings_for_active_source(body_text, arena) {
-            Ok(Some(inputs)) => inputs,
-            Ok(None) => &[],
-            Err(error) => return sql_fail(error),
-        }
     };
     let language = match routine.language {
         RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
@@ -34776,12 +34906,12 @@ pub fn create_routine(
         RoutineLanguage::PlPgSql => "plpgsql",
     };
     if let Err(error) = storage.require_language_usage(language_name, txn.txid) {
-        return sql_fail(error);
+        return Err(error);
     }
     if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
         && routine.language != RoutineLanguage::PlPgSql
     {
-        return sql_fail(sql_err!(
+        return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "trigger functions require LANGUAGE plpgsql"
         ));
@@ -34793,11 +34923,11 @@ pub fn create_routine(
         crate::storage::SchemaObjectKind::NonRelation,
     ) {
         Ok(schema) => schema,
-        Err(error) => return sql_fail(error),
+        Err(error) => return Err(error),
     };
     let name = match SqlName::parse(routine.name.name) {
         Ok(name) => name,
-        Err(error) => return sql_fail(error),
+        Err(error) => return Err(error),
     };
     let mut result_columns = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS];
     let mut result_column_count = 0;
@@ -34808,10 +34938,10 @@ pub fn create_routine(
         } => {
             let result = match resolve_routine_type(storage, txn.txid, result_type) {
                 Ok(result) => result,
-                Err(error) => return sql_fail(error),
+                Err(error) => return Err(error),
             };
             if result.ctype == ColType::Internal {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "SQL functions cannot return type internal"
                 ));
@@ -34833,14 +34963,14 @@ pub fn create_routine(
             {
                 let name = match SqlName::parse(parameter.name.unwrap_or("")) {
                     Ok(name) => name,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 let resolved = match resolve_routine_type(storage, txn.txid, parameter.type_name) {
                     Ok(resolved) => resolved,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 if resolved.ctype.is_pseudo() {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "OUT parameter has pseudo-type {}",
                         parameter.type_name
@@ -34864,10 +34994,10 @@ pub fn create_routine(
             if let Some(declared) = declared_result_type {
                 let declared = match resolve_routine_type(storage, txn.txid, declared) {
                     Ok(result) => result,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 if declared != implied {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "function result type must agree with OUT parameters"
                     ));
@@ -34888,15 +35018,15 @@ pub fn create_routine(
             for (slot, column) in columns.iter().enumerate() {
                 let name = match SqlName::parse(column.name) {
                     Ok(name) => name,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 let resolved = match resolve_routine_type(storage, txn.txid, column.type_name) {
                     Ok(resolved) => resolved,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 let ctype = resolved.ctype;
                 if ctype.is_pseudo() {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "TABLE function column \"{}\" has pseudo-type {}",
                         column.name,
@@ -34915,7 +35045,7 @@ pub fn create_routine(
         }
         super::ast::RoutineCreateKind::Trigger => {
             if !routine.arguments.is_empty() {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "trigger functions cannot have declared arguments"
                 ));
@@ -34924,7 +35054,7 @@ pub fn create_routine(
         }
         super::ast::RoutineCreateKind::EventTrigger => {
             if !routine.arguments.is_empty() {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "event trigger functions cannot have declared arguments"
                 ));
@@ -34939,15 +35069,15 @@ pub fn create_routine(
     for (parameter_count, argument) in routine.arguments.iter().enumerate() {
         let argument_name = match SqlName::parse(argument.name.unwrap_or("")) {
             Ok(name) => name,
-            Err(error) => return sql_fail(error),
+            Err(error) => return Err(error),
         };
         let resolved = match resolve_routine_type(storage, txn.txid, argument.type_name) {
             Ok(resolved) => resolved,
-            Err(error) => return sql_fail(error),
+            Err(error) => return Err(error),
         };
         let ctype = resolved.ctype;
         if ctype.is_pseudo() {
-            return sql_fail(sql_err!(
+            return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
                 "function argument \"{}\" has pseudo-type {}",
                 argument.name.unwrap_or(""),
@@ -34958,7 +35088,7 @@ pub fn create_routine(
             Some(text) => {
                 let stored = StackStr::from_str(text);
                 if stored.is_truncated() {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "routine parameter default exceeds {} bytes",
                         crate::storage::ROUTINE_DEFAULT_MAX
@@ -35013,7 +35143,7 @@ pub fn create_routine(
         _ => None,
     };
     if let Some(output) = undetermined_result {
-        return sql_fail(sql_err!(
+        return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "cannot determine result data type for polymorphic type {}",
             output.name()
@@ -35027,14 +35157,14 @@ pub fn create_routine(
     );
     if let Some(replaced_slot) = replaced {
         if !routine.or_replace {
-            return sql_fail(sql_err!(
+            return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
                 "function \"{}\" already exists with same argument types",
                 name.as_str()
             ));
         }
         if let Err(error) = storage.require_routine_owner(replaced_slot, txn.txid) {
-            return sql_fail(error);
+            return Err(error);
         }
         let prior = storage.routine(replaced_slot);
         let prior_kind = prior.kind;
@@ -35053,30 +35183,157 @@ pub fn create_routine(
                 } else {
                     "cannot change routine kind of existing routine"
                 };
-            return sql_fail(sql_err!(
+            return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
                 "{}",
                 message
             ));
         }
     }
+    let mut configs = [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
+    let mut config_count = 0;
+    for config in routine.configs.iter() {
+        let name = match super::guc::canonical_setting_name(config.name) {
+            Ok(name) => name,
+            Err(error) => return Err(error),
+        };
+        let value = match config.value {
+            super::ast::RoutineConfigValue::Default => {
+                if let Err(error) = guc.validate_setting_value(config.name, None) {
+                    return Err(error);
+                }
+                continue;
+            }
+            super::ast::RoutineConfigValue::Value(value) => {
+                match guc.validate_setting_value(config.name, Some(value)) {
+                    Ok(()) => StackStr::from_str(value),
+                    Err(error) => return Err(error),
+                }
+            }
+            super::ast::RoutineConfigValue::Current => match guc.capture_setting_value(config.name)
+            {
+                Ok(value) => StackStr::from_str(value.as_str()),
+                Err(error) => return Err(error),
+            },
+        };
+        if value.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine configuration value exceeds {} bytes",
+                crate::storage::ROUTINE_CONFIG_VALUE_MAX
+            ));
+        }
+        configs[config_count] = crate::storage::RoutineConfig { name, value };
+        config_count += 1;
+    }
+    let attributes = crate::storage::RoutineAttributes {
+        strict: routine.attributes.strict,
+        volatility: match routine.attributes.volatility {
+            super::ast::RoutineVolatility::Immutable => {
+                crate::storage::RoutineVolatility::Immutable
+            }
+            super::ast::RoutineVolatility::Stable => crate::storage::RoutineVolatility::Stable,
+            super::ast::RoutineVolatility::Volatile => crate::storage::RoutineVolatility::Volatile,
+        },
+        parallel: match routine.attributes.parallel {
+            super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
+            super::ast::RoutineParallel::Restricted => crate::storage::RoutineParallel::Restricted,
+            super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
+        },
+        security_definer: routine.attributes.security_definer,
+        leakproof: routine.attributes.leakproof,
+        cost_bits: routine.attributes.cost.map(|value| value.get().to_bits()),
+        rows_bits: routine.attributes.rows.map(|value| value.get().to_bits()),
+    };
+    if attributes.leakproof {
+        let current = super::eval::funcs::system::current_user_owned();
+        let superuser = storage
+            .find_role_visible(current.as_str(), txn.txid)
+            .is_some_and(|role| storage.role(role).attributes_to(txn.txid).superuser);
+        if !superuser {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "only superuser can define a leakproof function"
+            ));
+        }
+    }
+    Ok(ResolvedRoutineDeclaration {
+        schema,
+        name,
+        arguments,
+        argument_count,
+        parameters,
+        kind,
+        result_columns,
+        result_column_count,
+        language,
+        attributes,
+        configs,
+        config_count,
+        body_kind,
+        replaced,
+    })
+}
+
+pub(crate) struct ValidatedRoutineBody {
+    dependencies: crate::storage::StoredQueryDependencies,
+    creation_path: StackStr<128>,
+}
+
+pub(crate) fn validate_routine_body(
+    storage: &Storage,
+    txn: &TxnState,
+    routine: &CreateRoutine<'_>,
+    declaration: &ResolvedRoutineDeclaration,
+    validation_inputs: &[super::type_inputs::Binding<'_>],
+    guc: &crate::sql::guc::GucState,
+    arena: &Arena,
+    check_string_body: bool,
+) -> Result<ValidatedRoutineBody, SqlError> {
+    let body_kind = declaration.body_kind;
+    let kind = declaration.kind;
+    let arguments = &declaration.arguments;
+    let argument_count = declaration.argument_count;
+    let parameters = &declaration.parameters;
+    let result_columns = &declaration.result_columns;
+    let result_column_count = declaration.result_column_count;
+    let body_text = match routine.body {
+        super::ast::RoutineBody::String(body)
+        | super::ast::RoutineBody::Return(body)
+        | super::ast::RoutineBody::Atomic(body) => body,
+    };
+    let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
+        validation_inputs
+    } else {
+        match super::type_inputs::bindings_for_active_source(body_text, arena) {
+            Ok(Some(inputs)) => inputs,
+            Ok(None) => &[],
+            Err(error) => return Err(error),
+        }
+    };
     let mut dependencies = match storage.empty_stored_query_dependencies(arena) {
         Ok(dependencies) => dependencies,
-        Err(error) => return sql_fail(error),
+        Err(error) => return Err(error),
     };
     let mut creation_path = StackStr::<128>::new();
+    if body_kind == crate::storage::RoutineBodyKind::String && !check_string_body {
+        return Ok(ValidatedRoutineBody {
+            dependencies,
+            creation_path,
+        });
+    }
     let formal_scope = match enter_routine_parameter_types(
         &arguments[..argument_count],
         Some(&super::query::storage_catalog(storage, arena, txn.txid)),
     ) {
         Ok(scope) => scope,
-        Err(error) => return sql_fail(error),
+        Err(error) => return Err(error),
     };
     match kind {
         crate::storage::RoutineKind::Function { result } => {
             if routine.language == RoutineLanguage::PlPgSql {
                 if body_kind != crate::storage::RoutineBodyKind::String {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "PL/pgSQL functions require a string-literal body"
                     ));
@@ -35095,18 +35352,18 @@ pub fn create_routine(
                 };
                 let program = match parse_plpgsql_program(body_text, arena, program_kind) {
                     Ok(program) => program,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 let program =
                     match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                         Ok(program) => program,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                 if let Err(error) = validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
                 ) {
-                    return sql_fail(error);
+                    return Err(error);
                 }
             } else {
                 let returns_void = matches!(
@@ -35125,7 +35382,7 @@ pub fn create_routine(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
@@ -35135,7 +35392,7 @@ pub fn create_routine(
                         &program, storage, txn.txid, path, arena,
                     ) {
                         Ok(dependencies) => dependencies,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
@@ -35146,7 +35403,7 @@ pub fn create_routine(
         | crate::storage::RoutineKind::TableFunction => {
             if routine.language == RoutineLanguage::PlPgSql {
                 if body_kind != crate::storage::RoutineBodyKind::String {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "PL/pgSQL functions require a string-literal body"
                     ));
@@ -35158,12 +35415,12 @@ pub fn create_routine(
                 };
                 let program = match parse_plpgsql_program(body_text, arena, program_kind) {
                     Ok(program) => program,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 let program =
                     match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                         Ok(program) => program,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
@@ -35174,7 +35431,7 @@ pub fn create_routine(
                     .alloc_slice_with(namespace_capacity, |_| RoutineParameterDef::EMPTY)
                 {
                     Ok(namespace) => namespace,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                    Err(_) => return Err(super::query::arena_full_pub()),
                 };
                 let mut namespace_count = routine.arguments.len();
                 namespace[..namespace_count].copy_from_slice(&parameters[..namespace_count]);
@@ -35192,7 +35449,7 @@ pub fn create_routine(
                 if let Err(error) =
                     validate_plpgsql_routine_namespace(&program, &namespace[..namespace_count])
                 {
-                    return sql_fail(error);
+                    return Err(error);
                 }
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
@@ -35213,7 +35470,7 @@ pub fn create_routine(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
@@ -35223,7 +35480,7 @@ pub fn create_routine(
                         &program, storage, txn.txid, path, arena,
                     ) {
                         Ok(dependencies) => dependencies,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
@@ -35231,44 +35488,44 @@ pub fn create_routine(
         }
         crate::storage::RoutineKind::Trigger => {
             if body_kind != crate::storage::RoutineBodyKind::String {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "trigger functions require a string-literal body"
                 ));
             }
             let program = match parse_trigger_program(body_text, arena) {
                 Ok(program) => program,
-                Err(error) => return sql_fail(error),
+                Err(error) => return Err(error),
             };
             if let Err(error) = resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
-                return sql_fail(error);
+                return Err(error);
             }
         }
         crate::storage::RoutineKind::EventTrigger => {
             if body_kind != crate::storage::RoutineBodyKind::String {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "event trigger functions require a string-literal body"
                 ));
             }
             let program = match parse_event_trigger_program(body_text, arena) {
                 Ok(program) => program,
-                Err(error) => return sql_fail(error),
+                Err(error) => return Err(error),
             };
             if let Err(error) = resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
-                return sql_fail(error);
+                return Err(error);
             }
         }
         crate::storage::RoutineKind::Procedure => {
             if body_kind == crate::storage::RoutineBodyKind::Return {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
                     "procedures cannot have a RETURN expression body"
                 ));
             }
             if routine.language == RoutineLanguage::PlPgSql {
                 if body_kind != crate::storage::RoutineBodyKind::String {
-                    return sql_fail(sql_err!(
+                    return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "PL/pgSQL procedures require a string-literal body"
                     ));
@@ -35276,18 +35533,18 @@ pub fn create_routine(
                 let program =
                     match parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure) {
                         Ok(program) => program,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                 let program =
                     match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                         Ok(program) => program,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                 if let Err(error) = validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
                 ) {
-                    return sql_fail(error);
+                    return Err(error);
                 }
             } else {
                 let program = match super::query::parse_stored_routine_function_program(
@@ -35301,7 +35558,7 @@ pub fn create_routine(
                     |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
                 ) {
                     Ok(program) => program,
-                    Err(error) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 };
                 if body_kind != crate::storage::RoutineBodyKind::String {
                     let raw_path = guc.search_path();
@@ -35311,7 +35568,7 @@ pub fn create_routine(
                         &program, storage, txn.txid, path, arena,
                     ) {
                         Ok(dependencies) => dependencies,
-                        Err(error) => return sql_fail(error),
+                        Err(error) => return Err(error),
                     };
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
@@ -35322,6 +35579,57 @@ pub fn create_routine(
         }
     }
     drop(formal_scope);
+    Ok(ValidatedRoutineBody {
+        dependencies,
+        creation_path,
+    })
+}
+
+pub fn create_routine(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    routine: &CreateRoutine<'_>,
+    declaration: ResolvedRoutineDeclaration,
+    validated: ValidatedRoutineBody,
+    guc: &crate::sql::guc::GucState,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let ResolvedRoutineDeclaration {
+        schema,
+        name,
+        arguments,
+        argument_count,
+        parameters,
+        kind,
+        result_columns,
+        result_column_count,
+        language,
+        attributes,
+        configs,
+        config_count,
+        body_kind,
+        replaced,
+    } = declaration;
+    let body_text = match routine.body {
+        super::ast::RoutineBody::String(body)
+        | super::ast::RoutineBody::Return(body)
+        | super::ast::RoutineBody::Atomic(body) => body,
+    };
+    let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
+        &[][..]
+    } else {
+        match super::type_inputs::bindings_for_active_source(body_text, arena) {
+            Ok(Some(inputs)) => inputs,
+            Ok(None) => &[],
+            Err(error) => return sql_fail(error),
+        }
+    };
+    let ValidatedRoutineBody {
+        mut dependencies,
+        creation_path,
+    } = validated;
     let input_sources = match arena.alloc_slice_with(routine.arguments.len() + 1, |_| {
         crate::storage::StoredInputSource {
             section: crate::storage::StoredInputSection::RoutineBody,
@@ -35335,7 +35643,11 @@ pub fn create_routine(
     input_sources[0] = crate::storage::StoredInputSource {
         section: crate::storage::StoredInputSection::RoutineBody,
         sql: body_text,
-        bindings: body_inputs,
+        bindings: if body_kind == crate::storage::RoutineBodyKind::String {
+            &[]
+        } else {
+            body_inputs
+        },
     };
     for (index, argument) in routine.arguments.iter().enumerate() {
         let text = argument.mode.default_text().unwrap_or("");
@@ -35397,73 +35709,6 @@ pub fn create_routine(
             "routine definition exceeds {} bytes",
             ROUTINE_SQL_MAX
         ));
-    }
-    let mut configs = [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
-    let mut config_count = 0;
-    for config in routine.configs.iter() {
-        let name = match super::guc::canonical_setting_name(config.name) {
-            Ok(name) => name,
-            Err(error) => return sql_fail(error),
-        };
-        let value = match config.value {
-            super::ast::RoutineConfigValue::Default => {
-                if let Err(error) = guc.validate_setting_value(config.name, None) {
-                    return sql_fail(error);
-                }
-                continue;
-            }
-            super::ast::RoutineConfigValue::Value(value) => {
-                match guc.validate_setting_value(config.name, Some(value)) {
-                    Ok(()) => StackStr::from_str(value),
-                    Err(error) => return sql_fail(error),
-                }
-            }
-            super::ast::RoutineConfigValue::Current => match guc.capture_setting_value(config.name)
-            {
-                Ok(value) => StackStr::from_str(value.as_str()),
-                Err(error) => return sql_fail(error),
-            },
-        };
-        if value.is_truncated() {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine configuration value exceeds {} bytes",
-                crate::storage::ROUTINE_CONFIG_VALUE_MAX
-            ));
-        }
-        configs[config_count] = crate::storage::RoutineConfig { name, value };
-        config_count += 1;
-    }
-    let attributes = crate::storage::RoutineAttributes {
-        strict: routine.attributes.strict,
-        volatility: match routine.attributes.volatility {
-            super::ast::RoutineVolatility::Immutable => {
-                crate::storage::RoutineVolatility::Immutable
-            }
-            super::ast::RoutineVolatility::Stable => crate::storage::RoutineVolatility::Stable,
-            super::ast::RoutineVolatility::Volatile => crate::storage::RoutineVolatility::Volatile,
-        },
-        parallel: match routine.attributes.parallel {
-            super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
-            super::ast::RoutineParallel::Restricted => crate::storage::RoutineParallel::Restricted,
-            super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
-        },
-        security_definer: routine.attributes.security_definer,
-        leakproof: routine.attributes.leakproof,
-        cost_bits: routine.attributes.cost.map(|value| value.get().to_bits()),
-        rows_bits: routine.attributes.rows.map(|value| value.get().to_bits()),
-    };
-    if attributes.leakproof {
-        let current = super::eval::funcs::system::current_user_owned();
-        let superuser = storage
-            .find_role_visible(current.as_str(), txn.txid)
-            .is_some_and(|role| storage.role(role).attributes_to(txn.txid).superuser);
-        if !superuser {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "only superuser can define a leakproof function"
-            ));
-        }
     }
     let (slot, creation) = match replaced {
         Some(slot) => {
@@ -41890,7 +42135,14 @@ pub fn create_table_as(
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (i, slot) in values.iter_mut().enumerate().take(n_cols) {
                 let v = decode_projected_pub(bytes, i);
-                match coerce_assignment(v, &def.columns()[i], None, storage, txn.txid, arena) {
+                match coerce_assignment(
+                    v,
+                    &def.columns()[i],
+                    PlannedAssignmentCast::NONE,
+                    storage,
+                    txn.txid,
+                    arena,
+                ) {
                     Ok(v) => *slot = v,
                     Err(e) => return sql_fail(e),
                 }
@@ -42182,7 +42434,14 @@ pub fn refresh_materialized_view(
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (i, slot_v) in values.iter_mut().enumerate().take(n_cols) {
             let v = decode_projected_pub(bytes, i);
-            match coerce_assignment(v, &def.columns()[i], None, storage, txn.txid, arena) {
+            match coerce_assignment(
+                v,
+                &def.columns()[i],
+                PlannedAssignmentCast::NONE,
+                storage,
+                txn.txid,
+                arena,
+            ) {
                 Ok(v) => *slot_v = v,
                 Err(e) => return sql_fail(e),
             }
@@ -59002,7 +59261,7 @@ where
 /// The catalog already stores constants in typed form, so execution never
 /// reparses or re-coerces those values.
 fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
-    view: Option<ViewCheck<'_>>,
+    view: Option<ViewCheck<'a>>,
     definition: &crate::storage::TableDefinition<Definition0>,
     arena: &'a Arena,
     storage: &Storage,
@@ -59367,7 +59626,7 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &R,
-    assignment: Option<(&ColumnMeta, Option<&super::eval::BoundCast>)>,
+    assignment: Option<(&ColumnMeta, PlannedAssignmentCast<'_>)>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = {
         let expressions = [Some(expression)];
@@ -73833,10 +74092,24 @@ pub(crate) fn coerce<'a>(
 }
 
 #[derive(Clone, Copy)]
+struct PlannedAssignmentCast<'a> {
+    defined: Option<&'a super::eval::BoundCast>,
+    site: Option<super::type_inputs::AssignmentSite>,
+}
+
+impl PlannedAssignmentCast<'_> {
+    const NONE: Self = Self {
+        defined: None,
+        site: None,
+    };
+}
+
+#[derive(Clone, Copy)]
 struct AssignmentCastEntry<'a> {
     expression: &'a Expr<'a>,
     target_oid: i32,
     cast: Option<&'a super::eval::BoundCast>,
+    site: Option<super::type_inputs::AssignmentSite>,
 }
 
 #[derive(Clone, Copy)]
@@ -73849,7 +74122,7 @@ impl<'a> AssignmentCasts<'a> {
         column: &ColumnMeta,
         storage: &Storage,
         txid: u32,
-    ) -> Result<Option<&'a super::eval::BoundCast>, SqlError> {
+    ) -> Result<PlannedAssignmentCast<'a>, SqlError> {
         let target = storage
             .routine_type_oid(column.ctype, column.user_type, txid)
             .ok_or_else(|| {
@@ -73861,7 +74134,10 @@ impl<'a> AssignmentCasts<'a> {
         self.0
             .iter()
             .find(|entry| core::ptr::eq(entry.expression, expression) && entry.target_oid == target)
-            .map(|entry| entry.cast)
+            .map(|entry| PlannedAssignmentCast {
+                defined: entry.cast,
+                site: entry.site,
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -73879,13 +74155,14 @@ fn prepare_dml_assignment_casts<'a>(
     outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<AssignmentCasts<'a>, SqlError> {
     let mut entries = crate::mem::arena::ArenaList::new_persistent(arena);
-    super::query::for_each_dml_assignment(statement, &mut |_, _, expression| {
+    super::query::for_each_dml_assignment(statement, &mut |_, _, expression, site| {
         if !matches!(expression, Expr::DefaultMarker) {
             entries
                 .push(AssignmentCastEntry {
                     expression,
                     target_oid: 0,
                     cast: None,
+                    site,
                 })
                 .map_err(|_| super::eval::arena_full())?;
         }
@@ -73997,7 +74274,7 @@ fn prepare_insert_select_casts<'a>(
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'_>>,
-) -> Result<&'a [Option<&'a super::eval::BoundCast>], SqlError> {
+) -> Result<&'a [PlannedAssignmentCast<'a>], SqlError> {
     let relation = storage
         .resolve_relation(statement.table.schema, statement.table.name, txid)
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "relation does not exist"))?;
@@ -74027,7 +74304,7 @@ fn prepare_insert_select_casts<'a>(
         statement.columns.len()
     };
     let casts = arena
-        .alloc_slice_with(count, |_| None)
+        .alloc_slice_with(count, |_| PlannedAssignmentCast::NONE)
         .map_err(|_| super::eval::arena_full())?;
     let mut index = 0;
     super::query::visit_projection_types(select, storage, txid, arena, outer, &mut |source| {
@@ -74057,7 +74334,7 @@ fn prepare_insert_select_casts<'a>(
                 "INSERT has more expressions than target columns"
             )
         })?;
-        *out = selected
+        let defined = selected
             .map(|cast| {
                 arena
                     .alloc_persistent_slice_with(1, |_| cast)
@@ -74065,6 +74342,15 @@ fn prepare_insert_select_casts<'a>(
                     .map_err(|_| super::eval::arena_full())
             })
             .transpose()?;
+        *out = PlannedAssignmentCast {
+            defined,
+            site: statement.source_position.get().map(|statement_position| {
+                super::type_inputs::AssignmentSite {
+                    statement_position,
+                    node: super::type_inputs::AssignmentNode::SelectOutput { output: index },
+                }
+            }),
+        };
         index += 1;
         Ok(())
     })?;
@@ -74085,7 +74371,7 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
     values: &[Datum<'a>],
     definition: &crate::storage::TableDefinition<B>,
     targets: &[usize],
-    casts: &[Option<&super::eval::BoundCast>],
+    casts: &[PlannedAssignmentCast<'_>],
     overriding: Overriding,
     storage: &Storage,
     txid: u32,
@@ -74120,12 +74406,15 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
 fn coerce_assignment<'a>(
     value: Datum<'a>,
     column: &ColumnMeta,
-    cast: Option<&super::eval::BoundCast>,
+    cast: PlannedAssignmentCast<'_>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let value = match cast {
+    let _site = cast
+        .site
+        .map(|site| super::query::input_progress::enter_assignment(Some(site)));
+    let value = match cast.defined {
         Some(cast) => {
             let catalog = super::query::storage_catalog(storage, arena, txid);
             super::eval::CatalogAccess::execute_bound_cast(&catalog, cast, value, arena)?
@@ -74133,7 +74422,7 @@ fn coerce_assignment<'a>(
         None => value,
     };
     // The selected path has already checked every destination domain element.
-    if cast.is_some()
+    if cast.defined.is_some()
         && matches!(
             column.ctype,
             ColType::Array(crate::sql::types::ArrElem::Domain { .. })
@@ -74162,7 +74451,17 @@ fn eval_assignment<'a>(
         super::eval::expression_type_identity(expression, row, hooks)?.routine_argument_oid();
     let cast = prepare_assignment_cast(source, column, storage, txid, arena)?;
     let value = eval_full(expression, arena, params, row, hooks)?;
-    coerce_assignment(value, column, cast.as_ref(), storage, txid, arena)
+    coerce_assignment(
+        value,
+        column,
+        PlannedAssignmentCast {
+            defined: cast.as_ref(),
+            site: None,
+        },
+        storage,
+        txid,
+        arena,
+    )
 }
 
 fn coerce_column_value<'a>(
@@ -74715,7 +75014,10 @@ fn coerce_composite_value_inner<'a>(
             let value = coerce_assignment(
                 input[index].value,
                 &column,
-                cast.as_ref(),
+                PlannedAssignmentCast {
+                    defined: cast.as_ref(),
+                    site: None,
+                },
                 storage,
                 txid,
                 arena,

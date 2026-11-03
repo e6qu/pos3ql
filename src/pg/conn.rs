@@ -5758,12 +5758,12 @@ mod tests {
                  CREATE DOMAIN input_wait_domain AS input_wait_choice CHECK(input_wait_allowed(VALUE))",
             );
             for parse in [false, true] {
-                for cancel in [false, true] {
+                for (cancel, timeout) in [(false, false), (true, false), (false, true)] {
                     request(
                         &mut writer,
                         &mut engine,
                         "TRUNCATE input_wait_audit; UPDATE input_wait_gate SET hits=0; \
-                         SELECT setval('input_wait_checks',1,false); SET application_name=''; SELECT setseed(0.5)",
+                         SELECT setval('input_wait_checks',1,false); SET application_name=''; SET lock_timeout='10s'; SELECT setseed(0.5)",
                     );
                     request(
                         &mut holder,
@@ -5789,13 +5789,20 @@ mod tests {
                         },
                         &payload
                     )));
-                    for _ in 0..3 {
+                    let mut original_deadline = None;
+                    for attempt in 0..3 {
                         assert!(matches!(
                             crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
                             Step::Parked
                         ));
                         assert!(writer.send.is_empty());
                         assert!(writer.sqlprep.request_input_waiting());
+                        if attempt == 0 {
+                            original_deadline = writer.parked_deadline;
+                            assert!(original_deadline.is_some());
+                        } else {
+                            assert_eq!(writer.parked_deadline, original_deadline);
+                        }
                     }
                     let state = request(
                         &mut observer,
@@ -5803,11 +5810,24 @@ mod tests {
                         "SELECT last_value::text||':'||is_called::text FROM input_wait_checks",
                     );
                     assert!(contains_value(&state, b"2:true"));
-                    if cancel {
-                        assert!(crate::mem::guard::forbid_alloc(
-                            || writer.cancel_parked(&mut engine)
+                    if cancel || timeout {
+                        if cancel {
+                            assert!(crate::mem::guard::forbid_alloc(
+                                || writer.cancel_parked(&mut engine)
+                            ));
+                        } else {
+                            writer.parked_deadline = Some(Instant::now());
+                            assert!(matches!(
+                                crate::mem::guard::forbid_alloc(
+                                    || writer.process_message(&mut engine)
+                                ),
+                                Step::Continue
+                            ));
+                        }
+                        assert!(contains_value(
+                            writer.send.readable(),
+                            if cancel { b"57014" } else { b"55P03" }
                         ));
-                        assert!(contains_value(writer.send.readable(), b"57014"));
                         if parse {
                             writer.send.clear();
                             assert!(writer.recv.append(&frontend(wire::FMSG_SYNC, &[])));
@@ -5818,7 +5838,7 @@ mod tests {
                         }
                     }
                     request(&mut holder, &mut engine, "COMMIT");
-                    if !cancel {
+                    if !cancel && !timeout {
                         assert!(matches!(
                             crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
                             Step::Continue
@@ -5857,7 +5877,11 @@ mod tests {
                     );
                     assert!(contains_value(
                         &state,
-                        if cancel { b"2:0:" } else { b"2:2:ab" }
+                        if cancel || timeout {
+                            b"2:0:"
+                        } else {
+                            b"2:2:ab"
+                        }
                     ));
                 }
             }

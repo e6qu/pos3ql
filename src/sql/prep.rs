@@ -457,7 +457,7 @@ impl SqlPreparedPool {
                 "dynamic SQL plan identity has an invalid shape"
             ));
         };
-        let generation = u64::from_le_bytes(bytes.try_into().map_err(|_| {
+        let generation = u64::from_le_bytes((*bytes).try_into().map_err(|_| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "dynamic SQL plan identity has an invalid length"

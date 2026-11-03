@@ -5815,7 +5815,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         )
                     });
             }
-            let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
+            let dependencies =
+                storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
             let inputs = if routine.body_kind == crate::storage::RoutineBodyKind::String {
                 &[][..]
             } else {

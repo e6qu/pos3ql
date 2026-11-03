@@ -6926,9 +6926,18 @@ impl Checkpointer {
                         )?;
                     let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
                         storage,
-                        |section| {
-                            (section == crate::storage::StoredInputSection::RuleSource)
-                                .then_some(source.as_str())
+                        |section| match section {
+                            crate::storage::StoredInputSection::RuleSource => Some(source.as_str()),
+                            crate::storage::StoredInputSection::Query
+                                if name.as_str() == "_RETURN"
+                                    && condition.is_none()
+                                    && action_count == 1 =>
+                            {
+                                let span = actions[0];
+                                let start = usize::from(span.start);
+                                source.as_str().get(start..start + usize::from(span.len))
+                            }
+                            _ => None,
                         },
                     )?;
                     if words.next().is_some() {

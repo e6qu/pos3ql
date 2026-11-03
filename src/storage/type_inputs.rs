@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::mem::{
     arena::Arena,
-    lease_pool::{LeasePool, SharedSlice},
+    lease_pool::{LeasePool, MutableSlice, SharedSlice},
 };
 use crate::sql::{
     eval::{SqlError, sqlstate},
@@ -83,6 +83,18 @@ pub struct StoredTypeInputs {
 }
 
 pub(crate) static EMPTY_STORED_TYPE_INPUTS: StoredTypeInputs = StoredTypeInputs::EMPTY;
+
+pub(super) enum SchemaInputRename {
+    Query {
+        image: usize,
+        inputs: StoredTypeInputs,
+    },
+    Domain {
+        slot: usize,
+        pending: bool,
+        inputs: StoredTypeInputs,
+    },
+}
 
 impl AsRef<StoredTypeInputs> for StoredTypeInputs {
     fn as_ref(&self) -> &StoredTypeInputs {
@@ -541,6 +553,511 @@ fn validate_definition_inputs<'source>(
 }
 
 impl super::Storage {
+    fn validate_template_input_oid(
+        &self,
+        oid: i32,
+        source: super::DatabaseOid,
+        transaction: u32,
+    ) -> Result<Option<(super::NamedTypeSlot, super::NamedTypeSlot)>, SqlError> {
+        let Some((kind, creation, array)) = super::NamedTypeKind::from_oid(oid) else {
+            return Ok(None);
+        };
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        let source_ref = catalog
+            .source_reference_by_creation(kind, creation, source)
+            .ok_or_else(invalid)?;
+        let source_type = catalog
+            .resolve_source_reference(source_ref, source, 0)?
+            .ok_or_else(invalid)?;
+        let target_database = super::current_database();
+        let target_ref = catalog
+            .source_reference_by_creation(kind, creation, target_database)
+            .ok_or_else(invalid)?;
+        let target_type = catalog
+            .resolve_source_reference(target_ref, target_database, transaction)?
+            .ok_or_else(invalid)?;
+        // Database cloning preserves creation numbers and SQL OIDs, while
+        // selecting fresh catalog slots. Verify both qualified maps before
+        // sharing a cached value whose bytes deliberately contain no slots.
+        if source_type.oid(array) != oid
+            || target_type.oid(array) != oid
+            || source_type.base != target_type.base
+        {
+            return Err(invalid());
+        }
+        Ok(Some((
+            source_type.identity.slot(),
+            target_type.identity.slot(),
+        )))
+    }
+
+    fn validate_template_input_value(
+        &self,
+        value: crate::sql::types::Datum<'_>,
+        source: super::DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        use crate::sql::types::{Datum, oid};
+        match value {
+            Datum::Enum { slot, member, .. } => {
+                let Some((super::NamedTypeSlot::Enum(before), super::NamedTypeSlot::Enum(after))) =
+                    self.validate_template_input_oid(oid::enum_oid(slot), source, transaction)?
+                else {
+                    return Err(invalid());
+                };
+                let member = member.ok_or_else(invalid)?;
+                let original = self
+                    .enum_for(before, 0)
+                    .members()
+                    .nth(member.ordinal() as usize)
+                    .ok_or_else(invalid)?;
+                let copied = self
+                    .enum_for(after, transaction)
+                    .members()
+                    .nth(member.ordinal() as usize)
+                    .ok_or_else(invalid)?;
+                if original.identity.is_none() || original.identity != copied.identity {
+                    return Err(invalid());
+                }
+            }
+            Datum::CompositeText { slot, .. } => {
+                self.validate_template_input_oid(oid::composite_oid(slot), source, transaction)?;
+            }
+            Datum::Composite { slot, fields } => {
+                self.validate_template_input_oid(oid::composite_oid(slot), source, transaction)?;
+                for field in fields {
+                    self.validate_template_input_oid(field.type_oid, source, transaction)?;
+                    self.validate_template_input_value(field.value, source, transaction)?;
+                }
+            }
+            Datum::Record(fields) => {
+                for field in fields {
+                    self.validate_template_input_oid(field.type_oid, source, transaction)?;
+                    self.validate_template_input_value(field.value, source, transaction)?;
+                }
+            }
+            Datum::Array { element, raw } => {
+                self.validate_template_input_oid(element.array_oid(), source, transaction)?;
+                self.validate_template_input_oid(element.to_coltype().oid(), source, transaction)?;
+                for value in crate::sql::array::elements(raw, element) {
+                    self.validate_template_input_value(value, source, transaction)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_template_type_inputs(
+        &self,
+        inputs: &StoredTypeInputs,
+        source: super::DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        inputs.visit(|_, binding| {
+            self.validate_template_input_oid(binding.type_oid, source, transaction)?;
+            let target = self
+                .routine_result_for_oid(binding.type_oid, transaction)
+                .ok_or_else(invalid)?;
+            validate_representation(binding, target.ctype)?;
+            if binding.encoded[2] == 0 {
+                return Ok(());
+            }
+            let descriptor = super::CachedArrayElement::from_bytes(
+                binding.encoded[3..9]
+                    .try_into()
+                    .expect("validated input descriptor"),
+            )
+            .ok_or_else(invalid)?;
+            let element = descriptor.element();
+            self.validate_template_input_oid(element.array_oid(), source, transaction)?;
+            self.validate_template_input_oid(element.to_coltype().oid(), source, transaction)?;
+            for payload in crate::sql::array::element_payloads(&binding.encoded[13..]) {
+                let mut value = [crate::sql::types::Datum::Null];
+                super::rowenc::decode(payload, &[element.to_coltype()], &mut value)
+                    .map_err(|_| invalid())?;
+                self.validate_template_input_value(value[0], source, transaction)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_schema_query_inputs<'source>(
+        &self,
+        image: usize,
+        source: impl FnMut(
+            StoredInputSection,
+        ) -> Option<(
+            &'source str,
+            &'source str,
+            crate::sql::parser::StoredSqlKind,
+        )>,
+        names: (super::SqlName, super::SqlName),
+        arena: &Arena,
+    ) -> Result<Option<StoredTypeInputs>, SqlError> {
+        let mark = arena.mark();
+        let result: Result<Option<StoredTypeInputs>, SqlError> = (|| {
+            let mut dependencies = self.snapshot_dependency_image(image, arena)?;
+            if dependencies.type_inputs().bytes().is_empty() {
+                return Ok(None);
+            }
+            dependencies.rename_schema(names.0, names.1);
+            let inputs = self.relocate_stored_type_inputs(
+                dependencies.type_inputs(),
+                source,
+                dependencies.view(),
+                arena,
+            )?;
+            Ok((inputs != *dependencies.type_inputs()).then_some(inputs))
+        })();
+        // Only immutable pool roots escape this parser scratch scope.
+        unsafe { arena.rewind_to(mark) };
+        result
+    }
+
+    pub(super) fn prepare_schema_input_renames(
+        &self,
+        old: super::SqlName,
+        new: super::SqlName,
+        arena: &Arena,
+    ) -> Result<MutableSlice<SchemaInputRename>, SqlError> {
+        use super::{CatalogDdlState, StoredQueryDependencyOwner};
+        use crate::sql::parser::StoredSqlKind;
+        let mut plans = self.metadata_pool.lease(0).map_err(metadata_full)?;
+        for (slot, rule) in self.rule_entries().filter(|(_, rule)| {
+            rule.database == super::current_database() && rule.ddl_state != CatalogDdlState::Absent
+        }) {
+            for (image, original) in core::iter::once((
+                self.committed_dependency_image(StoredQueryDependencyOwner::Rule(slot as u16)),
+                rule.definition,
+            ))
+            .chain(rule.pending.map(|pending| {
+                (
+                    self.stored_query_dependency_pending_base + pending.dependency_slot as usize,
+                    pending.definition,
+                )
+            })) {
+                let mut replacement = original;
+                replacement.rename_schema(old, new, arena)?;
+                if let Some(inputs) = self.prepare_schema_query_inputs(
+                    image,
+                    |section| {
+                        let pair = match section {
+                            StoredInputSection::Query if original.is_view_return() => (
+                                original.action_sql().next()?,
+                                replacement.action_sql().next()?,
+                            ),
+                            StoredInputSection::RuleSource => {
+                                (original.source.as_str(), replacement.source.as_str())
+                            }
+                            _ => return None,
+                        };
+                        Some((pair.0, pair.1, StoredSqlKind::Statements))
+                    },
+                    (old, new),
+                    arena,
+                )? {
+                    plans
+                        .push(SchemaInputRename::Query { image, inputs })
+                        .map_err(metadata_full)?;
+                }
+            }
+        }
+        for (slot, routine) in (super::RoutineIter {
+            catalog: &self.routines,
+            next_slot: 0,
+        })
+        .filter(|(_, routine)| {
+            routine.database == super::current_database()
+                && routine.ddl_state != CatalogDdlState::Absent
+        }) {
+            for (image, original) in core::iter::once((
+                self.committed_dependency_image(StoredQueryDependencyOwner::Routine(slot as u16)),
+                routine.definition_for(0),
+            ))
+            .chain(routine.pending_definition.map(|pending| {
+                (
+                    self.stored_query_dependency_pending_base + pending.dependency_slot as usize,
+                    routine.definition_for(pending.txid),
+                )
+            })) {
+                let mut body = original.body;
+                if original.body_kind != super::RoutineBodyKind::String {
+                    super::rename_schema_qualified_sql(
+                        &mut body,
+                        &mut [],
+                        old,
+                        new,
+                        original.body_kind.bound_sql_kind()?,
+                        arena,
+                    )?;
+                }
+                if let Some(inputs) = self.prepare_schema_query_inputs(
+                    image,
+                    |section| match section {
+                        StoredInputSection::RoutineBody => Some((
+                            original.body.as_str(),
+                            body.as_str(),
+                            original.body_kind.bound_sql_kind().ok()?,
+                        )),
+                        StoredInputSection::ParameterDefault(index) => {
+                            let source = original
+                                .parameters
+                                .get(usize::from(index))?
+                                .mode
+                                .default_sql()?;
+                            Some((source, source, StoredSqlKind::Expression))
+                        }
+                        _ => None,
+                    },
+                    (old, new),
+                    arena,
+                )? {
+                    plans
+                        .push(SchemaInputRename::Query { image, inputs })
+                        .map_err(metadata_full)?;
+                }
+            }
+        }
+        for slot in 0..self.matview_count() {
+            let view = self.matview(slot);
+            if view.database != super::current_database()
+                || view.ddl_state == CatalogDdlState::Absent
+            {
+                continue;
+            }
+            for (image, original) in core::iter::once((
+                self.matview_dependency_image(slot),
+                view.sql,
+            ))
+            .chain(view.pending_query.map(|pending| {
+                (
+                    self.stored_query_dependency_pending_base + pending.dependency_slot as usize,
+                    pending.sql,
+                )
+            })) {
+                let mut replacement = original;
+                super::rename_schema_qualified_sql(
+                    &mut replacement,
+                    &mut [],
+                    old,
+                    new,
+                    StoredSqlKind::Statements,
+                    arena,
+                )?;
+                if let Some(inputs) = self.prepare_schema_query_inputs(
+                    image,
+                    |section| {
+                        (section == StoredInputSection::Query).then_some((
+                            original.as_str(),
+                            replacement.as_str(),
+                            StoredSqlKind::Statements,
+                        ))
+                    },
+                    (old, new),
+                    arena,
+                )? {
+                    plans
+                        .push(SchemaInputRename::Query { image, inputs })
+                        .map_err(metadata_full)?;
+                }
+            }
+        }
+        for (slot, policy) in (super::PolicyIter {
+            catalog: &self.policy_catalog,
+            next_slot: 0,
+        })
+        .filter(|(_, policy)| {
+            policy.database == super::current_database()
+                && policy.ddl_state != CatalogDdlState::Absent
+        }) {
+            for (image, original) in core::iter::once((
+                self.committed_dependency_image(StoredQueryDependencyOwner::Policy(slot as u16)),
+                policy.definition,
+            ))
+            .chain(policy.pending_definition.map(|pending| {
+                (
+                    self.stored_query_dependency_pending_base + pending.dependency_slot as usize,
+                    pending.definition,
+                )
+            })) {
+                let mut replacement = original;
+                for source in [&mut replacement.using, &mut replacement.with_check]
+                    .into_iter()
+                    .flatten()
+                {
+                    super::rename_schema_qualified_sql(
+                        source,
+                        &mut [],
+                        old,
+                        new,
+                        StoredSqlKind::Expression,
+                        arena,
+                    )?;
+                }
+                if let Some(inputs) = self.prepare_schema_query_inputs(
+                    image,
+                    |section| {
+                        let pair = match section {
+                            StoredInputSection::PolicyUsing => {
+                                (original.using.as_ref()?, replacement.using.as_ref()?)
+                            }
+                            StoredInputSection::PolicyCheck => (
+                                original.with_check.as_ref()?,
+                                replacement.with_check.as_ref()?,
+                            ),
+                            _ => return None,
+                        };
+                        Some((pair.0.as_str(), pair.1.as_str(), StoredSqlKind::Expression))
+                    },
+                    (old, new),
+                    arena,
+                )? {
+                    plans
+                        .push(SchemaInputRename::Query { image, inputs })
+                        .map_err(metadata_full)?;
+                }
+            }
+        }
+        for (slot, domain) in (super::DomainIter {
+            catalog: &self.type_catalog,
+            next_slot: 0,
+        })
+        .filter(|(_, domain)| {
+            domain.database == super::current_database()
+                && domain.ddl_state != CatalogDdlState::Absent
+        }) {
+            for (pending, transaction, source, inputs) in core::iter::once((
+                false,
+                domain.ddl_state.pending_txid().unwrap_or(0),
+                domain.default_expr.as_ref(),
+                &domain.default_inputs,
+            ))
+            .chain(domain.pending_definition.as_ref().map(|pending| {
+                (
+                    true,
+                    pending.txid,
+                    pending.spec.default_expr.as_ref(),
+                    &pending.spec.default_inputs,
+                )
+            })) {
+                if inputs.bytes().is_empty() {
+                    continue;
+                }
+                let source = source.ok_or_else(invalid)?;
+                let mark = arena.mark();
+                let result: Result<(), SqlError> = (|| {
+                    let mut replacement = *source;
+                    crate::sql::enum_values::checks::rename_default_schema(
+                        &mut replacement,
+                        &mut [],
+                        old,
+                        new,
+                        arena,
+                    )?;
+                    let before =
+                        crate::sql::enum_values::checks::default_display(source.as_str(), arena)?;
+                    let after = crate::sql::enum_values::checks::default_display(
+                        replacement.as_str(),
+                        arena,
+                    )?;
+                    let bindings = inputs.borrowed_sections(arena)?;
+                    let mut sources = crate::mem::arena::ArenaList::new(arena);
+                    for &(section, bindings) in bindings {
+                        if section != StoredInputSection::DomainDefault {
+                            return Err(invalid());
+                        }
+                        let bindings = type_inputs::rebase(
+                            before,
+                            after,
+                            StoredSqlKind::Expression,
+                            bindings,
+                            |name| {
+                                let mut original = crate::util::StackStr::<260>::from_str(name);
+                                if original.is_truncated() {
+                                    return Err(invalid());
+                                }
+                                super::rename_schema_qualified_sql(
+                                    &mut original,
+                                    &mut [],
+                                    new,
+                                    old,
+                                    StoredSqlKind::TypeName,
+                                    arena,
+                                )?;
+                                Ok(type_inputs::target_oid(
+                                    self,
+                                    transaction,
+                                    original.as_str(),
+                                ))
+                            },
+                            arena,
+                        )?;
+                        sources
+                            .push(StoredInputSource {
+                                section,
+                                sql: after,
+                                bindings,
+                            })
+                            .map_err(|_| crate::sql::query::arena_full_pub())?;
+                    }
+                    let replacement =
+                        inputs.relocated_sources(sources.as_slice(), &self.metadata_pool)?;
+                    if replacement != *inputs {
+                        plans
+                            .push(SchemaInputRename::Domain {
+                                slot,
+                                pending,
+                                inputs: replacement,
+                            })
+                            .map_err(metadata_full)?;
+                    }
+                    Ok(())
+                })();
+                unsafe { arena.rewind_to(mark) };
+                result?;
+            }
+        }
+        Ok(plans)
+    }
+
+    pub(super) fn apply_schema_input_renames(&self, mut plans: MutableSlice<SchemaInputRename>) {
+        while let Some(plan) = plans.pop() {
+            match plan {
+                SchemaInputRename::Query { image, inputs } => {
+                    self.stored_query_dependencies
+                        .lock()
+                        .expect("stored-query dependency catalog lock poisoned")
+                        .type_inputs[image] = inputs;
+                }
+                SchemaInputRename::Domain {
+                    slot,
+                    pending,
+                    inputs,
+                } => {
+                    let mut catalog = self
+                        .type_catalog
+                        .lock()
+                        .expect("type catalog lock poisoned");
+                    let domain = &mut catalog.domains[slot];
+                    if pending {
+                        domain
+                            .pending_definition
+                            .as_mut()
+                            .expect("exclusive schema recovery preserves pending sources")
+                            .spec
+                            .default_inputs = inputs;
+                    } else {
+                        domain.default_inputs = inputs;
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn relocate_stored_type_inputs<'source>(
         &self,
         inputs: &StoredTypeInputs,

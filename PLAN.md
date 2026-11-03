@@ -53,8 +53,14 @@ Finish retaining values checked while SQL is prepared. For example, preparing
 `SELECT '{approved}'::checked_status[]` can run a user-defined constraint;
 describing or executing that prepared statement must reuse its checked value.
 Cover implicit column and function arguments, repeated lock waits, cancellation,
-stored definitions, renames and recovery. Keep completed inputs while rolling
-back and safely replaying the unfinished input within its original deadline.
+stored definitions, renames and recovery. A SQL function checks its string body
+at creation and again when each caller's plan first needs it. A PL/pgSQL statement
+keeps its own plan across calls; dynamic `EXECUTE` makes a new plan each time.
+Unreached branches must not run constraints. Verify these differences against
+PostgreSQL, including function settings and `check_function_bodies=off`.
+Keep completed inputs while rolling back and safely replaying the unfinished
+input within its original deadline. Demonstrate the complete behavior in CI
+before closing this acceptance item.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

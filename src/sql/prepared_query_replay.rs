@@ -158,8 +158,16 @@ pub(super) fn stage_query_record(
         } => {
             let target = rule_target(storage, *target, table_schema, table, txid)?;
             let dependencies = storage.rebind_stored_query_dependencies(
-                dependencies.materialize(storage, txid, |section| {
-                    (section == crate::storage::StoredInputSection::RuleSource).then_some(*source)
+                dependencies.materialize(storage, txid, |section| match section {
+                    crate::storage::StoredInputSection::RuleSource => Some(*source),
+                    crate::storage::StoredInputSection::Query
+                        if *name == "_RETURN" && condition.is_none() && *action_count == 1 =>
+                    {
+                        let span = actions[0];
+                        let start = usize::from(span.start);
+                        source.get(start..start + usize::from(span.len))
+                    }
+                    _ => None,
                 })?,
                 txid,
             )?;

@@ -20,6 +20,39 @@ pub(crate) fn capture_contextual_type_inputs(
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
+    capture_discovered_type_inputs(parser, storage, txid, arena, |visit| {
+        discover_defaults(parser, statement, storage, txid, arena, visit)
+            .and_then(|()| discover(statement, storage, txid, arena, visit))
+    })
+}
+
+pub(crate) fn capture_contextual_expression_type_inputs<'a>(
+    parser: &crate::sql::parser::Parser<'_>,
+    expression: &Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    columns: &dyn ColTypeResolver,
+    row: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    capture_discovered_type_inputs(parser, storage, txid, arena, |visit| {
+        let mut walker = Walker {
+            storage,
+            txid,
+            arena,
+            visit,
+        };
+        walker.expression(expression, columns, row)
+    })
+}
+
+fn capture_discovered_type_inputs(
+    parser: &crate::sql::parser::Parser<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    discover: impl FnOnce(&mut Visit<'_>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     let literals = parser.string_literals();
     if literals.is_empty()
         || !(0..storage.domain_count()).any(|slot| storage.domain_slot_visible_to(slot, txid))
@@ -69,8 +102,7 @@ pub(crate) fn capture_contextual_type_inputs(
         count += 1;
         Ok(())
     };
-    let result = discover_defaults(parser, statement, storage, txid, arena, &mut visit)
-        .and_then(|()| discover(statement, storage, txid, arena, &mut visit));
+    let result = discover(&mut visit);
     // Only copied source ordinals and type identities escape schema scratch.
     unsafe { arena.rewind_to(mark) };
     result?;

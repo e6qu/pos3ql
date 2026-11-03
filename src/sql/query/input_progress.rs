@@ -681,6 +681,7 @@ thread_local! {
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static CURRENT_CALL: Cell<Option<usize>> = const { Cell::new(None) };
     static CURRENT_SOURCE_POSITION: Cell<Option<usize>> = const { Cell::new(None) };
+    static CURRENT_ASSIGNMENT_SITE: Cell<Option<crate::sql::type_inputs::AssignmentSite>> = const { Cell::new(None) };
     static IN_BODY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -793,8 +794,38 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
     Ok(position)
 }
 
-pub(crate) fn source_position() -> Option<usize> {
-    CURRENT_SOURCE_POSITION.with(Cell::get)
+pub(crate) fn invocation_site() -> Option<super::InvocationSite> {
+    CURRENT_SOURCE_POSITION
+        .with(Cell::get)
+        .map(super::InvocationSite::Expression)
+        .or_else(|| {
+            CURRENT_ASSIGNMENT_SITE
+                .with(Cell::get)
+                .map(super::InvocationSite::Assignment)
+        })
+}
+
+pub(crate) struct AssignmentScope {
+    previous: Option<crate::sql::type_inputs::AssignmentSite>,
+    previous_source: Option<usize>,
+    _thread: core::marker::PhantomData<*const ()>,
+}
+
+impl Drop for AssignmentScope {
+    fn drop(&mut self) {
+        CURRENT_ASSIGNMENT_SITE.with(|current| current.set(self.previous));
+        CURRENT_SOURCE_POSITION.with(|current| current.set(self.previous_source));
+    }
+}
+
+pub(crate) fn enter_assignment(
+    site: Option<crate::sql::type_inputs::AssignmentSite>,
+) -> AssignmentScope {
+    AssignmentScope {
+        previous: CURRENT_ASSIGNMENT_SITE.with(|current| current.replace(site)),
+        previous_source: CURRENT_SOURCE_POSITION.with(|current| current.replace(None)),
+        _thread: core::marker::PhantomData,
+    }
 }
 
 pub(crate) struct InputScope {
@@ -826,6 +857,8 @@ pub(crate) struct BodyScope {
     active: Option<ActiveInput>,
     available: Option<ActiveInput>,
     expression: Option<usize>,
+    source_position: Option<usize>,
+    assignment: Option<crate::sql::type_inputs::AssignmentSite>,
     in_body: bool,
 }
 impl Drop for BodyScope {
@@ -833,6 +866,8 @@ impl Drop for BodyScope {
         ACTIVE_INPUT.with(|active| active.set(self.active));
         AVAILABLE_INPUT.with(|active| active.set(self.available));
         CURRENT_CALL.with(|current| current.set(self.expression));
+        CURRENT_SOURCE_POSITION.with(|current| current.set(self.source_position));
+        CURRENT_ASSIGNMENT_SITE.with(|current| current.set(self.assignment));
         IN_BODY.with(|current| current.set(self.in_body));
     }
 }
@@ -841,6 +876,8 @@ pub(crate) fn enter_body() -> BodyScope {
         active: ACTIVE_INPUT.with(|active| active.replace(None)),
         available: AVAILABLE_INPUT.with(|active| active.replace(None)),
         expression: CURRENT_CALL.with(|current| current.replace(None)),
+        source_position: CURRENT_SOURCE_POSITION.with(|current| current.replace(None)),
+        assignment: CURRENT_ASSIGNMENT_SITE.with(|current| current.replace(None)),
         in_body: IN_BODY.with(|current| current.replace(true)),
     }
 }
@@ -1040,6 +1077,63 @@ mod tests {
                 ..crate::storage::CastDef::EMPTY
             },
         }
+    }
+
+    #[test]
+    fn assignment_sites_are_static_and_do_not_leak_into_nested_body_sources() {
+        use crate::sql::type_inputs::{AssignmentNode, AssignmentSite};
+        let mut budget = Budget::new(32 << 10);
+        let arena = Arena::new(&mut budget, "assignment source sites", 32 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut parser =
+                crate::sql::parser::Parser::new("INSERT INTO target VALUES(1,2),(3,4)", &arena)
+                    .unwrap();
+            let statement = parser.next_stmt().unwrap().unwrap();
+            let mut sites = ArenaList::new(&arena);
+            super::super::for_each_dml_assignment(&statement, &mut |_, _, _, site| {
+                sites.push(site.unwrap()).map_err(|_| full())
+            })
+            .unwrap();
+            assert_eq!(
+                sites.borrowed_slice()[0],
+                AssignmentSite {
+                    statement_position: 0,
+                    node: AssignmentNode::Values { row: 0, value: 0 }
+                }
+            );
+            assert_eq!(
+                sites.borrowed_slice()[3],
+                AssignmentSite {
+                    statement_position: 0,
+                    node: AssignmentNode::Values { row: 1, value: 1 }
+                }
+            );
+            let site = sites.borrowed_slice()[3];
+            assert_eq!(invocation_site(), None);
+            {
+                let _assignment = enter_assignment(Some(site));
+                assert_eq!(
+                    invocation_site(),
+                    Some(super::super::InvocationSite::Assignment(site))
+                );
+                {
+                    let _body = enter_body();
+                    assert_eq!(invocation_site(), None);
+                    let expression =
+                        crate::sql::parser::parse_expr("inner_call(1)", &arena).unwrap();
+                    let _expression = enter_expression(expression).unwrap();
+                    assert_eq!(
+                        invocation_site(),
+                        Some(super::super::InvocationSite::Expression(0))
+                    );
+                }
+                assert_eq!(
+                    invocation_site(),
+                    Some(super::super::InvocationSite::Assignment(site))
+                );
+            }
+            assert_eq!(invocation_site(), None);
+        });
     }
 
     #[test]

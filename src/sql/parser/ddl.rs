@@ -1392,6 +1392,7 @@ impl<'a> Parser<'a> {
     /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
     /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("create")?;
         let or_replace = if self.eat_ident("or")? {
             self.expect_ident("replace")?;
@@ -1420,10 +1421,10 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("expected VIEW after CREATE OR REPLACE TEMPORARY"));
             }
             if self.eat_ident("function")? {
-                return self.create_routine(true, true);
+                return self.create_routine(source_position, true, true);
             }
             if self.eat_ident("procedure")? {
-                return self.create_routine(true, false);
+                return self.create_routine(source_position, true, false);
             }
             if self.eat_ident("aggregate")? {
                 return self.create_aggregate(true);
@@ -1495,10 +1496,10 @@ impl<'a> Parser<'a> {
             return self.create_role(true);
         }
         if self.eat_ident("function")? {
-            return self.create_routine(false, true);
+            return self.create_routine(source_position, false, true);
         }
         if self.eat_ident("procedure")? {
-            return self.create_routine(false, false);
+            return self.create_routine(source_position, false, false);
         }
         if self.eat_ident("aggregate")? {
             return self.create_aggregate(false);
@@ -3556,7 +3557,12 @@ impl<'a> Parser<'a> {
 
     /// SQL-language routine definition. The parsed parameter modes separate
     /// call identity from output shape before catalog resolution.
-    fn create_routine(&mut self, or_replace: bool, function: bool) -> Result<Stmt<'a>, ParseError> {
+    fn create_routine(
+        &mut self,
+        source_position: crate::sql::ast::SourcePosition,
+        or_replace: bool,
+        function: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name(if function {
             "function name"
         } else {
@@ -4022,6 +4028,7 @@ impl<'a> Parser<'a> {
             });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
+            source_position,
             name,
             or_replace,
             arguments: self.arena_slice(&arguments[..count])?,

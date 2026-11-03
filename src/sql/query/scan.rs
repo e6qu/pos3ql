@@ -1751,6 +1751,7 @@ where
                 order_by: left_order,
                 over: left_over,
                 filter: left_filter,
+                ..
             },
             Expr::Call {
                 kind: right_kind,
@@ -1765,6 +1766,7 @@ where
                 order_by: right_order,
                 over: right_over,
                 filter: right_filter,
+                ..
             },
         ) => {
             left_kind == right_kind

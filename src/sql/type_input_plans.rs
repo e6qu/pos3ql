@@ -257,6 +257,24 @@ impl RoutineInputPlans {
         }
     }
 
+    pub(crate) fn retire_invalid_definitions(&mut self, mut visible: impl FnMut(i32, u64) -> bool) {
+        loop {
+            let retired = self.slots.iter().enumerate().find_map(|(index, slot)| {
+                let key = match &slot.state {
+                    State::Vacant => return None,
+                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                };
+                let (oid, version) = key.source.routine_definition()?;
+                (!visible(oid, version)).then_some(PlanId {
+                    slot: index,
+                    generation: slot.generation,
+                })
+            });
+            let Some(retired) = retired else { break };
+            self.abandon(retired).expect("selected plan is live");
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         for slot in self.slots.iter_mut() {
             slot.state = State::Vacant;

@@ -102,12 +102,12 @@ identifiers. The shared counter permits identities 1–9,999,999; reserving anot
 returns `54000` rather than wrapping. Renames and unchanged rules preserve their
 identities; dropping and recreating a rule reserves a new one.
 
-Table payload v15 and domain payload marker 252 append one four-byte,
+Table payload v15 and domain payload marker 251 append one four-byte,
 little-endian identity per constraint. Tables order CHECKs, foreign keys, live
 NOT NULL attributes by stable attribute number, then the detached partition
 CHECK. Domains order CHECKs, then NOT NULL when required. Manifest
 `constraint_identity POSITION CREATED_AT` records use the same table order;
-`dom6` appends domain identities. Positions describe the saved layout and never
+`dom7` appends domain identities. Positions describe the saved layout and never
 determine a public identifier. The internal large-object page table has no
 public constraints and carries no such records.
 
@@ -172,12 +172,15 @@ after it is saved and read again. Query and array memory budgets still apply.
 
 Table columns and domains store their NOT NULL constraint names. Renaming
 `orders` to `sales` preserves `orders_id_not_null`; recovery keeps that same
-name. Manifest `col4` and `dom6` records include its hexadecimal name, and the
+name. Manifest `col4` and `dom7` records include its hexadecimal name, and the
 journal stores its length and bytes. Nullable columns and domains store an
 empty name. A missing required name or an unexpected name is corrupt data.
 Column names are hexadecimal fields too, preserving spaces and avoiding
 position-dependent parsing of the rest of a line. Extra fields are rejected.
-Domain journal payloads use marker 252 and reject earlier payload layouts.
+Domain journal payloads use marker 251 and reject earlier payload layouts.
+A mandatory checked-default input section follows their constraint identities;
+`dom7` records carry the same section. An empty section is explicit. Recovery
+rejects missing sections, invalid type identities and malformed saved values.
 
 Table definitions retain a separate attribute layout. Live entries map a
 PostgreSQL column number to its current row position. Dropped entries retain
@@ -534,7 +537,7 @@ including objects deleted before checkpoint. Restore never assigns
 a fresh lifetime to a saved type. Slots are checked against configured capacity;
 zero creation identities, mismatched lifetimes and unavailable slots are errors.
 
-The manifest writes `dom6`, `enm3` and `cmp2` records before a required
+The manifest writes `dom7`, `enm3` and `cmp2` records before a required
 `types_end` record. At that boundary, recovery resolves domain chains and
 composite fields in each database before loading dependent definitions. Missing
 or duplicate boundaries and later type records are rejected.
@@ -546,7 +549,7 @@ PostgreSQL polymorphic type. The schema is stored separately and database scope
 comes from the enclosing record. The SQL name after the prefix retains its
 original colons and Unicode bytes. Manifests hex-encode these fields. Tables,
 composites, routine signatures/results, aggregate types, casts and operator
-contracts share this encoding. Table definition payloads use version 13.
+contracts share this encoding. Table definition payloads use version 15.
 
 Bit and varbit modifiers store the bit count directly: `bit(6)` stores `6`.
 Character modifiers include their four-byte header: `varchar(7)` stores `11`.
@@ -627,10 +630,13 @@ rows; prepared recovery must retain that pending decision.
 CREATE VIEW records start with a 20-byte identity: the view's two-byte catalog
 position and eight-byte creation stamp, then the return rule's two-byte position
 and eight-byte creation stamp, all little endian. Creation stamps are nonzero
-and distinct. Checkpoint `vw13` records carry the same four fields before the
+and distinct. Checkpoint `vw14` records carry the same four fields before the
 encoded query. Recovery rejects unavailable positions and mismatched identities;
 it never relocates an existing object to make room. This preserves identifiers
-when an aborted creation leaves a gap in either catalog.
+when an aborted creation leaves a gap in either catalog. The view-column
+payload and `vw14` record also retain checked column defaults by column ordinal.
+These values share the startup metadata pool and survive replacement and rollback;
+recovery restores their original input values without running constraints again.
 
 ## Catalog identities and sequence restarts
 

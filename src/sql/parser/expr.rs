@@ -69,7 +69,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Pratt expression parser.
-    pub(super) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
+    pub(crate) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
         let mut left = self.prefix()?;
         loop {
             let source_position = SourcePosition::new(Some(self.peek_at));

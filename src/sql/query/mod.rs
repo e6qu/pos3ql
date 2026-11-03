@@ -71,6 +71,7 @@ mod cte;
 pub(crate) use cte::captured_type_oid;
 mod dependencies;
 mod type_inputs;
+pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
 pub(crate) use type_inputs::capture_contextual_type_inputs;
 pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
@@ -884,12 +885,18 @@ pub fn check_timeout() -> Result<(), SqlError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvocationSite {
+    Expression(usize),
+    Assignment(super::type_inputs::AssignmentSite),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation<'a> {
     pub target: PendingRoutineTarget<'a>,
     pub arguments: &'a [u8],
     pub argument_count: usize,
-    pub source_position: Option<usize>,
+    pub source_position: Option<InvocationSite>,
 }
 
 #[derive(Clone, Copy)]
@@ -1255,7 +1262,7 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            source_position: input_progress::source_position(),
+            source_position: input_progress::invocation_site(),
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1289,7 +1296,7 @@ impl<'a> RoutineInvocationState<'a> {
             return super::exec::detach_routine_datum(value, query_arena);
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            source_position: input_progress::source_position(),
+            source_position: input_progress::invocation_site(),
             target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
@@ -1339,7 +1346,7 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(rows));
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            source_position,
+            source_position: source_position.map(InvocationSite::Expression),
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,

@@ -4935,6 +4935,7 @@ fn subst_insert<'a>(
         None => None,
     };
     Ok(Insert {
+        source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
         columns: statement.columns,
         rows,
@@ -4954,6 +4955,7 @@ fn subst_update<'a>(
     arena: &'a Arena,
 ) -> Result<Update<'a>, SqlError> {
     Ok(Update {
+        source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
         alias: statement.alias,
         assignments: subst_assignments(statement.assignments, context, arena)?,
@@ -5048,6 +5050,7 @@ fn subst_merge<'a>(
             .map_err(|_| arena_full())?;
     }
     Ok(Merge {
+        source_position: statement.source_position,
         target: rewrite_stored_relation_name(statement.target, context, arena)?,
         target_inheritance: statement.target_inheritance,
         target_alias: statement.target_alias,

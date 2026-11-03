@@ -46,6 +46,7 @@ pub mod notify;
 pub mod numeric;
 mod param_types;
 pub mod parser;
+mod plpgsql_inputs;
 pub mod prep;
 mod prepared_foreign_replay;
 mod prepared_object_replay;
@@ -562,10 +563,18 @@ struct CommandSnapshot {
     _files: Option<crate::storage::StatementFileScope>,
 }
 
-struct RoutineBodyInputs<'a> {
+struct PreparedTypeInputs<'a> {
     owner: type_input_plans::Owner,
     source: type_inputs::Source,
     bindings: &'a [type_inputs::Binding<'a>],
+}
+
+struct TypeInputPlanSource<'a, 'c> {
+    key: Option<type_input_plans::Key>,
+    source: type_inputs::Source,
+    text: &'a str,
+    candidates: &'c [type_inputs::Candidate<'a>],
+    captured: Option<type_input_plans::InputImage>,
 }
 
 /// The query engine: catalog, memtable storage, WAL, object-storage
@@ -11670,6 +11679,13 @@ impl Engine {
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.dml_scratch.clear();
         if let Err(error) = sqlprep.execution_epoch() {
+            txn.release_suspended_statement();
+            if txn.is_explicit() {
+                txn.failed = true;
+            } else {
+                cursors.on_rollback();
+                self.rollback_txn(txn, guc);
+            }
             responder.error(error.sqlstate, error.message.as_str())?;
             return Ok(ExtendedExecutionStatus::Complete(false));
         }
@@ -14068,6 +14084,7 @@ impl Engine {
                                 rewritten.columns
                             };
                             let rewritten = match arena.alloc(Insert {
+                                source_position: rewritten.source_position,
                                 table: view.base,
                                 columns,
                                 rows: rewritten.rows,
@@ -14162,6 +14179,7 @@ impl Engine {
                                 Err(error) => return Ok(Err(error)),
                             };
                             let rewritten = match arena.alloc(Update {
+                                source_position: rewritten.source_position,
                                 table: view.base,
                                 alias: update.alias,
                                 assignments: rewritten.assignments,
@@ -15165,9 +15183,253 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_create_routine(
+        &mut self,
+        routine: &ast::CreateRoutine<'_>,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let declaration = match exec::resolve_routine_declaration(&self.storage, txn, routine, guc)
+        {
+            Ok(declaration) => declaration,
+            Err(error) => return Ok(Err(error)),
+        };
+        let check_body = guc.check_function_bodies();
+        let result = (|| {
+            let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
+                match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                None
+            };
+            let role = eval::funcs::system::current_user_owned();
+            if let Err(error) = self.publish_session_context(guc, txn, role.as_str()) {
+                return Ok(Err(error));
+            }
+            timezone::set_session(guc.timezone());
+            let bindings = if check_body
+                && routine.language == ast::RoutineLanguage::Sql
+                && let ast::RoutineBody::String(body) = routine.body
+            {
+                let _formals = match exec::enter_routine_parameter_types(
+                    &declaration.arguments[..declaration.argument_count],
+                    Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+                ) {
+                    Ok(scope) => scope,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let parsed = (|| {
+                    let body = arena.alloc_str(body).map_err(|_| eval::arena_full())?;
+                    let name = arena
+                        .alloc_str(routine.name.name)
+                        .map_err(|_| eval::arena_full())?;
+                    let mut parser = Parser::new(body, arena)
+                        .and_then(|parser| {
+                            parser.with_routine_parameters(
+                                name,
+                                &declaration.arguments[..declaration.argument_count],
+                            )
+                        })
+                        .map_err(|error| parse_error_to_sql(&error))?;
+                    parser.capture_type_inputs();
+                    while let Some(statement) = parser
+                        .next_stmt()
+                        .map_err(|error| parse_error_to_sql(&error))?
+                    {
+                        query::capture_contextual_type_inputs(
+                            &parser,
+                            &statement,
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                        )?;
+                    }
+                    Ok((body, parser))
+                })();
+                let (body, parser) = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let owner = match type_input_plans::owner() {
+                    Ok(owner) => owner,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let source = type_inputs::Source::CreateRoutineValidation {
+                    statement: routine.source_position.get(),
+                };
+                let key = (routine.source_position.get().is_some()
+                    && owner != type_input_plans::Owner::Unlocated)
+                    .then_some(type_input_plans::Key { owner, source });
+                match self.prepare_type_input_plan(
+                    TypeInputPlanSource {
+                        key,
+                        source,
+                        text: body,
+                        candidates: parser.type_input_candidates(),
+                        captured: None,
+                    },
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )? {
+                    Ok(prepared) => prepared.bindings,
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                &[]
+            };
+            Ok(exec::validate_routine_body(
+                &self.storage,
+                txn,
+                routine,
+                &declaration,
+                bindings,
+                guc,
+                arena,
+                check_body,
+            ))
+        })();
+        let role = eval::funcs::system::current_user_owned();
+        timezone::set_session(guc.timezone());
+        let restored = self.publish_session_context(guc, txn, role.as_str());
+        let validated = match result {
+            Err(error) => return Err(error),
+            Ok(Err(error)) => return Ok(Err(error)),
+            Ok(Ok(bindings)) => {
+                if let Err(error) = restored {
+                    return Ok(Err(error));
+                }
+                bindings
+            }
+        };
+        exec::create_routine(
+            &mut self.storage,
+            &mut self.wal,
+            txn,
+            routine,
+            declaration,
+            validated,
+            guc,
+            arena,
+            responder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_plpgsql_inputs<'a>(
+        &mut self,
+        site: plpgsql_inputs::Site<'a>,
+        routine_oid: i32,
+        definition_version: u64,
+        row: &dyn eval::ColumnLookup<'a>,
+        arena: &'a Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
+        let source = type_inputs::Source::PlpgsqlBodyExpression {
+            routine_oid,
+            definition_version,
+            expression: site.position,
+        };
+        let owner = if routine_oid > 0 {
+            type_input_plans::Owner::Backend
+        } else {
+            match type_input_plans::owner() {
+                Ok(owner) => owner,
+                Err(error) => return Ok(Err(error)),
+            }
+        };
+        let key = type_input_plans::Key { owner, source };
+        let ready = match sqlprep.routine_inputs.find(key) {
+            Ok(Some(type_input_plans::Lookup::Ready(_, _))) => true,
+            Ok(_) => false,
+            Err(error) => return Ok(Err(error)),
+        };
+        let parser = if ready {
+            None
+        } else {
+            let parsed = (|| {
+                let mut parser =
+                    Parser::new(site.text, arena).map_err(|error| parse_error_to_sql(&error))?;
+                parser.capture_type_inputs();
+                match site.kind {
+                    plpgsql_inputs::Kind::Expression => {
+                        let expression = parser
+                            .expression(0)
+                            .map_err(|error| parse_error_to_sql(&error))?;
+                        let catalog = query::storage_catalog(&self.storage, arena, txn.txid);
+                        let columns = eval::RuntimeColumnTypes {
+                            row,
+                            catalog: Some(&catalog),
+                        };
+                        query::capture_contextual_expression_type_inputs(
+                            &parser,
+                            expression,
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                            &columns,
+                            row,
+                        )?;
+                    }
+                    plpgsql_inputs::Kind::Query | plpgsql_inputs::Kind::Statement => {
+                        while let Some(statement) = parser
+                            .next_stmt()
+                            .map_err(|error| parse_error_to_sql(&error))?
+                        {
+                            query::capture_contextual_type_inputs(
+                                &parser,
+                                &statement,
+                                &self.storage,
+                                txn.txid,
+                                arena,
+                            )?;
+                        }
+                    }
+                }
+                Ok(parser)
+            })();
+            match parsed {
+                Ok(parser) => Some(parser),
+                Err(error) => return Ok(Err(error)),
+            }
+        };
+        let candidates = parser
+            .as_ref()
+            .map_or(&[][..], |parser| parser.type_input_candidates());
+        self.prepare_type_input_plan(
+            TypeInputPlanSource {
+                key: Some(key),
+                source,
+                text: site.text,
+                candidates,
+                captured: None,
+            },
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_routine_body_inputs<'a>(
         &mut self,
-        source_position: Option<usize>,
+        source_position: Option<query::InvocationSite>,
         slot: usize,
         routine: &crate::storage::RoutineDef,
         body: &'a str,
@@ -15177,7 +15439,7 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
-    ) -> Result<Result<RoutineBodyInputs<'a>, SqlError>, WireFull> {
+    ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
         use type_input_plans::{InputImage, Key, Lookup, Owner};
         let routine_oid = crate::storage::routine_oid(routine);
         let parent = match type_input_plans::owner() {
@@ -15185,11 +15447,20 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         let source = match source_position {
-            Some(callsite) => type_inputs::Source::SqlRoutineCallSite {
-                routine_oid,
-                definition_version: routine.version,
-                callsite,
-            },
+            Some(query::InvocationSite::Expression(callsite)) => {
+                type_inputs::Source::SqlRoutineCallSite {
+                    routine_oid,
+                    definition_version: routine.version,
+                    callsite,
+                }
+            }
+            Some(query::InvocationSite::Assignment(site)) => {
+                type_inputs::Source::AssignmentRoutineCallSite {
+                    routine_oid,
+                    definition_version: routine.version,
+                    site,
+                }
+            }
             None => type_inputs::Source::UnlocatedRoutineBody {
                 routine_oid,
                 definition_version: routine.version,
@@ -15203,10 +15474,9 @@ impl Engine {
             Ok(prior) => prior.flatten(),
             Err(error) => return Ok(Err(error)),
         };
-        let (plan, ready) = match prior {
-            Some(Lookup::Ready(plan, image)) => (Some(plan), Some(image)),
-            Some(Lookup::Waiting(plan)) => (Some(plan), None),
-            None => (None, None),
+        let ready = match prior {
+            Some(Lookup::Ready(_, image)) => Some(image),
+            Some(Lookup::Waiting(_)) | None => None,
         };
         let mut captured = None;
         let mut parser = None;
@@ -15252,14 +15522,71 @@ impl Engine {
                 }
             }
         }
+        self.prepare_type_input_plan(
+            TypeInputPlanSource {
+                key,
+                source,
+                text: body,
+                candidates: parser
+                    .as_ref()
+                    .map_or(&[], |parser| parser.type_input_candidates()),
+                captured,
+            },
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_type_input_plan<'a>(
+        &mut self,
+        input: TypeInputPlanSource<'a, '_>,
+        arena: &'a Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
+        use type_input_plans::{InputImage, Lookup, Owner};
+        let TypeInputPlanSource {
+            key,
+            source,
+            text,
+            candidates,
+            mut captured,
+        } = input;
+        // Executing ancestors own their descendants until their frames finish.
+        // At a plan boundary, dropped/replaced definitions can release quota.
+        if !type_input_plans::has_active_plan() {
+            sqlprep
+                .routine_inputs
+                .retire_invalid_definitions(|oid, version| {
+                    self.storage
+                        .routine_slot_by_oid(oid, txn.txid)
+                        .is_some_and(|slot| {
+                            self.storage.routine_for(slot, txn.txid).version == version
+                        })
+                });
+        }
+        let prior = match key.map(|key| sqlprep.routine_inputs.find(key)).transpose() {
+            Ok(prior) => prior.flatten(),
+            Err(error) => return Ok(Err(error)),
+        };
+        let (plan, ready) = match prior {
+            Some(Lookup::Ready(plan, image)) => (Some(plan), Some(image)),
+            Some(Lookup::Waiting(plan)) => (Some(plan), None),
+            None => (None, None),
+        };
         let Some(key) = key else {
             let bindings = match captured {
                 Some(image) => image.bindings(arena),
-                None if parser.as_ref().is_some_and(|parser| {
-                    parser.type_input_candidates().iter().any(|candidate| {
-                        type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate)
-                            .is_some()
-                    })
+                None if candidates.iter().any(|candidate| {
+                    type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate).is_some()
                 }) =>
                 {
                     Err(sql_err!(
@@ -15269,7 +15596,7 @@ impl Engine {
                 }
                 None => Ok(&[][..]),
             };
-            return Ok(bindings.map(|bindings| RoutineBodyInputs {
+            return Ok(bindings.map(|bindings| PreparedTypeInputs {
                 owner: Owner::Unlocated,
                 source,
                 bindings,
@@ -15312,17 +15639,8 @@ impl Engine {
                         let image = match captured.take() {
                             Some(image) => image,
                             None => {
-                                let parser = parser
-                                    .as_ref()
-                                    .expect("string routine input preparation owns its parser");
                                 let bindings = match self.bind_type_inputs(
-                                    parser.type_input_candidates(),
-                                    arena,
-                                    txn,
-                                    sqlprep,
-                                    cursors,
-                                    guc,
-                                    responder,
+                                    candidates, arena, txn, sqlprep, cursors, guc, responder,
                                 ) {
                                     Ok(result) => result?,
                                     Err(_) => {
@@ -15341,7 +15659,7 @@ impl Engine {
                                 });
                                 InputImage::Runtime(
                                     self.storage
-                                        .freeze_runtime_type_inputs(body, ordered, txn.txid)?,
+                                        .freeze_runtime_type_inputs(text, ordered, txn.txid)?,
                                 )
                             }
                         };
@@ -15391,7 +15709,7 @@ impl Engine {
             }
             Err(error) => return Ok(Err(error)),
         };
-        Ok(image.bindings(arena).map(|bindings| RoutineBodyInputs {
+        Ok(image.bindings(arena).map(|bindings| PreparedTypeInputs {
             owner: Owner::Nested(plan),
             source,
             bindings,
@@ -17669,15 +17987,9 @@ impl Engine {
             Stmt::DropRule(rule) => {
                 exec::drop_rule(&mut self.storage, &mut self.wal, txn, *rule, responder)
             }
-            Stmt::CreateRoutine(routine) => exec::create_routine(
-                &mut self.storage,
-                &mut self.wal,
-                txn,
-                routine,
-                guc,
-                arena,
-                responder,
-            ),
+            Stmt::CreateRoutine(routine) => {
+                self.execute_create_routine(routine, arena, txn, sqlprep, cursors, guc, responder)
+            }
             Stmt::CreateAggregate(aggregate) => exec::create_aggregate(
                 &mut self.storage,
                 &mut self.wal,
@@ -24649,8 +24961,16 @@ fn apply_wal_op(
                 ));
             }
             let dependencies = storage.rebind_stored_query_dependencies(
-                dependencies.materialize(storage, 0, |section| {
-                    (section == crate::storage::StoredInputSection::RuleSource).then_some(source)
+                dependencies.materialize(storage, 0, |section| match section {
+                    crate::storage::StoredInputSection::RuleSource => Some(source),
+                    crate::storage::StoredInputSection::Query
+                        if name == "_RETURN" && condition.is_none() && action_count == 1 =>
+                    {
+                        let span = actions[0];
+                        let start = usize::from(span.start);
+                        source.get(start..start + usize::from(span.len))
+                    }
+                    _ => None,
                 })?,
                 0,
             )?;

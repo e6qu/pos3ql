@@ -4307,6 +4307,7 @@ pub struct AggregateIdentity<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateRoutine<'a> {
+    pub source_position: SourcePosition,
     pub name: QualName<'a>,
     pub or_replace: bool,
     pub arguments: &'a [RoutineArgument<'a>],
@@ -4833,6 +4834,7 @@ impl<'a> Returning<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Insert<'a> {
+    pub source_position: SourcePosition,
     pub table: QualName<'a>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
@@ -4886,6 +4888,7 @@ pub struct OnConflictTarget<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Update<'a> {
+    pub source_position: SourcePosition,
     pub table: QualName<'a>,
     pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
@@ -4908,6 +4911,7 @@ pub struct Delete<'a> {
 /// `MERGE INTO target [AS alias] USING source [AS alias] ON cond WHEN ...`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Merge<'a> {
+    pub source_position: SourcePosition,
     pub target: QualName<'a>,
     /// Whether target-row matching includes inheritance descendants. INSERT
     /// actions always name `target` itself, as PostgreSQL specifies.

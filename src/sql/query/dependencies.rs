@@ -1366,13 +1366,39 @@ fn validate_insert_projection(
 
 pub(crate) fn for_each_dml_assignment<'a>(
     statement: &Stmt<'a>,
-    visit: &mut dyn FnMut(Option<&'a str>, usize, &'a Expr<'a>) -> Result<(), SqlError>,
+    visit: &mut dyn FnMut(
+        Option<&'a str>,
+        usize,
+        &'a Expr<'a>,
+        Option<crate::sql::type_inputs::AssignmentSite>,
+    ) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    use crate::sql::type_inputs::{AssignmentNode, AssignmentSite};
+    let position = match statement {
+        Stmt::Insert(value) => value.source_position.get(),
+        Stmt::Update(value) => value.source_position.get(),
+        Stmt::Merge(value) => value.source_position.get(),
+        _ => None,
+    };
+    let site = |node| {
+        position.map(|statement_position| AssignmentSite {
+            statement_position,
+            node,
+        })
+    };
     match statement {
         Stmt::Insert(insert) => {
-            for row in insert.rows {
+            for (row_index, row) in insert.rows.iter().enumerate() {
                 for (index, expression) in row.iter().enumerate() {
-                    visit(insert.columns.get(index).copied(), index, expression)?;
+                    visit(
+                        insert.columns.get(index).copied(),
+                        index,
+                        expression,
+                        site(AssignmentNode::Values {
+                            row: row_index,
+                            value: index,
+                        }),
+                    )?;
                 }
             }
             for (index, (name, expression)) in insert
@@ -1382,27 +1408,53 @@ pub(crate) fn for_each_dml_assignment<'a>(
                 .flatten()
                 .enumerate()
             {
-                visit(Some(name), index, expression)?;
+                visit(
+                    Some(name),
+                    index,
+                    expression,
+                    site(AssignmentNode::OnConflict { assignment: index }),
+                )?;
             }
         }
         Stmt::Update(update) => {
             for (index, (name, expression)) in update.assignments.iter().enumerate() {
-                visit(Some(name), index, expression)?;
+                visit(
+                    Some(name),
+                    index,
+                    expression,
+                    site(AssignmentNode::Update { assignment: index }),
+                )?;
             }
         }
         Stmt::Merge(merge) => {
-            for when in merge.whens {
+            for (when_index, when) in merge.whens.iter().enumerate() {
                 match when.action() {
                     crate::sql::ast::MergeActionRef::Update(assignments) => {
                         for (index, (name, expression)) in assignments.iter().enumerate() {
-                            visit(Some(name), index, expression)?;
+                            visit(
+                                Some(name),
+                                index,
+                                expression,
+                                site(AssignmentNode::Merge {
+                                    when: when_index,
+                                    value: index,
+                                }),
+                            )?;
                         }
                     }
                     crate::sql::ast::MergeActionRef::Insert {
                         columns, values, ..
                     } => {
                         for (index, expression) in values.iter().enumerate() {
-                            visit(columns.get(index).copied(), index, expression)?;
+                            visit(
+                                columns.get(index).copied(),
+                                index,
+                                expression,
+                                site(AssignmentNode::Merge {
+                                    when: when_index,
+                                    value: index,
+                                }),
+                            )?;
                         }
                     }
                     _ => {}
@@ -1539,7 +1591,7 @@ fn visit_dml_assignment_inputs(
             arena,
         };
         let mut assignments = crate::mem::arena::ArenaList::new(arena);
-        for_each_dml_assignment(statement, &mut |name, index, expression| {
+        for_each_dml_assignment(statement, &mut |name, index, expression, _site| {
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {

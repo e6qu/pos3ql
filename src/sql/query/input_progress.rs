@@ -471,14 +471,14 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 },
             };
             frames
-                .push(AttemptFrame::Temporary(
+                .push(AttemptFrame::Temporary(Cell::from_mut(
                     self.arena
-                        .alloc(Cell::new(InputFrame {
+                        .alloc(InputFrame {
                             site,
                             state: InputState::Pending,
-                        }))
+                        })
                         .map_err(|_| full())?,
-                ))
+                )))
                 .map_err(|_| full())?;
         }
         let frame = frames
@@ -509,9 +509,9 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
         match selected {
             AttemptFrame::Temporary(current) => current.set(frame),
             AttemptFrame::Saved(_) => {
-                *selected = AttemptFrame::Temporary(
-                    self.arena.alloc(Cell::new(frame)).map_err(|_| full())?,
-                );
+                *selected = AttemptFrame::Temporary(Cell::from_mut(
+                    self.arena.alloc(frame).map_err(|_| full())?,
+                ));
             }
         }
         Ok(())

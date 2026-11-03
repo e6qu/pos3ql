@@ -56,9 +56,10 @@ finishes without changing their owner. SQL, commands, hashes, raw output and
 run `python3 verify-owner-reassignment.py .` to verify the recorded observations.
 
 [protocol-reference.zip](protocol-reference.zip), SHA256
-`dd67b2c53d7795b1d6f25ced1aa8393d02600a8de07db98edd4741cf415aba49`,
+`a0f41b53f2a76d00350d0030dfebd8e739b3393485ed7f4b23a67a6e8204bacb`,
 retains 69 raw protocol exchanges on that PostgreSQL build, their runner and
-provenance. A duplicate portal Bind fails the explicit transaction. Database
+provenance. Startup cancellation keys are omitted at capture. A duplicate portal
+Bind fails the explicit transaction. Database
 creation publishes before `Sync`; concurrent index commands expose intermediate
 catalog states before their final transaction ends. Bound integer and text
 parameters skip unreached function checks. Extract it and run

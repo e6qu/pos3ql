@@ -90,6 +90,7 @@ impl ParameterInference<'_> {
                 arguments,
                 argument_names,
                 variadic,
+                ..
             } => {
                 let mut actual = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 if arguments.len() > actual.len() {

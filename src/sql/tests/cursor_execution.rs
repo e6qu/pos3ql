@@ -1587,7 +1587,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
             &mut session.transaction,
             &mut session.pool,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut Responder::new(&mut session.send),
             session.connection_id,
             false,

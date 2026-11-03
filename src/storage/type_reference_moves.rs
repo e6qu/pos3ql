@@ -1737,7 +1737,7 @@ mod tests {
     fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
         let (schema, name) = match movement.identity.slot() {
             NamedTypeSlot::Domain(_) => {
-                let definition = catalog.domains[movement.identity.slot().index()];
+                let definition = &catalog.domains[movement.identity.slot().index()];
                 (definition.schema, definition.name)
             }
             NamedTypeSlot::Enum(_) => {

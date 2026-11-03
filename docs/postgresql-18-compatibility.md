@@ -68,8 +68,9 @@ child because it does not own that sequence. Detaching a partition clears its
 inherited identity generation; rolling back the detach restores it.
 
 Scalar functions, functions in `FROM`, and `CALL` share input binding with
-explicit rules for their evaluation context. Named arguments and omitted defaults run in the declared
-input order. Defaults share the caller's session: a default using `nextval('order_numbers')` updates that
+explicit rules for their evaluation context. At execution, named arguments and
+omitted defaults run in the declared input order. Defaults share the caller's
+session: a default using `nextval('order_numbers')` updates that
 connection's `currval('order_numbers')`. Function lookup and missing-function
 errors do not run arguments to discover their types.
 Aggregate support functions can refer to supported built-ins by their selected
@@ -121,6 +122,24 @@ Enum labels written directly in SQL are checked before choosing rows. If
 converts when its expression runs: the same unused arm containing
 `'missing'::text::order_status` is skipped.
 
+An untyped serialized array can run domain checks during input preparation.
+For example, `PREPARE saved AS SELECT '{paid}'::checked_status[]` checks that
+value at `PREPARE`; repeated `EXECUTE saved` reuses it. A literal supplied to a
+column or function parameter of that type follows the same rule. In contrast,
+`ARRAY['paid']::checked_status[]` performs its domain checks when executed.
+
+SQL string functions validate their inputs at `CREATE` and prepare separate
+inputs for each caller's plan. SQL string procedures also validate at `CREATE`,
+then retain their first `CALL`'s body inputs for that backend and definition.
+Supported static procedural sources prepare
+when first reached and reuse the backend's plan; dynamic `EXECUTE` prepares
+each command afresh. Views, rules, SQL `BEGIN ATOMIC` bodies and stored defaults
+retain their checked inputs with the definition, including domain and
+view-column defaults. See [plan lifetimes](architecture.md#the-request-path).
+`DISCARD PLANS` releases cached routine-input plans; `DISCARD ALL` also clears
+prepared statements. Attempting either while a routine-input plan is executing
+returns `0A000` before invalidation. Stored definition inputs are unaffected.
+
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.
 Arrays of domains whose base is an array of user-defined values are rejected:
@@ -128,6 +147,16 @@ the stored base code cannot retain that nested declaration. A scalar domain
 containing an array of scalar domains is supported.
 For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
 from an unsupported `positive_ids[]` column.
+
+Data-change triggers currently reject a reached SQL string literal that needs
+checked input for an array of a named domain, such as
+`PERFORM cardinality('{1}'::positive_integer[])`. They raise `0A000` before
+running the domain constraint. Unreached branches and trigger expressions that
+need no checked input continue normally. These triggers cannot yet retain
+their unfinished execution while the engine prepares that value; replaying
+after undoing earlier row changes would give constraints the wrong data.
+Event triggers use the engine's procedural execution context and retain each
+statement's checked inputs across calls.
 
 Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
 reject client text and binary input with `0A000`, matching PostgreSQL. Reports
@@ -239,7 +268,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Object-row source retention | 64 point-source slots per query workspace, separate from scan sources; checked shared lease counts | Complete captured generations and newest deletion metadata; SQLSTATE 54000 on exhaustion, without reducing scan capacity |
 | Retained row metadata | 64 copied point reads per query workspace; each reserves the configured maximum pending and committed versions | Startup-owned metadata, heap sources, and saved-file roots; SQLSTATE 54000 on exhaustion, with no shared version lock held during retention; captured-table admission returns 40001 before reserving a slot when its identity changed |
 | Bound prepared statements | `max_prepared` slots per SQL/protocol namespace; `prepared_bytes` per slot and one active SQL input record | Text, parameter metadata and checked literal values share each reservation. Releasing a name preserves values needed by bound portals; the last portal releases the slot. Exhaustion is SQLSTATE 54000. |
-| Routine input plans | `routine_input_slots` per backend; checked values share `table_metadata_bytes` | SQL call sites and procedural expressions retain their own input values. Plan-control or value-space exhaustion returns SQLSTATE 54000. |
+| Routine input plans | `routine_input_slots` startup control records per backend; actual checked values share global `table_metadata_bytes` and `table_metadata_leases` | Caller plans and supported static procedural sources retain separately owned values. No maximum-width payload is reserved per plan or table. SQLSTATE 54000 names control or metadata exhaustion; settings take effect at startup. |
 | Temporary namespaces | One fixed entry per connection/subscription slot; first creation consumes a transaction DDL undo entry | Creation rolls back; an established empty namespace survives ordinary drops and DISCARD, then disappears at disconnect. Namespace state never enters durable records |
 | Streamed COPY statement-trigger inputs | `txn_rows` records and `copy_transition_bytes` (256 KiB default) per connection and subscription worker | Startup-owned encoded values; no later source lookup; SQLSTATE 54000 aborts COPY on row/byte exhaustion; cleanup permits a smaller retry |
 | Execution schema images | `definition_image_slots` retained identities for physical schema pins and separately typed synthetic column payloads | SQLSTATE 54000 before partial description on exhaustion; identifiers include pool and generation identity; synthetic hidden fields retain their full backing width |

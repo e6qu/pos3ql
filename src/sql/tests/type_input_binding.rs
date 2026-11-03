@@ -1,5 +1,97 @@
 use super::*;
 
+// PostgreSQL 18.6 SQL SHA256:
+// a6d12a932def651411044e1d08dbd2bb3d67c958d9c9ada897433d434a310f1a.
+#[test]
+fn procedural_for_queries_execute_source_effects_once() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("pl-for-input-effects-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "SET application_name=''; CREATE FUNCTION for_input_effects() RETURNS text LANGUAGE plpgsql AS $$ \
+             DECLARE scalar_value integer; record_value record; BEGIN \
+              FOR scalar_value IN SELECT length(set_config('application_name',current_setting('application_name')||'s',false)) LOOP NULL; END LOOP; \
+              FOR record_value IN SELECT set_config('application_name',current_setting('application_name')||'r',false) AS value LOOP NULL; END LOOP; \
+              FOR scalar_value IN EXECUTE 'SELECT length(set_config(''application_name'',current_setting(''application_name'')||''d'',false))' LOOP NULL; END LOOP; \
+              RETURN current_setting('application_name'); END$$", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT for_input_effects()", true)),
+            ["srd"]
+        );
+    }
+}
+
+// PostgreSQL 18.6 event-trigger visibility reference SQL SHA256:
+// 88cbb1c2ca5aad8e5b7883ef3cda840d008be0f3f790f60cdcf620435a6e8cfe.
+#[test]
+fn checked_trigger_inputs_preserve_visibility_or_reject_before_constraint_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("trigger-input-boundary-{mode:?}"));
+        config.transaction_mode = mode;
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE trigger_input_checks; CREATE TABLE trigger_input_rows(id integer); \
+             CREATE TABLE trigger_input_audit(observed integer); CREATE TABLE event_input_audit(tag text); \
+             INSERT INTO trigger_input_rows VALUES(1); \
+             CREATE FUNCTION trigger_input_allowed(value integer) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+               PERFORM nextval('trigger_input_checks'); \
+               INSERT INTO trigger_input_audit SELECT count(*) FROM trigger_input_rows; RETURN true; END$$; \
+             CREATE DOMAIN trigger_input_checked AS integer CHECK(trigger_input_allowed(VALUE)); \
+             CREATE FUNCTION checked_row_input() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+               IF NEW.id=0 THEN RETURN NEW; END IF; \
+               PERFORM cardinality('{1}'::trigger_input_checked[]); RETURN NEW; END$$; \
+             CREATE TRIGGER checked_row_input AFTER INSERT ON trigger_input_rows \
+               FOR EACH ROW EXECUTE FUNCTION checked_row_input(); \
+             INSERT INTO trigger_input_rows VALUES(0)", true);
+        let rejected = session.execute(
+            &mut engine,
+            "INSERT INTO trigger_input_rows VALUES(2),(3)",
+            true,
+        );
+        let diagnostic = String::from_utf8_lossy(&rejected);
+        assert!(diagnostic.contains("0A000"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(
+                "checked type inputs in data-change triggers require a resumable execution context"
+            ),
+            "{diagnostic}"
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT id FROM trigger_input_rows ORDER BY id; \
+             SELECT count(*) FROM trigger_input_audit; SELECT last_value,is_called FROM trigger_input_checks", true)),
+            ["0", "1", "0", "1|f"]);
+        session.success(&mut engine,
+            "DROP TRIGGER checked_row_input ON trigger_input_rows; \
+             CREATE FUNCTION checked_event_input() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN \
+               PERFORM cardinality('{1}'::trigger_input_checked[]); \
+               INSERT INTO event_input_audit VALUES(TG_TAG); END$$; \
+             CREATE EVENT TRIGGER checked_event_input ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+               EXECUTE FUNCTION checked_event_input()", true);
+        session.success(&mut engine,
+            "BEGIN; INSERT INTO trigger_input_rows VALUES(2); \
+             CREATE TABLE checked_event_one(id integer); CREATE TABLE checked_event_two(id integer); COMMIT", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT observed FROM trigger_input_audit; SELECT last_value FROM trigger_input_checks; \
+             SELECT count(*) FROM event_input_audit; SELECT count(*) FROM trigger_input_rows", true)),
+            ["3", "1", "2", "3"]);
+        drop((session, engine));
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
 // PostgreSQL 18.6 phase oracle SQL SHA256:
 // e9f16455ade1b384282cc4a6ecdb3d49d782edf3853e760ce66cf0e40c8e8345.
 #[test]
@@ -10,6 +102,7 @@ fn procedural_expression_inputs_are_lazy_backend_plans() {
     ] {
         let mut config = test_config(&format!("pl-input-plans-{mode:?}"));
         config.transaction_mode = mode;
+        config.max_routines = 9;
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -23,7 +116,10 @@ fn procedural_expression_inputs_are_lazy_backend_plans() {
              CREATE FUNCTION pl_assignment() RETURNS integer LANGUAGE plpgsql AS $$DECLARE v pl_checked[]; BEGIN v:='{a}'::pl_checked[]; RETURN cardinality(v); END$$; \
              CREATE FUNCTION pl_return() RETURNS pl_checked[] LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::pl_checked[]; END$$; \
              CREATE FUNCTION pl_call() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN pl_take('{a}'); END$$; \
-             CREATE FUNCTION pl_unreached() RETURNS integer LANGUAGE plpgsql AS $$BEGIN IF false THEN RETURN pl_take('{a}'); END IF; RETURN 0; END$$", true);
+             CREATE FUNCTION pl_unreached() RETURNS integer LANGUAGE plpgsql AS $$BEGIN IF false THEN RETURN pl_take('{a}'); END IF; RETURN 0; END$$; \
+             CREATE FUNCTION pl_select() RETURNS integer LANGUAGE plpgsql AS $$DECLARE n integer; BEGIN SELECT cardinality('{a}'::pl_checked[]) INTO n; RETURN n; END$$; \
+             CREATE FUNCTION pl_open() RETURNS integer LANGUAGE plpgsql AS $$DECLARE c refcursor; n integer; BEGIN OPEN c FOR SELECT cardinality('{a}'::pl_checked[]); FETCH c INTO n; CLOSE c; RETURN n; END$$; \
+             CREATE FUNCTION pl_dynamic() RETURNS integer LANGUAGE plpgsql AS $$DECLARE n integer; BEGIN EXECUTE 'SELECT cardinality(''{a}''::pl_checked[])' INTO n; RETURN n; END$$", true);
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
@@ -36,9 +132,23 @@ fn procedural_expression_inputs_are_lazy_backend_plans() {
             ("SELECT pl_assignment()", "1|1"),
             ("SELECT pl_return()::text", "2|2"),
             ("SELECT pl_call()", "3|3"),
+            ("SELECT pl_select()", "4|4"),
+            ("SELECT pl_open()", "5|5"),
+            ("SELECT pl_dynamic()", "7|7"),
         ] {
             session.success(&mut engine, query, true);
             session.success(&mut engine, query, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT currval('pl_checks'),count(*) FROM pl_audit",
+                    true
+                )),
+                [count]
+            );
+        }
+        for count in ["8|8", "9|9"] {
+            session.success(&mut engine, "DO $$DECLARE i integer; BEGIN FOR i IN 1..3 LOOP PERFORM cardinality('{a}'::pl_checked[]); END LOOP; END$$", true);
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,

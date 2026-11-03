@@ -188,7 +188,7 @@ fn sorted_and_paged_projection_effects(external: bool) {
             &mut other.transaction,
             &mut other.pool,
             &mut other.cursors,
-            &mut other.guc,
+            &other.guc,
             &mut Responder::new(&mut other.send),
             2,
             false,

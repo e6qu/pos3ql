@@ -64,8 +64,8 @@ of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
 Function calls bind their selected function, input mapping and declared types
-before running arguments. Reached inputs and defaults run in declaration order;
-lookup never evaluates an argument as a probe. Defaults keep the object identities
+before running arguments. At execution, reached inputs and defaults run in
+declaration order; lookup never evaluates an argument as a probe. Defaults keep the object identities
 captured when the routine was created. A renamed sequence therefore cannot be
 replaced accidentally by another sequence with its old name.
 
@@ -90,10 +90,32 @@ an overflowing first array child must not advance a sequence in a later child.
 
 Some literal values are checked while SQL is prepared. For example, preparing
 `SELECT '{approved}'::checked_status[]` can run checks on a domain, a type with
-extra constraints. The parser records each literal's position and selected type;
-Describe and Execute reuse its encoded value. Equal literals at different
-positions remain distinct inputs. Converting a typed text expression or an
-`ARRAY[...]` constructor retains PostgreSQL's later check timing.
+extra constraints. The same applies when an untyped string gets that array type
+from a column or function parameter. The parser records each occurrence's
+position, selected type identity and encoded value. Describe, Execute and
+retries restore that value without repeating its checks. Equal literals at
+different positions remain distinct inputs. A typed text expression or an
+`ARRAY[...]` constructor keeps its later execution-time checks.
+
+Checked values belong to the SQL source that analyzed them:
+
+| Source | Input preparation and lifetime |
+|---|---|
+| Simple command | Prepared at command admission; a new command analyzes its inputs again. |
+| SQL `PREPARE` or protocol Parse | Prepared once and retained with that statement and its bound portals. Describe and repeated execution reuse the values. |
+| SQL string function body | `CREATE` validation has its own input values. A caller prepares separate body inputs when its call site first runs, then reuses them for that caller's plan lifetime. |
+| SQL string procedure body | `CREATE` validation is separate. The backend prepares body inputs at the first `CALL` and reuses them for that procedure definition, including later `CALL` commands. |
+| Supported static PL/pgSQL source | Prepared when reached and retained by the backend for that routine definition and source occurrence. An unreached branch does not prepare its inputs. |
+| Dynamic `EXECUTE` | Each execution owns a fresh plan, even when the command text equals an earlier command. |
+| Stored view, rule, default or SQL `BEGIN ATOMIC` body | Prepared with the definition and retained in its immutable metadata image, including domain and view-column defaults. Recovery restores values and captured type identities without rerunning checks. |
+
+`DISCARD PLANS` and `DISCARD ALL` release cached routine-input plans and their
+value owners. They do not re-evaluate inputs saved in schema definitions.
+Invalidating an executing routine-input plan returns `0A000` before clearing it.
+The [compatibility guide](postgresql-18-compatibility.md) records procedural
+boundaries. Native regressions in `src/sql/tests/type_input_binding.rs` and
+`src/sql/tests/type_input_positions.rs` retain the PostgreSQL 18.6 reference
+SQL digests for these phase distinctions.
 
 When an expression hands a mutable function to the engine, input preparation preserves completed
 expressions, conversions, defaults and nested calls in the statement arena.
@@ -326,6 +348,13 @@ statement slot, plus one `prepared_bytes` buffer for active input preparation.
 For example, with `max_prepared=8`, those buffers reserve `17 * prepared_bytes`.
 Text, parameter declarations and checked literal values share each buffer.
 Exhaustion returns `54000`; increasing the setting takes effect at startup.
+
+`routine_input_slots` reserves plan-control records per backend; the starter
+configuration uses 128. Encoded values lease only their actual bytes from the
+global `table_metadata_bytes` pool and consume its lease descriptors. There is
+no maximum-sized value buffer per plan or per table. Nested and backend-static
+plans share the fixed control capacity. Exhaustion returns `54000` naming
+`routine_input_slots` or the metadata pool; neither grows at runtime.
 
 `statistics_bytes` and `statistics_leases` reserve a separate shared pool for
 analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.

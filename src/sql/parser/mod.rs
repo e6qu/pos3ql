@@ -642,9 +642,12 @@ pub(crate) fn parse_cursor_command<'a>(
     sql: &'a str,
     arena: &'a Arena,
     parameters: &'a [NamedParameter<'a>],
+    inputs: &'a [super::type_inputs::Binding<'a>],
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
 ) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.named_parameters = parameters;
+    parser.set_type_inputs(inputs);
     let mut statement = None;
     let mut multiple = false;
     while let Some(parsed) = parser
@@ -663,6 +666,7 @@ pub(crate) fn parse_cursor_command<'a>(
             "cannot open multi-query plan as cursor"
         ));
     }
+    validate(&parser)?;
     arena
         .alloc(statement.unwrap())
         .map(|statement| &*statement)

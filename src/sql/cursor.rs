@@ -453,8 +453,15 @@ impl CursorPool {
         sql: &str,
         params: &[Datum],
         locals: &[CursorLocal],
+        inputs: &[super::type_inputs::Binding<'_>],
+        storage: &crate::storage::Storage,
+        txid: u32,
     ) -> Result<(), SqlError> {
-        self.slots[at].query.bind(sql, params, locals)
+        self.slots[at]
+            .query
+            .bind(sql, params, locals, inputs, |parser| {
+                super::type_inputs::validate_restored(parser, storage, txid)
+            })
     }
 
     pub(crate) fn execution_parts(

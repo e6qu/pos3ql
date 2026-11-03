@@ -15,6 +15,12 @@ pub(super) enum Kind {
 }
 
 #[derive(Clone, Copy)]
+pub(super) enum Origin {
+    Routine { oid: i32, version: u64 },
+    Anonymous,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct Site<'a> {
     pub kind: Kind,
     pub key: usize,
@@ -96,6 +102,72 @@ fn invalid_source() -> SqlError {
         sqlstate::INTERNAL_ERROR,
         "PL/pgSQL input plan has no original body span"
     )
+}
+
+pub(super) fn parse<'a>(
+    site: Site<'a>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+    row: &dyn super::eval::ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<super::parser::Parser<'a>, SqlError> {
+    let mut parser = super::parser::Parser::new(site.text, arena)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.capture_type_inputs();
+    match site.kind {
+        Kind::Expression => {
+            let expression = parser
+                .expression(0)
+                .map_err(|error| super::parse_error_to_sql(&error))?;
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            let columns = super::eval::RuntimeColumnTypes {
+                row,
+                catalog: Some(&catalog),
+            };
+            super::query::capture_contextual_expression_type_inputs(
+                &parser, expression, storage, txid, arena, &columns, row,
+            )?;
+        }
+        Kind::Query | Kind::Statement => {
+            while let Some(statement) = parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+            {
+                let statement = arena
+                    .alloc(statement)
+                    .map_err(|_| super::query::arena_full_pub())?;
+                super::query::capture_procedural_statement_type_inputs(
+                    &parser, statement, storage, txid, arena, row,
+                )?;
+            }
+        }
+    }
+    Ok(parser)
+}
+
+pub(super) fn reject_atomic<'a>(
+    site: Site<'a>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+    row: &dyn super::eval::ColumnLookup<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let parser = parse(site, storage, txid, row, arena)?;
+        if parser.type_input_candidates().iter().any(|candidate| {
+            super::type_inputs::candidate_target_oid(storage, txid, candidate).is_some()
+        }) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "checked type inputs in data-change triggers require a resumable execution context"
+            ));
+        }
+        Ok(())
+    })();
+    // Only an owned error escapes this metadata-only decision.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 #[cfg(test)]

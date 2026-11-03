@@ -168,3 +168,98 @@ fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() 
         });
     }
 }
+
+// PostgreSQL 18.6 procedure phase SQL SHA256:
+// 40eacd789e95cee4b796a91ce08125a5f8e77d1a0d36f89e88c1aa828680ea12;
+// DISCARD and fresh-backend control:
+// d5d8c14547aa1ed34b485c26921cfca7f64f2d0af24c2be8a573740ea0d62ad6.
+#[test]
+fn sql_procedure_inputs_keep_backend_and_stored_definition_lifetimes_through_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for checkpoint in [false, true] {
+            let mut config =
+                test_config(&format!("procedure-input-lifetime-{mode:?}-{checkpoint}"));
+            config.transaction_mode = mode;
+            let server = object_reads::HttpObjectServer::start(&mut config);
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine,
+                "CREATE SEQUENCE procedure_checks; CREATE TYPE procedure_choice AS ENUM('a'); \
+                 CREATE DOMAIN procedure_checked AS procedure_choice CHECK(nextval('procedure_checks')>0); \
+                 CREATE PROCEDURE checked_string_procedure() LANGUAGE sql AS 'SELECT ''{a}''::procedure_checked[]'",true);
+            let counter = "SELECT last_value FROM procedure_checks";
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                ["1"]
+            );
+            for _ in 0..2 {
+                session.success(&mut engine, "CALL checked_string_procedure()", true);
+                assert_eq!(
+                    data_rows(&session.success(&mut engine, counter, true)),
+                    ["2"]
+                );
+            }
+            session.success(
+                &mut engine,
+                "CREATE PROCEDURE checked_atomic_procedure() LANGUAGE sql \
+                 BEGIN ATOMIC SELECT '{a}'::procedure_checked[]; END",
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                ["3"]
+            );
+            session.success(
+                &mut engine,
+                "CALL checked_atomic_procedure(); CALL checked_atomic_procedure()",
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                ["3"]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+            drop((session, engine));
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut reader = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&reader.success(&mut recovered, counter, true)),
+                ["3"]
+            );
+            reader.success(&mut recovered, "CALL checked_atomic_procedure()", true);
+            assert_eq!(
+                data_rows(&reader.success(&mut recovered, counter, true)),
+                ["3"]
+            );
+            for _ in 0..2 {
+                reader.success(&mut recovered, "CALL checked_string_procedure()", true);
+                assert_eq!(
+                    data_rows(&reader.success(&mut recovered, counter, true)),
+                    ["4"]
+                );
+            }
+            reader.success(
+                &mut recovered,
+                "DISCARD PLANS; CALL checked_string_procedure(); CALL checked_atomic_procedure()",
+                true,
+            );
+            assert_eq!(
+                data_rows(&reader.success(&mut recovered, counter, true)),
+                ["5"]
+            );
+            drop((reader, recovered));
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            drop(server);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}

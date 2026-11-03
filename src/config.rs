@@ -75,7 +75,8 @@ pub struct Config {
     pub max_prepared: usize,
     /// Stored query text and metadata per wire or SQL prepared statement.
     pub prepared_bytes: usize,
-    /// Checked routine-input plans retained by each backend session.
+    /// Per-backend controls for caller-owned and static routine-input plans.
+    /// Encoded values lease actual bytes from shared table_metadata_bytes.
     pub routine_input_slots: usize,
     /// Portal slots per connection.
     pub max_portals: usize,

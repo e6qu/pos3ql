@@ -31,6 +31,10 @@ pub(crate) enum Source {
     RootCommand {
         statement: usize,
     },
+    SqlProcedureBody {
+        routine_oid: i32,
+        definition_version: u64,
+    },
     SqlRoutineCallSite {
         routine_oid: i32,
         definition_version: u64,
@@ -46,6 +50,9 @@ pub(crate) enum Source {
         definition_version: u64,
         expression: usize,
     },
+    PlpgsqlAnonymousExpression {
+        expression: usize,
+    },
     UnlocatedRoutineBody {
         routine_oid: i32,
         definition_version: u64,
@@ -55,7 +62,11 @@ pub(crate) enum Source {
 impl Source {
     pub(crate) fn routine_definition(self) -> Option<(i32, u64)> {
         match self {
-            Self::SqlRoutineCallSite {
+            Self::SqlProcedureBody {
+                routine_oid,
+                definition_version,
+            }
+            | Self::SqlRoutineCallSite {
                 routine_oid,
                 definition_version,
                 ..
@@ -74,7 +85,9 @@ impl Source {
                 routine_oid,
                 definition_version,
             } => Some((routine_oid, definition_version)),
-            Self::RootCommand { .. } | Self::CreateRoutineValidation { .. } => None,
+            Self::RootCommand { .. }
+            | Self::CreateRoutineValidation { .. }
+            | Self::PlpgsqlAnonymousExpression { .. } => None,
         }
     }
 }

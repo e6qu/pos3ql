@@ -1120,6 +1120,9 @@ impl super::Storage {
         bindings: &[Binding<'_>],
         txid: u32,
     ) -> Result<SharedSlice<u8>, SqlError> {
+        if bindings.is_empty() {
+            return Ok(SharedSlice::EMPTY);
+        }
         for binding in bindings {
             if binding.end > source.len()
                 || !source.is_char_boundary(binding.start)

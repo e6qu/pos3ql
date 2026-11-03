@@ -76,6 +76,8 @@ impl CursorQuery {
         sql: &str,
         params: &[Datum],
         locals: &[CursorLocal],
+        inputs: &[crate::sql::type_inputs::Binding<'_>],
+        validate: impl FnOnce(&crate::sql::parser::Parser<'_>) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         self.clear();
         let full = query_full;
@@ -150,7 +152,19 @@ impl CursorQuery {
                 }
             }
         }
-        let statement = crate::sql::parser::parse_cursor_command(source, &self.arena, bindings)?;
+        let bytes = self
+            .arena
+            .alloc_slice_with(crate::sql::type_inputs::encoded_len(inputs)?, |_| 0u8)
+            .map_err(|_| full())?;
+        crate::sql::type_inputs::encode_into(inputs, bytes)?;
+        let inputs = crate::sql::type_inputs::decode(bytes, &self.arena)?;
+        let statement = crate::sql::parser::parse_cursor_command(
+            source,
+            &self.arena,
+            bindings,
+            inputs,
+            validate,
+        )?;
         let statement = match statement {
             Stmt::Select(select) => CursorStatement::Select(select),
             Stmt::SetQuery(query) => CursorStatement::SetQuery(query),
@@ -278,7 +292,13 @@ mod tests {
             value: Datum::Text(&text),
         }];
         crate::mem::guard::forbid_alloc(|| {
-            query.bind(&source, &[Datum::Text(&text), Datum::Record(&fields)], &[])
+            query.bind(
+                &source,
+                &[Datum::Text(&text), Datum::Record(&fields)],
+                &[],
+                &[],
+                |_| Ok(()),
+            )
         })
         .unwrap();
         source.clear();
@@ -303,7 +323,8 @@ mod tests {
             moved.with_query(|_, _, _| ()).unwrap_err().sqlstate,
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
         );
-        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[], &[])).unwrap();
+        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[], &[], &[], |_| Ok(())))
+            .unwrap();
         moved
             .with_query(|_, params, _| assert!(params.is_empty()))
             .unwrap();
@@ -319,7 +340,9 @@ mod tests {
         let types = [oid::DATE; 101];
         let params = [Datum::Null; 101];
         crate::mem::guard::forbid_alloc(|| {
-            with_bound_parameter_types(&types, || query.bind("SELECT $101", &params, &[]))
+            with_bound_parameter_types(&types, || {
+                query.bind("SELECT $101", &params, &[], &[], |_| Ok(()))
+            })
         })
         .unwrap();
         assert_eq!(bound_parameter_type_oid(101), None);
@@ -388,8 +411,10 @@ mod tests {
                 value: Datum::Bool(true),
             },
         ];
-        crate::mem::guard::forbid_alloc(|| query.bind("SELECT r.label, d, found", &[], &locals))
-            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            query.bind("SELECT r.label, d, found", &[], &locals, &[], |_| Ok(()))
+        })
+        .unwrap();
         text.clear();
         crate::mem::guard::forbid_alloc(|| {
             query.with_query(|statement, params, arena| {
@@ -441,7 +466,13 @@ mod tests {
             value: Datum::Record(&fields),
         };
         crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT $1, r.field255", &[Datum::Record(&fields)], &[local])
+            query.bind(
+                "SELECT $1, r.field255",
+                &[Datum::Record(&fields)],
+                &[local],
+                &[],
+                |_| Ok(()),
+            )
         })
         .unwrap();
         drop(fields);
@@ -509,6 +540,8 @@ mod tests {
                         type_oid: oid::DATE,
                         value: Datum::Null,
                     }],
+                    &[],
+                    |_| Ok(()),
                 )
                 .unwrap();
             query
@@ -567,21 +600,25 @@ mod tests {
         let mut query = CursorQuery::new(&mut budget, 4096).unwrap();
         assert_eq!(
             query
-                .bind("SELECT 1; SELECT 2", &[], &[])
+                .bind("SELECT 1; SELECT 2", &[], &[], &[], |_| Ok(()))
                 .unwrap_err()
                 .sqlstate,
             sqlstate::INVALID_CURSOR_DEFINITION
         );
         let wide = "x".repeat(8192);
-        let error = crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[])).unwrap_err();
-        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-        assert!(error.message.as_str().contains("cursor_query_bytes"));
         let error =
-            crate::mem::guard::forbid_alloc(|| query.bind("SELECT $1", &[Datum::Text(&wide)], &[]))
+            crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[], &[], |_| Ok(())))
                 .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
-        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[])).unwrap();
+        let error = crate::mem::guard::forbid_alloc(|| {
+            query.bind("SELECT $1", &[Datum::Text(&wide)], &[], &[], |_| Ok(()))
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("cursor_query_bytes"));
+        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[], &[], |_| Ok(())))
+            .unwrap();
     }
     #[test]
     fn cursor_owned_query_retains_domain_parameter_identity_without_borrowing_catalog() {
@@ -681,7 +718,9 @@ mod tests {
                     enter_routine_parameter_types(&formal, Some(&catalog)).unwrap()
                 };
                 assert_eq!(bound_parameter_type_oid(1), Some(123456));
-                query.bind("SELECT $1", &[Datum::Null], &[]).unwrap();
+                query
+                    .bind("SELECT $1", &[Datum::Null], &[], &[], |_| Ok(()))
+                    .unwrap();
                 drop(scope);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
                 let error = enter_routine_parameter_types(&formal, None)
@@ -713,7 +752,7 @@ mod tests {
             let values = vec!["1"; fields].join(",");
             let sql = format!("SELECT ROW((ROW({values})).*, 1)");
             crate::mem::guard::forbid_alloc(|| {
-                query.bind(&sql, &[], &[]).unwrap();
+                query.bind(&sql, &[], &[], &[], |_| Ok(())).unwrap();
                 query
                     .with_query(|statement, _, _| {
                         let CursorStatement::Select(select) = statement else {

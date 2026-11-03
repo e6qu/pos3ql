@@ -44,6 +44,7 @@ impl InputImage {
         arena: &'a Arena,
     ) -> Result<&'a [super::type_inputs::Binding<'a>], SqlError> {
         match self {
+            Self::Runtime(bytes) if bytes.is_empty() => Ok(&[]),
             Self::Runtime(bytes) => {
                 let bytes = arena
                     .alloc_slice_copy(bytes)

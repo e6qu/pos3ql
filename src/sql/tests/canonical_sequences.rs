@@ -525,7 +525,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
                     &mut session.transaction,
                     &mut session.pool,
                     &mut session.cursors,
-                    &mut session.guc,
+                    &session.guc,
                     &mut Responder::new(&mut session.send),
                     session.connection_id,
                     false,

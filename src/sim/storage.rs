@@ -205,7 +205,7 @@ impl World {
             &mut session.txn,
             &mut session.prepared,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut responder,
             1,
         );

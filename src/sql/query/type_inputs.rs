@@ -810,6 +810,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 arguments,
                 argument_names,
                 variadic,
+                ..
             } => {
                 let catalog = crate::sql::exec::CatalogCols {
                     definition: None,
@@ -956,6 +957,10 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             arena,
             outer,
             &mut |group, assignment_columns| {
+                let row = MetadataOnly {
+                    row: &row,
+                    columns: assignment_columns,
+                };
                 for assignment in group {
                     self.expression(assignment.expression, assignment_columns, &row)?;
                 }

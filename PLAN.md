@@ -61,6 +61,13 @@ PostgreSQL, including function settings and `check_function_bodies=off`.
 Keep completed inputs while rolling back and safely replaying the unfinished
 input within its original deadline. Demonstrate the complete behavior in CI
 before closing this acceptance item.
+Data-change trigger statements that need checked domain-array input currently
+raise `0A000` before running the constraint; event triggers have an engine-owned
+execution context. Finish a retained trigger continuation that preserves prior
+row changes, local variables, branch position and transition rows while input
+preparation waits. Verify that constraints see the preceding transaction and
+statement changes, run once, and do not fire in unreached branches. Do not route
+these checks through a retry that first undoes the rows they must observe.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

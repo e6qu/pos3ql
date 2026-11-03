@@ -41,7 +41,7 @@ pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
 mod routine_resolution;
-pub use routine_resolution::RoutineCallSelection;
+pub(crate) use routine_resolution::RoutineCallSelection;
 mod sequence_lifecycles;
 mod table_lifecycles;
 pub(crate) use query_lifecycles::{

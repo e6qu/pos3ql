@@ -5,6 +5,7 @@
 
 use crate::mem::arena::Arena;
 use crate::stack_format;
+pub use crate::storage::RoutineCallSelection;
 use crate::util::StackStr;
 
 use super::ast::{BinaryOp, CastBinding, Collation, Expr, GroupingSet, UnaryOp};

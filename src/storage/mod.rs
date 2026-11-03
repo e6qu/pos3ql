@@ -5391,6 +5391,15 @@ pub(crate) struct StoredQueryDefinition {
     pub dependencies: StoredQueryDependencies,
 }
 
+/// A resolved read keeps the durable literal coordinates separate from SQL
+/// whose enum names and labels have been refreshed for this reader.
+pub(crate) struct StoredQuerySnapshot<'a> {
+    pub sql: StackStr<VIEW_SQL_MAX>,
+    pub creation_path: StackStr<128>,
+    pub dependencies: StoredQueryDependencies,
+    pub input_source: Option<&'a str>,
+}
+
 /// Stored SQL must cross the same path boundary as a session assignment before
 /// publication. In particular, a fixed string's truncated prefix is not a path.
 pub(crate) fn validate_stored_search_path(path: &StackStr<128>) -> Result<(), SqlError> {
@@ -5891,6 +5900,12 @@ impl ViewColumns {
             .iter()
             .find(|entry| entry.column == index as u16)
             .map(|entry| &entry.default)
+    }
+
+    pub(crate) fn default_sql(&self, index: usize) -> Option<&str> {
+        self.default_at_ref(index)?
+            .expression()
+            .map(|source| source.as_str())
     }
 
     pub fn with_default(mut self, index: usize, default: ColumnDefault) -> Result<Self, SqlError> {
@@ -16701,8 +16716,32 @@ pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     }
     let mark = arena.mark();
     let result = (|| {
-        let namespaces =
-            crate::sql::parser::schema_namespace_sources(source.as_str(), kind, arena)?;
+        let parsed_source = if matches!(kind, crate::sql::parser::StoredSqlKind::Statements) {
+            crate::sql::enum_values::query_binding_source(source.as_str())?
+        } else {
+            source.as_str()
+        };
+        let prefix = source.as_str().len() - parsed_source.len();
+        let mut namespaces =
+            crate::sql::parser::schema_namespace_sources(parsed_source, kind, arena)?;
+        if prefix != 0 {
+            let positions = arena
+                .alloc_slice_copy(namespaces.namespaces)
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            for position in positions.iter_mut() {
+                position.start += prefix;
+                position.end += prefix;
+            }
+            let literals = arena
+                .alloc_slice_copy(namespaces.catalog_literals)
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            for literal in literals.iter_mut() {
+                literal.position.start += prefix;
+                literal.position.end += prefix;
+            }
+            namespaces.namespaces = positions;
+            namespaces.catalog_literals = literals;
+        }
         rewrite_schema_sql_tokens(
             source,
             spans,
@@ -22964,7 +23003,7 @@ impl Storage {
                 .lock()
                 .expect("type catalog lock poisoned");
             for source_slot in 0..type_catalog.domains.len() {
-                let mut definition = type_catalog.domains[source_slot];
+                let mut definition = type_catalog.domains[source_slot].clone();
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
                 {
                     continue;
@@ -39868,12 +39907,12 @@ impl Storage {
         usize::from(self.view(slot).return_rule)
     }
 
-    pub(crate) fn snapshot_view_query(
+    pub(crate) fn snapshot_view_query<'a>(
         &self,
         slot: usize,
         txid: u32,
-        arena: &crate::mem::arena::Arena,
-    ) -> Result<StoredQueryDefinition, SqlError> {
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<StoredQuerySnapshot<'a>, SqlError> {
         let mut query = {
             let catalog = self.view_rule_catalog();
             let rule_slot = catalog.views[slot].return_rule;
@@ -39902,7 +39941,7 @@ impl Storage {
         };
         let user = crate::sql::eval::funcs::system::session_user_owned();
         let path = self.compute_path(query.creation_path.as_str(), user.as_str(), txid);
-        query.sql = crate::sql::enum_values::resolve_query(
+        let resolved = crate::sql::enum_values::resolve_query(
             query.sql.as_str(),
             self,
             txid,
@@ -39910,7 +39949,24 @@ impl Storage {
             &mut query.dependencies,
             arena,
         )?;
-        Ok(query)
+        let original = crate::sql::enum_values::query_binding_source(query.sql.as_str())?;
+        let input_source: Option<&'a str> = if original != resolved.as_str()
+            && !query.dependencies.type_inputs().bytes().is_empty()
+        {
+            Some(
+                arena
+                    .alloc_str(original)
+                    .map_err(|_| crate::sql::query::arena_full_pub())?,
+            )
+        } else {
+            None
+        };
+        Ok(StoredQuerySnapshot {
+            sql: resolved,
+            creation_path: query.creation_path,
+            dependencies: query.dependencies,
+            input_source,
+        })
     }
 
     pub(crate) fn view_sql(&self, slot: usize) -> StackStr<VIEW_SQL_MAX> {
@@ -42895,6 +42951,17 @@ impl Storage {
         let (mut permissions, mut catalog) = self.type_creation_catalogs();
         if !defer_manifest_binding {
             catalog.bind_domain_spec(self, &mut spec, txid)?;
+            self.validate_definition_type_inputs(
+                &spec.default_inputs,
+                |section| {
+                    (section == StoredInputSection::DomainDefault)
+                        .then_some(spec.default_expr.as_ref())
+                        .flatten()
+                        .map(|text| text.as_str())
+                },
+                txid,
+                Some(&catalog),
+            )?;
         }
         self.require_named_type_name(&catalog, schema, name, txid, None)?;
         let Some(new) = catalog.domains.iter().enumerate().position(|(slot, d)| {
@@ -43069,6 +43136,17 @@ impl Storage {
             if definition.database != current_database || !definition.visible_to(txid) {
                 continue;
             }
+            self.validate_definition_type_inputs(
+                &definition.default_inputs,
+                |section| {
+                    (section == StoredInputSection::DomainDefault)
+                        .then_some(definition.default_expr.as_ref())
+                        .flatten()
+                        .map(|text| text.as_str())
+                },
+                txid,
+                Some(&catalog),
+            )?;
             for parent in [true, false] {
                 let name = if parent {
                     definition.base_domain
@@ -43201,6 +43279,17 @@ impl Storage {
         }
         catalog.validate_type_edit(target, txid)?;
         catalog.bind_domain_spec(self, &mut spec, txid)?;
+        self.validate_definition_type_inputs(
+            &spec.default_inputs,
+            |section| {
+                (section == StoredInputSection::DomainDefault)
+                    .then_some(spec.default_expr.as_ref())
+                    .flatten()
+                    .map(|text| text.as_str())
+            },
+            txid,
+            Some(&catalog),
+        )?;
         let version = catalog.versions.next()?;
         let origin = catalog.origin;
         let domain = &mut catalog.domains[slot];
@@ -44712,6 +44801,12 @@ impl Storage {
             type_contracts::CatalogPublicationInput::ViewDefinition,
             None,
         );
+        self.validate_view_default_inputs(
+            &definition.columns,
+            &definition.default_inputs,
+            txid,
+            owners.types.as_deref(),
+        )?;
         let catalog = &mut owners.catalog;
         if let Some(blocker) = catalog.views.iter().find_map(|v| {
             (v.database == current_database()
@@ -53446,6 +53541,11 @@ impl Storage {
             self.validate_rule_edit(&catalog, selected_target, txid)?;
             catalog.rules[slot]
         };
+        let mut schema_dependencies = if let RuleMetadataChange::Schema { arena, .. } = change {
+            Some(self.snapshot_rule_dependencies(slot, txid, arena)?)
+        } else {
+            None
+        };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -53482,6 +53582,39 @@ impl Storage {
                 rename_schema_path(&mut definition.creation_path, old, new)?;
                 definition.rename_schema(old, new, arena)?;
             }
+        }
+        if let RuleMetadataChange::Schema {
+            old: from,
+            new: to,
+            arena,
+        } = change
+        {
+            let dependencies = schema_dependencies
+                .as_mut()
+                .expect("schema image captured before catalog locks");
+            dependencies.rename_schema(from, to);
+            let inputs = self.relocate_stored_type_inputs(
+                dependencies.type_inputs(),
+                |section| {
+                    let (source, replacement) = match section {
+                        StoredInputSection::RuleSource => {
+                            (old.source.as_str(), definition.source.as_str())
+                        }
+                        StoredInputSection::Query if old.is_view_return() => {
+                            (old.action_sql().next()?, definition.action_sql().next()?)
+                        }
+                        _ => return None,
+                    };
+                    Some((
+                        source,
+                        replacement,
+                        crate::sql::parser::StoredSqlKind::Statements,
+                    ))
+                },
+                dependencies.view(),
+                arena,
+            )?;
+            dependencies.set_type_inputs(inputs);
         }
         if owners
             .catalog
@@ -53540,24 +53673,22 @@ impl Storage {
         }
         let previous = prior.map(|pending| pending.dependency_slot);
         let version = self.catalog_sequence.next()?;
-        let dependency_slot = owners.allocate_preserved_query_image(
-            self,
-            StoredQueryDependencyOwner::Rule(slot as u16),
-            previous,
-            txid,
-        )?;
-        if let RuleMetadataChange::Schema { old, new, .. } = change {
-            let count = owners.dependencies.pending[dependency_slot as usize].count;
-            rename_dependency_schema(
-                owners.dependencies.image_mut(
-                    self.stored_query_dependency_pending_base + dependency_slot as usize,
-                    count,
-                    self.stored_query_dependencies_per_image,
-                ),
-                old,
-                new,
-            );
-        }
+        let dependency_slot = if let Some(dependencies) = schema_dependencies.as_ref() {
+            owners.allocate_query_image(
+                self,
+                StoredQueryDependencyOwner::Rule(slot as u16),
+                previous,
+                dependencies.view(),
+                txid,
+            )?
+        } else {
+            owners.allocate_preserved_query_image(
+                self,
+                StoredQueryDependencyOwner::Rule(slot as u16),
+                previous,
+                txid,
+            )?
+        };
         owners.catalog.rules[slot].pending = Some(PendingRuleDefinition {
             txid,
             version,

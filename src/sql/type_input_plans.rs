@@ -58,11 +58,18 @@ impl InputImage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Owner {
     Transient { generation: u64, statement: usize },
+    Dynamic { epoch: u64, generation: u64 },
     ProtocolPrepared(u64),
     SqlPrepared(u64),
     Backend,
     Unlocated,
     Nested(PlanId),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DynamicCommandKind {
+    Statement,
+    Cursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,8 +270,9 @@ impl RoutineInputPlans {
                     State::Preparing { key, .. } | State::Ready { key, .. } => key,
                     State::Vacant => return None,
                 };
-                matches!(key.owner, Owner::Transient { generation: found, .. } if found == generation)
-                    .then_some(key.owner)
+                matches!(key.owner, Owner::Transient { generation: found, .. }
+                    | Owner::Dynamic { epoch: found, .. } if found == generation)
+                .then_some(key.owner)
             });
             let Some(owner) = owner else {
                 break;
@@ -297,6 +305,11 @@ fn stale() -> SqlError {
 
 thread_local! {
     static OWNER: core::cell::Cell<Option<Owner>> = const { core::cell::Cell::new(None) };
+    static ACTIVE_PLANS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+pub(crate) fn has_active_plan() -> bool {
+    ACTIVE_PLANS.with(core::cell::Cell::get) != 0
 }
 
 pub(crate) fn owner() -> Result<Owner, SqlError> {
@@ -309,12 +322,150 @@ pub(crate) fn owner() -> Result<Owner, SqlError> {
 }
 
 pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Owner>);
+    struct Restore {
+        owner: Option<Owner>,
+        depth: usize,
+    }
     impl Drop for Restore {
         fn drop(&mut self) {
-            OWNER.with(|owner| owner.set(self.0));
+            OWNER.with(|owner| owner.set(self.owner));
+            ACTIVE_PLANS.with(|active| active.set(self.depth));
         }
     }
-    let _restore = Restore(OWNER.with(|active| active.replace(Some(owner))));
+    let depth = ACTIVE_PLANS.with(core::cell::Cell::get);
+    let _restore = Restore {
+        owner: OWNER.with(|active| active.replace(Some(owner))),
+        depth,
+    };
+    if matches!(owner, Owner::Nested(_)) {
+        ACTIVE_PLANS.with(|active| {
+            active.set(
+                depth
+                    .checked_add(1)
+                    .expect("plan depth fits the call stack"),
+            )
+        });
+    }
     run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::lease_pool::{LeasePool, Purpose};
+
+    fn source(callsite: usize) -> Source {
+        Source::SqlRoutineCallSite {
+            routine_oid: 100_001,
+            definition_version: 7,
+            callsite,
+        }
+    }
+
+    #[test]
+    fn plan_inputs_keep_payloads_after_parent_retirement_and_pool_owner_drop() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 2;
+        let mut budget = Budget::new(
+            RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(1024, 4) + 4096,
+        );
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 1024, 4).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let arena = Arena::new(&mut budget, "retained plan values", 4096).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        let root = Key {
+            owner: Owner::ProtocolPrepared(11),
+            source: source(7),
+        };
+        let (retained, old_child) = crate::mem::guard::forbid_alloc(|| {
+            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let parent = plans.reserve(root).unwrap();
+            plans
+                .complete(parent, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let child = Key {
+                owner: Owner::Nested(parent),
+                source: source(31),
+            };
+            let child_id = plans.reserve(child).unwrap();
+            plans
+                .complete(child_id, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let Some(Lookup::Ready(_, retained)) = plans.find(root).unwrap() else {
+                panic!("ready root")
+            };
+            plans.retire(root.owner);
+            assert!(plans.find(root).unwrap().is_none());
+            assert!(plans.find(child).is_err());
+            assert!(retained.bindings(&arena).unwrap().is_empty());
+            let replacement = plans.reserve(root).unwrap();
+            assert_ne!(replacement, parent);
+            assert!(
+                plans
+                    .complete(child_id, InputImage::Runtime(bytes.clone()))
+                    .is_err()
+            );
+            plans
+                .complete(replacement, InputImage::Runtime(bytes))
+                .unwrap();
+            (retained, child_id)
+        });
+        drop(pool);
+        drop(plans);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(retained.bindings(&arena).unwrap().is_empty());
+            assert_ne!(old_child.generation, 0);
+            drop(retained);
+        });
+    }
+
+    #[test]
+    fn input_plan_exhaustion_and_waits_preserve_ready_owners_and_exact_identities() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 2;
+        let mut budget = Budget::new(
+            RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(1024, 4),
+        );
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 1024, 4).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = Key {
+                owner: Owner::SqlPrepared(3),
+                source: source(0),
+            };
+            let second = Key {
+                owner: Owner::SqlPrepared(3),
+                source: source(10),
+            };
+            let parent = plans.reserve(first).unwrap();
+            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            plans.complete(parent, InputImage::Runtime(bytes)).unwrap();
+            let waiting = plans.reserve(second).unwrap();
+            assert_eq!(
+                plans.find(second).err().unwrap().sqlstate,
+                sqlstate::OBJECT_IN_USE
+            );
+            plans.set_waiting(waiting, true).unwrap();
+            assert!(
+                matches!(plans.find(second).unwrap(), Some(Lookup::Waiting(found)) if found == waiting)
+            );
+            let third = Key {
+                owner: Owner::SqlPrepared(3),
+                source: source(20),
+            };
+            assert_eq!(
+                plans.reserve(third).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert!(
+                matches!(plans.find(first).unwrap(), Some(Lookup::Ready(found, _)) if found == parent)
+            );
+            plans.abandon(waiting).unwrap();
+            let replacement = plans.reserve(third).unwrap();
+            assert_ne!(replacement, waiting);
+            assert!(plans.set_waiting(waiting, false).is_err());
+            plans.clear();
+            assert!(plans.find(first).unwrap().is_none());
+        });
+    }
 }

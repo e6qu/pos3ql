@@ -1,5 +1,148 @@
 use super::*;
 
+#[test]
+// PostgreSQL 18.6 reference SQL SHA256:
+// 143cf93eb9053325deab30b35e325ed0f56f4855a849e31f5cd22ab1e83d68a7.
+fn stored_query_inputs_follow_enum_resolution_and_schema_edits_without_rechecking() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for checkpoint in [false, true] {
+            let mut config = test_config(&format!("resolved-input-sources-{mode:?}-{checkpoint}"));
+            config.transaction_mode = mode;
+            let server = object_reads::HttpObjectServer::start(&mut config);
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(&mut engine,
+                "CREATE SEQUENCE source_input_checks; CREATE SCHEMA input_sources; \
+                 CREATE TYPE input_sources.choice AS ENUM('a','b'); \
+                 CREATE DOMAIN input_sources.checked AS input_sources.choice \
+                   CHECK(nextval('source_input_checks')>0); \
+                 CREATE VIEW bound_source_view AS SELECT 'a'::input_sources.choice AS label, \
+                   '{b}'::input_sources.checked[] AS value; \
+                 CREATE TABLE bound_source_defaults(id integer,value input_sources.checked[] DEFAULT '{a}'); \
+                 INSERT INTO bound_source_defaults(id) VALUES(1),(2)", true);
+            assert_eq!(data_rows(&session.success(&mut engine,
+                "SELECT label,value::text FROM bound_source_view; SELECT last_value FROM source_input_checks", true)),
+                ["a|{b}", "2"]);
+            session.success(
+                &mut engine,
+                "ALTER TYPE input_sources.choice RENAME VALUE 'a' TO 'longer_label'",
+                true,
+            );
+            session.success(
+                &mut engine,
+                "BEGIN; ALTER SCHEMA input_sources RENAME TO transient_input_sources; ROLLBACK; \
+                 ALTER SCHEMA input_sources RENAME TO retained_input_sources; \
+                 INSERT INTO bound_source_defaults(id) VALUES(3)",
+                true,
+            );
+            let verify = "SELECT label,value::text FROM bound_source_view; \
+                          SELECT value::text FROM bound_source_defaults; \
+                          SELECT last_value FROM source_input_checks";
+            assert_eq!(
+                data_rows(&session.success(&mut engine, verify, true)),
+                [
+                    "longer_label|{b}",
+                    "{longer_label}",
+                    "{longer_label}",
+                    "{longer_label}",
+                    "2"
+                ]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+            drop((session, engine));
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut reader = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            assert_eq!(
+                data_rows(&reader.success(&mut recovered, verify, true)),
+                [
+                    "longer_label|{b}",
+                    "{longer_label}",
+                    "{longer_label}",
+                    "{longer_label}",
+                    "2"
+                ]
+            );
+            drop((reader, recovered));
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            drop(server);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}
+
+#[test]
+fn domain_and_view_defaults_retain_checked_inputs_across_edits_and_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("default-input-owners-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE default_checks; CREATE TABLE default_audit(value text); \
+             CREATE TYPE default_choice AS ENUM('a','b'); \
+             CREATE FUNCTION check_default(value default_choice) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+               PERFORM nextval('default_checks'); INSERT INTO default_audit VALUES(value::text); RETURN true; END$$; \
+             CREATE DOMAIN default_checked AS default_choice CHECK(check_default(VALUE)); \
+             CREATE DOMAIN default_array AS default_checked[] DEFAULT '{a}'; \
+             CREATE TABLE domain_defaults(id integer,value default_array); \
+             CREATE TABLE view_default_values(id integer,value default_checked[]); \
+             CREATE VIEW owner_defaults AS SELECT id,value FROM view_default_values; \
+             ALTER VIEW owner_defaults ALTER COLUMN value SET DEFAULT '{a}'", true);
+        let counter = "SELECT currval('default_checks'),count(*) FROM default_audit";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["2|2"]
+        );
+        session.success(
+            &mut engine,
+            "INSERT INTO domain_defaults(id) VALUES(1),(2); \
+             INSERT INTO owner_defaults(id) VALUES(1),(2); \
+             CREATE OR REPLACE VIEW owner_defaults AS SELECT id,value FROM view_default_values; \
+             INSERT INTO owner_defaults(id) VALUES(3)",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["2|2"]
+        );
+        session.success(&mut engine,
+            "BEGIN; SAVEPOINT previous_defaults; \
+             ALTER DOMAIN default_array SET DEFAULT '{b}'; \
+             ALTER VIEW owner_defaults ALTER COLUMN value SET DEFAULT '{b}'; \
+             INSERT INTO domain_defaults(id) VALUES(3); INSERT INTO owner_defaults(id) VALUES(4); \
+             ROLLBACK TO previous_defaults; \
+             INSERT INTO domain_defaults(id) VALUES(4); INSERT INTO owner_defaults(id) VALUES(5); COMMIT", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["4|2"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT id,value::text FROM domain_defaults ORDER BY id; \
+             SELECT id,value::text FROM owner_defaults ORDER BY id",
+                true
+            )),
+            [
+                "1|{a}", "2|{a}", "4|{a}", "1|{a}", "2|{a}", "3|{a}", "5|{a}"
+            ]
+        );
+    }
+}
+
 // PostgreSQL 18.6 PREPARE reference SQL SHA256:
 // daf5154b24ffeb86c7deae60b70570fa4bef142d2865b12b9c93d650e32c77a5.
 #[test]
@@ -196,7 +339,7 @@ fn routine_input_binding_uses_its_owner_and_settings_then_restores_the_caller() 
              CREATE FUNCTION public.input_scope_rows() RETURNS SETOF integer LANGUAGE sql SECURITY DEFINER \
                SET search_path TO input_context,pg_catalog SET application_name TO 'routine-input' \
                AS 'SELECT cardinality(''{a}''::checked[])'; \
-             REVOKE ALL ON SCHEMA input_context FROM PUBLIC; \
+             TRUNCATE input_context.audit; REVOKE ALL ON SCHEMA input_context FROM PUBLIC; \
              SET search_path TO public; SET application_name TO 'caller-input'; SET ROLE input_context_caller", true);
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT public.input_scope_scalar(),current_user,current_schema(),current_setting('application_name')", true)),

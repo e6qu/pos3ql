@@ -407,7 +407,7 @@ impl Storage {
                         &seen,
                         &mut owned,
                     )?;
-                    if let Some(pending) = domain.pending_definition {
+                    if let Some(pending) = &domain.pending_definition {
                         validate_window(
                             pending.spec.constraint_identities(),
                             domain.created_at,

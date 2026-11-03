@@ -258,7 +258,7 @@ wal_record_kinds! {
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
 const TABLE_DEF_PAYLOAD_VERSION: u8 = 15;
-const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 3;
+const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -329,6 +329,17 @@ fn take_column_set(payload: &[u8], at: &mut usize) -> Option<ColumnSet> {
     Some(columns)
 }
 
+fn take_stored_type_inputs<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+    let length =
+        u32::from_le_bytes(payload.get(*at..at.checked_add(4)?)?.try_into().ok()?) as usize;
+    *at += 4;
+    let end = at.checked_add(length)?;
+    let bytes = payload.get(*at..end)?;
+    crate::storage::StoredTypeInputs::validate_encoded(bytes).ok()?;
+    *at = end;
+    Some(bytes)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WalColumnSets<'a> {
     Captured(&'a [ColumnSet]),
@@ -391,25 +402,36 @@ impl WalColumnSets<'_> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WalViewColumns<'a> {
-    Captured(&'a crate::storage::ViewColumns),
-    Encoded { bytes: &'a [u8], wide_count: bool },
+    Captured {
+        columns: &'a crate::storage::ViewColumns,
+        default_inputs: &'a crate::storage::StoredTypeInputs,
+    },
+    Encoded {
+        bytes: &'a [u8],
+        wide_count: bool,
+    },
 }
 
-impl WalViewColumns<'_> {
+impl<'a> WalViewColumns<'a> {
     fn encoded_len(self) -> usize {
         match self {
-            Self::Captured(columns) => {
-                3 + columns
-                    .names()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| {
-                        1 + name.as_str().len()
-                            + encoded_view_default_len(
-                                columns.default_at(index).expect("view column exists"),
-                            )
-                    })
-                    .sum::<usize>()
+            Self::Captured {
+                columns,
+                default_inputs,
+            } => {
+                3 + 4
+                    + default_inputs.bytes().len()
+                    + columns
+                        .names()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            1 + name.as_str().len()
+                                + encoded_view_default_len(
+                                    columns.default_at(index).expect("view column exists"),
+                                )
+                        })
+                        .sum::<usize>()
             }
             Self::Encoded {
                 bytes,
@@ -424,7 +446,10 @@ impl WalViewColumns<'_> {
 
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
-            Self::Captured(columns) => append_view_columns(buffer, columns),
+            Self::Captured {
+                columns,
+                default_inputs,
+            } => append_view_columns(buffer, columns, default_inputs.bytes()),
             Self::Encoded {
                 bytes,
                 wide_count: true,
@@ -433,16 +458,53 @@ impl WalViewColumns<'_> {
                 bytes: _,
                 wide_count: false,
             } => self
-                .materialize()
-                .is_some_and(|columns| append_view_columns(buffer, &columns)),
+                .decode()
+                .is_some_and(|(columns, inputs)| append_view_columns(buffer, &columns, inputs)),
         }
     }
 
-    pub(crate) fn materialize(self) -> Option<crate::storage::ViewColumns> {
+    fn decode(self) -> Option<(crate::storage::ViewColumns, &'a [u8])> {
         match self {
-            Self::Captured(columns) => Some(*columns),
+            Self::Captured {
+                columns,
+                default_inputs,
+            } => Some((*columns, default_inputs.bytes())),
             Self::Encoded { bytes, wide_count } => decode_view_columns(bytes, wide_count),
         }
+    }
+
+    pub(crate) fn materialize(
+        self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<
+        (
+            crate::storage::ViewColumns,
+            crate::storage::StoredTypeInputs,
+        ),
+        SqlError,
+    > {
+        if let Self::Captured {
+            columns,
+            default_inputs,
+        } = self
+        {
+            return Ok((*columns, default_inputs.clone()));
+        }
+        let (columns, bytes) = self
+            .decode()
+            .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "corrupt view column image"))?;
+        let inputs = storage.restore_definition_type_inputs(
+            bytes,
+            |section| {
+                let crate::storage::StoredInputSection::ViewDefault(attribute) = section else {
+                    return None;
+                };
+                columns.default_sql(usize::from(attribute) - 1)
+            },
+            txid,
+        )?;
+        Ok((columns, inputs))
     }
 }
 
@@ -3941,6 +4003,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n += def.constraint_identities().count()
                 * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+            n += 4 + def.default_inputs.bytes().len();
             n
         }
         WalOp::RestoreDomain(payload)
@@ -5962,7 +6025,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 };
                 ok &= buffer.append(&identity.to_le_bytes());
             }
-            ok
+            let inputs = def.default_inputs.bytes();
+            ok && u32::try_from(inputs.len()).is_ok()
+                && buffer.append(&(inputs.len() as u32).to_le_bytes())
+                && buffer.append(inputs)
         }
         WalOp::RestoreDomain(payload)
         | WalOp::RestoreTypedDomain(payload)
@@ -7569,8 +7635,10 @@ pub(crate) fn decode_table_payload(
     definition
 }
 
-pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<(u16, crate::storage::DomainDef)> {
-    let mut definition = crate::storage::DomainDef::EMPTY;
+pub(crate) fn decode_domain_payload(
+    payload: &[u8],
+) -> Option<(u16, crate::storage::DomainDef, &[u8])> {
+    let mut definition = None;
     decode_op_inner(
         KIND_CREATE_DOMAIN,
         payload,
@@ -7579,9 +7647,11 @@ pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<(u16, crate::stora
             ..WalDecodeOutput::NONE
         },
     )?;
+    let (definition, inputs) = definition?;
     Some((
         u16::from_le_bytes(payload.get(..2)?.try_into().ok()?),
         definition,
+        inputs,
     ))
 }
 
@@ -7697,7 +7767,7 @@ struct WalDecodeOutput<'output, 'payload> {
             &'payload [u8],
         )>,
     >,
-    domain: Option<&'output mut crate::storage::DomainDef>,
+    domain: Option<&'output mut Option<(crate::storage::DomainDef, &'payload [u8])>>,
     routine: Option<
         &'output mut Option<(
             crate::storage::CatalogPosition,
@@ -8573,6 +8643,7 @@ fn decode_op_inner<'a>(
                 take_name(&mut at)?;
                 decode_view_default(payload, &mut at)?;
             }
+            take_stored_type_inputs(payload, &mut at)?;
             let columns = WalViewColumns::Encoded {
                 bytes: payload.get(columns_start..at)?,
                 wide_count: wide_columns,
@@ -8682,6 +8753,7 @@ fn decode_op_inner<'a>(
                 take_name(&mut at)?;
                 decode_view_default(payload, &mut at)?;
             }
+            take_stored_type_inputs(payload, &mut at)?;
             let columns = WalViewColumns::Encoded {
                 bytes: payload.get(columns_start..at)?,
                 wide_count: wide_columns,
@@ -10295,6 +10367,7 @@ fn decode_op_inner<'a>(
             } else {
                 None
             };
+            let inputs = take_stored_type_inputs(payload, &mut at)?;
             if at != payload.len() {
                 return None;
             }
@@ -10312,6 +10385,7 @@ fn decode_op_inner<'a>(
                 not_null_name,
                 not_null_identity,
                 default_expr,
+                default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                 checks,
                 n_checks,
                 pending_definition: None,
@@ -10328,7 +10402,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             if let Some(output) = decoded_domain {
-                *output = definition;
+                *output = Some((definition, inputs));
             }
             Some(if kind == KIND_CREATE_DOMAIN_TYPED {
                 WalOp::RestoreTypedDomain(payload)
@@ -12214,7 +12288,11 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
     }
 }
 
-fn append_view_columns(buffer: &mut FixedBuf, columns: &crate::storage::ViewColumns) -> bool {
+fn append_view_columns(
+    buffer: &mut FixedBuf,
+    columns: &crate::storage::ViewColumns,
+    default_inputs: &[u8],
+) -> bool {
     buffer.append(&(columns.len() as u16).to_le_bytes())
         && buffer.append(&[u8::from(columns.has_aliases())])
         && columns.names().iter().enumerate().all(|(index, name)| {
@@ -12226,9 +12304,15 @@ fn append_view_columns(buffer: &mut FixedBuf, columns: &crate::storage::ViewColu
                     columns.default_at(index).expect("view column exists"),
                 )
         })
+        && u32::try_from(default_inputs.len()).is_ok()
+        && buffer.append(&(default_inputs.len() as u32).to_le_bytes())
+        && buffer.append(default_inputs)
 }
 
-fn decode_view_columns(payload: &[u8], wide_count: bool) -> Option<crate::storage::ViewColumns> {
+fn decode_view_columns(
+    payload: &[u8],
+    wide_count: bool,
+) -> Option<(crate::storage::ViewColumns, &[u8])> {
     let (count, mut at) = if wide_count {
         let count = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?) as usize;
         (count, 2)
@@ -12264,6 +12348,7 @@ fn decode_view_columns(payload: &[u8], wide_count: bool) -> Option<crate::storag
             default_count += 1;
         }
     }
+    let inputs = take_stored_type_inputs(payload, &mut at)?;
     if at != payload.len() {
         return None;
     }
@@ -12275,7 +12360,7 @@ fn decode_view_columns(payload: &[u8], wide_count: bool) -> Option<crate::storag
             .with_default(default_indexes[index], defaults[index])
             .ok()?;
     }
-    Some(columns)
+    Some((columns, inputs))
 }
 
 fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDefault) -> bool {
@@ -14241,7 +14326,10 @@ mod tests {
                     identity: crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
                     schema: "public",
                     name: "states",
-                    columns: WalViewColumns::Captured(&columns),
+                    columns: WalViewColumns::Captured {
+                        columns: &columns,
+                        default_inputs: &crate::storage::StoredTypeInputs::EMPTY,
+                    },
                     sql: "pos3ql-bound-query-v1\nSELECT /*p3e:0:0*/'old'::state",
                     path: "public",
                     security_invoker: false,
@@ -14316,7 +14404,7 @@ mod tests {
                             panic!("expected typed view");
                         };
                         assert_eq!(
-                            decoded_columns.materialize().unwrap().default_at(0),
+                            decoded_columns.decode().unwrap().0.default_at(0),
                             columns.default_at(0)
                         );
                     }
@@ -14358,7 +14446,7 @@ mod tests {
                 let decoded = decode_op(KIND_CREATE_DOMAIN_TYPED, payload.readable()).unwrap();
                 assert_eq!(op_kind(&decoded), KIND_CREATE_DOMAIN_TYPED);
                 assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
-                let (_, definition) = decode_domain_payload(payload.readable()).unwrap();
+                let (_, definition, _) = decode_domain_payload(payload.readable()).unwrap();
                 let ColType::Array(rebound) = definition.base else {
                     panic!("expected array base");
                 };
@@ -14382,7 +14470,7 @@ mod tests {
             assert_eq!(op_kind(&operation), KIND_CREATE_DOMAIN_TYPED);
             assert!(append_payload(&mut payload, &operation));
             assert!(decode_op(KIND_CREATE_DOMAIN, payload.readable()).is_none());
-            let (_, decoded) = decode_domain_payload(payload.readable()).unwrap();
+            let (_, decoded, _) = decode_domain_payload(payload.readable()).unwrap();
             assert_eq!(decoded.default_expr, domain.default_expr);
             payload.clear();
             assert!(append_view_default(
@@ -15067,7 +15155,7 @@ mod tests {
                     format!("{lsn}:CreateTable({definition:?})")
                 }
                 WalOp::RestoreDomain(payload) => {
-                    let (_, definition) = decode_domain_payload(payload).unwrap();
+                    let (_, definition, _) = decode_domain_payload(payload).unwrap();
                     format!("{lsn}:CreateDomain({definition:?})")
                 }
                 operation => format!("{lsn}:{operation:?}"),
@@ -15703,7 +15791,10 @@ mod tests {
                     identity,
                     schema: "public",
                     name: "retained_view",
-                    columns: WalViewColumns::Captured(&columns),
+                    columns: WalViewColumns::Captured {
+                        columns: &columns,
+                        default_inputs: &crate::storage::StoredTypeInputs::EMPTY
+                    },
                     sql: "SELECT 1 AS value",
                     path: "public",
                     security_invoker: false,
@@ -15816,7 +15907,10 @@ mod tests {
                 identity: crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap(),
                 schema: "public",
                 name: "reader_view",
-                columns: WalViewColumns::Captured(&create_columns),
+                columns: WalViewColumns::Captured {
+                    columns: &create_columns,
+                    default_inputs: &crate::storage::StoredTypeInputs::EMPTY
+                },
                 sql: "SELECT * FROM protected",
                 path: "public",
                 security_invoker: true,
@@ -15840,7 +15934,7 @@ mod tests {
             identity,
             crate::storage::ViewCatalogIdentity::new(0, 7, 0, 8).unwrap()
         );
-        let columns = columns.materialize().unwrap();
+        let (columns, _) = columns.decode().unwrap();
         assert!(security_invoker);
         assert_eq!(security_barrier, 1);
         assert_eq!(check_option, 2);
@@ -15872,7 +15966,10 @@ mod tests {
             &WalOp::SetViewColumns {
                 schema: "public",
                 name: "reader_view",
-                columns: WalViewColumns::Captured(&columns),
+                columns: WalViewColumns::Captured {
+                    columns: &columns,
+                    default_inputs: &crate::storage::StoredTypeInputs::EMPTY
+                },
             },
         ));
         let Some(WalOp::SetViewColumns { columns, .. }) =
@@ -15880,7 +15977,7 @@ mod tests {
         else {
             panic!("view-column payload did not decode");
         };
-        let columns = columns.materialize().unwrap();
+        let (columns, _) = columns.decode().unwrap();
         assert!(columns.has_aliases());
         assert_eq!(columns.names()[0].as_str(), "published_value");
         assert!(matches!(
@@ -16950,7 +17047,7 @@ mod tests {
             else {
                 panic!("expected encoded domain image");
             };
-            let (_, decoded) = decode_domain_payload(encoded).unwrap();
+            let (_, decoded, _) = decode_domain_payload(encoded).unwrap();
             assert_eq!(decoded.schema, definition.schema);
             assert_eq!(decoded.name, definition.name);
             assert_eq!(decoded.base, definition.base);
@@ -16962,6 +17059,138 @@ mod tests {
                 assert_eq!(actual.validation, expected.validation);
             }
             assert!(decode_domain_payload(&encoded[..encoded.len() - 1]).is_none());
+        });
+    }
+
+    #[test]
+    fn domain_and_view_default_inputs_round_trip_without_rebinding_or_heap_allocation() {
+        use crate::mem::{
+            arena::Arena,
+            lease_pool::{LeasePool, Purpose},
+        };
+        use crate::sql::{
+            type_inputs::{Binding, InputKind},
+            types::{ArrElem, Datum},
+        };
+        use crate::storage::{StoredInputSection, StoredInputSource, StoredTypeInputs};
+        let mut budget = Budget::new(32768);
+        let arena = Arena::new(&mut budget, "default codec scratch", 8192).unwrap();
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 2048, 4).unwrap();
+        let mut payload = FixedBuf::new(&mut budget, "default codec payload", 8192).unwrap();
+        let source = "'{41}'::integer[]";
+        crate::mem::guard::forbid_alloc(|| {
+            let raw = crate::sql::array::build(&[Datum::Int4(41)], &arena).unwrap();
+            let encoded = crate::sql::exec::encode_projected_pub(
+                &[Datum::Array {
+                    element: ArrElem::Int4,
+                    raw,
+                }],
+                &arena,
+            )
+            .unwrap();
+            let input = Binding {
+                kind: InputKind::ExplicitCast,
+                start: 0,
+                end: source.len(),
+                type_oid: ColType::Array(ArrElem::Int4).oid(),
+                type_mod: -1,
+                collation: None,
+                encoded,
+            };
+            let dependencies = crate::storage::StoredQueryDependencyView::new(&[]);
+            let domain_inputs = StoredTypeInputs::from_sources(
+                &[StoredInputSource {
+                    section: StoredInputSection::DomainDefault,
+                    sql: source,
+                    bindings: &[input],
+                }],
+                dependencies,
+                &pool,
+            )
+            .unwrap();
+            let domain = crate::storage::DomainDef {
+                schema: SqlName::parse("public").unwrap(),
+                name: SqlName::parse("default_array").unwrap(),
+                created_at: 1,
+                base: ColType::Array(ArrElem::Int4),
+                default_expr: Some(StackStr::from_str(source)),
+                default_inputs: domain_inputs,
+                ..crate::storage::DomainDef::EMPTY
+            };
+            let operation = WalOp::CreateDomain(0, &domain);
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), encoded_payload_len(&operation));
+            let (_, decoded, inputs) = decode_domain_payload(payload.readable()).unwrap();
+            assert_eq!(decoded.default_expr, domain.default_expr);
+            assert_eq!(inputs, domain.default_inputs.bytes());
+            let missing = payload.len() - inputs.len() - 4;
+            assert!(decode_domain_payload(&payload.readable()[..missing]).is_none());
+            let version = 2 + 8 + 1 + domain.name.as_str().len() + 1 + domain.schema.as_str().len();
+            payload.filled_mut()[version] = DOMAIN_PAYLOAD_VERSION + 1;
+            assert!(decode_domain_payload(payload.readable()).is_none());
+            payload.filled_mut()[version] = DOMAIN_PAYLOAD_VERSION;
+            let root_at = payload.len() - domain.default_inputs.bytes().len();
+            payload.filled_mut()[root_at] = b'X';
+            assert!(decode_domain_payload(payload.readable()).is_none());
+
+            let view_inputs = StoredTypeInputs::from_sources(
+                &[StoredInputSource {
+                    section: StoredInputSection::ViewDefault(1),
+                    sql: source,
+                    bindings: &[input],
+                }],
+                dependencies,
+                &pool,
+            )
+            .unwrap();
+            let columns = crate::storage::ViewColumns::from_names(&["value"])
+                .unwrap()
+                .with_default(
+                    0,
+                    crate::storage::ColumnDefault::Expression(StackStr::from_str(source)),
+                )
+                .unwrap();
+            for create in [true, false] {
+                let columns_image = WalViewColumns::Captured {
+                    columns: &columns,
+                    default_inputs: &view_inputs,
+                };
+                let operation = if create {
+                    WalOp::CreateView {
+                        identity: crate::storage::ViewCatalogIdentity::new(0, 1, 0, 2).unwrap(),
+                        schema: "public",
+                        name: "default_view",
+                        columns: columns_image,
+                        sql: "SELECT ARRAY[1] AS value",
+                        path: "public",
+                        security_invoker: false,
+                        security_barrier: 0,
+                        check_option: 0,
+                        dependencies: WalStoredQueryDependencies::Captured(dependencies),
+                    }
+                } else {
+                    WalOp::SetViewColumns {
+                        schema: "public",
+                        name: "default_view",
+                        columns: columns_image,
+                    }
+                };
+                payload.clear();
+                assert!(append_payload(&mut payload, &operation));
+                assert_eq!(payload.len(), encoded_payload_len(&operation));
+                let decoded_columns =
+                    match decode_op(op_kind(&operation), payload.readable()).unwrap() {
+                        WalOp::CreateView { columns, .. }
+                        | WalOp::SetViewColumns { columns, .. } => columns,
+                        _ => panic!("expected view column image"),
+                    };
+                let (decoded, inputs) = decoded_columns.decode().unwrap();
+                assert_eq!(decoded.default_at(0), columns.default_at(0));
+                assert_eq!(inputs, view_inputs.bytes());
+                for end in 0..payload.len() {
+                    assert!(decode_op(op_kind(&operation), &payload.readable()[..end]).is_none());
+                }
+            }
         });
     }
 
@@ -16993,11 +17222,12 @@ mod tests {
             if not_null == 1 {
                 bytes.extend_from_slice(&3u32.to_le_bytes());
             }
+            bytes.extend_from_slice(&0u32.to_le_bytes());
             bytes
         }
         let valid = payload("7", "VALUE > 0", 1, "bounded_domain_not_null");
         assert!(decode_op(KIND_CREATE_DOMAIN, &valid).is_some());
-        let (_, restored) = decode_domain_payload(&valid).unwrap();
+        let (_, restored, _) = decode_domain_payload(&valid).unwrap();
         assert_eq!(
             restored.not_null_name.unwrap().as_str(),
             "bounded_domain_not_null"
@@ -17252,7 +17482,10 @@ mod tests {
                         identity: crate::storage::ViewCatalogIdentity::new(0, 1, 0, 2).unwrap(),
                         schema: "public",
                         name: "saved_view",
-                        columns: WalViewColumns::Captured(&columns),
+                        columns: WalViewColumns::Captured {
+                            columns: &columns,
+                            default_inputs: &crate::storage::StoredTypeInputs::EMPTY,
+                        },
                         sql: "SELECT 1 AS value",
                         path,
                         security_invoker: false,

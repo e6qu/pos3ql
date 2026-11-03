@@ -70,6 +70,7 @@ impl StoredInputSection {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct StoredInputSource<'a> {
     pub section: StoredInputSection,
     pub sql: &'a str,
@@ -358,6 +359,11 @@ impl StoredTypeInputs {
     ) -> Result<Self, SqlError> {
         visit_sections(bytes, |section, map| {
             let sql = source(section).ok_or_else(invalid)?;
+            let sql = if section == StoredInputSection::Query {
+                crate::sql::enum_values::query_binding_source(sql)?
+            } else {
+                sql
+            };
             type_inputs::visit(map, |binding| {
                 validate_span(sql, binding)?;
                 validate(binding)
@@ -535,6 +541,53 @@ fn validate_definition_inputs<'source>(
 }
 
 impl super::Storage {
+    pub(crate) fn relocate_stored_type_inputs<'source>(
+        &self,
+        inputs: &StoredTypeInputs,
+        mut source: impl FnMut(
+            StoredInputSection,
+        ) -> Option<(
+            &'source str,
+            &'source str,
+            crate::sql::parser::StoredSqlKind,
+        )>,
+        dependencies: super::StoredQueryDependencyView<'_>,
+        arena: &Arena,
+    ) -> Result<StoredTypeInputs, SqlError> {
+        if inputs.bytes().is_empty() {
+            return Ok(inputs.clone());
+        }
+        let sections = inputs.borrowed_sections(arena)?;
+        let mut relocated = crate::mem::arena::ArenaList::new(arena);
+        for &(section, bindings) in sections {
+            let (old, new, kind) = source(section).ok_or_else(invalid)?;
+            let (old, new) = if section == StoredInputSection::Query {
+                (
+                    crate::sql::enum_values::query_binding_source(old)?,
+                    crate::sql::enum_values::query_binding_source(new)?,
+                )
+            } else {
+                (old, new)
+            };
+            let bindings = type_inputs::rebase(
+                old,
+                new,
+                kind,
+                bindings,
+                |name| Ok(crate::sql::query::captured_type_oid(name, dependencies)),
+                arena,
+            )?;
+            relocated
+                .push(StoredInputSource {
+                    section,
+                    sql: new,
+                    bindings,
+                })
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+        }
+        inputs.relocated_sources(relocated.as_slice(), &self.metadata_pool)
+    }
+
     pub(super) fn validate_definition_type_inputs<'source>(
         &self,
         inputs: &StoredTypeInputs,
@@ -655,12 +708,13 @@ impl super::Storage {
         source: impl FnMut(StoredInputSection) -> Option<&'source str>,
         txid: u32,
     ) -> Result<StoredTypeInputs, SqlError> {
-        StoredTypeInputs::restore_validated(
-            bytes,
-            source,
-            |binding| self.validate_stored_input_type(binding, txid),
-            &self.metadata_pool,
-        )
+        let inputs = self.decode_stored_type_inputs(bytes)?;
+        let catalog = self
+            .type_catalog
+            .lock()
+            .expect("type catalog lock poisoned");
+        validate_definition_inputs(&inputs, source, txid, Some(&catalog))?;
+        Ok(inputs)
     }
 
     fn validate_stored_input_type(&self, binding: Binding<'_>, txid: u32) -> Result<(), SqlError> {

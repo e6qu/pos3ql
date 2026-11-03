@@ -28,9 +28,7 @@ pub(super) fn stage_query_record(
             check_option,
             dependencies,
         } => {
-            let columns = columns
-                .materialize()
-                .ok_or_else(|| invalid("view columns"))?;
+            let (columns, default_inputs) = columns.materialize(storage, txid)?;
             let dependencies = storage.rebind_stored_query_dependencies(
                 dependencies.materialize(storage, txid, |section| {
                     (section == crate::storage::StoredInputSection::Query).then_some(*sql)
@@ -45,7 +43,7 @@ pub(super) fn stage_query_record(
                 SqlName::parse(name)?,
                 ViewDefinition {
                     persistence: RelationPersistence::Permanent,
-                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+                    default_inputs,
                     columns,
                     query: StoredQueryDefinition {
                         sql,
@@ -108,13 +106,12 @@ pub(super) fn stage_query_record(
             let slot = storage
                 .view_slot(schema, name, txid)
                 .ok_or_else(|| invalid("view source"))?;
-            let columns = columns
-                .materialize()
-                .ok_or_else(|| invalid("view columns"))?;
+            let (columns, default_inputs) = columns.materialize(storage, txid)?;
             let prior = storage.stage_view_columns(
                 storage.prepare_view_edit(slot, txid)?,
                 columns,
                 txid,
+                default_inputs,
             )?;
             transaction.record_catalog_change(
                 storage,

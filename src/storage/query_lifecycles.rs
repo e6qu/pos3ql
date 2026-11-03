@@ -820,6 +820,7 @@ impl Storage {
             && let super::RuleTarget::View(view) = rule.definition.target
             && (owners.catalog.views[usize::from(view)]
                 .pending_definition
+                .as_ref()
                 .is_some_and(|pending| pending.txid == target.transaction)
                 || owners.catalog.views[usize::from(view)]
                     .ddl_state
@@ -1012,10 +1013,12 @@ impl Storage {
             if matches(0)
                 || view
                     .pending_definition
+                    .as_ref()
                     .is_some_and(|pending| matches(pending.txid))
             {
                 blocked = view
                     .pending_definition
+                    .as_ref()
                     .map(|pending| pending.txid)
                     .or_else(|| view.ddl_state.pending_txid())
                     .filter(|owner| *owner != transaction);
@@ -1402,6 +1405,12 @@ impl Storage {
         definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
+        self.validate_view_default_inputs(
+            &definition.columns,
+            &definition.default_inputs,
+            transaction,
+            owners.types.as_deref(),
+        )?;
         super::validate_stored_search_path(&definition.query.creation_path)?;
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
         let current = owners.catalog.views[slot].clone();
@@ -1551,10 +1560,44 @@ impl Storage {
         target: CatalogEditTarget,
         columns: super::ViewColumns,
         transaction: u32,
+        default_inputs: super::StoredTypeInputs,
     ) -> Result<ViewAlterUndo, SqlError> {
+        {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.validate_view_default_inputs(
+                &columns,
+                &default_inputs,
+                transaction,
+                Some(&catalog),
+            )?;
+        }
         self.stage_view_metadata(target, transaction, |definition| {
-            definition.columns = columns
+            definition.columns = columns;
+            definition.default_inputs = default_inputs;
         })
+    }
+
+    pub(super) fn validate_view_default_inputs(
+        &self,
+        columns: &super::ViewColumns,
+        inputs: &super::StoredTypeInputs,
+        transaction: u32,
+        catalog: Option<&super::TypeCatalog>,
+    ) -> Result<(), SqlError> {
+        self.validate_definition_type_inputs(
+            inputs,
+            |section| {
+                let super::StoredInputSection::ViewDefault(attribute) = section else {
+                    return None;
+                };
+                columns.default_sql(usize::from(attribute).checked_sub(1)?)
+            },
+            transaction,
+            catalog,
+        )
     }
 
     fn validate_view_comment_move(

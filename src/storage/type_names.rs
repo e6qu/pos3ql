@@ -203,7 +203,7 @@ impl Storage {
                     |owner| view.schema_for(owner) == schema && view.name_for(owner) == name;
                 for owner in [
                     view.ddl_state.pending_txid(),
-                    view.pending_definition.map(|pending| pending.txid),
+                    view.pending_definition.as_ref().map(|pending| pending.txid),
                 ]
                 .into_iter()
                 .flatten()

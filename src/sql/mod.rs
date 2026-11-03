@@ -1529,7 +1529,7 @@ struct EventTriggerExecution<'a, 'response> {
     txn: &'a mut TxnState,
     sqlprep: &'a mut SqlPreparedPool,
     cursors: &'a mut cursor::CursorPool,
-    guc: &'a mut GucState,
+    guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
 }
@@ -9483,7 +9483,7 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if param_types.len() > prep::MAX_PREP_PARAMS {
             return Ok(Err(SqlError {
@@ -9715,6 +9715,14 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if matches!(target, ast::DiscardTarget::Plans | ast::DiscardTarget::All)
+            && type_input_plans::has_active_plan()
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "invalidating an executing routine input plan is not supported"
+            )));
+        }
         if matches!(
             target,
             ast::DiscardTarget::All | ast::DiscardTarget::Temporary
@@ -9740,6 +9748,7 @@ impl Engine {
                 self.storage
                     .release_connection_advisory_locks(self.work.connection_id());
                 sqlprep.clear();
+                sqlprep.routine_inputs.clear();
                 cursors.close_all();
                 guc.discard_all();
                 if let Err(error) = self.apply_system_settings(guc) {
@@ -9756,8 +9765,8 @@ impl Engine {
                 self.protocol_reset = ProtocolReset::All;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
-            // Plans are rebuilt at execution; temporary drops were staged above.
-            ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
+            ast::DiscardTarget::Plans => sqlprep.routine_inputs.clear(),
+            ast::DiscardTarget::Temporary => {}
         }
         responder.command_complete(match target {
             ast::DiscardTarget::All => "DISCARD ALL",
@@ -10977,7 +10986,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
     ) -> Result<ExecutionStatus, WireFull> {
@@ -11011,7 +11020,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
@@ -11085,7 +11094,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
@@ -11575,7 +11584,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
@@ -11653,13 +11662,17 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
         bound_inputs: &[u8],
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         self.dml_scratch.clear();
+        if let Err(error) = sqlprep.execution_epoch() {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            return Ok(ExtendedExecutionStatus::Complete(false));
+        }
         self.bind_query_connection(conn_id);
         if let Err(error) = self.check_commit_admission_wait(txn, guc, lock_timeout_expired) {
             cursors.on_rollback();
@@ -12125,7 +12138,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
@@ -12417,7 +12430,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<&'a [type_inputs::Binding<'a>], SqlError>, WireFull> {
         if candidates.is_empty() {
@@ -12833,7 +12846,7 @@ impl Engine {
         txn: &mut TxnState,
         arena: &'a Arena,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Option<&'a [(&'a str, &'a ast::MaterializedCte<'a>)]>, SqlError> {
         use crate::sql::exec::{MAX_PROJ, encode_projected_pub};
@@ -13001,7 +13014,7 @@ impl Engine {
         authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         connection_id: i32,
@@ -13408,7 +13421,7 @@ impl Engine {
             let exclusion = match arena.alloc(Expr::Unary {
                 operator: ast::UnaryOp::Not,
                 operand: condition,
-                ..
+                source_position: ast::SourcePosition::UNKNOWN,
             }) {
                 Ok(exclusion) => &*exclusion,
                 Err(_) => return Ok(Err(query::arena_full_pub())),
@@ -13644,7 +13657,7 @@ impl Engine {
         authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         returning: bool,
@@ -13749,7 +13762,7 @@ impl Engine {
         authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -13893,7 +13906,7 @@ impl Engine {
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -13939,7 +13952,7 @@ impl Engine {
         authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -14031,6 +14044,7 @@ impl Engine {
                                 defaults: exec::ViewInsertDefaults {
                                     base_columns: view.base_columns,
                                     columns: view.defaults,
+                                    inputs: view.default_inputs,
                                 },
                             });
                             let rewritten = match query::rewrite_view_dml(
@@ -14121,6 +14135,7 @@ impl Engine {
                                 defaults: exec::ViewInsertDefaults {
                                     base_columns: view.base_columns,
                                     columns: view.defaults,
+                                    inputs: view.default_inputs,
                                 },
                             });
                             let rewritten = match query::rewrite_view_dml(
@@ -14271,7 +14286,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let source_snapshot = txn.command_id().saturating_add(1);
@@ -14368,7 +14383,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         mut evaluate: impl FnMut(
             &Storage,
@@ -14434,7 +14449,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let mut emitted = 0u64;
@@ -14570,7 +14585,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
@@ -14668,7 +14683,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let outcome = (|| {
@@ -14841,7 +14856,7 @@ impl Engine {
         arena: &'statement Arena,
         params: &[Datum],
         txn: &mut TxnState,
-        guc: &mut GucState,
+        guc: &GucState,
         invocations: Option<&'statement query::RoutineInvocationState<'statement>>,
         sequence_state: Option<&sequence::SequenceReplayState>,
         responder: &mut Responder,
@@ -14915,7 +14930,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
         let nested_invocations = query::RoutineInvocationState::new(arena);
@@ -15160,7 +15175,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<RoutineBodyInputs<'a>, SqlError>, WireFull> {
         use type_input_plans::{InputImage, Key, Lookup, Owner};
@@ -15393,7 +15408,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
         let Some(result_type) = routine.kind.function_result() else {
@@ -15562,7 +15577,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<&'a [&'a [u8]], SqlError>, WireFull> {
         if !routine.kind.is_set_returning() {
@@ -15996,7 +16011,7 @@ impl Engine {
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
@@ -16060,7 +16075,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         txn: &mut TxnState,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16189,7 +16204,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16275,7 +16290,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16709,7 +16724,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
@@ -16881,7 +16896,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16967,7 +16982,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16998,7 +17013,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         arena: &Arena,
         responder: &mut Responder,
@@ -17010,7 +17025,7 @@ impl Engine {
             &mut TxnState,
             &mut SqlPreparedPool,
             &mut cursor::CursorPool,
-            &mut GucState,
+            &GucState,
             &mut Responder,
         ) -> Result<Result<(), SqlError>, WireFull>,
     {
@@ -17172,7 +17187,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
         reset_workspace: bool,
@@ -17378,7 +17393,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
         reset_workspace: bool,
@@ -19907,7 +19922,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<crate::storage::ExtensionPackage, SqlError>, WireFull> {
         let prior_role = guc.current_identity();
@@ -20045,7 +20060,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         use core::fmt::Write as _;
@@ -20328,7 +20343,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         use core::fmt::Write as _;
@@ -20444,7 +20459,7 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 if let Err(error) = txn.record_ddl(DdlUndo::ViewChanged(
-                    crate::storage::ViewPublication::Altered(prior),
+                    crate::storage::ViewPublication::Altered(prior.clone()),
                 )) {
                     self.storage.rollback_view_alter(prior);
                     return Ok(Err(error));
@@ -20591,7 +20606,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         use core::fmt::Write as _;
@@ -20753,7 +20768,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         for name in names {
@@ -20933,7 +20948,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let mut installing =
@@ -20971,7 +20986,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &mut GucState,
+        guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let parsed_name = match crate::storage::SqlName::parse(name) {
@@ -22416,7 +22431,7 @@ fn rollback_transaction_overlays(storage: &mut Storage, txn: &TxnState) {
     for &(table, rowid, prior) in txn.touched().iter().rev() {
         storage.restore_pending(table as usize, rowid, txn.txid, prior);
     }
-    for &undo in txn.ddl().iter().rev() {
+    for undo in txn.ddl().iter().rev().cloned() {
         rollback_catalog_change(storage, undo, txn.txid);
     }
     for undo in txn.statistics_undo().iter().rev() {
@@ -24424,12 +24439,7 @@ fn apply_wal_op(
             check_option,
             dependencies,
         } => {
-            let columns = columns.materialize().ok_or_else(|| {
-                sql_err!(
-                    eval::sqlstate::DATA_EXCEPTION,
-                    "invalid view column journal payload"
-                )
-            })?;
+            let (columns, default_inputs) = columns.materialize(storage, 0)?;
             // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
@@ -24448,7 +24458,7 @@ fn apply_wal_op(
                 crate::storage::SqlName::parse(name)?,
                 crate::storage::ViewDefinition {
                     persistence: crate::storage::RelationPersistence::Permanent,
-                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+                    default_inputs,
                     columns,
                     query: crate::storage::StoredQueryDefinition {
                         sql: buffer,
@@ -24548,12 +24558,7 @@ fn apply_wal_op(
             name,
             columns,
         } => {
-            let columns = columns.materialize().ok_or_else(|| {
-                sql_err!(
-                    eval::sqlstate::DATA_EXCEPTION,
-                    "invalid view column journal payload"
-                )
-            })?;
+            let (columns, default_inputs) = columns.materialize(storage, 0)?;
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
                 .map(|object| object.slot as usize)
@@ -24564,8 +24569,12 @@ fn apply_wal_op(
                         name
                     )
                 })?;
-            let undo =
-                storage.stage_view_columns(storage.prepare_view_edit(slot, 0)?, columns, 0)?;
+            let undo = storage.stage_view_columns(
+                storage.prepare_view_edit(slot, 0)?,
+                columns,
+                0,
+                default_inputs,
+            )?;
             storage.commit_view_alter(undo);
         }
         WalOp::RenameView {
@@ -25236,12 +25245,14 @@ fn apply_wal_op(
         }
         WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
         WalOp::RestoreDomain(payload) | WalOp::RestoreTypedDomain(payload) => {
-            let (slot, def) = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "journal domain definition is corrupt"
-                )
-            })?;
+            let (slot, mut def, inputs) =
+                crate::wal::decode_domain_payload(payload).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal domain definition is corrupt"
+                    )
+                })?;
+            def.default_inputs = storage.decode_stored_type_inputs(inputs)?;
             // An ALTER replays as a redefinition: redefine in place if it
             // exists, else create it committed (txid 0).
             let spec = crate::storage::DomainSpec {

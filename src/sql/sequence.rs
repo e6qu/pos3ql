@@ -43,6 +43,7 @@ pub(crate) enum StatementEffectKind {
     StatisticsVoid,
     Cursor,
     RoutineInput,
+    PlanAllocation,
 }
 
 #[derive(Clone, Copy)]

@@ -111,17 +111,14 @@ pub(crate) fn stored_query_dependencies(
 
 pub(crate) fn parse_stored_query<'a>(
     sql: &'a str,
+    input_source: &str,
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let bindings = match dependencies.type_inputs() {
-        Some(inputs) => {
-            inputs.detached_bindings(crate::storage::StoredInputSection::Query, arena)?
-        }
-        None => &[],
-    };
+    let bindings =
+        rebase_stored_query_inputs(input_source, sql, dependencies, storage, txid, arena)?;
     super::parser::parse_query_with_type_inputs(sql, bindings, arena, |parser| {
         super::type_inputs::validate_restored_with(parser, |name| {
             if let Some(oid) = cte::captured_type_oid(name, dependencies) {
@@ -150,12 +147,18 @@ pub(crate) fn rebase_stored_query_inputs<'a>(
         }
         None => &[],
     };
+    if old == new {
+        return Ok(inputs);
+    }
     super::type_inputs::rebase(
         old,
         new,
         super::parser::StoredSqlKind::Statements,
         inputs,
-        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        |name| {
+            Ok(cte::captured_type_oid(name, dependencies)
+                .or_else(|| super::type_inputs::target_oid(storage, txid, name)))
+        },
         arena,
     )
 }
@@ -6855,6 +6858,10 @@ pub struct UpdatableView<'a> {
     /// Durable defaults for the exposed columns, applied before base-table
     /// defaults when INSERT leaves a view column unspecified.
     pub defaults: crate::storage::ViewColumns,
+    pub default_inputs: &'a [(
+        crate::storage::StoredInputSection,
+        &'a [super::type_inputs::Binding<'a>],
+    )],
     pub check_option: Option<crate::storage::ViewCheckOption>,
 }
 
@@ -6891,8 +6898,9 @@ pub fn resolve_view_for_dml<'a>(
             name
         )
     };
+    let input_source = query.input_source.unwrap_or(sql);
     let dependencies = query.dependencies;
-    let sel = parse_stored_query(sql, storage, txid, dependencies.view(), arena)?;
+    let sel = parse_stored_query(sql, input_source, storage, txid, dependencies.view(), arena)?;
     let sel = expand_stored_query(sel, storage, txid, view_path, dependencies.view(), arena)?;
     if sel.set_body.is_some()
         || sel.distinct
@@ -6986,6 +6994,10 @@ pub fn resolve_view_for_dml<'a>(
         columns,
         base_columns,
         defaults: *storage.view(view_slot).columns_for(txid),
+        default_inputs: storage
+            .view(view_slot)
+            .default_inputs_for(txid)
+            .detached_sections(arena)?,
         check_option,
     }))
 }
@@ -7094,6 +7106,7 @@ pub fn describe_query_under<'a>(
 
 pub(crate) fn describe_stored_query<'a>(
     sql: &'a str,
+    input_source: &str,
     storage: &'a Storage,
     txid: u32,
     path: crate::storage::PathContext,
@@ -7101,7 +7114,7 @@ pub(crate) fn describe_stored_query<'a>(
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
 ) -> Result<usize, SqlError> {
-    let select = parse_stored_query(sql, storage, txid, dependencies, arena)?;
+    let select = parse_stored_query(sql, input_source, storage, txid, dependencies, arena)?;
     let select = expand_stored_query(select, storage, txid, path, dependencies, arena)?;
     describe_select(select, storage, txid, arena, out)
 }

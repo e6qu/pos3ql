@@ -374,6 +374,14 @@ impl SqlPreparedPool {
         &mut self,
         statement: usize,
     ) -> Result<super::type_input_plans::Owner, SqlError> {
+        let generation = self.execution_epoch()?;
+        Ok(super::type_input_plans::Owner::Transient {
+            generation,
+            statement,
+        })
+    }
+
+    pub(crate) fn execution_epoch(&mut self) -> Result<u64, SqlError> {
         let generation = match self.transient_plan {
             Some(generation) => generation,
             None => {
@@ -382,10 +390,80 @@ impl SqlPreparedPool {
                 generation
             }
         };
-        Ok(super::type_input_plans::Owner::Transient {
-            generation,
-            statement,
-        })
+        Ok(generation)
+    }
+
+    pub(crate) fn dynamic_owner(
+        &mut self,
+        kind: super::type_input_plans::DynamicCommandKind,
+        source: &str,
+        parameter_types: &[i32],
+        arguments: &[super::types::Datum<'_>],
+        arena: &Arena,
+    ) -> Result<super::type_input_plans::Owner, SqlError> {
+        use super::types::Datum;
+        let epoch = self.execution_epoch()?;
+        let length = parameter_types
+            .len()
+            .checked_mul(4)
+            .ok_or_else(super::eval::arena_full)?;
+        let types = arena
+            .alloc_slice_with(length, |_| 0u8)
+            .map_err(|_| super::eval::arena_full())?;
+        for (out, oid) in types.chunks_exact_mut(4).zip(parameter_types) {
+            out.copy_from_slice(&oid.to_le_bytes());
+        }
+        let key = arena
+            .alloc_slice_with(
+                arguments
+                    .len()
+                    .checked_add(3)
+                    .ok_or_else(super::eval::arena_full)?,
+                |_| Datum::Null,
+            )
+            .map_err(|_| super::eval::arena_full())?;
+        key[0] = Datum::Text(source);
+        key[1] = Datum::Int4(match kind {
+            super::type_input_plans::DynamicCommandKind::Statement => 0,
+            super::type_input_plans::DynamicCommandKind::Cursor => 1,
+        });
+        key[2] = Datum::Bytea(types);
+        key[3..].copy_from_slice(arguments);
+        let values = super::sequence::statement_effect(
+            super::sequence::StatementEffectKind::PlanAllocation,
+            key,
+            super::sequence::StatementEffectRetry::Restart,
+            arena,
+            || {
+                let result = (|| {
+                    let generation = self.new_plan()?;
+                    let bytes = arena
+                        .alloc_slice_copy(&generation.to_le_bytes())
+                        .map_err(|_| super::eval::arena_full())?;
+                    arena
+                        .alloc_slice_copy(&[Datum::Bytea(bytes)])
+                        .map(|values| &*values)
+                        .map_err(|_| super::eval::arena_full())
+                })();
+                super::sequence::StatementEffectAttempt {
+                    result,
+                    rewound_state: false,
+                }
+            },
+        )?;
+        let [Datum::Bytea(bytes)] = values else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "dynamic SQL plan identity has an invalid shape"
+            ));
+        };
+        let generation = u64::from_le_bytes(bytes.try_into().map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "dynamic SQL plan identity has an invalid length"
+            )
+        })?);
+        Ok(super::type_input_plans::Owner::Dynamic { epoch, generation })
     }
 
     pub(crate) fn plan_owner(&self, name: &str) -> Option<super::type_input_plans::Owner> {

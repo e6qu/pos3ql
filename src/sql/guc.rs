@@ -1050,7 +1050,7 @@ pub struct GucState {
     /// Immutable authenticated identity from the startup packet. PostgreSQL
     /// uses this identity—not a later SET ROLE or SET SESSION
     /// AUTHORIZATION—as the authority for changing session authorization.
-    authenticated_user: crate::storage::SessionIdentity,
+    authenticated_user: Cell<crate::storage::SessionIdentity>,
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
     random: Cell<PrngState>,
@@ -1238,7 +1238,7 @@ impl GucState {
             .clone_from_slice(&source.transaction.savepoints[..count]);
         destination.transaction.savepoint_count = count;
         target.transaction_mode = self.transaction_mode;
-        target.authenticated_user = self.authenticated_user;
+        target.authenticated_user.set(self.authenticated_user.get());
         target.random.set(self.random.get());
         target.seq_session.discard();
         for (source, destination) in self
@@ -1371,7 +1371,7 @@ impl GucState {
                     savepoint_count: 0,
                 },
             }),
-            authenticated_user: crate::storage::SessionIdentity::bootstrap(),
+            authenticated_user: Cell::new(crate::storage::SessionIdentity::bootstrap()),
             seq_session: SeqSession::new(),
             random: Cell::new(PrngState::UNINITIALIZED),
         }
@@ -1478,8 +1478,8 @@ impl GucState {
         self.store.borrow().current.session_authorization.name()
     }
 
-    pub fn authenticated_user(&self) -> &str {
-        self.authenticated_user.as_str()
+    pub fn authenticated_user(&self) -> StackStr<64> {
+        self.authenticated_user.get().name()
     }
 
     pub fn set_session_user(&mut self, user: &str) {
@@ -1487,7 +1487,7 @@ impl GucState {
     }
 
     pub(crate) fn bind_session_user(&mut self, role: crate::storage::SessionIdentity) {
-        self.authenticated_user = role;
+        self.authenticated_user.set(role);
         let mut store = self.store.borrow_mut();
         store.current.current_role = role;
         store.current.session_authorization = role;
@@ -1531,7 +1531,7 @@ impl GucState {
     }
 
     pub fn reset_session_authorization(&self, local: bool) {
-        let authenticated_user = self.authenticated_user;
+        let authenticated_user = self.authenticated_user.get();
         self.set_session_authorization(authenticated_user, local);
     }
 
@@ -1544,15 +1544,12 @@ impl GucState {
     }
 
     pub(crate) fn authenticated_identity(&self) -> crate::storage::SessionIdentity {
-        self.authenticated_user
+        self.authenticated_user.get()
     }
 
-    pub(crate) fn refresh_identities(
-        &mut self,
-        storage: &crate::storage::Storage,
-        transaction: u32,
-    ) {
-        self.authenticated_user = self.authenticated_user.refresh(storage, transaction);
+    pub(crate) fn refresh_identities(&self, storage: &crate::storage::Storage, transaction: u32) {
+        self.authenticated_user
+            .set(self.authenticated_user.get().refresh(storage, transaction));
         let mut store = self.store.borrow_mut();
         store.current.current_role = store.current.current_role.refresh(storage, transaction);
         store.current.session_authorization = store

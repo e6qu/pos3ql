@@ -5408,6 +5408,7 @@ fn subst_tableref<'a>(
         let dependencies = query.dependencies;
         let vsel = super::parse_stored_query(
             view_sql,
+            query.input_source.unwrap_or(view_sql),
             context.storage,
             context.txid,
             dependencies.view(),

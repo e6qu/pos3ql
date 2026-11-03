@@ -21,13 +21,14 @@ pub(super) fn stage_type_record(
     let txid = transaction.txid;
     match operation {
         WalOp::RestoreDomain(payload) | WalOp::RestoreTypedDomain(payload) => {
-            let (slot, definition) =
-                crate::wal::decode_domain_payload(payload).ok_or_else(|| {
+            let (slot, mut definition, inputs) = crate::wal::decode_domain_payload(payload)
+                .ok_or_else(|| {
                     sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "prepared domain definition is corrupt"
                     )
                 })?;
+            definition.default_inputs = storage.decode_stored_type_inputs(inputs)?;
             stage_domain(storage, transaction, usize::from(slot), &definition)?;
         }
         WalOp::CreateDomain(slot, definition) => {

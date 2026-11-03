@@ -38,7 +38,6 @@ impl RoutineChange {
 pub(crate) enum RoutineDependencies<'input> {
     Replace(StoredQueryDependencyView<'input>),
     Preserve,
-    RenameSchema { old: SqlName, new: SqlName },
 }
 
 impl Storage {
@@ -203,22 +202,10 @@ impl Storage {
             RoutineDependencies::Replace(dependencies) => {
                 owners.allocate_query_image(self, owner, previous, dependencies, transaction)?
             }
-            RoutineDependencies::Preserve | RoutineDependencies::RenameSchema { .. } => {
+            RoutineDependencies::Preserve => {
                 owners.allocate_preserved_query_image(self, owner, previous, transaction)?
             }
         };
-        if let RoutineDependencies::RenameSchema { old, new } = dependencies {
-            let count = owners.dependencies.pending[dependency_slot as usize].count;
-            super::rename_dependency_schema(
-                owners.dependencies.image_mut(
-                    self.stored_query_dependency_pending_base + dependency_slot as usize,
-                    count,
-                    self.stored_query_dependencies_per_image,
-                ),
-                old,
-                new,
-            );
-        }
         owners.catalog[slot].pending_definition = Some(PendingRoutineDefinition {
             txid: transaction,
             version,

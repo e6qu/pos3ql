@@ -749,6 +749,7 @@ impl super::Storage {
                 catalog.domains[slot].ddl_state = next;
                 if next == State::Absent {
                     catalog.domains[slot].pending_definition = None;
+                    catalog.domains[slot].default_inputs = super::StoredTypeInputs::EMPTY;
                 }
                 &mut catalog.domains[slot].ownership
             }
@@ -932,6 +933,7 @@ mod tests {
                         not_null_name: None,
                         not_null_identity: None,
                         default_expr: None,
+                        default_inputs: super::super::StoredTypeInputs::EMPTY,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
                     },

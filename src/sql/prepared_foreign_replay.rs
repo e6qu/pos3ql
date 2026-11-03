@@ -336,7 +336,11 @@ pub(super) fn stage_batch(
     })();
     if result.is_err() {
         for position in (mark..transaction.ddl().len()).rev() {
-            super::rollback_catalog_change(storage, transaction.ddl()[position], transaction.txid);
+            super::rollback_catalog_change(
+                storage,
+                transaction.ddl()[position].clone(),
+                transaction.txid,
+            );
         }
         transaction.rewind_ddl(mark);
     }

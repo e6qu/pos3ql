@@ -436,9 +436,7 @@ impl TypeDefinitionImages {
         }) {
             return Ok(definition);
         }
-        self.domains.copy(key, source, |definition| {
-            *definition = source.definition_for(transaction);
-        })
+        self.domains.insert(key, source.definition_for(transaction))
     }
 
     pub(crate) fn enumeration(
@@ -746,6 +744,7 @@ mod tests {
                         not_null_name: None,
                         not_null_identity: None,
                         default_expr: None,
+                        default_inputs: super::super::StoredTypeInputs::EMPTY,
                         checks,
                         n_checks: 1,
                     },

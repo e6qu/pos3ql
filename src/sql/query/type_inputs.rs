@@ -31,54 +31,46 @@ pub(crate) fn capture_contextual_type_inputs(
         .map_err(|_| super::arena_full())?;
     let mark = arena.mark();
     let mut count = 0;
-    let result = discover(
-        statement,
-        storage,
-        txid,
-        arena,
-        &mut |expression, target, type_mod, kind| {
-            let expression = match expression {
-                Expr::Cast { operand, .. } => *operand,
-                expression => expression,
-            };
-            let Expr::Str(value) = expression else {
-                return Ok(());
-            };
-            let Some(index) = literals
-                .iter()
-                .position(|(expression, _)| match expression {
-                    Expr::Str(source) => {
-                        value.len() == source.len()
-                            && core::ptr::eq(value.as_ptr(), source.as_ptr())
-                    }
-                    _ => false,
-                })
-            else {
-                // A stored source owns its own admitted inputs, rather than the
-                // raw statement currently being analyzed.
-                return Ok(());
-            };
-            if let Some(previous) =
-                found[..count]
-                    .iter()
-                    .flatten()
-                    .find(|(previous, _, _, previous_kind)| {
-                        *previous == index && *previous_kind == kind
-                    })
-            {
-                if *previous != (index, target, type_mod, kind) {
-                    return Err(sql_err!(
-                        super::sqlstate::DATATYPE_MISMATCH,
-                        "SQL input occurrence has conflicting destination types"
-                    ));
+    let mut visit = |expression: &Expr<'_>, target, type_mod, kind| {
+        let expression = match expression {
+            Expr::Cast { operand, .. } => *operand,
+            expression => expression,
+        };
+        let Expr::Str(value) = expression else {
+            return Ok(());
+        };
+        let Some(index) = literals
+            .iter()
+            .position(|(expression, _)| match expression {
+                Expr::Str(source) => {
+                    value.len() == source.len() && core::ptr::eq(value.as_ptr(), source.as_ptr())
                 }
-                return Ok(());
+                _ => false,
+            })
+        else {
+            // A stored source owns its own admitted inputs, rather than the
+            // raw statement currently being analyzed.
+            return Ok(());
+        };
+        if let Some(previous) = found[..count]
+            .iter()
+            .flatten()
+            .find(|(previous, _, _, previous_kind)| *previous == index && *previous_kind == kind)
+        {
+            if *previous != (index, target, type_mod, kind) {
+                return Err(sql_err!(
+                    super::sqlstate::DATATYPE_MISMATCH,
+                    "SQL input occurrence has conflicting destination types"
+                ));
             }
-            found[count] = Some((index, target, type_mod, kind));
-            count += 1;
-            Ok(())
-        },
-    );
+            return Ok(());
+        }
+        found[count] = Some((index, target, type_mod, kind));
+        count += 1;
+        Ok(())
+    };
+    let result = discover_defaults(parser, statement, storage, txid, arena, &mut visit)
+        .and_then(|()| discover(statement, storage, txid, arena, &mut visit));
     // Only copied source ordinals and type identities escape schema scratch.
     unsafe { arena.rewind_to(mark) };
     result?;
@@ -111,6 +103,153 @@ pub(crate) fn capture_contextual_type_inputs(
     Ok(())
 }
 
+fn discover_defaults(
+    parser: &crate::sql::parser::Parser<'_>,
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut Visit<'_>,
+) -> Result<(), SqlError> {
+    let (source, target, type_mod) = match statement {
+        Stmt::CreateDomain(domain) => {
+            let Some(source) = domain.default_text else {
+                return Ok(());
+            };
+            let target = crate::sql::exec::resolve_routine_type(storage, txid, domain.base_type)?;
+            (
+                source,
+                storage.routine_type_oid(target.ctype, target.user_type, txid),
+                domain.base_type_mod,
+            )
+        }
+        Stmt::AlterDomain {
+            name,
+            action: ast::AlterDomainAction::SetDefault(source),
+        } => {
+            let name = match name.schema {
+                Some(schema) => crate::stack_format!(130, "{}.{}", schema, name.name),
+                None => crate::util::StackStr::from_str(name.name),
+            };
+            let Some(domain) = storage.find_domain(name.as_str(), txid) else {
+                return Ok(());
+            };
+            (
+                *source,
+                storage.routine_type_oid(
+                    domain.base,
+                    domain.base_domain.or(domain.base_user_type),
+                    txid,
+                ),
+                domain.base_type_mod,
+            )
+        }
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::SetDefault { column, expression },
+            ..
+        } => {
+            let Some(crate::storage::ResolvedRelation::View(slot)) =
+                storage.resolve_relation(name.schema, name.name, txid)
+            else {
+                return Ok(());
+            };
+            let view = storage.view(slot);
+            let Some(index) = view
+                .columns_for(txid)
+                .names()
+                .iter()
+                .position(|name| name.as_str() == *column)
+            else {
+                return Ok(());
+            };
+            let descriptions = arena
+                .alloc_slice_with(view.columns_for(txid).len(), |_| {
+                    crate::sql::types::ColDesc::new("", 0, 0)
+                })
+                .map_err(|_| super::arena_full())?;
+            let count =
+                crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
+            let description = descriptions
+                .get(index)
+                .filter(|_| index < count)
+                .ok_or_else(|| {
+                    sql_err!(
+                        super::sqlstate::INTERNAL_ERROR,
+                        "view default output type is missing"
+                    )
+                })?;
+            (
+                *expression,
+                Some(description.type_oid),
+                description.type_mod,
+            )
+        }
+        _ => return Ok(()),
+    };
+    let Some(target) = target else {
+        return Err(sql_err!(
+            super::sqlstate::UNDEFINED_OBJECT,
+            "default input type is unavailable"
+        ));
+    };
+    let (offset, _) = parser.source_range(source).ok_or_else(|| {
+        sql_err!(
+            super::sqlstate::INTERNAL_ERROR,
+            "default SQL has no original source occurrence"
+        )
+    })?;
+    let syntax = crate::sql::parser::type_input_sources(
+        source,
+        crate::sql::parser::StoredSqlKind::Expression,
+        arena,
+    )?;
+    let expression = syntax
+        .expression
+        .expect("expression source parser retains its root");
+    let literals = parser.string_literals();
+    let mut translate = |expression: &Expr<'_>, oid, type_mod, kind| {
+        let expression = match expression {
+            Expr::Cast { operand, .. } => *operand,
+            expression => expression,
+        };
+        let Expr::Str(value) = expression else {
+            return Ok(());
+        };
+        let site = syntax.literals.iter().find(|(expression, _)| matches!(expression, Expr::Str(source) if source.len() == value.len() && core::ptr::eq(source.as_ptr(), value.as_ptr())))
+            .ok_or_else(|| sql_err!(super::sqlstate::INTERNAL_ERROR, "default literal has no parser source"))?.1;
+        let original = literals
+            .iter()
+            .find(|(_, source)| {
+                source.start == offset + site.start && source.end == offset + site.end
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    super::sqlstate::INTERNAL_ERROR,
+                    "default literal has no command source"
+                )
+            })?
+            .0;
+        visit(original, oid, type_mod, kind)
+    };
+    let columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let mut walker = Walker {
+        storage,
+        txid,
+        arena,
+        visit: &mut translate,
+    };
+    walker.expression(expression, &columns, &crate::sql::eval::NoColumns)?;
+    walker.input(expression, target, type_mod)
+}
+
 fn discover(
     statement: &Stmt<'_>,
     storage: &Storage,
@@ -134,7 +273,7 @@ struct Walker<'a, 'v, 'callback> {
     visit: &'v mut Visit<'callback>,
 }
 
-impl Walker<'_, '_, '_> {
+impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
         if matches!(expression, Expr::Str(_))
             && matches!(
@@ -295,7 +434,10 @@ impl Walker<'_, '_, '_> {
         expression: &Expr<'a>,
         columns: &dyn ColTypeResolver,
         row: &dyn ColumnLookup<'a>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         match expression {
             Expr::Subquery(select)
             | Expr::Exists(select)
@@ -354,7 +496,10 @@ impl Walker<'_, '_, '_> {
         table: &ast::TableRef<'a>,
         columns: &dyn ColTypeResolver,
         row: &dyn ColumnLookup<'a>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         if let Some(query) = table.subquery {
             self.select(query, Some(row), None)?;
         }
@@ -389,10 +534,13 @@ impl Walker<'_, '_, '_> {
 
     fn select<'a>(
         &mut self,
-        select: &Select<'a>,
+        select: &'a Select<'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
         targets: Option<&[(i32, i32)]>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
         if let Some(tree) = select.set_body {
             self.set_tree(tree, outer)?;
@@ -497,9 +645,12 @@ impl Walker<'_, '_, '_> {
 
     fn set_tree<'a>(
         &mut self,
-        tree: &ast::SetTree<'a>,
+        tree: &'a ast::SetTree<'a>,
         outer: Option<&dyn ColumnLookup<'a>>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         match tree {
             ast::SetTree::Select(select) => self.select(select, outer, None),
             ast::SetTree::Op { left, right, .. } => {
@@ -509,7 +660,10 @@ impl Walker<'_, '_, '_> {
         }
     }
 
-    fn statement(&mut self, statement: &Stmt<'_>) -> Result<(), SqlError> {
+    fn statement<'a>(&mut self, statement: &'a Stmt<'a>) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         match statement {
             Stmt::Select(select) => self.select(select, None, None),
             Stmt::SetQuery(query) => self.set_tree(query.body, None),
@@ -568,7 +722,10 @@ impl Walker<'_, '_, '_> {
         }
     }
 
-    fn dml(&mut self, statement: &Stmt<'_>) -> Result<(), SqlError> {
+    fn dml<'a>(&mut self, statement: &'a Stmt<'a>) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         let storage = self.storage;
         let txid = self.txid;
         let arena = self.arena;

@@ -120,6 +120,19 @@ pub(crate) fn is_bound_query(source: &str) -> bool {
     source.starts_with(QUERY_HEADER)
 }
 
+pub(crate) fn query_binding_source(source: &str) -> Result<&str, SqlError> {
+    if let Some(body) = source.strip_prefix(QUERY_HEADER) {
+        return Ok(body);
+    }
+    if source.starts_with("pos3ql-bound-query-") {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unsupported stored query encoding"
+        ));
+    }
+    Ok(source)
+}
+
 #[derive(Clone, Copy)]
 struct QueryToken<'a> {
     token: super::lexer::Tok<'a>,
@@ -350,6 +363,32 @@ pub(crate) fn bind_query<const N: usize>(
             "stored enum binding exceeds {} bytes",
             N
         ));
+    }
+    let inputs = dependencies
+        .type_inputs()
+        .detached_bindings(crate::storage::StoredInputSection::Query, arena)?;
+    if !inputs.is_empty() {
+        let encoded_source = query_binding_source(output.as_str())?;
+        let inputs = super::type_inputs::rebase(
+            source,
+            encoded_source,
+            super::parser::StoredSqlKind::Statements,
+            inputs,
+            |name| {
+                Ok(super::query::captured_type_oid(name, dependencies.view())
+                    .or_else(|| super::type_inputs::target_oid(storage, txid, name)))
+            },
+            arena,
+        )?;
+        let root = storage.capture_stored_type_inputs(
+            &[crate::storage::StoredInputSource {
+                section: crate::storage::StoredInputSection::Query,
+                sql: encoded_source,
+                bindings: inputs,
+            }],
+            dependencies.view(),
+        )?;
+        dependencies.set_type_inputs(root);
     }
     Ok(output)
 }

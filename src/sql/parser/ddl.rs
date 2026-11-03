@@ -4526,7 +4526,7 @@ impl<'a> Parser<'a> {
                 }
                 let start = self.peek_at;
                 let _ = self.column_default_expression()?;
-                default_text = Some(self.arena_str(self.text[start..self.peek_at].trim_end())?);
+                default_text = Some(self.text[start..self.peek_at].trim_end());
             } else if cname.is_some() {
                 return Err(self.err_here("expected NOT NULL or CHECK after CONSTRAINT"));
             } else {
@@ -4620,9 +4620,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("default")?;
                 let start = self.peek_at;
                 let _ = self.expression(0)?;
-                AlterDomainAction::SetDefault(
-                    self.arena_str(self.text[start..self.peek_at].trim_end())?,
-                )
+                AlterDomainAction::SetDefault(self.text[start..self.peek_at].trim_end())
             }
         } else if self.eat_ident("rename")? {
             if self.eat_ident("constraint")? {

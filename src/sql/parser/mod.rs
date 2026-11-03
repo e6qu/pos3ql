@@ -380,6 +380,7 @@ pub(crate) enum StoredSqlKind {
 pub(crate) struct TypeInputSyntax<'a> {
     pub casts: &'a [super::type_inputs::Candidate<'a>],
     pub literals: &'a [(&'a Expr<'a>, NamespaceSource)],
+    pub expression: Option<&'a Expr<'a>>,
 }
 
 pub(crate) fn type_input_sources<'a>(
@@ -389,11 +390,14 @@ pub(crate) fn type_input_sources<'a>(
 ) -> Result<TypeInputSyntax<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.capture_type_inputs();
+    let mut expression = None;
     match kind {
         StoredSqlKind::Expression => {
-            parser
-                .expression(0)
-                .map_err(|error| super::parse_error_to_sql(&error))?;
+            expression = Some(
+                parser
+                    .expression(0)
+                    .map_err(|error| super::parse_error_to_sql(&error))?,
+            );
         }
         StoredSqlKind::Statements => {
             while parser
@@ -418,6 +422,7 @@ pub(crate) fn type_input_sources<'a>(
     Ok(TypeInputSyntax {
         casts: parser.type_input_candidates(),
         literals: parser.string_literals(),
+        expression,
     })
 }
 
@@ -1117,6 +1122,15 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn source_position(&self) -> usize {
         self.peek_at
+    }
+
+    pub(crate) fn source_range(&self, fragment: &str) -> Option<(usize, usize)> {
+        let start = (fragment.as_ptr() as usize).checked_sub(self.text.as_ptr() as usize)?;
+        let end = start.checked_add(fragment.len())?;
+        (end <= self.text.len()
+            && self.text.is_char_boundary(start)
+            && self.text.is_char_boundary(end))
+        .then_some((start, end))
     }
 
     pub fn max_param(&self) -> u32 {

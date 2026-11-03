@@ -442,6 +442,10 @@ pub(crate) struct ViewCheck<'a> {
 pub(crate) struct ViewInsertDefaults<'a> {
     pub base_columns: &'a [&'a str],
     pub columns: crate::storage::ViewColumns,
+    pub inputs: &'a [(
+        crate::storage::StoredInputSection,
+        &'a [super::type_inputs::Binding<'a>],
+    )],
 }
 
 struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
@@ -4031,6 +4035,92 @@ fn build_def_with_likes(
     }
     def.n_columns = n;
     Ok(def)
+}
+
+fn capture_default_inputs(
+    storage: &Storage,
+    raw: &str,
+    stored: &str,
+    section: crate::storage::StoredInputSection,
+    txid: u32,
+    arena: &Arena,
+) -> Result<crate::storage::StoredTypeInputs, SqlError> {
+    let inputs = super::type_inputs::bindings_for_active_source(raw, arena)?.unwrap_or(&[]);
+    let display = super::enum_values::checks::default_display(stored, arena)?;
+    let inputs = super::type_inputs::rebase(
+        raw,
+        display,
+        super::parser::StoredSqlKind::Expression,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )?;
+    storage.capture_definition_type_inputs(
+        &[crate::storage::StoredInputSource {
+            section,
+            sql: display,
+            bindings: inputs,
+        }],
+        txid,
+    )
+}
+
+fn capture_view_default_inputs(
+    storage: &Storage,
+    previous: &crate::storage::ViewDef,
+    columns: &crate::storage::ViewColumns,
+    changed: usize,
+    raw: Option<&str>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<crate::storage::StoredTypeInputs, SqlError> {
+    let prior = previous.default_inputs_for(txid).detached_sections(arena)?;
+    let sources = arena
+        .alloc_slice_with(columns.len(), |column| crate::storage::StoredInputSource {
+            section: crate::storage::StoredInputSection::ViewDefault((column + 1) as u16),
+            sql: "",
+            bindings: &[],
+        })
+        .map_err(|_| arena_full())?;
+    for (index, output) in sources.iter_mut().enumerate() {
+        let Some(source) = columns.default_sql(index) else {
+            continue;
+        };
+        output.sql = super::enum_values::checks::default_display(source, arena)?;
+        let inputs = if index == changed {
+            match raw {
+                Some(raw) => {
+                    super::type_inputs::bindings_for_active_source(raw, arena)?.unwrap_or(&[])
+                }
+                None => &[],
+            }
+        } else {
+            prior
+                .binary_search_by_key(&output.section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| prior[index].1)
+        };
+        let old = if index == changed {
+            raw.unwrap_or("")
+        } else {
+            previous
+                .columns_for(txid)
+                .default_sql(index)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "view default source is missing")
+                })?
+        };
+        let old = super::enum_values::checks::default_display(old, arena)?;
+        output.bindings = super::type_inputs::rebase(
+            old,
+            output.sql,
+            super::parser::StoredSqlKind::Expression,
+            inputs,
+            |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+            arena,
+        )?;
+    }
+    storage.capture_definition_type_inputs(sources, txid)
 }
 
 fn capture_created_table_inputs(
@@ -16860,6 +16950,7 @@ struct PlpgsqlCursorMotion<'a> {
 
 #[derive(Clone, Copy)]
 struct BoundPlpgsqlCommand<'a> {
+    owner: super::type_input_plans::Owner,
     source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
@@ -20310,7 +20401,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &mut super::guc::GucState,
+    guc: &super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
     source: &'a str,
     arena: &'a Arena,
@@ -20382,7 +20473,7 @@ pub(crate) fn execute_event_trigger<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &mut super::guc::GucState,
+    guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     event: &'a str,
     tag: &'a str,
@@ -20461,7 +20552,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &mut super::guc::GucState,
+    guc: &super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
@@ -20625,7 +20716,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &mut super::guc::GucState,
+    guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
@@ -20796,7 +20887,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &mut super::guc::GucState,
+    guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
@@ -21794,7 +21885,7 @@ enum PlpgsqlExecHost<'s> {
     },
     Routine {
         engine: &'s mut super::Engine,
-        guc: &'s mut super::guc::GucState,
+        guc: &'s super::guc::GucState,
         sqlprep: &'s mut super::prep::SqlPreparedPool,
         cursors: &'s mut super::cursor::CursorPool,
         transaction_context: PlpgsqlTransactionContext,
@@ -21896,6 +21987,13 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
+    fn plan_owner(&self) -> Result<super::type_input_plans::Owner, SqlError> {
+        match &self.host {
+            PlpgsqlExecHost::Routine { .. } => super::type_input_plans::owner(),
+            PlpgsqlExecHost::Atomic { .. } => Ok(super::type_input_plans::Owner::Unlocated),
+        }
+    }
+
     fn storage(&self) -> &Storage {
         self.host.storage()
     }
@@ -22012,11 +22110,7 @@ fn eval_procedural_expression<'a>(
         })?
 }
 
-#[derive(Clone, Copy)]
-enum DynamicCommandKind {
-    Statement,
-    Cursor,
-}
+use super::type_input_plans::DynamicCommandKind;
 
 fn bind_plpgsql_dynamic_query<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
@@ -22062,7 +22156,14 @@ fn bind_plpgsql_dynamic_query<'a>(
             context.arena,
         )?;
     }
+    let owner = match &mut context.host {
+        PlpgsqlExecHost::Routine { sqlprep, .. } => {
+            sqlprep.dynamic_owner(kind, command, parameter_types, arguments, context.arena)?
+        }
+        PlpgsqlExecHost::Atomic { .. } => super::type_input_plans::Owner::Unlocated,
+    };
     Ok(BoundPlpgsqlCommand {
+        owner,
         source: command,
         statement: match kind {
             DynamicCommandKind::Statement => {
@@ -22147,6 +22248,9 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
             name
         )
     })?;
+    let owner = sqlprep
+        .plan_owner(name)
+        .expect("a live SQL prepared statement owns its routine input plans");
     let declared =
         crate::sql::prep::decode_types(sqlprep.get_type_codes(name).unwrap_or(&[]), context.arena)?;
     let declared_count = declared.len();
@@ -22173,6 +22277,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .alloc_str(text)
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(BoundPlpgsqlCommand {
+        owner,
         source: text,
         statement: engine.prepared_statement(
             name,
@@ -22193,30 +22298,32 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
-    with_bound_parameter_types(query.parameter_types, || match query.statement {
-        Stmt::Select(select) => super::query::select_into_rows(
-            context.storage(),
-            context.txn.txid,
-            select,
-            context.arena,
-            query.arguments,
-            None,
-            Some(sequence),
-            emit,
-        ),
-        Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
-            context.storage(),
-            context.txn.txid,
-            set_query,
-            context.arena,
-            query.arguments,
-            Some(sequence),
-            emit,
-        ),
-        _ => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
-        )),
+    super::type_input_plans::with_owner(query.owner, || {
+        with_bound_parameter_types(query.parameter_types, || match query.statement {
+            Stmt::Select(select) => super::query::select_into_rows(
+                context.storage(),
+                context.txn.txid,
+                select,
+                context.arena,
+                query.arguments,
+                None,
+                Some(sequence),
+                emit,
+            ),
+            Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
+                context.storage(),
+                context.txn.txid,
+                set_query,
+                context.arena,
+                query.arguments,
+                Some(sequence),
+                emit,
+            ),
+            _ => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
+            )),
+        })
     })
 }
 
@@ -22231,171 +22338,174 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<u64, SqlError> {
-    super::query::validate_dml_assignment_casts(
-        query.statement,
-        context.storage(),
-        context.txn.txid,
-        context.arena,
-        None,
-    )?;
-    let statement = match transition_relations {
-        Some(relations) => super::query::bind_dml_materialized_relations(
+    super::type_input_plans::with_owner(query.owner, || {
+        super::query::validate_dml_assignment_casts(
             query.statement,
             context.storage(),
             context.txn.txid,
             context.arena,
-            query.arguments,
-            relations,
-        )?,
-        None => query.statement,
-    };
-    match statement {
-        Stmt::Insert(statement) => {
-            let assignment_casts = prepare_dml_assignment_casts(
-                &Stmt::Insert(*statement),
+            None,
+        )?;
+        let statement = match transition_relations {
+            Some(relations) => super::query::bind_dml_materialized_relations(
+                query.statement,
                 context.storage(),
                 context.txn.txid,
                 context.arena,
-                None,
-            )?;
-            let source_casts = match statement.select {
-                Some(select) => Some(prepare_insert_select_casts(
-                    statement,
-                    select,
+                query.arguments,
+                relations,
+            )?,
+            None => query.statement,
+        };
+        match statement {
+            Stmt::Insert(statement) => {
+                let assignment_casts = prepare_dml_assignment_casts(
+                    &Stmt::Insert(*statement),
                     context.storage(),
                     context.txn.txid,
                     context.arena,
                     None,
-                )?),
-                None => None,
-            };
-            let prepared_select = match statement.select {
-                Some(select) => Some(materialize_trigger_insert_source(
-                    context.storage(),
-                    statement,
-                    select,
-                    source_casts.expect("prepared SELECT has a cast plan"),
-                    context.arena,
-                    context.arena,
-                    context.txn.txid,
-                    TriggerQueryExecution {
-                        params: query.arguments,
-                        seq_session: context.seq_session(),
-                    },
-                    None,
-                )?),
-                None => None,
-            };
-            let arena = context.arena;
-            let params = query.arguments;
-            let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
-            let scratch = unsafe { &mut *scratch };
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            responder.clear_affected_rows();
-            let outcome = responder.without_query_output(|responder| {
-                insert(
-                    storage,
-                    txn,
-                    scratch,
-                    statement,
-                    DmlAuthorization::Invoker,
-                    None,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    capture,
-                    None,
-                    transition_relations,
-                    None,
-                    prepared_select.map_or(InsertSource::Statement, |rows| {
-                        InsertSource::MaterializedSelect {
-                            rows,
-                            assignments: assignment_casts,
-                        }
-                    }),
-                )
-            });
-            drop(command);
-            dynamic_dml_outcome(responder, outcome, "INSERT")
+                )?;
+                let source_casts = match statement.select {
+                    Some(select) => Some(prepare_insert_select_casts(
+                        statement,
+                        select,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                        None,
+                    )?),
+                    None => None,
+                };
+                let prepared_select = match statement.select {
+                    Some(select) => Some(materialize_trigger_insert_source(
+                        context.storage(),
+                        statement,
+                        select,
+                        source_casts.expect("prepared SELECT has a cast plan"),
+                        context.arena,
+                        context.arena,
+                        context.txn.txid,
+                        TriggerQueryExecution {
+                            params: query.arguments,
+                            seq_session: context.seq_session(),
+                        },
+                        None,
+                    )?),
+                    None => None,
+                };
+                let arena = context.arena;
+                let params = query.arguments;
+                let (storage, txn, scratch, responder, seq_session) =
+                    context.dml_parts_with_sequence();
+                let scratch = unsafe { &mut *scratch };
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                responder.clear_affected_rows();
+                let outcome = responder.without_query_output(|responder| {
+                    insert(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        DmlAuthorization::Invoker,
+                        None,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        capture,
+                        None,
+                        transition_relations,
+                        None,
+                        prepared_select.map_or(InsertSource::Statement, |rows| {
+                            InsertSource::MaterializedSelect {
+                                rows,
+                                assignments: assignment_casts,
+                            }
+                        }),
+                    )
+                });
+                drop(command);
+                dynamic_dml_outcome(responder, outcome, "INSERT")
+            }
+            Stmt::Update(statement) => {
+                let scratch = unsafe { &mut *context.scratch() };
+                let arena = context.arena;
+                let params = query.arguments;
+                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                let nested = scratch.pool().lease(0).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested DML selection: {}",
+                        error
+                    )
+                })?;
+                let saved = core::mem::replace(scratch, nested);
+                responder.clear_affected_rows();
+                let outcome = responder.without_query_output(|responder| {
+                    update(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        DmlAuthorization::Invoker,
+                        None,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        capture,
+                        None,
+                    )
+                });
+                drop(command);
+                *scratch = saved;
+                dynamic_dml_outcome(responder, outcome, "UPDATE")
+            }
+            Stmt::Delete(statement) => {
+                let scratch = unsafe { &mut *context.scratch() };
+                let arena = context.arena;
+                let params = query.arguments;
+                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
+                let mut command = txn.enter_trigger_sql(storage)?;
+                let txn = &mut *command;
+                let nested = scratch.pool().lease(0).map_err(|error| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested DML selection: {}",
+                        error
+                    )
+                })?;
+                let saved = core::mem::replace(scratch, nested);
+                responder.clear_affected_rows();
+                let outcome = responder.without_query_output(|responder| {
+                    delete(
+                        storage,
+                        txn,
+                        scratch,
+                        statement,
+                        DmlAuthorization::Invoker,
+                        arena,
+                        params,
+                        seq_session,
+                        responder,
+                        capture,
+                        None,
+                    )
+                });
+                drop(command);
+                *scratch = saved;
+                dynamic_dml_outcome(responder, outcome, "DELETE")
+            }
+            _ => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL dynamic command is not data-modifying"
+            )),
         }
-        Stmt::Update(statement) => {
-            let scratch = unsafe { &mut *context.scratch() };
-            let arena = context.arena;
-            let params = query.arguments;
-            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            let nested = scratch.pool().lease(0).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "nested DML selection: {}",
-                    error
-                )
-            })?;
-            let saved = core::mem::replace(scratch, nested);
-            responder.clear_affected_rows();
-            let outcome = responder.without_query_output(|responder| {
-                update(
-                    storage,
-                    txn,
-                    scratch,
-                    statement,
-                    DmlAuthorization::Invoker,
-                    None,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    capture,
-                    None,
-                )
-            });
-            drop(command);
-            *scratch = saved;
-            dynamic_dml_outcome(responder, outcome, "UPDATE")
-        }
-        Stmt::Delete(statement) => {
-            let scratch = unsafe { &mut *context.scratch() };
-            let arena = context.arena;
-            let params = query.arguments;
-            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-            let mut command = txn.enter_trigger_sql(storage)?;
-            let txn = &mut *command;
-            let nested = scratch.pool().lease(0).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "nested DML selection: {}",
-                    error
-                )
-            })?;
-            let saved = core::mem::replace(scratch, nested);
-            responder.clear_affected_rows();
-            let outcome = responder.without_query_output(|responder| {
-                delete(
-                    storage,
-                    txn,
-                    scratch,
-                    statement,
-                    DmlAuthorization::Invoker,
-                    arena,
-                    params,
-                    seq_session,
-                    responder,
-                    capture,
-                    None,
-                )
-            });
-            drop(command);
-            *scratch = saved;
-            dynamic_dml_outcome(responder, outcome, "DELETE")
-        }
-        _ => Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic command is not data-modifying"
-        )),
-    }
+    })
 }
 
 /// Static and dynamic utility commands use the routine's durable DDL executor. Atomic
@@ -22405,209 +22515,213 @@ fn execute_bound_plpgsql_utility<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
 ) -> Result<(), SqlError> {
-    if !query.arguments.is_empty() && !matches!(query.statement, Stmt::DeclareCursor { .. }) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic utility commands do not accept USING parameters"
-        ));
-    }
-    if let Stmt::CreateSchema {
-        name,
-        authorization,
-        if_not_exists,
-        elements,
-    } = query.statement
-    {
-        let resolved = match &context.host {
-            PlpgsqlExecHost::Routine { .. } => super::resolve_create_schema(
-                *name,
-                *authorization,
-                super::eval::funcs::system::current_identity(),
-                super::eval::funcs::system::session_identity(),
-            )?,
-            PlpgsqlExecHost::Atomic { .. } => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL utility commands are not valid in trigger execution"
-                ));
-            }
-        };
-        let authorization = resolved.authorization.as_ref().map(|role| role.as_str());
-        let name = context
-            .arena
-            .alloc_str(resolved.name.as_str())
-            .map_err(|_| super::query::arena_full_pub())?;
-        let outcome = {
-            let PlpgsqlExecHost::Routine {
-                engine,
-                guc,
-                sqlprep,
-                cursors,
-                transaction_context,
-            } = &mut context.host
-            else {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL utility commands are not valid in trigger execution"
-                ));
+    super::type_input_plans::with_owner(query.owner, || {
+        if !query.arguments.is_empty() && !matches!(query.statement, Stmt::DeclareCursor { .. }) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL dynamic utility commands do not accept USING parameters"
+            ));
+        }
+        if let Stmt::CreateSchema {
+            name,
+            authorization,
+            if_not_exists,
+            elements,
+        } = query.statement
+        {
+            let resolved = match &context.host {
+                PlpgsqlExecHost::Routine { .. } => super::resolve_create_schema(
+                    *name,
+                    *authorization,
+                    super::eval::funcs::system::current_identity(),
+                    super::eval::funcs::system::session_identity(),
+                )?,
+                PlpgsqlExecHost::Atomic { .. } => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PL/pgSQL utility commands are not valid in trigger execution"
+                    ));
+                }
             };
-            context.responder.without_query_output(|responder| {
-                engine.execute_routine_utility(
-                    query.statement,
-                    context.txn,
+            let authorization = resolved.authorization.as_ref().map(|role| role.as_str());
+            let name = context
+                .arena
+                .alloc_str(resolved.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?;
+            let outcome = {
+                let PlpgsqlExecHost::Routine {
+                    engine,
+                    guc,
                     sqlprep,
                     cursors,
-                    guc,
-                    *transaction_context,
-                    context.arena,
-                    responder,
-                    |engine, txn, _, _, _, responder| {
-                        super::exec::create_schema(
-                            &mut engine.storage,
-                            &mut engine.wal,
-                            txn,
-                            name,
-                            authorization,
-                            *if_not_exists,
-                            responder,
-                        )
-                    },
-                )
-            })
-        };
-        routine_utility_outcome(outcome)?;
-
-        let prior_user = crate::sql::eval::funcs::system::current_identity();
-        let authorization_identity = resolved
-            .authorization
-            .as_ref()
-            .map(|owner| {
-                context
-                    .storage()
-                    .capture_role(owner.as_str(), context.txn.txid)
-                    .map(crate::storage::SessionIdentity::bound)
-            })
-            .transpose()?;
-        let prior_role = {
-            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
-                unreachable!("schema creation requires a routine execution host")
+                    transaction_context,
+                } = &mut context.host
+                else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PL/pgSQL utility commands are not valid in trigger execution"
+                    ));
+                };
+                context.responder.without_query_output(|responder| {
+                    engine.execute_routine_utility(
+                        query.statement,
+                        context.txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        *transaction_context,
+                        context.arena,
+                        responder,
+                        |engine, txn, _, _, _, responder| {
+                            super::exec::create_schema(
+                                &mut engine.storage,
+                                &mut engine.wal,
+                                txn,
+                                name,
+                                authorization,
+                                *if_not_exists,
+                                responder,
+                            )
+                        },
+                    )
+                })
             };
-            let prior_role = guc.current_identity();
-            if let Some(owner) = authorization_identity {
-                guc.set_role(owner, true);
-                crate::sql::eval::funcs::system::set_current_user(owner);
-            }
-            prior_role
-        };
+            routine_utility_outcome(outcome)?;
 
-        // CREATE SCHEMA elements retain their static, typed qualification and
-        // durable utility execution path instead of reconstructing SQL text.
-        let elements_result = (|| {
-            for element in *elements {
-                let requalified = super::requalify_schema_element(element, name, context.arena)?;
-                if let Stmt::CreateView {
-                    name: view_name,
-                    persistence,
-                    columns,
-                    or_replace,
-                    security,
-                    security_barrier,
-                    check_option,
-                    sql,
-                } = requalified
-                {
-                    let outcome = {
-                        let PlpgsqlExecHost::Routine {
-                            engine,
-                            guc,
-                            sqlprep,
-                            cursors,
-                            transaction_context,
-                        } = &mut context.host
-                        else {
-                            unreachable!("schema creation requires a routine execution host")
-                        };
-                        let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
-                        let role = guc.current_role();
-                        let path = engine.storage.compute_path(
-                            schema_path,
-                            role.as_str(),
-                            context.txn.txid,
-                        );
-                        let old_path = engine.storage.swap_path(path);
-                        let outcome = context.responder.without_query_output(|responder| {
-                            engine.execute_routine_utility(
-                                requalified,
-                                context.txn,
+            let prior_user = crate::sql::eval::funcs::system::current_identity();
+            let authorization_identity = resolved
+                .authorization
+                .as_ref()
+                .map(|owner| {
+                    context
+                        .storage()
+                        .capture_role(owner.as_str(), context.txn.txid)
+                        .map(crate::storage::SessionIdentity::bound)
+                })
+                .transpose()?;
+            let prior_role = {
+                let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                    unreachable!("schema creation requires a routine execution host")
+                };
+                let prior_role = guc.current_identity();
+                if let Some(owner) = authorization_identity {
+                    guc.set_role(owner, true);
+                    crate::sql::eval::funcs::system::set_current_user(owner);
+                }
+                prior_role
+            };
+
+            // CREATE SCHEMA elements retain their static, typed qualification and
+            // durable utility execution path instead of reconstructing SQL text.
+            let elements_result = (|| {
+                for element in *elements {
+                    let requalified =
+                        super::requalify_schema_element(element, name, context.arena)?;
+                    if let Stmt::CreateView {
+                        name: view_name,
+                        persistence,
+                        columns,
+                        or_replace,
+                        security,
+                        security_barrier,
+                        check_option,
+                        sql,
+                    } = requalified
+                    {
+                        let outcome = {
+                            let PlpgsqlExecHost::Routine {
+                                engine,
+                                guc,
                                 sqlprep,
                                 cursors,
-                                guc,
-                                *transaction_context,
-                                context.arena,
-                                responder,
-                                |engine, txn, _, _, _, responder| {
-                                    super::exec::create_view(
-                                        &mut engine.storage,
-                                        &mut engine.wal,
-                                        txn,
-                                        super::exec::CreateViewCommand {
-                                            name: view_name,
-                                            persistence: *persistence,
-                                            columns,
-                                            or_replace: *or_replace,
-                                            security: *security,
-                                            security_barrier: *security_barrier,
-                                            check_option: *check_option,
-                                            sql,
-                                            raw_path: schema_path,
-                                        },
-                                        context.arena,
-                                        responder,
-                                    )
-                                },
-                            )
-                        });
-                        engine.storage.swap_path(old_path);
-                        outcome
-                    };
-                    routine_utility_outcome(outcome)?;
-                } else {
-                    execute_bound_plpgsql_utility(
-                        context,
-                        BoundPlpgsqlCommand {
-                            source: "",
-                            statement: requalified,
-                            arguments: &[],
-                            parameter_types: &[],
-                        },
-                    )?;
+                                transaction_context,
+                            } = &mut context.host
+                            else {
+                                unreachable!("schema creation requires a routine execution host")
+                            };
+                            let schema_path =
+                                crate::sql::eval::quote_ident_str(name, context.arena)?;
+                            let role = guc.current_role();
+                            let path = engine.storage.compute_path(
+                                schema_path,
+                                role.as_str(),
+                                context.txn.txid,
+                            );
+                            let old_path = engine.storage.swap_path(path);
+                            let outcome = context.responder.without_query_output(|responder| {
+                                engine.execute_routine_utility(
+                                    requalified,
+                                    context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    *transaction_context,
+                                    context.arena,
+                                    responder,
+                                    |engine, txn, _, _, _, responder| {
+                                        super::exec::create_view(
+                                            &mut engine.storage,
+                                            &mut engine.wal,
+                                            txn,
+                                            super::exec::CreateViewCommand {
+                                                name: view_name,
+                                                persistence: *persistence,
+                                                columns,
+                                                or_replace: *or_replace,
+                                                security: *security,
+                                                security_barrier: *security_barrier,
+                                                check_option: *check_option,
+                                                sql,
+                                                raw_path: schema_path,
+                                            },
+                                            context.arena,
+                                            responder,
+                                        )
+                                    },
+                                )
+                            });
+                            engine.storage.swap_path(old_path);
+                            outcome
+                        };
+                        routine_utility_outcome(outcome)?;
+                    } else {
+                        execute_bound_plpgsql_utility(
+                            context,
+                            BoundPlpgsqlCommand {
+                                owner: context.plan_owner()?,
+                                source: "",
+                                statement: requalified,
+                                arguments: &[],
+                                parameter_types: &[],
+                            },
+                        )?;
+                    }
                 }
+                Ok(())
+            })();
+            if resolved.authorization.is_some() {
+                let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                    unreachable!("schema creation requires a routine execution host")
+                };
+                guc.set_role(prior_role, true);
+                crate::sql::eval::funcs::system::set_current_user(prior_user);
             }
-            Ok(())
-        })();
-        if resolved.authorization.is_some() {
-            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
-                unreachable!("schema creation requires a routine execution host")
-            };
-            guc.set_role(prior_role, true);
-            crate::sql::eval::funcs::system::set_current_user(prior_user);
+            return elements_result;
         }
-        return elements_result;
-    }
-    let PlpgsqlExecHost::Routine {
-        engine,
-        guc,
-        sqlprep,
-        cursors,
-        transaction_context,
-    } = &mut context.host
-    else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL utility commands are not valid in trigger execution"
-        ));
-    };
-    let outcome = context.responder.without_query_output(|responder| {
+        let PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context,
+        } = &mut context.host
+        else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL utility commands are not valid in trigger execution"
+            ));
+        };
+        let outcome = context.responder.without_query_output(|responder| {
         engine.execute_routine_utility(
             query.statement,
             context.txn,
@@ -24262,7 +24376,8 @@ fn execute_bound_plpgsql_utility<'a>(
             },
         )
     });
-    routine_utility_outcome(outcome)
+        routine_utility_outcome(outcome)
+    })
 }
 
 fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
@@ -24311,6 +24426,7 @@ fn execute_plpgsql_dynamic_explain(
     let planned = resolve_plpgsql_dynamic_prepared(
         context,
         BoundPlpgsqlCommand {
+            owner: context.plan_owner()?,
             source: "",
             statement,
             arguments,
@@ -24666,7 +24782,7 @@ fn trigger_format_message<'a>(
 }
 
 fn trigger_diagnostic_text<'a, const N: usize>(
-    expression: &Expr<'a>,
+    expression: &'a Expr<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<N>, SqlError> {
@@ -25360,46 +25476,55 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             invocation,
                             transition: &transition,
                         };
-                        let (source, arguments, capture_locals, parameter_types) = match statement
-                            .query
-                        {
-                            PlpgsqlCursorQuery::Static(source) => {
-                                let parsed =
-                                    super::parser::parse_stored_statement(source, context.arena)?;
-                                match parsed {
-                                    Stmt::Select(_) | Stmt::SetQuery(_) => {
-                                        (source, context.params, true, None)
+                        let (source, arguments, capture_locals, parameter_types, plan_owner) =
+                            match statement.query {
+                                PlpgsqlCursorQuery::Static(source) => {
+                                    let parsed = super::parser::parse_stored_statement(
+                                        source,
+                                        context.arena,
+                                    )?;
+                                    match parsed {
+                                        Stmt::Select(_) | Stmt::SetQuery(_) => (
+                                            source,
+                                            context.params,
+                                            true,
+                                            None,
+                                            context.plan_owner()?,
+                                        ),
+                                        _ => {
+                                            return Err(sql_err!(
+                                                sqlstate::SYNTAX_ERROR,
+                                                "OPEN requires a SELECT"
+                                            ));
+                                        }
                                     }
-                                    _ => {
+                                }
+                                PlpgsqlCursorQuery::Dynamic(query) => {
+                                    let bound = bind_plpgsql_dynamic_query(
+                                        context,
+                                        query,
+                                        &scope,
+                                        DynamicCommandKind::Cursor,
+                                    )?;
+                                    let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
+                                    if !matches!(
+                                        bound.statement,
+                                        Stmt::Select(_) | Stmt::SetQuery(_)
+                                    ) {
                                         return Err(sql_err!(
                                             sqlstate::SYNTAX_ERROR,
                                             "OPEN requires a SELECT"
                                         ));
                                     }
+                                    (
+                                        bound.source,
+                                        bound.arguments,
+                                        false,
+                                        Some(bound.parameter_types),
+                                        bound.owner,
+                                    )
                                 }
-                            }
-                            PlpgsqlCursorQuery::Dynamic(query) => {
-                                let bound = bind_plpgsql_dynamic_query(
-                                    context,
-                                    query,
-                                    &scope,
-                                    DynamicCommandKind::Cursor,
-                                )?;
-                                let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
-                                if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
-                                    return Err(sql_err!(
-                                        sqlstate::SYNTAX_ERROR,
-                                        "OPEN requires a SELECT"
-                                    ));
-                                }
-                                (
-                                    bound.source,
-                                    bound.arguments,
-                                    false,
-                                    Some(bound.parameter_types),
-                                )
-                            }
-                        };
+                            };
                         let captured = if capture_locals {
                             scope.cursor_locals(
                                 context.storage(),
@@ -25436,10 +25561,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 guc,
                             )
                         };
-                        match parameter_types {
-                            Some(types) => with_bound_parameter_types(types, open),
-                            None => open(),
-                        }?;
+                        super::type_input_plans::with_owner(
+                            plan_owner,
+                            || match parameter_types {
+                                Some(types) => with_bound_parameter_types(types, open),
+                                None => open(),
+                            },
+                        )?;
                         *completed = true;
                         assign_trigger_local(
                             context,
@@ -26203,6 +26331,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 execute_bound_plpgsql_utility(
                     context,
                     BoundPlpgsqlCommand {
+                        owner: context.plan_owner()?,
                         source,
                         statement,
                         arguments: &[],
@@ -38354,6 +38483,7 @@ pub fn create_view(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
+    let mut default_inputs = crate::storage::StoredTypeInputs::EMPTY;
     if or_replace
         && let Some(slot) = storage.views_visible_to(txn.txid).find_map(|(slot, view)| {
             (view.schema_for(txn.txid) == schema && view.name_for(txn.txid) == sqlname)
@@ -38368,6 +38498,7 @@ pub fn create_view(
         ) {
             return sql_fail(error);
         }
+        default_inputs = storage.view(slot).default_inputs_for(txn.txid).clone();
         let prior = *storage.view(slot).columns_for(txn.txid);
         if prior.len() > columns.len() {
             return sql_fail(sql_err!(
@@ -38463,7 +38594,7 @@ pub fn create_view(
         sqlname,
         crate::storage::ViewDefinition {
             persistence,
-            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+            default_inputs: default_inputs.clone(),
             columns,
             query: crate::storage::StoredQueryDefinition {
                 sql: buffer,
@@ -38532,7 +38663,10 @@ pub fn create_view(
                         identity: storage.view_catalog_identity(new_slot),
                         schema: schema.as_str(),
                         name: name.name,
-                        columns: crate::wal::WalViewColumns::Captured(&columns),
+                        columns: crate::wal::WalViewColumns::Captured {
+                            columns: &columns,
+                            default_inputs: &default_inputs,
+                        },
                         sql: durable_sql.as_str(),
                         path: raw_path,
                         security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
@@ -38559,7 +38693,9 @@ pub fn create_view(
                 );
                 return sql_fail(e);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+            if let Err(error) =
+                txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone()))
+            {
                 storage.finish_view_publication(
                     publication,
                     crate::storage::CatalogDdlDecision::Rollback,
@@ -38839,7 +38975,17 @@ pub fn alter_view(
                     "view column type identity is unavailable"
                 ));
             };
-            let parsed = match crate::sql::parser::parse_expr(expression, arena) {
+            let literal_inputs =
+                match super::type_inputs::bindings_for_active_source(expression, arena) {
+                    Ok(inputs) => inputs.unwrap_or(&[]),
+                    Err(error) => return sql_fail(error),
+                };
+            let parsed = match crate::sql::parser::parse_expression_with_type_inputs(
+                expression,
+                literal_inputs,
+                arena,
+                |parser| super::type_inputs::validate_restored(parser, storage, txn.txid),
+            ) {
                 Ok(expression) => expression,
                 Err(error) => return sql_fail(error),
             };
@@ -38863,7 +39009,24 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
+            let default_inputs = match capture_view_default_inputs(
+                storage,
+                &storage.view(slot),
+                &columns,
+                index,
+                Some(expression),
+                txn.txid,
+                arena,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.stage_view_columns(
+                edit_target,
+                columns,
+                txn.txid,
+                default_inputs.clone(),
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -38879,7 +39042,10 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns: crate::wal::WalViewColumns::Captured(&columns),
+                        columns: crate::wal::WalViewColumns::Captured {
+                            columns: &columns,
+                            default_inputs: &default_inputs,
+                        },
                     },
                 )
             };
@@ -38913,7 +39079,24 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
+            let default_inputs = match capture_view_default_inputs(
+                storage,
+                &storage.view(slot),
+                &columns,
+                index,
+                None,
+                txn.txid,
+                arena,
+            ) {
+                Ok(inputs) => inputs,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.stage_view_columns(
+                edit_target,
+                columns,
+                txn.txid,
+                default_inputs.clone(),
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -38929,7 +39112,10 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns: crate::wal::WalViewColumns::Captured(&columns),
+                        columns: crate::wal::WalViewColumns::Captured {
+                            columns: &columns,
+                            default_inputs: &default_inputs,
+                        },
                     },
                 )
             };
@@ -38968,7 +39154,13 @@ pub fn alter_view(
                 let view = storage.view(slot);
                 view.names_for(txn.txid)
             };
-            let prior = match storage.stage_view_columns(edit_target, columns, txn.txid) {
+            let default_inputs = view_image.default_inputs_for(txn.txid).clone();
+            let prior = match storage.stage_view_columns(
+                edit_target,
+                columns,
+                txn.txid,
+                default_inputs.clone(),
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -38984,7 +39176,10 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns: crate::wal::WalViewColumns::Captured(&columns),
+                        columns: crate::wal::WalViewColumns::Captured {
+                            columns: &columns,
+                            default_inputs: &default_inputs,
+                        },
                     },
                 )
             };
@@ -39237,7 +39432,7 @@ fn publish_rewritten_view(
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
     let literal_inputs = super::query::rebase_stored_query_inputs(
-        query.sql.as_str(),
+        query.input_source.unwrap_or(query.sql.as_str()),
         rewritten.as_str(),
         query.dependencies.view(),
         storage,
@@ -39276,7 +39471,7 @@ fn publish_rewritten_view(
         storage.view_edit_target(view_slot, &view, txn.txid),
         crate::storage::ViewDefinition {
             persistence: view.persistence,
-            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+            default_inputs: view.default_inputs_for(txn.txid).clone(),
             columns: dependent_columns,
             query: crate::storage::StoredQueryDefinition {
                 sql: rewritten,
@@ -39302,7 +39497,10 @@ fn publish_rewritten_view(
                 identity: storage.view_catalog_identity(new_slot),
                 schema: view.schema_for(txn.txid).as_str(),
                 name: view.name_for(txn.txid).as_str(),
-                columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
+                columns: crate::wal::WalViewColumns::Captured {
+                    columns: &dependent_columns,
+                    default_inputs: view.default_inputs_for(txn.txid),
+                },
                 sql: rewritten.as_str(),
                 path: creation_path.as_str(),
                 security_invoker: matches!(
@@ -39323,7 +39521,7 @@ fn publish_rewritten_view(
         storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone())) {
         storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
         return Err(error);
     }
@@ -40396,6 +40594,7 @@ pub fn comment(
                 let dependencies = query.dependencies;
                 let described = super::query::describe_stored_query(
                     view_sql,
+                    query.input_source.unwrap_or(view_sql),
                     storage,
                     txid,
                     view_path,
@@ -42974,6 +43173,8 @@ pub(super) fn column_default_dependencies(
     storage: &Storage,
     transaction: u32,
     column: &ColumnMeta,
+    inputs: &crate::storage::StoredTypeInputs,
+    attribute: u16,
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     use core::fmt::Write;
@@ -42999,13 +43200,31 @@ pub(super) fn column_default_dependencies(
     };
     let mut query = StackStr::<{ crate::storage::DEFAULT_EXPR_MAX + 8 }>::new();
     write!(query, "SELECT {}", expression).map_err(|_| arena_full())?;
-    super::query::stored_query_dependencies(
+    let bindings = inputs.detached_bindings(
+        crate::storage::StoredInputSection::TableDefault(attribute),
+        arena,
+    )?;
+    let display = super::enum_values::checks::default_display(source.as_str(), arena)?;
+    let bindings = super::type_inputs::rebase(
+        display,
+        expression,
+        super::parser::StoredSqlKind::Expression,
+        bindings,
+        |name| Ok(super::type_inputs::target_oid(storage, transaction, name)),
+        arena,
+    )?;
+    let bindings = arena.alloc_slice_copy(bindings).map_err(|_| arena_full())?;
+    for binding in bindings.iter_mut() {
+        binding.start += 7;
+        binding.end += 7;
+    }
+    super::query::collect_query_dependencies(
         query.as_str(),
         storage,
         transaction,
         storage.path(),
         None,
-        &[],
+        bindings,
         arena,
     )
 }
@@ -43014,17 +43233,21 @@ fn column_default_uses_sequence(
     storage: &Storage,
     transaction: u32,
     column: &ColumnMeta,
+    inputs: &crate::storage::StoredTypeInputs,
+    attribute: u16,
     sequence: usize,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
     let mark = arena.mark();
     let result =
-        column_default_dependencies(storage, transaction, column, arena).map(|dependencies| {
-            dependencies.entries().iter().any(|dependency| {
-                dependency.class == crate::storage::DependencyClass::Sequence
-                    && usize::from(dependency.slot) == sequence
-            })
-        });
+        column_default_dependencies(storage, transaction, column, inputs, attribute, arena).map(
+            |dependencies| {
+                dependencies.entries().iter().any(|dependency| {
+                    dependency.class == crate::storage::DependencyClass::Sequence
+                        && usize::from(dependency.slot) == sequence
+                })
+            },
+        );
     // The predicate retains no parsed expression or dependency slice.
     unsafe { arena.rewind_to(mark) };
     result
@@ -43045,8 +43268,21 @@ fn remove_sequence_column_defaults(
         let (target, current) = storage.select_table_definition(table, txn.txid);
         let mut changed = false;
         let mut replacement = TableDefBuilder::from_definition(&current);
-        for column in replacement.columns.iter_mut().take(replacement.n_columns) {
-            if !column_default_uses_sequence(storage, txn.txid, column, sequence, arena)? {
+        for (index, column) in replacement
+            .columns
+            .iter_mut()
+            .take(replacement.n_columns)
+            .enumerate()
+        {
+            if !column_default_uses_sequence(
+                storage,
+                txn.txid,
+                column,
+                current.type_inputs.as_ref(),
+                current.attribute_number(index),
+                sequence,
+                arena,
+            )? {
                 continue;
             }
             if !cascade {
@@ -43064,6 +43300,7 @@ fn remove_sequence_column_defaults(
         if !changed {
             continue;
         }
+        refresh_table_type_inputs(storage, &current, &mut replacement, &[], txn.txid, arena)?;
         storage.lock_object(
             txn.txid,
             crate::storage::ObjectLockTarget::Table(table),
@@ -43392,11 +43629,21 @@ fn build_domain_spec(
         }
     };
     let resolved = resolve_routine_type(storage, txid, base_type)?;
-    let (base_domain, base_user_type, inherited_default) =
+    let (base_domain, base_user_type, inherited_default, inherited_inputs) =
         if let Some(parent) = storage.find_domain(base_type, txid) {
-            (resolved.user_type, None, parent.default_expr)
+            (
+                resolved.user_type,
+                None,
+                parent.default_expr,
+                parent.default_inputs.clone(),
+            )
         } else {
-            (None, resolved.user_type, None)
+            (
+                None,
+                resolved.user_type,
+                None,
+                crate::storage::StoredTypeInputs::EMPTY,
+            )
         };
     let base = resolved.ctype;
     let default_expr = match default_text {
@@ -43416,6 +43663,17 @@ fn build_domain_spec(
         // PostgreSQL copies a parent domain's default at CREATE time: a later
         // ALTER of the parent default does not change the child.
         None => inherited_default,
+    };
+    let default_inputs = match (default_text, default_expr.as_ref()) {
+        (Some(raw), Some(stored)) => capture_default_inputs(
+            storage,
+            raw,
+            stored.as_str(),
+            crate::storage::StoredInputSection::DomainDefault,
+            txid,
+            arena,
+        )?,
+        _ => inherited_inputs,
     };
     let mut checks = [crate::storage::CheckConstraint::EMPTY; crate::storage::MAX_DOMAIN_CHECKS];
     let mut n = 0;
@@ -43475,7 +43733,7 @@ fn build_domain_spec(
         not_null_name,
         not_null_identity: None,
         default_expr,
-        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+        default_inputs,
         checks,
         n_checks: n,
     })
@@ -44444,13 +44702,27 @@ pub fn alter_domain(
                     arena,
                 )
             }) {
-                Ok(t) => spec.default_expr = Some(t),
+                Ok(t) => {
+                    spec.default_inputs = match capture_default_inputs(
+                        storage,
+                        text,
+                        t.as_str(),
+                        crate::storage::StoredInputSection::DomainDefault,
+                        txn.txid,
+                        arena,
+                    ) {
+                        Ok(inputs) => inputs,
+                        Err(error) => return sql_fail(error),
+                    };
+                    spec.default_expr = Some(t);
+                }
                 Err(e) => return sql_fail(e),
             }
         }
         A::DropDefault => {
             revalidation = None;
             spec.default_expr = None;
+            spec.default_inputs = crate::storage::StoredTypeInputs::EMPTY;
         }
         A::AddCheck(check) => {
             if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
@@ -49314,7 +49586,7 @@ fn rewrite_composite_dependent_views(
             continue;
         }
         let literal_inputs = super::query::rebase_stored_query_inputs(
-            view_sql.as_str(),
+            query.input_source.unwrap_or(view_sql.as_str()),
             rewritten.as_str(),
             dependencies.view(),
             storage,
@@ -49334,7 +49606,7 @@ fn rewrite_composite_dependent_views(
             storage.view_edit_target(view_slot, &view, txn.txid),
             crate::storage::ViewDefinition {
                 persistence: view.persistence,
-                default_inputs: view.default_inputs.clone(),
+                default_inputs: view.default_inputs_for(txn.txid).clone(),
                 columns: view.columns,
                 query: crate::storage::StoredQueryDefinition {
                     sql: rewritten,
@@ -49360,7 +49632,10 @@ fn rewrite_composite_dependent_views(
                     identity: storage.view_catalog_identity(new_slot),
                     schema: view.schema_for(txn.txid).as_str(),
                     name: view.name_for(txn.txid).as_str(),
-                    columns: crate::wal::WalViewColumns::Captured(&view.columns),
+                    columns: crate::wal::WalViewColumns::Captured {
+                        columns: view.columns_for(txn.txid),
+                        default_inputs: view.default_inputs_for(txn.txid),
+                    },
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
                     security_invoker: matches!(
@@ -49382,7 +49657,7 @@ fn rewrite_composite_dependent_views(
                 .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication)) {
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone())) {
             storage
                 .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
@@ -58762,6 +59037,7 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
                 "view default target is absent from its base relation"
             ));
         };
+        let original = super::enum_values::checks::default_display(source.as_str(), arena)?;
         let source = super::enum_values::checks::resolve_default(
             source.as_str(),
             definition.columns.as_ref()[base_index].ctype,
@@ -58769,7 +59045,40 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
             txid,
             arena,
         )?;
-        parsed[base_index] = Some(crate::sql::parser::parse_expr(source, arena)?);
+        let section = crate::storage::StoredInputSection::ViewDefault((view_index + 1) as u16);
+        let inputs = view
+            .defaults
+            .inputs
+            .binary_search_by_key(&section, |(section, _)| *section)
+            .ok()
+            .map_or(&[][..], |index| view.defaults.inputs[index].1);
+        let inputs = super::type_inputs::rebase(
+            original,
+            source,
+            super::parser::StoredSqlKind::Expression,
+            inputs,
+            |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+            arena,
+        )?;
+        parsed[base_index] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+            source,
+            inputs,
+            arena,
+            |parser| {
+                super::type_inputs::validate_restored_candidates(parser, |candidate| {
+                    Ok(inputs
+                        .iter()
+                        .find(|input| {
+                            (input.start, input.end, input.kind)
+                                == (candidate.start, candidate.end, candidate.kind)
+                        })
+                        .map(|input| input.type_oid)
+                        .or_else(|| {
+                            super::type_inputs::candidate_target_oid(storage, txid, candidate)
+                        }))
+                })
+            },
+        )?);
     }
     Ok(parsed)
 }
@@ -61888,6 +62197,7 @@ pub(crate) fn view_trigger_definition<'a>(
         .map_err(|_| super::query::arena_full_pub())?;
     let n_columns = super::query::describe_stored_query(
         source,
+        query.input_source.unwrap_or(source),
         storage,
         txid,
         path,
@@ -62653,8 +62963,15 @@ fn materialize_view_rows<'a>(
     let source = arena
         .alloc_str(query.sql.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
-    let select = super::parser::parse_query(source, arena)?;
     let dependencies = query.dependencies;
+    let select = super::query::parse_stored_query(
+        source,
+        query.input_source.unwrap_or(source),
+        storage,
+        txid,
+        dependencies.view(),
+        arena,
+    )?;
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
     let (select, predicate) = super::query::filter_view_rows(

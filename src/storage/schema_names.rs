@@ -73,7 +73,7 @@ pub(super) fn validate_schema_name(name: SqlName) -> Result<(), SqlError> {
 }
 
 impl super::RoutineBodyKind {
-    pub(super) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
+    pub(crate) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
         match self {
             Self::Return => Ok(crate::sql::parser::StoredSqlKind::Expression),
             Self::Atomic => Ok(crate::sql::parser::StoredSqlKind::Statements),

@@ -363,7 +363,7 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 types_finished = true;
                 true
             }
-            Some("dom6" | "enm3" | "cmp2") if types_finished => {
+            Some("dom7" | "enm3" | "cmp2") if types_finished => {
                 return Err("type source follows its catalog boundary");
             }
             Some("end") => {
@@ -6361,7 +6361,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw13") => {
+                Some("vw14") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -7929,7 +7929,7 @@ impl Checkpointer {
                         log_count,
                     );
                 }
-                Some("dom6") => {
+                Some("dom7") => {
                     let source_slot: usize = parse_field(words.next(), "domain source slot")?;
                     if source_slot >= storage.domain_count() {
                         return Err(CheckpointSetupError::Corrupt(
@@ -8061,6 +8061,14 @@ impl Checkpointer {
                     } else {
                         None
                     };
+                    let inputs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("domain type inputs missing"))?,
+                    )?;
+                    let default_inputs = storage
+                        .decode_stored_type_inputs(&inputs)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid domain type inputs"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("unexpected domain fields"));
                     }
@@ -8074,6 +8082,7 @@ impl Checkpointer {
                         not_null_identity,
                         default_expr: (!default_text.is_empty())
                             .then(|| crate::util::StackStr::from_str(&default_text)),
+                        default_inputs,
                         checks,
                         n_checks,
                     };
@@ -10378,7 +10387,7 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(
                 &mut self.manifest_output,
-                "dom6 {} {} {} {} {} {}",
+                "dom7 {} {} {} {} {} {}",
                 slot,
                 d.created_at,
                 d.base.code(),
@@ -10426,7 +10435,12 @@ impl Checkpointer {
                 write!(&mut self.manifest_output, " {}", identity.created_at())
                     .map_err(|_| manifest_full())?;
             }
-            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
+            writeln!(
+                &mut self.manifest_output,
+                " {}",
+                ManifestInputBytes(d.default_inputs.bytes())
+            )
+            .map_err(|_| manifest_full())?;
         }
         // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
         // <sort-bits>]...`. Written before tables so an enum-typed column
@@ -11401,7 +11415,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw13 {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw14 {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11419,6 +11433,7 @@ impl Checkpointer {
                         .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
                     ManifestViewColumns(view.columns),
+                    ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
                 ),
             )?;
@@ -18774,7 +18789,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw13") {
+    if words.next() != Some("vw14") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -18905,17 +18920,35 @@ fn load_view(
             ))
         })?;
     }
+    let bytes = decode_manifest_hex_bytes(words.next().ok_or(CheckpointSetupError::Corrupt(
+        "view default type inputs missing",
+    ))?)?;
+    let default_inputs = storage
+        .restore_definition_type_inputs(
+            &bytes,
+            |section| {
+                let crate::storage::StoredInputSection::ViewDefault(attribute) = section else {
+                    return None;
+                };
+                columns.default_sql(usize::from(attribute) - 1)
+            },
+            0,
+        )
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid view default type inputs"))?;
     let dependencies = parse_stored_query_dependencies(&mut words)?
         .materialize(storage, |section| {
             (section == crate::storage::StoredInputSection::Query).then_some(sql.as_str())
         })?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("trailing view fields"));
+    }
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
     let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let definition = crate::storage::ViewDefinition {
         persistence: crate::storage::RelationPersistence::Permanent,
-        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
+        default_inputs,
         columns,
         query: crate::storage::StoredQueryDefinition {
             sql: buffer,
@@ -19790,7 +19823,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw13 0 1 0 2 {} {} {} {} 0 0 0 0:0: 0",
+                "vw14 0 1 0 2 {} {} {} {} 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),

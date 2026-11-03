@@ -3935,7 +3935,7 @@ pub(crate) fn collect<'a>(
         )?;
     }
     for original_pass in [true, false] {
-        for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
+        for (entry, &entry_origin) in undo.iter().cloned().zip(undo_origins) {
             if entry_origin != origin {
                 continue;
             }
@@ -3976,7 +3976,7 @@ pub(crate) fn collect<'a>(
         push_drop_once(&mut drops, &mut drop_count, reference, false, normal)?;
     }
     let mut seen_commands = ArenaList::new(arena);
-    for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
+    for (entry, &entry_origin) in undo.iter().cloned().zip(undo_origins) {
         if entry_origin != origin {
             continue;
         }

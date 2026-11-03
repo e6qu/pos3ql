@@ -17296,6 +17296,7 @@ pub(crate) fn describe_view<'a>(
         .map_err(|_| arena_full())?;
     let count = super::query::describe_stored_query(
         source,
+        query.input_source.unwrap_or(source),
         storage,
         txid,
         path,
@@ -21800,10 +21801,16 @@ fn pg_depend<'a>(
             continue;
         }
         let definition = storage.table_def(table, txid);
-        for column in definition.columns() {
+        for (column_index, column) in definition.columns().iter().enumerate() {
             let mark = arena.mark();
-            let dependencies =
-                super::exec::column_default_dependencies(storage, txid, column, arena);
+            let dependencies = super::exec::column_default_dependencies(
+                storage,
+                txid,
+                column,
+                definition.type_inputs.as_ref(),
+                definition.attribute_number(column_index),
+                arena,
+            );
             let count = dependencies.map(|dependencies| {
                 dependencies
                     .entries()
@@ -21971,8 +21978,14 @@ fn pg_depend<'a>(
         let definition = storage.table_def(table, txid);
         for (column_index, column) in definition.columns().iter().enumerate() {
             let mark = arena.mark();
-            let dependencies =
-                super::exec::column_default_dependencies(storage, txid, column, arena);
+            let dependencies = super::exec::column_default_dependencies(
+                storage,
+                txid,
+                column,
+                definition.type_inputs.as_ref(),
+                definition.attribute_number(column_index),
+                arena,
+            );
             let mut sequences = [0usize; crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
             let count = dependencies.map(|dependencies| {
                 let mut count = 0;

@@ -389,6 +389,7 @@ fn bind_planner_waits_keep_unpublished_parameters_and_release_them_on_abort() {
                         .all(|portal| !portal.active && portal.params.is_empty())
                 );
                 assert!(!conn.parked);
+                assert!(!conn.guc.seq_session().retains_statement_effects());
             }
             if !cancel {
                 message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);

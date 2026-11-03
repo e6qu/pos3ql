@@ -11982,6 +11982,8 @@ impl Engine {
                                 ) {
                                     Ok(outcome) => outcome,
                                     Err(WireFull) => {
+                                        sequence_scope.discard(guc.seq_session());
+                                        txn.release_suspended_statement();
                                         if txn.is_explicit() {
                                             txn.failed = true;
                                         } else {

@@ -76,7 +76,8 @@ unrelated table changes must not repeat a constraint.
 Compare procedural specialization, nested arguments, sized casts, selected
 operator/cast support functions and inherited ownership with PostgreSQL.
 Cover index, policy, rule and privilege changes, plus TRUNCATE commit, rollback
-and prepared transactions. Retain the selected table identity through these
+and prepared transactions, including immediate delivery to other sessions
+before an ANALYZE commits. Retain the selected table identity through these
 boundaries. Match whether whole-relation catalog statistics changed; repeating
 unchanged statistics and renaming an index must not repeat a constraint.
 Keep completed inputs while rolling back and safely replaying the unfinished

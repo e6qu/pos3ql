@@ -1,4 +1,65 @@
 use super::*;
+
+#[test]
+fn extended_output_exhaustion_releases_checked_input_receipts_in_explicit_transactions() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("checked-input-output-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut output =
+            crate::mem::FixedBuf::new(&mut budget, "checked input short response", 256).unwrap();
+        session.success(&mut engine,
+            "CREATE SEQUENCE overflow_checks; CREATE TYPE overflow_choice AS ENUM('a'); \
+             CREATE FUNCTION overflow_allowed(value overflow_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM nextval('overflow_checks'); RETURN true; END$$; \
+             CREATE DOMAIN overflow_checked AS overflow_choice CHECK(overflow_allowed(VALUE)); \
+             SET check_function_bodies=off; CREATE FUNCTION overflow_body() RETURNS integer \
+             LANGUAGE sql SET search_path=public AS $$SELECT cardinality('{a}'::overflow_checked[])$$; \
+             SET check_function_bodies=on; BEGIN", true);
+        session.arena.reset();
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_extended(
+                "SELECT overflow_body(),repeat('x',4096)",
+                &session.arena,
+                &[],
+                &[],
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut Responder::for_execute(&mut output, crate::pg::respond::ResultFmt::ALL_TEXT),
+                1,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExtendedExecutionStatus::Complete(false));
+        assert_eq!(error_sqlstates(output.readable()), ["54000"]);
+        assert!(session.transaction.failed);
+        assert!(!session.guc.seq_session().retains_statement_effects());
+        assert!(session.transaction.suspended_statement_context().is_none());
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM overflow_checks",
+                true
+            )),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT overflow_body()", true)),
+            ["1"]
+        );
+        drop((session, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
 #[test]
 fn runtime_input_retries_keep_their_receipts_across_namespace_changes() {
     for mode in [

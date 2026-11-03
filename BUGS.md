@@ -9,7 +9,8 @@ with their fixing code, tests and evidence.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) defines the required comparisons, allocation
 checks and failure diagnostics. Preserve ownership and allocation guards when
-repairing tests. Compiler success alone does not establish runtime correctness.
+repairing tests. Compare the same client-message and transaction boundaries;
+compiler success alone does not establish runtime correctness.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

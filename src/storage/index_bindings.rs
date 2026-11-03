@@ -488,7 +488,7 @@ mod tests {
                 storage
                     .write_table_def(
                         storage.select_table_definition(table, 7).0,
-                        moved,
+                        moved.clone(),
                         &mapping,
                         false,
                         crate::storage::ColumnSet::EMPTY,

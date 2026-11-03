@@ -100,11 +100,79 @@ ALTER SEQUENCE granularity_checks RESTART WITH 1;"#,
             (true, "SELECT granularity_body()", "16"),
         ] {
             let session = if use_second { &mut second } else { &mut first };
-            session.success(&mut engine, statement, true);
+            // Match psql's separate messages while BEGIN keeps explicit transactions open.
+            for command in statement.split(';') {
+                session.success(&mut engine, command.trim(), true);
+            }
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
                     "SELECT last_value FROM granularity_checks",
+                    true
+                )),
+                [expected],
+                "{statement}"
+            );
+        }
+        drop((first, second, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn changed_relation_estimates_invalidate_other_sessions_before_commit() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cross-analyze-plan-invalidation-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut first = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut second =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        first.success(&mut engine, r#"CREATE SEQUENCE cross_analyze_checks; CREATE TYPE cross_analyze_choice AS ENUM('a'); CREATE DOMAIN cross_analyze_checked AS cross_analyze_choice CHECK(nextval('cross_analyze_checks')>0); CREATE TABLE cross_analyze_anchor(id integer); CREATE TABLE cross_analyze_unrelated(id integer); INSERT INTO cross_analyze_anchor VALUES(1); CREATE FUNCTION cross_analyze_body() RETURNS cross_analyze_checked[] LANGUAGE sql SET search_path=public AS $$SELECT '{a}'::cross_analyze_checked[] FROM cross_analyze_anchor LIMIT 1$$; ALTER SEQUENCE cross_analyze_checks RESTART WITH 1;"#, true);
+        for (use_second, statement, expected) in [
+            (false, "SELECT cross_analyze_body()", "1"),
+            (true, "SELECT cross_analyze_body()", "2"),
+            (
+                false,
+                "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                "3",
+            ),
+            (true, "SELECT cross_analyze_body()", "4"),
+            (false, "ROLLBACK; SELECT cross_analyze_body()", "5"),
+            (true, "SELECT cross_analyze_body()", "5"),
+            (
+                false,
+                "ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                "6",
+            ),
+            (true, "SELECT cross_analyze_body()", "7"),
+            (
+                false,
+                "BEGIN; INSERT INTO cross_analyze_anchor VALUES(2); ANALYZE cross_analyze_anchor; SELECT cross_analyze_body()",
+                "8",
+            ),
+            (true, "SELECT cross_analyze_body()", "9"),
+            (false, "COMMIT; SELECT cross_analyze_body()", "10"),
+            (true, "SELECT cross_analyze_body()", "11"),
+            (
+                false,
+                "ANALYZE cross_analyze_unrelated; SELECT cross_analyze_body()",
+                "11",
+            ),
+        ] {
+            let session = if use_second { &mut second } else { &mut first };
+            // Match psql's separate messages while BEGIN keeps explicit transactions open.
+            for command in statement.split(';') {
+                session.success(&mut engine, command.trim(), true);
+            }
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM cross_analyze_checks",
                     true
                 )),
                 [expected],

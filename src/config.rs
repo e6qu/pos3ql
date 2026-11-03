@@ -1975,10 +1975,10 @@ impl Config {
             self.conn_send_buffer_bytes,
             self.sql_arena_bytes,
             crate::sql::exec::CopyTransitionRows::budget_bytes(self),
-            // Wire Parse and SQL PREPARE have independent fixed slot pools.
-            2usize
-                .saturating_mul(self.max_prepared)
-                .saturating_mul(self.prepared_bytes),
+            // The SQL pool also owns the active request's type-input record.
+            self.max_prepared
+                .saturating_mul(self.prepared_bytes)
+                .saturating_add(crate::sql::prep::SqlPreparedPool::budget_bytes(self)),
             self.max_portals
                 .saturating_mul(self.portal_bytes.saturating_add(self.portal_result_bytes)),
             self.max_tables

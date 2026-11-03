@@ -2837,6 +2837,7 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_) => true,
         Expr::Unary { operand, .. }

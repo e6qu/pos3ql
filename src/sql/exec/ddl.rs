@@ -677,6 +677,7 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker => {}

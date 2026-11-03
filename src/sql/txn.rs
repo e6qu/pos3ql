@@ -1065,6 +1065,35 @@ impl TxnState {
         })
     }
 
+    pub(crate) fn statement_large_object_descriptors<'a>(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [LargeObjectDescriptor], SqlError> {
+        let count = self
+            .large_object_descriptors
+            .iter()
+            .rposition(|descriptor| descriptor.active)
+            .map_or(0, |index| index + 1);
+        arena
+            .alloc_slice_copy(&self.large_object_descriptors[..count])
+            .map(|descriptors| &*descriptors)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "large-object retry state exceeds statement memory"
+                )
+            })
+    }
+
+    pub(crate) fn restore_statement_large_object_descriptors(
+        &mut self,
+        descriptors: &[LargeObjectDescriptor],
+    ) {
+        assert!(descriptors.len() <= self.large_object_descriptors.len());
+        self.large_object_descriptors[..descriptors.len()].copy_from_slice(descriptors);
+        self.large_object_descriptors[descriptors.len()..].fill(LargeObjectDescriptor::EMPTY);
+    }
+
     pub(crate) fn open_large_object_descriptor(
         &mut self,
         oid: crate::storage::LargeObjectOid,
@@ -2783,6 +2812,43 @@ impl TxnState {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statement_retry_restores_large_object_positions_and_descriptor_lifetimes() {
+        let mut budget = Budget::new(TxnState::budget_bytes(8) + 4096);
+        let mut txn = TxnState::new(&mut budget, 8).unwrap();
+        let arena = crate::mem::arena::Arena::new(&mut budget, "descriptor retry", 4096).unwrap();
+        let mode = LargeObjectDescriptorMode {
+            readable: true,
+            writable: true,
+        };
+        let oid = crate::storage::LargeObjectOid::parse(42).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let empty = txn.statement_large_object_descriptors(&arena).unwrap();
+            assert!(empty.is_empty());
+            let first = txn.open_large_object_descriptor(oid, mode).unwrap();
+            txn.large_object_descriptor_mut(first).unwrap().position = 19;
+            let saved = txn.statement_large_object_descriptors(&arena).unwrap();
+            for _ in 0..3 {
+                txn.large_object_descriptor_mut(first).unwrap().position += 11;
+                txn.close_large_object_descriptor(first).unwrap();
+                let reused = txn
+                    .open_large_object_descriptor(
+                        crate::storage::LargeObjectOid::parse(43).unwrap(),
+                        mode,
+                    )
+                    .unwrap();
+                assert_eq!(reused, first);
+                txn.open_large_object_descriptor(oid, mode).unwrap();
+                txn.restore_statement_large_object_descriptors(saved);
+                assert_eq!(txn.large_object_descriptor(first).unwrap().position, 19);
+                assert_eq!(txn.large_object_descriptor(first).unwrap().oid, oid);
+                assert!(txn.large_object_descriptor(first + 1).is_err());
+            }
+            txn.restore_statement_large_object_descriptors(empty);
+            assert!(txn.large_object_descriptor(first).is_err());
+        });
+    }
 
     #[test]
     fn configured_transaction_budgets_saturate_and_valid_reservations_are_exact() {

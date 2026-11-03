@@ -49,6 +49,12 @@ Temporary schema planning releases its scratch space after each visit, so
 repeated function handoffs do not retain another schema copy.
 Completed calls release body workspaces while preserving typed results and
 command effects, including nested calls and table-function results.
+Finish retaining values checked while SQL is prepared. For example, preparing
+`SELECT '{approved}'::checked_status[]` can run a user-defined constraint;
+describing or executing that prepared statement must reuse its checked value.
+Cover implicit column and function arguments, repeated lock waits, cancellation,
+stored definitions, renames and recovery. Keep completed inputs while rolling
+back and safely replaying the unfinished input within its original deadline.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.

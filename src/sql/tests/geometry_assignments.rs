@@ -3,7 +3,8 @@ use super::*;
 // PostgreSQL 18.6 reference SQL SHA256:
 // 9d652291010b05af1db990218c988f1290d3d42bc115096c8717858096b8430d;
 // 4b14060536a8a0532fcb8289fb5e0a12906c2560adc8d46ca64643e2e67ec050;
-// f275e93197dc099df1eeed76bcf49fe3b91835e1c1c9a3a1e207026c028343ea.
+// f275e93197dc099df1eeed76bcf49fe3b91835e1c1c9a3a1e207026c028343ea;
+// f95f88ab614aca8ebbbe79522e1b989c8ba7ffcd8402962eb7b71a8633d74848.
 #[test]
 fn named_array_folding_retains_empty_constructor_context() {
     for mode in [
@@ -44,6 +45,7 @@ fn named_array_folding_retains_empty_constructor_context() {
             "SELECT CASE WHEN false THEN ARRAY['missing']::fold_enum[] ELSE ARRAY['a']::fold_enum[] END",
             "SELECT 'missing'::fold_domain WHERE false",
             "SELECT ARRAY['missing']::fold_domain[] WHERE false",
+            "SELECT '{missing}'::fold_domain[] WHERE false",
         ] {
             assert_eq!(
                 error_sqlstates(&session.execute(&mut engine, sql, true)),
@@ -51,6 +53,14 @@ fn named_array_folding_retains_empty_constructor_context() {
                 "{sql}"
             );
         }
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT '{b}'::fold_domain[] WHERE false",
+                true
+            )),
+            ["23514"]
+        );
         for sql in [
             "SELECT 'missing'::text::fold_enum WHERE false",
             "SELECT ARRAY['missing'::text]::fold_enum[] WHERE false",
@@ -58,6 +68,7 @@ fn named_array_folding_retains_empty_constructor_context() {
             "SELECT 'a'::fold_enum,'a'::text::fold_enum WHERE false",
             "SELECT 'b'::fold_domain WHERE false",
             "SELECT ARRAY['b']::fold_domain[] WHERE false",
+            "SELECT '{a}'::fold_domain[] WHERE false",
         ] {
             assert!(
                 data_rows(&session.success(&mut engine, sql, true)).is_empty(),

@@ -84,6 +84,7 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> InputSite<'a> {
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_) => InputSite::Expression(InputNode::Value),
         Expr::Column { .. }
         | Expr::RoutineParam { .. }

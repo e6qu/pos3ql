@@ -33,6 +33,9 @@ pub(crate) use database_clone_positions::{
 };
 mod matview_lifecycles;
 mod query_lifecycles;
+mod type_inputs;
+pub use type_inputs::StoredTypeInputs;
+pub(crate) use type_inputs::{StoredInputSection, StoredInputSource};
 mod query_relation_sources;
 pub(crate) use query_relation_sources::RelationReference;
 mod routine_lifecycles;
@@ -1952,6 +1955,7 @@ impl ForeignKey {
 }
 
 pub trait DefinitionBacking: Clone + core::fmt::Debug {
+    type Inputs: AsRef<StoredTypeInputs> + Clone + core::fmt::Debug;
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize>: AsRef<[T]>
         + Clone
         + core::fmt::Debug;
@@ -1961,6 +1965,7 @@ pub trait DefinitionBacking: Clone + core::fmt::Debug {
 pub struct InlineDefinition;
 
 impl DefinitionBacking for InlineDefinition {
+    type Inputs = StoredTypeInputs;
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = [T; N];
 }
 
@@ -1968,6 +1973,7 @@ impl DefinitionBacking for InlineDefinition {
 pub struct StoredDefinition;
 
 impl DefinitionBacking for StoredDefinition {
+    type Inputs = StoredTypeInputs;
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> =
         crate::mem::lease_pool::SharedSlice<T>;
 }
@@ -1976,6 +1982,7 @@ impl DefinitionBacking for StoredDefinition {
 pub struct BorrowedDefinition<'a>(core::marker::PhantomData<&'a ()>);
 
 impl<'a> DefinitionBacking for BorrowedDefinition<'a> {
+    type Inputs = &'a StoredTypeInputs;
     type Slice<T: Copy + core::fmt::Debug + 'static, const N: usize> = &'a [T];
 }
 
@@ -1985,6 +1992,7 @@ pub(crate) type TableDefView<'a> = TableDefinition<BorrowedDefinition<'a>>;
 
 #[derive(Debug, Clone)]
 pub struct TableDefinition<B: DefinitionBacking> {
+    pub(crate) type_inputs: B::Inputs,
     /// The schema the table lives in ("public" unless created qualified or
     /// under a search_path naming another schema).
     pub schema: SqlName,
@@ -2033,7 +2041,6 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub partition: PartitionDef,
 }
 
-impl Copy for TableDefinition<InlineDefinition> {}
 impl Copy for TableDefinition<BorrowedDefinition<'_>> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2405,6 +2412,7 @@ pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 impl<B: DefinitionBacking> TableDefinition<B> {
     pub(crate) fn borrowed(&self) -> TableDefView<'_> {
         TableDefinition {
+            type_inputs: self.type_inputs.as_ref(),
             schema: self.schema,
             name: self.name,
             kind: self.kind,
@@ -2490,6 +2498,7 @@ impl TableDefBuilder {
     /// Copies an admitted definition into bounded edit or codec scratch.
     pub(crate) fn from_definition<B: DefinitionBacking>(source: &TableDefinition<B>) -> Self {
         let mut result = Self::empty();
+        result.type_inputs = source.type_inputs.as_ref().clone();
         let attribute_count = usize::from(source.attributes.count);
         result.schema = source.schema;
         result.name = source.name;
@@ -2554,6 +2563,7 @@ impl TableDefBuilder {
             sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error)
         };
         Ok(TableDefinition {
+            type_inputs: self.type_inputs.clone(),
             schema: self.schema,
             name: self.name,
             kind: self.kind,
@@ -2612,6 +2622,7 @@ impl TableDefBuilder {
     /// the constraint arrays at construction sites.
     pub const fn empty() -> Self {
         Self {
+            type_inputs: StoredTypeInputs::EMPTY,
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
@@ -2650,6 +2661,7 @@ impl TableDef {
     /// An unused control slot owns no metadata payload.
     pub const fn empty() -> Self {
         Self {
+            type_inputs: StoredTypeInputs::EMPTY,
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
@@ -2687,6 +2699,7 @@ impl TableDefView<'_> {
     /// An unused control slot owns no metadata payload.
     pub const fn empty() -> Self {
         Self {
+            type_inputs: &type_inputs::EMPTY_STORED_TYPE_INPUTS,
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
@@ -4878,6 +4891,7 @@ pub struct StoredQueryDependencies {
     entries: StoredQueryDependencyEntries,
     len: u8,
     limit: u8,
+    type_inputs: StoredTypeInputs,
 }
 
 impl Clone for StoredQueryDependencies {
@@ -4900,13 +4914,14 @@ impl Clone for StoredQueryDependencies {
             entries,
             len: self.len,
             limit: self.limit,
+            type_inputs: self.type_inputs.clone(),
         }
     }
 }
 
 impl PartialEq for StoredQueryDependencies {
     fn eq(&self, other: &Self) -> bool {
-        self.entries() == other.entries()
+        self.entries() == other.entries() && self.type_inputs == other.type_inputs
     }
 }
 
@@ -4926,6 +4941,7 @@ struct StoredQueryDependencyCatalog {
     entries: FixedVec<StoredQueryDependency>,
     counts: FixedVec<u8>,
     pending: FixedVec<PendingStoredQueryDependencies>,
+    type_inputs: FixedVec<StoredTypeInputs>,
 }
 
 impl StoredQueryDependencyCatalog {
@@ -4963,6 +4979,10 @@ impl StoredQueryDependencyCatalog {
         let target = &mut self.entries[start..start + entries_per_image];
         target.fill(StoredQueryDependency::EMPTY);
         target[..dependencies.entries().len()].copy_from_slice(dependencies.entries());
+        self.type_inputs[image] = dependencies
+            .type_inputs
+            .cloned()
+            .unwrap_or(StoredTypeInputs::EMPTY);
         Ok(count)
     }
 
@@ -4987,6 +5007,7 @@ impl StoredQueryDependencyCatalog {
         self.entries
             .copy_within(source..source + usize::from(count), target);
         self.counts[target_image] = count;
+        self.type_inputs[target_image] = self.type_inputs[source_image].clone();
     }
 }
 
@@ -5008,14 +5029,36 @@ impl PendingStoredQueryDependencies {
     };
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct StoredQueryDependencyView<'a> {
     entries: &'a [StoredQueryDependency],
+    type_inputs: Option<&'a StoredTypeInputs>,
 }
+
+impl PartialEq for StoredQueryDependencyView<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.type_inputs.map_or(&[][..], StoredTypeInputs::bytes)
+                == other.type_inputs.map_or(&[][..], StoredTypeInputs::bytes)
+    }
+}
+impl Eq for StoredQueryDependencyView<'_> {}
 
 impl<'a> StoredQueryDependencyView<'a> {
     pub(crate) const fn new(entries: &'a [StoredQueryDependency]) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            type_inputs: None,
+        }
+    }
+
+    pub(crate) const fn with_type_inputs(mut self, inputs: &'a StoredTypeInputs) -> Self {
+        self.type_inputs = Some(inputs);
+        self
+    }
+
+    pub(crate) fn type_inputs(self) -> Option<&'a StoredTypeInputs> {
+        self.type_inputs
     }
 
     pub(crate) fn entries(self) -> &'a [StoredQueryDependency] {
@@ -5033,6 +5076,7 @@ pub(crate) struct StoredQueryDependencyImage<'a> {
 impl StoredQueryDependencyImage<'_> {
     pub(crate) fn view(&self) -> StoredQueryDependencyView<'_> {
         StoredQueryDependencyView::new(self.entries())
+            .with_type_inputs(&self.catalog.type_inputs[self.image])
     }
 
     pub(crate) fn entries(&self) -> &[StoredQueryDependency] {
@@ -5048,6 +5092,7 @@ impl StoredQueryDependencies {
         ),
         len: 0,
         limit: INLINE_STORED_QUERY_DEPENDENCIES as u8,
+        type_inputs: StoredTypeInputs::EMPTY,
     };
 
     /// Recovery-only constructor. Runtime capture uses statement-arena storage.
@@ -5065,6 +5110,7 @@ impl StoredQueryDependencies {
             ),
             len: 0,
             limit: limit as u8,
+            type_inputs: StoredTypeInputs::EMPTY,
         }
     }
 
@@ -5088,11 +5134,20 @@ impl StoredQueryDependencies {
             },
             len: 0,
             limit: limit as u8,
+            type_inputs: StoredTypeInputs::EMPTY,
         })
     }
 
     pub(crate) fn view(&self) -> StoredQueryDependencyView<'_> {
-        StoredQueryDependencyView::new(self.entries())
+        StoredQueryDependencyView::new(self.entries()).with_type_inputs(&self.type_inputs)
+    }
+
+    pub(crate) fn type_inputs(&self) -> &StoredTypeInputs {
+        &self.type_inputs
+    }
+
+    pub(crate) fn set_type_inputs(&mut self, inputs: StoredTypeInputs) {
+        self.type_inputs = inputs;
     }
 
     /// Recovery-only copy used before the runtime allocation freeze.
@@ -5101,6 +5156,7 @@ impl StoredQueryDependencies {
         let mut dependencies = Self::with_recovery_limit(limit);
         dependencies.entry_storage_mut()[..view.entries().len()].copy_from_slice(view.entries());
         dependencies.len = view.entries().len() as u8;
+        dependencies.type_inputs = view.type_inputs.cloned().unwrap_or(StoredTypeInputs::EMPTY);
         dependencies
     }
 
@@ -7145,6 +7201,15 @@ pub(crate) enum RoutineParameterMode {
 }
 
 impl RoutineParameterMode {
+    pub(crate) fn default_sql(&self) -> Option<&str> {
+        match self {
+            Self::In { default } | Self::InOut { default } | Self::Variadic { default } => {
+                default.as_ref().map(|source| source.as_str())
+            }
+            Self::Out => None,
+        }
+    }
+
     pub(crate) const fn has_default(&self) -> bool {
         match self {
             Self::In { default } | Self::InOut { default } | Self::Variadic { default } => {
@@ -16418,6 +16483,10 @@ pub(crate) fn stored_query_dependency_budget_bytes(config: &Config) -> usize {
         .saturating_mul(config.max_stored_query_dependencies_per_object)
         .saturating_mul(size_of::<StoredQueryDependency>())
         .saturating_add(
+            stored_query_dependency_image_capacity(config)
+                .saturating_mul(size_of::<StoredTypeInputs>()),
+        )
+        .saturating_add(
             config
                 .max_rules
                 .saturating_add(config.max_policies)
@@ -19563,10 +19632,12 @@ impl Storage {
 
     fn clear_committed_dependencies(&self, owner: StoredQueryDependencyOwner) {
         let image = self.committed_dependency_image(owner);
-        self.stored_query_dependencies
+        let mut catalog = self
+            .stored_query_dependencies
             .lock()
-            .expect("stored-query dependency catalog lock poisoned")
-            .counts[image] = 0;
+            .expect("stored-query dependency catalog lock poisoned");
+        catalog.counts[image] = 0;
+        catalog.type_inputs[image] = StoredTypeInputs::EMPTY;
     }
 
     fn copy_dependency_image(&self, source_image: usize, target_image: usize) {
@@ -19594,10 +19665,12 @@ impl Storage {
     }
 
     fn clear_dependency_image(&self, image: usize) {
-        self.stored_query_dependencies
+        let mut catalog = self
+            .stored_query_dependencies
             .lock()
-            .expect("stored-query dependency catalog lock poisoned")
-            .counts[image] = 0;
+            .expect("stored-query dependency catalog lock poisoned");
+        catalog.counts[image] = 0;
+        catalog.type_inputs[image] = StoredTypeInputs::EMPTY;
     }
 
     fn snapshot_dependency_image(
@@ -19623,6 +19696,7 @@ impl Storage {
         for dependency in source {
             snapshot.push(*dependency)?;
         }
+        snapshot.type_inputs = catalog.type_inputs[image].clone();
         Ok(snapshot)
     }
 
@@ -19774,6 +19848,7 @@ impl Storage {
         catalog
             .entries
             .copy_within(source..source + usize::from(count), target);
+        catalog.type_inputs[target_image] = catalog.type_inputs[source_image].clone();
         catalog.pending[slot] = PendingStoredQueryDependencies {
             used: true,
             owner,
@@ -19805,6 +19880,8 @@ impl Storage {
             .expect("stored-query dependency catalog lock poisoned");
         let pending = catalog.pending[slot as usize];
         catalog.pending[slot as usize] = PendingStoredQueryDependencies::EMPTY;
+        catalog.type_inputs[self.stored_query_dependency_pending_base + slot as usize] =
+            StoredTypeInputs::EMPTY;
         pending.previous
     }
 
@@ -19838,10 +19915,13 @@ impl Storage {
             .entries
             .copy_within(source..source + usize::from(pending.count), target);
         catalog.counts[target_image] = pending.count;
+        catalog.type_inputs[target_image] = catalog.type_inputs[source_image].clone();
         let mut next = Some(tail);
         while let Some(slot) = next {
             let pending = catalog.pending[slot as usize];
             catalog.pending[slot as usize] = PendingStoredQueryDependencies::EMPTY;
+            catalog.type_inputs[self.stored_query_dependency_pending_base + slot as usize] =
+                StoredTypeInputs::EMPTY;
             next = pending.previous;
         }
     }
@@ -19856,6 +19936,7 @@ impl Storage {
         for dependency in serialized.entries() {
             rebound.push(self.rebound_stored_query_dependency(*dependency, txid)?)?;
         }
+        rebound.type_inputs = serialized.type_inputs.clone();
         Ok(rebound)
     }
 
@@ -20793,6 +20874,13 @@ impl Storage {
                 .push(0)
                 .expect("sized to committed stored-query dependency images");
         }
+        let mut stored_query_type_inputs =
+            FixedVec::new(budget, "stored_query_type_inputs", dependency_images)?;
+        for _ in 0..dependency_images {
+            stored_query_type_inputs
+                .push(StoredTypeInputs::EMPTY)
+                .expect("sized to every stored-query dependency image");
+        }
         let mut pending_stored_query_dependencies = FixedVec::new(
             budget,
             "pending_stored_query_dependencies",
@@ -21345,6 +21433,7 @@ impl Storage {
                 entries: stored_query_dependencies,
                 counts: stored_query_dependency_counts,
                 pending: pending_stored_query_dependencies,
+                type_inputs: stored_query_type_inputs,
             }),
             stored_query_dependencies_per_image: config.max_stored_query_dependencies_per_object,
             stored_query_dependency_pending_base: committed_dependency_images,
@@ -39284,11 +39373,12 @@ impl Storage {
     pub(crate) fn complete_replay_table_rewrite(
         &mut self,
         position: CatalogPosition,
-        mut def: TableDefBuilder,
+        definition: &TableDefBuilder,
     ) -> Result<bool, SqlError> {
         let Some(rewrite) = self.replay_table_rewrite.take() else {
             return Ok(false);
         };
+        let mut def = definition.clone();
         if rewrite.table != position.slot()
             || self.table(rewrite.table).created_at() != position.created_at()
         {
@@ -39362,13 +39452,14 @@ impl Storage {
             .iter()
             .any(|column| column.ctype.typlen() == -1);
         self.require_schema_create(def.schema.as_str(), txid)?;
+        let temporary = def.persistence == RelationPersistence::Temporary;
         let slot = table_creation::allocate(
             self,
             def,
             CatalogAllocation::New,
             TableCreation::Pending(txid),
         )?;
-        if def.persistence == RelationPersistence::Temporary {
+        if temporary {
             self.mark_temporary_transaction(txid);
         }
         Ok(slot)

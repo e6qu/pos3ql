@@ -250,6 +250,18 @@ mod window;
 
 mod ddl;
 
+struct TypeInputSources<'a> {
+    strings: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
+    candidates: ArenaList<'a, super::type_inputs::Candidate<'a>>,
+    restored: ArenaList<
+        'a,
+        (
+            super::type_inputs::Candidate<'a>,
+            super::type_inputs::Binding<'a>,
+        ),
+    >,
+}
+
 pub struct Parser<'a> {
     text: &'a str,
     lexer: Lexer<'a>,
@@ -258,6 +270,8 @@ pub struct Parser<'a> {
     previous_token: Option<(Tok<'a>, usize, usize)>,
     column_sources: Option<core::cell::RefCell<QuerySourceCollector<'a>>>,
     namespace_sources: Option<core::cell::RefCell<SchemaSqlSourceCollector<'a>>>,
+    type_input_sources: Option<core::cell::RefCell<TypeInputSources<'a>>>,
+    type_inputs: &'a [super::type_inputs::Binding<'a>],
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
@@ -361,6 +375,50 @@ pub(crate) enum StoredSqlKind {
     RoutineIdentity,
     OperatorName,
     OperatorIdentity,
+}
+
+pub(crate) struct TypeInputSyntax<'a> {
+    pub casts: &'a [super::type_inputs::Candidate<'a>],
+    pub literals: &'a [(&'a Expr<'a>, NamespaceSource)],
+}
+
+pub(crate) fn type_input_sources<'a>(
+    sql: &'a str,
+    kind: StoredSqlKind,
+    arena: &'a Arena,
+) -> Result<TypeInputSyntax<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.capture_type_inputs();
+    match kind {
+        StoredSqlKind::Expression => {
+            parser
+                .expression(0)
+                .map_err(|error| super::parse_error_to_sql(&error))?;
+        }
+        StoredSqlKind::Statements => {
+            while parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+                .is_some()
+            {}
+        }
+        _ => {
+            return Err(crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type input has no expression source"
+            ));
+        }
+    }
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after type input source"
+        ));
+    }
+    Ok(TypeInputSyntax {
+        casts: parser.type_input_candidates(),
+        literals: parser.string_literals(),
+    })
 }
 
 /// Namespace positions come from grammar nodes, so table aliases and record
@@ -497,6 +555,30 @@ pub fn parse_query<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, super::eval::SqlError> {
     parse_query_with_string_parameters(sql, arena, &[])
+}
+
+pub(crate) fn parse_query_with_type_inputs<'a>(
+    sql: &'a str,
+    bindings: &'a [super::type_inputs::Binding<'a>],
+    arena: &'a Arena,
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
+) -> Result<&'a Select<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(bindings);
+    let select = parser
+        .query_select()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after query"
+        ));
+    }
+    validate(&parser)?;
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| super::query::arena_full_pub())
 }
 
 /// Analyze ordinary expression strings as parameters while preserving syntax
@@ -726,6 +808,8 @@ impl<'a> Parser<'a> {
             previous_token: None,
             column_sources: None,
             namespace_sources: None,
+            type_input_sources: None,
+            type_inputs: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
             allow_into: false,
@@ -737,11 +821,101 @@ impl<'a> Parser<'a> {
         })
     }
 
+    pub(crate) fn capture_type_inputs(&mut self) {
+        if self.type_input_sources.is_none() {
+            self.type_input_sources = Some(core::cell::RefCell::new(TypeInputSources {
+                strings: ArenaList::new(self.arena),
+                candidates: ArenaList::new(self.arena),
+                restored: ArenaList::new(self.arena),
+            }));
+        }
+    }
+
+    pub(crate) fn type_input_candidates(&self) -> &'a [super::type_inputs::Candidate<'a>] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().candidates.as_slice())
+    }
+
+    pub(crate) fn string_literals(&self) -> &'a [(&'a Expr<'a>, NamespaceSource)] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().strings.as_slice())
+    }
+
+    pub(crate) fn restored_type_inputs(
+        &self,
+    ) -> &'a [(
+        super::type_inputs::Candidate<'a>,
+        super::type_inputs::Binding<'a>,
+    )] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().restored.as_slice())
+    }
+
+    pub(crate) fn type_inputs_complete(&self) -> bool {
+        self.type_input_sources.is_some()
+            && self.restored_type_inputs().len() == self.type_inputs.len()
+    }
+
+    pub(crate) fn set_type_inputs(&mut self, bindings: &'a [super::type_inputs::Binding<'a>]) {
+        self.capture_type_inputs();
+        self.type_inputs = bindings;
+    }
+
     fn string_expression(
         &mut self,
         value: &'a str,
         source_at: usize,
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_end = self.previous_token.map_or(source_at, |(_, _, end)| end);
+        let key = (
+            source_at,
+            source_end,
+            super::type_inputs::InputKind::ImplicitLiteral,
+        );
+        if let Ok(index) = self
+            .type_inputs
+            .binary_search_by_key(&key, |binding| (binding.start, binding.end, binding.kind))
+        {
+            let binding = self.type_inputs[index];
+            let expression = self.arena_expr(Expr::Str(value))?;
+            if let Some(sources) = &self.type_input_sources {
+                if !sources
+                    .borrow()
+                    .restored
+                    .as_slice()
+                    .iter()
+                    .any(|(_, prior)| (prior.start, prior.end, prior.kind) == key)
+                {
+                    sources
+                        .borrow_mut()
+                        .restored
+                        .push((
+                            super::type_inputs::Candidate {
+                                start: source_at,
+                                end: source_end,
+                                target: super::type_inputs::CandidateTarget::ContextualOid(
+                                    binding.type_oid,
+                                ),
+                                kind: binding.kind,
+                                type_mod: binding.type_mod,
+                                expression,
+                            },
+                            binding,
+                        ))
+                        .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+                }
+            }
+            return self.arena_expr(Expr::BoundLiteral {
+                encoded: binding.encoded,
+                type_oid: binding.type_oid,
+                type_mod: binding.type_mod,
+                collation: binding.collation,
+                source: expression,
+            });
+        }
         if let Ok(index) = self.string_parameters.binary_search(&source_at) {
             let parameter = index
                 .checked_add(1)
@@ -825,6 +999,10 @@ impl<'a> Parser<'a> {
         let parsed = self.expression(0);
         self.stop_default_at_not_null = prior;
         parsed
+    }
+
+    pub(crate) fn source_position(&self) -> usize {
+        self.peek_at
     }
 
     pub fn max_param(&self) -> u32 {
@@ -8505,6 +8683,17 @@ impl<'a> Parser<'a> {
         expression: &'a Expr<'a>,
         source: NamespaceSource,
     ) -> Result<(), ParseError> {
+        if let Some(sources) = &self.type_input_sources {
+            let original = match expression {
+                Expr::BoundLiteral { source, .. } => *source,
+                _ => expression,
+            };
+            sources
+                .borrow_mut()
+                .strings
+                .push((original, source))
+                .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+        }
         if let Some(sources) = &self.namespace_sources {
             sources
                 .borrow_mut()
@@ -8700,10 +8889,97 @@ impl<'a> Parser<'a> {
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
         }
-        self.arena
+        let expression = self
+            .arena
             .alloc(e)
             .map(|m| &*m)
-            .map_err(|_| self.arena_full("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        if let Some(sources) = &self.type_input_sources
+            && let Expr::Cast {
+                operand,
+                type_name,
+                type_mod,
+                ..
+            } = expression
+            && let Expr::Str(_) = operand
+        {
+            let source =
+                sources
+                    .borrow()
+                    .strings
+                    .as_slice()
+                    .iter()
+                    .find_map(|(candidate, source)| {
+                        core::ptr::eq(*candidate, *operand).then_some(*source)
+                    });
+            if let Some(source) = source {
+                let end = self.previous_token.map_or(source.end, |(_, _, end)| end);
+                let key = (
+                    source.start,
+                    end,
+                    super::type_inputs::InputKind::ExplicitCast,
+                );
+                if let Ok(index) = self.type_inputs.binary_search_by_key(&key, |binding| {
+                    (binding.start, binding.end, binding.kind)
+                }) {
+                    let binding = self.type_inputs[index];
+                    if binding.type_mod != *type_mod {
+                        return Err(self.err_here("bound type input has a different type modifier"));
+                    }
+                    if !sources
+                        .borrow()
+                        .restored
+                        .as_slice()
+                        .iter()
+                        .any(|(_, prior)| (prior.start, prior.end, prior.kind) == key)
+                    {
+                        sources
+                            .borrow_mut()
+                            .restored
+                            .push((
+                                super::type_inputs::Candidate {
+                                    start: source.start,
+                                    end,
+                                    target: super::type_inputs::CandidateTarget::TypeName(
+                                        type_name,
+                                    ),
+                                    kind: super::type_inputs::InputKind::ExplicitCast,
+                                    type_mod: *type_mod,
+                                    expression,
+                                },
+                                binding,
+                            ))
+                            .map_err(|_| {
+                                self.arena_full("type input source map exceeds SQL arena")
+                            })?;
+                    }
+                    return self
+                        .arena
+                        .alloc(Expr::BoundLiteral {
+                            encoded: binding.encoded,
+                            type_oid: binding.type_oid,
+                            type_mod: binding.type_mod,
+                            collation: binding.collation,
+                            source: expression,
+                        })
+                        .map(|expression| &*expression)
+                        .map_err(|_| self.arena_full("bound type input exceeds SQL arena"));
+                }
+                sources
+                    .borrow_mut()
+                    .candidates
+                    .push(super::type_inputs::Candidate {
+                        start: source.start,
+                        end,
+                        target: super::type_inputs::CandidateTarget::TypeName(type_name),
+                        kind: super::type_inputs::InputKind::ExplicitCast,
+                        type_mod: *type_mod,
+                        expression,
+                    })
+                    .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+            }
+        }
+        Ok(expression)
     }
 
     /// Parses a flat, deduplicated grouping-expression list plus PostgreSQL's

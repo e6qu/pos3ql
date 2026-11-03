@@ -5598,6 +5598,15 @@ pub enum Expr<'a> {
         type_mod: i32,
         binding: CastBinding,
     },
+    /// Type input has already run for this SQL source occurrence. The source
+    /// syntax remains available to deparsers and dependency capture only.
+    BoundLiteral {
+        encoded: &'a [u8],
+        type_oid: i32,
+        type_mod: i32,
+        collation: Option<Collation>,
+        source: &'a Expr<'a>,
+    },
     /// A planned routine default keeps its declared input type without an
     /// extra conversion. Routine input preparation performs its one coercion.
     BoundDefault {
@@ -5907,7 +5916,8 @@ impl Expr<'_> {
             | Expr::Float(_)
             | Expr::NumericLit(_)
             | Expr::Str(_)
-            | Expr::BitLit(_) => true,
+            | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. } => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. }
             | Expr::RecursiveState { .. }
@@ -6008,6 +6018,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6090,6 +6101,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6177,6 +6189,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6257,6 +6270,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
@@ -6347,6 +6361,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }

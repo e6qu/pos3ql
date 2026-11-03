@@ -498,7 +498,7 @@ pub(crate) fn expression_type_identity<'a>(
     row: &dyn ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<ExpressionTypeIdentity, SqlError> {
-    if let Expr::BoundDefault { type_oid, .. } = expression {
+    if let Expr::BoundDefault { type_oid, .. } | Expr::BoundLiteral { type_oid, .. } = expression {
         return Ok(ExpressionTypeIdentity::Known(*type_oid));
     }
     if let Expr::Collate { operand, .. } = expression {
@@ -2648,6 +2648,7 @@ fn fold_check<'a>(
         | Expr::NumericLit(_)
         | Expr::Str(_)
         | Expr::BitLit(_)
+        | Expr::BoundLiteral { .. }
         | Expr::Column { .. }
         | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
@@ -3496,6 +3497,7 @@ fn eval_full_inner<'a>(
         }
     }
     match *expression {
+        Expr::BoundLiteral { encoded, .. } => super::type_inputs::value(encoded, arena),
         Expr::BoundDefault { expression, .. } => eval_full(expression, arena, params, row, hooks),
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
@@ -5189,6 +5191,11 @@ fn expression_collation<'a>(
                 indeterminate: false,
             }))
         }
+        Expr::BoundLiteral { collation, .. } => Ok(collation.map(|value| DerivedCollation {
+            value,
+            explicit: false,
+            indeterminate: false,
+        })),
         Expr::BoundDefault { expression, .. } => expression_collation(expression, row, catalog),
         Expr::Cast {
             operand, type_name, ..
@@ -6010,7 +6017,8 @@ fn bind_builtin_default<'a>(
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::NumericLit(_)
-        | Expr::Str(_) => Ok(expression),
+        | Expr::Str(_)
+        | Expr::BoundLiteral { .. } => Ok(expression),
         Expr::Cast {
             operand,
             type_name,
@@ -7395,7 +7403,9 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             row.col_type(Some(qualifier.as_str()), name)
         }
-        Expr::BoundDefault { type_oid, .. } => ColType::from_oid(*type_oid),
+        Expr::BoundDefault { type_oid, .. } | Expr::BoundLiteral { type_oid, .. } => {
+            ColType::from_oid(*type_oid)
+        }
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Collate { operand, .. } => static_type(operand, row),
         Expr::Array(items) => {

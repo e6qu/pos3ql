@@ -321,6 +321,7 @@ pub(super) fn is_error_safe(e: &Expr) -> bool {
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::Column { .. }
         | Expr::Param(_)
         | Expr::DefaultMarker => true,

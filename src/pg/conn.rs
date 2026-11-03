@@ -160,6 +160,7 @@ struct Prepared {
     /// share the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     query_len: usize,
+    oid_bytes: usize,
     n_params: u16,
 }
 
@@ -170,7 +171,11 @@ impl Prepared {
     }
 
     fn parameter_oid_bytes(&self) -> &[u8] {
-        &self.data.readable()[self.query_len..]
+        &self.data.readable()[self.query_len..self.query_len + self.oid_bytes]
+    }
+
+    fn type_inputs(&self) -> &[u8] {
+        &self.data.readable()[self.query_len + self.oid_bytes..]
     }
 }
 
@@ -461,6 +466,7 @@ pub struct Conn {
 
 impl Conn {
     fn clear_protocol_state(&mut self) {
+        self.sqlprep.clear_request_type_inputs();
         for prepared in &mut self.prepared {
             prepared.active = false;
         }
@@ -493,6 +499,7 @@ impl Conn {
                 name: empty,
                 data: FixedBuf::new(budget, "prepared_data", config.prepared_bytes)?,
                 query_len: 0,
+                oid_bytes: 0,
                 n_params: 0,
             });
         }
@@ -754,6 +761,7 @@ impl Conn {
             .unwrap_or(self.recv.len());
         self.recv.consume(message_bytes);
         self.finish_lock_wait();
+        self.sqlprep.clear_request_type_inputs();
         engine.cancel_backend_wait(self.id);
         if self.copy.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
@@ -1956,7 +1964,7 @@ impl Conn {
                 }
             }
             wire::FMSG_FLUSH => Step::Continue,
-            wire::FMSG_PARSE => self.handle_parse(total),
+            wire::FMSG_PARSE => self.handle_parse(engine, total),
             wire::FMSG_BIND => self.handle_bind(engine, total),
             wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
             wire::FMSG_EXECUTE => self.handle_execute(engine, total),
@@ -2840,7 +2848,7 @@ impl Conn {
         }
     }
 
-    fn handle_parse(&mut self, total: usize) -> Step {
+    fn handle_parse(&mut self, engine: &mut Engine, total: usize) -> Step {
         let payload = &self.recv.readable()[5..total];
         let parse = || -> Result<(&str, &str, usize, &[u8]), wire::Malformed> {
             let mut m = MsgIn::new(payload);
@@ -2863,7 +2871,13 @@ impl Conn {
         };
 
         // Validate now so Parse errors surface at Parse, like PostgreSQL.
-        self.arena.reset();
+        if self.sqlprep.request_input_waiting()
+            || self.guc.seq_session().retains_statement_effects()
+        {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
         let n_params = {
             let mut parser = match Parser::new(query, &self.arena) {
                 Ok(p) => p,
@@ -2975,10 +2989,67 @@ impl Conn {
                 "statement name too long",
             );
         };
+        let lock_timeout_expired = self.lock_timeout_expired();
+        let bound_inputs = {
+            let mut responder = Responder::new(&mut self.send);
+            engine.admit_type_input_source(
+                crate::sql::type_inputs::Source::RootCommand { statement: 0 },
+                query,
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &mut self.guc,
+                &mut responder,
+                self.id,
+                lock_timeout_expired,
+            )
+        };
+        let bound_inputs = match bound_inputs {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error))
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
+            {
+                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                    crate::sql::StatementWait::ObjectIo
+                } else {
+                    crate::sql::StatementWait::Lock
+                };
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                return Step::Parked;
+            }
+            Ok(Err(error)) => {
+                self.sqlprep.clear_request_type_inputs();
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                }
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+            Err(WireFull) => return Step::Close,
+        };
         let entry = &mut self.prepared[slot];
         entry.data.clear();
-        if query.len().saturating_add(param_oid_bytes.len()) > entry.data.capacity() {
+        if query
+            .len()
+            .saturating_add(param_oid_bytes.len())
+            .saturating_add(bound_inputs.len())
+            > entry.data.capacity()
+        {
             entry.active = false;
+            self.sqlprep.clear_request_type_inputs();
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+            }
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -2991,16 +3062,20 @@ impl Conn {
             "capacity checked above"
         );
         assert!(entry.data.append(param_oid_bytes), "capacity checked above");
+        assert!(entry.data.append(bound_inputs), "capacity checked above");
         entry.active = true;
         entry.name = sql_name;
         entry.query_len = query.len();
+        entry.oid_bytes = param_oid_bytes.len();
         entry.n_params = n_params as u16;
+        self.sqlprep.clear_request_type_inputs();
         if name.is_empty()
             && let Some(prior) = unnamed
             && prior != slot
         {
             self.prepared[prior].active = false;
         }
+        self.finish_lock_wait();
 
         let mut responder = Responder::new(&mut self.send);
         match responder.parse_complete() {
@@ -3132,6 +3207,7 @@ impl Conn {
                 &self.txn,
                 n_params,
                 self.prepared[stmt_slot].parameter_oid_bytes(),
+                self.prepared[stmt_slot].type_inputs(),
             ) {
                 Ok(oids) => oids,
                 Err(error) => {
@@ -3153,6 +3229,7 @@ impl Conn {
                         &self.txn,
                         Some(&self.cursors),
                         &mut responder,
+                        self.prepared[stmt_slot].type_inputs(),
                     )
                 })
             };
@@ -3363,6 +3440,7 @@ impl Conn {
             &self.txn,
             usize::from(n_params),
             self.prepared[slot].parameter_oid_bytes(),
+            self.prepared[slot].type_inputs(),
         ) {
             Ok(oids) => oids,
             Err(error) => {
@@ -3385,6 +3463,7 @@ impl Conn {
                 &self.txn,
                 Some(&self.cursors),
                 &mut responder,
+                self.prepared[slot].type_inputs(),
             ) {
                 Ok(true) => Step::Continue,
                 Ok(false) => {
@@ -3450,7 +3529,11 @@ impl Conn {
             max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
 
         if need_run {
-            self.arena.reset();
+            if self.guc.seq_session().retains_statement_effects() {
+                self.arena.recycle_front();
+            } else {
+                self.arena.reset();
+            }
             let lock_timeout_expired = self.lock_timeout_expired();
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
@@ -3487,6 +3570,7 @@ impl Conn {
                 &self.txn,
                 parameter_count,
                 prepared.parameter_oid_bytes(),
+                prepared.type_inputs(),
             ) {
                 Ok(oids) => oids,
                 Err(error) => {
@@ -3585,6 +3669,7 @@ impl Conn {
                     &mut responder,
                     self.id,
                     lock_timeout_expired,
+                    prepared.type_inputs(),
                 )
             } else {
                 let mut responder = Responder::for_execute(&mut self.send, rfmt);
@@ -3600,10 +3685,18 @@ impl Conn {
                     &mut responder,
                     self.id,
                     lock_timeout_expired,
+                    prepared.type_inputs(),
                 )
             };
             let pending_copy = engine.take_pending_copy();
-            self.arena.reset();
+            if matches!(
+                result,
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked { .. })
+            ) {
+                self.arena.recycle_front();
+            } else {
+                self.arena.reset();
+            }
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
                     self.finish_lock_wait();
@@ -3806,7 +3899,13 @@ impl Conn {
         if is_replication_command(self.replication, text) {
             return self.handle_replication_query(engine, identify_system, total);
         }
-        self.arena.reset();
+        if self.sqlprep.request_input_waiting()
+            || self.guc.seq_session().retains_statement_effects()
+        {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
         let mark = self.send.mark();
         // Stream large results: put the socket in blocking mode so the
         // Responder can drain a full send buffer straight to the client and
@@ -3846,6 +3945,7 @@ impl Conn {
         let status = self.txn.status_byte();
         let step = match result {
             Ok(crate::sql::ExecutionStatus::Complete) => {
+                self.sqlprep.clear_request_type_inputs();
                 self.finish_lock_wait();
                 self.resume_statement = 0;
                 // A COPY FROM STDIN holds its query cycle open: the
@@ -3887,10 +3987,11 @@ impl Conn {
                 self.resume_statement = completed_statements;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, wait);
-                self.arena.reset();
+                self.arena.recycle_front();
                 return Step::Parked;
             }
             Err(WireFull) => {
+                self.sqlprep.clear_request_type_inputs();
                 if engine.take_pending_copy().is_some() {
                     engine.copy_abort(&mut self.txn, &self.guc);
                     self.copy_transition_scratch.clear();
@@ -5535,6 +5636,410 @@ mod tests {
             bytes = &bytes[1 + length as usize..];
         }
         false
+    }
+
+    #[test]
+    fn serialized_domain_input_waits_retain_prefix_and_replay_only_active_effects() {
+        fn request(conn: &mut Conn, engine: &mut Engine, text: &str) -> Vec<u8> {
+            conn.send.clear();
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+            conn.send.readable().to_vec()
+        }
+        fn contains_value(bytes: &[u8], value: &[u8]) -> bool {
+            bytes.windows(value.len()).any(|found| found == value)
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-input-waits-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 8;
+            config.row_overlay_slots = 128;
+            config.max_connections = 3;
+            config.prepared_bytes = 32 << 10;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = Conn::new(&config, &mut budget).unwrap();
+            let mut holder = Conn::new(&config, &mut budget).unwrap();
+            let mut observer = Conn::new(&config, &mut budget).unwrap();
+            writer.id = 1;
+            holder.id = 2;
+            observer.id = 3;
+            writer.phase = Phase::Ready;
+            holder.phase = Phase::Ready;
+            observer.phase = Phase::Ready;
+            request(
+                &mut writer,
+                &mut engine,
+                "CREATE SEQUENCE input_wait_checks; \
+                 CREATE TABLE input_wait_audit(value text, draw double precision); \
+                 CREATE TABLE input_wait_gate(id integer PRIMARY KEY, hits integer); \
+                 INSERT INTO input_wait_gate VALUES(1,0),(2,0); \
+                 CREATE TYPE input_wait_choice AS ENUM('a','b'); \
+                 CREATE FUNCTION input_wait_allowed(value input_wait_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 DECLARE draw double precision; BEGIN \
+                   PERFORM nextval('input_wait_checks'); \
+                   PERFORM set_config('application_name',current_setting('application_name')||value::text,false); \
+                   draw := random(); \
+                   INSERT INTO input_wait_audit VALUES(value::text,draw); \
+                   UPDATE input_wait_gate SET hits=hits+1 WHERE id=CASE WHEN value='a' THEN 1 ELSE 2 END; \
+                   RETURN true; END$$; \
+                 CREATE DOMAIN input_wait_domain AS input_wait_choice CHECK(input_wait_allowed(VALUE))",
+            );
+            for parse in [false, true] {
+                for cancel in [false, true] {
+                    request(
+                        &mut writer,
+                        &mut engine,
+                        "TRUNCATE input_wait_audit; UPDATE input_wait_gate SET hits=0; \
+                         SELECT setval('input_wait_checks',1,false); SET application_name=''; SELECT setseed(0.5)",
+                    );
+                    request(
+                        &mut holder,
+                        &mut engine,
+                        "BEGIN; UPDATE input_wait_gate SET hits=hits WHERE id=2",
+                    );
+                    writer.send.clear();
+                    let sql = "SELECT '{a}'::input_wait_domain[], '{b}'::input_wait_domain[]";
+                    let mut payload = Vec::new();
+                    if parse {
+                        payload.extend_from_slice(b"wait_input\0");
+                    }
+                    payload.extend_from_slice(sql.as_bytes());
+                    payload.push(0);
+                    if parse {
+                        payload.extend_from_slice(&0u16.to_be_bytes());
+                    }
+                    assert!(writer.recv.append(&frontend(
+                        if parse {
+                            wire::FMSG_PARSE
+                        } else {
+                            wire::FMSG_QUERY
+                        },
+                        &payload
+                    )));
+                    for _ in 0..3 {
+                        assert!(matches!(
+                            crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                            Step::Parked
+                        ));
+                        assert!(writer.send.is_empty());
+                        assert!(writer.sqlprep.request_input_waiting());
+                    }
+                    let state = request(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT last_value::text||':'||is_called::text FROM input_wait_checks",
+                    );
+                    assert!(contains_value(&state, b"2:true"));
+                    if cancel {
+                        assert!(crate::mem::guard::forbid_alloc(
+                            || writer.cancel_parked(&mut engine)
+                        ));
+                        assert!(contains_value(writer.send.readable(), b"57014"));
+                        if parse {
+                            writer.send.clear();
+                            assert!(writer.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                        }
+                    }
+                    request(&mut holder, &mut engine, "COMMIT");
+                    if !cancel {
+                        assert!(matches!(
+                            crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                            Step::Continue
+                        ));
+                        assert!(!has_backend_message(
+                            writer.send.readable(),
+                            wire::MSG_ERROR_RESPONSE
+                        ));
+                        if parse {
+                            assert!(has_backend_message(
+                                writer.send.readable(),
+                                wire::MSG_PARSE_COMPLETE
+                            ));
+                            writer.send.clear();
+                            assert!(writer.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                            writer.send.clear();
+                            assert!(
+                                writer
+                                    .recv
+                                    .append(&frontend(wire::FMSG_CLOSE, b"Swait_input\0"))
+                            );
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                        }
+                    }
+                    let state = request(
+                        &mut writer,
+                        &mut engine,
+                        "SELECT currval('input_wait_checks')::text||':'||count(*)::text||':'||current_setting('application_name') FROM input_wait_audit",
+                    );
+                    assert!(contains_value(
+                        &state,
+                        if cancel { b"2:0:" } else { b"2:2:ab" }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    // PostgreSQL 18.6 PREPARE/EXECUTE reference SQL SHA256:
+    // 79d26366490991a38ea78b54b9a2c055f6de593702a37f58307054a5e22f20b0.
+    fn serialized_domain_inputs_are_bound_once_per_prepared_source() {
+        fn message(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            kind: u8,
+            payload: &[u8],
+            error: bool,
+        ) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let response = conn.send.readable().to_vec();
+            assert_eq!(
+                has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                error,
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            response
+        }
+        fn query(conn: &mut Conn, engine: &mut Engine, text: &str) -> Vec<u8> {
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            message(conn, engine, wire::FMSG_QUERY, &payload, false)
+        }
+        fn parse(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            name: &str,
+            text: &str,
+            error: bool,
+        ) -> Vec<u8> {
+            let mut payload = name.as_bytes().to_vec();
+            payload.push(0);
+            payload.extend_from_slice(text.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&0u16.to_be_bytes());
+            message(conn, engine, wire::FMSG_PARSE, &payload, error)
+        }
+        fn first_row(mut bytes: &[u8]) -> String {
+            while bytes.len() >= 5 {
+                let length = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize + 1;
+                if bytes[0] == wire::MSG_DATA_ROW {
+                    let count = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+                    let mut at = 7;
+                    let mut row = String::new();
+                    for column in 0..count {
+                        if column != 0 {
+                            row.push('|');
+                        }
+                        let length = i32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        if length < 0 {
+                            row.push_str("NULL");
+                        } else {
+                            row.push_str(
+                                core::str::from_utf8(&bytes[at..at + length as usize]).unwrap(),
+                            );
+                            at += length as usize;
+                        }
+                    }
+                    return row;
+                }
+                bytes = &bytes[length..];
+            }
+            panic!("missing result row")
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-bound-domain-input-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 8;
+            config.row_overlay_slots = 128;
+            config.max_connections = 1;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.prepared_bytes = 16 << 10;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            conn.phase = Phase::Ready;
+            query(
+                &mut conn,
+                &mut engine,
+                "CREATE SEQUENCE input_checks; CREATE TABLE input_audit(value text); \
+                 CREATE TYPE input_choice AS ENUM('a','b'); \
+                 CREATE FUNCTION input_allowed(value input_choice) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+                   PERFORM nextval('input_checks'); INSERT INTO input_audit VALUES(value::text); RETURN value='a'; END$$; \
+                 CREATE DOMAIN checked_choice AS input_choice CHECK(input_allowed(VALUE))",
+            );
+            assert!(has_backend_message(
+                &parse(
+                    &mut conn,
+                    &mut engine,
+                    "bound",
+                    "SELECT '{a}'::checked_choice[]",
+                    false
+                ),
+                wire::MSG_PARSE_COMPLETE
+            ));
+            for _ in 0..2 {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_DESCRIBE,
+                    b"Sbound\0",
+                    false,
+                );
+            }
+            for portal in ["first", "second"] {
+                let mut bind = portal.as_bytes().to_vec();
+                bind.extend_from_slice(b"\0bound\0");
+                bind.extend_from_slice(&[0; 6]);
+                message(&mut conn, &mut engine, wire::FMSG_BIND, &bind, false);
+            }
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+            parse(&mut conn, &mut engine, "bound", "SELECT 99", false);
+            for portal in ["first", "second"] {
+                let mut describe = vec![b'P'];
+                describe.extend_from_slice(portal.as_bytes());
+                describe.push(0);
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_DESCRIBE,
+                    &describe,
+                    false,
+                );
+                let mut execute = portal.as_bytes().to_vec();
+                execute.push(0);
+                execute.extend_from_slice(&0u32.to_be_bytes());
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        &execute,
+                        false
+                    )),
+                    "{a}"
+                );
+            }
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "1|1"
+            );
+            parse(
+                &mut conn,
+                &mut engine,
+                "runtime",
+                "SELECT ARRAY['a']::checked_choice[]",
+                false,
+            );
+            for portal in ["first", "second"] {
+                let mut bind = portal.as_bytes().to_vec();
+                bind.extend_from_slice(b"\0runtime\0");
+                bind.extend_from_slice(&[0; 6]);
+                message(&mut conn, &mut engine, wire::FMSG_BIND, &bind, false);
+                let mut execute = portal.as_bytes().to_vec();
+                execute.push(0);
+                execute.extend_from_slice(&0u32.to_be_bytes());
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        &execute,
+                        false
+                    )),
+                    "{a}"
+                );
+            }
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            query(
+                &mut conn,
+                &mut engine,
+                "PREPARE sql_bound AS SELECT '{a}'::checked_choice[]; EXECUTE sql_bound; EXECUTE sql_bound",
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "4|4"
+            );
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+            let error = parse(
+                &mut conn,
+                &mut engine,
+                "bad",
+                "SELECT '{b}'::checked_choice[]",
+                true,
+            );
+            assert!(error.windows(5).any(|bytes| bytes == b"23514"));
+            assert!(!has_backend_message(&error, wire::MSG_PARSE_COMPLETE));
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "5|4"
+            );
+        }
     }
 
     #[test]

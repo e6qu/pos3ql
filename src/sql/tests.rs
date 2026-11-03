@@ -15576,6 +15576,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
                     &transaction,
                     2,
                     &[],
+                    &[],
                 )
                 .unwrap();
             assert_eq!(
@@ -19490,7 +19491,7 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
         let mut responder =
             Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
         engine
-            .describe(sql_text, &arena, &transaction, None, &mut responder)
+            .describe(sql_text, &arena, &transaction, None, &mut responder, &[])
             .unwrap()
     };
     assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
@@ -28183,6 +28184,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[..2], [enum_oid, domain_oid]);
@@ -28192,6 +28194,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &arena,
             &transaction,
             2,
+            &[],
             &[],
         )
         .unwrap();
@@ -28205,6 +28208,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
@@ -28215,15 +28219,30 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
     let inferred = engine
-        .infer_param_types("CALL protocol_record($1)", &arena, &transaction, 1, &[])
+        .infer_param_types(
+            "CALL protocol_record($1)",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            &[],
+        )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
     let inferred = engine
-        .infer_param_types("CALL protocol_output($1, $2)", &arena, &transaction, 2, &[])
+        .infer_param_types(
+            "CALL protocol_output($1, $2)",
+            &arena,
+            &transaction,
+            2,
+            &[],
+            &[],
+        )
         .unwrap();
     assert_eq!(
         inferred[..2],
@@ -28591,7 +28610,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
     let inferred = engine
-        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[])
+        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[], &[])
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
@@ -54648,6 +54667,7 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
             &arena,
             &transaction,
             2,
+            &[],
             &[],
         )
         .unwrap();
@@ -92155,6 +92175,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     &session.transaction,
                     Some(&session.cursors),
                     &mut responder,
+                    &[],
                 ))
                 .unwrap()
             );

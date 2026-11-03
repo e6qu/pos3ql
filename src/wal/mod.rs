@@ -257,7 +257,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 14;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 15;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 3;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -461,23 +461,27 @@ impl WalStoredQueryDependencies<'_> {
     fn encoded_len(self) -> usize {
         match self {
             Self::Captured(dependencies) => {
-                2 + dependencies
-                    .entries()
-                    .iter()
-                    .map(|dependency| {
-                        1 + 1
-                            + dependency.identity.storage_key().len()
-                            + ColumnSet::ENCODED_BYTES
-                            + 1
-                            + dependency.schema.as_str().len()
-                            + 1
-                            + dependency.name.as_str().len()
-                            + 1
-                            + dependency.referenced_schema.as_str().len()
-                            + 1
-                            + dependency.referenced_name.as_str().len()
-                    })
-                    .sum::<usize>()
+                2 + 4
+                    + dependencies
+                        .type_inputs()
+                        .map_or(0, |inputs| inputs.bytes().len())
+                    + dependencies
+                        .entries()
+                        .iter()
+                        .map(|dependency| {
+                            1 + 1
+                                + dependency.identity.storage_key().len()
+                                + ColumnSet::ENCODED_BYTES
+                                + 1
+                                + dependency.schema.as_str().len()
+                                + 1
+                                + dependency.name.as_str().len()
+                                + 1
+                                + dependency.referenced_schema.as_str().len()
+                                + 1
+                                + dependency.referenced_name.as_str().len()
+                        })
+                        .sum::<usize>()
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -486,7 +490,7 @@ impl WalStoredQueryDependencies<'_> {
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(dependencies) => {
-                let mut ok = buffer.append(&[0xfd, dependencies.entries().len() as u8]);
+                let mut ok = buffer.append(&[0xfc, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
                         && append_stored_dependency_name(
@@ -505,25 +509,46 @@ impl WalStoredQueryDependencies<'_> {
                             dependency.referenced_name.as_str(),
                         );
                 }
-                ok
+                let inputs = dependencies
+                    .type_inputs()
+                    .map_or(&[][..], |inputs| inputs.bytes());
+                ok && u32::try_from(inputs.len()).is_ok()
+                    && buffer.append(&(inputs.len() as u32).to_le_bytes())
+                    && buffer.append(inputs)
             }
             Self::Encoded(bytes) => buffer.append(bytes),
         }
     }
 
     #[inline(never)]
-    pub(crate) fn materialize(self) -> Result<StoredQueryDependencies, SqlError> {
+    pub(crate) fn materialize<'source>(
+        self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        source: impl FnMut(crate::storage::StoredInputSection) -> Option<&'source str>,
+    ) -> Result<StoredQueryDependencies, SqlError> {
         match self {
             Self::Captured(dependencies) => Ok(StoredQueryDependencies::from_recovery_view(
                 dependencies,
                 dependencies.entries().len().max(1),
             )),
-            Self::Encoded(bytes) => decode_stored_query_dependencies(bytes).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "corrupt stored-query dependencies in journal"
-                )
-            }),
+            Self::Encoded(bytes) => {
+                let (mut dependencies, inputs) = decode_stored_query_dependencies(bytes)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "corrupt stored-query dependencies in journal"
+                        )
+                    })?;
+                let inputs = storage.restore_stored_type_inputs(
+                    inputs,
+                    source,
+                    dependencies.view(),
+                    txid,
+                )?;
+                dependencies.set_type_inputs(inputs);
+                Ok(dependencies)
+            }
         }
     }
 }
@@ -1048,6 +1073,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     n += 3;
     n += def.implicit_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+    n += 4 + def.type_inputs.as_ref().bytes().len();
     n
 }
 
@@ -1213,6 +1239,10 @@ fn append_table_payload<B: DefinitionBacking>(
         };
         ok &= buffer.append(&identity.to_le_bytes());
     }
+    let inputs = def.type_inputs.as_ref().bytes();
+    ok &= u32::try_from(inputs.len()).is_ok()
+        && buffer.append(&(inputs.len() as u32).to_le_bytes())
+        && buffer.append(inputs);
     ok
 }
 
@@ -6866,7 +6896,7 @@ fn stored_dependency_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a s
 }
 
 fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
-    if payload.first() != Some(&0xfd) {
+    if payload.first() != Some(&0xfc) {
         return false;
     }
     let Some(&count) = payload.get(1) else {
@@ -6902,11 +6932,22 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
             }
         }
     }
-    at == payload.len()
+    let Some(length) = payload
+        .get(at..at + 4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("checked length")) as usize)
+    else {
+        return false;
+    };
+    at += 4;
+    let Some(end) = at.checked_add(length) else {
+        return false;
+    };
+    end == payload.len()
+        && crate::storage::StoredTypeInputs::validate_encoded(&payload[at..end]).is_ok()
 }
 
 #[inline(never)]
-fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDependencies> {
+fn decode_stored_query_dependencies(payload: &[u8]) -> Option<(StoredQueryDependencies, &[u8])> {
     if !validate_stored_query_dependencies(payload) {
         return None;
     }
@@ -6937,7 +6978,9 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
             })
             .ok()?;
     }
-    Some(dependencies)
+    let length = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+    at += 4;
+    Some((dependencies, payload.get(at..at.checked_add(length)?)?))
 }
 
 fn decode_statistics_column(
@@ -7513,7 +7556,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
 
 pub(crate) fn decode_table_payload(
     payload: &[u8],
-) -> Option<(crate::storage::CatalogPosition, TableDefBuilder)> {
+) -> Option<(crate::storage::CatalogPosition, TableDefBuilder, &[u8])> {
     let mut definition = None;
     decode_op_inner(
         KIND_CREATE,
@@ -7647,7 +7690,13 @@ pub(crate) fn decode_operator_class_payload(
 }
 
 struct WalDecodeOutput<'output, 'payload> {
-    table: Option<&'output mut Option<(crate::storage::CatalogPosition, TableDefBuilder)>>,
+    table: Option<
+        &'output mut Option<(
+            crate::storage::CatalogPosition,
+            TableDefBuilder,
+            &'payload [u8],
+        )>,
+    >,
     domain: Option<&'output mut crate::storage::DomainDef>,
     routine: Option<
         &'output mut Option<(
@@ -8293,7 +8342,13 @@ fn decode_op_inner<'a>(
                     return None;
                 }
             }
-            if at != payload.len() {
+            let length = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+            at += 4;
+            let inputs = payload.get(at..at.checked_add(length)?)?;
+            at += length;
+            if at != payload.len()
+                || crate::storage::StoredTypeInputs::validate_encoded(inputs).is_err()
+            {
                 return None;
             }
             if decoded_table.is_none()
@@ -8302,7 +8357,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             if let Some(output) = decoded_table {
-                *output = Some((identity, def));
+                *output = Some((identity, def, inputs));
             }
             Some(if kind == KIND_CREATE_TYPED {
                 WalOp::RestoreTypedTable(payload)
@@ -13751,9 +13806,9 @@ mod tests {
         let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 1024).unwrap();
         assert!(WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut encoded));
         assert_eq!(
-            WalStoredQueryDependencies::Encoded(encoded.readable())
-                .materialize()
-                .unwrap(),
+            decode_stored_query_dependencies(encoded.readable())
+                .unwrap()
+                .0,
             dependencies
         );
         assert_eq!(
@@ -13788,7 +13843,9 @@ mod tests {
                 WalStoredQueryDependencies::Captured(dependencies.view()).encoded_len()
             );
             assert_eq!(
-                decode_stored_query_dependencies(encoded.readable()).unwrap(),
+                decode_stored_query_dependencies(encoded.readable())
+                    .unwrap()
+                    .0,
                 dependencies
             );
             let mut wrong_kind = encoded.readable().to_vec();
@@ -13818,12 +13875,13 @@ mod tests {
         ] {
             let encode = |payload: &mut FixedBuf, key: &str| {
                 payload.clear();
-                assert!(payload.append(&[0xfd, 1, class as u8]));
+                assert!(payload.append(&[0xfc, 1, class as u8]));
                 assert!(append_stored_dependency_name(payload, key));
                 assert!(append_column_set(payload, ColumnSet::EMPTY));
                 for name in ["public", "items", "", "items"] {
                     assert!(append_stored_dependency_name(payload, name));
                 }
+                assert!(payload.append(&0u32.to_le_bytes()));
             };
             encode(
                 &mut payload,
@@ -14234,7 +14292,7 @@ mod tests {
                 match *kind {
                     KIND_CREATE_TYPED => {
                         assert!(decode_op(KIND_CREATE, payload.readable()).is_none());
-                        let (_, decoded) = decode_table_payload(payload.readable()).unwrap();
+                        let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
                         assert_eq!(decoded.columns[0].default, table.columns[0].default);
                     }
                     KIND_CREATE_DOMAIN_TYPED => {
@@ -14983,7 +15041,7 @@ mod tests {
             assert!(append_payload(&mut from_builder, &builder));
             assert!(append_payload(&mut from_stored, &stored));
             assert_eq!(from_builder.readable(), from_stored.readable());
-            let (position, decoded) = decode_table_payload(from_stored.readable()).unwrap();
+            let (position, decoded, _) = decode_table_payload(from_stored.readable()).unwrap();
             assert_eq!(position, identity);
             assert_eq!(decoded.columns(), definition.columns());
             assert_eq!(
@@ -15005,7 +15063,7 @@ mod tests {
             let operation = decode_record(record).unwrap();
             let shown = match operation {
                 WalOp::RestoreTable(payload) => {
-                    let (_, definition) = decode_table_payload(payload).unwrap();
+                    let (_, definition, _) = decode_table_payload(payload).unwrap();
                     format!("{lsn}:CreateTable({definition:?})")
                 }
                 WalOp::RestoreDomain(payload) => {
@@ -15046,6 +15104,7 @@ mod tests {
         for invalid in [0, crate::storage::MAX_RELATION_GENERATION + 1, 101] {
             let mut corrupt = bytes.to_vec();
             let end = corrupt.len()
+                - 4
                 - definition.constraint_identities().count()
                     * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             corrupt[end - 8..end].copy_from_slice(&invalid.to_le_bytes());
@@ -15076,20 +15135,23 @@ mod tests {
             .unwrap()
             .unwrap()
             .created_at();
-        let last: [u8; 4] = payload.readable()[length - 4..].try_into().unwrap();
+        let last: [u8; 4] = payload.readable()[length - 8..length - 4]
+            .try_into()
+            .unwrap();
         crate::mem::guard::forbid_alloc(|| {
             assert!(decode_table_payload(payload.readable()).is_some());
             for missing in 1..=4 {
                 assert!(decode_table_payload(&payload.readable()[..length - missing]).is_none());
             }
             for invalid in [0, 50, crate::storage::MAX_CONSTRAINT_CREATION + 1, first] {
-                payload.filled_mut()[length - 4..].copy_from_slice(&(invalid as u32).to_le_bytes());
+                payload.filled_mut()[length - 8..length - 4]
+                    .copy_from_slice(&(invalid as u32).to_le_bytes());
                 assert!(
                     decode_table_payload(payload.readable()).is_none(),
                     "accepted constraint identity {invalid}"
                 );
             }
-            payload.filled_mut()[length - 4..].copy_from_slice(&last);
+            payload.filled_mut()[length - 8..length - 4].copy_from_slice(&last);
             assert!(decode_table_payload(payload.readable()).is_some());
         });
     }
@@ -15115,7 +15177,7 @@ mod tests {
                         definition: (&definition).into(),
                     }
                 ));
-                let (_, restored) = decode_table_payload(payload.readable()).unwrap();
+                let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.uniques[0].kind, kind);
                 assert_eq!(restored.attributes, definition.attributes);
                 assert_eq!(restored.not_null_names[0], definition.not_null_names[0]);
@@ -15181,9 +15243,9 @@ mod tests {
                     definition: (&definition).into(),
                 }
             ));
-            assert_eq!(current.readable()[0], 14);
+            assert_eq!(current.readable()[0], 15);
             assert!(decode_table_payload(current.readable()).is_some());
-            for version in [0, 1, 13, 15, u8::MAX] {
+            for version in [0, 1, 13, 14, u8::MAX] {
                 incompatible.clear();
                 assert!(incompatible.append(&[version]));
                 assert!(incompatible.append(&current.readable()[1..]));
@@ -15230,7 +15292,7 @@ mod tests {
                         definition: (&definition).into(),
                     })
                 );
-                let (_, restored) = decode_table_payload(payload.readable()).unwrap();
+                let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
                 assert_eq!(restored.columns[1].collation, collation);
             });
         }
@@ -15282,7 +15344,7 @@ mod tests {
                 definition: (&definition).into()
             }
         ));
-        let (_, restored) = decode_table_payload(payload.readable())
+        let (_, restored, _) = decode_table_payload(payload.readable())
             .expect("partition table definition did not decode");
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
         assert_eq!(restored.type_membership, definition.type_membership);
@@ -17423,7 +17485,10 @@ mod tests {
                 decoded.configs[MAX_ROUTINE_CONFIGS - 1].value.len(),
                 crate::storage::ROUTINE_CONFIG_VALUE_MAX
             );
-            assert!(dependencies.materialize().is_ok());
+            let WalStoredQueryDependencies::Encoded(bytes) = dependencies else {
+                panic!("decoded routine must retain its encoded dependency image");
+            };
+            assert!(decode_stored_query_dependencies(bytes).is_some());
             assert!(
                 decode_routine_payload(&payload.readable()[..payload.len() - 1], true).is_none()
             );

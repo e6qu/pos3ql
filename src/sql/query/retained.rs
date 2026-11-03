@@ -90,6 +90,7 @@ fn retained_expression(
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_) => true,
         Expr::Unary {
             operator: UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot,
@@ -167,6 +168,7 @@ fn row_independent(expression: &Expr<'_>, scope: &QueryScope<'_>) -> bool {
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_) => true,
         Expr::RoutineParam {

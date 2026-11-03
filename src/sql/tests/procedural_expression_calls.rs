@@ -1,5 +1,7 @@
 use super::*;
 
+// PostgreSQL 18.6 reference SQL SHA256:
+// b9ff9c6b7cefb6d32041e6a1bc91cfaa90121cbd06f0d5c262c8aa28cdc5a225.
 #[test]
 fn procedural_expressions_resume_nested_calls_without_repeating_effects() {
     for mode in [

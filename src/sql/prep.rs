@@ -48,12 +48,36 @@ pub(crate) fn decode_types<'a>(codes: &[u8], arena: &'a Arena) -> Result<&'a [Co
 
 pub struct SqlPreparedPool {
     slots: Vec<Slot>,
+    request: FixedBuf,
+    request_owner: Option<RequestInputOwner>,
+}
+
+struct RequestInputOwner {
+    source: super::type_inputs::Source,
+    text_len: usize,
+    progress: RequestInputProgress,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RequestInputProgress {
+    pub next: usize,
+    pub waiting: Option<PendingTypeInput>,
+    pub complete: bool,
+    pub mark: super::txn::StatementMark,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingTypeInput {
+    pub start: usize,
+    pub end: usize,
+    pub kind: super::type_inputs::InputKind,
+    pub target: i32,
 }
 
 struct Slot {
     active: bool,
     name: SqlName,
-    /// Query text, one durable code per parameter, then big-endian result OIDs.
+    /// Query text, parameter codes, result OIDs, then bound type inputs.
     /// All metadata shares the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     text_len: usize,
@@ -61,6 +85,7 @@ struct Slot {
     prepared_at: i64,
     custom_plans: i64,
     n_results: usize,
+    input_bytes: usize,
 }
 
 thread_local! {
@@ -119,7 +144,10 @@ impl PreparedResultTypes<'_> {
 
 impl SqlPreparedPool {
     pub fn budget_bytes(config: &Config) -> usize {
-        config.max_prepared * config.prepared_bytes
+        config
+            .max_prepared
+            .saturating_add(1)
+            .saturating_mul(config.prepared_bytes)
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -134,9 +162,15 @@ impl SqlPreparedPool {
                 prepared_at: 0,
                 custom_plans: 0,
                 n_results: 0,
+                input_bytes: 0,
             });
         }
-        Ok(Self { slots })
+        let request = FixedBuf::new(budget, "sql_request_type_inputs", config.prepared_bytes)?;
+        Ok(Self {
+            slots,
+            request,
+            request_owner: None,
+        })
     }
 
     pub fn store(
@@ -145,6 +179,7 @@ impl SqlPreparedPool {
         sql: &str,
         param_types: &[ColType],
         result_types: &[i32],
+        type_inputs: &[u8],
     ) -> Result<(), SqlError> {
         if self.get(name).is_some() {
             return Err(sql_err!(
@@ -178,6 +213,7 @@ impl SqlPreparedPool {
             .len()
             .saturating_add(param_types.len())
             .saturating_add(result_bytes)
+            .saturating_add(type_inputs.len())
             > slot.data.capacity()
         {
             return Err(sql_err!(
@@ -195,9 +231,11 @@ impl SqlPreparedPool {
                 "capacity checked above"
             );
         }
+        assert!(slot.data.append(type_inputs), "capacity checked above");
         slot.text_len = sql.len();
         slot.n_params = param_types.len();
         slot.n_results = result_types.len();
+        slot.input_bytes = type_inputs.len();
         slot.name = SqlName::parse(name)?;
         slot.prepared_at = crate::sql::datetime::now_micros();
         slot.custom_plans = 0;
@@ -222,6 +260,86 @@ impl SqlPreparedPool {
             .iter()
             .find(|s| s.active && s.name.as_str() == name)
             .map(|s| &s.data.readable()[s.text_len..s.text_len + s.n_params])
+    }
+
+    pub(crate) fn type_inputs(&self, name: &str) -> Option<&[u8]> {
+        self.slots
+            .iter()
+            .find(|slot| slot.active && slot.name.as_str() == name)
+            .map(|slot| {
+                let start = slot.text_len + slot.n_params + slot.n_results * 4;
+                &slot.data.readable()[start..start + slot.input_bytes]
+            })
+    }
+
+    pub(crate) fn request_type_inputs(
+        &self,
+        source: super::type_inputs::Source,
+        text: &str,
+    ) -> Result<Option<(&[u8], RequestInputProgress)>, SqlError> {
+        let Some(owner) = &self.request_owner else {
+            return Ok(None);
+        };
+        if owner.source != source {
+            return Ok(None);
+        }
+        if self.request.readable().get(..owner.text_len) != Some(text.as_bytes()) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "active type-input source was replaced"
+            ));
+        }
+        Ok(Some((
+            &self.request.readable()[owner.text_len..],
+            owner.progress,
+        )))
+    }
+
+    pub(crate) fn request_input_progress(&self) -> Option<RequestInputProgress> {
+        self.request_owner.as_ref().map(|owner| owner.progress)
+    }
+
+    pub(crate) fn request_input_waiting(&self) -> bool {
+        self.request_owner
+            .as_ref()
+            .is_some_and(|owner| owner.progress.waiting.is_some())
+    }
+
+    pub(crate) fn save_request_input_progress(
+        &mut self,
+        source: super::type_inputs::Source,
+        text: &str,
+        bindings: &[super::type_inputs::Binding<'_>],
+        progress: RequestInputProgress,
+    ) -> Result<(), SqlError> {
+        let bytes = super::type_inputs::encoded_len(bindings)?;
+        if text
+            .len()
+            .checked_add(bytes)
+            .is_none_or(|bytes| bytes > self.request.capacity())
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "active SQL source and bound inputs exceed prepared_bytes"
+            ));
+        }
+        self.request.clear();
+        assert!(
+            self.request.append(text.as_bytes()),
+            "capacity checked above"
+        );
+        super::type_inputs::encode(bindings, &mut self.request)?;
+        self.request_owner = Some(RequestInputOwner {
+            source,
+            text_len: text.len(),
+            progress,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn clear_request_type_inputs(&mut self) {
+        self.request_owner = None;
+        self.request.clear();
     }
 
     /// Returns whether the statement existed.

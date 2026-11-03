@@ -4354,8 +4354,17 @@ impl Checkpointer {
                     if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
-                    let name = rest_of(line, 12 + inheritance_count)?;
+                    let inputs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("table type inputs missing"))?,
+                    )?;
+                    let type_inputs = storage
+                        .decode_stored_type_inputs(&inputs)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid table type inputs"))?;
+                    let name = rest_of(line, 13 + inheritance_count)?;
                     let def = TableDefBuilder {
+                        type_inputs,
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
                         name: sql_name(name)?,
@@ -6682,7 +6691,19 @@ impl Checkpointer {
                         ))?)?,
                         "invalid routine creation search path",
                     )?;
-                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+                        storage,
+                        |section| match section {
+                            crate::storage::StoredInputSection::RoutineBody => Some(body.as_str()),
+                            crate::storage::StoredInputSection::ParameterDefault(index) => {
+                                parameters
+                                    .get(usize::from(index))
+                                    .filter(|_| usize::from(index) < parameter_count)
+                                    .and_then(|parameter| parameter.mode.default_sql())
+                            }
+                            _ => None,
+                        },
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed routine record"));
                     }
@@ -6903,7 +6924,13 @@ impl Checkpointer {
                             )?)?,
                             "invalid rule creation search path",
                         )?;
-                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+                        storage,
+                        |section| {
+                            (section == crate::storage::StoredInputSection::RuleSource)
+                                .then_some(source.as_str())
+                        },
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rule fields"));
                     }
@@ -10623,13 +10650,15 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            write!(table_line, " {}", definition.name.as_str()).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table manifest line exceeds fixed capacity"
-                )
-            })?;
-            write_manifest(&mut self.manifest_output, table_line.as_str())?;
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!(
+                    "{} {} {}",
+                    table_line.as_str(),
+                    ManifestInputBytes(definition.type_inputs.bytes()),
+                    definition.name.as_str()
+                ),
+            )?;
             write_manifest(
                 &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
@@ -18063,7 +18092,18 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
     };
     let using = expression(words.next())?;
     let with_check = expression(words.next())?;
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+        storage,
+        |section| match section {
+            crate::storage::StoredInputSection::PolicyUsing => {
+                using.as_ref().map(|sql| sql.as_str())
+            }
+            crate::storage::StoredInputSection::PolicyCheck => {
+                with_check.as_ref().map(|sql| sql.as_str())
+            }
+            _ => None,
+        },
+    )?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt("trailing policy fields"));
     }
@@ -18865,7 +18905,10 @@ fn load_view(
             ))
         })?;
     }
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?
+        .materialize(storage, |section| {
+            (section == crate::storage::StoredInputSection::Query).then_some(sql.as_str())
+        })?;
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
@@ -18930,7 +18973,10 @@ fn load_matview(
     let path = read_hex(words.next(), "materialized-view path missing")?;
     let name = read_hex(words.next(), "materialized-view name missing")?;
     let populated: u8 = parse_field(words.next(), "materialized-view populated")?;
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?
+        .materialize(storage, |section| {
+            (section == crate::storage::StoredInputSection::Query).then_some(sql.as_str())
+        })?;
     if populated > 1 || words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt(
             "invalid materialized-view fields",
@@ -19197,7 +19243,7 @@ impl core::fmt::Display for ManifestRoutineResult {
 
 impl core::fmt::Display for ManifestDependencies<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(output, "{}", self.0.entries().len())?;
+        write!(output, "i2 {}", self.0.entries().len())?;
         for dependency in self.0.entries() {
             write!(output, " {} ", dependency.class as u8)?;
             write!(output, "{} ", dependency.identity.storage_key())?;
@@ -19218,13 +19264,61 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             }
             write!(output, " {}", dependency.referenced_columns)?;
         }
+        write!(
+            output,
+            " {}",
+            ManifestInputBytes(
+                self.0
+                    .type_inputs()
+                    .map_or(&[][..], |inputs| inputs.bytes())
+            )
+        )?;
         Ok(())
     }
 }
 
-fn parse_stored_query_dependencies(
-    words: &mut core::str::Split<'_, char>,
-) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
+struct ManifestInputBytes<'a>(&'a [u8]);
+
+impl core::fmt::Display for ManifestInputBytes<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return output.write_str("-");
+        }
+        for byte in self.0 {
+            write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+struct ParsedManifestDependencies<'a> {
+    dependencies: crate::storage::StoredQueryDependencies,
+    inputs: &'a str,
+}
+
+impl ParsedManifestDependencies<'_> {
+    fn materialize<'source>(
+        mut self,
+        storage: &Storage,
+        source: impl FnMut(crate::storage::StoredInputSection) -> Option<&'source str>,
+    ) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
+        let bytes = decode_manifest_hex_bytes(self.inputs)?;
+        let inputs = storage
+            .restore_stored_type_inputs(&bytes, source, self.dependencies.view(), 0)
+            .map_err(|_| CheckpointSetupError::Corrupt("invalid stored SQL type inputs"))?;
+        self.dependencies.set_type_inputs(inputs);
+        Ok(self.dependencies)
+    }
+}
+
+fn parse_stored_query_dependencies<'a>(
+    words: &mut core::str::Split<'a, char>,
+) -> Result<ParsedManifestDependencies<'a>, CheckpointSetupError> {
+    if words.next() != Some("i2") {
+        return Err(CheckpointSetupError::Corrupt(
+            "unsupported stored SQL dependency image",
+        ));
+    }
     let count: usize = parse_field(words.next(), "stored-query dependency count")?;
     if count > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
         return Err(CheckpointSetupError::Corrupt(
@@ -19272,7 +19366,16 @@ fn parse_stored_query_dependencies(
             })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
-    Ok(dependencies)
+    let inputs = words.next().ok_or(CheckpointSetupError::Corrupt(
+        "stored SQL type inputs missing",
+    ))?;
+    let bytes = decode_manifest_hex_bytes(inputs)?;
+    crate::storage::StoredTypeInputs::validate_encoded(&bytes)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid stored SQL type inputs"))?;
+    Ok(ParsedManifestDependencies {
+        dependencies,
+        inputs,
+    })
 }
 
 fn sql_name(s: &str) -> Result<SqlName, CheckpointSetupError> {
@@ -22512,7 +22615,9 @@ mod stored_dependency_tests {
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));
         let mut words = encoded.split(' ');
         assert_eq!(
-            parse_stored_query_dependencies(&mut words).unwrap(),
+            parse_stored_query_dependencies(&mut words)
+                .unwrap()
+                .dependencies,
             dependencies
         );
         for (class, key) in [
@@ -22538,7 +22643,9 @@ mod stored_dependency_tests {
                 .unwrap();
             let encoded = format!("{}", ManifestDependencies(dependencies.view()));
             assert_eq!(
-                parse_stored_query_dependencies(&mut encoded.split(' ')).unwrap(),
+                parse_stored_query_dependencies(&mut encoded.split(' '))
+                    .unwrap()
+                    .dependencies,
                 dependencies
             );
         }
@@ -22565,13 +22672,13 @@ mod stored_dependency_tests {
                 "v:31"
             };
             let valid = format!(
-                "1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {}",
+                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} -",
                 class as u8,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
             let input = format!(
-                "1 {} {key} 7075626c6963 6974656d73  6974656d73 {}",
+                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} -",
                 class as u8,
                 crate::storage::ColumnSet::EMPTY
             );

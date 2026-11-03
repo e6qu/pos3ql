@@ -47,6 +47,10 @@ pub(super) struct StatementSequenceReplay {
 }
 
 impl StatementSequenceReplay {
+    pub(super) fn is_retained(self) -> bool {
+        self.head.is_some()
+    }
+
     pub(super) const EMPTY: Self = Self {
         head: None,
         tail: None,
@@ -138,6 +142,12 @@ fn statement_call(
     call: SequenceCall,
     action: impl FnOnce() -> Result<i64, SqlError>,
 ) -> Result<i64, SqlError> {
+    if matches!(
+        call.operation,
+        SequenceOperation::Next | SequenceOperation::Set { .. }
+    ) {
+        super::query::protect_statement_effects();
+    }
     STATEMENT_ARENA.with(|active| {
         let pointer = active.get();
         if pointer.is_null() {

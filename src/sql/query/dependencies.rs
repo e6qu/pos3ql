@@ -1383,6 +1383,33 @@ pub(crate) fn visit_dml_assignment_types(
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
     visit: &mut dyn FnMut(i32, &crate::storage::ColumnMeta) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    visit_dml_assignment_contexts(
+        statement,
+        storage,
+        txid,
+        arena,
+        outer,
+        &mut |expression, column, columns| {
+            visit(
+                crate::sql::exec::infer_routine_argument_oid(expression, columns)?,
+                column,
+            )
+        },
+    )
+}
+
+pub(super) fn visit_dml_assignment_contexts(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    visit: &mut dyn FnMut(
+        &Expr<'_>,
+        &crate::storage::ColumnMeta,
+        &dyn ColTypeResolver,
+    ) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
         let (statement, with) = match statement {
@@ -1444,10 +1471,7 @@ pub(crate) fn visit_dml_assignment_types(
                     "INSERT has more expressions than target columns"
                 )
             })?;
-            visit(
-                crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
-                column,
-            )
+            visit(expression, column, &columns)
         })
     })();
     // Only Copy cast snapshots, allocated in the persistent tail, may escape.
@@ -1648,7 +1672,7 @@ fn validate_assignment_type(
     )
 }
 
-fn dml_dependency_scope<'a>(
+pub(super) fn dml_dependency_scope<'a>(
     storage: &'a Storage,
     target: QualName<'a>,
     alias: Option<&'a str>,
@@ -3210,6 +3234,9 @@ fn collect_expression<'a>(
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
     let path = context.path;
+    if let Expr::BoundLiteral { source, .. } = expression {
+        return collect_expression(source, storage, txid, ctes, dependencies, arena, context);
+    }
     if let Expr::Cast { type_name, .. } = expression {
         collect_type(type_name, storage, txid, path, dependencies)?;
     }

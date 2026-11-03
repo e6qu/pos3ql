@@ -488,6 +488,10 @@ impl SequenceCache {
 }
 
 impl SeqSession {
+    pub(crate) fn retains_statement_effects(&self) -> bool {
+        self.statement_replay.get().is_retained()
+    }
+
     const fn new() -> Self {
         SeqSession {
             statement_replay: Cell::new(super::sequence::StatementSequenceReplay::EMPTY),
@@ -974,6 +978,11 @@ struct GucSavepoint {
     session_overrides: u32,
 }
 
+pub(crate) struct StatementSettings {
+    values: GucSavepoint,
+    random: PrngState,
+}
+
 struct GucTransaction {
     active: bool,
     start: GucValues,
@@ -1097,6 +1106,32 @@ impl Default for GucState {
 }
 
 impl GucState {
+    pub(crate) fn statement_settings(&self) -> StatementSettings {
+        let state = self.store.borrow();
+        StatementSettings {
+            values: GucSavepoint {
+                current: state.current,
+                session: state.transaction.session,
+                current_overrides: state.session_overrides,
+                session_overrides: state.transaction.session_overrides,
+            },
+            random: self.random.get(),
+        }
+    }
+
+    pub(crate) fn restore_statement_settings(&self, mark: StatementSettings) {
+        {
+            let mut state = self.store.borrow_mut();
+            state.current = mark.values.current;
+            state.transaction.session = mark.values.session;
+            state.session_overrides = mark.values.current_overrides;
+            state.transaction.session_overrides = mark.values.session_overrides;
+        }
+        self.random.set(mark.random);
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
+        crate::sql::timezone::set_session(self.timezone());
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_sequence_capacity(
         budget: &mut Budget,
@@ -3073,6 +3108,38 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn statement_retry_restores_settings_and_the_random_stream() {
+        let state = GucState::new();
+        state.begin_transaction();
+        state
+            .set_config("application_name", Some("before"), false)
+            .unwrap();
+        state.set_random_seed(0.5).unwrap();
+        let expected = state.random().unwrap();
+        state.set_random_seed(0.5).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..3 {
+                let mark = state.statement_settings();
+                assert_eq!(state.random().unwrap(), expected);
+                state
+                    .set_config("application_name", Some("during"), false)
+                    .unwrap();
+                state.restore_statement_settings(mark);
+                assert_eq!(
+                    state.get_owned("application_name").unwrap().as_str(),
+                    "before"
+                );
+            }
+            assert_eq!(state.random().unwrap(), expected);
+            state.commit_transaction();
+            assert_eq!(
+                state.get_owned("application_name").unwrap().as_str(),
+                "before"
+            );
+        });
+    }
 
     #[test]
     fn configured_guc_capacities_saturate_and_valid_reservations_remain_exact() {

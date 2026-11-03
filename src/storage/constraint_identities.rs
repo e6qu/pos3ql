@@ -457,7 +457,7 @@ mod tests {
             let before = storage.catalog_identity_sequence();
             let position = CatalogPosition::new(1, before + 10).unwrap();
             for rejected_kind in 0..3 {
-                let mut rejected = original;
+                let mut rejected = original.clone();
                 rejected.name = SqlName::parse("rejected_restore").unwrap();
                 match rejected_kind {
                     0 => rejected.checks[0].identity = None,

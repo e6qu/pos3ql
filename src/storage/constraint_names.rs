@@ -243,7 +243,7 @@ mod tests {
         original.columns[1].not_null = NotNullOrigin::Local;
         table(&mut original).unwrap();
         let retained_name = original.not_null_names[1];
-        let mut replacement = original;
+        let mut replacement = original.clone();
         replacement.name = SqlName::parse("renamed").unwrap();
         replacement.columns[0] = original.columns[1];
         replacement.columns[1] = ColumnMeta {

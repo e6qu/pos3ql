@@ -9647,7 +9647,7 @@ fn replay_table_rewrite_marker_must_be_paired_exactly_once() {
         storage
             .complete_replay_table_rewrite(
                 storage.table_position(0),
-                make_def("t", &[("id", ColType::Int4, true)])
+                &make_def("t", &[("id", ColType::Int4, true)])
             )
             .unwrap()
     );

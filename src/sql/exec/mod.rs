@@ -21886,7 +21886,10 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         }
         Ok(())
     })?;
-    let PlpgsqlExecHost::Routine { sqlprep, .. } = &context.host else {
+    let PlpgsqlExecHost::Routine {
+        engine, sqlprep, ..
+    } = &context.host
+    else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "prepared statements are not available in trigger execution"
@@ -21926,7 +21929,13 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(BoundPlpgsqlCommand {
         source: text,
-        statement: super::parser::parse_stored_statement(text, context.arena)?,
+        statement: engine.prepared_statement(
+            name,
+            args.len(),
+            sqlprep,
+            context.arena,
+            context.txn.txid,
+        )?,
         arguments: &*values,
         parameter_types,
     })
@@ -23943,6 +23952,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     context.arena,
                     txn,
                     responder,
+                    cursors,
+                    guc,
                 ),
                 Stmt::Deallocate(name) => {
                     engine.execute_deallocate_statement(*name, sqlprep, responder)
@@ -47661,10 +47672,10 @@ fn rewrite_table_owned_column_references(
 ) -> Result<(), SqlError> {
     let from = definition.columns[column].name;
     let rename = CompositeFieldRename { from, to };
-    let current = *definition;
-    let mut renamed = current;
+    let current = definition.clone();
+    let mut renamed = current.clone();
     renamed.columns[column].name = to;
-    let target_shape = renamed;
+    let target_shape = renamed.clone();
 
     for metadata in renamed.columns.iter_mut().take(renamed.n_columns) {
         metadata.default = match metadata.default {
@@ -54133,6 +54144,7 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
@@ -70411,7 +70423,7 @@ fn alter_table_relation(
     // Build every rewritten image and validate its content
     // (NOT NULL / CHECK / foreign keys), all before any journaling, so a
     // failure — a cast error included — leaves the table untouched.
-    let mut rewrite_validation_def = new_def;
+    let mut rewrite_validation_def = new_def.clone();
     for check in &mut rewrite_validation_def.checks[..rewrite_validation_def.n_checks] {
         if !check.validation.validated() {
             check.validation = crate::storage::ConstraintValidation::NotEnforced;
@@ -73751,6 +73763,11 @@ pub(crate) fn coerce_user_type_array<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     let (source, raw) = match value {
+        Datum::Array { element, raw }
+            if element == target && matches!(target, crate::sql::types::ArrElem::Domain { .. }) =>
+        {
+            return Ok(Datum::Array { element, raw });
+        }
         Datum::Array { element, raw } => (element, raw),
         Datum::Text(text) | Datum::Bpchar(text) => (
             crate::sql::types::ArrElem::Text,

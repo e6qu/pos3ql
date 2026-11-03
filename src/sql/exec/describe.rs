@@ -24,7 +24,7 @@ use core::cell::Cell;
 fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i32 {
     match expression {
         Expr::Column { name, .. } => column_mod(name),
-        Expr::Cast { type_mod, .. } => *type_mod,
+        Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
         Expr::Collate { operand, .. } => output_type_mod(operand, column_mod),
         _ => -1,
     }
@@ -1617,6 +1617,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             }
             _ => cast_target_name(type_name),
         },
+        Expr::BoundLiteral { source, .. } => name_of(source),
         Expr::BoundDefault {
             expression: operand,
             ..
@@ -1652,6 +1653,7 @@ fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         | Expr::Call { .. }
         | Expr::Array(_)
         | Expr::ArraySubquery(_) => name_of(expression),
+        Expr::BoundLiteral { source, .. } => cast_source_name(source),
         Expr::Cast { operand, .. }
         | Expr::BoundDefault {
             expression: operand,
@@ -2735,6 +2737,22 @@ fn expression_static_metadata(
     columns: &dyn ColTypeResolver,
 ) -> Option<StaticTypeMeta> {
     match expression {
+        Expr::BoundLiteral {
+            type_oid,
+            type_mod,
+            collation,
+            ..
+        } => {
+            let ctype = crate::sql::eval::constructor_type_from_oid(*type_oid, &|oid| {
+                columns.domain_base_type(oid)
+            })?;
+            Some(StaticTypeMeta {
+                ctype,
+                type_oid: *type_oid,
+                type_mod: *type_mod,
+                collation: collation.unwrap_or(crate::sql::ast::Collation::None),
+            })
+        }
         Expr::Column { qualifier, name } if !columns.is_whole_row(name) => {
             columns.column_meta(*qualifier, name)
         }
@@ -4880,7 +4898,7 @@ pub fn infer_type_res(
         return Ok(result);
     }
     Ok(match expression {
-        Expr::BoundDefault { type_oid, .. } => (
+        Expr::BoundDefault { type_oid, .. } | Expr::BoundLiteral { type_oid, .. } => (
             *type_oid,
             coltype_of_oid(*type_oid)
                 .or_else(|| columns.domain_base_type(*type_oid))

@@ -167,6 +167,10 @@ statement failed while removing whole notice/warning records and secondary
 DETAIL/HINT fields, including continuation lines. Diagnostic bytes outside UTF-8
 are escaped losslessly rather than replaced; primary error messages remain
 comparison inputs in exact-message mode.
+The Differential workflow keeps complete failed comparisons and server logs in
+`differential-failure-<shard>-<revision>` artifacts for seven days. Download those
+when its console preview ends before the mismatch you need. The other corpus
+harness prints the complete diff, including when coverage forces rows to disk.
 The port-based corpus harness requires an external reference at `127.0.0.1`;
 forward a remote reference explicitly instead of supplying a host it cannot use.
 Synchronize concurrent catalog changes before comparing current permission

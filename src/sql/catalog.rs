@@ -12433,8 +12433,8 @@ pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
     let mut argument_oids = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
     let (schema, name, arguments) = if let Some(declaration) = builtin_callable_by_oid(oid) {
         (
-            SqlName::new(declaration.schema).expect("built-in schema fits its name bound"),
-            SqlName::new(declaration.name).expect("built-in routine fits its name bound"),
+            SqlName::parse(declaration.schema).expect("built-in schema fits its name bound"),
+            SqlName::parse(declaration.name).expect("built-in routine fits its name bound"),
             declaration.arguments,
         )
     } else {

@@ -9012,11 +9012,15 @@ impl<'a> Parser<'a> {
     fn syntax_error_here(&self) -> ParseError {
         ParseError {
             at: self.peek_at,
-            message: stack_format!(
-                96,
-                "syntax error at or near \"{}\"",
-                &self.text[self.peek_at..self.lexer.token_end()]
-            ),
+            message: if self.peeked == Tok::Eof {
+                StackStr::from_str("syntax error at end of input")
+            } else {
+                stack_format!(
+                    96,
+                    "syntax error at or near \"{}\"",
+                    &self.text[self.peek_at..self.lexer.token_end()]
+                )
+            },
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -12124,6 +12128,29 @@ mod tests {
                         ..
                     }]
                 ));
+            });
+        }
+    }
+
+    #[test]
+    fn ordinary_call_closing_errors_keep_the_unexpected_token() {
+        for (sql, message) in [
+            (
+                "SELECT pg_catalog.json_object('x':1)",
+                "syntax error at or near \":\"",
+            ),
+            (
+                "SELECT \"pg_catalog\".json_object('x':1)",
+                "syntax error at or near \":\"",
+            ),
+            ("SELECT arbitrary(1:2)", "syntax error at or near \":\""),
+            ("SELECT arbitrary(1", "syntax error at end of input"),
+            ("SELECT count(*", "syntax error at end of input"),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(error.message.as_str(), message);
             });
         }
     }

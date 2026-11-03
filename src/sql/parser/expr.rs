@@ -2180,6 +2180,9 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("DISTINCT cannot be used with *"));
             }
             self.advance()?;
+            if self.peeked != Tok::Op(")") {
+                return Err(self.syntax_error_here());
+            }
             self.expect_op(")")?;
             let filter = self.parse_filter()?;
             let over = self.parse_over()?;
@@ -2269,13 +2272,14 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
-        if kind == CallKind::SqlSyntax
-            && ((matches!(
-                name,
-                "coalesce" | "greatest" | "least" | "grouping" | "xmlconcat"
-            ) && args.is_empty())
-                || (name == "nullif" && args.len() != 2)
-                || (name == "json_scalar" && args.len() != 1))
+        if self.peeked != Tok::Op(")")
+            || (kind == CallKind::SqlSyntax
+                && ((matches!(
+                    name,
+                    "coalesce" | "greatest" | "least" | "grouping" | "xmlconcat"
+                ) && args.is_empty())
+                    || (name == "nullif" && args.len() != 2)
+                    || (name == "json_scalar" && args.len() != 1)))
         {
             return Err(self.syntax_error_here());
         }

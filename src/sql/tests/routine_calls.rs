@@ -2608,6 +2608,9 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
             request,
             String::from_utf8_lossy(&output)
         );
+        if request.contains("pg_catalog.json_object('x':1)") {
+            assert!(String::from_utf8_lossy(&output).contains("syntax error at or near \":\""));
+        }
     }
     session.success(
         &mut engine,

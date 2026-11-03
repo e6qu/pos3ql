@@ -1,6 +1,78 @@
 use super::*;
 
 #[test]
+fn reassign_owned_preserves_target_objects_and_foreign_owners_through_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("reassign-target-foreign-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE ROLE reassign_source SUPERUSER; CREATE ROLE reassign_target SUPERUSER; \
+             CREATE FOREIGN DATA WRAPPER reassign_wrapper; \
+             ALTER FOREIGN DATA WRAPPER reassign_wrapper OWNER TO reassign_source; \
+             CREATE SERVER reassign_server FOREIGN DATA WRAPPER reassign_wrapper; \
+             ALTER SERVER reassign_server OWNER TO reassign_source; \
+             CREATE COLLATION reassign_collation (PROVIDER=libc, LOCALE='C'); \
+             ALTER COLLATION reassign_collation OWNER TO reassign_source",
+            true,
+        );
+        let owners = "SELECT pg_get_userbyid(fdwowner) FROM pg_foreign_data_wrapper WHERE fdwname='reassign_wrapper'; \
+                      SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='reassign_server'; \
+                      SELECT pg_get_userbyid(collowner) FROM pg_collation WHERE collname='reassign_collation'";
+        session.success(&mut engine, "BEGIN", true);
+        session.success(
+            &mut engine,
+            "REASSIGN OWNED BY reassign_source TO reassign_source; REASSIGN OWNED BY reassign_source TO reassign_source",
+            true,
+        );
+        assert!(session.transaction.ddl().is_empty());
+        session.success(
+            &mut engine,
+            "REASSIGN OWNED BY reassign_source,reassign_target TO reassign_target",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, owners, true)),
+            ["reassign_target"; 3]
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, owners, true)),
+            ["reassign_source"; 3]
+        );
+        session.success(
+            &mut engine,
+            "REASSIGN OWNED BY reassign_source,reassign_target TO reassign_target",
+            true,
+        );
+        drop((session, engine));
+        let mut reopened_budget = test_engine_budget(&config, 1 << 29);
+        let mut reopened = Engine::new(&config, &mut reopened_budget).unwrap();
+        let mut reopened_session = ConfiguredTransactionSession::new(&config, &mut reopened_budget);
+        assert_eq!(
+            data_rows(&reopened_session.success(&mut reopened, owners, true)),
+            ["reassign_target"; 3]
+        );
+        reopened_session.success(&mut reopened, "BEGIN", true);
+        reopened_session.success(
+            &mut reopened,
+            "REASSIGN OWNED BY reassign_source,reassign_target TO reassign_target",
+            true,
+        );
+        assert!(reopened_session.transaction.ddl().is_empty());
+        reopened_session.success(&mut reopened, "ROLLBACK", true);
+        drop((reopened_session, reopened));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn owner_commands_report_events_without_repeating_catalog_mutations() {
     let config = test_config("owner-noop-event");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -16,7 +88,7 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
          CREATE FUNCTION owner_event_capture() RETURNS event_trigger LANGUAGE plpgsql AS \
          $$BEGIN INSERT INTO owner_event_log SELECT command_tag,object_type,object_identity \
          FROM pg_event_trigger_ddl_commands(); RETURN; END$$; \
-         CREATE EVENT TRIGGER owner_event ON ddl_command_end WHEN TAG IN ('ALTER TABLE','ALTER SERVER') \
+         CREATE EVENT TRIGGER owner_event ON ddl_command_end WHEN TAG IN ('ALTER TABLE','ALTER SERVER','ALTER FOREIGN DATA WRAPPER') \
          EXECUTE FUNCTION owner_event_capture()",
         true,
     );
@@ -48,6 +120,11 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
     ] {
         session.success(&mut engine, statement, true);
     }
+    session.success(
+        &mut engine,
+        "ALTER FOREIGN DATA WRAPPER owner_event_wrapper OWNER TO postgres",
+        true,
+    );
     assert_eq!(
         data_rows(&session.success(
             &mut engine,
@@ -55,13 +132,22 @@ fn owner_commands_report_events_without_repeating_catalog_mutations() {
             true
         )),
         [
-            "ALTER SERVER|foreign server|owner_event_server",
-            "ALTER SERVER|foreign server|owner_event_server",
-            "ALTER SERVER|foreign server|owner_event_server",
+            "ALTER FOREIGN DATA WRAPPER|foreign-data wrapper|owner_event_wrapper",
+            "ALTER SERVER|server|owner_event_server",
+            "ALTER SERVER|server|owner_event_server",
+            "ALTER SERVER|server|owner_event_server",
             "ALTER TABLE|table|public.owner_event_target",
             "ALTER TABLE|table|public.owner_event_target",
             "ALTER TABLE|table|public.owner_event_target",
         ]
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine,
+            "SELECT type,identity FROM pg_identify_object('pg_foreign_data_wrapper'::regclass,(SELECT oid FROM pg_foreign_data_wrapper WHERE fdwname='owner_event_wrapper'),0); \
+             SELECT type,identity FROM pg_identify_object('pg_foreign_server'::regclass,(SELECT oid FROM pg_foreign_server WHERE srvname='owner_event_server'),0); \
+             SELECT classid='pg_foreign_data_wrapper'::regclass FROM pg_get_object_address('foreign-data wrapper',ARRAY['owner_event_wrapper'],ARRAY[]::text[]); \
+             SELECT classid='pg_foreign_server'::regclass FROM pg_get_object_address('server',ARRAY['owner_event_server'],ARRAY[]::text[])", true)),
+        ["foreign-data wrapper|owner_event_wrapper", "server|owner_event_server", "t", "t"]
     );
     session.success(&mut engine, "ROLLBACK", true);
 }
@@ -119,6 +205,14 @@ fn ownership_uses_inherited_privileges_and_accepts_same_owner_commands() {
              REASSIGN OWNED BY owner_group TO owner_group",
             true,
         );
+        session.success(&mut engine, "BEGIN", true);
+        session.success(
+            &mut engine,
+            "REASSIGN OWNED BY owner_group TO owner_group; REASSIGN OWNED BY owner_group TO owner_group",
+            true,
+        );
+        assert!(session.transaction.ddl().is_empty());
+        session.success(&mut engine, "COMMIT", true);
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, "SET ROLE owner_group", true)),
             ["42501"]

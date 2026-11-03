@@ -166,10 +166,12 @@ fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
                 true,
             );
             let query = "SELECT caught_body()";
-            assert!(matches!(
-                reader.execute_status(&mut engine, query, true),
-                ExecutionStatus::Blocked { .. }
-            ));
+            let status = reader.execute_status(&mut engine, query, true);
+            assert!(
+                matches!(status, ExecutionStatus::Blocked { .. }),
+                "{mode:?} {language}: {status:?}: {}",
+                String::from_utf8_lossy(reader.send.readable())
+            );
             schema_editor.success(&mut engine, "DROP DOMAIN caught_checked", true);
             let deadline = reader.transaction.suspended_statement_deadline();
             assert!(deadline.is_some());

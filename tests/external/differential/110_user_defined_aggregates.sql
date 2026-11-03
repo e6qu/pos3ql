@@ -151,3 +151,39 @@ DROP FUNCTION differential_total_inverse(bigint, integer);
 DROP FUNCTION differential_total_final(bigint);
 DROP FUNCTION differential_offset_final(bigint, integer);
 DROP TABLE differential_aggregate_input;
+
+-- Component permission belongs to the aggregate owner, while the SQL body
+-- keeps the caller's identity (PostgreSQL nodeAgg.c component ACL checks).
+CREATE ROLE differential_component_owner;
+CREATE ROLE differential_component_reader;
+GRANT CREATE ON SCHEMA public TO differential_component_owner;
+CREATE FUNCTION differential_component_state(state bigint, value integer)
+RETURNS bigint LANGUAGE SQL AS $$
+  SELECT coalesce(state,0) + CASE WHEN current_user::text='differential_component_reader'
+    THEN value ELSE 100 END
+$$;
+REVOKE EXECUTE ON FUNCTION differential_component_state(bigint,integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION differential_component_state(bigint,integer)
+  TO differential_component_owner;
+SET ROLE differential_component_owner;
+CREATE AGGREGATE differential_component_total(integer) (
+  SFUNC=differential_component_state, STYPE=bigint, INITCOND='10'
+);
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION differential_component_total(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION differential_component_total(integer)
+  TO differential_component_reader;
+SET ROLE differential_component_reader;
+SELECT differential_component_total(value) FROM (VALUES (2),(3)) input(value);
+SELECT differential_component_state(0::bigint,2);
+RESET ROLE;
+REVOKE EXECUTE ON FUNCTION differential_component_state(bigint,integer)
+  FROM differential_component_owner;
+SET ROLE differential_component_reader;
+SELECT differential_component_total(value) FROM (SELECT 2 AS value WHERE FALSE) input;
+RESET ROLE;
+DROP AGGREGATE differential_component_total(integer);
+DROP FUNCTION differential_component_state(bigint,integer);
+REVOKE CREATE ON SCHEMA public FROM differential_component_owner;
+DROP ROLE differential_component_owner;
+DROP ROLE differential_component_reader;

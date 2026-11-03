@@ -18,6 +18,13 @@ Preserve distinct function effects and caught errors through retries; validate
 the original bounded-row, cursor, driver and recovery cases before merging.
 Keep checked values through reparsing and default conversion; use declared
 type identities rather than repeating a conversion that already completed.
+Use PostgreSQL's canonical object labels across DDL events, identification and
+address lookup; retain reference output for same-owner commands as well.
+Exclude the destination role from ownership-reassignment work after permission
+checks; same-owner changes must not loop or consume catalog capacity.
+Preserve implicit-command versus executed-block state and clear failed protocol
+work at the shared error boundary. Aggregate support-call authorization must not
+change the role observed inside its body or permit direct unauthorized calls.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

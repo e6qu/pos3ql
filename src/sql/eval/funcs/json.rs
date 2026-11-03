@@ -85,6 +85,7 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                             &[value],
                             &[cast.source_type_oid],
                             crate::sql::ast::Collation::None,
+                            crate::sql::eval::RoutineCallAccess::Caller,
                             self.arena,
                         )?
                         .ok_or_else(|| {

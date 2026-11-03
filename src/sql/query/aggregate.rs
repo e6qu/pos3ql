@@ -179,7 +179,7 @@ pub(crate) fn fold_aggregates<'a>(
 #[derive(Clone, Copy)]
 pub(crate) struct AggState<'a> {
     kind: AggKind,
-    custom: Option<&'a crate::storage::AggregateRoutine>,
+    custom: Option<(i32, &'a crate::storage::AggregateRoutine)>,
     custom_moving: bool,
     custom_state_initialized: bool,
     custom_transition_strict: bool,
@@ -665,7 +665,7 @@ impl<'a> AggState<'a> {
             }
             return Ok(());
         }
-        let Some(aggregate) = self.custom else {
+        let Some((_, aggregate)) = self.custom else {
             return Ok(());
         };
         let Expr::Call { args, order_by, .. } = node else {
@@ -710,7 +710,7 @@ impl<'a> AggState<'a> {
     }
 
     pub(crate) fn supports_partial(&self) -> bool {
-        self.custom.is_some_and(|aggregate| {
+        self.custom.is_some_and(|(_, aggregate)| {
             matches!(aggregate.kind, crate::storage::AggregateKind::Normal)
                 && aggregate.partial.is_some()
                 && !self.distinct
@@ -724,7 +724,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<(), SqlError> {
-        let aggregate = self.custom.expect("partial aggregate is catalog-defined");
+        let (aggregate_oid, aggregate) = self.custom.expect("partial aggregate is catalog-defined");
         let partial = aggregate
             .partial
             .expect("partial aggregate contract selected");
@@ -744,6 +744,7 @@ impl<'a> AggState<'a> {
                     &[incoming],
                     &[self.custom_state_oid],
                     self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -761,6 +762,7 @@ impl<'a> AggState<'a> {
                         crate::sql::types::oid::INTERNAL,
                     ],
                     self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -794,6 +796,7 @@ impl<'a> AggState<'a> {
                     &[current, incoming],
                     &[self.custom_state_oid, self.custom_state_oid],
                     self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -901,7 +904,10 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
+                self.custom = Some((
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    arena.alloc(aggregate).map_err(|_| arena_full())?,
+                ));
             }
         }
         if self.custom.is_none()
@@ -927,10 +933,25 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
+                self.custom = Some((
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    arena.alloc(aggregate).map_err(|_| arena_full())?,
+                ));
             }
         }
-        if let Some(aggregate) = self.custom {
+        if let Some((aggregate_oid, aggregate)) = self.custom {
+            // PostgreSQL checks component privileges as the aggregate owner
+            // during initialization, even if no input row invokes the function.
+            let access = crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid);
+            super::require_routine_call_access(storage, aggregate.transition_oid, txid, access)?;
+            if let Some(final_function) = aggregate.final_function {
+                super::require_routine_call_access(
+                    storage,
+                    final_function.function_oid,
+                    txid,
+                    access,
+                )?;
+            }
             self.custom_state_oid = storage
                 .routine_type_oid(
                     aggregate.state_type.ctype,
@@ -1197,7 +1218,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
     ) -> Result<bool, SqlError> {
         self.init(node, storage, txid, columns, arena)?;
-        let Some(aggregate) = self.custom else {
+        let Some((_, aggregate)) = self.custom else {
             return Ok(false);
         };
         let Some(moving) = aggregate.moving else {
@@ -1208,6 +1229,14 @@ impl<'a> AggState<'a> {
             || !self.ord_spec.is_empty()
         {
             return Ok(false);
+        }
+        let access = crate::sql::eval::RoutineCallAccess::Aggregate(
+            self.custom.expect("moving aggregate is bound").0,
+        );
+        super::require_routine_call_access(storage, moving.transition_oid, txid, access)?;
+        super::require_routine_call_access(storage, moving.inverse_oid, txid, access)?;
+        if let Some(final_function) = moving.final_function {
+            super::require_routine_call_access(storage, final_function.function_oid, txid, access)?;
         }
         self.custom_moving = true;
         self.best = None;
@@ -1254,7 +1283,7 @@ impl<'a> AggState<'a> {
         {
             return Ok(true);
         }
-        let aggregate = self.custom.expect("moving aggregate is catalog-defined");
+        let (aggregate_oid, aggregate) = self.custom.expect("moving aggregate is catalog-defined");
         let moving = aggregate
             .moving
             .expect("moving aggregate contract selected");
@@ -1284,6 +1313,7 @@ impl<'a> AggState<'a> {
                 &arguments[..1 + args.len()],
                 &argument_type_oids[..1 + args.len()],
                 self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {
@@ -1518,7 +1548,7 @@ impl<'a> AggState<'a> {
         row: &impl ColumnLookup<'a>,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<(), SqlError> {
-        let aggregate = self.custom.expect("custom aggregate selected at init");
+        let (_, aggregate) = self.custom.expect("custom aggregate selected at init");
         let Expr::Call {
             args,
             order_by,
@@ -1597,6 +1627,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<(), SqlError> {
+        let (aggregate_oid, _) = self.custom.expect("aggregate transition is bound");
         if self.custom_transition_strict {
             if values.iter().any(Datum::is_null) {
                 return Ok(());
@@ -1630,6 +1661,7 @@ impl<'a> AggState<'a> {
                 &arguments[..1 + values.len()],
                 &argument_type_oids[..1 + values.len()],
                 self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {
@@ -2657,7 +2689,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<Datum<'a>, SqlError> {
-        let aggregate = self.custom.expect("custom aggregate selected at init");
+        let (aggregate_oid, aggregate) = self.custom.expect("custom aggregate selected at init");
         if self.ord_len > 0 {
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let argument_count = usize::from(self.custom_argument_count);
@@ -2776,6 +2808,7 @@ impl<'a> AggState<'a> {
                 &arguments[..count],
                 &argument_type_oids[..count],
                 self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {

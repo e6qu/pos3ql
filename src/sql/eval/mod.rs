@@ -1263,6 +1263,14 @@ pub enum RoutineCallTarget<'name> {
     },
 }
 
+/// Component privileges belong to the aggregate owner; its function body still
+/// executes with the query caller's identity unless SECURITY DEFINER applies.
+#[derive(Clone, Copy)]
+pub enum RoutineCallAccess {
+    Caller,
+    Aggregate(i32),
+}
+
 pub trait CatalogAccess {
     fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
         Err(sql_err!(
@@ -1666,6 +1674,7 @@ pub trait CatalogAccess {
         _arguments: &[Datum<'a>],
         _argument_type_oids: &[i32],
         _input_collation: super::ast::Collation,
+        _access: RoutineCallAccess,
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)

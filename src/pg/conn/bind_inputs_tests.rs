@@ -121,6 +121,302 @@ fn config(name: &str, mode: crate::config::TransactionMode) -> Config {
     config
 }
 
+fn parse_command(conn: &mut Conn, engine: &mut Engine, sql: &str) {
+    let mut payload = vec![0];
+    payload.extend_from_slice(sql.as_bytes());
+    payload.extend_from_slice(&[0, 0, 0]);
+    assert!(has_message(
+        &message(conn, engine, wire::FMSG_PARSE, &payload, false),
+        wire::MSG_PARSE_COMPLETE
+    ));
+}
+
+fn bind_command(conn: &mut Conn, engine: &mut Engine, sql: &str) {
+    parse_command(conn, engine, sql);
+    assert!(has_message(
+        &message(conn, engine, wire::FMSG_BIND, &[0; 8], false),
+        wire::MSG_BIND_COMPLETE
+    ));
+}
+
+#[test]
+fn prepared_resolution_distinguishes_bind_from_an_executed_pipeline() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = config("bind-prepared-resolution", mode);
+        config.max_prepared_transactions = 1;
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        conn.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE TABLE bind_prepared(id integer PRIMARY KEY, value text); \
+             INSERT INTO bind_prepared VALUES(1,'before')",
+        );
+        for commit in [false, true] {
+            for context in ["first", "pipeline", "explicit"] {
+                query(
+                    &mut conn,
+                    &mut engine,
+                    "UPDATE bind_prepared SET value='before' WHERE id=1",
+                );
+                query(
+                    &mut conn,
+                    &mut engine,
+                    "BEGIN; \
+                     UPDATE bind_prepared SET value='after' WHERE id=1; \
+                     PREPARE TRANSACTION 'bind-held'",
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut conn,
+                        &mut engine,
+                        "SELECT gid FROM pg_prepared_xacts"
+                    )),
+                    "bind-held"
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut conn,
+                        &mut engine,
+                        "SELECT value FROM bind_prepared WHERE id=1"
+                    )),
+                    "before"
+                );
+                match context {
+                    "pipeline" => {
+                        bind_command(&mut conn, &mut engine, "SELECT 1");
+                        assert_eq!(
+                            first_row(&message(
+                                &mut conn,
+                                &mut engine,
+                                wire::FMSG_EXECUTE,
+                                &[0; 5],
+                                false
+                            )),
+                            "1"
+                        );
+                        assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::ImplicitBlock);
+                    }
+                    "explicit" => {
+                        query(&mut conn, &mut engine, "BEGIN");
+                    }
+                    "first" => {}
+                    _ => unreachable!(),
+                }
+                let sql = if commit {
+                    "COMMIT PREPARED 'bind-held'"
+                } else {
+                    "ROLLBACK PREPARED 'bind-held'"
+                };
+                bind_command(&mut conn, &mut engine, sql);
+                if context == "first" {
+                    assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Implicit);
+                    assert!(!conn.txn.snapshot_taken());
+                }
+                let blocked = context != "first";
+                let response =
+                    message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], blocked);
+                if blocked {
+                    assert!(response.windows(5).any(|bytes| bytes == b"25001"));
+                    assert!(matches!(conn.phase, Phase::SkipToSync));
+                    assert!(!conn.guc.seq_session().retains_statement_effects());
+                } else {
+                    assert!(has_message(&response, wire::MSG_COMMAND_COMPLETE));
+                    assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Implicit);
+                }
+                message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+                assert!(matches!(conn.phase, Phase::Ready));
+                if context == "explicit" {
+                    assert_eq!(conn.txn.status_byte(), b'E');
+                    bind_command(&mut conn, &mut engine, "ROLLBACK");
+                    message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+                }
+                assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+                if blocked {
+                    assert_eq!(
+                        first_row(&query(
+                            &mut conn,
+                            &mut engine,
+                            "SELECT gid FROM pg_prepared_xacts"
+                        )),
+                        "bind-held"
+                    );
+                    bind_command(&mut conn, &mut engine, sql);
+                    assert!(!conn.txn.snapshot_taken());
+                    message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+                }
+                assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+                assert_eq!(
+                    first_row(&query(
+                        &mut conn,
+                        &mut engine,
+                        "SELECT count(*) FROM pg_prepared_xacts"
+                    )),
+                    "0"
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut conn,
+                        &mut engine,
+                        "SELECT value FROM bind_prepared WHERE id=1"
+                    )),
+                    if commit { "after" } else { "before" }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extended_parse_errors_abort_implicit_work_and_preserve_explicit_failure() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("parse-error-transaction", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        conn.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE TABLE parse_error_values(value integer)",
+        );
+        for explicit in [false, true] {
+            if explicit {
+                query(&mut conn, &mut engine, "BEGIN");
+            }
+            bind_command(
+                &mut conn,
+                &mut engine,
+                "INSERT INTO parse_error_values VALUES(1)",
+            );
+            message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+            let error = message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_PARSE,
+                b"\0SELECT (\0\0\0",
+                true,
+            );
+            assert!(error.windows(5).any(|bytes| bytes == b"42601"));
+            assert!(!conn.guc.seq_session().retains_statement_effects());
+            assert_eq!(conn.txn.status_byte(), if explicit { b'E' } else { b'I' });
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            if explicit {
+                bind_command(&mut conn, &mut engine, "ROLLBACK");
+                message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            }
+            assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT count(*) FROM parse_error_values"
+                )),
+                "0"
+            );
+        }
+    }
+}
+
+#[test]
+fn binding_transaction_settings_does_not_take_a_data_snapshot() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("bind-transaction-snapshot", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        conn.phase = Phase::Ready;
+        query(&mut conn, &mut engine, "BEGIN");
+        bind_command(
+            &mut conn,
+            &mut engine,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        );
+        assert!(!conn.txn.snapshot_taken());
+        message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert!(!conn.txn.snapshot_taken());
+        parse_command(&mut conn, &mut engine, "SELECT 1");
+        assert!(conn.txn.snapshot_taken());
+        bind_command(
+            &mut conn,
+            &mut engine,
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        );
+        let error = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], true);
+        assert!(error.windows(5).any(|bytes| bytes == b"25001"));
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(conn.txn.status_byte(), b'E');
+        query(&mut conn, &mut engine, "ROLLBACK");
+
+        parse(&mut conn, &mut engine, "SELECT 1", &[]);
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+        query(&mut conn, &mut engine, "BEGIN");
+        assert!(!conn.txn.snapshot_taken());
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("", &[]),
+            false,
+        );
+        assert!(conn.txn.snapshot_taken());
+        message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        bind_command(
+            &mut conn,
+            &mut engine,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        );
+        let error = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], true);
+        assert!(error.windows(5).any(|bytes| bytes == b"25001"));
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        query(&mut conn, &mut engine, "ROLLBACK");
+
+        if mode == crate::config::TransactionMode::Mvcc {
+            let position = engine.replication_identity().1;
+            let snapshot = crate::mem::guard::forbid_alloc(|| {
+                engine.export_replication_snapshot(2, position).unwrap()
+            });
+            query(
+                &mut conn,
+                &mut engine,
+                "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            );
+            bind_command(
+                &mut conn,
+                &mut engine,
+                &format!("SET TRANSACTION SNAPSHOT '{}'", snapshot.as_str()),
+            );
+            assert!(!conn.txn.snapshot_taken());
+            message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert!(conn.txn.snapshot_taken());
+            assert_eq!(conn.txn.snapshot_lsn(), Some(position));
+            query(&mut conn, &mut engine, "ROLLBACK");
+            engine.invalidate_replication_snapshot(2);
+        }
+    }
+}
+
 #[test]
 fn checked_function_planning_happens_at_bind_after_parameter_validation() {
     for mode in [
@@ -394,6 +690,8 @@ fn bind_planner_waits_keep_unpublished_parameters_and_release_them_on_abort() {
             if !cancel {
                 message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
             }
+            assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+            assert!(!conn.guc.seq_session().retains_statement_effects());
             assert_eq!(
                 first_row(&query(
                     &mut observer,

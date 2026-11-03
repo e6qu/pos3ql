@@ -95,6 +95,14 @@ subsequent changes. Demonstrate the complete behavior in CI
 before closing this acceptance item. The original PostgreSQL probe inputs, raw
 results and verified provenance are retained under
 `tests/external/reference/2026-11-03-input-plans/`.
+Focused PostgreSQL 18.6 observations also cover cursor fetch timing, query-error
+order, checked defaults, prepared values and canonical foreign-object labels.
+Keep event reporting, object identification and address lookup consistent with
+the same object kind; an unchanged owner still produces the expected DDL event.
+Reassigning ownership must exclude the destination from the objects still to
+change. Repeated same-owner commands must finish without consuming catalog
+versions; foreign wrappers and servers must preserve ownership through rollback
+and recovery.
 Data-change trigger statements that need checked domain-array input currently
 raise `0A000` before running the constraint; event triggers have an engine-owned
 execution context. Finish a retained trigger continuation that preserves prior
@@ -126,6 +134,13 @@ or typed NULL must not bypass an otherwise invalid conversion. Run real
 SQLAlchemy, Alembic and psycopg2 inspection, migrations,
 streaming and binary-client workflows against both servers; preserve native
 Linux amd64, Linux arm64 and macOS arm64 coverage.
+Keep protocol preparation separate from an executed implicit command block.
+Standalone prepared-transaction resolution must work through JDBC, while
+unsynchronized preceding executions and explicit blocks still reject it. Query
+analysis must pin snapshots at PostgreSQL's boundary; utility preparation must
+permit transaction settings, and protocol errors must preserve correct rollback
+and failed-block recovery. Aggregate support functions use the aggregate owner's
+permission to call them while their bodies retain ordinary invoker identity.
 
 ### Share fixed memory and disk capacity according to demand
 

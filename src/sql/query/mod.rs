@@ -904,6 +904,7 @@ pub(crate) struct PendingRoutineInvocation<'a> {
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
     pub input_collation: super::ast::Collation,
+    pub access: super::eval::RoutineCallAccess,
     pub plan_owner: super::type_input_plans::Owner,
 }
 
@@ -911,6 +912,66 @@ pub(crate) struct PendingRoutineInvocation<'a> {
 pub(crate) enum PendingRoutineTarget<'a> {
     Stored(&'a RoutineCallContract<'a>),
     Intrinsic(i32),
+}
+
+pub(super) fn require_routine_call_access(
+    storage: &Storage,
+    function_oid: i32,
+    txid: u32,
+    access: super::eval::RoutineCallAccess,
+) -> Result<(), SqlError> {
+    let role = match access {
+        super::eval::RoutineCallAccess::Caller => {
+            return storage
+                .routine_slot_by_oid(function_oid, txid)
+                .map_or(Ok(()), |slot| storage.require_routine_execute(slot, txid));
+        }
+        super::eval::RoutineCallAccess::Aggregate(aggregate_oid) => {
+            let slot = storage
+                .routine_slot_by_oid(aggregate_oid, txid)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_FUNCTION, "aggregate no longer exists")
+                })?;
+            let routine = storage.routine_for(slot, txid);
+            let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "bound routine is not an aggregate"
+                ));
+            };
+            if !aggregate.uses_function_oid(function_oid) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "function is not a bound aggregate component"
+                ));
+            }
+            usize::from(routine.ownership.owner_to(txid))
+        }
+    };
+    let Some(slot) = storage.routine_slot_by_oid(function_oid, txid) else {
+        return if super::catalog::builtin_callable_by_oid(function_oid).is_some() {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "aggregate component function no longer exists"
+            ))
+        };
+    };
+    if storage.has_object_privilege(
+        Storage::routine_access_object(slot),
+        role,
+        crate::storage::PrivilegeSet::EXECUTE,
+        txid,
+    ) {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for function {}",
+            storage.routine_for(slot, txid).name
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1254,6 +1315,10 @@ impl<'a> RoutineInvocationState<'a> {
         self.inputs.begin_attempt();
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "deferred calls retain their arguments, arenas, source, collation and privilege authority"
+    )]
     pub(crate) fn resolve<'query>(
         &self,
         routine: &crate::storage::RoutineDef,
@@ -1262,6 +1327,7 @@ impl<'a> RoutineInvocationState<'a> {
         query_arena: &'query Arena,
         source_position: Option<InvocationSite>,
         input_collation: super::ast::Collation,
+        access: super::eval::RoutineCallAccess,
     ) -> Result<Option<Datum<'query>>, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1283,6 +1349,7 @@ impl<'a> RoutineInvocationState<'a> {
             plan_owner: super::type_input_plans::owner()?,
             source_position,
             input_collation,
+            access,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1323,6 +1390,7 @@ impl<'a> RoutineInvocationState<'a> {
             plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
             input_collation: super::ast::Collation::None,
+            access: super::eval::RoutineCallAccess::Caller,
             target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
@@ -1383,6 +1451,7 @@ impl<'a> RoutineInvocationState<'a> {
             plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
             input_collation,
+            access: super::eval::RoutineCallAccess::Caller,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1987,6 +2056,7 @@ pub(crate) fn execute_index_comparison<'a>(
             &storage.routine_for(slot, txid),
             &[left, right],
             super::ast::Collation::None,
+            super::eval::RoutineCallAccess::Caller,
             arena,
         )?
         .ok_or_else(|| {
@@ -2763,6 +2833,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     &routine,
                     &arguments[..routine.argument_count],
                     input_collation,
+                    super::eval::RoutineCallAccess::Caller,
                     arena,
                 )?
                 .unwrap_or(Datum::Null)
@@ -2931,6 +3002,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
             input_collation,
+            super::eval::RoutineCallAccess::Caller,
             arena,
         )?
         .ok_or_else(|| {
@@ -2953,6 +3025,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum<'a>],
         input_collation: super::ast::Collation,
+        access: super::eval::RoutineCallAccess,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
@@ -3008,6 +3081,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     source_position,
                     input_collation,
+                    access,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
@@ -3018,6 +3092,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     source_position,
                     input_collation,
+                    access,
                 );
             }
             return Err(sql_err!(
@@ -3065,6 +3140,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     source_position,
                     input_collation,
+                    access,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
@@ -3075,6 +3151,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arena,
                     source_position,
                     input_collation,
+                    access,
                 );
             }
             return Err(sql_err!(
@@ -4390,6 +4467,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             routine,
             &completed.values[..declared.argument_count],
             completed.input_collation,
+            super::eval::RoutineCallAccess::Caller,
             arena,
         )?
         .ok_or_else(|| {
@@ -4406,8 +4484,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         arguments: &[Datum<'a>],
         argument_type_oids: &[i32],
         input_collation: super::ast::Collation,
+        access: super::eval::RoutineCallAccess,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
+        require_routine_call_access(self.storage, oid, self.txid, access)?;
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
             let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
                 sql_err!(
@@ -4498,7 +4578,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(slot, &routine, arguments, input_collation, arena)
+        self.execute_routine(slot, &routine, arguments, input_collation, access, arena)
     }
 
     fn cast_evaluation(

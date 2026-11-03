@@ -1108,6 +1108,12 @@ fn collect_returning_expression<'a>(
                     failure = Some(error);
                 }
             }
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))
+                    && context.outer_column(qualifier, name) => {}
             Err(error) => failure = Some(error),
         }
     });

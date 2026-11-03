@@ -1764,7 +1764,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
     })
     .unwrap();
     assert_eq!(result, ExtendedExecutionStatus::Complete(true));
-    assert_eq!(session.transaction.mode, TxnMode::Implicit);
+    assert_eq!(session.transaction.mode, TxnMode::ImplicitBlock);
     session.send.clear();
     session.arena.reset();
     let result = crate::mem::guard::forbid_alloc(|| {

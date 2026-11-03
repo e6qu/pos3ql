@@ -183,8 +183,9 @@ def main():
                   "wide statistics samples also change a column type, analyze it and roll back the savepoint.",
                   "Retained-reader pressure is covered by",
                   "ownership/capacity regressions; this single-session matrix does not measure it.", "",
-                  "Session reservation is a full configured connection ceiling; session draws report",
-                  "the direct embedded client's actual buffers. These are local-only debug samples,",
+                  "Populated samples reserve a full configured connection ceiling; session draws report",
+                  "the direct embedded client's actual buffers. Empty samples start no session and",
+                  "report zero session reservation and draw. These are local-only debug samples,",
                   "not a production memory minimum or an object-store throughput qualification.", "",
                   "| Mode | Tables | Workload | Engine reserved MiB | Session drawn MiB | Startup peak MiB | Final peak MiB | Final current MiB | Final getrusage diagnostic MiB |",
                   "|---|---:|---|---:|---:|---:|---:|---:|---:|"]

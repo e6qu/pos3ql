@@ -14692,7 +14692,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
         [
             "access method",
             "cast",
-            "foreign data wrapper",
+            "foreign-data wrapper",
             "language",
             "operator",
             "operator class",
@@ -43497,6 +43497,8 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
          CREATE ROLE aggregate_reader; \
          GRANT CREATE ON SCHEMA public TO aggregate_owner; \
          CREATE SCHEMA aggregate_target; \
+         GRANT CREATE ON SCHEMA aggregate_target TO aggregate_owner; \
+         GRANT USAGE ON SCHEMA aggregate_target TO aggregate_reader; \
          CREATE FUNCTION protected_aggregate_state(state bigint, value integer) \
            RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; \
          REVOKE EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) FROM PUBLIC",
@@ -43569,6 +43571,9 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
         &mut engine,
         &mut budget,
         "RESET ROLE; \
+         CREATE OR REPLACE FUNCTION protected_aggregate_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS \
+           $body$SELECT coalesce(state, 0) + CASE WHEN current_user::text='aggregate_reader' THEN value ELSE 100 END$body$; \
          GRANT EXECUTE ON ROUTINE aggregate_target.moved_total(integer) TO aggregate_reader; \
          SET ROLE aggregate_reader; \
          SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value); \
@@ -43580,10 +43585,35 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
         "{}",
         String::from_utf8_lossy(&granted_call)
     );
+    let support_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE aggregate_reader; SELECT protected_aggregate_state(0::bigint, 2); RESET ROLE",
+    );
+    assert!(
+        String::from_utf8_lossy(&support_denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&support_denied)
+    );
+    let owner_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         ALTER AGGREGATE aggregate_target.moved_total(integer) OWNER TO aggregate_owner; \
+         REVOKE EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) FROM aggregate_owner; \
+         SET ROLE aggregate_reader; \
+         SELECT aggregate_target.moved_total(value) FROM (SELECT 2 AS value WHERE FALSE) input",
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_denied).contains("42501")
+            && String::from_utf8_lossy(&owner_denied).contains("protected_aggregate_state"),
+        "{}",
+        String::from_utf8_lossy(&owner_denied)
+    );
     let restricted = run_with(
         &mut engine,
         &mut budget,
-        "DROP FUNCTION protected_aggregate_state(bigint, integer)",
+        "RESET ROLE; DROP FUNCTION protected_aggregate_state(bigint, integer)",
     );
     assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
     let cascade = run_with(
@@ -62387,6 +62417,9 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
     let mut send = crate::mem::FixedBuf::new(&mut budget, "lock wait send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "lock wait sql", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
+    if let Some(owner) = waiter.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
     let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let sql = "UPDATE row_lock_test SET value = 11 WHERE id = 1";
@@ -62408,7 +62441,9 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             completed_statements: 0,
             output_mark: 0,
             wait: crate::sql::StatementWait::Lock,
-        }
+        },
+        "{}",
+        String::from_utf8_lossy(send.readable())
     );
     assert!(send.is_empty(), "a parked statement emits no wire output");
 

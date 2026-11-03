@@ -928,6 +928,36 @@ pub enum ExtendedExecutionStatus {
     Blocked { wait: StatementWait },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ProtocolStatement {
+    Query,
+    Utility,
+    TransactionExit,
+}
+
+impl ProtocolStatement {
+    pub(crate) fn for_statement(statement: &Stmt<'_>) -> Self {
+        match statement {
+            Stmt::Select(_)
+            | Stmt::SetQuery(_)
+            | Stmt::With { .. }
+            | Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::Merge(_)
+            | Stmt::Call { .. }
+            | Stmt::DeclareCursor { .. }
+            | Stmt::Explain { .. }
+            | Stmt::CreateTableAs { .. } => Self::Query,
+            Stmt::Commit
+            | Stmt::Rollback
+            | Stmt::PrepareTransaction(_)
+            | Stmt::RollbackToSavepoint(_) => Self::TransactionExit,
+            _ => Self::Utility,
+        }
+    }
+}
+
 fn statement_writes(statement: &Stmt<'_>) -> bool {
     match statement {
         Stmt::Explain { options, statement } => {
@@ -10569,7 +10599,7 @@ impl Engine {
             return Ok(());
         }
         let transaction_boundary =
-            txn.mode == TxnMode::Implicit && matches!(finish, CopyFinishMode::ImplicitTransaction);
+            txn.is_implicit() && matches!(finish, CopyFinishMode::ImplicitTransaction);
         let boundary = if transaction_boundary {
             exec::TriggerQueueBoundary::Transaction
         } else {
@@ -10618,7 +10648,7 @@ impl Engine {
             return self.finish_pending_transaction(txn, guc);
         }
         workspace.arena.reset();
-        let boundary = if txn.mode == TxnMode::Implicit {
+        let boundary = if txn.is_implicit() {
             exec::TriggerQueueBoundary::Transaction
         } else {
             exec::TriggerQueueBoundary::Statement
@@ -10634,7 +10664,7 @@ impl Engine {
             workspace.transition_rows,
             boundary,
         )?;
-        if txn.mode == TxnMode::Implicit {
+        if txn.is_implicit() {
             return self.commit_txn(txn, guc);
         }
         Ok(())
@@ -10684,7 +10714,7 @@ impl Engine {
     /// outright; an explicit one is marked failed, as any errored statement
     /// leaves it.
     pub fn copy_abort(&mut self, txn: &mut TxnState, guc: &GucState) {
-        if txn.mode == TxnMode::Implicit {
+        if txn.is_implicit() {
             self.rollback_txn(txn, guc);
         } else {
             txn.failed = true;
@@ -11391,7 +11421,8 @@ impl Engine {
                 }
             }
             emit_parse_warnings(&mut parser, responder)?;
-            let routine_transaction_context = if !txn.is_explicit() && statement_count == 1 {
+            let routine_transaction_context = if !txn.is_transaction_block() && statement_count == 1
+            {
                 exec::PlpgsqlTransactionContext::NonAtomic
             } else {
                 exec::PlpgsqlTransactionContext::Atomic
@@ -11502,7 +11533,7 @@ impl Engine {
                     return Ok(ExecutionStatus::Complete);
                 }
                 if matches!(statement, Stmt::Begin(_))
-                    && txn.mode == TxnMode::Implicit
+                    && txn.is_implicit()
                     && let Err(error) = self.commit_txn_with_triggers(
                         txn,
                         guc,
@@ -11738,7 +11769,7 @@ impl Engine {
             }
             // Implicit transactions commit at end of message — except a COPY
             // FROM in flight, whose statement does not end until CopyDone.
-            if txn.mode == TxnMode::Implicit
+            if txn.is_implicit()
                 && self.pending_copy.is_none()
                 && let Err(e) = self.commit_txn_with_triggers(
                     txn,
@@ -11977,7 +12008,7 @@ impl Engine {
                         // to it, so `now()` and `statement_timestamp()` agree on a lone
                         // statement as they do in PostgreSQL.
                         txn.begin_statement_clock();
-                        let routine_transaction_context = if txn.is_active() {
+                        let routine_transaction_context = if txn.is_transaction_block() {
                             exec::PlpgsqlTransactionContext::Atomic
                         } else {
                             exec::PlpgsqlTransactionContext::NonAtomic
@@ -12114,6 +12145,19 @@ impl Engine {
                                     });
                                 }
                                 txn.compact_completed_constraints();
+                                if top_level_only_command(&statement).is_none()
+                                    && !matches!(
+                                        statement,
+                                        Stmt::Begin(_)
+                                            | Stmt::Commit
+                                            | Stmt::Rollback
+                                            | Stmt::PrepareTransaction(_)
+                                            | Stmt::CommitPrepared(_)
+                                            | Stmt::RollbackPrepared(_)
+                                    )
+                                {
+                                    txn.begin_implicit_block();
+                                }
                                 Ok(ExtendedExecutionStatus::Complete(true))
                             }
                             Err(mut e) => {
@@ -12340,7 +12384,7 @@ impl Engine {
             txn.compact_completed_constraints();
             let response_mark = responder.buffer.mark();
             responder.function_call_response(&value, binary_result)?;
-            if txn.mode == TxnMode::Implicit
+            if txn.is_implicit()
                 && let Err(error) = self.commit_txn_with_triggers(
                     txn,
                     guc,
@@ -12679,15 +12723,43 @@ impl Engine {
         result
     }
 
+    pub(crate) fn begin_extended_parse(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        conn_id: i32,
+        statement: ProtocolStatement,
+    ) -> Result<(), SqlError> {
+        self.bind_query_connection(conn_id);
+        if txn.failed && !matches!(statement, ProtocolStatement::TransactionExit) {
+            return Err(sql_err!(
+                sqlstate::IN_FAILED_SQL_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block"
+            ));
+        }
+        txn.begin_statement_clock();
+        self.ensure_txn(txn, TxnMode::Implicit, guc)?;
+        self.begin_command_snapshot(
+            txn,
+            matches!(statement, ProtocolStatement::Query),
+            false,
+            false,
+            false,
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn begin_extended_bind(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
         conn_id: i32,
         lock_timeout_expired: bool,
+        statement: ProtocolStatement,
+        has_parameters: bool,
     ) -> Result<CommandSnapshot, SqlError> {
         self.bind_query_connection(conn_id);
-        if txn.failed {
+        if txn.failed && !matches!(statement, ProtocolStatement::TransactionExit) {
             return Err(sql_err!(
                 sqlstate::IN_FAILED_SQL_TRANSACTION,
                 "current transaction is aborted, commands ignored until end of transaction block"
@@ -12712,7 +12784,13 @@ impl Engine {
             ));
         }
         query::check_timeout()?;
-        self.begin_command_snapshot(txn, true, true, true, true)
+        self.begin_command_snapshot(
+            txn,
+            has_parameters || matches!(statement, ProtocolStatement::Query),
+            true,
+            true,
+            true,
+        )
     }
 
     #[expect(
@@ -16444,7 +16522,12 @@ impl Engine {
                 "scalar routine resolved to a set-returning function"
             )));
         }
-        if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
+        if let Err(error) = query::require_routine_call_access(
+            &self.storage,
+            crate::storage::routine_oid(routine),
+            txn.txid,
+            pending.access,
+        ) {
             return Ok(Err(error));
         }
         let owner = match self
@@ -22502,6 +22585,7 @@ impl Engine {
             scroll,
             hold,
             binary,
+            datetime::now_micros(),
         )?;
         let at = attempt.index();
         if !cursors.opening_query_bound(at) {

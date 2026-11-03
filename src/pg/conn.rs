@@ -164,6 +164,7 @@ struct Prepared {
     n_params: u16,
     plan: u64,
     planner_ready: bool,
+    kind: crate::sql::ProtocolStatement,
 }
 
 impl Prepared {
@@ -551,6 +552,7 @@ impl Conn {
                 n_params: 0,
                 plan: 0,
                 planner_ready: false,
+                kind: crate::sql::ProtocolStatement::Utility,
             });
         }
         let mut portals = Vec::with_capacity(config.max_portals);
@@ -1968,7 +1970,7 @@ impl Conn {
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
                 let lock_timeout_expired = self.lock_timeout_expired();
-                let result = if self.txn.mode == crate::sql::txn::TxnMode::Implicit {
+                let result = if self.txn.is_implicit() {
                     engine
                         .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
                         .and_then(|()| {
@@ -2048,16 +2050,30 @@ impl Conn {
         if msg_type == wire::FMSG_BIND && !matches!(step, Step::Parked) {
             crate::sql::query::disarm_timeout();
             self.abandon_pending_bind();
-            if self.phase == Phase::SkipToSync {
-                crate::sql::sequence::finish_statement(self.guc.seq_session());
-                if self.txn.is_explicit() {
-                    self.txn.failed = true;
-                } else {
-                    engine.rollback_txn(&mut self.txn, &self.guc);
-                    self.cursors.on_rollback();
-                }
+            self.finish_lock_wait();
+        }
+        if matches!(step, Step::Continue)
+            && self.phase == Phase::SkipToSync
+            && matches!(
+                msg_type,
+                wire::FMSG_PARSE
+                    | wire::FMSG_BIND
+                    | wire::FMSG_DESCRIBE
+                    | wire::FMSG_EXECUTE
+                    | wire::FMSG_CLOSE
+            )
+        {
+            crate::sql::query::disarm_timeout();
+            crate::sql::sequence::finish_statement(self.guc.seq_session());
+            self.sqlprep.clear_request_type_inputs();
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else if self.txn.is_active() && self.txn.staged_commit().is_none() {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+                self.cursors.on_rollback();
             }
             self.finish_lock_wait();
+            engine.finish_backend_statement(&self.txn, self.id);
         }
         step
     }
@@ -2962,7 +2978,7 @@ impl Conn {
         } else {
             self.arena.reset();
         }
-        let n_params = {
+        let (n_params, statement_kind) = {
             let mut parser = match Parser::new(query, &self.arena) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2974,8 +2990,11 @@ impl Conn {
                     );
                 }
             };
-            match parser.next_stmt() {
-                Ok(_first) => {}
+            let statement_kind = match parser.next_stmt() {
+                Ok(first) => first.as_ref().map_or(
+                    crate::sql::ProtocolStatement::Utility,
+                    crate::sql::ProtocolStatement::for_statement,
+                ),
                 Err(e) => {
                     return ext_err(
                         &mut self.send,
@@ -2984,7 +3003,7 @@ impl Conn {
                         e.message.as_str(),
                     );
                 }
-            }
+            };
             match parser.next_stmt() {
                 Ok(None) => {}
                 Ok(Some(_)) => {
@@ -3004,7 +3023,7 @@ impl Conn {
                     );
                 }
             }
-            parser.max_param()
+            (parser.max_param(), statement_kind)
         };
         if n_params as usize > MAX_BIND_PARAMS {
             return ext_err(
@@ -3021,6 +3040,22 @@ impl Conn {
                 &mut self.phase,
                 sqlstate::PROTOCOL_VIOLATION,
                 "Parse message supplies more parameter types than the statement uses",
+            );
+        }
+        if let Err(error) =
+            engine.begin_extended_parse(&mut self.txn, &self.guc, self.id, statement_kind)
+        {
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+                self.cursors.on_rollback();
+            }
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                error.sqlstate,
+                error.message.as_str(),
             );
         }
 
@@ -3172,6 +3207,7 @@ impl Conn {
         entry.n_params = n_params as u16;
         entry.plan = plan;
         entry.planner_ready = false;
+        entry.kind = statement_kind;
         self.sqlprep.clear_request_type_inputs();
         if name.is_empty()
             && let Some(prior) = unnamed
@@ -3306,18 +3342,24 @@ impl Conn {
         }
         let timeout = self.lock_timeout_expired();
         let resumed = self.parked;
-        let mut snapshot =
-            match engine.begin_extended_bind(&mut self.txn, &self.guc, self.id, timeout) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        error.sqlstate,
-                        error.message.as_str(),
-                    );
-                }
-            };
+        let mut snapshot = match engine.begin_extended_bind(
+            &mut self.txn,
+            &self.guc,
+            self.id,
+            timeout,
+            self.prepared[stmt_slot].kind,
+            n_params != 0,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
         if !result_formats.matches_column_count(1) || result_formats.any_binary() {
             // A per-column result-format list needs the query's described
             // shape. Probe that same typed boundary before a portal exists,

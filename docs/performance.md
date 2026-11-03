@@ -371,7 +371,8 @@ Compare the named shared pools at equal settings. Total memory can still rise
 with table identities, catalog/history structures, connection metadata and
 other independent reservations. Peak resident memory measures touched pages;
 it is different from reserved bytes and the 128 MiB virtual query stack.
-Populated measurements include a separately reported session reservation. This
+Populated measurements include a separately reported session reservation. Empty
+samples start no session and report zero session reservation and draw. This
 single-session matrix does not measure retained-reader pressure; ownership,
 exhaustion and cancellation regressions cover that behavior separately. Fresh CI
 artifacts are still required to accept the current shared-metadata integration.

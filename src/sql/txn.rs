@@ -148,6 +148,8 @@ pub enum TxnMode {
     Idle,
     /// Started automatically for a statement/message.
     Implicit,
+    /// An extended Execute completed; later commands share the block until Sync.
+    ImplicitBlock,
     /// BEGIN was issued.
     Explicit,
 }
@@ -1216,6 +1218,20 @@ impl TxnState {
 
     pub fn is_explicit(&self) -> bool {
         self.mode == TxnMode::Explicit
+    }
+
+    pub(crate) fn is_implicit(&self) -> bool {
+        matches!(self.mode, TxnMode::Implicit | TxnMode::ImplicitBlock)
+    }
+
+    pub(crate) fn is_transaction_block(&self) -> bool {
+        matches!(self.mode, TxnMode::Explicit | TxnMode::ImplicitBlock)
+    }
+
+    pub(crate) fn begin_implicit_block(&mut self) {
+        if self.mode == TxnMode::Implicit {
+            self.mode = TxnMode::ImplicitBlock;
+        }
     }
 
     pub(crate) fn begin_concurrent_partition_detach(&mut self) {

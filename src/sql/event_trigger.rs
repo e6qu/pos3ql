@@ -1984,9 +1984,9 @@ fn primary_object(
                 .foreign_server_by_slot(slot, txid)
                 .ok_or_else(graph_full)?;
             base_object(
-                1417,
+                catalog::PG_FOREIGN_SERVER_OID,
                 storage.foreign_server_entry(slot).oid(),
-                "foreign server",
+                "server",
                 None,
                 Some(server.name.as_str()),
                 StackStr::from_str(identifier(server.name.as_str()).as_str()),
@@ -1998,9 +1998,9 @@ fn primary_object(
                 .foreign_wrapper_by_slot(slot, txid)
                 .ok_or_else(graph_full)?;
             base_object(
-                2328,
+                catalog::PG_FOREIGN_DATA_WRAPPER_OID,
                 storage.foreign_wrapper_entry(slot).oid(),
-                "foreign data wrapper",
+                "foreign-data wrapper",
                 None,
                 Some(wrapper.name.as_str()),
                 StackStr::from_str(identifier(wrapper.name.as_str()).as_str()),
@@ -2129,6 +2129,8 @@ pub(crate) fn catalog_object_address(
             | "policy"
             | "publication"
             | "subscription"
+            | "server"
+            | "foreign-data wrapper"
             | "extension"
             | "large object"
             | "role"
@@ -2308,6 +2310,12 @@ pub(crate) fn catalog_object_address(
     }
     for (slot, _) in storage.extensions_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::Extension(slot)));
+    }
+    for (slot, _) in storage.foreign_servers(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::ForeignServer(slot)));
+    }
+    for (slot, _) in storage.foreign_wrappers(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(slot)));
     }
     for (slot, _) in storage.large_objects_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::LargeObject(slot)));
@@ -2744,6 +2752,20 @@ fn existing_catalog_object(
                 .find_map(|(slot, extension)| (extension.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
+        catalog::PG_FOREIGN_SERVER_OID => EventObjectRef::Primary(ObjectRef::ForeignServer(
+            storage
+                .foreign_servers(txid)
+                .find_map(|(slot, entry)| (entry.oid() == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_FOREIGN_DATA_WRAPPER_OID => {
+            EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
+                storage
+                    .foreign_wrappers(txid)
+                    .find_map(|(slot, entry)| (entry.oid() == object_id).then_some(slot))
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+            ))
+        }
         catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(
             storage
                 .large_objects_visible_to(txid)
@@ -2816,6 +2838,8 @@ pub(crate) fn catalog_object(
                 catalog::PG_POLICY_OID => "policy",
                 catalog::PG_PUBLICATION_OID => "publication",
                 catalog::PG_SUBSCRIPTION_OID => "subscription",
+                catalog::PG_FOREIGN_SERVER_OID => "server",
+                catalog::PG_FOREIGN_DATA_WRAPPER_OID => "foreign-data wrapper",
                 catalog::PG_EXTENSION_OID => "extension",
                 catalog::PG_LARGEOBJECT_OID => "large object",
                 1260 => "role",

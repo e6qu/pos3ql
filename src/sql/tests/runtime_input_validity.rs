@@ -366,6 +366,8 @@ fn dependency_columns_keep_inner_sql_precedence_and_resolve_outer_locals() {
         for source in [
             "SELECT id,label FROM input_rows WHERE keep LIMIT max_rows",
             "UPDATE input_rows SET id=id+max_rows WHERE keep RETURNING label",
+            "DELETE FROM input_rows WHERE id=max_rows AND keep RETURNING id,label",
+            "INSERT INTO input_rows VALUES(max_rows) RETURNING id,label",
         ] {
             let statement = parser::parse_stored_statement(source, &arena).unwrap();
             let mut dependencies = engine
@@ -380,7 +382,7 @@ fn dependency_columns_keep_inner_sql_precedence_and_resolve_outer_locals() {
                 &arena,
                 Some(&Locals),
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
             let table = dependencies
                 .entries()
                 .iter()

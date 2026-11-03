@@ -128,6 +128,14 @@ its slot. Planning can inspect already decoded parameters to skip a branch
 such as `CASE WHEN $1=0 THEN checked_function() ELSE 17 END`, without running
 the skipped function's constraints.
 
+Protocol preparation distinguishes starting a command from executing a block of
+commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
+without making it an explicit transaction. An earlier execution before `Sync`,
+or an explicit `BEGIN`, still prevents that command with `25001`. Query analysis
+pins the data snapshot; preparing a transaction-setting utility does not. Errors
+roll back implicit work, while an explicit failed block remains failed until a
+transaction-exit command such as `ROLLBACK`.
+
 `DISCARD PLANS` makes future query admissions prepare again. Running calls and
 bound portals or cursors retain their checked images; a compiled PL/pgSQL
 function keeps its identity while its SQL statements can get new plans.

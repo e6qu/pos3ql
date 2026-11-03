@@ -10021,6 +10021,19 @@ pub fn reassign_owned(
         ));
     }
 
+    // A rewritten object must leave the source set. Besides avoiding needless
+    // catalog versions, this makes each catalog's find-and-rewrite loop finish.
+    let source_count = {
+        let mut count = 0;
+        for index in 0..source_count {
+            let role = source_roles[index];
+            if usize::from(role) != target {
+                source_roles[count] = role;
+                count += 1;
+            }
+        }
+        count
+    };
     let classes = [
         AccessClass::Table,
         AccessClass::View,
@@ -10036,6 +10049,8 @@ pub fn reassign_owned(
         AccessClass::Tablespace,
         AccessClass::Extension,
         AccessClass::EventTrigger,
+        AccessClass::ForeignDataWrapper,
+        AccessClass::ForeignServer,
     ];
     let mut changes = 0usize;
     for class in classes {

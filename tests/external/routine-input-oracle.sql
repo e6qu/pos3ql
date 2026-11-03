@@ -76,7 +76,25 @@ SELECT 'noop schema owner', last_value FROM checks;
 CREATE INDEX anchor_id_idx ON anchor(id);
 SELECT opaque();
 SELECT 'selected index create', last_value FROM checks;
-DROP INDEX anchor_id_idx;
+ALTER INDEX anchor_id_idx RENAME TO anchor_id_renamed;
+SELECT opaque();
+SELECT 'selected index rename', last_value FROM checks;
+ALTER INDEX anchor_id_renamed SET (fillfactor=80);
+SELECT opaque();
+SELECT 'selected index storage options', last_value FROM checks;
+ALTER TABLE anchor OWNER TO postgres;
+SELECT opaque();
+SELECT 'selected table noop owner', last_value FROM checks;
+ANALYZE anchor;
+SELECT opaque();
+SELECT 'selected table analyze', last_value FROM checks;
+TRUNCATE anchor;
+SELECT opaque();
+SELECT 'selected table truncate empty', last_value FROM checks;
+INSERT INTO anchor(id) VALUES (1);
+SELECT opaque();
+SELECT 'selected table insert after truncate', last_value FROM checks;
+DROP INDEX anchor_id_renamed;
 SELECT opaque();
 SELECT 'selected index drop', last_value FROM checks;
 CREATE INDEX unrelated_id_idx ON unrelated(id);
@@ -226,3 +244,24 @@ SELECT 'prepare creator after data-only prepare', last_value FROM checks;
 ROLLBACK PREPARED 'oracle-plan-data';
 SELECT opaque();
 SELECT 'prepare creator after data-only rollback prepared', last_value FROM checks;
+
+CREATE SEQUENCE reentrant_checks;
+CREATE TYPE reentrant_choice AS ENUM('a');
+CREATE FUNCTION reentrant_allowed(value reentrant_choice) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM nextval('validity_probe.reentrant_checks');
+  CREATE SCHEMA IF NOT EXISTS reentrant_created;
+  RETURN true;
+END $$;
+CREATE DOMAIN reentrant_checked AS reentrant_choice
+  CHECK(validity_probe.reentrant_allowed(VALUE));
+SET check_function_bodies=off;
+CREATE FUNCTION reentrant_body() RETURNS validity_probe.reentrant_checked[]
+  LANGUAGE sql SET search_path=validity_probe,public AS
+  $$ SELECT '{a}'::reentrant_checked[] $$;
+SET check_function_bodies=on;
+SELECT reentrant_body(),reentrant_body();
+SELECT 'reentrant checked namespace first pair',last_value FROM reentrant_checks;
+DROP SCHEMA reentrant_created;
+SELECT reentrant_body(),reentrant_body();
+SELECT 'reentrant checked namespace second pair',last_value FROM reentrant_checks;

@@ -73,6 +73,8 @@ parameterized planning must use the supplied values when pruning branches.
 already bound portal or cursor. Verify cache changes across
 schema edits, commit, rollback, search paths and roles against PostgreSQL;
 unrelated table changes must not repeat a constraint.
+Verify procedural specialization, nested argument substitution and selected
+index, policy, rule and privilege changes with actual PostgreSQL results.
 Keep completed inputs while rolling back and safely replaying the unfinished
 input within its original deadline. Demonstrate the complete behavior in CI
 before closing this acceptance item.

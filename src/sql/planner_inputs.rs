@@ -20,7 +20,15 @@ use super::{
 #[derive(Clone, Copy)]
 struct Parameters {
     values: *const (),
+    known: *const bool,
     count: usize,
+    source: ParameterSource,
+}
+
+#[derive(Clone, Copy)]
+enum ParameterSource {
+    Bound,
+    Inline { depth: usize },
 }
 
 std::thread_local! {
@@ -46,7 +54,9 @@ pub(crate) fn with_parameters<R>(
 ) -> R {
     let current = parameters.map(|values| Parameters {
         values: values.as_ptr().cast(),
+        known: core::ptr::null(),
         count: values.len(),
+        source: ParameterSource::Bound,
     });
     let _scope = ParameterScope {
         prior: PARAMETERS.with(|slot| slot.replace(current)),
@@ -55,16 +65,56 @@ pub(crate) fn with_parameters<R>(
     run()
 }
 
+fn with_inline_parameters<R>(
+    values: &[super::types::Datum<'_>],
+    known: &[bool],
+    run: impl FnOnce() -> R,
+) -> R {
+    assert_eq!(values.len(), known.len());
+    let current = Parameters {
+        values: values.as_ptr().cast(),
+        known: known.as_ptr(),
+        count: values.len(),
+        source: ParameterSource::Inline {
+            depth: super::exec::routine_parameter_depth(),
+        },
+    };
+    let _scope = ParameterScope {
+        prior: PARAMETERS.with(|slot| slot.replace(Some(current))),
+        thread: core::marker::PhantomData,
+    };
+    run()
+}
+
+fn parameter_known(index: u32) -> bool {
+    let Some(index) = index.checked_sub(1).map(|index| index as usize) else {
+        return false;
+    };
+    inspect_parameters(|values| {
+        if !values.is_some_and(|values| index < values.len()) {
+            return false;
+        }
+        let current = PARAMETERS
+            .with(core::cell::Cell::get)
+            .expect("visible parameter scope exists");
+        // SAFETY: with_inline_parameters installs one initialized mask entry
+        // per value and keeps both borrowed slices live through inspection.
+        current.known.is_null() || unsafe { *current.known.add(index) }
+    })
+}
+
 /// Only copied facts may leave inspection; borrowed text/array values cannot.
 fn inspect_parameters<R>(
     inspect: impl for<'parameters> FnOnce(Option<&'parameters [super::types::Datum<'parameters>]>) -> R,
 ) -> R {
-    // The declaration context already has a scoped guard; it prevents a
-    // routine's $1 from reading the client's unrelated first parameter.
-    if !super::exec::bound_parameter_context_active() {
-        return inspect(None);
-    }
     let current = PARAMETERS.with(core::cell::Cell::get);
+    let current = current.filter(|current| match current.source {
+        ParameterSource::Bound => super::exec::bound_parameter_context_active(),
+        ParameterSource::Inline { depth } => {
+            !super::exec::bound_parameter_context_active()
+                && depth == super::exec::routine_parameter_depth()
+        }
+    });
     let values = current.map(|current| {
         // SAFETY: with_parameters keeps the immutable slice and its values live
         // until its private scope restores the previous pointer. Inspection is
@@ -128,8 +178,8 @@ pub(crate) fn capture_planner_inputs<'a, 'source>(
         outer,
         &mut |expression, columns, assignment| {
             let candidate = match assignment {
-                Some((target, site)) => {
-                    capture_assignment(expression, columns, target, site, storage, txid, arena)?
+                Some(assignment) => {
+                    capture_assignment(expression, columns, assignment, storage, txid, arena)?
                 }
                 None => capture(expression, columns, storage, txid, arena)?,
             };
@@ -293,10 +343,11 @@ fn capture<'a>(
                         element.element_oid(),
                         storage,
                         txid,
+                        arena,
                     )?)
                     .map_err(|_| super::eval::arena_full())?;
             }
-            inline::array_argument_facts(converted.as_slice(), target)
+            inline::array_argument_facts(converted.as_slice(), target, element, arena)?
         } else {
             if elements.len() != 1 {
                 return Err(missing_contract());
@@ -304,7 +355,9 @@ fn capture<'a>(
             elements.as_slice()[0]
         };
         normalized
-            .push(inline::convert_argument(fact, target, storage, txid)?)
+            .push(inline::convert_argument(
+                fact, target, storage, txid, arena,
+            )?)
             .map_err(|_| super::eval::arena_full())?;
     }
     if routine.attributes.strict
@@ -328,12 +381,12 @@ fn capture<'a>(
 fn capture_assignment<'a>(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
-    target: i32,
-    site: super::type_inputs::AssignmentSite,
+    assignment: (i32, i32, super::type_inputs::AssignmentSite),
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<Candidate<'a>>, SqlError> {
+    let (target, type_mod, site) = assignment;
     let source = infer_routine_argument_oid(expression, columns)?;
     if source == target || source == super::types::oid::UNKNOWN {
         return Ok(None);
@@ -378,12 +431,20 @@ fn capture_assignment<'a>(
         .map_err(|_| super::eval::arena_full())?;
     if routine.argument_count >= 2 {
         arguments
-            .push(inline::literal_argument(super::types::oid::INT4))
+            .push(inline::literal_argument(
+                super::types::Datum::Int4(type_mod),
+                super::types::oid::INT4,
+                arena,
+            )?)
             .map_err(|_| super::eval::arena_full())?;
     }
     if routine.argument_count == 3 {
         arguments
-            .push(inline::literal_argument(super::types::oid::BOOL))
+            .push(inline::literal_argument(
+                super::types::Datum::Bool(false),
+                super::types::oid::BOOL,
+                arena,
+            )?)
             .map_err(|_| super::eval::arena_full())?;
     }
     Candidate::detach(
@@ -799,6 +860,30 @@ impl Engine {
                 Ok(parameters) => parameters,
                 Err(error) => return Ok(Err(error)),
             };
+            let values = match arena
+                .alloc_slice_with(candidate.arguments.len(), |_| super::types::Datum::Null)
+            {
+                Ok(values) => values,
+                Err(_) => return Ok(Err(super::eval::arena_full())),
+            };
+            let known = match arena.alloc_slice_with(candidate.arguments.len(), |_| false) {
+                Ok(known) => known,
+                Err(_) => return Ok(Err(super::eval::arena_full())),
+            };
+            for ((value, known), argument) in values
+                .iter_mut()
+                .zip(known.iter_mut())
+                .zip(candidate.arguments)
+            {
+                match argument.constant(arena) {
+                    Ok(Some(constant)) => {
+                        *value = constant;
+                        *known = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
             let ancestry = match arena.alloc_slice_with(ancestors.len() + 1, |at| {
                 if at < ancestors.len() {
                     ancestors[at]
@@ -809,16 +894,19 @@ impl Engine {
                 Ok(value) => value,
                 Err(_) => return Ok(Err(super::eval::arena_full())),
             };
-            for statement in statements {
-                let result = type_input_plans::with_owner(prepared.owner, || {
-                    self.prepare_planner_inputs_under(
-                        statement, None, arena, txn, sqlprep, cursors, guc, responder, ancestry,
-                    )
-                })?;
-                if result.is_err() {
-                    return Ok(result);
+            return with_inline_parameters(values, known, || {
+                for statement in statements {
+                    let result = type_input_plans::with_owner(prepared.owner, || {
+                        self.prepare_planner_inputs_under(
+                            statement, None, arena, txn, sqlprep, cursors, guc, responder, ancestry,
+                        )
+                    })?;
+                    if result.is_err() {
+                        return Ok(result);
+                    }
                 }
-            }
+                Ok(Ok(()))
+            });
         }
         Ok(Ok(()))
     }
@@ -858,6 +946,23 @@ mod parameter_tests {
                     assert!(inspect_parameters(|values| matches!(values, Some([]))))
                 });
                 let formal = super::super::exec::enter_routine_parameter_types(&[], None).unwrap();
+                assert!(inspect_parameters(|values| values.is_none()));
+                let values = [Datum::Null, Datum::Null, Datum::Int4(9)];
+                with_inline_parameters(&values, &[false, true, true], || {
+                    assert!(!parameter_known(1));
+                    assert!(parameter_known(2));
+                    assert!(parameter_known(3));
+                    let nested =
+                        super::super::exec::enter_routine_parameter_types(&[], None).unwrap();
+                    assert!(inspect_parameters(|values| values.is_none()));
+                    assert!(!parameter_known(3));
+                    drop(nested);
+                    assert!(parameter_known(3));
+                    assert!(inspect_parameters(|values| matches!(
+                        values,
+                        Some([Datum::Null, Datum::Null, Datum::Int4(9)])
+                    )));
+                });
                 assert!(inspect_parameters(|values| values.is_none()));
                 drop(formal);
                 assert!(inspect_parameters(|values| matches!(

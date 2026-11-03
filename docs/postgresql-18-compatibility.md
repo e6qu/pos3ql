@@ -146,6 +146,12 @@ when first reached and reuse the backend's plan; dynamic `EXECUTE` prepares
 each command afresh. Views, rules, SQL `BEGIN ATOMIC` bodies and stored defaults
 retain their checked inputs with the definition, including domain and
 view-column defaults. See [plan lifetimes](architecture.md#the-request-path).
+PL/pgSQL routines keep separate instances for resolved input types and input
+collation. For example, calling a polymorphic routine with an integer and then
+text prepares its reached statements separately. Repeating the integer call
+reuses that instance. Each used instance consumes one `routine_input_slots`
+control record and an actual-length key in the shared metadata pool; reached
+statement plans use the same fixed controls.
 `DISCARD PLANS` releases cached routine-input plans for future requests; existing
 portals and cursors keep their checked values. `DISCARD ALL` also clears
 prepared statements. Attempting either while a routine-input plan is executing

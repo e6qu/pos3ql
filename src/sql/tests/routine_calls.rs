@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn plpgsql_input_plans_specialize_collation_and_polymorphism_without_eager_checks() {
+    // PG18.6 run41661367458, oracle SQL SHA256:
+    // 3df4b20befdb50122161465bd83cc7a870e63ccc78bd6b9cb8e8c0bafc444e38.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("plpgsql-input-instances-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE specialization_checks; CREATE TYPE specialization_choice AS ENUM('a'); \
+             CREATE DOMAIN specialization_checked AS specialization_choice CHECK(nextval('specialization_checks')>0); \
+             CREATE FUNCTION pl_collated(input text DEFAULT ('a' COLLATE \"C\")) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::specialization_checked[]; END$$; \
+             CREATE FUNCTION pl_polymorphic(input anyelement) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::specialization_checked[]; END$$; \
+             CREATE FUNCTION pl_unreached(input anyelement,choose boolean) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN IF choose THEN RETURN '{a}'::specialization_checked[]; END IF; RETURN NULL; END$$", true);
+        for (query, expected) in [
+            ("SELECT pl_collated()", "1"),
+            ("SELECT pl_collated('a' COLLATE \"C\")", "2"),
+            ("SELECT pl_collated('a' COLLATE \"POSIX\")", "3"),
+            ("SELECT pl_collated()", "3"),
+            ("SELECT pl_polymorphic(1)", "4"),
+            ("SELECT pl_polymorphic(2)", "4"),
+            ("SELECT pl_polymorphic('a'::text)", "5"),
+            ("SELECT pl_polymorphic(3)", "5"),
+            ("SELECT pl_unreached(1,false)", "5"),
+            ("SELECT pl_unreached('a'::text,false)", "5"),
+            ("SELECT pl_unreached(1,true)", "6"),
+            ("SELECT pl_unreached('a'::text,true)", "7"),
+            ("SELECT pl_unreached(2,true)", "7"),
+        ] {
+            session.success(&mut engine, query, true);
+            let output = session.success(
+                &mut engine,
+                "SELECT last_value FROM specialization_checks",
+                true,
+            );
+            assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
+        }
+    }
+}
+
+#[test]
 fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() {
     // PostgreSQL REL_18_6 funccache.c:268-300 keys by input collation and
     // declared argument OIDs, resolving only polymorphic/RECORD declarations.

@@ -4566,10 +4566,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(|meta| meta.map(|meta| meta.type_oid))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "operator keeps selected and per-argument collations"
-    )]
     fn call_operator<'a>(
         &self,
         name: &str,

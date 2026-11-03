@@ -15,7 +15,7 @@ type Visit<'a> = dyn FnMut(&Expr<'_>, i32, i32, InputKind) -> Result<(), SqlErro
 type PlannerVisit<'a> = dyn FnMut(
         &Expr<'_>,
         &dyn ColTypeResolver,
-        Option<(i32, crate::sql::type_inputs::AssignmentSite)>,
+        Option<(i32, i32, crate::sql::type_inputs::AssignmentSite)>,
     ) -> Result<(), SqlError>
     + 'a;
 
@@ -902,14 +902,14 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                         arena,
                     };
                     for (index, column) in output.columns().iter().enumerate() {
-                        if let Some((target, _, Some(site))) = targets.get(index) {
+                        if let Some((target, type_mod, Some(site))) = targets.get(index) {
                             planner(
                                 &Expr::Column {
                                     qualifier: None,
                                     name: column.name.as_str(),
                                 },
                                 &columns,
-                                Some((*target, *site)),
+                                Some((*target, *type_mod, *site)),
                             )?;
                         }
                     }
@@ -969,11 +969,11 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 }
                 self.expression(expression, &columns, &row)?;
                 if matches!(item, SelectItem::Expr { .. })
-                    && let Some((target, _, Some(site))) =
+                    && let Some((target, type_mod, Some(site))) =
                         targets.and_then(|targets| targets.get(output_index))
                     && let Some(planner) = &mut self.planner
                 {
-                    planner(expression, &columns, Some((*target, *site)))?;
+                    planner(expression, &columns, Some((*target, *type_mod, *site)))?;
                 }
             }
             if targets.is_some() {
@@ -1009,10 +1009,14 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                                     },
                                     name: scope.output_name(entry),
                                 };
-                                if let Some((target, _, Some(site))) =
+                                if let Some((target, type_mod, Some(site))) =
                                     targets.and_then(|targets| targets.get(output_index + index))
                                 {
-                                    planner(&expression, &columns, Some((*target, *site)))?;
+                                    planner(
+                                        &expression,
+                                        &columns,
+                                        Some((*target, *type_mod, *site)),
+                                    )?;
                                 }
                             }
                         }
@@ -1027,7 +1031,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                             |name, _| {
                                 if result.is_ok()
                                     && let Some(planner) = &mut self.planner
-                                    && let Some((target, _, Some(site))) =
+                                    && let Some((target, type_mod, Some(site))) =
                                         targets.and_then(|targets| targets.get(index))
                                 {
                                     result = planner(
@@ -1036,7 +1040,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                                             field: name,
                                         },
                                         &columns,
-                                        Some((*target, *site)),
+                                        Some((*target, *type_mod, *site)),
                                     );
                                 }
                                 index += 1;
@@ -1296,7 +1300,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                         planner(
                             assignment.expression,
                             assignment_columns,
-                            Some((target, site)),
+                            Some((target, column.type_mod, site)),
                         )?;
                     }
                 }

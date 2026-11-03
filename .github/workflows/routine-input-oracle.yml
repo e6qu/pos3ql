@@ -8,6 +8,7 @@ on:
       - 'tests/external/routine-input-oracle.py'
       - 'tests/external/differential/205_planner_checked_inputs.sql'
       - 'tests/external/differential/206_runtime_input_collations.sql'
+      - 'tests/external/differential/207_plpgsql_input_instances.sql'
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ jobs:
         image: mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_INITDB_ARGS: '--lc-collate=C --lc-ctype=C --encoding=UTF8'
+          POSTGRES_INITDB_ARGS: '--lc-collate=C --lc-ctype=C --encoding=UTF8 --set=max_prepared_transactions=4'
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
@@ -42,7 +43,7 @@ jobs:
           docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
             < tests/external/routine-input-oracle.sql 2>&1 | tee oracle-evidence/postgres.log
           python3 tests/external/routine-input-oracle.py "$POSTGRES_CONTAINER" oracle-evidence/sessions.jsonl
-          for fixture in tests/external/differential/205_planner_checked_inputs.sql tests/external/differential/206_runtime_input_collations.sql; do
+          for fixture in tests/external/differential/205_planner_checked_inputs.sql tests/external/differential/206_runtime_input_collations.sql tests/external/differential/207_plpgsql_input_instances.sql; do
             sha256sum "$fixture" >> oracle-evidence/inputs.sha256
             docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
               < "$fixture" 2>&1 | tee "oracle-evidence/$(basename "$fixture").log"

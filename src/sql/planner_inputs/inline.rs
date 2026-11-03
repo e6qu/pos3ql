@@ -125,12 +125,10 @@ fn builtin_constant(
     storage: &Storage,
     txid: u32,
 ) -> Result<bool, SqlError> {
+    if let Some(index) = parameter_index(expression, columns) {
+        return Ok(super::parameter_known(index));
+    }
     let safe = match expression {
-        Expr::Param(index) => super::inspect_parameters(|parameters| {
-            index.checked_sub(1).is_some_and(|index| {
-                parameters.is_some_and(|parameters| (index as usize) < parameters.len())
-            })
-        }),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)
@@ -223,6 +221,19 @@ fn builtin_constant(
     Ok(children_safe)
 }
 
+fn parameter_index(expression: &Expr<'_>, columns: &dyn ColTypeResolver) -> Option<u32> {
+    match expression {
+        Expr::Param(index) => Some(*index),
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+            source: ast::ParameterSource::SqlRoutine,
+        } if columns.resolve(*qualifier, name).is_err() => Some(*index),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Properties {
     volatility: u8,
@@ -278,7 +289,93 @@ impl Properties {
 pub(crate) struct ArgumentFacts {
     pub type_oid: i32,
     pub known_null: bool,
+    constant: Option<crate::mem::arena::ArenaSliceHandle<u8>>,
     properties: Properties,
+}
+
+impl ArgumentFacts {
+    pub(super) fn constant<'a>(
+        self,
+        arena: &'a Arena,
+    ) -> Result<Option<crate::sql::types::Datum<'a>>, SqlError> {
+        let Some(handle) = self.constant else {
+            return Ok(None);
+        };
+        let bytes = {
+            let retained = arena.retained_slice_mut(handle).map_err(|_| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "planner constant value no longer belongs to this workspace"
+                )
+            })?;
+            arena
+                .alloc_slice_copy(&retained)
+                .map_err(|_| crate::sql::eval::arena_full())?
+        };
+        let mut value = [crate::sql::types::Datum::Null];
+        if crate::sql::exec::decode_projected_row_into(bytes, arena, &mut value)? != 1 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "planner constant row has invalid width"
+            ));
+        }
+        Ok(Some(value[0]))
+    }
+}
+
+fn retain_constant(
+    value: crate::sql::types::Datum<'_>,
+    arena: &Arena,
+) -> Result<crate::mem::arena::ArenaSliceHandle<u8>, SqlError> {
+    let mark = arena.mark();
+    let retained = crate::sql::exec::encode_projected_pub(&[value], arena).and_then(|row| {
+        arena
+            .retain_slice_with(row.len(), |index| row[index])
+            .map_err(|_| crate::sql::eval::arena_full())
+    });
+    unsafe { arena.rewind_to(mark) };
+    retained
+}
+
+fn capture_constant(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<crate::mem::arena::ArenaSliceHandle<u8>>, SqlError> {
+    if !builtin_constant(expression, columns, storage, txid)? {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    let captured = arena
+        .with_remaining_bytes(|scratch| {
+            let catalog = crate::sql::query::storage_catalog(storage, scratch, txid);
+            let hooks = crate::sql::eval::EvalHooks {
+                catalog: Some(&catalog),
+                ..crate::sql::eval::NO_HOOKS
+            };
+            super::inspect_parameters(|parameters| {
+                let value = crate::sql::eval::eval_full(
+                    expression,
+                    scratch,
+                    parameters.unwrap_or(crate::sql::eval::NO_PARAMS),
+                    &crate::sql::eval::NoColumns,
+                    &hooks,
+                )?;
+                crate::sql::exec::encode_projected_pub(&[value], scratch)
+            })
+        })
+        .map_err(|_| crate::sql::eval::arena_full())
+        .and_then(|value| value)
+        .and_then(|row| {
+            arena
+                .retain_slice_with(row.len(), |index| row[index])
+                .map_err(|_| crate::sql::eval::arena_full())
+        });
+    // The checked handle owns tail bytes; no expression or schema scratch escapes.
+    unsafe { arena.rewind_to(mark) };
+    captured.map(Some)
 }
 
 pub(crate) fn declaration(
@@ -307,6 +404,7 @@ pub(crate) fn argument_facts<'a>(
         .alloc_slice_with(arguments.len(), |_| ArgumentFacts {
             type_oid: oid::UNKNOWN,
             known_null: false,
+            constant: None,
             properties: Properties::UNKNOWN,
         })
         .map_err(|_| crate::sql::eval::arena_full())?;
@@ -314,21 +412,30 @@ pub(crate) fn argument_facts<'a>(
         *output = ArgumentFacts {
             type_oid: infer_routine_argument_oid(argument, columns)?,
             known_null: known_null(argument, columns, storage, txid, arena, 0)?,
+            constant: capture_constant(argument, columns, storage, txid, arena)?,
             properties: expression_properties(argument, columns, storage, txid, arena, 0)?,
         };
     }
     Ok(facts)
 }
 
-pub(crate) fn literal_argument(type_oid: i32) -> ArgumentFacts {
-    ArgumentFacts {
+pub(crate) fn literal_argument(
+    value: crate::sql::types::Datum<'_>,
+    type_oid: i32,
+    arena: &Arena,
+) -> Result<ArgumentFacts, SqlError> {
+    Ok(ArgumentFacts {
         type_oid,
-        known_null: false,
+        known_null: value.is_null(),
+        constant: Some(retain_constant(value, arena)?),
         properties: Properties::EMPTY,
-    }
+    })
 }
 
 pub(crate) fn cast_source_argument(mut argument: ArgumentFacts, leaf_source: i32) -> ArgumentFacts {
+    if argument.type_oid != leaf_source {
+        argument.constant = None;
+    }
     argument.type_oid = leaf_source;
     argument
 }
@@ -338,8 +445,10 @@ pub(crate) fn convert_argument(
     expected_oid: i32,
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
 ) -> Result<ArgumentFacts, SqlError> {
     if facts.type_oid != expected_oid {
+        let source = facts.type_oid;
         let cast = cast_properties(
             storage,
             txid,
@@ -353,12 +462,60 @@ pub(crate) fn convert_argument(
                 .is_none();
         facts.properties.include(cast);
         facts.properties = facts.properties.folded();
+        facts.constant = if facts.constant.is_some() {
+            let target = storage
+                .routine_result_for_oid(expected_oid, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "planner argument target type is unavailable"
+                    )
+                })?;
+            let named = crate::storage::NamedTypeKind::from_oid(expected_oid);
+            let source_base = storage
+                .domain_base_type_for_oid(source, txid)
+                .map_or(source, ColType::oid);
+            let builtin = builtin_cast_properties(storage, txid, source_base, expected_oid);
+            let safe = catalog::defined_cast_path(storage, txid, source, expected_oid).is_none()
+                && catalog::defined_cast_path(storage, txid, source_base, expected_oid).is_none()
+                && match named {
+                    Some((crate::storage::NamedTypeKind::Enum, _, _)) => source == oid::UNKNOWN,
+                    Some(_) => false,
+                    None => builtin.known && builtin.volatility == 0,
+                };
+            if safe {
+                let mark = arena.mark();
+                let converted = (|| {
+                    let value = facts.constant(arena)?.expect("constant handle is present");
+                    let argument = crate::storage::RoutineArgumentDef {
+                        name: crate::storage::SqlName::EMPTY,
+                        ctype: target.ctype,
+                        user_type: target.user_type,
+                    };
+                    let value = crate::sql::exec::coerce_routine_argument(
+                        value, argument, storage, txid, arena,
+                    )?;
+                    retain_constant(value, arena)
+                })();
+                unsafe { arena.rewind_to(mark) };
+                Some(converted?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         facts.type_oid = expected_oid;
     }
     Ok(facts)
 }
 
-pub(crate) fn array_argument_facts(elements: &[ArgumentFacts], array_oid: i32) -> ArgumentFacts {
+pub(crate) fn array_argument_facts(
+    elements: &[ArgumentFacts],
+    array_oid: i32,
+    element: crate::sql::types::ArrElem,
+    arena: &Arena,
+) -> Result<ArgumentFacts, SqlError> {
     let mut properties = Properties {
         strict: false,
         ..Properties::EMPTY
@@ -366,11 +523,31 @@ pub(crate) fn array_argument_facts(elements: &[ArgumentFacts], array_oid: i32) -
     for element in elements {
         properties.include(element.properties);
     }
-    ArgumentFacts {
+    let constant = if elements.iter().all(|element| element.constant.is_some()) {
+        let mark = arena.mark();
+        let captured = (|| {
+            let values = arena
+                .alloc_slice_with(elements.len(), |_| crate::sql::types::Datum::Null)
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            for (value, facts) in values.iter_mut().zip(elements) {
+                *value = facts
+                    .constant(arena)?
+                    .expect("all array elements are constants");
+            }
+            let raw = crate::sql::array::build(values, arena)?;
+            retain_constant(crate::sql::types::Datum::Array { element, raw }, arena)
+        })();
+        unsafe { arena.rewind_to(mark) };
+        Some(captured?)
+    } else {
+        None
+    };
+    Ok(ArgumentFacts {
         type_oid: array_oid,
         known_null: false,
+        constant,
         properties: properties.folded(),
-    }
+    })
 }
 
 fn known_null(
@@ -387,14 +564,16 @@ fn known_null(
             "SQL inlining expression nesting exceeds 512 levels"
         ));
     }
+    if let Some(index) = parameter_index(expression, columns) {
+        return Ok(super::parameter_known(index)
+            && super::inspect_parameters(|parameters| {
+                parameters
+                    .and_then(|parameters| parameters.get(index as usize - 1))
+                    .is_some_and(|value| value.is_null())
+            }));
+    }
     Ok(match expression {
         Expr::Null => true,
-        Expr::Param(index) => super::inspect_parameters(|parameters| {
-            index
-                .checked_sub(1)
-                .and_then(|index| parameters.and_then(|parameters| parameters.get(index as usize)))
-                .is_some_and(|value| value.is_null())
-        }),
         Expr::BoundLiteral { encoded, .. } => {
             crate::sql::type_inputs::value(encoded, arena)?.is_null()
         }
@@ -796,12 +975,8 @@ fn expression_properties(
         | Expr::Str(_)
         | Expr::BitLit(_)
         | Expr::BoundLiteral { .. } => Properties::EMPTY,
-        Expr::Param(index)
-            if super::inspect_parameters(|parameters| {
-                index.checked_sub(1).is_some_and(|index| {
-                    parameters.is_some_and(|parameters| (index as usize) < parameters.len())
-                })
-            }) =>
+        Expr::Param(_) | Expr::RoutineParam { .. }
+            if parameter_index(expression, columns).is_some_and(super::parameter_known) =>
         {
             Properties::EMPTY
         }
@@ -1278,10 +1453,15 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let mut candidates = crate::mem::arena::ArenaList::new_persistent(&arena);
             let mark = arena.mark();
+            let constants = [
+                literal_argument(crate::sql::types::Datum::Int4(17), oid::INT4, &arena).unwrap(),
+                literal_argument(crate::sql::types::Datum::Null, oid::TEXT, &arena).unwrap(),
+            ];
             let arguments = arena
                 .alloc_slice_with(2, |at| ArgumentFacts {
                     type_oid: if at == 0 { oid::INT4 } else { oid::TEXT },
                     known_null: at == 1,
+                    constant: constants[at].constant,
                     properties: Properties {
                         cost: at as f64 + 3.0,
                         ..Properties::EMPTY
@@ -1304,7 +1484,8 @@ mod tests {
                 candidates: candidates.as_slice(),
             };
             // DML schema visitors release their front scratch after callbacks.
-            // The captured graph contains only the persistent candidate/fact slices.
+            // The captured graph keeps persistent facts and checked handles
+            // to their encoded constants, independently of schema scratch.
             unsafe { arena.rewind_to(mark) };
             let _replacement = arena.alloc_slice_with(4096, |_| 0xa5u8).unwrap();
             let [candidate] = captured.candidates else {
@@ -1320,6 +1501,29 @@ mod tests {
             assert_eq!(candidate.arguments[1].type_oid, oid::TEXT);
             assert_eq!(candidate.arguments[1].properties.cost, 4.0);
             assert!(candidate.arguments[1].known_null);
+            assert_eq!(
+                candidate.arguments[0].constant(&arena).unwrap(),
+                Some(crate::sql::types::Datum::Int4(17))
+            );
+            assert_eq!(
+                candidate.arguments[1].constant(&arena).unwrap(),
+                Some(crate::sql::types::Datum::Null)
+            );
+            let borrowed = arena
+                .retained_slice_mut(candidate.arguments[0].constant.unwrap())
+                .unwrap();
+            assert_eq!(
+                candidate.arguments[0]
+                    .constant(&arena)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            );
+            drop(borrowed);
+            assert_eq!(
+                candidate.arguments[0].constant(&arena).unwrap(),
+                Some(crate::sql::types::Datum::Int4(17))
+            );
         });
     }
 
@@ -1357,6 +1561,7 @@ mod tests {
                 &[ArgumentFacts {
                     type_oid: oid::INT4,
                     known_null: true,
+                    constant: None,
                     properties: Properties {
                         volatility: 1,
                         cost: 7.0,
@@ -1365,7 +1570,10 @@ mod tests {
                     },
                 }],
                 crate::sql::types::ArrElem::Int4.array_oid(),
-            );
+                crate::sql::types::ArrElem::Int4,
+                &arena,
+            )
+            .unwrap();
             assert!(!packed.known_null);
             assert!(!packed.properties.strict);
             assert_eq!(packed.properties.volatility, 1);
@@ -1403,6 +1611,7 @@ mod tests {
         let argument = ArgumentFacts {
             type_oid: oid::INT4,
             known_null: false,
+            constant: None,
             properties: Properties {
                 constant: false,
                 ..Properties::EMPTY

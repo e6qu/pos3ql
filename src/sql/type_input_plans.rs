@@ -6,7 +6,7 @@ use crate::sql_err;
 
 use super::{
     eval::{SqlError, sqlstate},
-    type_inputs::Source,
+    type_inputs::{RoutineInputKind, Source},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ impl RoutineInputPlans {
     }
 
     pub(crate) fn reserve(&mut self, key: Key) -> Result<PlanId, SqlError> {
-        if matches!(key.source, Source::SqlRoutineBody { .. }) {
+        if matches!(key.source, Source::RuntimeRoutineInstance { .. }) {
             return Err(stale());
         }
         if let Owner::Nested(parent) = key.owner {
@@ -203,8 +203,9 @@ impl RoutineInputPlans {
         Ok(self.install(index, generation, key, SharedSlice::EMPTY))
     }
 
-    pub(crate) fn sql_body_key(
+    pub(crate) fn runtime_routine_key(
         &mut self,
+        kind: RoutineInputKind,
         routine_oid: i32,
         definition_version: u64,
         canonical: &[u8],
@@ -214,7 +215,7 @@ impl RoutineInputPlans {
         if canonical.is_empty() {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "SQL routine body specialization is empty"
+                "routine instance specialization is empty"
             ));
         }
         let mut current = None;
@@ -227,12 +228,14 @@ impl RoutineInputPlans {
             if let Key {
                 owner: Owner::Backend,
                 source:
-                    Source::SqlRoutineBody {
+                    Source::RuntimeRoutineInstance {
+                        kind: found_kind,
                         routine_oid: oid,
                         definition_version: version,
                         ..
                     },
             } = key
+                && found_kind == kind
                 && oid == routine_oid
                 && version == definition_version
                 && slot.specialization.as_ref() == canonical
@@ -262,12 +265,13 @@ impl RoutineInputPlans {
         if specialization.as_ref() != canonical {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
-                "SQL routine body specialization changed during reservation"
+                "routine instance specialization changed during reservation"
             ));
         }
         let key = Key {
             owner: Owner::Backend,
-            source: Source::SqlRoutineBody {
+            source: Source::RuntimeRoutineInstance {
+                kind,
                 routine_oid,
                 definition_version,
                 specialization: generation,
@@ -283,7 +287,7 @@ impl RoutineInputPlans {
     pub(crate) fn adopt_body(&self, plan: PlanId, key: Key) -> Result<(), SqlError> {
         let slot = self.slot(plan)?;
         if matches!(slot.state, State::Preparing { key: found, waiting: false } if found == key)
-            && matches!(key, Key { owner: Owner::Backend, source: Source::SqlRoutineBody { specialization, .. } } if specialization == plan.generation)
+            && matches!(key, Key { owner: Owner::Backend, source: Source::RuntimeRoutineInstance { kind: RoutineInputKind::Sql, specialization, .. } } if specialization == plan.generation)
             && !slot.specialization.is_empty()
         {
             Ok(())
@@ -735,6 +739,71 @@ mod tests {
     }
 
     #[test]
+    fn runtime_routine_languages_keep_distinct_instances_and_reuse_owned_keys() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 2;
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 2));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 2).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let sql = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"text/c",
+                    |_| Ok(true),
+                    freeze,
+                )
+                .unwrap();
+            let pl = plans
+                .runtime_routine_key(
+                    RoutineInputKind::Plpgsql,
+                    100_001,
+                    7,
+                    b"text/c",
+                    |_| Ok(true),
+                    freeze,
+                )
+                .unwrap();
+            assert_ne!(sql.key, pl.key);
+            plans
+                .complete(
+                    sql.reserved.unwrap(),
+                    InputImage::Runtime(SharedSlice::EMPTY),
+                )
+                .unwrap();
+            plans
+                .complete(
+                    pl.reserved.unwrap(),
+                    InputImage::Runtime(SharedSlice::EMPTY),
+                )
+                .unwrap();
+            for _ in 0..1100 {
+                let again = plans
+                    .runtime_routine_key(
+                        RoutineInputKind::Plpgsql,
+                        100_001,
+                        7,
+                        b"text/c",
+                        |_| Ok(true),
+                        |_| panic!("ready PL instance must retain its existing key"),
+                    )
+                    .unwrap();
+                assert_eq!(again.key, pl.key);
+                assert!(again.reserved.is_none());
+            }
+            plans.clear();
+            assert!(pool.lease::<u8>(64).is_ok());
+        });
+    }
+
+    #[test]
     fn runtime_sql_body_keys_compare_exact_bytes_and_share_ready_and_waiting_owners() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 3;
@@ -750,7 +819,14 @@ mod tests {
             let mut bytes = *b"declared-int4,collation-0,result-int4";
             let original = bytes;
             let first = plans
-                .sql_body_key(100_001, 7, &bytes, |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    &bytes,
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             let first_id = first.reserved.unwrap();
             plans.adopt_body(first_id, first.key).unwrap();
@@ -760,14 +836,22 @@ mod tests {
             );
             bytes[9] = b'X';
             let changed = plans
-                .sql_body_key(100_001, 7, &bytes, |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    &bytes,
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             let waiting = changed.reserved.unwrap();
             assert_ne!(changed.key, first.key);
             plans.adopt_body(waiting, changed.key).unwrap();
             plans.set_waiting(waiting, true).unwrap();
             let reused = plans
-                .sql_body_key(
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
                     100_001,
                     7,
                     &bytes,
@@ -791,7 +875,14 @@ mod tests {
                 panic!("ready typed SQL body");
             };
             let other = plans
-                .sql_body_key(100_002, 7, &original, |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_002,
+                    7,
+                    &original,
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             plans
                 .adopt_body(other.reserved.unwrap(), other.key)
@@ -799,7 +890,8 @@ mod tests {
             assert_ne!(other.key, first.key);
             assert_eq!(pool.lease::<u8>(1).unwrap_err().available_leases, 0);
             let reused = plans
-                .sql_body_key(
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
                     100_001,
                     7,
                     &original,
@@ -810,7 +902,8 @@ mod tests {
             assert_eq!(reused.key, first.key);
             assert!(reused.reserved.is_none());
             let error = plans
-                .sql_body_key(
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
                     100_001,
                     8,
                     &original,
@@ -848,7 +941,14 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             let first = plans
-                .sql_body_key(100_001, 7, b"declared-int4", |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"declared-int4",
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             let id = first.reserved.unwrap();
             plans.adopt_body(id, first.key).unwrap();
@@ -857,7 +957,14 @@ mod tests {
                 .unwrap();
             let generation = plans.next_generation;
             let error = plans
-                .sql_body_key(100_001, 7, b"declared-int8", |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"declared-int8",
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(plans.next_generation, generation);
@@ -874,14 +981,22 @@ mod tests {
             );
             plans.abandon(id).unwrap();
             let replacement = plans
-                .sql_body_key(100_001, 7, b"declared-int8", |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"declared-int8",
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             assert_ne!(replacement.key, first.key);
             assert!(plans.adopt_body(id, replacement.key).is_err());
             plans.clear();
             plans.next_generation = u64::MAX;
             let error = plans
-                .sql_body_key(
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
                     100_001,
                     7,
                     b"declared-int4",
@@ -908,7 +1023,14 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             let first = plans
-                .sql_body_key(100_001, 7, b"int4", |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_001,
+                    7,
+                    b"int4",
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             let old = first.reserved.unwrap();
             plans
@@ -921,7 +1043,14 @@ mod tests {
                 panic!("ready body")
             };
             let other = plans
-                .sql_body_key(100_002, 7, b"int4", |_| Ok(true), freeze)
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
+                    100_002,
+                    7,
+                    b"int4",
+                    |_| Ok(true),
+                    freeze,
+                )
                 .unwrap();
             plans
                 .complete(
@@ -931,7 +1060,14 @@ mod tests {
                 .unwrap();
             let recursive = with_owner(Owner::Nested(old), || {
                 let replaced_other = plans
-                    .sql_body_key(100_002, 7, b"int4", |_| Ok(false), freeze)
+                    .runtime_routine_key(
+                        RoutineInputKind::Sql,
+                        100_002,
+                        7,
+                        b"int4",
+                        |_| Ok(false),
+                        freeze,
+                    )
                     .unwrap();
                 assert_ne!(replaced_other.key, other.key);
                 with_owner(
@@ -941,7 +1077,14 @@ mod tests {
                     },
                     || {
                         let replacement = plans
-                            .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
+                            .runtime_routine_key(
+                                RoutineInputKind::Sql,
+                                100_001,
+                                7,
+                                b"int4",
+                                |_| Ok(false),
+                                freeze,
+                            )
                             .unwrap();
                         let new = replacement.reserved.unwrap();
                         assert_ne!(new, old);
@@ -949,7 +1092,8 @@ mod tests {
                             .complete(new, InputImage::Runtime(SharedSlice::EMPTY))
                             .unwrap();
                         let reused = plans
-                            .sql_body_key(
+                            .runtime_routine_key(
+                                RoutineInputKind::Sql,
                                 100_001,
                                 7,
                                 b"int4",
@@ -972,7 +1116,8 @@ mod tests {
                 Some(Lookup::Ready(_, _))
             ));
             let replacement = plans
-                .sql_body_key(
+                .runtime_routine_key(
+                    RoutineInputKind::Sql,
                     100_001,
                     7,
                     b"int4",

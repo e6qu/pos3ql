@@ -2161,6 +2161,7 @@ std::thread_local! {
     static BOUND_PARAMETER_TYPES: Cell<BoundParameterTypes> =
         const { Cell::new(BoundParameterTypes::EMPTY) };
     static PARAMETER_CONTEXT: Cell<ParameterContext> = const { Cell::new(ParameterContext::Bound) };
+    static ROUTINE_PARAMETER_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Clone, Copy)]
@@ -2220,9 +2221,13 @@ pub(crate) fn bound_parameter_context_active() -> bool {
     matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Bound)
 }
 
+pub(crate) fn routine_parameter_depth() -> usize {
+    ROUTINE_PARAMETER_DEPTH.with(Cell::get)
+}
+
 /// Restores the enclosing routine's declaration when nested SQL routines
 /// return.  A parameter type is execution context, not a process-wide default.
-pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext);
+pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext, usize);
 
 pub(crate) fn enter_routine_parameter_types(
     arguments: &[RoutineArgumentDef],
@@ -2258,10 +2263,19 @@ pub(crate) fn enter_routine_parameter_types(
             },
         });
     }
+    let prior_depth = routine_parameter_depth();
+    let depth = prior_depth.checked_add(1).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine parameter scope depth exhausted"
+        )
+    })?;
+    ROUTINE_PARAMETER_DEPTH.with(|slot| slot.set(depth));
     let prior = ROUTINE_PARAMETER_TYPES.with(|slot| slot.replace(current));
     Ok(RoutineParameterScope(
         prior,
         PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)),
+        prior_depth,
     ))
 }
 
@@ -2269,6 +2283,7 @@ impl Drop for RoutineParameterScope {
     fn drop(&mut self) {
         ROUTINE_PARAMETER_TYPES.with(|slot| slot.set(self.0));
         PARAMETER_CONTEXT.with(|slot| slot.set(self.1));
+        ROUTINE_PARAMETER_DEPTH.with(|slot| slot.set(self.2));
     }
 }
 

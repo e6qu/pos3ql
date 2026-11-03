@@ -46,6 +46,7 @@ pub mod notify;
 pub mod numeric;
 mod param_types;
 pub mod parser;
+pub(crate) mod plan_invalidations;
 mod planner_inputs;
 mod plpgsql_inputs;
 pub mod prep;
@@ -6966,6 +6967,7 @@ impl Engine {
                         .expect("prepared transaction owns its database-scope WAL record");
                     self.prepared_transactions
                         .set_lsn_range(slot, first_lsn, staged.lsn);
+                    txn.detach_prepared_plan_invalidations();
                     core::mem::swap(
                         txn,
                         &mut self.prepared_transactions.slot_mut(slot).transaction,
@@ -7621,6 +7623,7 @@ impl Engine {
         }
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage.finish_cumulative_transaction(txn.txid, true);
+        self.storage.publish_plan_invalidations(txn.ddl());
         txn.clear();
         let result = notify_result.and(temporary_result);
         #[cfg(test)]
@@ -15637,6 +15640,62 @@ impl Engine {
         )
     }
 
+    fn plpgsql_instance_owner(
+        &self,
+        routine: &crate::storage::RoutineDef,
+        input_collation: ast::Collation,
+        txn: &TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        arena: &Arena,
+    ) -> Result<type_input_plans::Owner, SqlError> {
+        use type_input_plans::{InputImage, Lookup, Owner};
+        use type_inputs::RoutineInputKind;
+        arena
+            .with_remaining_region(|scratch| {
+                let canonical = routine_input_identity::canonical(
+                    &self.storage,
+                    routine,
+                    input_collation,
+                    RoutineInputKind::Plpgsql,
+                    txn.txid,
+                    scratch,
+                )?;
+                let admission = sqlprep.routine_inputs.runtime_routine_key(
+                    RoutineInputKind::Plpgsql,
+                    crate::storage::routine_oid(routine),
+                    routine.version,
+                    canonical,
+                    |validity| {
+                        if validity.is_none() {
+                            Ok(true)
+                        } else {
+                            Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "PL/pgSQL instance unexpectedly owns SQL plan validity"
+                            ))
+                        }
+                    },
+                    |bytes| self.storage.freeze_runtime_input_key(bytes),
+                )?;
+                if let Some(plan) = admission.reserved {
+                    sqlprep.routine_inputs.complete(
+                        plan,
+                        InputImage::Runtime(crate::mem::lease_pool::SharedSlice::EMPTY),
+                    )?;
+                }
+                match sqlprep.routine_inputs.find(admission.key)? {
+                    Some(Lookup::Ready(plan, InputImage::Runtime(bytes))) if bytes.is_empty() => {
+                        Ok(Owner::Nested(plan))
+                    }
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "PL/pgSQL instance did not finish admission"
+                    )),
+                }
+            })
+            .map_err(|_| eval::arena_full())?
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_plpgsql_inputs<'a>(
         &mut self,
@@ -15712,6 +15771,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
         use type_input_plans::{InputImage, Key, Lookup, Owner};
+        if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
+            return Ok(Err(error));
+        }
         let routine_oid = crate::storage::routine_oid(routine);
         let parent = match origin {
             RoutineBodyInputOrigin::Procedure => Owner::Backend,
@@ -15782,13 +15844,15 @@ impl Engine {
                 &self.storage,
                 routine,
                 input_collation,
+                type_inputs::RoutineInputKind::Sql,
                 txn.txid,
                 arena,
             ) {
                 Ok(canonical) => canonical,
                 Err(error) => return Ok(Err(error)),
             };
-            let admission = match sqlprep.routine_inputs.sql_body_key(
+            let admission = match sqlprep.routine_inputs.runtime_routine_key(
+                type_inputs::RoutineInputKind::Sql,
                 routine_oid,
                 routine.version,
                 canonical,
@@ -15873,7 +15937,7 @@ impl Engine {
                     }
                     let validity = self
                         .storage
-                        .capture_runtime_input_validity(&dependencies, txn.txid)?;
+                        .capture_runtime_input_validity(&dependencies, txn)?;
                     if let Some(plan) = reserved {
                         sqlprep.routine_inputs.set_body_validity(plan, validity)?;
                     }
@@ -16179,17 +16243,29 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
-            let value = match exec::execute_plpgsql_function(
-                self,
+            let instance = match self.plpgsql_instance_owner(
+                routine,
+                pending.input_collation,
                 txn,
                 sqlprep,
-                cursors,
-                guc,
-                routine,
-                &arguments[..pending.argument_count],
                 arena,
-                responder,
             ) {
+                Ok(owner) => owner,
+                Err(error) => return Ok(Err(error)),
+            };
+            let value = match type_input_plans::with_owner(instance, || {
+                exec::execute_plpgsql_function(
+                    self,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine,
+                    &arguments[..pending.argument_count],
+                    arena,
+                    responder,
+                )
+            }) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
@@ -16353,9 +16429,21 @@ impl Engine {
                     )));
                 }
             };
-            return Ok(exec::execute_plpgsql_table_function(
-                self, txn, sqlprep, cursors, guc, routine, &*inputs, arena, responder,
-            ));
+            let instance = match self.plpgsql_instance_owner(
+                routine,
+                pending.input_collation,
+                txn,
+                sqlprep,
+                arena,
+            ) {
+                Ok(owner) => owner,
+                Err(error) => return Ok(Err(error)),
+            };
+            return Ok(type_input_plans::with_owner(instance, || {
+                exec::execute_plpgsql_table_function(
+                    self, txn, sqlprep, cursors, guc, routine, &*inputs, arena, responder,
+                )
+            }));
         }
         let body = match arena.alloc_str(routine.body.as_str()) {
             Ok(body) => body,
@@ -17087,26 +17175,38 @@ impl Engine {
             timezone::set_session(guc.timezone());
             if routine.language == crate::storage::RoutineLanguage::PlPgSql {
                 let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                let output_count = match exec::execute_plpgsql_procedure(
-                    self,
+                let instance = match self.plpgsql_instance_owner(
+                    routine,
+                    input_collation,
                     txn,
                     sqlprep,
-                    cursors,
-                    guc,
-                    if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
-                        && !routine.attributes.security_definer
-                        && routine.configs().is_empty()
-                    {
-                        exec::PlpgsqlTransactionContext::NonAtomic
-                    } else {
-                        exec::PlpgsqlTransactionContext::Atomic
-                    },
-                    routine,
-                    &completed[..declared.argument_count],
                     arena,
-                    responder,
-                    &mut output_values,
                 ) {
+                    Ok(owner) => owner,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let output_count = match type_input_plans::with_owner(instance, || {
+                    exec::execute_plpgsql_procedure(
+                        self,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
+                            && !routine.attributes.security_definer
+                            && routine.configs().is_empty()
+                        {
+                            exec::PlpgsqlTransactionContext::NonAtomic
+                        } else {
+                            exec::PlpgsqlTransactionContext::Atomic
+                        },
+                        routine,
+                        &completed[..declared.argument_count],
+                        arena,
+                        responder,
+                        &mut output_values,
+                    )
+                }) {
                     Ok(count) => count,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -17824,6 +17924,9 @@ impl Engine {
             &mut Responder,
         ) -> Result<Result<(), SqlError>, WireFull>,
     {
+        if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
+            return Ok(Err(error));
+        }
         if txn.failed {
             return Ok(Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
@@ -18195,6 +18298,9 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
+            return Ok(Err(error));
+        }
         if matches!(
             statement,
             Stmt::Select(_)

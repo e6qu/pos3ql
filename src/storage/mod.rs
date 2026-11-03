@@ -6,6 +6,7 @@
 //! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
+mod plan_invalidations;
 mod runtime_input_validity;
 pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
@@ -13098,6 +13099,12 @@ pub(crate) struct ObjectAclUndo {
     prior: Option<PendingObjectAcl>,
 }
 
+impl ObjectAclUndo {
+    pub(crate) fn object(self) -> AccessObject {
+        self.object
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AclEntry {
     pub object: AccessObject,
@@ -15381,6 +15388,7 @@ pub struct Storage {
     /// Monotonic stamp shared by every catalog's `created_at` fields.
     catalog_sequence: CatalogSequence,
     catalog_sources: catalog_sources::CatalogSources,
+    plan_invalidations: plan_invalidations::PlanInvalidations,
     next_rowid: row_identities::RowIdentities,
     /// Repeatable-read retention and serializable read tracking share one
     /// startup-bounded transaction snapshot state.
@@ -20454,6 +20462,7 @@ impl Storage {
             Self::type_definition_image_budget_bytes(config),
             size_of::<type_references::CatalogOrigin>(),
             size_of::<catalog_sources::CatalogSources>(),
+            plan_invalidations::PlanInvalidations::budget_bytes(config.max_databases),
             SpillRootRegistry::budget_bytes(config),
             QueryRootPool::budget_bytes(config),
             pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>()),
@@ -20666,6 +20675,8 @@ impl Storage {
             "catalog reference origin",
         )?;
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
+        let plan_invalidations =
+            plan_invalidations::PlanInvalidations::new(config.max_databases, budget)?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         budget.draw(
@@ -21674,6 +21685,7 @@ impl Storage {
             }),
             catalog_sequence: CatalogSequence::new(0),
             catalog_sources,
+            plan_invalidations,
             transaction_mode: config.transaction_mode,
             catalog_history: CatalogHistory::new(
                 budget,
@@ -25246,6 +25258,8 @@ impl Storage {
             catalog.definitions[slot].ddl_state.commit_drop();
         }
         statistics.databases[slot] = DatabaseCumulativeStatistics::empty(DatabaseDef::EMPTY.oid);
+        self.plan_invalidations
+            .retire_database(catalog.definitions[slot].oid);
         catalog.definitions[slot] = DatabaseDef::EMPTY;
     }
 

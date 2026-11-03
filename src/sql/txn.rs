@@ -274,6 +274,7 @@ pub(super) struct CacheCapacityWait {
 }
 
 pub struct TxnState {
+    plan_invalidations: Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
     staged_commit: Option<StagedCommit>,
     commit_admission: Option<CommitAdmission>,
     pub(super) catalog_history: Option<crate::storage::CatalogHistoryBatch>,
@@ -911,6 +912,9 @@ impl TxnState {
                     .descriptors
                     .saturating_mul(core::mem::size_of::<LargeObjectDescriptor>()),
             )
+            .saturating_add(core::mem::size_of::<
+                Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+            >())
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -959,6 +963,12 @@ impl TxnState {
         budget: &mut Budget,
         capacity: TransactionCapacity,
     ) -> Result<Self, BudgetError> {
+        budget.draw(
+            core::mem::size_of::<
+                Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+            >(),
+            "transaction plan invalidation owner",
+        )?;
         let mut large_object_descriptors =
             FixedVec::new(budget, "large_object_descriptors", capacity.descriptors)?;
         for _ in 0..capacity.descriptors {
@@ -967,6 +977,7 @@ impl TxnState {
                 .expect("sized to descriptor capacity");
         }
         Ok(Self {
+            plan_invalidations: None,
             staged_commit: None,
             commit_admission: None,
             catalog_history: None,
@@ -2543,7 +2554,10 @@ impl TxnState {
 
     pub fn rewind_ddl(&mut self, ddl_mark: usize) {
         while self.ddl.len() > ddl_mark {
-            self.ddl.pop();
+            let undo = self.ddl.pop().expect("DDL exceeds its rewind mark");
+            if let Some(owner) = &self.plan_invalidations {
+                owner.change(undo.catalog_plan_change());
+            }
             self.ddl_origins.pop();
         }
     }
@@ -2750,6 +2764,7 @@ impl TxnState {
     }
 
     pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
+        let invalidation = undo.catalog_plan_change();
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2760,7 +2775,52 @@ impl TxnState {
         self.ddl_origins
             .push(self.ddl_origin)
             .expect("parallel DDL origin pool has the same capacity");
+        if let Some(owner) = &self.plan_invalidations {
+            owner.change(invalidation);
+        }
         Ok(())
+    }
+
+    pub(crate) fn bind_plan_invalidations(
+        &mut self,
+        owner: &std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>,
+    ) -> Result<(), SqlError> {
+        if let Some(current) = &self.plan_invalidations {
+            if std::sync::Arc::ptr_eq(current, owner) {
+                return Ok(());
+            }
+            if self.mode != TxnMode::Idle {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "active transaction cannot change its SQL plan owner"
+                ));
+            }
+        }
+        self.plan_invalidations = Some(std::sync::Arc::clone(owner));
+        Ok(())
+    }
+
+    pub(crate) fn plan_invalidation_stamp(
+        &self,
+        depends_on_roles: bool,
+    ) -> Result<super::plan_invalidations::LocalPlanStamp, SqlError> {
+        self.plan_invalidations
+            .as_ref()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "transaction has no SQL plan invalidation owner"
+                )
+            })?
+            .stamp(depends_on_roles)
+    }
+
+    pub(crate) fn detach_prepared_plan_invalidations(&mut self) {
+        if let Some(owner) = self.plan_invalidations.take() {
+            for undo in self.ddl.iter() {
+                owner.change(undo.catalog_plan_change());
+            }
+        }
     }
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {
@@ -2794,6 +2854,11 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        if let Some(owner) = &self.plan_invalidations {
+            for undo in self.ddl.iter() {
+                owner.change(undo.catalog_plan_change());
+            }
+        }
         self.staged_commit = None;
         self.commit_admission = None;
         self.catalog_history = None;

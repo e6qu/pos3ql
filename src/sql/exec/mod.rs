@@ -760,7 +760,7 @@ pub(crate) use describe::{
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
-    with_bound_parameter_types,
+    routine_parameter_depth, with_bound_parameter_types,
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
@@ -7559,6 +7559,10 @@ pub fn alter_owner(
     if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
         return sql_fail(error);
     }
+    if object.class == AccessClass::Schema && storage.object_owner(object, txn.txid) == new_owner {
+        responder.command_complete(tag)?;
+        return sql_ok();
+    }
     let current = super::eval::funcs::system::current_user_owned();
     let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
@@ -7591,6 +7595,15 @@ pub fn alter_owner(
         if let Err(error) = storage.require_schema_create_as(schema.as_str(), new_owner, txn.txid) {
             return sql_fail(error);
         }
+    }
+    if object.class == AccessClass::Schema
+        && !storage.has_current_database_create_privilege(current_role, txn.txid)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for database {}",
+            storage.current_database_name(txn.txid).as_str()
+        ));
     }
     let old_owner = storage.object_owner(object, txn.txid) as u16;
     let prior = if object.class == AccessClass::Schema {
@@ -16574,6 +16587,7 @@ struct TriggerInvocation<'a> {
     relid: i32,
     routine_oid: i32,
     input_origin: super::plpgsql_inputs::Origin,
+    input_owner: super::type_input_plans::Owner,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
     nargs: i32,
     when: &'static str,
@@ -16744,6 +16758,7 @@ impl<'a> TriggerInvocation<'a> {
                 oid: crate::storage::routine_oid(routine),
                 version: routine.version,
             },
+            input_owner: super::type_input_plans::Owner::Backend,
             input_sites: &[],
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
@@ -16764,8 +16779,8 @@ impl<'a> TriggerInvocation<'a> {
         })
     }
 
-    fn anonymous() -> Self {
-        Self {
+    fn anonymous() -> Result<Self, SqlError> {
+        Ok(Self {
             program_kind: PlpgsqlProgramKind::Anonymous,
             name: "",
             routine_schema: "",
@@ -16775,6 +16790,7 @@ impl<'a> TriggerInvocation<'a> {
             relid: 0,
             routine_oid: 0,
             input_origin: super::plpgsql_inputs::Origin::Anonymous,
+            input_owner: super::type_input_plans::owner()?,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -16784,7 +16800,7 @@ impl<'a> TriggerInvocation<'a> {
             event: "",
             tag: "",
             exception: None,
-        }
+        })
     }
 
     fn procedure(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<Self, SqlError> {
@@ -16805,6 +16821,7 @@ impl<'a> TriggerInvocation<'a> {
                 oid: crate::storage::routine_oid(routine),
                 version: routine.version,
             },
+            input_owner: super::type_input_plans::owner()?,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -16839,6 +16856,7 @@ impl<'a> TriggerInvocation<'a> {
                 oid: crate::storage::routine_oid(routine),
                 version: routine.version,
             },
+            input_owner: super::type_input_plans::owner()?,
             input_sites: &[],
             nargs: i32::try_from(routine.arguments().len())
                 .expect("routine argument capacity fits int4"),
@@ -16875,6 +16893,7 @@ impl<'a> TriggerInvocation<'a> {
                 oid: crate::storage::routine_oid(routine),
                 version: routine.version,
             },
+            input_owner: super::type_input_plans::Owner::Backend,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -16898,7 +16917,7 @@ impl<'a> TriggerInvocation<'a> {
     ) -> Result<super::type_input_plans::Key, SqlError> {
         let (owner, source) = match self.input_origin {
             super::plpgsql_inputs::Origin::Routine { oid, version } => (
-                super::type_input_plans::Owner::Backend,
+                self.input_owner,
                 super::type_inputs::Source::PlpgsqlBodyExpression {
                     routine_oid: oid,
                     definition_version: version,
@@ -16906,7 +16925,7 @@ impl<'a> TriggerInvocation<'a> {
                 },
             ),
             super::plpgsql_inputs::Origin::Anonymous => (
-                super::type_input_plans::owner()?,
+                self.input_owner,
                 super::type_inputs::Source::PlpgsqlAnonymousExpression {
                     expression: site.position,
                 },
@@ -20557,7 +20576,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         arena,
     )?;
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::anonymous().with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::anonymous()?.with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,

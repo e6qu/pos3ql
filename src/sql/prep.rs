@@ -51,6 +51,8 @@ pub struct SqlPreparedPool {
     request: FixedBuf,
     request_owner: Option<RequestInputOwner>,
     pub(crate) routine_inputs: super::type_input_plans::RoutineInputPlans,
+    pub(crate) plan_invalidations:
+        std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>,
     transient_plan: Option<u64>,
     next_plan: u64,
 }
@@ -155,6 +157,7 @@ impl SqlPreparedPool {
             .saturating_add(super::type_input_plans::RoutineInputPlans::budget_bytes(
                 config,
             ))
+            .saturating_add(super::plan_invalidations::LocalPlanInvalidations::budget_bytes())
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -180,6 +183,7 @@ impl SqlPreparedPool {
             request,
             request_owner: None,
             routine_inputs,
+            plan_invalidations: super::plan_invalidations::LocalPlanInvalidations::new(budget)?,
             transient_plan: None,
             next_plan: 1,
         })

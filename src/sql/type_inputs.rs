@@ -8,6 +8,12 @@ use super::{
 use crate::mem::{arena::Arena, buffer::FixedBuf};
 use crate::sql_err;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoutineInputKind {
+    Sql,
+    Plpgsql,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssignmentNode {
     Values { row: usize, value: usize },
@@ -35,7 +41,8 @@ pub(crate) enum Source {
         routine_oid: i32,
         definition_version: u64,
     },
-    SqlRoutineBody {
+    RuntimeRoutineInstance {
+        kind: RoutineInputKind,
         routine_oid: i32,
         definition_version: u64,
         specialization: u64,
@@ -76,7 +83,7 @@ impl Source {
                 routine_oid,
                 definition_version,
             }
-            | Self::SqlRoutineBody {
+            | Self::RuntimeRoutineInstance {
                 routine_oid,
                 definition_version,
                 ..

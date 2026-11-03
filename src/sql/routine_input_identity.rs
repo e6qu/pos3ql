@@ -14,21 +14,44 @@ pub(super) fn canonical<'a>(
     storage: &Storage,
     routine: &RoutineDef,
     input_collation: Collation,
+    kind: super::type_inputs::RoutineInputKind,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
+    if !matches!(
+        (kind, routine.language),
+        (
+            super::type_inputs::RoutineInputKind::Sql,
+            crate::storage::RoutineLanguage::Sql
+        ) | (
+            super::type_inputs::RoutineInputKind::Plpgsql,
+            crate::storage::RoutineLanguage::PlPgSql
+        )
+    ) {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "routine input cache language changed"
+        ));
+    }
     let mut length = 0usize;
-    encode(storage, routine, input_collation, txid, &mut |bytes| {
-        length = length
-            .checked_add(bytes.len())
-            .ok_or_else(super::eval::arena_full)?;
-        Ok(())
-    })?;
+    encode(
+        storage,
+        routine,
+        input_collation,
+        kind,
+        txid,
+        &mut |bytes| {
+            length = length
+                .checked_add(bytes.len())
+                .ok_or_else(super::eval::arena_full)?;
+            Ok(())
+        },
+    )?;
     let bytes = arena
         .alloc_slice_with(length, |_| 0u8)
         .map_err(|_| super::eval::arena_full())?;
     let mut offset = 0;
-    encode(storage, routine, input_collation, txid, &mut |part| {
+    encode(storage, routine, input_collation, kind, txid, &mut |part| {
         let end = offset + part.len();
         bytes[offset..end].copy_from_slice(part);
         offset = end;
@@ -41,6 +64,7 @@ fn encode(
     storage: &Storage,
     routine: &RoutineDef,
     input_collation: Collation,
+    kind: super::type_inputs::RoutineInputKind,
     txid: u32,
     emit: &mut impl FnMut(&[u8]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
@@ -59,6 +83,9 @@ fn encode(
     // RoutineCallContract binds polymorphic and RECORD inputs before admission.
     for argument in routine.arguments() {
         emit(&type_oid(argument.ctype, argument.user_type)?.to_le_bytes())?;
+    }
+    if kind == super::type_inputs::RoutineInputKind::Plpgsql {
+        return Ok(());
     }
     let composite = match routine.kind {
         RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {

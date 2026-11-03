@@ -105,7 +105,7 @@ Checked values belong to the SQL source that analyzed them:
 | SQL `PREPARE` or protocol Parse | Prepared once and retained with that statement and its bound portals. Describe and repeated execution reuse the values. |
 | SQL string function or procedure body | `CREATE` validation is separate. The first runtime call prepares inputs retained by the backend for the routine definition and resolved call types. Later commands reuse them. |
 | SQL function considered for inlining | The caller's planner checks the body. An accepted inline keeps its checked values with that caller plan; a rejected attempt leaves runtime preparation separate. |
-| Supported static PL/pgSQL source | Prepared when reached and retained by the backend for that routine definition and source occurrence. An unreached branch does not prepare its inputs. |
+| Supported static PL/pgSQL source | Prepared when reached and retained by the backend for that routine definition, resolved input types, input collation and source occurrence. An unreached branch does not prepare its inputs. |
 | Dynamic `EXECUTE` | Each execution owns a fresh plan, even when the command text equals an earlier command. |
 | Stored view, rule, default or SQL `BEGIN ATOMIC` body | Prepared with the definition and retained in its immutable metadata image, including domain and view-column defaults. Recovery restores values and captured type identities without rerunning checks. |
 

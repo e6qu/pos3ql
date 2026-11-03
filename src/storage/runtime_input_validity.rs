@@ -40,6 +40,8 @@ enum Dependency {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeInputValidity {
+    global: super::plan_invalidations::PlanInvalidationStamp,
+    local: crate::sql::plan_invalidations::LocalPlanStamp,
     database: DatabaseOid,
     namespaces: SharedSlice<Namespace>,
     explicit_catalog: bool,
@@ -51,8 +53,9 @@ impl Storage {
     pub(crate) fn capture_runtime_input_validity(
         &self,
         dependencies: &StoredQueryDependencies,
-        transaction: u32,
+        txn: &crate::sql::txn::TxnState,
     ) -> Result<RuntimeInputValidity, SqlError> {
+        let transaction = txn.txid;
         let full = |error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error);
         let path = self.path();
         let mut namespaces = self
@@ -151,6 +154,10 @@ impl Storage {
             None
         };
         Ok(RuntimeInputValidity {
+            global: self
+                .plan_invalidations
+                .stamp(super::current_database(), depends_on_roles)?,
+            local: txn.plan_invalidation_stamp(depends_on_roles)?,
             database: super::current_database(),
             namespaces: namespaces.freeze(),
             explicit_catalog: path.explicit_catalog(),
@@ -162,6 +169,9 @@ impl Storage {
 
 impl RuntimeInputValidity {
     pub(crate) fn matches(&self, storage: &Storage, transaction: u32) -> Result<bool, SqlError> {
+        if !storage.plan_invalidations.matches(self.global)? || !self.local.matches()? {
+            return Ok(false);
+        }
         if self.database != super::current_database() {
             return Ok(false);
         }
@@ -179,15 +189,14 @@ impl RuntimeInputValidity {
                 return Ok(false);
             }
         }
-        if let Some((role, row_security)) = self.role {
-            if storage
+        if let Some((role, row_security)) = self.role
+            && (storage
                 .current_role_slot(transaction)
                 .map(|slot| storage.role(slot).oid())
                 != Some(role)
-                || row_security != crate::sql::guc::active_row_security()
-            {
-                return Ok(false);
-            }
+                || row_security != crate::sql::guc::active_row_security())
+        {
+            return Ok(false);
         }
         for dependency in self.dependencies.iter() {
             let matches = match *dependency {

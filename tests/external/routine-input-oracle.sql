@@ -69,6 +69,9 @@ SELECT 'namespace after rollback', last_value FROM checks;
 CREATE SCHEMA IF NOT EXISTS pending_namespace;
 SELECT opaque();
 SELECT 'noop namespace ddl', last_value FROM checks;
+ALTER SCHEMA validity_probe OWNER TO postgres;
+SELECT opaque();
+SELECT 'noop schema owner', last_value FROM checks;
 
 CREATE INDEX anchor_id_idx ON anchor(id);
 SELECT opaque();
@@ -164,5 +167,62 @@ SELECT pl_polymorphic('a'::text);
 SELECT 'pl separate text',last_value FROM specialization_checks;
 SELECT pl_polymorphic(3);
 SELECT 'pl reused integer',last_value FROM specialization_checks;
+CREATE FUNCTION sql_collation_inner(input text) RETURNS specialization_checked[]
+  LANGUAGE sql SET search_path=runtime_specialization_probe,public
+  AS $$SELECT '{a}'::specialization_checked[]$$;
+CREATE FUNCTION sql_collation_outer(input text) RETURNS specialization_checked[]
+  LANGUAGE sql SET search_path=runtime_specialization_probe,public
+  AS $$SELECT sql_collation_inner(input)$$;
+CREATE FUNCTION pl_collation_outer(input text) RETURNS specialization_checked[]
+  LANGUAGE plpgsql AS $$BEGIN RETURN sql_collation_inner(input); END$$;
+ALTER SEQUENCE specialization_checks RESTART WITH 1;
+SELECT sql_collation_outer('a' COLLATE "C");
+SELECT 'sql formal first c',last_value FROM specialization_checks;
+SELECT sql_collation_outer('a' COLLATE "POSIX");
+SELECT 'sql formal separate posix',last_value FROM specialization_checks;
+SELECT sql_collation_outer('a' COLLATE "C");
+SELECT 'sql formal reused c',last_value FROM specialization_checks;
+DISCARD PLANS;
+ALTER SEQUENCE specialization_checks RESTART WITH 1;
+SELECT pl_collation_outer('a' COLLATE "C");
+SELECT 'pl formal first c',last_value FROM specialization_checks;
+SELECT pl_collation_outer('a' COLLATE "POSIX");
+SELECT 'pl formal separate posix',last_value FROM specialization_checks;
+SELECT pl_collation_outer('a' COLLATE "C");
+SELECT 'pl formal reused c',last_value FROM specialization_checks;
 RESET search_path;
 DROP SCHEMA runtime_specialization_probe CASCADE;
+
+SET search_path=validity_probe,public;
+SELECT opaque();
+SELECT 'prepare baseline', last_value FROM checks;
+BEGIN;
+CREATE SCHEMA oracle_prepared_committed;
+SELECT opaque();
+SELECT 'prepare creator before prepare', last_value FROM checks;
+PREPARE TRANSACTION 'oracle-plan-commit';
+SELECT opaque();
+SELECT 'prepare creator after prepare', last_value FROM checks;
+COMMIT PREPARED 'oracle-plan-commit';
+SELECT opaque();
+SELECT 'prepare creator after commit prepared', last_value FROM checks;
+
+BEGIN;
+CREATE SCHEMA oracle_prepared_rolled_back;
+SELECT opaque();
+SELECT 'prepare creator before rollback prepare', last_value FROM checks;
+PREPARE TRANSACTION 'oracle-plan-rollback';
+SELECT opaque();
+SELECT 'prepare creator before rollback prepared', last_value FROM checks;
+ROLLBACK PREPARED 'oracle-plan-rollback';
+SELECT opaque();
+SELECT 'prepare creator after rollback prepared', last_value FROM checks;
+
+BEGIN;
+INSERT INTO anchor(id) VALUES (2);
+PREPARE TRANSACTION 'oracle-plan-data';
+SELECT opaque();
+SELECT 'prepare creator after data-only prepare', last_value FROM checks;
+ROLLBACK PREPARED 'oracle-plan-data';
+SELECT opaque();
+SELECT 'prepare creator after data-only rollback prepared', last_value FROM checks;

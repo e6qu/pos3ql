@@ -18,7 +18,7 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DISTINCT row exceeds the statement arena"
+            "projected row exceeds the statement arena"
         )
     })?;
     encode_projected_into(values, out)?;

@@ -254,6 +254,49 @@ mod tests {
     use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
 
+    fn advance_test_cursor(
+        query: &mut crate::sql::cursor::CursorQuery,
+        storage: &Storage,
+        txid: u32,
+        observed_at: i64,
+        work: &Arena,
+        buffers: &mut RowCursorBuffers,
+        responder: &mut crate::pg::respond::Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        loop {
+            let mark = work.mark();
+            let result: Result<Option<bool>, SqlError> = (|| {
+                if !query.prepare_row(storage, txid, observed_at, work, buffers)? {
+                    return Ok(Some(false));
+                }
+                let invocations = crate::sql::query::RoutineInvocationState::new(work);
+                invocations.begin_attempt();
+                if !query.evaluate_predicate(storage, txid, work, None, &invocations, work)? {
+                    query.finish_row(false);
+                    return Ok(None);
+                }
+                let skipped = query.skip_row();
+                let mut projected = crate::mem::arena::ArenaList::new(work);
+                for index in 0..query.items_len() {
+                    for value in query.evaluate_item(index, storage, txid, work, None, &invocations, work)? {
+                        projected.push(*value).map_err(|_| crate::sql::eval::arena_full())?;
+                    }
+                }
+                if !skipped {
+                    responder.data_row(projected.as_slice()).map_err(|_| crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "test cursor result buffer is full"))?;
+                }
+                query.finish_row(!skipped);
+                Ok(Some(!skipped))
+            })();
+            // Results have been copied into the caller-owned typed buffer;
+            // failed output keeps the pending physical row in CursorQuery.
+            unsafe { work.rewind_to(mark) };
+            if let Some(emitted) = result? {
+                return Ok(emitted);
+            }
+        }
+    }
+
     #[test]
     fn cursor_owned_query_retains_a_physical_plan_after_owner_and_storage_moves() {
         use crate::mem::FixedBuf;
@@ -326,7 +369,9 @@ mod tests {
         let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             query
-                .bind("SELECT n+0,payload FROM retained_plan WHERE n>0", &[], &[])
+                .bind("SELECT n+0,payload FROM retained_plan WHERE n>0", &[], &[], &[],
+                    crate::sql::type_input_plans::Owner::Backend,
+                    |parser| crate::sql::type_inputs::validate_restored(parser, &storage, 0))
                 .unwrap();
             assert!(
                 query
@@ -343,7 +388,7 @@ mod tests {
         });
         assert!(rows.readable().is_empty());
         let error = crate::mem::guard::forbid_alloc(|| {
-            query.advance_source(
+            advance_test_cursor(&mut query,
                 &storage,
                 0,
                 0,
@@ -368,8 +413,7 @@ mod tests {
             rows.clear();
             crate::mem::guard::forbid_alloc(|| {
                 assert!(
-                    query
-                        .advance_source(
+                    advance_test_cursor(&mut query,
                             &storage,
                             0,
                             0,
@@ -391,8 +435,7 @@ mod tests {
             assert_eq!(decoded, [Datum::Int4(expected), Datum::Text("value")]);
         }
         assert!(
-            !query
-                .advance_source(
+            !advance_test_cursor(&mut query,
                     &storage,
                     0,
                     0,

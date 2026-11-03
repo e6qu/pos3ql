@@ -4041,6 +4041,42 @@ pub(crate) fn builtin_operator_properties(
     if ambiguous { None } else { best }
 }
 
+/// The selected procedure identity, rather than a merged volatility summary.
+pub(crate) fn builtin_operator_procedure(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> Option<i32> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let mut best = None;
+    let mut best_score = None;
+    let mut ambiguous = false;
+    for &(candidate, expected_left, expected_right, procedure) in builtin_properties::OPERATORS {
+        if candidate != name {
+            continue;
+        }
+        let Some((left_rank, _, _)) =
+            builtin_argument_properties(left.unwrap_or(0), expected_left)
+        else {
+            continue;
+        };
+        let Some((right_rank, _, _)) =
+            builtin_argument_properties(right.unwrap_or(0), expected_right)
+        else {
+            continue;
+        };
+        let score = left_rank + right_rank;
+        if best_score.is_none_or(|prior| score > prior) {
+            best_score = Some(score);
+            best = Some(procedure);
+            ambiguous = false;
+        } else if best_score == Some(score) && best != Some(procedure) {
+            ambiguous = true;
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
 /// NULLIF retains the first argument after equality overload coercion.
 /// Match exact inputs before PostgreSQL's same-category preferred types.
 pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i32), SqlError> {
@@ -4326,6 +4362,52 @@ pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool,
         return builtin_inout_cast_properties(source, target);
     }
     None
+}
+
+/// Visits the actual input/output or cast functions; binary paths visit none.
+pub(crate) fn builtin_cast_procedures(
+    source: i32,
+    target: i32,
+    mut visit: impl FnMut(i32),
+) -> Option<()> {
+    if source == super::types::oid::UNKNOWN {
+        let &(_, input, _) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == target)?;
+        visit(input);
+        return Some(());
+    }
+    if let Some(cast) = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+    {
+        match cast.method {
+            b'b' => return Some(()),
+            b'f' => {
+                visit(cast.procedure);
+                return Some(());
+            }
+            b'i' => {}
+            _ => unreachable!("PostgreSQL cast method"),
+        }
+    } else if source == target {
+        return Some(());
+    } else if ![source, target].into_iter().any(|oid| {
+        ColType::from_oid(oid).is_some_and(|ctype| super::types::type_category(ctype) == "S")
+    }) {
+        return None;
+    }
+    builtin_inout_cast_procedures(source, target, visit)
+}
+
+pub(crate) fn builtin_inout_cast_procedures(
+    source: i32,
+    target: i32,
+    mut visit: impl FnMut(i32),
+) -> Option<()> {
+    let &(_, input, _) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == target)?;
+    let &(_, _, output) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == source)?;
+    visit(output);
+    visit(input);
+    Some(())
 }
 
 pub(crate) fn builtin_inout_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {

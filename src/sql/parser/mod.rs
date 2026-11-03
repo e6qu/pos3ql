@@ -783,19 +783,15 @@ pub(crate) fn parse_type_name<'a>(
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_expression<'a>(
     sql: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
-    let expression = parser
-        .expression(0)
-        .map_err(|error| super::parse_error_to_sql(&error))?;
+    let expression = parser.expression(0).map_err(|error| super::parse_error_to_sql(&error))?;
     if parser.peeked != Tok::Eof {
-        return Err(crate::sql_err!(
-            sqlstate::SYNTAX_ERROR,
-            "trailing tokens after routine parameter default"
-        ));
+        return Err(crate::sql_err!(sqlstate::SYNTAX_ERROR, "trailing tokens after expression"));
     }
     Ok(expression)
 }
@@ -1004,8 +1000,8 @@ impl<'a> Parser<'a> {
         {
             let binding = self.type_inputs[index];
             let expression = self.arena_expr(Expr::Str(value))?;
-            if let Some(sources) = &self.type_input_sources {
-                if !sources
+            if let Some(sources) = &self.type_input_sources
+                && !sources
                     .borrow()
                     .restored
                     .as_slice()
@@ -1029,7 +1025,6 @@ impl<'a> Parser<'a> {
                             binding,
                         ))
                         .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
-                }
             }
             return self.arena_expr(Expr::BoundLiteral {
                 encoded: binding.encoded,

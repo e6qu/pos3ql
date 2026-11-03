@@ -1254,18 +1254,17 @@ impl<'a> RetainedSelect<'a> {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "retained query pipeline plumbing"
+        reason = "cursor bounds and physical row preparation share one explicit retained context"
     )]
-    pub(crate) fn advance<'work>(
+    pub(crate) fn prepare_cursor_row<'work>(
         &mut self,
         storage: &'work Storage,
         txid: u32,
         observed_at: i64,
-        params: &[Datum<'work>],
         state_arena: &'a Arena,
-        work: &'work Arena,
         buffers: &mut RowCursorBuffers,
-        responder: &mut Responder<'_>,
+        work: &'work Arena,
+        params: &[Datum<'work>],
     ) -> Result<bool, SqlError> {
         if let RowBounds::Unstarted { limit, offset } = self.bounds {
             self.bounds = RowBounds::Active {
@@ -1283,73 +1282,6 @@ impl<'a> RetainedSelect<'a> {
                 )?,
             };
         }
-        loop {
-            let work_mark = work.mark();
-            if !self.prepare_statement_row(storage, txid, observed_at, state_arena, buffers)? {
-                return Ok(false);
-            }
-            let pending = self.pending.as_ref().expect("captured cursor input row");
-            let definition = self
-                .scope
-                .defs
-                .stored(0)
-                .expect("retained source definition");
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            pending.decode(definition, &mut values)?;
-            let rowids = [Some(pending.row.rowid)];
-            let row = scan::JoinRow {
-                scope: &self.scope,
-                values: scan::JoinRowValues::Flat {
-                    values: &values,
-                    offsets: &[0],
-                },
-                rowids: &rowids,
-            };
-            let catalog = storage_catalog(storage, work, txid);
-            let hooks = EvalHooks {
-                catalog: Some(&catalog),
-                ..super::super::eval::NO_HOOKS
-            };
-            if let Some(predicate) = self.predicate
-                && !where_passes(predicate, work, params, &row, &hooks)?
-            {
-                let mark = self.pending.take().expect("filtered input row").mark;
-                unsafe {
-                    state_arena.rewind_to(mark);
-                    work.rewind_to(work_mark);
-                }
-                continue;
-            }
-            let mut projected = [Datum::Null; MAX_PROJ];
-            let width = project_row(
-                self.items,
-                &self.scope,
-                &row,
-                work,
-                params,
-                &hooks,
-                &mut projected,
-                None,
-            )?;
-            let RowBounds::Active { skip, remaining } = &mut self.bounds else {
-                unreachable!("row bounds initialized before requesting input")
-            };
-            if *skip != 0 {
-                *skip -= 1;
-                let mark = self.pending.take().expect("skipped input row").mark;
-                unsafe {
-                    state_arena.rewind_to(mark);
-                    work.rewind_to(work_mark);
-                }
-                continue;
-            }
-            emit_data_row(storage, txid, work, responder, &projected[..width])
-                .map_err(|_| super::super::cursor_result_too_large())??;
-            *remaining -= 1;
-            let mark = self.pending.take().expect("consumed input row").mark;
-            // The typed result is copied into the cursor buffer before this rewind.
-            unsafe { state_arena.rewind_to(mark) };
-            return Ok(true);
-        }
+        self.prepare_statement_row(storage, txid, observed_at, state_arena, buffers)
     }
 }

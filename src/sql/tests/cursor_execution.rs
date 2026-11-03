@@ -1,5 +1,47 @@
 use super::*;
 
+// PostgreSQL 18.6 opaque SQL-function phase oracle SQL SHA256:
+// 71df626e54f2dd353981387010aff2ce26bf2028bb44920a630526c8fc9a5993.
+// Backend cache reuse SQL SHA256:
+// 622bafc3e7ffb7f83fc3282fab8ecb0c941a1bb8f72fc87a1b382644c92b242b.
+#[test]
+fn cursor_function_plans_keep_their_owner_and_row_handoffs() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("cursor-function-input-owner-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE cursor_checks; CREATE SEQUENCE cursor_rows START 10; \
+             CREATE TABLE cursor_values(id integer); INSERT INTO cursor_values VALUES(1),(2); \
+             CREATE FUNCTION cursor_allowed(value integer) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+              PERFORM nextval('cursor_checks'); RETURN true; END$$; \
+             CREATE DOMAIN cursor_checked AS integer CHECK(cursor_allowed(VALUE)); \
+             CREATE FUNCTION cursor_constant() RETURNS cursor_checked[] LANGUAGE sql SET search_path TO public \
+              AS 'SELECT ''{1}''::cursor_checked[]'; \
+             CREATE FUNCTION cursor_row(value integer) RETURNS integer LANGUAGE plpgsql AS $$BEGIN \
+              RETURN value+nextval('cursor_rows')::integer; END$$", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "BEGIN; DECLARE values_cursor NO SCROLL CURSOR FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; SELECT last_value FROM cursor_checks", true)), ["1"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks", true)), ["{1}|11", "2"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks", true)), ["{1}|13", "2"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "CLOSE values_cursor; DECLARE values_cursor NO SCROLL CURSOR FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; FETCH ALL FROM values_cursor; \
+             SELECT last_value FROM cursor_checks; CLOSE values_cursor; COMMIT", true)),
+            ["{1}|13", "{1}|15", "2"]);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "BEGIN; DECLARE held_values NO SCROLL CURSOR WITH HOLD FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; COMMIT; \
+             FETCH ALL FROM held_values; SELECT last_value FROM cursor_checks; CLOSE held_values", true)),
+            ["{1}|15", "{1}|17", "2"]);
+    }
+}
+
 #[test]
 fn cursor_builtin_hashes_preserve_types_lengths_seeds_and_argument_effects() {
     let config = test_config("cursor-builtin-hashes");
@@ -1605,6 +1647,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
             true,
             &session.arena,
             &mut session.transaction,
+            &mut session.pool,
             &session.guc,
             &mut session.cursors,
             &mut Responder::new(&mut session.send),

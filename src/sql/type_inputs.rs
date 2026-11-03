@@ -35,10 +35,20 @@ pub(crate) enum Source {
         routine_oid: i32,
         definition_version: u64,
     },
+    SqlRoutineBody {
+        routine_oid: i32,
+        definition_version: u64,
+        specialization: u64,
+    },
     SqlRoutineCallSite {
         routine_oid: i32,
         definition_version: u64,
         callsite: usize,
+    },
+    SqlInlineAttempt {
+        routine_oid: i32,
+        definition_version: u64,
+        site: super::query::InvocationSite,
     },
     AssignmentRoutineCallSite {
         routine_oid: i32,
@@ -66,7 +76,17 @@ impl Source {
                 routine_oid,
                 definition_version,
             }
+            | Self::SqlRoutineBody {
+                routine_oid,
+                definition_version,
+                ..
+            }
             | Self::SqlRoutineCallSite {
+                routine_oid,
+                definition_version,
+                ..
+            }
+            | Self::SqlInlineAttempt {
                 routine_oid,
                 definition_version,
                 ..
@@ -96,7 +116,8 @@ impl Source {
 struct ActiveSource {
     source: Source,
     text: *const str,
-    bindings: *const [Binding<'static>],
+    bindings: *const (),
+    binding_count: usize,
 }
 
 thread_local! {
@@ -124,7 +145,8 @@ fn enter_source<'a>(
         active.replace(Some(ActiveSource {
             source,
             text: text as *const str,
-            bindings: bindings as *const [Binding<'a>] as *const [Binding<'static>],
+            bindings: bindings.as_ptr().cast(),
+            binding_count: bindings.len(),
         }))
     });
     ActiveSourceGuard {
@@ -148,6 +170,17 @@ pub(crate) fn active_source() -> Option<Source> {
     ACTIVE_SOURCE.with(|active| active.get().map(|source| source.source))
 }
 
+pub(crate) fn active_source_position(fragment: &str) -> Result<Option<(Source, usize)>, SqlError> {
+    let Some(active) = ACTIVE_SOURCE.with(core::cell::Cell::get) else { return Ok(None); };
+    // The closure-only source scope owns this text; only copied identities leave.
+    let text = unsafe { &*active.text };
+    let Some(start) = (fragment.as_ptr() as usize).checked_sub(text.as_ptr() as usize) else { return Ok(None); };
+    let end = start.checked_add(fragment.len()).ok_or_else(invalid)?;
+    if end > text.len() { return Ok(None); }
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) { return Err(invalid()); }
+    Ok(Some((active.source, start)))
+}
+
 /// An active source is borrowed only while its guard is on this thread.
 /// Returned descriptors and payloads are copied into the destination owner.
 pub(crate) fn bindings_for_active_source<'a>(
@@ -159,7 +192,9 @@ pub(crate) fn bindings_for_active_source<'a>(
     };
     // SAFETY: enter_source borrows these values until its non-Send guard is
     // dropped. No reference into that scoped owner escapes this function.
-    let (text, bindings) = unsafe { (&*active.text, &*active.bindings) };
+    let (text, bindings) = unsafe {
+        (&*active.text, core::slice::from_raw_parts(active.bindings.cast::<Binding<'_>>(), active.binding_count))
+    };
     let start = text.as_ptr() as usize;
     let end = start.checked_add(text.len()).ok_or_else(invalid)?;
     let selected_start = source_slice.as_ptr() as usize;

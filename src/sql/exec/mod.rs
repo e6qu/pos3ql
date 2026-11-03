@@ -22078,6 +22078,7 @@ impl PlpgsqlExecHost<'_> {
             engine,
             guc,
             cursors,
+            sqlprep,
             transaction_context: PlpgsqlTransactionContext::NonAtomic,
             ..
         } = self
@@ -22099,7 +22100,7 @@ impl PlpgsqlExecHost<'_> {
                 // The procedure stack cannot be replayed after transaction
                 // control. Drain this explicit boundary, promoting all earlier
                 // commits in log order before continuing the same invocation.
-                match engine.commit_txn_with_triggers(txn, guc, Some(cursors), arena, responder) {
+                match engine.commit_txn_with_triggers(txn, guc, Some(super::CursorCommitContext { cursors, plans: sqlprep, arena }), arena, responder) {
                     Err(error)
                         if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                             && txn.staged_commit().is_some() => {}
@@ -22284,7 +22285,7 @@ fn eval_procedural_expression<'a>(
                 cursors,
                 guc,
                 context.responder,
-                |storage, _work, sequences, invocations| {
+                |storage, _work, sequences, invocations, _cursors| {
                     let _scope = super::query::enter_routine_invocation_scope(Some(
                         super::query::RoutineInvocationContext::new(invocations, arena),
                     ));
@@ -24615,6 +24616,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         arena: context.arena,
                         params: query.arguments,
                         txn,
+                        sqlprep,
                         cursors,
                         guc,
                         responder,
@@ -25955,6 +25957,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             engine,
                             guc,
                             cursors,
+                            sqlprep,
                             ..
                         } = &mut context.host
                         else {
@@ -25971,11 +25974,12 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 statement.scroll,
                                 false,
                                 false,
-                                arguments,
                                 captured,
-                                context.txn,
-                                cursors,
-                                guc,
+                                &mut super::CursorStatementContext {
+                                    arena: context.arena, params: arguments,
+                                    txn: context.txn, sqlprep, cursors, guc,
+                                    responder: context.responder,
+                                },
                             )
                         };
                         let input_source = plpgsql_command_source(source, context.arena)?;
@@ -26039,7 +26043,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         let arena = context.arena;
                         let (count, rows) = {
                             let PlpgsqlExecHost::Routine {
-                                engine, cursors, ..
+                                engine, cursors, sqlprep, guc, ..
                             } = &mut context.host
                             else {
                                 return Err(sql_err!(
@@ -26051,8 +26055,10 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 name,
                                 statement.motion,
                                 statement.move_only,
-                                context.txn.txid,
-                                cursors,
+                                &mut super::CursorStatementContext {
+                                    arena, params: &[], txn: context.txn, sqlprep,
+                                    cursors, guc, responder: context.responder,
+                                },
                             )?;
                             *completed = true;
                             let rows = arena
@@ -26582,7 +26588,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             let arena = context.arena;
                             let rows = {
                                 let PlpgsqlExecHost::Routine {
-                                    engine, cursors, ..
+                                    engine, cursors, sqlprep, guc, ..
                                 } = &mut context.host
                                 else {
                                     return Err(sql_err!(
@@ -26594,8 +26600,10 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                     name,
                                     *motion,
                                     false,
-                                    context.txn.txid,
-                                    cursors,
+                                    &mut super::CursorStatementContext {
+                                        arena, params: &[], txn: context.txn, sqlprep,
+                                        cursors, guc, responder: context.responder,
+                                    },
                                 )?;
                                 arena
                                     .alloc_slice_copy(cursors.emitted())
@@ -28254,7 +28262,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                     .len()
                     .checked_mul(2)
                     .and_then(|count| count.checked_add(6))
-                    .ok_or_else(|| super::query::arena_full_pub())?;
+                    .ok_or_else(super::query::arena_full_pub)?;
                 let output = arena
                     .alloc_slice_with(count, |_| Datum::Null)
                     .map_err(|_| super::query::arena_full_pub())?;
@@ -28329,7 +28337,7 @@ fn cursor_effect_error_fields<'a>(
     let copy = |text: &str| {
         arena
             .alloc_str(text)
-            .map(|text| Datum::Text(&*text))
+            .map(|text| Datum::Text(text))
             .map_err(|_| super::query::arena_full_pub())
     };
     output[0] = copy(error.sqlstate.as_str())?;
@@ -35479,11 +35487,7 @@ pub(crate) fn resolve_routine_declaration(
                     Err(error) => return Err(error),
                 }
             }
-            super::ast::RoutineConfigValue::Current => match guc.capture_setting_value(config.name)
-            {
-                Ok(value) => StackStr::from_str(value.as_str()),
-                Err(error) => return Err(error),
-            },
+            super::ast::RoutineConfigValue::Current => StackStr::from_str(guc.capture_setting_value(config.name)?.as_str()),
         };
         if value.is_truncated() {
             return Err(sql_err!(
@@ -35584,10 +35588,7 @@ pub(crate) fn validate_routine_body(
             Err(error) => return Err(error),
         }
     };
-    let mut dependencies = match storage.empty_stored_query_dependencies(arena) {
-        Ok(dependencies) => dependencies,
-        Err(error) => return Err(error),
-    };
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     let mut creation_path = StackStr::<128>::new();
     if body_kind == crate::storage::RoutineBodyKind::String && !check_string_body {
         return Ok(ValidatedRoutineBody {
@@ -35622,10 +35623,7 @@ pub(crate) fn validate_routine_body(
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
                 let program =
-                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
-                        Ok(program) => program,
-                        Err(error) => return Err(error),
-                    };
+                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
@@ -35650,12 +35648,9 @@ pub(crate) fn validate_routine_body(
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
                     let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
-                    dependencies = match super::query::stored_routine_dependencies(
+                    dependencies = super::query::stored_routine_dependencies(
                         &program, storage, txn.txid, path, arena,
-                    ) {
-                        Ok(dependencies) => dependencies,
-                        Err(error) => return Err(error),
-                    };
+                    )?;
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
             }
@@ -35677,10 +35672,7 @@ pub(crate) fn validate_routine_body(
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
                 let program =
-                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
-                        Ok(program) => program,
-                        Err(error) => return Err(error),
-                    };
+                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
                         .then_some(result_column_count)
@@ -35705,11 +35697,7 @@ pub(crate) fn validate_routine_body(
                         namespace_count += 1;
                     }
                 }
-                if let Err(error) =
-                    validate_plpgsql_routine_namespace(&program, &namespace[..namespace_count])
-                {
-                    return Err(error);
-                }
+                validate_plpgsql_routine_namespace(&program, &namespace[..namespace_count])?;
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
             } else {
@@ -35732,12 +35720,9 @@ pub(crate) fn validate_routine_body(
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
                     let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
-                    dependencies = match super::query::stored_routine_dependencies(
+                    dependencies = super::query::stored_routine_dependencies(
                         &program, storage, txn.txid, path, arena,
-                    ) {
-                        Ok(dependencies) => dependencies,
-                        Err(error) => return Err(error),
-                    };
+                    )?;
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
             }
@@ -35777,15 +35762,9 @@ pub(crate) fn validate_routine_body(
                     ));
                 }
                 let program =
-                    match parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure) {
-                        Ok(program) => program,
-                        Err(error) => return Err(error),
-                    };
+                    parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure)?;
                 let program =
-                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
-                        Ok(program) => program,
-                        Err(error) => return Err(error),
-                    };
+                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
@@ -35805,12 +35784,9 @@ pub(crate) fn validate_routine_body(
                     let raw_path = guc.search_path();
                     let user = super::eval::funcs::system::session_user_owned();
                     let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
-                    dependencies = match super::query::stored_routine_dependencies(
+                    dependencies = super::query::stored_routine_dependencies(
                         &program, storage, txn.txid, path, arena,
-                    ) {
-                        Ok(dependencies) => dependencies,
-                        Err(error) => return Err(error),
-                    };
+                    )?;
                     creation_path = StackStr::from_str(raw_path.as_str());
                 }
             }

@@ -72,7 +72,7 @@ pub(crate) use cte::captured_type_oid;
 mod dependencies;
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
-pub(crate) use type_inputs::capture_contextual_type_inputs;
+pub(crate) use type_inputs::{capture_contextual_type_inputs, visit_planner_calls};
 pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
 pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
@@ -898,6 +898,7 @@ pub(crate) struct PendingRoutineInvocation<'a> {
     pub arguments: &'a [u8],
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
+    pub plan_owner: super::type_input_plans::Owner,
 }
 
 #[derive(Clone, Copy)]
@@ -1249,6 +1250,7 @@ impl<'a> RoutineInvocationState<'a> {
         arguments: &[Datum],
         statement_arena: &'a Arena,
         query_arena: &'query Arena,
+        source_position: Option<InvocationSite>,
     ) -> Result<Option<Datum<'query>>, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1263,7 +1265,8 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
         self.pending.set(Some(PendingRoutineInvocation {
-            source_position: input_progress::invocation_site(),
+            plan_owner: super::type_input_plans::owner()?,
+            source_position,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1297,6 +1300,7 @@ impl<'a> RoutineInvocationState<'a> {
             return super::exec::detach_routine_datum(value, query_arena);
         }
         self.pending.set(Some(PendingRoutineInvocation {
+            plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
             target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
@@ -1347,6 +1351,7 @@ impl<'a> RoutineInvocationState<'a> {
             return Ok(Some(rows));
         }
         self.pending.set(Some(PendingRoutineInvocation {
+            plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
@@ -2769,6 +2774,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        let source_position = input_progress::invocation_site();
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
@@ -2816,10 +2822,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     self.statement_arena
                         .expect("routine invocation state has statement arena"),
                     arena,
+                    source_position,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(routine, arguments, statement_arena, arena);
+                return invocations.resolve(routine, arguments, statement_arena, arena, source_position);
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2861,10 +2868,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     self.statement_arena
                         .expect("routine invocation state has statement arena"),
                     arena,
+                    source_position,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(routine, arguments, statement_arena, arena);
+                return invocations.resolve(routine, arguments, statement_arena, arena, source_position);
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -6866,7 +6874,7 @@ pub struct UpdatableView<'a> {
     /// Durable defaults for the exposed columns, applied before base-table
     /// defaults when INSERT leaves a view column unspecified.
     pub defaults: crate::storage::ViewColumns,
-    pub default_inputs: &'a [(
+    pub(crate) default_inputs: &'a [(
         crate::storage::StoredInputSection,
         &'a [super::type_inputs::Binding<'a>],
     )],
@@ -7096,7 +7104,7 @@ pub fn describe_query<'a>(
 
 /// Resolves a stored view body's output under the creator's captured search
 /// path, rather than the session path of the client inspecting the view.
-pub fn describe_query_under<'a>(
+pub(crate) fn describe_query_under<'a>(
     sql: &'a str,
     storage: &'a Storage,
     txid: u32,
@@ -7112,6 +7120,7 @@ pub fn describe_query_under<'a>(
     describe_select(select, storage, txid, arena, out)
 }
 
+#[expect(clippy::too_many_arguments, reason = "stored query metadata uses its captured source, path, and dependencies")]
 pub(crate) fn describe_stored_query<'a>(
     sql: &'a str,
     input_source: &str,

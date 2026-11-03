@@ -23,6 +23,7 @@ pub(crate) struct CursorQuery {
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
     pub(crate) sequence_replay: crate::sql::sequence::SequenceReplayState,
     arena: Arena,
+    owner: crate::sql::type_input_plans::Owner,
 }
 
 struct BoundQuery<'a> {
@@ -61,6 +62,7 @@ impl CursorQuery {
             retained: None,
             sequence_replay: crate::sql::sequence::SequenceReplayState::empty(),
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
+            owner: crate::sql::type_input_plans::Owner::Unlocated,
         })
     }
 
@@ -69,7 +71,10 @@ impl CursorQuery {
         self.bound = None;
         self.sequence_replay = crate::sql::sequence::SequenceReplayState::empty();
         self.arena.reset();
+        self.owner = crate::sql::type_input_plans::Owner::Unlocated;
     }
+
+    pub(crate) fn is_bound(&self) -> bool { self.bound.is_some() }
 
     pub(crate) fn bind(
         &mut self,
@@ -77,9 +82,11 @@ impl CursorQuery {
         params: &[Datum],
         locals: &[CursorLocal],
         inputs: &[crate::sql::type_inputs::Binding<'_>],
+        owner: crate::sql::type_input_plans::Owner,
         validate: impl FnOnce(&crate::sql::parser::Parser<'_>) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
         self.clear();
+        self.owner = owner;
         let full = query_full;
         let source = self.arena.alloc_str(sql).map_err(|_| full())?;
         let values = copy_values(&self.arena, params)?;
@@ -200,7 +207,7 @@ impl CursorQuery {
             return Ok(false);
         };
         let mark = self.arena.mark();
-        let source = crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+        let source = crate::sql::type_input_plans::with_owner(self.owner, || crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
             crate::sql::query::RetainedSelect::open(
                 storage,
                 txid,
@@ -209,7 +216,16 @@ impl CursorQuery {
                 &self.arena,
                 responder,
             )
-        })?;
+        }));
+        let source = match source {
+            Ok(source) => source,
+            Err(error) => {
+                // No retained source escaped; pending invocation arguments are
+                // copied into the caller's invocation frame before yielding.
+                unsafe { self.arena.rewind_to(mark) };
+                return Err(error);
+            }
+        };
         match source {
             Some(source) => {
                 // Scope names and arrays borrow this allocation; definitions,
@@ -231,32 +247,47 @@ impl CursorQuery {
         }
     }
 
-    pub(crate) fn advance_source(
-        &mut self,
-        storage: &crate::storage::Storage,
-        txid: u32,
-        observed_at: i64,
-        work: &Arena,
-        buffers: &mut crate::storage::RowCursorBuffers,
-        responder: &mut crate::pg::respond::Responder<'_>,
+    pub(crate) fn prepare_row(
+        &mut self, storage: &crate::storage::Storage, txid: u32, observed_at: i64,
+        work: &Arena, buffers: &mut crate::storage::RowCursorBuffers,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
         let source = self.retained.as_mut().expect("retained cursor input");
-        // advance retains only bytes in this arena's allocation. It never
-        // stores this temporary reference to the movable Arena object itself.
+        // Retention stores bytes in this allocation, never the movable Arena object.
         let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
-        crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
-            source.advance(
-                storage,
-                txid,
-                observed_at,
-                bound.params,
-                arena,
-                work,
-                buffers,
-                responder,
-            )
-        })
+        crate::sql::type_input_plans::with_owner(self.owner, || crate::sql::exec::with_bound_parameter_types(bound.parameter_types, ||
+            source.prepare_cursor_row(storage, txid, observed_at, arena, buffers, work, bound.params)))
+    }
+
+    pub(crate) fn evaluate_predicate<'frame>(
+        &self, storage: &crate::storage::Storage, txid: u32, work: &Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        invocations: &crate::sql::query::RoutineInvocationState<'frame>, frame: &'frame Arena,
+    ) -> Result<bool, SqlError> {
+        let bound = self.bound.as_ref().expect("bound cursor query");
+        crate::sql::type_input_plans::with_owner(self.owner, || crate::sql::exec::with_bound_parameter_types(bound.parameter_types, ||
+            self.retained.as_ref().expect("retained cursor input").evaluate_statement_predicate(
+                storage, txid, work, bound.params, sequences, Some(invocations), frame)))
+    }
+
+    pub(crate) fn items_len(&self) -> usize { self.retained.as_ref().expect("retained cursor input").statement_items_len() }
+
+    #[expect(clippy::too_many_arguments, reason = "cursor row expressions retain typed values in their external invocation frame")]
+    pub(crate) fn evaluate_item<'frame>(
+        &self, index: usize, storage: &crate::storage::Storage, txid: u32, work: &Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        invocations: &crate::sql::query::RoutineInvocationState<'frame>, frame: &'frame Arena,
+    ) -> Result<&'frame [Datum<'frame>], SqlError> {
+        let bound = self.bound.as_ref().expect("bound cursor query");
+        crate::sql::type_input_plans::with_owner(self.owner, || crate::sql::exec::with_bound_parameter_types(bound.parameter_types, ||
+            self.retained.as_ref().expect("retained cursor input").evaluate_statement_item(
+                index, storage, txid, work, bound.params, sequences, Some(invocations), frame)))
+    }
+
+    pub(crate) fn skip_row(&mut self) -> bool { self.retained.as_mut().expect("retained cursor input").skip_statement_row() }
+
+    pub(crate) fn finish_row(&mut self, emitted: bool) {
+        self.retained.as_mut().expect("retained cursor input").finish_statement_row(&self.arena, emitted);
     }
 
     pub(crate) fn with_query<R>(
@@ -269,10 +300,10 @@ impl CursorQuery {
                 "cursor query is not bound"
             )
         })?;
-        Ok(crate::sql::exec::with_bound_parameter_types(
+        Ok(crate::sql::type_input_plans::with_owner(self.owner, || crate::sql::exec::with_bound_parameter_types(
             bound.parameter_types,
             || use_query(bound.statement, bound.params, &self.arena),
-        ))
+        )))
     }
 }
 
@@ -297,6 +328,7 @@ mod tests {
                 &[Datum::Text(&text), Datum::Record(&fields)],
                 &[],
                 &[],
+                crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
         })
@@ -323,7 +355,7 @@ mod tests {
             moved.with_query(|_, _, _| ()).unwrap_err().sqlstate,
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
         );
-        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[], &[], &[], |_| Ok(())))
+        crate::mem::guard::forbid_alloc(|| moved.bind("SELECT 42", &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(())))
             .unwrap();
         moved
             .with_query(|_, params, _| assert!(params.is_empty()))
@@ -341,7 +373,7 @@ mod tests {
         let params = [Datum::Null; 101];
         crate::mem::guard::forbid_alloc(|| {
             with_bound_parameter_types(&types, || {
-                query.bind("SELECT $101", &params, &[], &[], |_| Ok(()))
+                query.bind("SELECT $101", &params, &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(()))
             })
         })
         .unwrap();
@@ -412,7 +444,7 @@ mod tests {
             },
         ];
         crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT r.label, d, found", &[], &locals, &[], |_| Ok(()))
+            query.bind("SELECT r.label, d, found", &[], &locals, &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(()))
         })
         .unwrap();
         text.clear();
@@ -471,6 +503,7 @@ mod tests {
                 &[Datum::Record(&fields)],
                 &[local],
                 &[],
+                crate::sql::type_input_plans::Owner::Unlocated,
                 |_| Ok(()),
             )
         })
@@ -541,6 +574,7 @@ mod tests {
                         value: Datum::Null,
                     }],
                     &[],
+                    crate::sql::type_input_plans::Owner::Unlocated,
                     |_| Ok(()),
                 )
                 .unwrap();
@@ -600,24 +634,24 @@ mod tests {
         let mut query = CursorQuery::new(&mut budget, 4096).unwrap();
         assert_eq!(
             query
-                .bind("SELECT 1; SELECT 2", &[], &[], &[], |_| Ok(()))
+                .bind("SELECT 1; SELECT 2", &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(()))
                 .unwrap_err()
                 .sqlstate,
             sqlstate::INVALID_CURSOR_DEFINITION
         );
         let wide = "x".repeat(8192);
         let error =
-            crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[], &[], |_| Ok(())))
+            crate::mem::guard::forbid_alloc(|| query.bind(&wide, &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(())))
                 .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
         let error = crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT $1", &[Datum::Text(&wide)], &[], &[], |_| Ok(()))
+            query.bind("SELECT $1", &[Datum::Text(&wide)], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(()))
         })
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("cursor_query_bytes"));
-        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[], &[], |_| Ok(())))
+        crate::mem::guard::forbid_alloc(|| query.bind("SELECT 1", &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(())))
             .unwrap();
     }
     #[test]
@@ -719,7 +753,7 @@ mod tests {
                 };
                 assert_eq!(bound_parameter_type_oid(1), Some(123456));
                 query
-                    .bind("SELECT $1", &[Datum::Null], &[], &[], |_| Ok(()))
+                    .bind("SELECT $1", &[Datum::Null], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(()))
                     .unwrap();
                 drop(scope);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
@@ -752,7 +786,7 @@ mod tests {
             let values = vec!["1"; fields].join(",");
             let sql = format!("SELECT ROW((ROW({values})).*, 1)");
             crate::mem::guard::forbid_alloc(|| {
-                query.bind(&sql, &[], &[], &[], |_| Ok(())).unwrap();
+                query.bind(&sql, &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(())).unwrap();
                 query
                     .with_query(|statement, _, _| {
                         let CursorStatement::Select(select) = statement else {

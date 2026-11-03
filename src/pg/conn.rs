@@ -795,6 +795,7 @@ impl Conn {
         if !self.txn.is_active() {
             self.cursors.on_rollback();
         }
+        self.sqlprep.routine_inputs.retire_invalid_cursors(|generation| self.cursors.contains_plan_owner(generation));
         engine.finish_backend_statement(&self.txn, self.id);
         let mut synchronized = extended && parked_sync;
         while extended && !synchronized && self.recv.len() >= 5 {
@@ -1937,7 +1938,7 @@ impl Conn {
                             engine.commit_txn_with_triggers(
                                 &mut self.txn,
                                 &self.guc,
-                                Some(&mut self.cursors),
+                                Some(crate::sql::CursorCommitContext { cursors: &mut self.cursors, plans: &mut self.sqlprep, arena: &self.arena }),
                                 &self.arena,
                                 &mut responder,
                             )
@@ -2174,6 +2175,7 @@ impl Conn {
                 result_format == 1,
                 &self.arena,
                 &mut self.txn,
+                &mut self.sqlprep,
                 &self.guc,
                 &mut self.cursors,
                 &mut responder,
@@ -2792,7 +2794,7 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
-                        Some(&mut self.cursors),
+                        Some(crate::sql::CursorCommitContext { cursors: &mut self.cursors, plans: &mut self.sqlprep, arena: &self.arena }),
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {

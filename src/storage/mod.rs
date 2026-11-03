@@ -34,7 +34,7 @@ pub(crate) use database_clone_positions::{
 mod matview_lifecycles;
 mod query_lifecycles;
 mod type_inputs;
-pub use type_inputs::StoredTypeInputs;
+pub(crate) use type_inputs::StoredTypeInputs;
 pub(crate) use type_inputs::{StoredInputSection, StoredInputSource};
 mod query_relation_sources;
 pub(crate) use query_relation_sources::RelationReference;

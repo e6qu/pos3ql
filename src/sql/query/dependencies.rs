@@ -1489,17 +1489,19 @@ pub(crate) fn visit_dml_assignment_types(
     )
 }
 
+type AssignmentContextVisit<'visit> = dyn FnMut(
+    &Expr<'_>,
+    &crate::storage::ColumnMeta,
+    &dyn ColTypeResolver,
+) -> Result<(), SqlError> + 'visit;
+
 pub(super) fn visit_dml_assignment_contexts(
     statement: &Stmt<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
-    visit: &mut dyn FnMut(
-        &Expr<'_>,
-        &crate::storage::ColumnMeta,
-        &dyn ColTypeResolver,
-    ) -> Result<(), SqlError>,
+    visit: &mut AssignmentContextVisit<'_>,
 ) -> Result<(), SqlError> {
     visit_dml_assignment_inputs(
         statement,
@@ -1526,21 +1528,22 @@ pub(super) struct AssignmentInput<'a> {
     ordinal: usize,
 }
 
+type AssignmentGroupVisit<'visit> = dyn FnMut(
+    &[AssignmentInput<'_>],
+    &dyn ColTypeResolver,
+) -> Result<(), SqlError> + 'visit;
+
 pub(super) fn visit_dml_assignment_groups(
     statement: &Stmt<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
-    visit: &mut dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError>,
+    visit: &mut AssignmentGroupVisit<'_>,
 ) -> Result<(), SqlError> {
     visit_dml_assignment_inputs(statement, storage, txid, arena, outer, true, visit)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shared schema authority for streaming and grouped assignment analysis"
-)]
 fn visit_dml_assignment_inputs(
     statement: &Stmt<'_>,
     storage: &Storage,
@@ -1548,7 +1551,7 @@ fn visit_dml_assignment_inputs(
     arena: &Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
     grouped: bool,
-    visit: &mut dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError>,
+    visit: &mut AssignmentGroupVisit<'_>,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {

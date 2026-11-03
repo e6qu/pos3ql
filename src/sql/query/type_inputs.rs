@@ -12,6 +12,7 @@ use crate::sql_err;
 use crate::storage::{NamedTypeKind, RoutineCallKind, RoutineCallSelection, Storage};
 
 type Visit<'a> = dyn FnMut(&Expr<'_>, i32, i32, InputKind) -> Result<(), SqlError> + 'a;
+type PlannerVisit<'a> = dyn FnMut(&Expr<'_>, &dyn ColTypeResolver) -> Result<(), SqlError> + 'a;
 
 // Discovery can borrow storage briefly even when caller values live for the
 // entire execution. This adapter exposes the same declared identities only.
@@ -98,6 +99,7 @@ pub(crate) fn capture_contextual_expression_type_inputs<'a>(
             txid,
             arena,
             visit,
+            planner: None,
         };
         walker.expression(expression, columns, &metadata)
     })
@@ -126,6 +128,7 @@ pub(crate) fn capture_procedural_statement_type_inputs<'a>(
             txid,
             arena,
             visit,
+            planner: None,
         };
         match statement {
             Stmt::Select(select) => walker.select(select, Some(&outer), None),
@@ -369,6 +372,7 @@ fn discover_defaults(
         txid,
         arena,
         visit: &mut translate,
+        planner: None,
     };
     walker.expression(expression, &columns, &crate::sql::eval::NoColumns)?;
     walker.input(expression, target, type_mod)
@@ -386,8 +390,35 @@ fn discover(
         txid,
         arena,
         visit,
+        planner: None,
     };
     walker.statement(statement)
+}
+
+
+/// Planning visits selected expression calls with schema metadata only. The
+/// callback must copy its facts before the scoped column resolver is dropped.
+pub(crate) fn visit_planner_calls<'a>(
+    statement: &Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    visit: &mut PlannerVisit<'_>,
+) -> Result<(), SqlError> {
+    let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
+    let mut walker = Walker { storage, txid, arena, visit: &mut ignore, planner: Some(visit) };
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let empty = crate::sql::eval::NoColumns;
+    let outer = outer.unwrap_or(&empty);
+    let columns = RuntimeColumnTypes { row: outer, catalog: Some(&catalog) };
+    let metadata = MetadataOnly { row: outer, columns: &columns };
+    match statement {
+        Stmt::Select(select) => walker.select(select, Some(&metadata), None),
+        Stmt::SetQuery(query) => walker.set_tree(query.body, Some(&metadata)),
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => walker.dml(statement, Some(&metadata)),
+        _ => walker.statement(statement),
+    }
 }
 
 struct Walker<'a, 'v, 'callback> {
@@ -395,6 +426,7 @@ struct Walker<'a, 'v, 'callback> {
     txid: u32,
     arena: &'a Arena,
     visit: &'v mut Visit<'callback>,
+    planner: Option<&'v mut PlannerVisit<'callback>>,
 }
 
 impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
@@ -410,6 +442,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments, reason = "routine input analysis preserves named/variadic syntax, procedure kind and declared columns")]
     fn call(
         &mut self,
         name: &str,
@@ -562,6 +595,31 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
+        if self.planner.is_some() {
+            if let Expr::Case { operand: None, whens, otherwise, .. } = expression {
+                for (condition, result) in *whens {
+                    self.expression(condition, columns, row)?;
+                    match condition {
+                        Expr::Bool(false) | Expr::Null => continue,
+                        Expr::Bool(true) => return self.expression(result, columns, row),
+                        _ => self.expression(result, columns, row)?,
+                    }
+                }
+                if let Some(otherwise) = otherwise {
+                    self.expression(otherwise, columns, row)?;
+                }
+                return Ok(());
+            }
+            if let Expr::Call { kind: ast::CallKind::SqlSyntax, name: "coalesce", args, .. } = expression {
+                for argument in *args {
+                    self.expression(argument, columns, row)?;
+                    if matches!(argument, Expr::Bool(_) | Expr::Int(_) | Expr::Str(_)) {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+        }
         match expression {
             Expr::Subquery(select)
             | Expr::Exists(select)
@@ -581,6 +639,12 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         super::walk_children(expression, &mut |child| {
             self.expression(child, columns, row)
         })?;
+        if let Some(planner) = &mut self.planner {
+            if matches!(expression, Expr::Call { kind: ast::CallKind::Routine, .. }) {
+                planner(expression, columns)?;
+            }
+            return Ok(());
+        }
         if let Expr::Cast {
             operand: Expr::Str(_),
             type_name,
@@ -638,15 +702,33 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     .map_err(|_| super::arena_full())?,
                 None => table.table,
             };
-            self.call(
-                name,
-                None,
-                arguments,
-                table.func_argument_names,
-                table.func_variadic,
-                false,
-                columns,
-            )?;
+            if let Some(planner) = &mut self.planner {
+                planner(&Expr::Call {
+                    kind: ast::CallKind::Routine,
+                    name,
+                    bound_oid: None,
+                    bound_strict: None,
+                    source_position: table.func_source_position,
+                    args: arguments,
+                    argument_names: table.func_argument_names,
+                    variadic: table.func_variadic,
+                    star: false,
+                    distinct: false,
+                    order_by: &[],
+                    over: None,
+                    filter: None,
+                }, columns)?;
+            } else {
+                self.call(
+                    name,
+                    None,
+                    arguments,
+                    table.func_argument_names,
+                    table.func_variadic,
+                    false,
+                    columns,
+                )?;
+            }
         }
         if let Some(group) = table.rows_from {
             for table in group {
@@ -706,17 +788,15 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 if matches!(item, SelectItem::Expr { .. })
                     && let Some((target, type_mod)) =
                         targets.and_then(|targets| targets.get(output_index))
+                    && matches!(expression, Expr::Str(_))
+                    && matches!(
+                        NamedTypeKind::from_oid(*target),
+                        Some((NamedTypeKind::Domain, _, true))
+                    )
                 {
-                    if matches!(expression, Expr::Str(_))
-                        && matches!(
-                            NamedTypeKind::from_oid(*target),
-                            Some((NamedTypeKind::Domain, _, true))
-                        )
-                    {
-                        target_inputs
-                            .push((*expression, *target, *type_mod))
-                            .map_err(|_| super::arena_full())?;
-                    }
+                    target_inputs
+                        .push((*expression, *target, *type_mod))
+                        .map_err(|_| super::arena_full())?;
                 }
                 self.expression(expression, &columns, &row)?;
             }

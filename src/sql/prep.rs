@@ -410,7 +410,7 @@ impl SqlPreparedPool {
         let types = arena
             .alloc_slice_with(length, |_| 0u8)
             .map_err(|_| super::eval::arena_full())?;
-        for (out, oid) in types.chunks_exact_mut(4).zip(parameter_types) {
+        for (out, oid) in types.as_chunks_mut::<4>().0.iter_mut().zip(parameter_types) {
             out.copy_from_slice(&oid.to_le_bytes());
         }
         let key = arena

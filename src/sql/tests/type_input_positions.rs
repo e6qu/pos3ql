@@ -263,3 +263,49 @@ fn sql_procedure_inputs_keep_backend_and_stored_definition_lifetimes_through_rec
         }
     }
 }
+
+// PostgreSQL 18.6 SQL SHA256:
+// 9142d2785fc9532152ee23a1daf38adad5d0ceeab4d7133f614843cdc4e33579.
+#[test]
+fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("cursor-inline-input-phase-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE phase_checks; CREATE TYPE phase_choice AS ENUM('a'); \
+             CREATE TABLE phase_audit(value phase_choice); CREATE TABLE phase_mutations(id integer); \
+             CREATE TABLE phase_empty(id integer); \
+             CREATE FUNCTION phase_allowed(value phase_choice) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+              PERFORM nextval('phase_checks'); INSERT INTO phase_audit VALUES(value); RETURN true; END$$; \
+             CREATE DOMAIN phase_checked AS phase_choice CHECK(phase_allowed(VALUE)); \
+             CREATE FUNCTION phase_plain() RETURNS phase_checked[] LANGUAGE sql AS 'SELECT ''{a}''::phase_checked[]'; \
+             CREATE FUNCTION phase_opaque() RETURNS phase_checked[] LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::phase_checked[]'; \
+             CREATE FUNCTION phase_where() RETURNS phase_checked[] LANGUAGE sql AS 'SELECT ''{a}''::phase_checked[] WHERE true'; \
+             CREATE FUNCTION phase_dml() RETURNS phase_checked[] LANGUAGE sql AS 'INSERT INTO phase_mutations VALUES(1) RETURNING ''{a}''::phase_checked[]'; \
+             CREATE FUNCTION phase_strict(value integer) RETURNS phase_checked[] LANGUAGE sql STRICT AS 'SELECT ''{a}''::phase_checked[]'", true);
+        let counter = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END, \
+             (SELECT count(*) FROM phase_audit),(SELECT count(*) FROM phase_mutations) FROM phase_checks";
+        for (query, declared, fetched) in [
+            ("SELECT CASE WHEN false THEN phase_plain() ELSE NULL END FROM generate_series(1,2)", "0|0|0", "0|0|0"),
+            ("SELECT phase_plain() FROM generate_series(1,0)", "1|1|0", "1|1|0"),
+            ("SELECT phase_plain() WHERE false", "1|1|0", "1|1|0"),
+            ("SELECT phase_opaque() FROM generate_series(1,0)", "0|0|0", "0|0|0"),
+            ("SELECT phase_where()", "1|1|0", "2|2|0"),
+            ("SELECT phase_dml()", "1|1|0", "2|2|1"),
+            ("SELECT phase_strict(NULL)", "0|0|0", "0|0|0"),
+            ("SELECT phase_strict(id) FROM phase_empty", "1|1|0", "1|1|0"),
+            ("SELECT phase_strict(id) FROM (VALUES(1)) source(id)", "1|1|0", "2|2|0"),
+        ] {
+            session.success(&mut engine,
+                "ALTER SEQUENCE phase_checks RESTART WITH 1; TRUNCATE phase_audit,phase_mutations; BEGIN", true);
+            session.success(&mut engine, &format!("DECLARE phase_cursor NO SCROLL CURSOR FOR {query}"), true);
+            assert_eq!(data_rows(&session.success(&mut engine, counter, true)), [declared], "DECLARE {query}");
+            session.success(&mut engine, "FETCH ALL FROM phase_cursor", true);
+            assert_eq!(data_rows(&session.success(&mut engine, counter, true)), [fetched], "FETCH {query}");
+            session.success(&mut engine, "CLOSE phase_cursor; COMMIT", true);
+        }
+    }
+}

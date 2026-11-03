@@ -5951,15 +5951,15 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
         catalog[3].ddl_state = CatalogDdlState::PendingCreate { txid: 7 };
     }
     crate::mem::guard::forbid_alloc(|| {
-        let slots = |name, transaction, kind| {
-            let mut candidates = storage.routine_candidates("public", name, transaction, kind);
-            let candidate = candidates.next().map(|(slot, _)| {
-                assert!(storage.routines.try_lock().is_ok());
+        let selected = |name, transaction, kind| {
+            let qualified = stack_format!(130, "public.{}", name);
+            let selected =
+                storage.select_routine_call(qualified.as_str(), &[], &[], false, transaction, kind);
+            assert!(storage.routines.try_lock().is_ok());
+            if let RoutineCallSelection::Stored(slot) = selected {
                 assert!(storage.routine_slot_visible_to(slot, transaction));
-                slot
-            });
-            assert!(candidates.next().is_none());
-            candidate
+            }
+            selected
         };
         assert_eq!(
             storage.routine_identity_for(1, 0).unwrap().name.as_str(),
@@ -5976,31 +5976,31 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
         assert!(storage.routine_identity_for(2, 7).is_none());
         assert!(storage.routine_identity_for(3, 0).is_none());
         assert!(storage.routine_identity_for(3, 7).is_some());
-        assert_eq!(slots("probe", 0, RoutineCallKind::Scalar), Some(1));
-        assert_eq!(slots("probe", 7, RoutineCallKind::Scalar), Some(3));
-        assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), Some(1));
-        assert_eq!(slots("renamed", 0, RoutineCallKind::Scalar), None);
-        assert_eq!(slots("probe", 0, RoutineCallKind::Procedure), None);
-        assert_eq!(slots("absent", 0, RoutineCallKind::Scalar), None);
         assert_eq!(
-            storage.routine_slot_in("public", "renamed", &[], 7, RoutineCallKind::Scalar),
-            Some(1)
+            selected("probe", 0, RoutineCallKind::Scalar),
+            RoutineCallSelection::Stored(1)
         );
         assert_eq!(
-            storage.routine_slot_in_oids("public", "renamed", &[], 7, RoutineCallKind::Scalar),
-            Some(1)
+            selected("probe", 7, RoutineCallKind::Scalar),
+            RoutineCallSelection::Stored(3)
         );
         assert_eq!(
-            storage.routine_slot_in_named_oids(
-                "public",
-                "renamed",
-                &[],
-                &[],
-                false,
-                7,
-                RoutineCallKind::Scalar
-            ),
-            Some(1)
+            selected("renamed", 7, RoutineCallKind::Scalar),
+            RoutineCallSelection::Stored(1)
+        );
+        assert_eq!(
+            selected("renamed", 0, RoutineCallKind::Scalar),
+            RoutineCallSelection::Absent
+        );
+        assert_eq!(
+            selected("probe", 0, RoutineCallKind::Procedure),
+            RoutineCallSelection::WrongKind {
+                is_procedure: false
+            }
+        );
+        assert_eq!(
+            selected("absent", 0, RoutineCallKind::Scalar),
+            RoutineCallSelection::Absent
         );
         {
             let mut catalog = storage.routines.lock().unwrap();
@@ -6009,18 +6009,37 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
             catalog[1].parameters[0].ctype = ColType::Int4;
             catalog[1].parameter_count = 1;
         }
-        let (retained_slot, retained) = storage
-            .routine_candidates("public", "renamed", 7, RoutineCallKind::Scalar)
-            .next()
-            .unwrap();
+        let RoutineCallSelection::Stored(retained_slot) = storage.select_routine_call(
+            "public.renamed",
+            &[],
+            &[crate::sql::types::oid::INT4],
+            false,
+            7,
+            RoutineCallKind::Scalar,
+        ) else {
+            panic!("the visible typed routine must be selected");
+        };
+        let retained = {
+            let catalog = storage.routines.lock().unwrap();
+            RoutineInputSignature::from_definition(&catalog[retained_slot], 7)
+        };
+        assert!(storage.routines.try_lock().is_ok());
         {
             let mut catalog = storage.routines.lock().unwrap();
             catalog[1].ddl_state = CatalogDdlState::Absent;
             catalog[1].arguments[0].ctype = ColType::Text;
+            catalog[1].parameters[0].ctype = ColType::Text;
         }
         assert_eq!(retained_slot, 1);
-        assert_eq!(retained.arguments()[0].ctype, ColType::Int4);
-        assert_eq!(slots("renamed", 7, RoutineCallKind::Scalar), None);
+        assert_eq!(retained.arguments[0].ctype, ColType::Int4);
+        assert_eq!(
+            retained.parameter_for_input(0).unwrap().ctype,
+            ColType::Int4
+        );
+        assert_eq!(
+            selected("renamed", 7, RoutineCallKind::Scalar),
+            RoutineCallSelection::Absent
+        );
         assert_eq!(storage.routine_entries().count(), 4);
     });
 }

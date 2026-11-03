@@ -30,27 +30,33 @@ fn stage_foreign_record(
                 match change {
                     PreparedForeignChange::Unchanged => {}
                     PreparedForeignChange::Created => {
-                        transaction.record_ddl(DdlUndo::$created(slot as u32))?
+                        transaction.record_ddl(storage, DdlUndo::$created(slot as u32))?
                     }
                     PreparedForeignChange::Dropped => {
-                        transaction.record_ddl(DdlUndo::$dropped(slot as u32))?
+                        transaction.record_ddl(storage, DdlUndo::$dropped(slot as u32))?
                     }
                     PreparedForeignChange::Changed {
                         definition,
                         ownership,
                     } => {
                         if let Some(prior) = definition {
-                            transaction.record_ddl(DdlUndo::$altered {
-                                slot: slot as u32,
-                                prior,
-                            })?;
+                            transaction.record_ddl(
+                                storage,
+                                DdlUndo::$altered {
+                                    slot: slot as u32,
+                                    prior,
+                                },
+                            )?;
                         }
                         if let Some(prior) = ownership {
-                            transaction.record_ddl(DdlUndo::ForeignOwnerChanged {
-                                class: ForeignObjectClass::$class,
-                                slot: slot as u32,
-                                prior,
-                            })?;
+                            transaction.record_ddl(
+                                storage,
+                                DdlUndo::ForeignOwnerChanged {
+                                    class: ForeignObjectClass::$class,
+                                    slot: slot as u32,
+                                    prior,
+                                },
+                            )?;
                         }
                     }
                 }

@@ -24,6 +24,9 @@ compiler gate alone does not establish their correctness.
 Bind preparation also requires parameter-error timing, retained-value and
 cancelled-portal regressions; cache invalidation needs PostgreSQL comparisons
 across schema changes and transaction boundaries.
+Invalidation regressions also cover retained object identities, pending drops,
+slot reuse and allocation-free delivery; nominally passing compiler checks
+cannot substitute for those runtime comparisons.
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

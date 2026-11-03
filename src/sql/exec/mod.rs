@@ -760,7 +760,7 @@ pub(crate) use describe::{
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
-    routine_parameter_depth, with_bound_parameter_types,
+    routine_parameter_collation, routine_parameter_depth, with_bound_parameter_types,
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
@@ -1061,7 +1061,10 @@ fn ensure_temporary_namespace(
 ) -> Result<(), SqlError> {
     if persistence == crate::storage::RelationPersistence::Temporary
         && let Some(identity) = storage.create_temporary_namespace(txn.txid)?
-        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::TemporaryNamespaceCreated(identity))
+        && let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::TemporaryNamespaceCreated(identity),
+        )
     {
         storage.finish_temporary_namespace(
             identity,
@@ -1344,7 +1347,7 @@ fn create_table_kind(
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Created(slot as u32)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::Created(slot as u32)) {
                 if let Some(binding) = foreign_slot {
                     storage.foreign_catalog_rollback_create(
                         crate::storage::foreign::ForeignObjectClass::Table,
@@ -1355,8 +1358,10 @@ fn create_table_kind(
                 return sql_fail(e);
             }
             if let Some(binding) = foreign_slot
-                && let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::ForeignTableCreated(binding as u32))
+                && let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::ForeignTableCreated(binding as u32),
+                )
             {
                 storage.foreign_catalog_rollback_create(
                     crate::storage::foreign::ForeignObjectClass::Table,
@@ -1801,8 +1806,10 @@ pub fn create_foreign_data_wrapper(
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperCreated(slot as u32))
-    {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ForeignDataWrapperCreated(slot as u32),
+    ) {
         storage.foreign_catalog_rollback_create(
             crate::storage::foreign::ForeignObjectClass::Wrapper,
             slot,
@@ -1886,7 +1893,10 @@ pub fn create_foreign_server(
         }
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ForeignServerCreated(slot as u32),
+    ) {
         storage.foreign_catalog_rollback_create(
             crate::storage::foreign::ForeignObjectClass::Server,
             slot,
@@ -2047,7 +2057,10 @@ pub fn create_user_mapping(
         }
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::UserMappingCreated(slot as u32),
+    ) {
         storage.foreign_catalog_rollback_create(
             crate::storage::foreign::ForeignObjectClass::Mapping,
             slot,
@@ -2120,11 +2133,14 @@ fn alter_foreign_owner(
         ));
     }
     let prior = storage.stage_foreign_catalog_owner(class, slot, owner as u16, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignOwnerChanged {
-        class,
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ForeignOwnerChanged {
+            class,
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_foreign_catalog_owner(class, slot, prior);
         return Err(error);
     }
@@ -2184,10 +2200,13 @@ pub fn alter_foreign_data_wrapper(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ForeignDataWrapperAltered {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_foreign_wrapper_alter(slot, prior);
                 return sql_fail(error);
             }
@@ -2234,10 +2253,13 @@ pub fn alter_foreign_data_wrapper(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperAltered {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ForeignDataWrapperAltered {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_foreign_wrapper_alter(slot, prior);
                 return sql_fail(error);
             }
@@ -2332,10 +2354,13 @@ pub fn alter_foreign_server(
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ForeignServerAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_foreign_server_alter(slot, prior);
             return sql_fail(error);
         }
@@ -2394,10 +2419,13 @@ pub fn alter_user_mapping(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::UserMappingAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_foreign_mapping_alter(slot, prior);
         return sql_fail(error);
     }
@@ -2415,7 +2443,10 @@ fn mark_user_mapping_drop(
         slot,
         txn.txid,
     );
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::UserMappingDropped(slot as u32),
+    ) {
         storage.foreign_catalog_rollback_drop(
             crate::storage::foreign::ForeignObjectClass::Mapping,
             slot,
@@ -2512,9 +2543,10 @@ fn drop_foreign_table_slot(
         binding_slot,
         txn.txid,
     );
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignTableDropped(
-        binding_slot as u32,
-    )) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ForeignTableDropped(binding_slot as u32),
+    ) {
         storage.foreign_catalog_rollback_drop(
             crate::storage::foreign::ForeignObjectClass::Table,
             binding_slot,
@@ -2580,7 +2612,10 @@ fn mark_foreign_server_drop(
         slot,
         txn.txid,
     );
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ForeignServerDropped(slot as u32),
+    ) {
         storage.foreign_catalog_rollback_drop(
             crate::storage::foreign::ForeignObjectClass::Server,
             slot,
@@ -2710,9 +2745,10 @@ pub fn drop_foreign_data_wrapper(
             slot,
             txn.txid,
         );
-        if let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperDropped(slot as u32))
-        {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ForeignDataWrapperDropped(slot as u32),
+        ) {
             storage.foreign_catalog_rollback_drop(
                 crate::storage::foreign::ForeignObjectClass::Wrapper,
                 slot,
@@ -2771,9 +2807,10 @@ pub fn drop_foreign_table(
             *binding,
             txn.txid,
         );
-        if let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::ForeignTableDropped(*binding as u32))
-        {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ForeignTableDropped(*binding as u32),
+        ) {
             storage.foreign_catalog_rollback_drop(
                 crate::storage::foreign::ForeignObjectClass::Table,
                 *binding,
@@ -2950,10 +2987,13 @@ pub(crate) fn alter_foreign_table(
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignTableAltered {
-            slot: binding_slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ForeignTableAltered {
+                slot: binding_slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_foreign_table_alter(binding_slot, prior);
             return sql_fail(error);
         }
@@ -4769,7 +4809,8 @@ fn copy_like_statistics<Definition0: crate::storage::DefinitionBacking>(
                 storage.rollback_extended_statistics_create(slot);
                 return Err(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsCreated(slot as u32))
+            if let Err(error) =
+                txn.record_ddl(storage, super::txn::DdlUndo::StatisticsCreated(slot as u32))
             {
                 storage.rollback_extended_statistics_create(slot);
                 return Err(error);
@@ -6719,9 +6760,10 @@ fn drop_table_kind(
                             return sql_fail(error);
                         }
                     }
-                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(
-                        statistics_slot as u32,
-                    )) {
+                    if let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::StatisticsDropped(statistics_slot as u32),
+                    ) {
                         storage.rollback_extended_statistics_drop(statistics_slot, txn.txid);
                         return sql_fail(error);
                     }
@@ -6736,7 +6778,7 @@ fn drop_table_kind(
                         return sql_fail(error);
                     }
                     if let Err(error) =
-                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                        txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
                     {
                         storage.rollback_trigger_drop(slot, txn.txid);
                         return sql_fail(error);
@@ -6876,7 +6918,8 @@ pub fn create_schema(
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaCreated(slot as u32)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::SchemaCreated(slot as u32))
+            {
                 storage.rollback_schema_create(slot);
                 return sql_fail(e);
             }
@@ -7058,10 +7101,13 @@ fn rewrite_object_acl_owner(
             },
             txn.txid,
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectAclChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage
                 .restore_acl_pending(slot, prior)
                 .expect("transaction owns its object ACL undo");
@@ -7092,10 +7138,13 @@ fn rewrite_object_acl_owner(
             },
             txn.txid,
         );
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ColumnAclChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.restore_column_acl_pending(slot, prior);
             return Err(error);
         }
@@ -7135,10 +7184,13 @@ fn preserve_object_acl(
                     })?,
             },
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage
                 .restore_acl_pending(changed, prior)
                 .expect("transaction owns its object ACL undo");
@@ -7162,10 +7214,13 @@ fn preserve_object_acl(
             grant_options,
             txn.txid,
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ColumnAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage.restore_column_acl_pending(changed, prior);
             return Err(error);
         }
@@ -7200,10 +7255,13 @@ fn remap_table_column_acls(
             crate::storage::PrivilegeSet::NONE,
             txn.txid,
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ColumnAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage.restore_column_acl_pending(changed, prior);
             return Err(error);
         }
@@ -7219,10 +7277,13 @@ fn remap_table_column_acls(
             grant_options,
             txn.txid,
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ColumnAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage.restore_column_acl_pending(changed, prior);
             return Err(error);
         }
@@ -7614,7 +7675,10 @@ pub fn alter_owner(
     } else {
         storage.set_object_owner(object, new_owner, txn.txid)
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+    ) {
         storage.restore_object_owner(object, prior);
         return sql_fail(error);
     }
@@ -7629,10 +7693,13 @@ pub fn alter_owner(
         };
         let backing_old_owner = storage.object_owner(backing, txn.txid) as u16;
         let backing_prior = storage.set_object_owner(backing, new_owner, txn.txid);
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged {
-            object: backing,
-            prior: backing_prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectOwnerChanged {
+                object: backing,
+                prior: backing_prior,
+            },
+        ) {
             storage.restore_object_owner(backing, backing_prior);
             return sql_fail(error);
         }
@@ -7704,7 +7771,10 @@ pub fn alter_large_object_owner(
     }
     let old_owner = storage.object_owner(object, txn.txid) as u16;
     let prior = storage.set_object_owner(object, new_owner, txn.txid);
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+    ) {
         storage.restore_object_owner(object, prior);
         return sql_fail(error);
     }
@@ -7950,10 +8020,13 @@ pub fn create_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RoleChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
@@ -8110,10 +8183,13 @@ fn stage_role_membership(
         storage.rollback_role_membership_change(membership, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
-        slot: membership as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RoleMembershipChanged {
+            slot: membership as u32,
+            prior,
+        },
+    ) {
         storage.rollback_role_membership_change(membership, prior);
         return Err(error);
     }
@@ -8201,10 +8277,13 @@ pub fn alter_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RoleChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
@@ -8411,10 +8490,13 @@ fn stage_role_setting(
         storage.rollback_role_setting(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleSettingChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RoleSettingChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_role_setting(slot, prior);
         return Err(error);
     }
@@ -8443,10 +8525,13 @@ fn stage_system_setting(
         storage.rollback_system_setting(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SystemSettingChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SystemSettingChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_system_setting(slot, prior);
         return Err(error);
     }
@@ -8582,10 +8667,13 @@ pub fn rename_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RoleChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
@@ -8699,10 +8787,13 @@ pub fn drop_role(
                 storage.rollback_role_membership_change(changed_slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
-                slot: changed_slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::RoleMembershipChanged {
+                    slot: changed_slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_role_membership_change(changed_slot, prior);
                 return sql_fail(error);
             }
@@ -8758,10 +8849,13 @@ pub fn drop_role(
             storage.rollback_role_change(slot, prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::RoleChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_role_change(slot, prior);
             return sql_fail(error);
         }
@@ -9066,10 +9160,13 @@ pub fn grant_role(
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::RoleMembershipChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
@@ -9258,10 +9355,13 @@ pub fn revoke_role(
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::RoleMembershipChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_role_membership_change(slot, prior);
                 return sql_fail(error);
             }
@@ -9337,10 +9437,13 @@ fn cascade_role_membership_grants(
                 storage.rollback_role_membership_change(changed, prior);
                 return Err(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoleMembershipChanged {
-                slot: changed as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::RoleMembershipChanged {
+                    slot: changed as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_role_membership_change(changed, prior);
                 return Err(error);
             }
@@ -9659,10 +9762,13 @@ pub fn alter_default_privileges(
                 }) else {
                     continue;
                 };
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
-                    slot: slot as u32,
-                    prior,
-                }) {
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::DefaultAclChanged {
+                        slot: slot as u32,
+                        prior,
+                    },
+                ) {
                     storage.restore_default_acl_pending(slot, prior);
                     return sql_fail(error);
                 }
@@ -9772,10 +9878,13 @@ fn apply_default_privileges_to_new_object(
                 transaction: txn.txid,
             },
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectAclChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage
                 .restore_acl_pending(slot, prior)
                 .expect("transaction owns its object ACL undo");
@@ -9995,9 +10104,10 @@ pub fn reassign_owned(
             } else {
                 storage.set_object_owner(object, target, txn.txid)
             };
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior })
-            {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+            ) {
                 storage.restore_object_owner(object, prior);
                 return sql_fail(error);
             }
@@ -10066,10 +10176,13 @@ pub fn reassign_owned(
             storage.rollback_collation_alter(slot, prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::CollationAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_collation_alter(slot, prior);
             return sql_fail(error);
         }
@@ -10098,10 +10211,13 @@ pub fn reassign_owned(
             storage.rollback_conversion_alter(slot, prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ConversionAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_conversion_alter(slot, prior);
             return sql_fail(error);
         }
@@ -10155,10 +10271,13 @@ fn record_acl_removal(
             transaction: txn.txid,
         },
     )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-        slot: changed as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ObjectAclChanged {
+            slot: changed as u32,
+            prior,
+        },
+    ) {
         storage
             .restore_acl_pending(changed, prior)
             .expect("transaction owns its object ACL undo");
@@ -10292,10 +10411,13 @@ fn drop_owned_privileges(
             PrivilegeSet::NONE,
             txn.txid,
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ColumnAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage.restore_column_acl_pending(changed, prior);
             return Err(error);
         }
@@ -10332,10 +10454,13 @@ fn drop_owned_privileges(
         else {
             continue;
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
-            slot: changed as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::DefaultAclChanged {
+                slot: changed as u32,
+                prior,
+            },
+        ) {
             storage.restore_default_acl_pending(changed, prior);
             return Err(error);
         }
@@ -11771,10 +11896,13 @@ fn materialize_public_acl_default(
                 transaction: txn.txid,
             },
         )?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectAclChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage
                 .restore_acl_pending(slot, prior)
                 .expect("transaction owns its object ACL undo");
@@ -11848,10 +11976,13 @@ fn revoke_dependent_column_privileges(
                 dependent_options.without(lost),
                 txn.txid,
             )?;
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ColumnAclChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_column_acl_pending(slot, prior);
                 return Err(error);
             }
@@ -11976,10 +12107,13 @@ pub fn grant_privileges(
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
                 };
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-                    slot: slot as u32,
-                    prior,
-                }) {
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::ObjectAclChanged {
+                        slot: slot as u32,
+                        prior,
+                    },
+                ) {
                     storage
                         .restore_acl_pending(slot, prior)
                         .expect("transaction owns its object ACL undo");
@@ -12029,10 +12163,13 @@ pub fn grant_privileges(
                         Ok(change) => change,
                         Err(error) => return sql_fail(error),
                     };
-                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-                        slot: slot as u32,
-                        prior,
-                    }) {
+                    if let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::ColumnAclChanged {
+                            slot: slot as u32,
+                            prior,
+                        },
+                    ) {
                         storage.restore_column_acl_pending(slot, prior);
                         return sql_fail(error);
                     }
@@ -12259,12 +12396,13 @@ pub fn revoke_privileges(
                                 Ok(change) => change,
                                 Err(error) => return sql_fail(error),
                             };
-                            if let Err(error) =
-                                txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
+                            if let Err(error) = txn.record_ddl(
+                                storage,
+                                super::txn::DdlUndo::ObjectAclChanged {
                                     slot: slot as u32,
                                     prior,
-                                })
-                            {
+                                },
+                            ) {
                                 storage
                                     .restore_acl_pending(slot, prior)
                                     .expect("transaction owns its object ACL undo");
@@ -12307,10 +12445,13 @@ pub fn revoke_privileges(
                     Ok(change) => change,
                     Err(error) => return sql_fail(error),
                 };
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectAclChanged {
-                    slot: slot as u32,
-                    prior,
-                }) {
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::ObjectAclChanged {
+                        slot: slot as u32,
+                        prior,
+                    },
+                ) {
                     storage
                         .restore_acl_pending(slot, prior)
                         .expect("transaction owns its object ACL undo");
@@ -12372,10 +12513,13 @@ pub fn revoke_privileges(
                         Ok(change) => change,
                         Err(error) => return sql_fail(error),
                     };
-                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ColumnAclChanged {
-                        slot: slot as u32,
-                        prior,
-                    }) {
+                    if let Err(error) = txn.record_ddl(
+                        storage,
+                        super::txn::DdlUndo::ColumnAclChanged {
+                            slot: slot as u32,
+                            prior,
+                        },
+                    ) {
                         storage.restore_column_acl_pending(slot, prior);
                         return sql_fail(error);
                     }
@@ -12522,7 +12666,9 @@ pub fn grant_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+            if let Err(error) =
+                txn.record_ddl(storage, super::txn::DdlUndo::ParameterAclChanged { prior })
+            {
                 storage
                     .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
@@ -12586,7 +12732,9 @@ fn cascade_parameter_acl_grants(
                 old_options.without(removed),
                 txn.txid,
             )?;
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+            if let Err(error) =
+                txn.record_ddl(storage, super::txn::DdlUndo::ParameterAclChanged { prior })
+            {
                 storage
                     .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
@@ -12700,7 +12848,9 @@ pub fn revoke_parameter_privileges(
                 Ok(change) => change,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged { prior }) {
+            if let Err(error) =
+                txn.record_ddl(storage, super::txn::DdlUndo::ParameterAclChanged { prior })
+            {
                 storage
                     .restore_parameter_acl_pending(prior)
                     .expect("transaction owns its parameter ACL undo");
@@ -14212,7 +14362,8 @@ pub(crate) fn drop_schema(
                     Err(e) => return sql_fail(e),
                 };
                 if let Some(undo) = dropped
-                    && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+                    && let Err(error) =
+                        txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
                 {
                     storage.rollback_view_drop(undo);
                     return sql_fail(error);
@@ -14421,7 +14572,8 @@ pub(crate) fn drop_schema(
                     txn.txid,
                 ) {
                     Ok(Some(slot)) => {
-                        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot))
+                        if let Err(error) =
+                            txn.record_ddl(storage, super::txn::DdlUndo::DomainDropped(slot))
                         {
                             storage
                                 .finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
@@ -14453,7 +14605,9 @@ pub(crate) fn drop_schema(
                     txn.txid,
                 ) {
                     Ok(Some(slot)) => {
-                        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot)) {
+                        if let Err(error) =
+                            txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot))
+                        {
                             storage
                                 .finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                             return sql_fail(error);
@@ -14553,9 +14707,10 @@ pub(crate) fn drop_schema(
                         return sql_fail(error);
                     }
                 }
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(*statistics as u32))
-                {
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::StatisticsDropped(*statistics as u32),
+                ) {
                     storage.rollback_extended_statistics_drop(*statistics, txn.txid);
                     return sql_fail(error);
                 }
@@ -14624,7 +14779,7 @@ pub(crate) fn drop_schema(
                         return sql_fail(error);
                     }
                     if let Err(error) =
-                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                        txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32))
                     {
                         storage.rollback_trigger_drop(slot, txn.txid);
                         return sql_fail(error);
@@ -14681,10 +14836,13 @@ pub(crate) fn drop_schema(
                 Err(error) => return sql_fail(error),
             };
             if let Some((changed, prior)) = change
-                && let Err(error) = txn.record_ddl(super::txn::DdlUndo::DefaultAclChanged {
-                    slot: changed as u32,
-                    prior,
-                })
+                && let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::DefaultAclChanged {
+                        slot: changed as u32,
+                        prior,
+                    },
+                )
             {
                 storage.restore_default_acl_pending(changed, prior);
                 return sql_fail(error);
@@ -14712,7 +14870,7 @@ pub(crate) fn drop_schema(
             storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
-        if let Err(e) = txn.record_ddl(super::txn::DdlUndo::SchemaDropped(slot as u32)) {
+        if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::SchemaDropped(slot as u32)) {
             storage.rollback_schema_drop(slot, txn.txid);
             return sql_fail(e);
         }
@@ -14769,10 +14927,13 @@ fn remove_schema_from_publications(
             storage.rollback_publication_alter(slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::PublicationAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_publication_alter(slot, prior);
             return Err(error);
         }
@@ -14907,7 +15068,10 @@ pub fn create_publication(
                 storage.rollback_publication_create(slot);
                 return sql_fail(error);
             }
-            match txn.record_ddl(super::txn::DdlUndo::PublicationCreated(slot as u32)) {
+            match txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::PublicationCreated(slot as u32),
+            ) {
                 Ok(()) => Ok(Ok(responder.command_complete("CREATE PUBLICATION")?)),
                 Err(error) => {
                     storage.rollback_publication_create(slot);
@@ -14996,9 +15160,10 @@ pub fn drop_publication(
                     storage.rollback_publication_drop(slot, txn.txid);
                     return sql_fail(error);
                 }
-                if let Err(error) =
-                    txn.record_ddl(super::txn::DdlUndo::PublicationDropped(slot as u32))
-                {
+                if let Err(error) = txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::PublicationDropped(slot as u32),
+                ) {
                     storage.rollback_publication_drop(slot, txn.txid);
                     return sql_fail(error);
                 }
@@ -15173,7 +15338,10 @@ pub fn create_subscription(
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SubscriptionCreated(slot as u32),
+    ) {
         storage.rollback_subscription_create(slot);
         return sql_fail(error);
     }
@@ -15245,10 +15413,13 @@ pub fn alter_subscription(
                 storage.restore_subscription_enabled(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionEnabled {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::SubscriptionEnabled {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_subscription_enabled(slot, prior);
                 return sql_fail(error);
             }
@@ -15480,10 +15651,13 @@ pub fn alter_subscription(
                 storage.restore_subscription_owner_pending(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionOwnerChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::SubscriptionOwnerChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_subscription_owner_pending(slot, prior);
                 return sql_fail(error);
             }
@@ -15509,10 +15683,13 @@ pub fn alter_subscription(
                 storage.rollback_subscription_rename(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::SubscriptionRenamed {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_subscription_rename(slot, prior);
                 return sql_fail(error);
             }
@@ -15636,10 +15813,13 @@ fn stage_subscription_refresh(
         storage.restore_subscription_bootstrap(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionBootstrapChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SubscriptionBootstrapChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.restore_subscription_bootstrap(slot, prior);
         return Err(error);
     }
@@ -15692,10 +15872,13 @@ fn alter_subscription_definition(
         storage.restore_subscription_definition(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionDefinitionChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::SubscriptionDefinitionChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.restore_subscription_definition(slot, prior);
         return Err(error);
     }
@@ -15743,7 +15926,10 @@ pub fn drop_subscription(
             storage.rollback_subscription_drop(slot, txn.txid);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SubscriptionDropped(slot as u32)) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::SubscriptionDropped(slot as u32),
+        ) {
             storage.rollback_subscription_drop(slot, txn.txid);
             return sql_fail(error);
         }
@@ -15799,10 +15985,13 @@ pub fn alter_publication(
                 storage.rollback_publication_rename(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::PublicationRenamed {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_publication_rename(slot, prior);
                 return sql_fail(error);
             }
@@ -15865,10 +16054,13 @@ pub fn alter_publication(
                 storage.restore_publication_owner_pending(slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationOwnerChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::PublicationOwnerChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_publication_owner_pending(slot, prior);
                 return sql_fail(error);
             }
@@ -16117,10 +16309,13 @@ pub fn alter_publication(
         storage.rollback_publication_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::PublicationAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_publication_alter(slot, prior);
         return sql_fail(error);
     }
@@ -16588,6 +16783,7 @@ struct TriggerInvocation<'a> {
     routine_oid: i32,
     input_origin: super::plpgsql_inputs::Origin,
     input_owner: super::type_input_plans::Owner,
+    input_collation: crate::sql::ast::Collation,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
     nargs: i32,
     when: &'static str,
@@ -16759,6 +16955,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::Owner::Backend,
+            input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
             nargs: i32::try_from(trigger.arguments.values().len())
                 .expect("trigger argument capacity fits int4"),
@@ -16791,6 +16988,7 @@ impl<'a> TriggerInvocation<'a> {
             routine_oid: 0,
             input_origin: super::plpgsql_inputs::Origin::Anonymous,
             input_owner: super::type_input_plans::owner()?,
+            input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -16803,7 +17001,11 @@ impl<'a> TriggerInvocation<'a> {
         })
     }
 
-    fn procedure(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<Self, SqlError> {
+    fn procedure(
+        routine: &crate::storage::RoutineDef,
+        input_collation: crate::sql::ast::Collation,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
         Ok(Self {
             program_kind: PlpgsqlProgramKind::Procedure,
             name: "",
@@ -16822,6 +17024,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::owner()?,
+            input_collation: input_collation,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -16837,6 +17040,7 @@ impl<'a> TriggerInvocation<'a> {
     fn function(
         routine: &crate::storage::RoutineDef,
         program_kind: PlpgsqlProgramKind,
+        input_collation: crate::sql::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         Ok(Self {
@@ -16857,6 +17061,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::owner()?,
+            input_collation: input_collation,
             input_sites: &[],
             nargs: i32::try_from(routine.arguments().len())
                 .expect("routine argument capacity fits int4"),
@@ -16894,6 +17099,7 @@ impl<'a> TriggerInvocation<'a> {
                 version: routine.version,
             },
             input_owner: super::type_input_plans::Owner::Backend,
+            input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
             nargs: 0,
             when: "",
@@ -20718,6 +20924,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     guc: &super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
     routine: &crate::storage::RoutineDef,
+    input_collation: crate::sql::ast::Collation,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
@@ -20730,6 +20937,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             arena,
             txn.txid,
         )),
+        input_collation,
     )?;
     let source = arena
         .alloc_str(routine.body.as_str())
@@ -20804,8 +21012,8 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation =
-        TriggerInvocation::procedure(routine, arena)?.with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::procedure(routine, input_collation, arena)?
+        .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -20882,6 +21090,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
+    input_collation: crate::sql::ast::Collation,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
@@ -20974,7 +21183,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::function(routine, program_kind, arena)?
+    let invocation = TriggerInvocation::function(routine, program_kind, input_collation, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -21054,6 +21263,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
+    input_collation: crate::sql::ast::Collation,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
@@ -21139,8 +21349,13 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     }
     let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
-    let invocation = TriggerInvocation::function(routine, PlpgsqlProgramKind::SetFunction, arena)?
-        .with_input_sites(program.input_sites);
+    let invocation = TriggerInvocation::function(
+        routine,
+        PlpgsqlProgramKind::SetFunction,
+        input_collation,
+        arena,
+    )?
+    .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -21681,7 +21896,11 @@ where
                 });
             if let Some(ctype) = local_type.or(runtime_type) {
                 return if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
+                    if self.invocation.input_collation == crate::sql::ast::Collation::None {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        self.invocation.input_collation
+                    }
                 } else {
                     crate::sql::ast::Collation::None
                 };
@@ -21957,7 +22176,11 @@ where
                 });
             if let Some(ctype) = ctype {
                 return if ctype.is_collatable() {
-                    crate::sql::ast::Collation::Default
+                    if self.invocation.input_collation == crate::sql::ast::Collation::None {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        self.invocation.input_collation
+                    }
                 } else {
                     crate::sql::ast::Collation::None
                 };
@@ -29509,7 +29732,10 @@ pub fn create_event_trigger(
         storage.rollback_event_trigger_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::EventTriggerCreated(slot as u32),
+    ) {
         storage.rollback_event_trigger_create(slot);
         return sql_fail(error);
     }
@@ -29588,10 +29814,13 @@ pub fn alter_event_trigger(
         storage.rollback_event_trigger_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::EventTriggerAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_event_trigger_alter(slot, prior);
         return sql_fail(error);
     }
@@ -29644,7 +29873,10 @@ pub fn drop_event_trigger(
         storage.rollback_event_trigger_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::EventTriggerDropped(slot as u32),
+    ) {
         storage.rollback_event_trigger_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -30101,7 +30333,7 @@ pub fn create_trigger(
             prior,
         }
     });
-    if let Err(error) = txn.record_ddl(undo) {
+    if let Err(error) = txn.record_ddl(storage, undo) {
         if let Some(prior) = replaced_prior {
             storage.rollback_trigger_alter(slot, prior);
         } else {
@@ -30510,7 +30742,7 @@ pub fn create_policy(
         storage.rollback_policy_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::PolicyCreated(slot as u32)) {
         storage.rollback_policy_create(slot);
         return sql_fail(error);
     }
@@ -30641,10 +30873,13 @@ pub fn alter_policy(
         storage.rollback_policy_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::PolicyAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_policy_alter(slot, prior);
         return sql_fail(error);
     }
@@ -30738,7 +30973,7 @@ fn drop_policy_slot(
         )?;
     }
     storage.drop_policy(slot, txn.txid);
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::PolicyDropped(slot as u32)) {
         storage.rollback_policy_drop(slot, txn.txid);
         return Err(error);
     }
@@ -30819,7 +31054,7 @@ pub fn drop_trigger(
         storage.rollback_trigger_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32)) {
         storage.rollback_trigger_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -30981,10 +31216,13 @@ pub fn alter_trigger(
         storage.rollback_trigger_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::TriggerAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_trigger_alter(slot, prior);
         return sql_fail(error);
     }
@@ -31514,7 +31752,7 @@ pub(crate) fn create_cast(
         storage.rollback_cast_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CastCreated(slot as u32)) {
         storage.rollback_cast_create(slot);
         return sql_fail(error);
     }
@@ -31551,7 +31789,7 @@ fn stage_cast_drop(
         storage.rollback_cast_drop(slot, txn.txid);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CastDropped(slot as u32)) {
         storage.rollback_cast_drop(slot, txn.txid);
         return Err(error);
     }
@@ -31713,7 +31951,7 @@ fn operator_link_or_shell(
         storage.rollback_operator_create(slot);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::OperatorCreated(slot as u32)) {
         storage.rollback_operator_create(slot);
         return Err(error);
     }
@@ -31867,7 +32105,9 @@ pub(crate) fn create_operator(
             storage.rollback_operator_create(slot);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::OperatorCreated(slot as u32))
+        {
             storage.rollback_operator_create(slot);
             return sql_fail(error);
         }
@@ -32210,7 +32450,8 @@ pub fn create_collation(
         storage.rollback_collation_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CollationCreated(slot as u32))
+    {
         storage.rollback_collation_create(slot);
         return sql_fail(error);
     }
@@ -32287,7 +32528,8 @@ pub fn create_conversion(
         storage.rollback_conversion_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::ConversionCreated(slot as u32))
+    {
         storage.rollback_conversion_create(slot);
         return sql_fail(error);
     }
@@ -32393,7 +32635,8 @@ fn stage_text_search_create(
         storage.rollback_text_search_create(slot);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TextSearchCreated(slot as u32))
+    {
         storage.rollback_text_search_create(slot);
         return Err(error);
     }
@@ -32422,10 +32665,13 @@ fn stage_text_search_alter(
         storage.rollback_text_search_alter(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::TextSearchAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_text_search_alter(slot, prior);
         return Err(error);
     }
@@ -32453,7 +32699,8 @@ fn stage_text_search_drop(
         storage.rollback_text_search_drop(slot, txn.txid);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TextSearchDropped(slot as u32))
+    {
         storage.rollback_text_search_drop(slot, txn.txid);
         return Err(error);
     }
@@ -33318,10 +33565,13 @@ pub fn alter_collation(
         storage.rollback_collation_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::CollationAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_collation_alter(slot, prior);
         return sql_fail(error);
     }
@@ -33389,10 +33639,13 @@ pub fn alter_conversion(
         storage.rollback_conversion_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ConversionAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_conversion_alter(slot, prior);
         return sql_fail(error);
     }
@@ -33629,7 +33882,9 @@ pub(crate) fn drop_collation(
                 storage.rollback_composite_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
+            if let Err(error) =
+                txn.record_ddl(storage, super::txn::DdlUndo::CompositeAltered(prior))
+            {
                 storage.rollback_composite_alter(prior);
                 return sql_fail(error);
             }
@@ -33696,7 +33951,8 @@ pub(crate) fn drop_collation(
         storage.rollback_collation_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CollationDropped(slot as u32))
+    {
         storage.rollback_collation_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -33747,7 +34003,8 @@ pub fn drop_conversion(
         storage.rollback_conversion_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::ConversionDropped(slot as u32))
+    {
         storage.rollback_conversion_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -33795,10 +34052,13 @@ fn stage_operator(
         storage.rollback_operator_alter(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_operator_alter(slot, prior);
         return Err(error);
     }
@@ -33827,7 +34087,7 @@ fn stage_operator_drop(
         storage.rollback_operator_drop(slot, txn.txid);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::OperatorDropped(slot as u32)) {
         storage.rollback_operator_drop(slot, txn.txid);
         return Err(error);
     }
@@ -34198,7 +34458,10 @@ pub(crate) fn create_operator_family(
         storage.rollback_operator_family_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorFamilyCreated(slot as u32),
+    ) {
         storage.rollback_operator_family_create(slot);
         return sql_fail(error);
     }
@@ -34226,7 +34489,10 @@ fn stage_operator_family_drop(
         storage.rollback_operator_family_drop(slot, txn.txid);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorFamilyDropped(slot as u32),
+    ) {
         storage.rollback_operator_family_drop(slot, txn.txid);
         return Err(error);
     }
@@ -34487,10 +34753,13 @@ fn stage_operator_family(
         storage.rollback_operator_family_alter(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorFamilyAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_operator_family_alter(slot, prior);
         return Err(error);
     }
@@ -34691,10 +34960,13 @@ fn stage_operator_class(
         storage.rollback_operator_class_alter(slot, prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorClassAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_operator_class_alter(slot, prior);
         return Err(error);
     }
@@ -34774,7 +35046,10 @@ fn stage_operator_class_drop(
         storage.rollback_operator_class_drop(slot, txn.txid);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorClassDropped(slot as u32),
+    ) {
         storage.rollback_operator_class_drop(slot, txn.txid);
         return Err(error);
     }
@@ -34829,8 +35104,10 @@ pub(crate) fn create_operator_class(
             Ok(slot) => slot,
             Err(error) => return sql_fail(error),
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyCreated(slot as u32))
-        {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::OperatorFamilyCreated(slot as u32),
+        ) {
             storage.rollback_operator_family_create(slot);
             return sql_fail(error);
         }
@@ -35009,7 +35286,10 @@ pub(crate) fn create_operator_class(
         storage.rollback_operator_class_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::OperatorClassCreated(slot as u32),
+    ) {
         storage.rollback_operator_class_create(slot);
         return sql_fail(error);
     }
@@ -35660,6 +35940,7 @@ pub(crate) fn validate_routine_body(
     let formal_scope = enter_routine_parameter_types(
         &arguments[..argument_count],
         Some(&super::query::storage_catalog(storage, arena, txn.txid)),
+        crate::sql::ast::Collation::None,
     )?;
     match kind {
         crate::storage::RoutineKind::Function { result } => {
@@ -37066,10 +37347,13 @@ pub(crate) fn prepare_update_extension(
         target,
         txn.txid,
     )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionAltered {
-        slot: extension as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionAltered {
+            slot: extension as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_alter(extension, prior);
         return Err(error);
     }
@@ -37142,10 +37426,13 @@ pub(crate) fn set_extension_schema(
     }
     let prior =
         storage.alter_extension_definition(extension, namespace, true, version, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionAltered {
-        slot: extension as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionAltered {
+            slot: extension as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_alter(extension, prior);
         return Err(error);
     }
@@ -37192,7 +37479,10 @@ pub(crate) fn drop_extension_catalog(
         ));
     }
     storage.drop_extension_in(extension, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDropped(extension as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionDropped(extension as u32),
+    ) {
         storage.rollback_extension_drop(extension, txn.txid);
         return Err(error);
     }
@@ -37352,7 +37642,10 @@ pub(crate) fn prepare_create_extension(
         target,
         txn.txid,
     )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionCreated(extension as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionCreated(extension as u32),
+    ) {
         storage.rollback_extension_create(extension);
         return Err(error);
     }
@@ -37392,10 +37685,13 @@ pub(crate) fn set_extension_dependency(
         })?;
     let (slot, prior) =
         storage.change_extension_dependency(extension, object, kind, enabled, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionDependencyChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_dependency(slot, prior);
         return Err(error);
     }
@@ -37412,10 +37708,13 @@ pub(crate) fn set_extension_config(
     let condition = crate::storage::extension_config_condition(condition)?;
     let (slot, prior) =
         storage.change_extension_config(extension, relation, condition, true, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionConfigChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionConfigChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_config(slot, prior);
         return Err(error);
     }
@@ -37434,10 +37733,13 @@ fn remove_extension_config(
     let condition = storage.extension_config(config_slot).condition_to(txn.txid);
     let (slot, prior) =
         storage.change_extension_config(extension, relation, condition, false, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionConfigChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionConfigChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_config(slot, prior);
         return Err(error);
     }
@@ -37710,10 +38012,13 @@ pub(crate) fn alter_extension_membership(
         add,
         txn.txid,
     )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionDependencyChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_dependency(slot, prior);
         return Err(error);
     }
@@ -37736,10 +38041,13 @@ pub(crate) fn record_extension_member(
         true,
         txn.txid,
     )?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ExtensionDependencyChanged {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ExtensionDependencyChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extension_dependency(slot, prior);
         return Err(error);
     }
@@ -38242,9 +38550,10 @@ pub fn alter_routine(
             return sql_fail(error);
         }
         let prior = storage.set_object_owner(object, new_owner, txn.txid);
-        if let Err(error) =
-            txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior })
-        {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+        ) {
             storage.restore_object_owner(object, prior);
             return sql_fail(error);
         }
@@ -38797,9 +39106,10 @@ pub fn drop_routine(
                 storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(
-                trigger_slot as u32,
-            )) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::EventTriggerDropped(trigger_slot as u32),
+            ) {
                 storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
                 return sql_fail(error);
             }
@@ -39217,9 +39527,10 @@ pub fn create_view(
                 );
                 return sql_fail(e);
             }
-            if let Err(error) =
-                txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone()))
-            {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ViewChanged(publication.clone()),
+            ) {
                 storage.finish_view_publication(
                     publication,
                     crate::storage::CatalogDdlDecision::Rollback,
@@ -39401,9 +39712,12 @@ pub fn alter_view(
             storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-            crate::storage::ViewPublication::Altered(prior.clone()),
-        )) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(
+                prior.clone(),
+            )),
+        ) {
             storage.rollback_view_alter(prior);
             return sql_fail(error);
         }
@@ -39577,9 +39891,12 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior.clone()),
-            )) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(
+                    prior.clone(),
+                )),
+            ) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
@@ -39647,9 +39964,12 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior.clone()),
-            )) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(
+                    prior.clone(),
+                )),
+            ) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
@@ -39711,9 +40031,12 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior.clone()),
-            )) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(
+                    prior.clone(),
+                )),
+            ) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
@@ -39774,9 +40097,12 @@ pub fn alter_view(
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-                crate::storage::ViewPublication::Altered(prior.clone()),
-            )) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(
+                    prior.clone(),
+                )),
+            ) {
                 storage.rollback_view_alter(prior);
                 return sql_fail(error);
             }
@@ -39820,9 +40146,10 @@ pub fn alter_view(
         storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(
-        crate::storage::ViewPublication::Altered(prior.clone()),
-    )) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(prior.clone())),
+    ) {
         storage.rollback_view_alter(prior);
         return sql_fail(error);
     }
@@ -40045,7 +40372,10 @@ fn publish_rewritten_view(
         storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone())) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::ViewChanged(publication.clone()),
+    ) {
         storage.finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
         return Err(error);
     }
@@ -40736,10 +41066,13 @@ pub fn create_rule(
         );
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleChanged {
-        publication,
-        prior_table_rule_txid,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::RuleChanged {
+            publication,
+            prior_table_rule_txid,
+        },
+    ) {
         storage.finish_rule_publication(
             publication,
             prior_table_rule_txid,
@@ -40803,7 +41136,7 @@ pub fn alter_rule(
         storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::RuleAltered(prior)) {
         storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
@@ -40863,7 +41196,7 @@ fn alter_table_rule_enabled(
         storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered(prior)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::RuleAltered(prior)) {
         storage.rollback_rule_alter(prior);
         return sql_fail(error);
     }
@@ -40960,7 +41293,7 @@ pub fn drop_rule(
             return sql_fail(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::RuleDropped(dropped)) {
         storage.rollback_rule_drop(dropped);
         return sql_fail(error);
     }
@@ -42055,10 +42388,13 @@ fn stage_comment(
             return Err(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::CommentSet {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.restore_comment_pending(slot, prior);
         return Err(error);
     }
@@ -42310,7 +42646,7 @@ pub fn create_table_as(
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Created(slot as u32)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::Created(slot as u32)) {
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
@@ -42733,7 +43069,10 @@ pub fn refresh_materialized_view(
         Ok(undo) => undo,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::MatviewPopulationChanged(population)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::MatviewPopulationChanged(population),
+    ) {
         storage.finish_matview_population(population, crate::storage::CatalogDdlDecision::Rollback);
         return sql_fail(error);
     }
@@ -44368,7 +44707,7 @@ pub fn create_domain(
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainCreated(created)) {
+    if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::DomainCreated(created)) {
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
@@ -45000,7 +45339,9 @@ fn drop_domain_selection(
             txn.txid,
         ) {
             Ok(Some(slot)) => {
-                if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainDropped(slot)) {
+                if let Err(error) =
+                    txn.record_ddl(storage, super::txn::DdlUndo::DomainDropped(slot))
+                {
                     storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                     return Err(error);
                 }
@@ -45183,7 +45524,9 @@ pub fn alter_domain(
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::DomainAltered(prior.clone()))
+        {
             storage.rollback_domain_alter(prior);
             return sql_fail(error);
         }
@@ -45457,7 +45800,7 @@ pub fn alter_domain(
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
+    if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::DomainAltered(prior.clone())) {
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
     }
@@ -45817,7 +46160,7 @@ pub fn create_enum(
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumCreated(created)) {
+    if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumCreated(created)) {
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(e);
     }
@@ -46002,7 +46345,7 @@ pub fn create_composite(
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeCreated(created)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CompositeCreated(created)) {
         storage.finish_type_ddl(created, crate::storage::TypeDdlDecision::Rollback);
         return sql_fail(error);
     }
@@ -46232,7 +46575,7 @@ pub(crate) fn drop_type(
             txn.txid,
         ) {
             Ok(Some(slot)) => {
-                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumDropped(slot)) {
+                if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumDropped(slot)) {
                     storage.finish_type_ddl(slot, crate::storage::TypeDdlDecision::Rollback);
                     return sql_fail(e);
                 }
@@ -46538,7 +46881,7 @@ fn drop_composite_type(
                 "composite type vanished during drop"
             )
         })?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeDropped(dropped)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CompositeDropped(dropped)) {
         storage.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
         return Err(error);
     }
@@ -46793,7 +47136,7 @@ fn cascade_drop_composite_fields(
         storage.rollback_composite_alter(prior);
         return Err(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CompositeAltered(prior)) {
         storage.rollback_composite_alter(prior);
         return Err(error);
     }
@@ -47447,7 +47790,9 @@ fn apply_column_drop_dependencies(
             storage.rollback_extended_statistics_drop(slot, txn.txid);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::StatisticsDropped(slot as u32))
+        {
             storage.rollback_extended_statistics_drop(slot, txn.txid);
             return Err(error);
         }
@@ -47616,10 +47961,13 @@ fn stage_publication_column_drop_dependencies(
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
-            slot: altered_slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::PublicationAltered {
+                slot: altered_slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
@@ -48356,7 +48704,7 @@ fn drop_selected_stored_queries(
         }
         stage_rule_drop(storage, wal, txn, definition)?;
         let dropped = storage.drop_rule(storage.prepare_rule_edit(slot, txn.txid)?, txn.txid)?;
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(dropped)) {
+        if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::RuleDropped(dropped)) {
             storage.rollback_rule_drop(dropped);
             return Err(error);
         }
@@ -48473,7 +48821,7 @@ fn drop_trigger_with_undo(
         )?;
     }
     storage.drop_trigger(slot, txn.txid)?;
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TriggerDropped(slot as u32)) {
         storage.rollback_trigger_drop(slot, txn.txid);
         return Err(error);
     }
@@ -48513,7 +48861,7 @@ fn drop_view_slot(
         )?;
     }
     if let Some(undo) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)?
-        && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+        && let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
     {
         storage.rollback_view_drop(undo);
         return Err(error);
@@ -48761,7 +49109,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -48832,7 +49180,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -48911,7 +49259,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
+            if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(error);
             }
@@ -48983,7 +49331,7 @@ pub fn alter_type(
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
-            if let Err(e) = txn.record_ddl(super::txn::DdlUndo::EnumAltered(prior)) {
+            if let Err(e) = txn.record_ddl(storage, super::txn::DdlUndo::EnumAltered(prior)) {
                 storage.rollback_enum_alter(prior);
                 return sql_fail(e);
             }
@@ -49254,7 +49602,7 @@ fn alter_composite_type(
         storage.rollback_composite_alter(prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered(prior)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::CompositeAltered(prior)) {
         storage.rollback_composite_alter(prior);
         return sql_fail(error);
     }
@@ -49453,10 +49801,13 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
             storage.rollback_policy_alter(slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PolicyAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::PolicyAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_policy_alter(slot, prior);
             return Err(error);
         }
@@ -49524,10 +49875,13 @@ fn rewrite_table_statistics_column_references<Definition0: crate::storage::Defin
             storage.rollback_extended_statistics_keys(slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsKeysAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::StatisticsKeysAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_extended_statistics_keys(slot, prior);
             return Err(error);
         }
@@ -49607,10 +49961,13 @@ fn remap_publication_column_projections(
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
-            slot: altered_slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::PublicationAltered {
+                slot: altered_slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
@@ -49699,10 +50056,13 @@ fn rewrite_table_publication_column_references<Definition0: crate::storage::Defi
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
-            slot: altered_slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::PublicationAltered {
+                slot: altered_slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
@@ -49941,7 +50301,9 @@ fn rewrite_composite_dependent_domains(
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DomainAltered(prior.clone())) {
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::DomainAltered(prior.clone()))
+        {
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
@@ -50195,7 +50557,10 @@ fn rewrite_composite_dependent_views(
                 .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewChanged(publication.clone())) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::ViewChanged(publication.clone()),
+        ) {
             storage
                 .finish_view_publication(publication, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
@@ -50797,7 +51162,7 @@ pub fn drop_view(
                 Err(e) => return sql_fail(e),
             };
             if let Some(undo) = dropped
-                && let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(undo))
+                && let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::ViewDropped(undo))
             {
                 storage.rollback_view_drop(undo);
                 return sql_fail(error);
@@ -51083,7 +51448,8 @@ pub fn create_statistics(
         storage.rollback_extended_statistics_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::StatisticsCreated(slot as u32))
+    {
         storage.rollback_extended_statistics_create(slot);
         return sql_fail(error);
     }
@@ -51165,10 +51531,13 @@ pub fn alter_statistics(
         storage.rollback_extended_statistics_alter(slot, prior);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::StatisticsAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_extended_statistics_alter(slot, prior);
         return sql_fail(error);
     }
@@ -51239,7 +51608,9 @@ pub fn drop_statistics(
                 return sql_fail(error);
             }
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::StatisticsDropped(slot as u32))
+        {
             storage.rollback_extended_statistics_drop(slot, txn.txid);
             return sql_fail(error);
         }
@@ -52715,10 +53086,13 @@ fn stage_index_definition(
             return Err(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexAltered {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::IndexAltered {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_index_definition(slot, prior);
         return Err(error);
     }
@@ -52738,7 +53112,7 @@ fn finish_index_creation(
     let result = (|| {
         prepare_index_creation(storage, txn, slot, table, arena)?;
         journal_index_creation(storage, wal, txn, slot, table)?;
-        txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))
+        txn.record_ddl(storage, super::txn::DdlUndo::IndexCreated(slot as u32))
     })();
     if result.is_err() {
         storage.rollback_index_create(slot);
@@ -53956,7 +54330,7 @@ pub fn create_database(
         storage.rollback_database_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::DatabaseCreated(slot as u32)) {
         storage.rollback_database_create(slot);
         return sql_fail(error);
     }
@@ -54197,11 +54571,14 @@ pub fn alter_database(
         storage.restore_object_owner(object, prior_owner);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseAltered {
-        slot: slot as u32,
-        prior_definition,
-        prior_owner,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::DatabaseAltered {
+            slot: slot as u32,
+            prior_definition,
+            prior_owner,
+        },
+    ) {
         storage.rollback_database_alter(slot, prior_definition);
         storage.restore_object_owner(object, prior_owner);
         return sql_fail(error);
@@ -54272,7 +54649,7 @@ pub fn drop_database(
         storage.rollback_database_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::DatabaseDropped(slot as u32)) {
         storage.rollback_database_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -54352,7 +54729,10 @@ pub fn create_access_method(
         storage.rollback_access_method_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::AccessMethodCreated(slot as u32),
+    ) {
         storage.rollback_access_method_create(slot);
         return sql_fail(error);
     }
@@ -54470,10 +54850,13 @@ pub fn drop_access_method(
                 storage.restore_comment_pending(comment_slot, prior);
                 return sql_fail(error);
             }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
-                slot: comment_slot as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::CommentSet {
+                    slot: comment_slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_comment_pending(comment_slot, prior);
                 return sql_fail(error);
             }
@@ -54484,7 +54867,10 @@ pub fn drop_access_method(
             storage.rollback_access_method_drop(slot, txn.txid);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodDropped(slot as u32)) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::AccessMethodDropped(slot as u32),
+        ) {
             storage.rollback_access_method_drop(slot, txn.txid);
             return sql_fail(error);
         }
@@ -54582,7 +54968,8 @@ pub fn create_tablespace(
         storage.rollback_tablespace_create(slot);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TablespaceCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TablespaceCreated(slot as u32))
+    {
         storage.rollback_tablespace_create(slot);
         return sql_fail(error);
     }
@@ -54709,11 +55096,14 @@ pub fn alter_tablespace(
         storage.restore_object_owner(object, prior_owner);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TablespaceAltered {
-        slot: slot as u32,
-        prior_definition,
-        prior_owner,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::TablespaceAltered {
+            slot: slot as u32,
+            prior_definition,
+            prior_owner,
+        },
+    ) {
         storage.rollback_tablespace_alter(slot, prior_definition);
         storage.restore_object_owner(object, prior_owner);
         return sql_fail(error);
@@ -54759,7 +55149,8 @@ pub fn drop_tablespace(
         storage.rollback_tablespace_drop(slot, txn.txid);
         return sql_fail(error);
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TablespaceDropped(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::TablespaceDropped(slot as u32))
+    {
         storage.rollback_tablespace_drop(slot, txn.txid);
         return sql_fail(error);
     }
@@ -54799,7 +55190,7 @@ fn stage_index_drop(
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
     let result = (|| {
         finish_index_drop(storage, wal, txn, dropped, schema, name)?;
-        txn.record_ddl(super::txn::DdlUndo::IndexDropped(dropped as u32))
+        txn.record_ddl(storage, super::txn::DdlUndo::IndexDropped(dropped as u32))
     })();
     if result.is_err() {
         storage.rollback_index_drop(dropped, txn.txid);
@@ -54877,10 +55268,13 @@ fn stage_index_rename(
             return Err(error);
         }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
-        slot: slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::IndexRenamed {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_index_rename(slot, prior);
         return Err(error);
     }
@@ -68194,10 +68588,13 @@ fn stage_partition_trigger_mode(
     else {
         return Ok(());
     };
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PartitionTriggerAltered {
-        slot: state_slot as u32,
-        prior,
-    }) {
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::PartitionTriggerAltered {
+            slot: state_slot as u32,
+            prior,
+        },
+    ) {
         storage.rollback_partition_trigger_state(state_slot, prior);
         return Err(error);
     }
@@ -68323,10 +68720,13 @@ fn alter_table_trigger_enabled(
             storage.rollback_trigger_alter(slot, prior);
             return sql_fail(error);
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TriggerAltered {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::TriggerAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.rollback_trigger_alter(slot, prior);
             return sql_fail(error);
         }
@@ -72714,10 +73114,13 @@ fn alter_table_relation(
                 return sql_fail(error);
             }
         }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::CommentSet {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.restore_comment_pending(slot, prior);
             return sql_fail(error);
         }
@@ -72785,10 +73188,13 @@ fn alter_table_relation(
                 "constraint comment disappeared during rename"
             ));
         };
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentIdentityChanged {
-            slot: slot as u32,
-            prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::CommentIdentityChanged {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
             storage.restore_comment_identity_pending(slot, prior);
             return sql_fail(error);
         }

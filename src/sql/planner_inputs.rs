@@ -37,7 +37,7 @@ std::thread_local! {
 
 struct ParameterScope {
     prior: Option<Parameters>,
-    thread: core::marker::PhantomData<std::rc::Rc<()>>,
+    _thread: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl Drop for ParameterScope {
@@ -60,7 +60,7 @@ pub(crate) fn with_parameters<R>(
     });
     let _scope = ParameterScope {
         prior: PARAMETERS.with(|slot| slot.replace(current)),
-        thread: core::marker::PhantomData,
+        _thread: core::marker::PhantomData,
     };
     run()
 }
@@ -81,7 +81,7 @@ fn with_inline_parameters<R>(
     };
     let _scope = ParameterScope {
         prior: PARAMETERS.with(|slot| slot.replace(Some(current))),
-        thread: core::marker::PhantomData,
+        _thread: core::marker::PhantomData,
     };
     run()
 }
@@ -134,6 +134,7 @@ struct Candidate<'a> {
     oid: i32,
     version: u64,
     site: InvocationSite,
+    input_collation: super::ast::Collation,
     arguments: &'a [inline::ArgumentFacts],
 }
 
@@ -142,6 +143,7 @@ impl<'a> Candidate<'a> {
         oid: i32,
         version: u64,
         site: InvocationSite,
+        input_collation: super::ast::Collation,
         arguments: &[inline::ArgumentFacts],
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
@@ -152,6 +154,7 @@ impl<'a> Candidate<'a> {
             oid,
             version,
             site,
+            input_collation,
             arguments,
         })
     }
@@ -287,6 +290,15 @@ fn capture<'a>(
         .routine_call_mapping(slot, argument_names, args.len(), *variadic, txid)
         .ok_or_else(missing_contract)?;
     let written = inline::argument_facts(args, columns, storage, txid, arena)?;
+    let input_collation = inline::call_collation(
+        args,
+        &mapping[..args.len()],
+        &routine,
+        columns,
+        storage,
+        txid,
+        arena,
+    )?;
     let mut normalized = ArenaList::new(arena);
     for input in 0..routine.argument_count {
         let parameter = routine
@@ -372,6 +384,7 @@ fn capture<'a>(
         crate::storage::routine_oid(&routine),
         routine.version,
         InvocationSite::Expression(position),
+        input_collation,
         normalized.as_slice(),
         arena,
     )
@@ -451,6 +464,7 @@ fn capture_assignment<'a>(
         oid,
         routine.version,
         InvocationSite::Assignment(site),
+        inline::cast_collation(expression, columns, storage, txid, arena)?,
         arguments.as_slice(),
         arena,
     )
@@ -760,6 +774,7 @@ impl Engine {
                 let _parameters = super::exec::enter_routine_parameter_types(
                     routine.arguments(),
                     Some(&catalog),
+                    candidate.input_collation,
                 )?;
                 query::capture_contextual_type_inputs(
                     parser,
@@ -813,8 +828,11 @@ impl Engine {
             }
             type_inputs::validate_restored(&parser, &self.storage, txn.txid)?;
             let catalog = query::storage_catalog(&self.storage, arena, txn.txid);
-            let _parameters =
-                super::exec::enter_routine_parameter_types(routine.arguments(), Some(&catalog))?;
+            let _parameters = super::exec::enter_routine_parameter_types(
+                routine.arguments(),
+                Some(&catalog),
+                candidate.input_collation,
+            )?;
             let columns = super::exec::CatalogCols {
                 definition: None,
                 alias: None,
@@ -854,7 +872,11 @@ impl Engine {
         if accepted {
             let parameters = {
                 let catalog = query::storage_catalog(&self.storage, arena, txn.txid);
-                super::exec::enter_routine_parameter_types(routine.arguments(), Some(&catalog))
+                super::exec::enter_routine_parameter_types(
+                    routine.arguments(),
+                    Some(&catalog),
+                    candidate.input_collation,
+                )
             };
             let _parameters = match parameters {
                 Ok(parameters) => parameters,
@@ -945,15 +967,24 @@ mod parameter_tests {
                 with_parameters(Some(&[]), || {
                     assert!(inspect_parameters(|values| matches!(values, Some([]))))
                 });
-                let formal = super::super::exec::enter_routine_parameter_types(&[], None).unwrap();
+                let formal = super::super::exec::enter_routine_parameter_types(
+                    &[],
+                    None,
+                    crate::sql::ast::Collation::None,
+                )
+                .unwrap();
                 assert!(inspect_parameters(|values| values.is_none()));
                 let values = [Datum::Null, Datum::Null, Datum::Int4(9)];
                 with_inline_parameters(&values, &[false, true, true], || {
                     assert!(!parameter_known(1));
                     assert!(parameter_known(2));
                     assert!(parameter_known(3));
-                    let nested =
-                        super::super::exec::enter_routine_parameter_types(&[], None).unwrap();
+                    let nested = super::super::exec::enter_routine_parameter_types(
+                        &[],
+                        None,
+                        crate::sql::ast::Collation::None,
+                    )
+                    .unwrap();
                     assert!(inspect_parameters(|values| values.is_none()));
                     assert!(!parameter_known(3));
                     drop(nested);

@@ -325,6 +325,7 @@ pub struct TxnState {
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
     ddl_origins: FixedVec<u32>,
+    ddl_plan_events: FixedVec<super::plan_invalidations::PlanInvalidationEvent>,
     ddl_origin: u32,
     next_ddl_origin: u32,
     /// Transaction-private ANALYZE versions, kept outside `DdlUndo`. The
@@ -853,6 +854,9 @@ impl TxnState {
             )
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<DdlUndo>()))
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<u32>()))
+            .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<
+                super::plan_invalidations::PlanInvalidationEvent,
+            >()))
             .saturating_add(
                 capacity
                     .analyze
@@ -1016,6 +1020,7 @@ impl TxnState {
             )?,
             ddl: FixedVec::new(budget, "txn_ddl", capacity.ddl)?,
             ddl_origins: FixedVec::new(budget, "txn_ddl_origins", capacity.ddl)?,
+            ddl_plan_events: FixedVec::new(budget, "txn_plan_invalidations", capacity.ddl)?,
             ddl_origin: 0,
             next_ddl_origin: 0,
             statistics_undo: FixedVec::new(budget, "txn_statistics_undo", capacity.analyze)?,
@@ -2554,9 +2559,13 @@ impl TxnState {
 
     pub fn rewind_ddl(&mut self, ddl_mark: usize) {
         while self.ddl.len() > ddl_mark {
-            let undo = self.ddl.pop().expect("DDL exceeds its rewind mark");
+            self.ddl.pop().expect("DDL exceeds its rewind mark");
+            let event = self
+                .ddl_plan_events
+                .pop()
+                .expect("DDL events parallel their changes");
             if let Some(owner) = &self.plan_invalidations {
-                owner.change(undo.catalog_plan_change());
+                owner.apply(event);
             }
             self.ddl_origins.pop();
         }
@@ -2624,7 +2633,7 @@ impl TxnState {
             rewrites_rows,
             invalidated_statistics,
         )?;
-        if let Err(error) = self.record_ddl(DdlUndo::TableAltered(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::TableAltered(change)) {
             storage.rollback_table_def(change);
             return Err(error);
         }
@@ -2705,7 +2714,7 @@ impl TxnState {
         undo: crate::storage::CatalogDdlUndo,
     ) -> Result<(), SqlError> {
         storage.validate_table_drop(undo, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::Dropped(undo)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::Dropped(undo)) {
             storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2718,7 +2727,7 @@ impl TxnState {
         change: crate::storage::MatviewDdlUndo,
     ) -> Result<(), SqlError> {
         storage.validate_matview_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::MatviewChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::MatviewChanged(change)) {
             storage.finish_matview_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2731,7 +2740,7 @@ impl TxnState {
         change: crate::storage::RoutineChange,
     ) -> Result<(), SqlError> {
         storage.validate_routine_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::RoutineChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::RoutineChanged(change)) {
             storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2744,7 +2753,7 @@ impl TxnState {
         change: crate::storage::SequenceChange,
     ) -> Result<(), SqlError> {
         storage.validate_sequence_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::SequenceChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::SequenceChanged(change)) {
             storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2756,27 +2765,36 @@ impl TxnState {
         storage: &mut crate::storage::Storage,
         undo: DdlUndo,
     ) -> Result<(), SqlError> {
-        if let Err(error) = self.record_ddl(undo.clone()) {
+        if let Err(error) = self.record_ddl(storage, undo.clone()) {
             super::rollback_catalog_change(storage, undo, self.txid);
             return Err(error);
         }
         Ok(())
     }
 
-    pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
-        let invalidation = undo.catalog_plan_change();
-        self.ddl.push(undo).map_err(|_| {
-            sql_err!(
+    pub(crate) fn record_ddl(&mut self, storage: &Storage, undo: DdlUndo) -> Result<(), SqlError> {
+        if self.ddl.len() == self.ddl.capacity()
+            || self.ddl_plan_events.len() == self.ddl_plan_events.capacity()
+        {
+            return Err(sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction contains more than {} catalog changes",
                 self.ddl.capacity()
-            )
-        })?;
+            ));
+        }
+        let event =
+            super::plan_invalidations::PlanInvalidationEvent::capture(storage, &undo, self.txid)?;
+        self.ddl
+            .push(undo)
+            .expect("DDL capacity was checked before capturing its event");
         self.ddl_origins
             .push(self.ddl_origin)
             .expect("parallel DDL origin pool has the same capacity");
+        self.ddl_plan_events
+            .push(event)
+            .expect("parallel DDL event pool has the same capacity");
         if let Some(owner) = &self.plan_invalidations {
-            owner.change(invalidation);
+            owner.apply(event);
         }
         Ok(())
     }
@@ -2800,6 +2818,7 @@ impl TxnState {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn plan_invalidation_stamp(
         &self,
         depends_on_roles: bool,
@@ -2815,16 +2834,42 @@ impl TxnState {
             .stamp(depends_on_roles)
     }
 
+    pub(crate) fn watch_plan_inputs(
+        &self,
+        storage: &Storage,
+        depends_on_roles: bool,
+        dependencies: crate::mem::lease_pool::SharedSlice<crate::storage::RuntimeInputDependency>,
+        own_routine: Option<i32>,
+    ) -> Result<super::plan_invalidations::LocalPlanStamp, SqlError> {
+        let owner = self.plan_invalidations.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "transaction has no SQL plan invalidation owner"
+            )
+        })?;
+        storage.register_plan_backend(owner)?;
+        owner.watch(
+            depends_on_roles,
+            storage.runtime_input_scope(),
+            dependencies,
+            own_routine,
+        )
+    }
+
     pub(crate) fn detach_prepared_plan_invalidations(&mut self) {
         if let Some(owner) = self.plan_invalidations.take() {
-            for undo in self.ddl.iter() {
-                owner.change(undo.catalog_plan_change());
+            for event in self.ddl_plan_events.iter() {
+                owner.apply(*event);
             }
         }
     }
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {
         &self.ddl
+    }
+
+    pub(crate) fn plan_events(&self) -> &[super::plan_invalidations::PlanInvalidationEvent] {
+        &self.ddl_plan_events
     }
 
     pub(crate) fn ddl_capacity(&self) -> usize {
@@ -2855,8 +2900,8 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         if let Some(owner) = &self.plan_invalidations {
-            for undo in self.ddl.iter() {
-                owner.change(undo.catalog_plan_change());
+            for event in self.ddl_plan_events.iter() {
+                owner.apply(*event);
             }
         }
         self.staged_commit = None;
@@ -2884,6 +2929,7 @@ impl TxnState {
         self.truncate_table_slots.clear();
         self.ddl.clear();
         self.ddl_origins.clear();
+        self.ddl_plan_events.clear();
         self.ddl_origin = 0;
         self.next_ddl_origin = 0;
         self.concurrent_partition_detach_pending = false;

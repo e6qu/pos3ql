@@ -16,7 +16,7 @@ struct Namespace {
 }
 
 #[derive(Clone, Copy)]
-enum Dependency {
+pub(crate) enum RuntimeInputDependency {
     Table {
         slot: u16,
         source: RelationReference,
@@ -36,24 +36,80 @@ enum Dependency {
         source: TypeReference,
         revision: u64,
     },
+    Sequence {
+        slot: u16,
+        created_at: u64,
+    },
 }
 
-#[derive(Clone)]
+impl RuntimeInputDependency {
+    pub(crate) fn matches_target(self, target: super::SelectedPlanTarget) -> bool {
+        use super::SelectedPlanTarget;
+        match (self, target) {
+            (
+                Self::Table { source, .. } | Self::View { source, .. },
+                SelectedPlanTarget::Relation { created_at },
+            ) => source.created_at() == created_at,
+            (
+                Self::Sequence {
+                    created_at: selected,
+                    ..
+                },
+                SelectedPlanTarget::Relation { created_at },
+            ) => selected == created_at,
+            (Self::Routine { oid: selected, .. }, SelectedPlanTarget::Routine { oid }) => {
+                selected == oid
+            }
+            (Self::Type { source, .. }, SelectedPlanTarget::Type { kind, creation }) => {
+                source.kind() == kind && source.creation() == creation
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeInputScope {
+    origin: super::type_references::CatalogOrigin,
+    database: DatabaseOid,
+}
+
+impl RuntimeInputScope {
+    pub(super) fn database(self) -> DatabaseOid {
+        self.database
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_scope(database: DatabaseOid) -> Self {
+        Self {
+            origin: super::type_references::CatalogOrigin::new().unwrap(),
+            database,
+        }
+    }
+}
+
 pub(crate) struct RuntimeInputValidity {
     global: super::plan_invalidations::PlanInvalidationStamp,
     local: crate::sql::plan_invalidations::LocalPlanStamp,
-    database: DatabaseOid,
+    scope: RuntimeInputScope,
     namespaces: SharedSlice<Namespace>,
     explicit_catalog: bool,
-    dependencies: SharedSlice<Dependency>,
+    dependencies: SharedSlice<RuntimeInputDependency>,
     role: Option<(super::RoleOid, bool)>,
 }
 
 impl Storage {
+    pub(crate) fn runtime_input_scope(&self) -> RuntimeInputScope {
+        RuntimeInputScope {
+            origin: self.catalog_sources.origin(),
+            database: super::current_database(),
+        }
+    }
     pub(crate) fn capture_runtime_input_validity(
         &self,
         dependencies: &StoredQueryDependencies,
         txn: &crate::sql::txn::TxnState,
+        own_routine: Option<i32>,
     ) -> Result<RuntimeInputValidity, SqlError> {
         let transaction = txn.txid;
         let full = |error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error);
@@ -81,18 +137,19 @@ impl Storage {
             .entries()
             .iter()
             .filter(|entry| {
-                matches!(
-                    entry.identity,
-                    StoredDependencyIdentity::Table(_)
-                        | StoredDependencyIdentity::View(_)
-                        | StoredDependencyIdentity::RoutineOid(_)
-                        | StoredDependencyIdentity::Type(_)
-                )
+                entry.class == super::DependencyClass::Sequence
+                    || matches!(
+                        entry.identity,
+                        StoredDependencyIdentity::Table(_)
+                            | StoredDependencyIdentity::View(_)
+                            | StoredDependencyIdentity::RoutineOid(_)
+                            | StoredDependencyIdentity::Type(_)
+                    )
             })
             .count();
         let mut selected = self
             .metadata_pool
-            .lease::<Dependency>(count)
+            .lease::<RuntimeInputDependency>(count)
             .map_err(full)?;
         let mut depends_on_roles = false;
         for entry in dependencies.entries() {
@@ -102,7 +159,7 @@ impl Storage {
                     let definition = self.table_def(slot, transaction);
                     depends_on_roles |= definition.row_level_security.enabled;
                     let (revision, pending_revision) = definition.revisions();
-                    Some(Dependency::Table {
+                    Some(RuntimeInputDependency::Table {
                         slot: entry.slot,
                         source,
                         revision,
@@ -116,24 +173,34 @@ impl Storage {
                         .as_ref()
                         .filter(|pending| pending.txid == transaction)
                         .map_or(view.version, |pending| pending.version);
-                    Some(Dependency::View {
+                    Some(RuntimeInputDependency::View {
                         slot: entry.slot,
                         source,
                         revision,
                     })
                 }
-                StoredDependencyIdentity::RoutineOid(oid) => Some(Dependency::Routine {
-                    oid,
-                    revision: self.routine_for(slot, transaction).version,
-                }),
+                StoredDependencyIdentity::RoutineOid(oid) => {
+                    Some(RuntimeInputDependency::Routine {
+                        oid,
+                        revision: self.routine_for(slot, transaction).version,
+                    })
+                }
                 StoredDependencyIdentity::Type(source) => {
                     let catalog = self
                         .type_catalog
                         .lock()
                         .expect("type catalog lock poisoned");
-                    Some(Dependency::Type {
+                    Some(RuntimeInputDependency::Type {
                         source,
                         revision: catalog.type_definition_version(source.slot(), transaction),
+                    })
+                }
+                StoredDependencyIdentity::Name
+                    if entry.class == super::DependencyClass::Sequence =>
+                {
+                    Some(RuntimeInputDependency::Sequence {
+                        slot: entry.slot,
+                        created_at: self.sequence(slot).created_at,
                     })
                 }
                 _ => None,
@@ -153,15 +220,17 @@ impl Storage {
         } else {
             None
         };
+        let selected = selected.freeze();
+        let local = txn.watch_plan_inputs(self, depends_on_roles, selected.clone(), own_routine)?;
         Ok(RuntimeInputValidity {
             global: self
                 .plan_invalidations
                 .stamp(super::current_database(), depends_on_roles)?,
-            local: txn.plan_invalidation_stamp(depends_on_roles)?,
-            database: super::current_database(),
+            local,
+            scope: self.runtime_input_scope(),
             namespaces: namespaces.freeze(),
             explicit_catalog: path.explicit_catalog(),
-            dependencies: selected.freeze(),
+            dependencies: selected,
             role,
         })
     }
@@ -172,7 +241,7 @@ impl RuntimeInputValidity {
         if !storage.plan_invalidations.matches(self.global)? || !self.local.matches()? {
             return Ok(false);
         }
-        if self.database != super::current_database() {
+        if self.scope != storage.runtime_input_scope() {
             return Ok(false);
         }
         let path = storage.path();
@@ -200,7 +269,7 @@ impl RuntimeInputValidity {
         }
         for dependency in self.dependencies.iter() {
             let matches = match *dependency {
-                Dependency::Table {
+                RuntimeInputDependency::Table {
                     slot,
                     source,
                     revision,
@@ -211,7 +280,7 @@ impl RuntimeInputValidity {
                         && definition.identity().created_at == source.created_at()
                         && definition.revisions() == (revision, pending_revision)
                 }
-                Dependency::View {
+                RuntimeInputDependency::View {
                     slot,
                     source,
                     revision,
@@ -226,18 +295,22 @@ impl RuntimeInputValidity {
                             .map_or(view.version, |pending| pending.version)
                             == revision
                 }
-                Dependency::Routine { oid, revision } => storage
+                RuntimeInputDependency::Routine { oid, revision } => storage
                     .routine_slot_by_oid(oid, transaction)
                     .is_some_and(|slot| storage.routine_for(slot, transaction).version == revision),
-                Dependency::Type { source, revision } => {
+                RuntimeInputDependency::Type { source, revision } => {
                     let catalog = storage
                         .type_catalog
                         .lock()
                         .expect("type catalog lock poisoned");
                     catalog
-                        .resolve_source_reference(source, self.database, transaction)?
+                        .resolve_source_reference(source, self.scope.database, transaction)?
                         .is_some()
                         && catalog.type_definition_version(source.slot(), transaction) == revision
+                }
+                RuntimeInputDependency::Sequence { slot, created_at } => {
+                    let sequence = storage.sequence(usize::from(slot));
+                    sequence.created_at == created_at && sequence.visible_to(transaction)
                 }
             };
             if !matches {

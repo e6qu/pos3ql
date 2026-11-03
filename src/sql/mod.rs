@@ -3104,7 +3104,7 @@ impl Engine {
                 .rollback_subscription_relation_refresh(txn.txid);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(DdlUndo::SubscriptionRelationsChanged) {
+        if let Err(error) = txn.record_ddl(&self.storage, DdlUndo::SubscriptionRelationsChanged) {
             self.storage
                 .rollback_subscription_relation_refresh(txn.txid);
             return Err(error);
@@ -3216,10 +3216,13 @@ impl Engine {
                 .restore_subscription_definition(current.slot(), change.prior);
             return Err(error);
         }
-        if let Err(error) = txn.record_ddl(DdlUndo::SubscriptionDefinitionChanged {
-            slot: current.slot() as u32,
-            prior: change.prior,
-        }) {
+        if let Err(error) = txn.record_ddl(
+            &self.storage,
+            DdlUndo::SubscriptionDefinitionChanged {
+                slot: current.slot() as u32,
+                prior: change.prior,
+            },
+        ) {
             self.storage
                 .restore_subscription_definition(current.slot(), change.prior);
             return Err(error);
@@ -7123,6 +7126,7 @@ impl Engine {
             self.transaction_publication.owns(txn.txid),
             "durable promotion retains its transaction owner"
         );
+        self.storage.publish_plan_invalidations(txn.plan_events());
         self.commit_altered_tables.clear();
         self.commit_index_tables.clear();
         for undo in txn.ddl() {
@@ -7623,7 +7627,6 @@ impl Engine {
         }
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage.finish_cumulative_transaction(txn.txid, true);
-        self.storage.publish_plan_invalidations(txn.ddl());
         txn.clear();
         let result = notify_result.and(temporary_result);
         #[cfg(test)]
@@ -15535,6 +15538,7 @@ impl Engine {
                 let _formals = match exec::enter_routine_parameter_types(
                     &declaration.arguments[..declaration.argument_count],
                     Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+                    ast::Collation::None,
                 ) {
                     Ok(scope) => scope,
                     Err(error) => return Ok(Err(error)),
@@ -15665,19 +15669,31 @@ impl Engine {
                     crate::storage::routine_oid(routine),
                     routine.version,
                     canonical,
-                    |validity| {
-                        if validity.is_none() {
-                            Ok(true)
-                        } else {
-                            Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PL/pgSQL instance unexpectedly owns SQL plan validity"
-                            ))
-                        }
+                    |validity| match validity {
+                        Some(validity) => validity.matches(&self.storage, txn.txid),
+                        None => Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "PL/pgSQL instance has no validity image"
+                        )),
                     },
                     |bytes| self.storage.freeze_runtime_input_key(bytes),
                 )?;
                 if let Some(plan) = admission.reserved {
+                    let validity = match (|| {
+                        let dependencies = self.storage.empty_stored_query_dependencies(scratch)?;
+                        self.storage.capture_runtime_input_validity(
+                            &dependencies,
+                            txn,
+                            Some(crate::storage::routine_oid(routine)),
+                        )
+                    })() {
+                        Ok(validity) => validity,
+                        Err(error) => {
+                            sqlprep.routine_inputs.abandon(plan)?;
+                            return Err(error);
+                        }
+                    };
+                    sqlprep.routine_inputs.set_body_validity(plan, validity)?;
                     sqlprep.routine_inputs.complete(
                         plan,
                         InputImage::Runtime(crate::mem::lease_pool::SharedSlice::EMPTY),
@@ -15935,10 +15951,12 @@ impl Engine {
                             arena,
                         )?;
                     }
-                    let validity = self
-                        .storage
-                        .capture_runtime_input_validity(&dependencies, txn)?;
                     if let Some(plan) = reserved {
+                        let validity = self.storage.capture_runtime_input_validity(
+                            &dependencies,
+                            txn,
+                            Some(routine_oid),
+                        )?;
                         sqlprep.routine_inputs.set_body_validity(plan, validity)?;
                     }
                     Ok(parser)
@@ -15988,6 +16006,9 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
         use type_input_plans::{InputImage, Lookup, Owner};
+        if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
+            return Ok(Err(error));
+        }
         let TypeInputPlanSource {
             key,
             reserved,
@@ -16216,6 +16237,7 @@ impl Engine {
         let _formal_scope = match exec::enter_routine_parameter_types(
             routine.arguments(),
             Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            pending.input_collation,
         ) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
@@ -16261,6 +16283,7 @@ impl Engine {
                     cursors,
                     guc,
                     routine,
+                    pending.input_collation,
                     &arguments[..pending.argument_count],
                     arena,
                     responder,
@@ -16392,6 +16415,7 @@ impl Engine {
         let _formal_scope = match exec::enter_routine_parameter_types(
             routine.arguments(),
             Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+            pending.input_collation,
         ) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
@@ -16441,7 +16465,16 @@ impl Engine {
             };
             return Ok(type_input_plans::with_owner(instance, || {
                 exec::execute_plpgsql_table_function(
-                    self, txn, sqlprep, cursors, guc, routine, &*inputs, arena, responder,
+                    self,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine,
+                    pending.input_collation,
+                    &*inputs,
+                    arena,
+                    responder,
                 )
             }));
         }
@@ -17201,6 +17234,7 @@ impl Engine {
                             exec::PlpgsqlTransactionContext::Atomic
                         },
                         routine,
+                        input_collation,
                         &completed[..declared.argument_count],
                         arena,
                         responder,
@@ -17271,6 +17305,7 @@ impl Engine {
             let _formal_scope = match exec::enter_routine_parameter_types(
                 routine.arguments(),
                 Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
+                input_collation,
             ) {
                 Ok(scope) => scope,
                 Err(error) => return Ok(Err(error)),
@@ -21227,10 +21262,13 @@ impl Engine {
                 false,
                 txn.txid,
             )?;
-            if let Err(error) = txn.record_ddl(DdlUndo::ExtensionDependencyChanged {
-                slot: changed as u32,
-                prior,
-            }) {
+            if let Err(error) = txn.record_ddl(
+                &self.storage,
+                DdlUndo::ExtensionDependencyChanged {
+                    slot: changed as u32,
+                    prior,
+                },
+            ) {
                 self.storage.rollback_extension_dependency(changed, prior);
                 return Err(error);
             }
@@ -21394,9 +21432,10 @@ impl Engine {
                     self.storage.rollback_view_alter(prior);
                     return Ok(Err(error));
                 }
-                if let Err(error) = txn.record_ddl(DdlUndo::ViewChanged(
-                    crate::storage::ViewPublication::Altered(prior.clone()),
-                )) {
+                if let Err(error) = txn.record_ddl(
+                    &self.storage,
+                    DdlUndo::ViewChanged(crate::storage::ViewPublication::Altered(prior.clone())),
+                ) {
                     self.storage.rollback_view_alter(prior);
                     return Ok(Err(error));
                 }
@@ -21799,10 +21838,13 @@ impl Engine {
                     Ok(changed) => changed,
                     Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) = txn.record_ddl(DdlUndo::ExtensionDependencyChanged {
-                    slot: dependency as u32,
-                    prior,
-                }) {
+                if let Err(error) = txn.record_ddl(
+                    &self.storage,
+                    DdlUndo::ExtensionDependencyChanged {
+                        slot: dependency as u32,
+                        prior,
+                    },
+                ) {
                     self.storage
                         .rollback_extension_dependency(dependency, prior);
                     return Ok(Err(error));
@@ -21853,10 +21895,13 @@ impl Engine {
                     Ok(changed) => changed,
                     Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) = txn.record_ddl(DdlUndo::ExtensionDependencyChanged {
-                    slot: changed as u32,
-                    prior,
-                }) {
+                if let Err(error) = txn.record_ddl(
+                    &self.storage,
+                    DdlUndo::ExtensionDependencyChanged {
+                        slot: changed as u32,
+                        prior,
+                    },
+                ) {
                     self.storage.rollback_extension_dependency(changed, prior);
                     return Ok(Err(error));
                 }
@@ -23749,7 +23794,7 @@ fn apply_prepared_table_wal_payload(
         prepared
             .slot_mut(prepared_slot)
             .transaction
-            .record_ddl(DdlUndo::Created(table as u32))?;
+            .record_ddl(storage, DdlUndo::Created(table as u32))?;
     }
     Ok(())
 }
@@ -24387,7 +24432,7 @@ fn replay_transaction_batches(
                             if let Err(error) = prepared
                                 .slot_mut(slot)
                                 .transaction
-                                .record_ddl(DdlUndo::MatviewPopulationChanged(undo))
+                                .record_ddl(storage, DdlUndo::MatviewPopulationChanged(undo))
                             {
                                 storage.finish_matview_population(
                                     undo,
@@ -24525,7 +24570,7 @@ fn replay_transaction_batches(
                             if let Err(error) = prepared
                                 .slot_mut(slot)
                                 .transaction
-                                .record_ddl(DdlUndo::ParameterAclChanged { prior })
+                                .record_ddl(storage, DdlUndo::ParameterAclChanged { prior })
                             {
                                 storage.restore_parameter_acl_pending(prior)?;
                                 return Err(error);

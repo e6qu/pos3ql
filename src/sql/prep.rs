@@ -157,7 +157,11 @@ impl SqlPreparedPool {
             .saturating_add(super::type_input_plans::RoutineInputPlans::budget_bytes(
                 config,
             ))
-            .saturating_add(super::plan_invalidations::LocalPlanInvalidations::budget_bytes())
+            .saturating_add(
+                super::plan_invalidations::LocalPlanInvalidations::budget_bytes(
+                    config.routine_input_slots,
+                ),
+            )
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -183,7 +187,10 @@ impl SqlPreparedPool {
             request,
             request_owner: None,
             routine_inputs,
-            plan_invalidations: super::plan_invalidations::LocalPlanInvalidations::new(budget)?,
+            plan_invalidations: super::plan_invalidations::LocalPlanInvalidations::new(
+                config.routine_input_slots,
+                budget,
+            )?,
             transient_plan: None,
             next_plan: 1,
         })

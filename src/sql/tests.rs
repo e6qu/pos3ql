@@ -17,6 +17,7 @@ mod foreign_parent_admission;
 mod geometric_casts;
 mod geometry_assignments;
 mod key_preparation;
+mod nested_planner_inputs;
 mod object_reads;
 mod oid_alias_comparisons;
 mod prepared_object_capacity;

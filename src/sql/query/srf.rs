@@ -5780,6 +5780,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
                 routine.arguments(),
                 hooks.catalog,
+                input_collation,
             )?;
             let owner = crate::storage::SessionIdentity::bound(
                 storage.capture_role_slot(routine.ownership.owner_to(txid).into(), txid)?,

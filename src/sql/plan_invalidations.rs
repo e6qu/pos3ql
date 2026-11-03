@@ -7,8 +7,9 @@ use super::{
     eval::{SqlError, sqlstate},
     txn::DdlUndo,
 };
-use crate::mem::{Budget, BudgetError};
+use crate::mem::{Budget, BudgetError, FixedVec, lease_pool::SharedSlice, mutex::Mutex};
 use crate::sql_err;
+use crate::storage::{RuntimeInputDependency, RuntimeInputScope, SelectedPlanTarget};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CatalogPlanChange {
@@ -16,28 +17,86 @@ pub(crate) struct CatalogPlanChange {
     pub roles: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PlanInvalidationEvent {
+    pub scope: RuntimeInputScope,
+    pub change: CatalogPlanChange,
+    pub selected: Option<SelectedPlanTarget>,
+}
+
+impl PlanInvalidationEvent {
+    pub(crate) fn capture(
+        storage: &crate::storage::Storage,
+        undo: &DdlUndo,
+        transaction: u32,
+    ) -> Result<Self, SqlError> {
+        let mut change = undo.catalog_plan_change();
+        change.global |= storage.operator_family_plan_change(undo, transaction);
+        Ok(Self {
+            scope: storage.runtime_input_scope(),
+            change,
+            selected: storage.selected_plan_target(undo, transaction)?,
+        })
+    }
+}
+
 pub(crate) struct LocalPlanInvalidations {
     global: AtomicU64,
     roles: AtomicU64,
+    watches: Mutex<Watches>,
 }
 
-#[derive(Clone)]
+struct Watch {
+    scope: RuntimeInputScope,
+    dependencies: SharedSlice<RuntimeInputDependency>,
+    own_routine: Option<i32>,
+    generation: u64,
+    epoch: u64,
+}
+
+struct Watches {
+    entries: FixedVec<Option<Watch>>,
+    next_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WatchToken {
+    slot: usize,
+    generation: u64,
+    epoch: u64,
+}
+
 pub(crate) struct LocalPlanStamp {
     owner: Arc<LocalPlanInvalidations>,
     global: u64,
     roles: Option<u64>,
+    watch: Option<WatchToken>,
 }
 
 impl LocalPlanInvalidations {
-    pub(crate) const fn budget_bytes() -> usize {
-        core::mem::size_of::<Self>() + 2 * core::mem::size_of::<usize>()
+    pub(crate) const fn budget_bytes(slots: usize) -> usize {
+        (core::mem::size_of::<Self>() + 2 * core::mem::size_of::<usize>())
+            .saturating_add(slots.saturating_mul(core::mem::size_of::<Option<Watch>>()))
     }
 
-    pub(crate) fn new(budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
-        budget.draw(Self::budget_bytes(), "backend plan invalidations")?;
+    pub(crate) fn new(slots: usize, budget: &mut Budget) -> Result<Arc<Self>, BudgetError> {
+        budget.draw(
+            core::mem::size_of::<Self>() + 2 * core::mem::size_of::<usize>(),
+            "backend plan invalidation controls",
+        )?;
+        let mut entries = FixedVec::new(budget, "routine_input_slots invalidation watches", slots)?;
+        for _ in 0..slots {
+            entries
+                .push(None)
+                .expect("startup reserved every plan watch");
+        }
         Ok(Arc::new(Self {
             global: AtomicU64::new(0),
             roles: AtomicU64::new(0),
+            watches: Mutex::new(Watches {
+                entries,
+                next_generation: 1,
+            }),
         }))
     }
 
@@ -51,10 +110,14 @@ impl LocalPlanInvalidations {
         }
     }
 
-    pub(crate) fn stamp(
-        self: &Arc<Self>,
-        depends_on_roles: bool,
-    ) -> Result<LocalPlanStamp, SqlError> {
+    pub(crate) fn apply(&self, event: PlanInvalidationEvent) {
+        self.change(event.change);
+        if let Some(target) = event.selected {
+            self.selected_changed(event.scope, target);
+        }
+    }
+
+    fn generations(&self, depends_on_roles: bool) -> Result<(u64, Option<u64>), SqlError> {
         let global = self.global.load(Ordering::Acquire);
         let roles = depends_on_roles.then(|| self.roles.load(Ordering::Acquire));
         if global == u64::MAX || roles == Some(u64::MAX) {
@@ -63,18 +126,129 @@ impl LocalPlanInvalidations {
                 "backend SQL plan invalidation identities exhausted"
             ));
         }
+        Ok((global, roles))
+    }
+
+    pub(crate) fn stamp(
+        self: &Arc<Self>,
+        depends_on_roles: bool,
+    ) -> Result<LocalPlanStamp, SqlError> {
+        let (global, roles) = self.generations(depends_on_roles)?;
         Ok(LocalPlanStamp {
             owner: Arc::clone(self),
             global,
             roles,
+            watch: None,
         })
+    }
+
+    pub(crate) fn watch(
+        self: &Arc<Self>,
+        depends_on_roles: bool,
+        scope: RuntimeInputScope,
+        dependencies: SharedSlice<RuntimeInputDependency>,
+        own_routine: Option<i32>,
+    ) -> Result<LocalPlanStamp, SqlError> {
+        let mut stamp = self.stamp(depends_on_roles)?;
+        let mut watches = self.watches.lock().expect("plan watch lock poisoned");
+        let slot = watches
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine_input_slots ({}) invalidation watches are full",
+                    watches.entries.len()
+                )
+            })?;
+        let generation = watches.next_generation;
+        watches.next_generation = generation.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL plan invalidation watch identities exhausted"
+            )
+        })?;
+        watches.entries[slot] = Some(Watch {
+            scope,
+            dependencies,
+            own_routine,
+            generation,
+            epoch: 0,
+        });
+        stamp.watch = Some(WatchToken {
+            slot,
+            generation,
+            epoch: 0,
+        });
+        Ok(stamp)
+    }
+
+    pub(crate) fn selected_changed(&self, scope: RuntimeInputScope, target: SelectedPlanTarget) {
+        let mut watches = self.watches.lock().expect("plan watch lock poisoned");
+        for watch in watches.entries.iter_mut().flatten() {
+            if watch.scope == scope
+                && (matches!(target, SelectedPlanTarget::Routine { oid } if watch.own_routine == Some(oid))
+                    || watch
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency.matches_target(target)))
+            {
+                watch.epoch = watch.epoch.saturating_add(1);
+            }
+        }
+    }
+
+    fn release_watch(&self, token: WatchToken) {
+        let mut watches = self.watches.lock().expect("plan watch lock poisoned");
+        if let Some(entry) = watches.entries.get_mut(token.slot)
+            && entry
+                .as_ref()
+                .is_some_and(|watch| watch.generation == token.generation)
+        {
+            *entry = None;
+        }
     }
 }
 
 impl LocalPlanStamp {
     pub(crate) fn matches(&self) -> Result<bool, SqlError> {
-        let current = self.owner.stamp(self.roles.is_some())?;
-        Ok(current.global == self.global && current.roles == self.roles)
+        let (global, roles) = self.owner.generations(self.roles.is_some())?;
+        if global != self.global || roles != self.roles {
+            return Ok(false);
+        }
+        if let Some(token) = self.watch {
+            let watches = self.owner.watches.lock().expect("plan watch lock poisoned");
+            let watch = watches
+                .entries
+                .get(token.slot)
+                .and_then(Option::as_ref)
+                .filter(|watch| watch.generation == token.generation)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "SQL plan invalidation watch was replaced"
+                    )
+                })?;
+            if watch.epoch == u64::MAX {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "SQL plan invalidation event identities exhausted"
+                ));
+            }
+            if watch.epoch != token.epoch {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Drop for LocalPlanStamp {
+    fn drop(&mut self) {
+        if let Some(token) = self.watch {
+            self.owner.release_watch(token);
+        }
     }
 }
 
@@ -129,8 +303,8 @@ mod tests {
 
     #[test]
     fn backend_invalidations_are_role_sensitive_and_never_wrap_without_allocation() {
-        let mut budget = Budget::new(LocalPlanInvalidations::budget_bytes());
-        let owner = LocalPlanInvalidations::new(&mut budget).unwrap();
+        let mut budget = Budget::new(LocalPlanInvalidations::budget_bytes(0));
+        let owner = LocalPlanInvalidations::new(0, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let ordinary = owner.stamp(false).unwrap();
             let secure = owner.stamp(true).unwrap();
@@ -162,28 +336,74 @@ mod tests {
     }
 
     #[test]
+    fn selected_watches_are_bounded_scoped_and_generation_safe_without_allocation() {
+        let mut budget = Budget::new(LocalPlanInvalidations::budget_bytes(2));
+        let owner = LocalPlanInvalidations::new(2, &mut budget).unwrap();
+        let scope = RuntimeInputScope::test_scope(crate::storage::DatabaseOid::POSTGRES);
+        let unrelated = RuntimeInputScope::test_scope(crate::storage::DatabaseOid::POSTGRES);
+        crate::mem::guard::forbid_alloc(|| {
+            let first = owner
+                .watch(false, scope, SharedSlice::EMPTY, Some(100_001))
+                .unwrap();
+            let other = owner
+                .watch(false, scope, SharedSlice::EMPTY, Some(100_002))
+                .unwrap();
+            let error = owner
+                .watch(false, scope, SharedSlice::EMPTY, None)
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("routine_input_slots"));
+            owner.selected_changed(unrelated, SelectedPlanTarget::Routine { oid: 100_001 });
+            assert!(first.matches().unwrap());
+            owner.selected_changed(scope, SelectedPlanTarget::Routine { oid: 100_001 });
+            assert!(!first.matches().unwrap());
+            assert!(other.matches().unwrap());
+            let stale = first.watch.unwrap();
+            drop(first);
+            let replacement = owner
+                .watch(false, scope, SharedSlice::EMPTY, Some(100_001))
+                .unwrap();
+            assert_ne!(replacement.watch.unwrap().generation, stale.generation);
+            owner.release_watch(stale);
+            assert!(replacement.matches().unwrap());
+            drop((replacement, other));
+            assert!(
+                owner
+                    .watches
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .all(Option::is_none)
+            );
+        });
+    }
+
+    #[test]
     fn transaction_workspaces_share_backend_lineage_and_prepared_work_detaches() {
         let mut budget = Budget::new(
-            2 * LocalPlanInvalidations::budget_bytes()
+            2 * LocalPlanInvalidations::budget_bytes(0)
                 + 2 * super::super::txn::TxnState::budget_bytes(8),
         );
-        let first = LocalPlanInvalidations::new(&mut budget).unwrap();
-        let other = LocalPlanInvalidations::new(&mut budget).unwrap();
+        let first = LocalPlanInvalidations::new(0, &mut budget).unwrap();
+        let other = LocalPlanInvalidations::new(0, &mut budget).unwrap();
         let mut transaction = super::super::txn::TxnState::new(&mut budget, 8).unwrap();
         let mut replacement = super::super::txn::TxnState::new(&mut budget, 8).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             transaction.bind_plan_invalidations(&first).unwrap();
             let old = transaction.plan_invalidation_stamp(false).unwrap();
-            transaction.record_ddl(DdlUndo::SchemaCreated(3)).unwrap();
+            first.change(DdlUndo::SchemaCreated(3).catalog_plan_change());
             assert!(!old.matches().unwrap());
             let pending = transaction.plan_invalidation_stamp(false).unwrap();
             transaction.rewind_ddl(0);
+            first.change(DdlUndo::SchemaCreated(3).catalog_plan_change());
             assert!(!pending.matches().unwrap());
             let reused = first.stamp(false).unwrap();
             replacement.bind_plan_invalidations(&first).unwrap();
             replacement.clear();
             assert!(reused.matches().unwrap());
-            transaction.record_ddl(DdlUndo::SchemaCreated(3)).unwrap();
+            first.change(DdlUndo::SchemaCreated(3).catalog_plan_change());
             transaction.mode = super::super::txn::TxnMode::Explicit;
             assert_eq!(
                 transaction
@@ -194,7 +414,15 @@ mod tests {
             );
             let before_prepare = first.stamp(false).unwrap();
             transaction.detach_prepared_plan_invalidations();
-            assert!(!before_prepare.matches().unwrap());
+            assert!(before_prepare.matches().unwrap());
+            assert_eq!(
+                transaction
+                    .plan_invalidation_stamp(false)
+                    .err()
+                    .unwrap()
+                    .sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
             let after_prepare = first.stamp(false).unwrap();
             transaction.clear();
             assert!(

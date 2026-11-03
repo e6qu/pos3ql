@@ -53,6 +53,12 @@ pub(crate) struct MatviewQueryUndo {
     prior: Option<PendingMatviewQuery>,
 }
 
+impl MatviewQueryUndo {
+    pub(crate) fn slot(self) -> usize {
+        self.target.slot()
+    }
+}
+
 impl core::fmt::Debug for MatviewQueryUndo {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         output

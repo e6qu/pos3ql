@@ -54,7 +54,7 @@ pub(super) fn stage_subscription_record(
                 .restore_subscription_stream_identity(slot, *created_at, 1)
                 .and_then(|()| {
                     storage.restore_subscription_owner(slot, *owner, txid)?;
-                    transaction.record_ddl(DdlUndo::SubscriptionCreated(slot as u32))
+                    transaction.record_ddl(storage, DdlUndo::SubscriptionCreated(slot as u32))
                 });
             if result.is_err() {
                 storage.rollback_subscription_create(slot);
@@ -69,7 +69,9 @@ pub(super) fn stage_subscription_record(
                     name
                 )
             })?;
-            if let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionDropped(slot as u32)) {
+            if let Err(error) =
+                transaction.record_ddl(storage, DdlUndo::SubscriptionDropped(slot as u32))
+            {
                 storage.rollback_subscription_drop(slot, txid);
                 return Err(error);
             }
@@ -84,10 +86,13 @@ pub(super) fn stage_subscription_record(
             }
             if let crate::storage::SubscriptionEnabledChange::Changed { prior } =
                 storage.set_subscription_enabled(slot, *enabled, txid)?
-                && let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionEnabled {
-                    slot: slot as u32,
-                    prior,
-                })
+                && let Err(error) = transaction.record_ddl(
+                    storage,
+                    DdlUndo::SubscriptionEnabled {
+                        slot: slot as u32,
+                        prior,
+                    },
+                )
             {
                 storage.restore_subscription_enabled(slot, prior);
                 return Err(error);
@@ -97,10 +102,13 @@ pub(super) fn stage_subscription_record(
             let (slot, _) = selected(storage, name, txid)?;
             if let crate::storage::SubscriptionBootstrapChange::Changed { prior } =
                 storage.set_subscription_bootstrap(slot, *bootstrap, txid)?
-                && let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionBootstrapChanged {
-                    slot: slot as u32,
-                    prior,
-                })
+                && let Err(error) = transaction.record_ddl(
+                    storage,
+                    DdlUndo::SubscriptionBootstrapChanged {
+                        slot: slot as u32,
+                        prior,
+                    },
+                )
             {
                 storage.restore_subscription_bootstrap(slot, prior);
                 return Err(error);
@@ -136,10 +144,13 @@ pub(super) fn stage_subscription_record(
             )?;
             let change = storage.set_subscription_definition(slot, definition, txid)?;
             if change.changed
-                && let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionDefinitionChanged {
-                    slot: slot as u32,
-                    prior: change.prior,
-                })
+                && let Err(error) = transaction.record_ddl(
+                    storage,
+                    DdlUndo::SubscriptionDefinitionChanged {
+                        slot: slot as u32,
+                        prior: change.prior,
+                    },
+                )
             {
                 storage.restore_subscription_definition(slot, change.prior);
                 return Err(error);
@@ -148,10 +159,13 @@ pub(super) fn stage_subscription_record(
         WalOp::SetSubscriptionOwner { name, owner } => {
             let (slot, _) = selected(storage, name, txid)?;
             let prior = storage.set_subscription_owner(slot, usize::from(*owner), txid)?;
-            if let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionOwnerChanged {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = transaction.record_ddl(
+                storage,
+                DdlUndo::SubscriptionOwnerChanged {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.restore_subscription_owner_pending(slot, prior);
                 return Err(error);
             }
@@ -163,10 +177,13 @@ pub(super) fn stage_subscription_record(
                 crate::storage::SqlName::parse(new_name)?,
                 txid,
             )?;
-            if let Err(error) = transaction.record_ddl(DdlUndo::SubscriptionRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
+            if let Err(error) = transaction.record_ddl(
+                storage,
+                DdlUndo::SubscriptionRenamed {
+                    slot: slot as u32,
+                    prior,
+                },
+            ) {
                 storage.rollback_subscription_rename(slot, prior);
                 return Err(error);
             }

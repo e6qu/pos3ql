@@ -2,20 +2,36 @@
 
 use crate::mem::{Budget, BudgetError, FixedVec, mutex::Mutex};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::plan_invalidations::LocalPlanInvalidations;
 use crate::sql_err;
+use std::sync::{Arc, Weak};
 
 use super::{DatabaseOid, Storage};
 
 impl Storage {
-    pub(crate) fn publish_plan_invalidations(&self, changes: &[crate::sql::txn::DdlUndo]) {
-        for change in changes {
-            let change = change.catalog_plan_change();
+    pub(crate) fn register_plan_backend(
+        &self,
+        owner: &Arc<LocalPlanInvalidations>,
+    ) -> Result<(), SqlError> {
+        self.plan_invalidations.register(owner)
+    }
+
+    pub(crate) fn publish_plan_invalidations(
+        &self,
+        events: &[crate::sql::plan_invalidations::PlanInvalidationEvent],
+    ) {
+        for event in events {
+            let change = event.change;
             if change.global {
                 self.plan_invalidations
-                    .change_database(super::current_database());
+                    .change_database(event.scope.database());
             }
             if change.roles {
                 self.plan_invalidations.change_roles();
+            }
+            if let Some(target) = event.selected {
+                self.plan_invalidations
+                    .selected_changed(event.scope, target);
             }
         }
     }
@@ -31,6 +47,7 @@ struct State {
     databases: FixedVec<DatabaseEpoch>,
     roles: u64,
     exhausted: bool,
+    backends: FixedVec<Option<Weak<LocalPlanInvalidations>>>,
 }
 
 pub(super) struct PlanInvalidations {
@@ -45,12 +62,27 @@ pub(crate) struct PlanInvalidationStamp {
 }
 
 impl PlanInvalidations {
-    pub(super) fn budget_bytes(databases: usize) -> usize {
-        core::mem::size_of::<Self>()
-            .saturating_add(databases.saturating_mul(core::mem::size_of::<DatabaseEpoch>()))
+    pub(super) fn backend_capacity(config: &crate::config::Config) -> usize {
+        (config.max_connections as usize)
+            .saturating_add(config.max_subscriptions)
+            .saturating_add(config.query_workspace_slots)
+            .saturating_add(config.commit_queue_slots)
     }
 
-    pub(super) fn new(databases: usize, budget: &mut Budget) -> Result<Self, BudgetError> {
+    pub(super) fn budget_bytes(databases: usize, backends: usize) -> usize {
+        core::mem::size_of::<Self>()
+            .saturating_add(databases.saturating_mul(core::mem::size_of::<DatabaseEpoch>()))
+            .saturating_add(
+                backends
+                    .saturating_mul(core::mem::size_of::<Option<Weak<LocalPlanInvalidations>>>()),
+            )
+    }
+
+    pub(super) fn new(
+        databases: usize,
+        backends: usize,
+        budget: &mut Budget,
+    ) -> Result<Self, BudgetError> {
         budget.draw(core::mem::size_of::<Self>(), "plan invalidation controls")?;
         let mut entries = FixedVec::new(budget, "database plan invalidations", databases)?;
         for _ in 0..databases {
@@ -61,13 +93,44 @@ impl PlanInvalidations {
                 })
                 .expect("startup reserved every database invalidation control");
         }
+        let mut owners = FixedVec::new(budget, "SQL plan backend registry", backends)?;
+        for _ in 0..backends {
+            owners
+                .push(None)
+                .expect("startup reserved every plan backend");
+        }
         Ok(Self {
             state: Mutex::new(State {
                 databases: entries,
                 roles: 0,
                 exhausted: false,
+                backends: owners,
             }),
         })
+    }
+
+    fn register(&self, owner: &Arc<LocalPlanInvalidations>) -> Result<(), SqlError> {
+        let mut state = self.state.lock().expect("plan invalidation lock poisoned");
+        if state
+            .backends
+            .iter()
+            .flatten()
+            .any(|backend| backend.as_ptr() == Arc::as_ptr(owner))
+        {
+            return Ok(());
+        }
+        let slot = state.backends.iter().position(|backend| backend.as_ref().is_none_or(|backend| backend.strong_count() == 0))
+            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL plan backend registry (max_connections + max_subscriptions + query_workspace_slots + commit_queue_slots = {}) is full", state.backends.len()))?;
+        state.backends[slot] = Some(Arc::downgrade(owner));
+        Ok(())
+    }
+
+    fn selected_changed(&self, scope: super::RuntimeInputScope, target: super::SelectedPlanTarget) {
+        let state = self.state.lock().expect("plan invalidation lock poisoned");
+        for backend in state.backends.iter().flatten().filter_map(Weak::upgrade) {
+            backend.selected_changed(scope, target);
+        }
     }
 
     pub(super) fn change_database(&self, database: DatabaseOid) {
@@ -146,8 +209,8 @@ mod tests {
 
     #[test]
     fn catalog_epochs_separate_databases_and_role_dependent_plans_without_allocation() {
-        let mut budget = Budget::new(PlanInvalidations::budget_bytes(3));
-        let epochs = PlanInvalidations::new(3, &mut budget).unwrap();
+        let mut budget = Budget::new(PlanInvalidations::budget_bytes(3, 0));
+        let epochs = PlanInvalidations::new(3, 0, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let database = DatabaseOid::POSTGRES;
             let unrelated = DatabaseOid::TEMPLATE1;
@@ -163,6 +226,51 @@ mod tests {
             assert!(!epochs.matches(plain).unwrap());
             epochs.retire_database(unrelated);
             epochs.change_database(unrelated);
+        });
+    }
+
+    #[test]
+    fn committed_selected_events_reach_registered_owners_without_runtime_allocation() {
+        let mut budget = Budget::new(
+            PlanInvalidations::budget_bytes(3, 2) + 3 * LocalPlanInvalidations::budget_bytes(1),
+        );
+        let epochs = PlanInvalidations::new(3, 2, &mut budget).unwrap();
+        let first = LocalPlanInvalidations::new(1, &mut budget).unwrap();
+        let second = LocalPlanInvalidations::new(1, &mut budget).unwrap();
+        let next = LocalPlanInvalidations::new(1, &mut budget).unwrap();
+        let scope = super::super::RuntimeInputScope::test_scope(DatabaseOid::POSTGRES);
+        crate::mem::guard::forbid_alloc(|| {
+            let first_watch = first
+                .watch(
+                    false,
+                    scope,
+                    crate::mem::lease_pool::SharedSlice::EMPTY,
+                    Some(100_001),
+                )
+                .unwrap();
+            let second_watch = second
+                .watch(
+                    false,
+                    scope,
+                    crate::mem::lease_pool::SharedSlice::EMPTY,
+                    Some(100_002),
+                )
+                .unwrap();
+            epochs.register(&first).unwrap();
+            epochs.register(&first).unwrap();
+            epochs.register(&second).unwrap();
+            assert_eq!(
+                epochs.register(&next).unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            epochs.selected_changed(
+                scope,
+                super::super::SelectedPlanTarget::Routine { oid: 100_001 },
+            );
+            assert!(!first_watch.matches().unwrap());
+            assert!(second_watch.matches().unwrap());
+            drop((first_watch, first));
+            epochs.register(&next).unwrap();
         });
     }
 }

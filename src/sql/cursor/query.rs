@@ -635,8 +635,12 @@ mod tests {
             user_type: None,
         }];
         crate::mem::guard::forbid_alloc(|| {
-            let _formal_scope =
-                crate::sql::exec::enter_routine_parameter_types(&formal, None).unwrap();
+            let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
+                &formal,
+                None,
+                crate::sql::ast::Collation::None,
+            )
+            .unwrap();
             assert_eq!(
                 crate::sql::exec::bound_parameter_type_oid(1),
                 Some(oid::INT4)
@@ -705,7 +709,9 @@ mod tests {
         }];
         with_bound_parameter_types(&[oid::DATE], || {
             {
-                let _formal_scope = enter_routine_parameter_types(&formal, None).unwrap();
+                let _formal_scope =
+                    enter_routine_parameter_types(&formal, None, crate::sql::ast::Collation::None)
+                        .unwrap();
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
                 with_bound_parameter_types(&[oid::TEXT], || {
                     assert_eq!(bound_parameter_type_oid(1), Some(oid::TEXT))
@@ -716,7 +722,7 @@ mod tests {
         });
         let source = vec![oid::DATE];
         let escaped = with_bound_parameter_types(&source, || {
-            enter_routine_parameter_types(&formal, None).unwrap()
+            enter_routine_parameter_types(&formal, None, crate::sql::ast::Collation::None).unwrap()
         });
         drop(source);
         drop(escaped);
@@ -875,7 +881,12 @@ mod tests {
             with_bound_parameter_types(&[oid::INT4], || {
                 let scope = {
                     let catalog = DomainCatalog;
-                    enter_routine_parameter_types(&formal, Some(&catalog)).unwrap()
+                    enter_routine_parameter_types(
+                        &formal,
+                        Some(&catalog),
+                        crate::sql::ast::Collation::None,
+                    )
+                    .unwrap()
                 };
                 assert_eq!(bound_parameter_type_oid(1), Some(123456));
                 query
@@ -890,15 +901,20 @@ mod tests {
                     .unwrap();
                 drop(scope);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
-                let error = enter_routine_parameter_types(&formal, None)
-                    .err()
-                    .expect("missing declared type");
+                let error =
+                    enter_routine_parameter_types(&formal, None, crate::sql::ast::Collation::None)
+                        .err()
+                        .expect("missing declared type");
                 assert_eq!(error.sqlstate, sqlstate::UNDEFINED_OBJECT);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
                 let too_many = [formal[0]; 101];
-                let error = enter_routine_parameter_types(&too_many, Some(&DomainCatalog))
-                    .err()
-                    .expect("argument limit");
+                let error = enter_routine_parameter_types(
+                    &too_many,
+                    Some(&DomainCatalog),
+                    crate::sql::ast::Collation::None,
+                )
+                .err()
+                .expect("argument limit");
                 assert_eq!(error.sqlstate, sqlstate::TOO_MANY_ARGUMENTS);
                 assert_eq!(bound_parameter_type_oid(1), Some(oid::INT4));
             });

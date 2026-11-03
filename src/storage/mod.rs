@@ -6,13 +6,17 @@
 //! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
+mod plan_invalidation_targets;
 mod plan_invalidations;
+pub(crate) use plan_invalidation_targets::SelectedPlanTarget;
 mod runtime_input_validity;
 pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
     CatalogRowImage, HistoricalCatalogRow,
 };
-pub(crate) use runtime_input_validity::RuntimeInputValidity;
+pub(crate) use runtime_input_validity::{
+    RuntimeInputDependency, RuntimeInputScope, RuntimeInputValidity,
+};
 mod catalog_identities;
 mod catalog_keys;
 mod catalog_sources;
@@ -20462,7 +20466,10 @@ impl Storage {
             Self::type_definition_image_budget_bytes(config),
             size_of::<type_references::CatalogOrigin>(),
             size_of::<catalog_sources::CatalogSources>(),
-            plan_invalidations::PlanInvalidations::budget_bytes(config.max_databases),
+            plan_invalidations::PlanInvalidations::budget_bytes(
+                config.max_databases,
+                plan_invalidations::PlanInvalidations::backend_capacity(config),
+            ),
             SpillRootRegistry::budget_bytes(config),
             QueryRootPool::budget_bytes(config),
             pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>()),
@@ -20675,8 +20682,11 @@ impl Storage {
             "catalog reference origin",
         )?;
         let catalog_sources = catalog_sources::CatalogSources::new(catalog_origin, budget)?;
-        let plan_invalidations =
-            plan_invalidations::PlanInvalidations::new(config.max_databases, budget)?;
+        let plan_invalidations = plan_invalidations::PlanInvalidations::new(
+            config.max_databases,
+            plan_invalidations::PlanInvalidations::backend_capacity(config),
+            budget,
+        )?;
         budget.draw(size_of::<Mutex<()>>(), "table creation controls")?;
         budget.draw(size_of::<CatalogSequence>(), "catalog sequence controls")?;
         budget.draw(

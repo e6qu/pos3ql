@@ -12,6 +12,115 @@ use crate::sql::{
 use crate::sql_err;
 use crate::storage::{RoutineDef, RoutineKind, RoutineLanguage, RoutineVolatility, Storage};
 
+struct MetadataColumns<'a> {
+    columns: &'a dyn ColTypeResolver,
+    storage: &'a Storage,
+    txid: u32,
+}
+
+impl<'a> crate::sql::eval::ColumnLookup<'a> for MetadataColumns<'_> {
+    fn lookup(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> Result<crate::sql::types::Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "planner metadata cannot read row values"
+        ))
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.columns.resolve(qualifier, name)
+    }
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.columns
+            .column_meta(qualifier, name)
+            .map(|metadata| metadata.ctype)
+    }
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        let metadata = self.columns.column_meta(qualifier, name)?;
+        self.storage
+            .routine_result_for_oid(metadata.type_oid, self.txid)?
+            .user_type
+    }
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
+        self.columns
+            .column_meta(qualifier, name)
+            .map_or(ast::Collation::None, |metadata| metadata.collation)
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, self.columns)
+            .map_or(ast::Collation::None, |metadata| metadata.collation)
+    }
+    fn whole_row_type(&self, name: &str) -> Option<ColType> {
+        self.columns
+            .whole_row_scalar_type(name)
+            .or_else(|| self.columns.is_whole_row(name).then_some(ColType::Record))
+    }
+    fn whole_row_is_scalar(&self, name: &str) -> bool {
+        self.columns.whole_row_scalar_type(name).is_some()
+    }
+    fn is_empty_scope(&self) -> bool {
+        self.columns.is_empty_scope()
+    }
+}
+
+pub(super) fn call_collation(
+    arguments: &[&Expr<'_>],
+    mapping: &[u8],
+    routine: &RoutineDef,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ast::Collation, SqlError> {
+    let row = MetadataColumns {
+        columns,
+        storage,
+        txid,
+    };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let mut derived = None;
+    // Only supplied arguments contribute; defaults are inserted afterwards.
+    for (expression, mapped) in arguments.iter().zip(mapping) {
+        let input = routine.arguments()[usize::from(*mapped)];
+        let collation =
+            crate::sql::eval::routine_argument_collation(expression, &row, Some(&catalog))?;
+        derived = crate::sql::eval::merge_derived_collations(
+            derived,
+            crate::sql::eval::DerivedCollation::for_input_type(collation, input.ctype),
+        )?;
+    }
+    Ok(derived.map_or(
+        ast::Collation::None,
+        crate::sql::eval::DerivedCollation::input_collation,
+    ))
+}
+
+pub(super) fn cast_collation(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ast::Collation, SqlError> {
+    let row = MetadataColumns {
+        columns,
+        storage,
+        txid,
+    };
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    crate::sql::eval::coercion_input_collation(expression, &row, Some(&catalog))
+}
+
 pub(crate) struct Context<'a> {
     pub storage: &'a Storage,
     pub txid: u32,
@@ -137,7 +246,9 @@ fn builtin_constant(
         | Expr::Str(_)
         | Expr::BitLit(_)
         | Expr::BoundLiteral { .. } => true,
-        Expr::IsNull { .. } | Expr::Collate { .. } | Expr::Array(_) => true,
+        Expr::IsNull { .. } | Expr::Collate { .. } | Expr::Array(_) | Expr::Subscript { .. } => {
+            true
+        }
         Expr::Unary {
             operator: UnaryOp::Not,
             ..
@@ -146,6 +257,21 @@ fn builtin_constant(
             operator: BinaryOp::And | BinaryOp::Or,
             ..
         } => true,
+        Expr::Unary {
+            operator: UnaryOp::Neg,
+            operand,
+            ..
+        } => {
+            let source = infer_routine_argument_oid(operand, columns)?;
+            if storage
+                .operator_slot_for_oids(None, "-", None, Some(source), txid)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            let properties = operator_properties(storage, txid, None, "-", None, Some(source))?;
+            properties.known && properties.volatility == 0
+        }
         Expr::Binary {
             operator,
             left,
@@ -193,7 +319,7 @@ fn builtin_constant(
             let Some(target) = ColType::from_sql_name(type_name) else {
                 return Ok(false);
             };
-            let source = infer_routine_argument_oid(operand, columns)?;
+            let source = cast_source_oid(operand, target.oid(), columns, storage, txid)?;
             if *binding == CastBinding::Resolve
                 && source != target.oid()
                 && catalog::defined_cast_path(storage, txid, source, target.oid()).is_some()
@@ -219,6 +345,30 @@ fn builtin_constant(
         Ok(())
     })?;
     Ok(children_safe)
+}
+
+fn cast_source_oid(
+    operand: &Expr<'_>,
+    target: i32,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+) -> Result<i32, SqlError> {
+    if let Expr::Array(items) = operand
+        && let Some(ColType::Array(element)) = storage
+            .routine_result_for_oid(target, txid)
+            .map(|result| result.ctype)
+    {
+        return Ok(crate::sql::eval::array_constructor_type(
+            items,
+            Some(element),
+            &|item| infer_routine_argument_oid(item, columns),
+            &|oid| storage.domain_base_type_for_oid(oid, txid),
+        )?
+        .element
+        .array_oid());
+    }
+    infer_routine_argument_oid(operand, columns)
 }
 
 fn parameter_index(expression: &Expr<'_>, columns: &dyn ColTypeResolver) -> Option<u32> {
@@ -1062,7 +1212,7 @@ fn expression_properties(
         } => cast_properties(
             storage,
             txid,
-            type_of(operand)?,
+            cast_source_oid(operand, type_of(expression)?, columns, storage, txid)?,
             type_of(expression)?,
             *binding,
         )?,
@@ -1474,6 +1624,7 @@ mod tests {
                         42,
                         7,
                         crate::sql::query::InvocationSite::Expression(19),
+                        ast::Collation::None,
                         arguments,
                         &arena,
                     )

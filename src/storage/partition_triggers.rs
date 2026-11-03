@@ -337,11 +337,13 @@ impl Storage {
                     None
                 };
                 if let Some((slot, prior)) = change
-                    && let Err(error) =
-                        txn.record_ddl(crate::sql::txn::DdlUndo::PartitionTriggerAltered {
+                    && let Err(error) = txn.record_ddl(
+                        self,
+                        crate::sql::txn::DdlUndo::PartitionTriggerAltered {
                             slot: slot as u32,
                             prior,
-                        })
+                        },
+                    )
                 {
                     self.rollback_partition_trigger_state(slot, prior);
                     return Err(error);

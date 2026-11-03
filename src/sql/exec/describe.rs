@@ -2232,6 +2232,7 @@ pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext,
 pub(crate) fn enter_routine_parameter_types(
     arguments: &[RoutineArgumentDef],
     catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    input_collation: crate::sql::ast::Collation,
 ) -> Result<RoutineParameterScope, SqlError> {
     let mut current = RoutineParameterTypes::EMPTY;
     if arguments.len() > current.types.len() {
@@ -2257,7 +2258,10 @@ pub(crate) fn enter_routine_parameter_types(
             type_oid,
             type_mod: -1,
             collation: if argument.ctype.is_collatable() {
-                crate::sql::ast::Collation::Default
+                match input_collation {
+                    crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
+                    collation => collation,
+                }
             } else {
                 crate::sql::ast::Collation::None
             },
@@ -2277,6 +2281,13 @@ pub(crate) fn enter_routine_parameter_types(
         PARAMETER_CONTEXT.with(|slot| slot.replace(ParameterContext::Routine)),
         prior_depth,
     ))
+}
+
+pub(crate) fn routine_parameter_collation(index: u32) -> Option<crate::sql::ast::Collation> {
+    if !matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Routine) {
+        return None;
+    }
+    routine_parameter_metadata(index).map(|metadata| metadata.collation)
 }
 
 impl Drop for RoutineParameterScope {

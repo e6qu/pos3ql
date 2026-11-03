@@ -84,6 +84,79 @@ SELECT 'set_output',last_value FROM planner_checks;
 SELECT id,value FROM planner_projection_values ORDER BY id;
 DROP TABLE planner_projection_values;
 DROP CAST(integer AS text);
+-- Inlining substitutes normalized argument constants after parsing the body.
+-- A direct checked literal still runs during that earlier parse step.
+CREATE FUNCTION planner_outer(flag integer DEFAULT 1) RETURNS integer LANGUAGE sql AS
+$$SELECT CASE WHEN flag=0 THEN planner_scalar() ELSE 17 END$$;
+CREATE FUNCTION planner_pair(flag integer,unused integer) RETURNS integer LANGUAGE sql AS
+$$SELECT CASE WHEN flag=0 THEN planner_scalar() ELSE 17 END$$;
+CREATE FUNCTION planner_coalesce(value integer) RETURNS integer LANGUAGE sql AS
+$$SELECT coalesce(value,planner_scalar())$$;
+CREATE FUNCTION planner_negative(flag integer DEFAULT -1) RETURNS integer LANGUAGE sql AS
+$$SELECT CASE WHEN flag<0 THEN 17 ELSE planner_scalar() END$$;
+CREATE FUNCTION planner_variadic(VARIADIC items integer[]) RETURNS integer LANGUAGE sql AS
+$$SELECT CASE WHEN $1[1] IS NULL THEN 17 ELSE planner_scalar() END$$;
+CREATE FUNCTION planner_direct(flag integer) RETURNS integer LANGUAGE sql AS
+$$SELECT CASE WHEN flag=0 THEN cardinality('{a}'::planner_checked[]) ELSE 17 END$$;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(1);
+SELECT 'nested_literal',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer();
+SELECT 'nested_default',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(flag=>1);
+SELECT 'nested_named',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(1::smallint);
+SELECT 'nested_coerced',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(NULL);
+SELECT 'nested_known_null',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(0);
+SELECT 'nested_reached',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(flag=>0);
+SELECT 'nested_named_reached',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_pair(1,value) FROM (VALUES(NULL::integer),(0)) source(value);
+SELECT 'nested_partly_known',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_outer(value) FROM (VALUES(1),(0)) source(value);
+SELECT 'nested_unknown',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_coalesce(17);
+SELECT 'nested_coalesce_known',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_coalesce(NULL);
+SELECT 'nested_coalesce_null',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_negative();
+SELECT 'nested_negative_default',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_variadic(1,2);
+SELECT 'nested_variadic_expanded',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_variadic(VARIADIC ARRAY[]::integer[]);
+SELECT 'nested_variadic_empty',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_variadic(VARIADIC ARRAY[NULL]::integer[]);
+SELECT 'nested_variadic_null',last_value,is_called FROM planner_checks;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+SELECT planner_direct(1);
+SELECT 'nested_direct_parse',last_value,is_called FROM planner_checks;
+CREATE FUNCTION planner_varchar(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS
+$$SELECT (CASE WHEN $2=9 AND NOT $3 THEN format('%s',$1) ELSE format('%s',planner_scalar()) END)::varchar$$;
+CREATE CAST(integer AS varchar) WITH FUNCTION planner_varchar(integer,integer,boolean) AS ASSIGNMENT;
+CREATE TABLE planner_typmod_values(value varchar(5));
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+INSERT INTO planner_typmod_values VALUES(11),(22);
+SELECT value FROM planner_typmod_values ORDER BY value;
+SELECT 'nested_typmod',last_value,is_called FROM planner_checks;
+DROP TABLE planner_typmod_values;
+DROP CAST(integer AS varchar);
+DROP FUNCTION planner_varchar(integer,integer,boolean),planner_outer(integer),planner_pair(integer,integer),planner_coalesce(integer),planner_negative(integer),planner_variadic(integer[]),planner_direct(integer);
 DROP FUNCTION planner_text(integer),planner_scalar(),planner_array(),planner_projection(integer);
 DROP DOMAIN planner_checked;
 DROP TYPE planner_choice;

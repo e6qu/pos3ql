@@ -371,6 +371,12 @@ global `table_metadata_bytes` pool and consume its lease descriptors. There is
 no maximum-sized value buffer per plan or per table. Nested and backend-static
 plans share the fixed control capacity. Exhaustion returns `54000` naming
 `routine_input_slots` or the metadata pool; neither grows at runtime.
+The same input-slot limit bounds each backend's watched plans. A watch shares
+the plan's actual dependency array; it does not reserve a list for every table.
+The transaction's fixed DDL log retains matching invalidation receipts, so
+commit and rollback use the selected object even if a name has changed or a
+catalog slot is later reused. Other backends receive committed changes; an
+aborted edit affects only its originating backend's cache.
 
 `statistics_bytes` and `statistics_leases` reserve a separate shared pool for
 analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.

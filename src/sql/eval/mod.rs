@@ -5184,6 +5184,13 @@ pub struct DerivedCollation {
 }
 
 impl DerivedCollation {
+    fn implicit(value: Collation, collatable: bool) -> Option<Self> {
+        (value != Collation::None || collatable).then_some(Self {
+            value,
+            explicit: false,
+            indeterminate: value == Collation::None && collatable,
+        })
+    }
     pub(crate) fn input_collation(self) -> Collation {
         if self.indeterminate {
             Collation::None
@@ -5246,6 +5253,49 @@ fn expression_collation<'a>(
             indeterminate: false,
         })),
         Expr::BoundDefault { expression, .. } => expression_collation(expression, row, catalog),
+        Expr::Param(index) => Ok(super::exec::routine_parameter_collation(*index).and_then(
+            |value| {
+                DerivedCollation::implicit(
+                    value,
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                )
+            },
+        )),
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+            source,
+        } => match row.resolve_column_type(*qualifier, name) {
+            Ok(_) if *source == super::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
+                sqlstate::AMBIGUOUS_COLUMN,
+                "column reference \"{}{}{}\" is ambiguous",
+                qualifier.unwrap_or(""),
+                if qualifier.is_some() { "." } else { "" },
+                name,
+            )),
+            Ok(ctype) => Ok(DerivedCollation::implicit(
+                row.collation(*qualifier, name),
+                ctype.is_collatable(),
+            )),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                Ok(match source {
+                    super::ast::ParameterSource::SqlRoutine => {
+                        super::exec::routine_parameter_collation(*index).and_then(|value| {
+                            DerivedCollation::implicit(
+                                value,
+                                static_type(expression, row).is_some_and(ColType::is_collatable),
+                            )
+                        })
+                    }
+                    super::ast::ParameterSource::PlpgsqlCursor => None,
+                })
+            }
+            Err(error) => Err(error),
+        },
         Expr::Cast {
             operand, type_name, ..
         } => match ColType::from_sql_name(type_name) {
@@ -5255,14 +5305,11 @@ fn expression_collation<'a>(
         },
         Expr::Column { qualifier, name } => {
             let value = row.collation(*qualifier, name);
-            Ok(Some(DerivedCollation {
+            Ok(DerivedCollation::implicit(
                 value,
-                explicit: false,
-                indeterminate: value == crate::sql::ast::Collation::None
-                    && row
-                        .col_type(*qualifier, name)
-                        .is_some_and(ColType::is_collatable),
-            }))
+                row.col_type(*qualifier, name)
+                    .is_some_and(ColType::is_collatable),
+            ))
         }
         Expr::SchemaColumn {
             schema,
@@ -5271,14 +5318,11 @@ fn expression_collation<'a>(
         } => {
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             let value = row.collation(Some(qualifier.as_str()), name);
-            Ok(Some(DerivedCollation {
+            Ok(DerivedCollation::implicit(
                 value,
-                explicit: false,
-                indeterminate: value == crate::sql::ast::Collation::None
-                    && row
-                        .col_type(Some(qualifier.as_str()), name)
-                        .is_some_and(ColType::is_collatable),
-            }))
+                row.col_type(Some(qualifier.as_str()), name)
+                    .is_some_and(ColType::is_collatable),
+            ))
         }
         Expr::Field { base, field } => match &**base {
             Expr::Call {
@@ -5297,21 +5341,17 @@ fn expression_collation<'a>(
             }
             Expr::WholeRow(table) => {
                 let value = row.collation(Some(table), field);
-                Ok(Some(DerivedCollation {
+                Ok(DerivedCollation::implicit(
                     value,
-                    explicit: false,
-                    indeterminate: value == crate::sql::ast::Collation::None
-                        && static_type(expression, row).is_some_and(ColType::is_collatable),
-                }))
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                ))
             }
             _ => {
                 let value = row.record_field_collation(base, field);
-                Ok(Some(DerivedCollation {
+                Ok(DerivedCollation::implicit(
                     value,
-                    explicit: false,
-                    indeterminate: value == crate::sql::ast::Collation::None
-                        && static_type(expression, row).is_some_and(ColType::is_collatable),
-                }))
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                ))
             }
         },
         Expr::Binary {
@@ -10051,6 +10091,105 @@ mod tests {
                     Collation::Default
                 );
             });
+        });
+    }
+
+    #[test]
+    fn formal_parameter_collations_restore_and_yield_to_columns_without_reading_values() {
+        use crate::sql::ast::{Collation, ParameterSource};
+        let formal = [crate::storage::RoutineArgumentDef {
+            name: crate::storage::SqlName::parse("input").unwrap(),
+            ctype: ColType::Text,
+            user_type: None,
+        }];
+        struct Columns;
+        impl<'a> ColumnLookup<'a> for Columns {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("collation inference must not read row values")
+            }
+            fn col_type(&self, _: Option<&str>, name: &str) -> Option<ColType> {
+                Some(if name == "integer" {
+                    ColType::Int4
+                } else {
+                    ColType::Text
+                })
+            }
+            fn collation(&self, _: Option<&str>, name: &str) -> Collation {
+                if name == "integer" {
+                    Collation::None
+                } else {
+                    Collation::Posix
+                }
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let _outer =
+                super::super::exec::enter_routine_parameter_types(&formal, None, Collation::C)
+                    .unwrap();
+            let positional = Expr::Param(1);
+            let named = Expr::RoutineParam {
+                qualifier: None,
+                name: "input",
+                index: 1,
+                source: ParameterSource::SqlRoutine,
+            };
+            assert_eq!(
+                routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            assert_eq!(
+                routine_input_collation(&[&named], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            assert_eq!(
+                routine_input_collation(&[&named], &Columns, None).unwrap(),
+                Collation::Posix
+            );
+            let cursor = Expr::RoutineParam {
+                qualifier: None,
+                name: "input",
+                index: 1,
+                source: ParameterSource::PlpgsqlCursor,
+            };
+            assert_eq!(
+                routine_input_collation(&[&cursor], &Columns, None)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::AMBIGUOUS_COLUMN
+            );
+            {
+                let _inner = super::super::exec::enter_routine_parameter_types(
+                    &formal,
+                    None,
+                    Collation::None,
+                )
+                .unwrap();
+                assert_eq!(
+                    routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                    Collation::Default
+                );
+            }
+            assert_eq!(
+                routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            super::super::exec::with_bound_parameter_types(
+                &[super::super::types::oid::TEXT],
+                || {
+                    assert_eq!(
+                        routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                        Collation::Default
+                    );
+                },
+            );
+            let integer = Expr::Column {
+                qualifier: None,
+                name: "integer",
+            };
+            assert_eq!(
+                routine_input_collation(&[&integer, &Expr::Str("text")], &Columns, None).unwrap(),
+                Collation::Default
+            );
         });
     }
 

@@ -3589,7 +3589,7 @@ fn eval_full_inner<'a>(
             };
             let mut v = if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
             {
-                eval_array_constructor(items, Some(element), *binding, arena, params, row, hooks)?
+                eval_array_constructor(items, Some(element), binding, arena, params, row, hooks)?
             } else {
                 eval_full(operand, arena, params, row, hooks)?
             };

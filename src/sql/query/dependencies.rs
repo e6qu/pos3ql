@@ -1464,8 +1464,14 @@ pub(crate) fn visit_projection_types(
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
         let mut oids = [0; crate::sql::exec::MAX_PROJ];
-        let count =
-            super::describe_set_body(storage, tree, txid, &mut columns, arena, Some(&mut oids))?;
+        let count = super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            Some(&mut oids),
+        )?;
         for oid in &oids[..count] {
             visit(*oid)?;
         }

@@ -37,6 +37,21 @@ pub(crate) struct BuiltinPlannerProcedure {
 }
 
 pub(crate) fn builtin_planner_procedure(oid: i32) -> Option<BuiltinPlannerProcedure> {
+    // Callable attributes describe the initialized catalog, including SQL
+    // functions installed after bootstrap. Internal I/O has its own inventory.
+    if let Some(signature) = builtin_callable_by_oid(oid) {
+        return Some(BuiltinPlannerProcedure {
+            volatility: match signature.catalog.volatility {
+                "i" => 0,
+                "s" => 1,
+                "v" => 2,
+                _ => return None,
+            },
+            strict: signature.catalog.strict,
+            cost: signature.catalog.cost,
+            forbidden: signature.kind != b'f' || signature.returns_set,
+        });
+    }
     let index = planner_properties::PROCEDURES
         .binary_search_by_key(&oid, |(oid, _)| *oid)
         .ok()?;
@@ -322,9 +337,9 @@ mod callable_contract_tests {
         for oid in [1084, 1150, 750] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
-        for signature in callable_signatures::CALLABLES {
-            let Some(properties) = builtin_planner_procedure(signature.oid) else {
-                assert!(signature.name.starts_with("postgres_fdw_"));
+        assert_eq!(planner_properties::PROCEDURES.len(), 194);
+        for (oid, properties) in planner_properties::PROCEDURES {
+            let Some(signature) = builtin_callable_by_oid(*oid) else {
                 continue;
             };
             assert_eq!(
@@ -345,6 +360,10 @@ mod callable_contract_tests {
                 signature.kind != b'f' || signature.returns_set
             );
         }
+        for oid in [6183, 6184] {
+            assert_eq!(builtin_planner_procedure(oid).unwrap().cost, 100.0);
+        }
+        assert!(builtin_planner_procedure(13700).unwrap().forbidden);
     }
 
     #[test]

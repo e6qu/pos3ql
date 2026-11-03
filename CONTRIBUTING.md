@@ -265,11 +265,13 @@ and [`pg_proc.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include
 ```sh
 python3 tools/generate-pg18-planner-properties.py \
   --source /path/to/pg_proc.dat --header /path/to/pg_proc.h \
+  --type-io-source src/sql/catalog_builtin_properties.rs \
   --output src/sql/catalog_planner_properties.rs
 ```
 
-The generator verifies both source checksums before writing. These planning
-facts include internal type conversions; they do not add callable SQL functions.
+The generator verifies all three source checksums before writing. It supplements
+the callable declarations with internal type input/output facts; SQL functions
+keep their initialized catalog attributes. These facts do not add callable functions.
 
 The catalog comparison also checks built-in view SQL against the PostgreSQL
 service. To regenerate its static definitions from retained `catalog-metadata.json`

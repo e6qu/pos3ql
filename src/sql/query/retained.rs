@@ -808,7 +808,8 @@ fn bind_defaults<'a>(
 
 impl<'a> RetainedSelect<'a> {
     pub(crate) fn default_scrollable(&self) -> bool {
-        !matches!(self.state, ReaderState::Eliminated)
+        matches!(self.source, RetainedSource::Physical(_))
+            && !matches!(self.state, ReaderState::Eliminated)
     }
 
     pub(crate) fn uses_table(&self, table: usize) -> bool {

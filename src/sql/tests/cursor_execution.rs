@@ -1354,6 +1354,22 @@ fn cursor_retained_default_mode_defers_reads_and_matches_plan_scrollability() {
         ["1"]
     );
     session.success(&mut engine, "CLOSE automatic; COMMIT", true);
+    for (option, expected) in [("", "f"), ("SCROLL", "t")] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE singleton_mode {option} CURSOR FOR SELECT 7 AS value"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='singleton_mode'; \
+             FETCH NEXT FROM singleton_mode; CLOSE singleton_mode; COMMIT",
+                true
+            )),
+            [expected, "7"]
+        );
+    }
     for predicate in ["FALSE", "'f'", "NULL AND TRUE"] {
         session.success(&mut engine, &format!("BEGIN; DECLARE empty_cursor CURSOR FOR SELECT id FROM default_input WHERE {predicate}"), true);
         assert_eq!(

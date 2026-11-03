@@ -6,6 +6,26 @@ use crate::sql::types::{GeometryKind, PgFloat8};
 use crate::sql_err;
 pub(crate) const EPSILON: f64 = 1e-6;
 
+/// PostgreSQL 18.6 pg_cast identities; execution properties use the shared
+/// catalog cast declarations. Query JSON SHA256:
+/// 1b47346bad7c9c90fc84f85ae54de426418a0ccbc73a76ff68c6d3ce02dfb0f4.
+pub(crate) const CAST_IDENTITIES: &[(i32, GeometryKind, GeometryKind)] = &[
+    (10171, GeometryKind::Point, GeometryKind::Box),
+    (10172, GeometryKind::Lseg, GeometryKind::Point),
+    (10173, GeometryKind::Path, GeometryKind::Polygon),
+    (10174, GeometryKind::Box, GeometryKind::Point),
+    (10175, GeometryKind::Box, GeometryKind::Lseg),
+    (10176, GeometryKind::Box, GeometryKind::Polygon),
+    (10177, GeometryKind::Box, GeometryKind::Circle),
+    (10178, GeometryKind::Polygon, GeometryKind::Point),
+    (10179, GeometryKind::Polygon, GeometryKind::Path),
+    (10180, GeometryKind::Polygon, GeometryKind::Box),
+    (10181, GeometryKind::Polygon, GeometryKind::Circle),
+    (10182, GeometryKind::Circle, GeometryKind::Point),
+    (10183, GeometryKind::Circle, GeometryKind::Box),
+    (10184, GeometryKind::Circle, GeometryKind::Polygon),
+];
+
 pub(crate) fn index_bounds(
     value: crate::sql::types::Datum<'_>,
 ) -> Result<crate::store::SpatialBounds, SqlError> {

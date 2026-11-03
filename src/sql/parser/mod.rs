@@ -9009,6 +9009,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn syntax_error_here(&self) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(
+                96,
+                "syntax error at or near \"{}\"",
+                &self.text[self.peek_at..self.lexer.token_end()]
+            ),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
     }
@@ -12071,5 +12083,92 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn sql_expression_modifiers_fail_at_the_original_token() {
+        for (sql, token) in [
+            ("SELECT COALESCE(DISTINCT 1,2)", "DISTINCT"),
+            ("SELECT ROW(VARIADIC ARRAY[1])", "VARIADIC"),
+            ("SELECT NULLIF(1,2) FILTER (WHERE true)", "FILTER"),
+            ("SELECT GREATEST(a=>1,b=>2)", "=>"),
+            ("SELECT JSON_ARRAY(DISTINCT 1)", "DISTINCT"),
+            ("SELECT JSON_ARRAY(VARIADIC ARRAY[1])", "VARIADIC"),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(
+                    error.message,
+                    stack_format!(96, "syntax error at or near \"{}\"", token)
+                );
+                assert_eq!(&sql[error.at..error.at + token.len()], token);
+            });
+        }
+        for sql in [
+            "SELECT \"coalesce\"(DISTINCT 1,2)",
+            "SELECT unnest(DISTINCT ARRAY[1])",
+            "SELECT unnest(VARIADIC ARRAY[1])",
+        ] {
+            with_parser(sql, |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    select.items,
+                    [SelectItem::Expr {
+                        expression: Expr::Call {
+                            kind: CallKind::Routine,
+                            ..
+                        },
+                        ..
+                    }]
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn array_brackets_build_nested_array_expressions() {
+        with_parser("SELECT ARRAY[[1,NULL],[3,4]]", |parser| {
+            let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
+            let [
+                SelectItem::Expr {
+                    expression: Expr::Array(rows),
+                    ..
+                },
+            ] = select.items
+            else {
+                panic!()
+            };
+            assert!(matches!(
+                rows,
+                [
+                    Expr::Array([Expr::Int(1), Expr::Null]),
+                    Expr::Array([Expr::Int(3), Expr::Int(4)])
+                ]
+            ));
+        });
+        with_parser(
+            "SELECT CASE WHEN false THEN ARRAY[[[[[[[1]]]]]]] ELSE ARRAY[1] END",
+            |parser| {
+                assert!(parser.next_stmt().unwrap().is_some());
+            },
+        );
+        with_parser("SELECT ARRAY[[1],ARRAY[2]]", |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().message.as_str(),
+                "syntax error at or near \"ARRAY\""
+            );
+        });
+        let deep = format!("SELECT ARRAY{}1{}", "[".repeat(65), "]".repeat(65));
+        with_parser(&deep, |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
     }
 }

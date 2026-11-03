@@ -645,6 +645,10 @@ pub(crate) fn visit_catalog_rowtype_fields(
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
+    fn is_empty_scope(&self) -> bool {
+        self.definition.is_none()
+    }
+
     fn type_name_fixed(
         &self,
         type_oid: i32,
@@ -709,15 +713,19 @@ impl ColTypeResolver for CatalogCols<'_> {
         static_meta_for_column(self.storage, column, self.txid)
     }
 
-    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
-        if self
-            .storage
-            .cast_for_oids(source_oid, target.oid(), self.txid)
-            .is_none()
-        {
-            super::super::eval::validate_catalog_reference_cast(source_oid, target)?;
-        }
-        Ok(())
+    fn validate_explicit_cast(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_explicit_cast(
+            self.storage,
+            self.txid,
+            source_oid,
+            target_oid,
+            target,
+        )
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -1909,6 +1917,11 @@ pub(crate) fn function_lookup_error(
 }
 
 pub trait ColTypeResolver {
+    /// True only when no relation scope can answer a column reference.
+    fn is_empty_scope(&self) -> bool {
+        false
+    }
+
     fn type_name_fixed(
         &self,
         type_oid: i32,
@@ -1931,7 +1944,12 @@ pub trait ColTypeResolver {
         self.resolve(qualifier, name).ok().map(StaticTypeMeta::of)
     }
 
-    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
+    fn validate_explicit_cast(
+        &self,
+        source_oid: i32,
+        _target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
         super::super::eval::validate_catalog_reference_cast(source_oid, target)
     }
 
@@ -3881,24 +3899,24 @@ pub fn not_composite(field: &str, type_name: &str) -> SqlError {
 /// No FROM clause: any column reference is an error.
 pub struct NoCols;
 impl ColTypeResolver for NoCols {
-    fn resolve(&self, _q: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_COLUMN,
-            "column \"{}\" does not exist",
-            name
-        ))
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        Err(crate::sql::eval::empty_scope_column_error(qualifier, name))
     }
 }
 
 struct NoColumnLookup;
 
 impl<'a> ColumnLookup<'a> for NoColumnLookup {
-    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_COLUMN,
-            "column \"{}\" does not exist",
-            name
-        ))
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(crate::sql::eval::empty_scope_column_error(qualifier, name))
     }
 }
 
@@ -4223,10 +4241,6 @@ pub(crate) fn infer_routine_argument_oid(
                 None => Ok(infer_type_res(expression, columns)?.0),
             }
         }
-        Expr::Cast { type_name, .. } => match columns.named_type_oid(type_name) {
-            Some(type_oid) => Ok(type_oid),
-            None => Ok(infer_type_res(expression, columns)?.0),
-        },
         _ => Ok(infer_type_res(expression, columns)?.0),
     }
 }
@@ -4842,6 +4856,12 @@ pub fn infer_type_res(
             table,
             name,
         } => {
+            if columns.is_empty_scope() {
+                return Err(crate::sql::eval::empty_scope_column_error(
+                    Some(table),
+                    name,
+                ));
+            }
             // Composed-qualifier resolution, as the evaluator binds it: only
             // an unaliased base table of that schema answers.
             let mut composed = crate::util::StackStr::<130>::new();
@@ -4952,8 +4972,10 @@ pub fn infer_type_res(
         } => {
             // Explicit array casts supply element types even to ARRAY[]. Other
             // casts must still validate their source expression first.
-            let target = columns
+            let target_oid = columns
                 .named_type_oid(type_name)
+                .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid));
+            let target = target_oid
                 .and_then(|oid| {
                     super::super::eval::constructor_type_from_oid(oid, &|oid| {
                         columns.domain_base_type(oid)
@@ -4970,13 +4992,17 @@ pub fn infer_type_res(
             } else {
                 infer_type_res(operand, columns)?;
             }
-            if let Some(target @ (ColType::Int2 | ColType::Int2Vector | ColType::OidVector)) =
-                ColType::from_sql_name(type_name)
-            {
-                let source_oid = infer_routine_argument_oid(operand, columns)?;
-                columns.validate_explicit_cast(source_oid, target)?;
+            if let (Some(target), Some(target_oid)) = (target, target_oid) {
+                let source_oid = if matches!(*operand, Expr::Array(items) if items.is_empty())
+                    && matches!(target, ColType::Array(_))
+                {
+                    target_oid
+                } else {
+                    infer_routine_argument_oid(operand, columns)?
+                };
+                columns.validate_explicit_cast(source_oid, target_oid, target)?;
             }
-            if let Some(type_oid) = columns.named_type_oid(type_name) {
+            if let Some(type_oid) = target_oid {
                 if matches!(coltype_of_oid(type_oid), Some(ColType::Composite(_)))
                     && infer_type_res(operand, columns)?.0 == oid::RECORD
                     && !matches!(operand, Expr::WholeRow(_))

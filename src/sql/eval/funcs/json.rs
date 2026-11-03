@@ -849,6 +849,7 @@ pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&'a Expr<'a>],
     star: bool,
+    variadic: bool,
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -1854,7 +1855,19 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
-                if !args.len().is_multiple_of(2) {
+                let expanded = if variadic {
+                    let Some(values) = super::super::args::variadic_tail(
+                        name, args, 0, true, arena, params, row, hooks,
+                    )?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Some(values)
+                } else {
+                    None
+                };
+                let count = expanded.map_or(args.len(), <[Datum<'a>]>::len);
+                if !count.is_multiple_of(2) {
                     return Err(sql_err!(
                         sqlstate::INVALID_PARAMETER_VALUE,
                         "argument list must have even number of elements"
@@ -1864,8 +1877,11 @@ pub(crate) fn dispatch<'a>(
                 let colon = if jsonb { ": " } else { " : " };
                 let mut buf = ArenaString::new(arena);
                 buf.write_char('{').map_err(|_| arena_full())?;
-                for pair in args.chunks(2) {
-                    let key = eval_full(pair[0], arena, params, row, hooks)?;
+                for index in (0..count).step_by(2) {
+                    let key = match expanded {
+                        Some(values) => values[index],
+                        None => eval_full(args[index], arena, params, row, hooks)?,
+                    };
                     if key.is_null() {
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -1873,8 +1889,11 @@ pub(crate) fn dispatch<'a>(
                             1
                         ));
                     }
-                    let value = eval_full(pair[1], arena, params, row, hooks)?;
-                    if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {
+                    let value = match expanded {
+                        Some(values) => values[index + 1],
+                        None => eval_full(args[index + 1], arena, params, row, hooks)?,
+                    };
+                    if index != 0 {
                         buf.write_str(", ").map_err(|_| arena_full())?;
                     }
                     let mut key_text = ArenaString::new(arena);
@@ -1898,15 +1917,30 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
+                let expanded = if variadic {
+                    let Some(values) = super::super::args::variadic_tail(
+                        name, args, 0, true, arena, params, row, hooks,
+                    )?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Some(values)
+                } else {
+                    None
+                };
+                let count = expanded.map_or(args.len(), <[Datum<'a>]>::len);
                 let jsonb = name == "jsonb_build_array";
                 let colon = if jsonb { ": " } else { " : " };
                 let mut buf = ArenaString::new(arena);
                 buf.write_char('[').map_err(|_| arena_full())?;
-                for (i, a) in args.iter().enumerate() {
+                for i in 0..count {
                     if i > 0 {
                         buf.write_str(", ").map_err(|_| arena_full())?;
                     }
-                    let value = eval_full(a, arena, params, row, hooks)?;
+                    let value = match expanded {
+                        Some(values) => values[i],
+                        None => eval_full(args[i], arena, params, row, hooks)?,
+                    };
                     json::write_datum_json_styled(&value, colon, ", ", &mut buf)
                         .map_err(|_| arena_full())?;
                 }

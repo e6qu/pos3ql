@@ -18,6 +18,86 @@ use super::{
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
+fn contains_geometry(ctype: ColType) -> bool {
+    match ctype {
+        ColType::Geometry(_) => true,
+        ColType::Array(element) => contains_geometry(element.to_coltype()),
+        _ => false,
+    }
+}
+
+fn geometry_cast_permitted(
+    source: ColType,
+    target: ColType,
+    context: super::DefinedCastContext,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    if let (ColType::Array(source), ColType::Array(target)) = (source, target) {
+        return geometry_cast_permitted(source.to_coltype(), target.to_coltype(), context);
+    }
+    let string = |ctype| {
+        matches!(
+            ctype,
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name | ColType::Char
+        )
+    };
+    if string(target) && !matches!(context, super::DefinedCastContext::Implicit) {
+        return true;
+    }
+    if string(source) && matches!(context, super::DefinedCastContext::Explicit) {
+        return true;
+    }
+    if let (ColType::Geometry(_), ColType::Geometry(_)) = (source, target) {
+        return crate::sql::catalog::builtin_cast_context(source.oid(), target.oid()).is_some_and(
+            |declared| match context {
+                super::DefinedCastContext::Explicit => true,
+                super::DefinedCastContext::Assignment => declared.permits_assignment(),
+                super::DefinedCastContext::Implicit => declared.permits_implicit(),
+            },
+        );
+    }
+    false
+}
+
+pub(crate) fn validate_geometry_cast(
+    source_oid: i32,
+    target: ColType,
+    context: super::DefinedCastContext,
+) -> Result<(), SqlError> {
+    if source_oid == crate::sql::types::oid::UNKNOWN {
+        return Ok(());
+    }
+    let Some(source) = ColType::from_oid(source_oid) else {
+        return Ok(());
+    };
+    validate_geometry_type_cast(source, target, context)
+}
+
+pub(crate) fn validate_geometry_type_cast(
+    source: ColType,
+    target: ColType,
+    context: super::DefinedCastContext,
+) -> Result<(), SqlError> {
+    if !contains_geometry(source) && !contains_geometry(target) {
+        return Ok(());
+    }
+    if geometry_cast_permitted(source, target, context) {
+        return Ok(());
+    }
+    Err(sql_err!(
+        match context {
+            super::DefinedCastContext::Assignment => sqlstate::DATATYPE_MISMATCH,
+            super::DefinedCastContext::Explicit | super::DefinedCastContext::Implicit =>
+                sqlstate::CANNOT_COERCE,
+        },
+        "cannot cast type {} to {}",
+        source.name(),
+        target.name()
+    ))
+}
+
 fn float_to_numeric<'a>(
     value: f64,
     fractional_digits: usize,
@@ -98,6 +178,7 @@ pub(crate) fn validate_catalog_reference_cast(
     source_oid: i32,
     target: ColType,
 ) -> Result<(), SqlError> {
+    validate_geometry_cast(source_oid, target, super::DefinedCastContext::Explicit)?;
     if matches!(target, ColType::Int2Vector | ColType::OidVector)
         && let Some(source @ ColType::Array(_)) = ColType::from_oid(source_oid)
     {
@@ -124,6 +205,11 @@ pub(crate) fn validate_catalog_reference_cast(
 pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     if v.is_null() {
         return Ok(Datum::Null);
+    }
+    if matches!(v, Datum::Geometry { .. })
+        && let ColType::Geometry(kind) = target
+    {
+        return super::funcs::geometry::convert_geometry(v, kind, arena);
     }
     validate_catalog_reference_cast(v.type_oid(), target)?;
     let v = match v {
@@ -311,7 +397,6 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
         },
         ColType::Geometry(kind) => match v {
-            Datum::Geometry { kind: actual, .. } if actual == kind => v,
             Datum::Text(text) => Datum::Geometry {
                 kind,
                 text: crate::sql::geometry::parse(kind, text, arena)?,

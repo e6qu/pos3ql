@@ -110,8 +110,10 @@ fn stored_aggregate_hooks_precede_scalar_routine_execution() {
         "CREATE FUNCTION aggregate_state(state bigint,value integer) RETURNS bigint LANGUAGE sql AS 'SELECT coalesce(state,0)+value'; \
          CREATE FUNCTION aggregate_final(state bigint) RETURNS bigint LANGUAGE sql AS 'SELECT state*2'; \
          CREATE FUNCTION aggregate_first_state(state anyelement,value anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT coalesce(state,value)'; \
+         CREATE FUNCTION aggregate_compatible_state(state anycompatible,value anycompatible) RETURNS anycompatible LANGUAGE sql AS 'SELECT coalesce(state,value)'; \
          CREATE AGGREGATE aggregate_total(integer)(SFUNC=aggregate_state,STYPE=bigint,FINALFUNC=aggregate_final); \
          CREATE AGGREGATE aggregate_first(anyelement)(SFUNC=aggregate_first_state,STYPE=anyelement); \
+         CREATE AGGREGATE aggregate_compatible(anycompatible)(SFUNC=aggregate_compatible_state,STYPE=anycompatible); \
          CREATE SEQUENCE aggregate_inputs START WITH 7", true);
     assert_eq!(
         data_rows(&session.success(
@@ -121,6 +123,34 @@ fn stored_aggregate_hooks_precede_scalar_routine_execution() {
         )),
         ["14|9"]
     );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT aggregate_first_state(NULL::text,'x'::text), \
+                    aggregate_first('y'::text),aggregate_first(ARRAY['z'::text])::text, \
+                    aggregate_compatible('c'::text)",
+            true
+        )),
+        ["x|y|{z}|c"]
+    );
+    crate::mem::guard::forbid_alloc(|| {
+        use crate::sql::types::oid;
+        assert!(
+            !engine
+                .storage
+                .routine_implicit_cast(oid::TEXT, oid::ANYELEMENT, 0)
+        );
+        assert!(
+            !engine
+                .storage
+                .routine_implicit_cast(oid::ANYELEMENT, oid::TEXT, 0)
+        );
+        assert!(
+            engine
+                .storage
+                .routine_implicit_cast(oid::ANYELEMENT, oid::ANYELEMENT, 0)
+        );
+    });
     assert_eq!(data_rows(&session.success(&mut engine,
         "SELECT aggregate_total(nextval('aggregate_inputs')::integer); SELECT nextval('aggregate_inputs')", true)), ["14", "8"]);
     assert_eq!(data_rows(&session.success(&mut engine,

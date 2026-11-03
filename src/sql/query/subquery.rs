@@ -915,6 +915,11 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn is_empty_scope(&self) -> bool {
+        self.scope.is_none_or(|scope| scope.n == 0)
+            && self.outer.is_none_or(|outer| outer.is_empty_scope())
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         self.scope
             .and_then(|scope| {
@@ -2370,6 +2375,12 @@ pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.scope.is_none_or(|scope| scope.n == 0)
+            && self.outer.is_none_or(|outer| outer.is_empty_scope())
+            && self.catalog.is_empty_scope()
+    }
+
     fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
         self.catalog.type_name_fixed(oid)
     }
@@ -2393,8 +2404,14 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         )
     }
 
-    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
-        self.catalog.validate_explicit_cast(source_oid, target)
+    fn validate_explicit_cast(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_explicit_cast(source_oid, target_oid, target)
     }
 
     fn visit_named_composite_fields(

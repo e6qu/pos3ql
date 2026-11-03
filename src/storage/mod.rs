@@ -45206,7 +45206,11 @@ impl Storage {
                 .zip(argument_type_oids)
                 .all(|(argument, oid)| {
                     self.routine_argument_oid(argument, txid)
-                        .is_some_and(|expected| self.routine_implicit_cast(*oid, expected, txid))
+                        .is_some_and(|expected| {
+                            expected == *oid
+                                || (argument.polymorphic_type().is_none()
+                                    && self.routine_implicit_cast(*oid, expected, txid))
+                        })
                 })
         {
             return Some(());
@@ -45646,6 +45650,13 @@ impl Storage {
 
         if actual_oid == expected_oid || actual_oid == oid::UNKNOWN {
             return true;
+        }
+        // Polymorphic declarations have no concrete representation until the
+        // complete call binds them. Their metadata storage type is not a cast.
+        if PolymorphicType::from_oid(actual_oid).is_some()
+            || PolymorphicType::from_oid(expected_oid).is_some()
+        {
+            return false;
         }
 
         let actual = match self.routine_result_for_oid(actual_oid, txid) {

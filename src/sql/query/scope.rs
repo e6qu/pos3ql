@@ -394,6 +394,10 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.lookup(qualifier, name).map(|_| Datum::Null)
     }
@@ -420,6 +424,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.0.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.find_column(qualifier, name)?;
         Ok(Datum::Null)

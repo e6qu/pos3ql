@@ -26,7 +26,8 @@ pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
     cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
-    validate_bits, validate_catalog_reference_cast,
+    validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
+    validate_geometry_type_cast,
 };
 
 mod args;
@@ -326,6 +327,11 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// True only when this lookup has no relation scope, including outer scopes.
+    fn is_empty_scope(&self) -> bool {
+        false
+    }
 
     fn recursive_state(&self, qualifier: &str, _index: usize) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -652,6 +658,22 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        match self.catalog {
+            Some(catalog) => catalog.validate_explicit_cast(source, target_oid, target),
+            None => validate_catalog_reference_cast(source, target),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+
     fn type_name_fixed(&self, type_oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
         let named = match self.catalog {
             Some(catalog) => catalog.type_name_fixed(type_oid)?,
@@ -868,6 +890,10 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn is_empty_scope(&self) -> bool {
+        (**self).is_empty_scope()
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         (**self).lookup(qualifier, name)
     }
@@ -949,13 +975,28 @@ pub fn qualifier_answers_target(
 
 pub struct NoColumns;
 
-impl<'a> ColumnLookup<'a> for NoColumns {
-    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(
+pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> SqlError {
+    match qualifier {
+        Some(table) => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            table
+        ),
+        None => sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column \"{}\" does not exist",
             name
-        ))
+        ),
+    }
+}
+
+impl<'a> ColumnLookup<'a> for NoColumns {
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(empty_scope_column_error(qualifier, name))
     }
 }
 
@@ -1183,6 +1224,15 @@ pub enum RoutineCallTarget<'name> {
 }
 
 pub trait CatalogAccess {
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        _target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        validate_catalog_reference_cast(source, target)
+    }
+
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3353,6 +3403,9 @@ fn eval_full_inner<'a>(
             table,
             name,
         } => {
+            if row.is_empty_scope() {
+                return Err(empty_scope_column_error(Some(table), name));
+            }
             // A three-part reference resolves through a composed
             // `schema.table` qualifier: only an unaliased FROM entry whose
             // base table really lives in that schema answers to it, exactly
@@ -3361,7 +3414,8 @@ fn eval_full_inner<'a>(
             let composed = arena
                 .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
                 .map_err(|_| arena_full())?;
-            materialize_named_composite(row.lookup(Some(composed), name)?, hooks, arena)
+            let value = row.lookup(Some(composed), name)?;
+            materialize_named_composite(value, hooks, arena)
         }
         Expr::RecursiveState {
             qualifier, index, ..
@@ -5873,6 +5927,14 @@ fn call<'a>(
     } else {
         args
     };
+    // Only a declared variadic handler unpacks the selected final input.
+    let variadic = variadic
+        && builtin.is_none_or(|(oid, _)| {
+            super::catalog::builtin_callable_by_oid(oid)
+                .expect("selected builtin declaration")
+                .variadic_element
+                .is_some()
+        });
     let argument_names = if builtin.is_some() {
         &[][..]
     } else {
@@ -6021,7 +6083,8 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
-        && let Some(result) = funcs::json::dispatch(name, args, star, arena, params, row, hooks)
+        && let Some(result) =
+            funcs::json::dispatch(name, args, star, variadic, arena, params, row, hooks)
     {
         return result;
     }
@@ -9807,6 +9870,85 @@ mod tests {
                 .unwrap(),
                 (crate::sql::types::oid::RECORD, -1)
             );
+        });
+    }
+
+    #[test]
+    fn empty_scope_qualified_references_report_missing_from_entries() {
+        use crate::sql::exec::ColTypeResolver as _;
+        struct Hidden;
+        impl crate::sql::exec::ColTypeResolver for Hidden {
+            fn resolve(&self, _: Option<&str>, _: &str) -> Result<ColType, SqlError> {
+                Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"pg_class\""
+                ))
+            }
+        }
+        impl<'a> ColumnLookup<'a> for Hidden {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"pg_class\""
+                ))
+            }
+        }
+        with_arena(|arena| {
+            crate::mem::guard::forbid_alloc(|| {
+                for (qualifier, state, message) in [
+                    (
+                        None,
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"value\" does not exist",
+                    ),
+                    (
+                        Some("missing"),
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"missing\"",
+                    ),
+                    (
+                        Some("a.b"),
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"a.b\"",
+                    ),
+                ] {
+                    let described = crate::sql::exec::NoCols
+                        .resolve(qualifier, "value")
+                        .unwrap_err();
+                    let evaluated = NoColumns.lookup(qualifier, "value").unwrap_err();
+                    assert_eq!(described.sqlstate, state);
+                    assert_eq!(evaluated.sqlstate, state);
+                    assert_eq!(described.message.as_str(), message);
+                    assert_eq!(evaluated.message.as_str(), message);
+                }
+                let reference = Expr::SchemaColumn {
+                    schema: "pg_catalog",
+                    table: "pg_class",
+                    name: "relname",
+                };
+                let described =
+                    crate::sql::exec::infer_type_res(&reference, &crate::sql::exec::NoCols)
+                        .unwrap_err();
+                let evaluated =
+                    eval_full(&reference, arena, NO_PARAMS, &NoColumns, &NO_HOOKS).unwrap_err();
+                for error in [described, evaluated] {
+                    assert_eq!(error.sqlstate, sqlstate::UNDEFINED_TABLE);
+                    assert_eq!(
+                        error.message.as_str(),
+                        "missing FROM-clause entry for table \"pg_class\""
+                    );
+                }
+                let described = crate::sql::exec::infer_type_res(&reference, &Hidden).unwrap_err();
+                let evaluated =
+                    eval_full(&reference, arena, NO_PARAMS, &Hidden, &NO_HOOKS).unwrap_err();
+                for error in [described, evaluated] {
+                    assert_eq!(error.sqlstate, sqlstate::UNDEFINED_TABLE);
+                    assert_eq!(
+                        error.message.as_str(),
+                        "invalid reference to FROM-clause entry for table \"pg_class\""
+                    );
+                }
+            })
         });
     }
 }

@@ -1149,6 +1149,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             let mut bound = *expression;
             let declaration = crate::sql::catalog::builtin_callable_by_oid(oid)
                 .expect("selected builtin declaration");
+            let effective_variadic = *variadic && declaration.variadic_element.is_some();
             let qualified =
                 crate::stack_format!(128, "{}.{}", declaration.schema, declaration.name);
             if qualified.is_truncated() {
@@ -1158,6 +1159,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 name,
                 args,
                 argument_names,
+                variadic: bound_variadic,
                 ..
             } = &mut bound
             {
@@ -1166,9 +1168,11 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .map_err(|_| arena_full())?;
                 *args = arguments;
                 *argument_names = &[];
+                *bound_variadic = effective_variadic;
             }
             let expression = &*arena.alloc(bound).map_err(|_| arena_full())?;
             let args = &arguments;
+            let variadic = &effective_variadic;
             let written_name = *name;
             let builtin_name = builtin_set_routine_name(written_name).unwrap_or(written_name);
             let name = &builtin_name;
@@ -1648,6 +1652,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
             name,
             args,
             argument_names,
+            variadic: bound_variadic,
             ..
         } = &mut bound
         else {
@@ -1657,6 +1662,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
         *argument_names = &[];
         let declaration = crate::sql::catalog::builtin_callable_by_oid(selected_oid)
             .expect("selected builtin declaration");
+        *bound_variadic &= declaration.variadic_element.is_some();
         let qualified = crate::stack_format!(128, "{}.{}", declaration.schema, declaration.name);
         if qualified.is_truncated() {
             return Err(arena_full());
@@ -4381,6 +4387,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         } else {
             written_args
         };
+        let effective_variadic = tref.func_variadic
+            && builtin_oid.is_none_or(|oid| {
+                crate::sql::catalog::builtin_callable_by_oid(oid)
+                    .expect("selected builtin declaration")
+                    .variadic_element
+                    .is_some()
+            });
         let eval_argument = |argument| {
             let _inputs = super::input_progress::enter();
             crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks)
@@ -4395,7 +4408,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         bound_strict: None,
                         args,
                         argument_names: &[],
-                        variadic: tref.func_variadic,
+                        variadic: effective_variadic,
                         star: false,
                         distinct: false,
                         order_by: &[],
@@ -4502,7 +4515,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 });
             }
             if tref.table.eq_ignore_ascii_case("parse_ident") {
-                if !(1..=2).contains(&args.len()) || tref.func_variadic {
+                if !(1..=2).contains(&args.len()) || effective_variadic {
                     return Err(srf_signature_error(tref.table));
                 }
                 let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
@@ -4517,7 +4530,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     .map_err(|_| arena_full());
             }
             if tref.table.eq_ignore_ascii_case("pg_input_error_info") {
-                if args.len() != 2 || tref.func_variadic {
+                if args.len() != 2 || effective_variadic {
                     return Err(srf_signature_error(tref.table));
                 }
                 let input = match eval_argument(args[0])? {
@@ -4700,7 +4713,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             if tref.table.eq_ignore_ascii_case("pg_get_publication_tables") {
                 let evaluated = evaluate_publication_arguments_with(
                     args,
-                    tref.func_variadic,
+                    effective_variadic,
                     arena,
                     eval_argument,
                 )?;

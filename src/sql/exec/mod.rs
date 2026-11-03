@@ -21826,6 +21826,13 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<u64, SqlError> {
+    super::query::validate_dml_assignment_casts(
+        query.statement,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        None,
+    )?;
     let statement = match transition_relations {
         Some(relations) => super::query::bind_dml_materialized_relations(
             query.statement,
@@ -26015,6 +26022,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         invocation,
                         transition: &transition,
                     };
+                    super::query::validate_dml_assignment_casts(
+                        &Stmt::Insert(statement),
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                        Some(&scope),
+                    )?;
                     let prepared_select = match statement.select {
                         Some(select) => {
                             let select = match transition_relations {
@@ -38444,8 +38458,14 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
         self.catalog.operator_first_argument_type(name, left, right)
     }
 
-    fn validate_explicit_cast(&self, source: i32, target: ColType) -> Result<(), SqlError> {
-        self.catalog.validate_explicit_cast(source, target)
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_explicit_cast(source, target_oid, target)
     }
 
     fn domain_base_type(&self, oid: i32) -> Option<ColType> {
@@ -58292,6 +58312,15 @@ pub(crate) fn merge<'a>(
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
     use crate::sql::ast::MergeActionRef as MergeAction;
+    if let Err(error) = super::query::validate_dml_assignment_casts(
+        &Stmt::Merge(*statement),
+        storage,
+        txn.txid,
+        arena,
+        None,
+    ) {
+        return sql_fail(error);
+    }
     let capturing = capture.is_some();
     let target_qual = crate::sql::ast::QualName {
         schema: statement.target.schema,
@@ -61612,6 +61641,15 @@ where
     'snapshot: 'a,
 {
     let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
+    if let Err(error) = super::query::validate_dml_assignment_casts(
+        &Stmt::Insert(*statement),
+        storage,
+        txn.txid,
+        arena,
+        transition,
+    ) {
+        return sql_fail(error);
+    }
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
         Ok(i) => i,
@@ -62895,6 +62933,15 @@ pub(crate) fn update<'a>(
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
+    if let Err(error) = super::query::validate_dml_assignment_casts(
+        &Stmt::Update(*statement),
+        storage,
+        txn.txid,
+        arena,
+        outer,
+    ) {
+        return sql_fail(error);
+    }
     let outer_lookup = outer;
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -64935,6 +64982,20 @@ fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
     use ColType::*;
     if from == to {
         return true;
+    }
+    if matches!(
+        from,
+        Geometry(_) | Array(crate::sql::types::ArrElem::Geometry(_))
+    ) || matches!(
+        to,
+        Geometry(_) | Array(crate::sql::types::ArrElem::Geometry(_))
+    ) {
+        return crate::sql::eval::validate_geometry_cast(
+            from.oid(),
+            to,
+            crate::sql::eval::DefinedCastContext::Assignment,
+        )
+        .is_ok();
     }
     let is_string = |t| matches!(t, Text | Varchar | Bpchar | Name);
     // to-string: assignment via the output function; from-string: explicit.
@@ -72220,6 +72281,13 @@ pub(crate) fn coerce<'a>(
         let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
         let value = crate::sql::eval::regobject_cast(v, col.ctype, Some(&catalog), arena)?;
         return apply_typmod(value, col.ctype, col.type_mod, arena);
+    }
+    if matches!(v, Datum::Geometry { .. } | Datum::Array { .. }) {
+        crate::sql::eval::validate_geometry_cast(
+            v.type_oid(),
+            col.ctype,
+            crate::sql::eval::DefinedCastContext::Assignment,
+        )?;
     }
     let v = cast_to(v, col.ctype, arena).map_err(|e| {
         // Data errors (out of range, bad input syntax — class 22) keep their

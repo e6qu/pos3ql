@@ -4137,6 +4137,39 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
     }
 }
 
+pub(crate) fn validate_explicit_cast(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target_oid: i32,
+    target: ColType,
+) -> Result<(), SqlError> {
+    if storage.cast_for_oids(source, target_oid, txid).is_some() {
+        return Ok(());
+    }
+    if let Some(contract) = storage.routine_result_for_oid(source, txid) {
+        super::eval::validate_geometry_type_cast(
+            contract.ctype,
+            target,
+            super::eval::DefinedCastContext::Explicit,
+        )?;
+    }
+    let source = storage
+        .domain_base_type_for_oid(source, txid)
+        .map_or(source, ColType::oid);
+    super::eval::validate_catalog_reference_cast(source, target)
+}
+
+pub(crate) fn builtin_cast_context(
+    source: i32,
+    target: i32,
+) -> Option<crate::storage::CastContext> {
+    builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+        .and_then(|cast| crate::storage::CastContext::from_code(cast.context))
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO
@@ -12386,7 +12419,7 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
 }
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
-    INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+    builtin_callable_by_oid(oid).is_some()
 }
 
 pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
@@ -12397,21 +12430,62 @@ pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
 }
 
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
-    if function_oid_is_visible(oid) {
-        return Some(true);
+    let mut argument_oids = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    let (schema, name, arguments) = if let Some(declaration) = builtin_callable_by_oid(oid) {
+        (
+            SqlName::new(declaration.schema).expect("built-in schema fits its name bound"),
+            SqlName::new(declaration.name).expect("built-in routine fits its name bound"),
+            declaration.arguments,
+        )
+    } else {
+        let slot = storage.routine_slot_by_oid(oid, txid)?;
+        let routine = storage.routine_for(slot, txid);
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            argument_oids[index] =
+                storage.routine_type_oid(argument.ctype, argument.user_type, txid)?;
+        }
+        (
+            routine.schema_for(txid),
+            routine.name_for(txid),
+            &argument_oids[..routine.argument_count],
+        )
+    };
+    let Some(rank) = storage.path_namespace_rank(schema.as_str(), txid) else {
+        return Some(false);
+    };
+    if builtin_callable_signatures(name.as_str()).any(|candidate| {
+        candidate.arguments == arguments
+            && storage
+                .path_namespace_rank(candidate.schema, txid)
+                .is_some_and(|other| other < rank)
+    }) {
+        return Some(false);
     }
-    let slot = storage.routine_slot_by_oid(oid, txid)?;
-    let routine = storage.routine_for(slot, txid);
-    let mut arguments = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-    for (index, argument) in routine.arguments().iter().enumerate() {
-        arguments[index] = storage.routine_type_oid(argument.ctype, argument.user_type, txid)?;
+    for slot in 0..storage.routine_count() {
+        if !storage.routine_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let routine = storage.routine_for(slot, txid);
+        if routine.name_for(txid) != name
+            || routine.arguments().len() != arguments.len()
+            || !storage
+                .path_namespace_rank(routine.schema_for(txid).as_str(), txid)
+                .is_some_and(|other| other < rank)
+        {
+            continue;
+        }
+        if routine
+            .arguments()
+            .iter()
+            .zip(arguments)
+            .all(|(argument, oid)| {
+                storage.routine_type_oid(argument.ctype, argument.user_type, txid) == Some(*oid)
+            })
+        {
+            return Some(false);
+        }
     }
-    let visible = storage.routine_slot_for_function_call_oids(
-        routine.name_for(txid).as_str(),
-        &arguments[..routine.argument_count],
-        txid,
-    ) == Some(slot);
-    Some(visible)
+    Some(true)
 }
 
 pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -12877,29 +12951,38 @@ fn routine_builtin_type(written: &str) -> Option<ColType> {
     routine_builtin_type(base.as_str())
 }
 
-fn intrinsic_argument_matches(
-    routine: IntrinsicRoutine,
+fn builtin_argument_matches(
+    routine: &BuiltinCallableSignature,
     arguments: &[crate::storage::RoutineArgumentDef],
 ) -> bool {
-    if routine.argument_count != arguments.len() as i32 {
+    if routine.arguments.len() != arguments.len() {
         return false;
     }
     routine
-        .argument_types
-        .split_ascii_whitespace()
+        .arguments
+        .iter()
         .zip(arguments)
         .all(|(oid, argument)| {
-            argument.user_type.is_none() && oid.parse::<i32>().ok() == Some(argument.ctype.oid())
+            argument.polymorphic_type().map_or_else(
+                || argument.user_type.is_none() && *oid == argument.ctype.oid(),
+                |kind| *oid == kind.oid(),
+            )
         })
 }
 
 fn routine_signature<'a>(
+    schema: Option<&str>,
     name: &str,
-    arguments: impl Iterator<Item = ColType>,
+    arguments: impl Iterator<Item = i32>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
+    if let Some(schema) = schema {
+        write_identifier(&mut text, schema);
+        text.write_char('.')
+            .map_err(|_| super::eval::arena_full())?;
+    }
     write_identifier(&mut text, name);
     text.write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -12907,7 +12990,15 @@ fn routine_signature<'a>(
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
         }
-        write!(text, "{}", argument.name()).map_err(|_| super::eval::arena_full())?;
+        let name = intrinsic_type_name(argument).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "built-in routine argument type {} has no name",
+                argument
+            )
+        })?;
+        text.write_str(name)
+            .map_err(|_| super::eval::arena_full())?;
     }
     write!(text, ")").map_err(|_| super::eval::arena_full())?;
     arena
@@ -12924,7 +13015,7 @@ fn routine_declared_signature<'a>(
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     let schema = routine.schema_for(txid);
-    if !storage.schema_is_on_path(schema, txid) {
+    if function_oid_visibility(storage, txid, crate::storage::routine_oid(&routine)) != Some(true) {
         write_identifier(&mut text, schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -13016,8 +13107,19 @@ pub(crate) fn routine_oid_by_name(
     } else {
         (written.trim(), 0)
     };
+    let unqualified = split_qualified_name(name).is_some_and(|(schema, _)| schema.is_none());
     let mut found = None;
-    let mut consider = |oid| -> Result<(), SqlError> {
+    let mut found_rank = usize::MAX;
+    let mut consider = |oid, rank| -> Result<(), SqlError> {
+        if found == Some(oid) {
+            return Ok(());
+        }
+        if signature && rank > found_rank {
+            return Ok(());
+        }
+        if signature && rank < found_rank {
+            found = None;
+        }
         if found.replace(oid).is_some() {
             return Err(sql_err!(
                 sqlstate::AMBIGUOUS_FUNCTION,
@@ -13025,15 +13127,27 @@ pub(crate) fn routine_oid_by_name(
                 written
             ));
         }
+        found_rank = rank;
         Ok(())
     };
-    for routine in INTRINSIC_ROUTINES {
-        if !routine_name_matches(name, "pg_catalog", routine.name)
-            || (signature && !intrinsic_argument_matches(*routine, &arguments[..argument_count]))
+    for routine in callable_signatures::CALLABLES {
+        if !routine_name_matches(name, routine.schema, routine.name)
+            || (signature && !builtin_argument_matches(routine, &arguments[..argument_count]))
         {
             continue;
         }
-        consider(routine.oid)?;
+        let rank = if unqualified {
+            let Some(rank) = storage.path_namespace_rank(routine.schema, txid) else {
+                continue;
+            };
+            if !signature && function_oid_visibility(storage, txid, routine.oid) != Some(true) {
+                continue;
+            }
+            rank
+        } else {
+            0
+        };
+        consider(routine.oid, rank)?;
     }
     for slot in 0..storage.routine_count() {
         let Some(identity) = storage.routine_identity_for(slot, txid) else {
@@ -13046,7 +13160,18 @@ pub(crate) fn routine_oid_by_name(
         {
             continue;
         }
-        consider(identity.oid)?;
+        let rank = if unqualified {
+            let Some(rank) = storage.path_namespace_rank(identity.schema.as_str(), txid) else {
+                continue;
+            };
+            if !signature && function_oid_visibility(storage, txid, identity.oid) != Some(true) {
+                continue;
+            }
+            rank
+        } else {
+            0
+        };
+        consider(identity.oid, rank)?;
     }
     Ok(found)
 }
@@ -13058,8 +13183,18 @@ pub(crate) fn routine_name_by_oid<'a>(
     signature: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+    if let Some(routine) = builtin_callable_by_oid(oid) {
+        let schema =
+            (function_oid_visibility(storage, txid, oid) != Some(true)).then_some(routine.schema);
         if !signature {
+            if let Some(schema) = schema {
+                let mut qualified = StackStr::<260>::new();
+                write_identifier(&mut qualified, schema);
+                core::fmt::Write::write_char(&mut qualified, '.').map_err(|_| arena_full())?;
+                write_identifier(&mut qualified, routine.name);
+                return alloc_rendered(&qualified, "qualified routine name is too long", arena)
+                    .map(Some);
+            }
             return if ident_needs_quotes(routine.name) {
                 super::eval::quote_ident_str(routine.name, arena).map(Some)
             } else {
@@ -13069,12 +13204,13 @@ pub(crate) fn routine_name_by_oid<'a>(
                     .map_err(|_| super::eval::arena_full())
             };
         }
-        let arguments = routine
-            .argument_types
-            .split_ascii_whitespace()
-            .filter_map(|oid| oid.parse::<i32>().ok())
-            .filter_map(ColType::from_oid);
-        return routine_signature(routine.name, arguments, arena).map(Some);
+        return routine_signature(
+            schema,
+            routine.name,
+            routine.arguments.iter().copied(),
+            arena,
+        )
+        .map(Some);
     }
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
@@ -13083,7 +13219,7 @@ pub(crate) fn routine_name_by_oid<'a>(
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
-        if !storage.schema_is_on_path(routine.schema_for(txid), txid) {
+        if function_oid_visibility(storage, txid, oid) != Some(true) {
             let mut qualified = StackStr::<256>::new();
             write_identifier(&mut qualified, routine.schema_for(txid).as_str());
             use core::fmt::Write;
@@ -14903,9 +15039,8 @@ fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option
     None
 }
 
-/// Search-path-aware SQL spelling of a user-defined type OID. `format_type`
-/// uses this for domains/enums and their automatically-created array types;
-/// built-in types deliberately return `None` and stay on the static path.
+/// Search-path-aware spelling of named types and table/view row types,
+/// including their arrays. Builtin types stay on the static naming path.
 pub fn user_type_name_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -14922,16 +15057,62 @@ pub(crate) fn user_type_name_fixed(
     txid: u32,
     oid: i32,
 ) -> Result<Option<StackStr<260>>, SqlError> {
-    let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) else {
-        return Ok(None);
-    };
-    let Some(source) = storage.routine_result_for_oid(oid, txid) else {
-        return Ok(None);
-    };
-    let Some(identity) = source.user_type else {
-        return Ok(None);
-    };
-    let (schema, name) = (identity.schema, identity.name);
+    let (schema, name, array) =
+        if let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
+            let Some(identity) = storage
+                .routine_result_for_oid(oid, txid)
+                .and_then(|source| source.user_type)
+            else {
+                return Ok(None);
+            };
+            (identity.schema, identity.name, array)
+        } else {
+            let Some((view_type, array)) = [
+                (FIRST_TABLE_COMPOSITE_TYPE_OID, false, false),
+                (FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID, false, true),
+                (FIRST_VIEW_COMPOSITE_TYPE_OID, true, false),
+                (FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID, true, true),
+            ]
+            .into_iter()
+            .find_map(|(first, view, array)| {
+                oid.checked_sub(first)
+                    .and_then(|created| u64::try_from(created).ok())
+                    .and_then(crate::storage::RelationIdentity::parse)
+                    .map(|_| (view, array))
+            }) else {
+                return Ok(None);
+            };
+            let mut relation_type = None;
+            let table_count = if view_type { 0 } else { storage.table_count() };
+            for slot in 0..table_count {
+                if !storage.table_slot_visible_to(slot, txid) {
+                    continue;
+                }
+                if table_row_type_oid(storage, slot, array) != oid {
+                    continue;
+                }
+                let definition = storage.table_def(slot, txid);
+                relation_type = Some((definition.schema, definition.name, array));
+                break;
+            }
+            if view_type {
+                for slot in 0..storage.view_count() {
+                    if !storage.view_slot_visible_to(slot, txid) {
+                        continue;
+                    }
+                    if view_row_type_oid(storage, slot, array) != oid {
+                        continue;
+                    }
+                    let view = storage.view(slot);
+                    relation_type = Some((view.schema_for(txid), view.name_for(txid), array));
+                    break;
+                }
+            }
+            let Some(relation_type) = relation_type else {
+                return Ok(None);
+            };
+            relation_type
+        };
     let written = stack_format!(160, "{}{}", name.as_str(), if array { "[]" } else { "" });
     let unqualified_visible = user_type_oid(storage, txid, written.as_str()) == Some(oid);
     let mut rendered = StackStr::<260>::new();
@@ -23933,7 +24114,9 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     ];
     let rows = catalog_rows(
         arena,
-        builtin.len() + storage.casts_visible_to(txid).count(),
+        builtin.len()
+            + crate::sql::geometry::CAST_IDENTITIES.len()
+            + storage.casts_visible_to(txid).count(),
     )?;
     for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
     {
@@ -23951,6 +24134,40 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
     }
     let mut count = builtin.len();
+    for &(oid, source, target) in crate::sql::geometry::CAST_IDENTITIES {
+        let cast = builtin_properties::CASTS
+            .iter()
+            .find(|cast| cast.source == source.oid() && cast.target == target.oid())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "geometric catalog cast has no shared declaration"
+                )
+            })?;
+        rows[count] = row(
+            &[
+                Datum::Int4(2605),
+                Datum::Int4(oid),
+                Datum::Int4(cast.source),
+                Datum::Int4(cast.target),
+                Datum::Int4(cast.procedure),
+                Datum::Bpchar(match cast.context {
+                    b'e' => "e",
+                    b'a' => "a",
+                    b'i' => "i",
+                    _ => unreachable!("catalog cast context"),
+                }),
+                Datum::Bpchar(match cast.method {
+                    b'f' => "f",
+                    b'b' => "b",
+                    b'i' => "i",
+                    _ => unreachable!("catalog cast method"),
+                }),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (_, cast) in storage.casts_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_cast"));
@@ -27286,14 +27503,15 @@ fn pg_aggregate<'a>(
             "xmlconcat2"
         } else if oid == 2901 {
             "xmlagg"
-        } else if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        } else if let Some(routine) = builtin_callable_by_oid(oid) {
             if matches!(oid, 4301 | 4389 | 4450 | 6227) {
                 match oid {
                     4301 | 6227 => "pg_catalog.range_agg",
                     _ => "pg_catalog.range_intersect_agg",
                 }
             } else {
-                routine.name
+                routine_name_by_oid(storage, txid, routine.oid, false, arena)?
+                    .expect("selected built-in declaration retains its identity")
             }
         } else {
             let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {

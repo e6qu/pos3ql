@@ -84,6 +84,23 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
             "SELECT nextval('rule_argument_effects'); \
              SELECT pg_get_ruledef(oid,false) LIKE '%rule_format_sink%' FROM pg_rewrite WHERE rulename='diag_action'", true)),
             ["2", "t"]);
+        session.success(&mut engine,
+            "CREATE SCHEMA \"Rule Schema\"; CREATE TABLE \"Rule Schema\".\"Rule Source\"(id integer); \
+             CREATE RULE \"Rule\"\"Name\" AS ON INSERT TO \"Rule Schema\".\"Rule Source\" DO NOTHING; \
+             CREATE RULE \"select\" AS ON DELETE TO \"Rule Schema\".\"Rule Source\" DO INSTEAD NOTHING", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT pg_get_ruledef(oid,false),pg_get_ruledef(oid,true) FROM pg_rewrite WHERE rulename='Rule\"Name'", true)),
+            ["CREATE RULE \"Rule\"\"Name\" AS\n    ON INSERT TO \"Rule Schema\".\"Rule Source\" DO NOTHING;|CREATE RULE \"Rule\"\"Name\" AS\n    ON INSERT TO \"Rule Schema\".\"Rule Source\" DO NOTHING;"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pg_get_ruledef(oid,false) FROM pg_rewrite WHERE rulename='select'",
+                true
+            )),
+            [
+                "CREATE RULE \"select\" AS\n    ON DELETE TO \"Rule Schema\".\"Rule Source\" DO INSTEAD NOTHING;"
+            ]
+        );
     }
 }
 
@@ -108,7 +125,8 @@ fn routine_lookup_diagnostics_keep_static_types_without_argument_effects() {
              CREATE FUNCTION diag_amb(value smallint) RETURNS integer LANGUAGE sql AS 'SELECT 1'; \
              CREATE FUNCTION diag_amb(value bigint) RETURNS integer LANGUAGE sql AS 'SELECT 1'; \
              CREATE TABLE diagnostic_inputs(value \"Hidden Schema\".\"Odd Type\"[]); \
-             INSERT INTO diagnostic_inputs VALUES(NULL)",
+             INSERT INTO diagnostic_inputs VALUES(NULL); \
+             CREATE VIEW diagnostic_view AS SELECT value FROM diagnostic_inputs",
             true,
         );
         assert_eq!(data_rows(&session.success(&mut engine,
@@ -162,6 +180,31 @@ fn routine_lookup_diagnostics_keep_static_types_without_argument_effects() {
                 "SELECT diag_missing(NULL::\"Hidden Schema\".\"Odd Row\"[])",
                 "42883",
                 "function diag_missing(\"Hidden Schema\".\"Odd Row\"[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::diagnostic_inputs)",
+                "42883",
+                "function diag_missing(diagnostic_inputs) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::diagnostic_inputs[])",
+                "42883",
+                "function diag_missing(diagnostic_inputs[]) does not exist",
+            ),
+            (
+                "SELECT diag_missing(NULL::diagnostic_view)",
+                "42883",
+                "function diag_missing(diagnostic_view) does not exist",
+            ),
+            (
+                "SELECT * FROM jsonb_populate_record(NULL::diagnostic_inputs,'{}'::json)",
+                "42883",
+                "function jsonb_populate_record(diagnostic_inputs, json) does not exist",
+            ),
+            (
+                "SELECT * FROM json_populate_record(NULL::diagnostic_inputs,'{}'::jsonb)",
+                "42883",
+                "function json_populate_record(diagnostic_inputs, jsonb) does not exist",
             ),
             (
                 "SELECT diag_missing(value) FROM diagnostic_inputs",
@@ -381,6 +424,53 @@ fn selected_builtin_arguments_preserve_defaults_names_and_once_only_effects() {
                 "[0:3]={1,2,2,4}",
                 "3",
             ]
+        );
+    }
+}
+
+#[test]
+fn explicit_variadic_keeps_nonvariadic_scalar_array_and_set_contracts() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("explicit-variadic-fixed-contracts");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE FUNCTION fixed_scalar(value integer) RETURNS integer LANGUAGE sql AS $$SELECT value$$; \
+             CREATE FUNCTION fixed_array(value integer[]) RETURNS integer[] LANGUAGE sql AS $$SELECT value$$; \
+             CREATE FUNCTION fixed_pair(marker integer,value integer[]) RETURNS integer LANGUAGE sql AS $$SELECT marker+cardinality(value)$$; \
+             CREATE SEQUENCE variadic_fixed_effects", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT fixed_scalar(VARIADIC 7),abs(VARIADIC(-3)); \
+             SELECT fixed_array(VARIADIC ARRAY[1,2]),fixed_array(VARIADIC NULL),fixed_array(VARIADIC '{3,4}'); \
+             SELECT fixed_array(VARIADIC value=>ARRAY[1,2]),fixed_pair(5,VARIADIC ARRAY[1,2]), \
+                    fixed_pair(marker=>5,VARIADIC value=>ARRAY[1,2]); \
+             SELECT to_json(VARIADIC ARRAY[1,2])::text,json_array_length(json_build_array(VARIADIC ARRAY[1,2])); \
+             SELECT unnest(VARIADIC ARRAY[1,2]); \
+             SELECT * FROM unnest(VARIADIC ARRAY[3,4]) AS selected(value); \
+             SELECT fixed_scalar(VARIADIC nextval('variadic_fixed_effects')::integer); \
+             SELECT nextval('variadic_fixed_effects'); \
+             SELECT json_build_object(VARIADIC ARRAY['k','v'])->>'k', \
+                    jsonb_build_object(VARIADIC ARRAY[]::text[])::text, \
+                    json_build_array(VARIADIC NULL::integer[]) IS NULL; \
+             SELECT json_array_length(json_build_array(VARIADIC ARRAY[nextval('variadic_fixed_effects'),nextval('variadic_fixed_effects')])); \
+             SELECT nextval('variadic_fixed_effects')", true)),
+            ["7|3", "{1,2}|NULL|{3,4}", "{1,2}|7|7", "[1,2]|2", "1", "2", "3", "4", "1", "2", "v|{}|t", "2", "5"]);
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "SELECT unnest(VARIADIC 1)", true)),
+            ["42883"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT json_build_object(VARIADIC ARRAY['k'])",
+                true
+            )),
+            ["22023"]
         );
     }
 }

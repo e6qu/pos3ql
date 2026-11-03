@@ -199,6 +199,12 @@ SQL JSON constructors use registered enum-to-JSON conversions, including inside
 arrays and records. Arrays and records retain their structural representation
 instead of invoking a cast registered for the whole container.
 
+Geometric conversions follow PostgreSQL's cast rules. For example, assigning a
+polygon to a path column is allowed; assigning a box to a point column needs
+an explicit `::point` cast. Those rules also apply to typed NULL values and
+arrays. Converting an open path to a polygon fails with `22023`, whether written
+as `polygon(value)` or `value::polygon`.
+
 `array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
 `btarraycmp` use the array comparison rules of the SQL operators. They accept
 arrays wrapped in domains (types with extra checks), preserving dimensions and
@@ -506,7 +512,8 @@ mode changes retain PostgreSQL's explicit relation-kind errors.
 their saved SQL when the flag is omitted or false; requesting pretty formatting
 for a condition or action returns `0A000`. For example,
 `pg_get_ruledef(rule_oid, false)` reconstructs a rule without requesting that
-unsupported formatting. A missing rule returns NULL in either mode.
+unsupported formatting. Names are quoted when their spelling requires it,
+including reserved words and embedded quotes. A missing rule returns NULL in either mode.
 
 ## Catalog listings and current lookups
 

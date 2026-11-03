@@ -30,13 +30,11 @@ pub(super) fn map_parameter_positions<'parameter>(
     if count > MAX_ROUTINE_ARGUMENTS || (!names.is_empty() && names.len() != count) {
         return None;
     }
+    // VARIADIC disables tail expansion; fixed signatures also accept it.
     let variadic = variadic_index;
     if formal_count > MAX_ROUTINE_ARGUMENTS
         || !explicit_variadic && variadic.is_some() && names.iter().any(Option::is_some)
     {
-        return None;
-    }
-    if explicit_variadic && variadic.is_none() {
         return None;
     }
     let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
@@ -71,7 +69,9 @@ pub(super) fn map_parameter_positions<'parameter>(
         supplied[input] = true;
         *target = input as u8;
     }
-    if explicit_variadic && (count == 0 || Some(usize::from(mapping[count - 1])) != variadic) {
+    if explicit_variadic
+        && (count == 0 || variadic.is_some_and(|input| usize::from(mapping[count - 1]) != input))
+    {
         return None;
     }
     for (input, supplied) in supplied.iter().enumerate().take(formal_count) {
@@ -674,6 +674,37 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_variadic_preserves_fixed_signature_mapping() {
+        crate::mem::guard::forbid_alloc(|| {
+            let parameters = [("marker", false), ("value", false)];
+            let mapping = map_parameter_positions(
+                2,
+                None,
+                |index| parameters.get(index).copied(),
+                &[Some("value"), Some("marker")],
+                2,
+                true,
+            )
+            .unwrap();
+            assert_eq!(&mapping[..2], &[1, 0]);
+            assert!(
+                map_parameter_positions(
+                    2,
+                    None,
+                    |index| parameters.get(index).copied(),
+                    &[],
+                    1,
+                    true
+                )
+                .is_none()
+            );
+            let single = |index| (index == 0).then_some(("value", false));
+            assert!(map_parameter_positions(1, Some(0), single, &[], 2, true).is_none());
+            assert!(map_parameter_positions(1, Some(0), single, &[], 1, true).is_some());
+        });
+    }
 
     #[test]
     fn builtin_signatures_keep_named_defaults_variadic_and_catalog_identity() {

@@ -11,6 +11,10 @@ pub(crate) fn builtin_implicit_cast(actual: ColType, expected: ColType) -> bool 
     if actual == expected {
         return true;
     }
+    if let (ColType::Geometry(_), ColType::Geometry(_)) = (actual, expected) {
+        return crate::sql::catalog::builtin_cast_context(actual.oid(), expected.oid())
+            .is_some_and(crate::storage::CastContext::permits_implicit);
+    }
     if let (ColType::Array(actual), ColType::Array(expected)) = (actual, expected) {
         return builtin_implicit_cast(actual.to_coltype(), expected.to_coltype());
     }

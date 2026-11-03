@@ -96,6 +96,7 @@ pub(crate) fn stored_query_dependencies(
 }
 
 pub(crate) use dependencies::collect_routine_parameter_defaults;
+pub(crate) use dependencies::validate_dml_assignment_casts;
 
 pub(crate) fn stored_routine_dependencies(
     program: &RoutineFunctionProgram<'_>,
@@ -2638,6 +2639,15 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        super::catalog::validate_explicit_cast(self.storage, self.txid, source, target_oid, target)
+    }
+
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         let pid = self.storage.current_connection_id();
         if pid <= 0 {
@@ -11312,6 +11322,10 @@ fn describe_scope_record_star<'q>(
 /// Resolves column types across all tables in a join scope.
 pub(super) struct ScopeCols<'s, 'd>(pub(super) &'s QueryScope<'d>);
 impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.0.n == 0
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
@@ -11386,6 +11400,10 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'outer_definition, 'stor
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.scope.n == 0 && self.outer_scope.is_none_or(|scope| scope.n == 0)
+    }
+
     fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
         Ok(
             super::catalog::user_type_name_fixed(self.storage, self.txid, oid)?
@@ -11421,15 +11439,19 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
             .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
     }
 
-    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
-        if self
-            .storage
-            .cast_for_oids(source_oid, target.oid(), self.txid)
-            .is_none()
-        {
-            super::eval::validate_catalog_reference_cast(source_oid, target)?;
-        }
-        Ok(())
+    fn validate_explicit_cast(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        super::catalog::validate_explicit_cast(
+            self.storage,
+            self.txid,
+            source_oid,
+            target_oid,
+            target,
+        )
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {

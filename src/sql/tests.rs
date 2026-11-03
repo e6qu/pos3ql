@@ -14,6 +14,8 @@ mod catalog_identity_lookup;
 mod client_catalog;
 mod cursor_execution;
 mod foreign_parent_admission;
+mod geometric_casts;
+mod geometry_assignments;
 mod key_preparation;
 mod object_reads;
 mod prepared_object_capacity;
@@ -21532,6 +21534,15 @@ fn selected_acl_operator_functions_resolve_both_operand_identities() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT ARRAY[[1,NULL],[3,4]], \
+         CASE WHEN false THEN ARRAY[[[[[[[1]]]]]]] ELSE ARRAY[1] END",
+            true
+        )),
+        ["{{1,NULL},{3,4}}|{1}"]
+    );
     let output = session.success(
         &mut engine,
         "CREATE ROLE acl_callable_reader; CREATE ROLE acl_callable_grantor; \
@@ -42872,17 +42883,20 @@ fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
         )),
         ["11"]
     );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT aggregate_old_tick(*) FROM aggregate_input; \
-             SELECT aggregate_first(v), aggregate_first(g::text) FROM aggregate_input; \
-             SELECT aggregate_array_first(ARRAY[v])::text, \
-                    aggregate_compatible_first(v::bigint) FROM aggregate_input"
-        )),
-        ["5", "3|1", "{3}|3"]
+    let polymorphic = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT aggregate_old_tick(*) FROM aggregate_input; \
+         SELECT aggregate_first(v), aggregate_first(g::text) FROM aggregate_input; \
+         SELECT aggregate_array_first(ARRAY[v])::text, \
+                aggregate_compatible_first(v::bigint) FROM aggregate_input",
     );
+    assert!(
+        error_sqlstates(&polymorphic).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&polymorphic)
+    );
+    assert_eq!(data_rows(&polymorphic), ["5", "3|1", "{3}|3"]);
     assert_eq!(
         row_description_type_oids(&describe_with(
             &mut engine,

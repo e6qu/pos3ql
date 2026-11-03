@@ -56,7 +56,9 @@ reads, nested calls and replaced objects. The
 Audit PostgreSQL 18 built-ins by signature and executable behavior, including
 `hashtextextended('order-42', 0)`. Catalog presence alone is not support.
 Keep values, declared types, nulls, errors and argument effects aligned with
-PostgreSQL. Run real SQLAlchemy, Alembic and psycopg2 inspection, migrations,
+PostgreSQL. Validate declared assignments before row processing: an empty input
+or typed NULL must not bypass an otherwise invalid conversion. Run real
+SQLAlchemy, Alembic and psycopg2 inspection, migrations,
 streaming and binary-client workflows against both servers; preserve native
 Linux amd64, Linux arm64 and macOS arm64 coverage.
 

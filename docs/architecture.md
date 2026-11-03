@@ -52,6 +52,11 @@ needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
 
+A waiting command keeps the downloads it needs. Completion or failure releases
+unused read-ahead requests. Commit does so once all required row images are in
+the journal, before waiting for its durable receipt; an abandoned speculative
+download cannot hold up the next checkpoint.
+
 State-changing routines, procedure commit boundaries, administrative work and
 large-result reads after their first transport flush still have synchronous
 reads. A cold read on one

@@ -15,6 +15,9 @@ use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, UnaryOp};
 use crate::sql::types::ColType;
 
+// Parsing bounds recursion; array dimensionality is checked when evaluated.
+const MAX_ARRAY_BRACKET_NESTING: usize = 64;
+
 impl<'a> Parser<'a> {
     fn between_comparisons(
         &self,
@@ -924,19 +927,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
-                    self.advance()?;
-                    let mut items = ArenaList::new(self.arena);
-                    if self.peeked != Tok::Op("]") {
-                        loop {
-                            let item = self.expression(0)?;
-                            self.push(&mut items, item)?;
-                            if !self.eat_op(",")? {
-                                break;
-                            }
-                        }
-                    }
-                    self.expect_op("]")?;
-                    return self.arena_expr(Expr::Array(items.as_slice()));
+                    return self.array_bracket_constructor(0);
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
@@ -1587,6 +1578,36 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn array_bracket_constructor(&mut self, depth: usize) -> Result<&'a Expr<'a>, ParseError> {
+        if depth == MAX_ARRAY_BRACKET_NESTING {
+            return Err(self.limit("array constructor nesting", MAX_ARRAY_BRACKET_NESTING));
+        }
+        self.expect_op("[")?;
+        let nested = self.peeked == Tok::Op("[");
+        let mut items = ArenaList::new(self.arena);
+        if self.peeked != Tok::Op("]") {
+            loop {
+                let item = if nested {
+                    if self.peeked != Tok::Op("[") {
+                        return Err(self.syntax_error_here());
+                    }
+                    self.array_bracket_constructor(depth + 1)?
+                } else {
+                    if self.peeked == Tok::Op("[") {
+                        return Err(self.syntax_error_here());
+                    }
+                    self.expression(0)?
+                };
+                self.push(&mut items, item)?;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        self.expect_op("]")?;
+        self.arena_expr(Expr::Array(items.as_slice()))
+    }
+
     fn sql_json_array_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
         let mut values = ArenaList::new(self.arena);
@@ -1594,6 +1615,9 @@ impl<'a> Parser<'a> {
             && self.peeked != Tok::Ident("absent")
             && self.peeked != Tok::Ident("returning")
         {
+            if matches!(self.peeked, Tok::Ident("distinct" | "variadic")) {
+                return Err(self.syntax_error_here());
+            }
             let value = self.expression(0)?;
             let value = self.sql_json_format_argument(value)?;
             self.push(&mut values, value)?;
@@ -2139,6 +2163,9 @@ impl<'a> Parser<'a> {
             return self.plain_call("pg_catalog.overlay", &cargs[..cn]);
         }
         // `agg(DISTINCT expression)` — deduplicate argument values before aggregating.
+        if kind == CallKind::SqlSyntax && self.peeked == Tok::Ident("distinct") {
+            return Err(self.syntax_error_here());
+        }
         let distinct = if self.peeked == Tok::Ident("distinct") {
             self.advance()?;
             true
@@ -2147,7 +2174,7 @@ impl<'a> Parser<'a> {
         };
         if self.peeked == Tok::Op("*") {
             if kind == CallKind::SqlSyntax {
-                return Err(self.err_here("SQL expression does not accept *"));
+                return Err(self.syntax_error_here());
             }
             if distinct {
                 return Err(self.err_here("DISTINCT cannot be used with *"));
@@ -2177,8 +2204,16 @@ impl<'a> Parser<'a> {
         let mut variadic = false;
         if self.peeked != Tok::Op(")") {
             loop {
+                if kind == CallKind::SqlSyntax
+                    && (self.peeked == Tok::Ident("variadic") || name == "merge_action")
+                {
+                    return Err(self.syntax_error_here());
+                }
                 let this_variadic = self.eat_ident("variadic")?;
                 let first = self.expression(0)?;
+                if kind == CallKind::SqlSyntax && matches!(self.peeked, Tok::Op("=>" | ":=")) {
+                    return Err(self.syntax_error_here());
+                }
                 if self.eat_op("=>")? {
                     let argument_name = match first {
                         Expr::Column {
@@ -2211,12 +2246,22 @@ impl<'a> Parser<'a> {
                     }
                     break;
                 }
+                if kind == CallKind::SqlSyntax
+                    && self.peeked == Tok::Op(",")
+                    && ((name == "json_scalar" && args.len() == 1)
+                        || (name == "nullif" && args.len() == 2))
+                {
+                    return Err(self.syntax_error_here());
+                }
                 if !self.eat_op(",")? {
                     break;
                 }
             }
         }
         // Optional aggregate `ORDER BY` (e.g. `string_agg(x, ',' ORDER BY y)`).
+        if kind == CallKind::SqlSyntax && self.peeked == Tok::Ident("order") {
+            return Err(self.syntax_error_here());
+        }
         let order_by = if self.peeked == Tok::Ident("order") {
             self.advance()?;
             self.expect_ident("by")?;
@@ -2224,7 +2269,22 @@ impl<'a> Parser<'a> {
         } else {
             &[]
         };
+        if kind == CallKind::SqlSyntax
+            && ((matches!(
+                name,
+                "coalesce" | "greatest" | "least" | "grouping" | "xmlconcat"
+            ) && args.is_empty())
+                || (name == "nullif" && args.len() != 2)
+                || (name == "json_scalar" && args.len() != 1))
+        {
+            return Err(self.syntax_error_here());
+        }
         self.expect_op(")")?;
+        if kind == CallKind::SqlSyntax
+            && matches!(self.peeked, Tok::Ident("within" | "filter" | "over"))
+        {
+            return Err(self.syntax_error_here());
+        }
         // Ordered-set aggregate: `agg(direct_args) WITHIN GROUP (ORDER BY ...)`.
         // The WITHIN GROUP ordering is the aggregated input; it is carried in the
         // same `order_by` slot.
@@ -2243,27 +2303,6 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = args.as_slice();
-        if kind == CallKind::SqlSyntax {
-            if distinct
-                || variadic
-                || saw_named
-                || !order_by.is_empty()
-                || filter.is_some()
-                || over.is_some()
-            {
-                return Err(self.err_here("SQL expression does not accept function-call modifiers"));
-            }
-            if (matches!(
-                name,
-                "coalesce" | "greatest" | "least" | "grouping" | "xmlconcat"
-            ) && args.is_empty())
-                || (name == "nullif" && args.len() != 2)
-                || (name == "json_scalar" && args.len() != 1)
-                || (name == "merge_action" && !args.is_empty())
-            {
-                return Err(self.err_here("invalid SQL expression argument count"));
-            }
-        }
         if matches!(name, "nextval" | "currval" | "setval")
             && let Some(first) = args.first()
         {

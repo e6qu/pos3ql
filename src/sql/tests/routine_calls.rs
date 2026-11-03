@@ -2609,6 +2609,74 @@ fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
             String::from_utf8_lossy(&output)
         );
     }
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA reference_scope; CREATE TABLE reference_scope.source(value integer); \
+         INSERT INTO reference_scope.source VALUES(7)",
+        true,
+    );
+    for query in [
+        "SELECT reference_scope.source.value FROM reference_scope.source",
+        "SELECT selected.value FROM reference_scope.source AS selected",
+        "SELECT (SELECT selected.value) FROM reference_scope.source AS selected",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, query, true)),
+            ["7"],
+            "{query}"
+        );
+    }
+    for (query, state) in [
+        ("SELECT missing.value", "42P01"),
+        ("SELECT pg_catalog.pg_class.relname", "42P01"),
+        ("SELECT \"a.b\".value", "42P01"),
+        ("SELECT value", "42703"),
+        (
+            "SELECT source.value FROM reference_scope.source AS selected",
+            "42P01",
+        ),
+        (
+            "SELECT selected.missing FROM reference_scope.source AS selected",
+            "42703",
+        ),
+        (
+            "SELECT (SELECT selected.missing) FROM reference_scope.source AS selected",
+            "42703",
+        ),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [state],
+            "{query}"
+        );
+    }
+    let hidden = session.execute(
+        &mut engine,
+        "SELECT reference_scope.source.value FROM reference_scope.source AS selected",
+        true,
+    );
+    assert_eq!(error_sqlstates(&hidden), ["42P01"]);
+    assert!(
+        String::from_utf8_lossy(&hidden)
+            .contains("invalid reference to FROM-clause entry for table \"source\"")
+    );
+    for (query, table) in [
+        ("SELECT (SELECT pg_catalog.pg_class.relname)", "pg_class"),
+        ("SELECT (SELECT \"a.b\".value)", "a.b"),
+    ] {
+        let output = session.execute(&mut engine, query, true);
+        assert_eq!(error_sqlstates(&output), ["42P01"], "{query}");
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains(&format!("missing FROM-clause entry for table \"{table}\"")),
+            "{query}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "DROP TABLE reference_scope.source; DROP SCHEMA reference_scope",
+        true,
+    );
 }
 
 #[test]
@@ -2741,4 +2809,60 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
             Some(Datum::Null)
         );
     });
+}
+
+#[test]
+fn builtin_aggregate_support_identities_survive_catalog_publication() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("builtin-aggregate-catalog-identity");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE AGGREGATE public.sum(integer) (SFUNC=pg_catalog.int4pl,STYPE=integer,INITCOND='100'); \
+             SET search_path=public,pg_catalog", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT sum(value),pg_catalog.sum(value) FROM (VALUES(1),(2)) AS input(value); \
+             SELECT aggtransfn::oid FROM pg_aggregate WHERE aggfnoid='public.sum(integer)'::regprocedure; \
+             SELECT 177::regproc,177::regprocedure, \
+                    to_regproc('pg_catalog.int4pl')::oid, \
+                    to_regprocedure('pg_catalog.int4pl(integer,integer)')::oid; \
+             SELECT to_regprocedure('pg_catalog.array_append(anycompatiblearray,anycompatible)')::oid", true)),
+            ["103|3", "177", "int4pl|int4pl(integer,integer)|177|177", "378"]);
+        session.success(&mut engine, "DROP AGGREGATE public.sum(integer)", true);
+        session.success(&mut engine,
+            "CREATE FUNCTION public.int4pl(integer,integer) RETURNS integer LANGUAGE sql AS 'SELECT 999'", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT 177::regproc,177::regprocedure,pg_function_is_visible(177), \
+                    to_regproc('int4pl')='public.int4pl(integer,integer)'::regprocedure, \
+                    to_regprocedure('int4pl(integer,integer)')='public.int4pl(integer,integer)'::regprocedure, \
+                    to_regproc('_pg_expandarray') IS NULL", true)),
+            ["pg_catalog.int4pl|pg_catalog.int4pl(integer,integer)|f|t|t|t"]);
+        session.success(
+            &mut engine,
+            "CREATE PROCEDURE public.visible_proc(integer) LANGUAGE sql AS 'SELECT 1'; \
+             CREATE SCHEMA z_first; CREATE SCHEMA z_second; \
+             CREATE FUNCTION z_first.echo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+             CREATE FUNCTION z_second.echo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+             SET search_path=z_first,z_second,public,pg_catalog",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pg_function_is_visible('public.visible_proc(integer)'::regprocedure), \
+                    to_regproc('visible_proc')='public.visible_proc(integer)'::regprocedure; \
+             SELECT 'z_second.echo(integer)'::regprocedure,to_regproc('z_second.echo'), \
+                    pg_function_is_visible('z_first.echo(integer)'::regprocedure), \
+                    pg_function_is_visible('z_second.echo(integer)'::regprocedure), \
+                    to_regprocedure('echo(integer)')='z_first.echo(integer)'::regprocedure",
+                true
+            )),
+            ["t|t", "z_second.echo(integer)|z_second.echo|t|f|t"]
+        );
+    }
 }

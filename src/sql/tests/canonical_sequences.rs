@@ -429,6 +429,7 @@ fn sequence_advances_from_another_transaction_survive_cold_commit_retries() {
         })
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+        assert!(engine.block_reads_pending());
         let staged = engine.wal.staged_bytes_for_tests(session.transaction.txid);
         let mut offset = 0;
         let mut scopes = 0;

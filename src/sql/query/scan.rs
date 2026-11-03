@@ -342,12 +342,12 @@ pub(crate) fn row_security_passes<'a>(
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
-    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_COLUMN,
-            "column \"{}\" does not exist",
-            name
-        ))
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(crate::sql::eval::empty_scope_column_error(qualifier, name))
     }
 }
 
@@ -441,6 +441,50 @@ mod tests {
     use super::{PaxColumnDemand, PaxReadDemand, SampleIdentity, TableSamplePlan};
     use crate::sql::ast::{BinaryOp, TableSampleMethod};
     use crate::sql::types::GistOperatorClass;
+
+    #[test]
+    fn chained_scope_is_empty_only_when_every_source_is_proven_empty() {
+        use crate::sql::eval::{ColumnLookup, NoColumns, SqlError};
+        use crate::sql::types::Datum;
+        struct Unknown;
+        impl<'a> ColumnLookup<'a> for Unknown {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("scope classification must not read values");
+            }
+        }
+        let empty = NoColumns;
+        let unknown = Unknown;
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                super::Chained {
+                    inner: &empty,
+                    outer: None
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                super::Chained {
+                    inner: &empty,
+                    outer: Some(&empty)
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                !super::Chained {
+                    inner: &empty,
+                    outer: Some(&unknown)
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                !super::Chained {
+                    inner: &unknown,
+                    outer: Some(&empty)
+                }
+                .is_empty_scope()
+            );
+        });
+    }
 
     #[test]
     fn gist_operator_matrix_matches_postgresql_18_search_strategies() {
@@ -4034,6 +4078,10 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.scope.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         let one = |t: usize, c: usize| match self.table_values(t) {
             // Empty slice = LEFT-join null row.
@@ -4239,6 +4287,10 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn is_empty_scope(&self) -> bool {
+        self.inner.is_empty_scope() && self.outer.is_none_or(|outer| outer.is_empty_scope())
+    }
+
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
         match self.inner.recursive_state(qualifier, index) {
             Ok(value) => Ok(value),

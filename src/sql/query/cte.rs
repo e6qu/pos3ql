@@ -143,11 +143,39 @@ fn expand_ctes_with_path<'a>(
     if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
+    with_schema_context(
+        sel.with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        depth,
+        authorization_role,
+        arena,
+        |context| subst_select_body(sel, context, arena),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "schema-only stored query binding context"
+)]
+fn with_schema_context<'a, 's, R>(
+    with: &'a [Cte<'a>],
+    storage: &'s Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
+    depth: u32,
+    authorization_role: Option<u16>,
+    arena: &'a Arena,
+    build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'a>) -> Result<R, SqlError>,
+) -> Result<R, SqlError> {
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
     let mut resolved = ArenaList::new(arena);
     let mut materialized = ArenaList::new(arena);
-    for (index, cte) in sel.with.iter().enumerate() {
-        if sel.with[..index].iter().any(|prior| prior.name == cte.name) {
+    for (index, cte) in with.iter().enumerate() {
+        if with[..index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "WITH query name \"{}\" specified more than once",
@@ -222,7 +250,32 @@ fn expand_ctes_with_path<'a>(
         recursive_state: None,
         execution: None,
     };
-    subst_select_body(sel, context, arena)
+    build(context)
+}
+
+/// Resolve input shapes without materializing a CTE or executing its defaults.
+pub(crate) fn expand_dml_ctes_schema<'a>(
+    statement: &'a Stmt<'a>,
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    with_schema_context(with, storage, txid, None, None, 0, None, arena, |context| {
+        let statement = match statement {
+            Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+            Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+            Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+            Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "assignment statement kind is invalid"
+                ));
+            }
+        };
+        Ok(&*arena.alloc(statement).map_err(|_| arena_full())?)
+    })
 }
 
 /// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is

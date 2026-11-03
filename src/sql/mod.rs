@@ -6804,6 +6804,12 @@ impl Engine {
         let staged = txn
             .staged_commit()
             .expect("completion owns a staged commit");
+        // Every cold row needed by the journal has been captured. An unused
+        // read-ahead request must not retain this command's owner while its
+        // durability receipt waits or after the transaction completes.
+        if let Some(owner) = self.read_owner {
+            self.cancel_read_owner(owner);
+        }
         if let Some(ticket) = staged.queue {
             self.promote_ready_commits()?;
             if self
@@ -12273,6 +12279,11 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         connection_id: i32,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
+        {
+            return Ok(Err(error));
+        }
         let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_dml_ctes(
             statement,
@@ -13005,6 +13016,11 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
+        {
+            return Ok(Err(error));
+        }
         // Expand every DML source before the mutable storage borrow so views
         // behave consistently across INSERT, UPDATE FROM, DELETE USING and MERGE.
         let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
@@ -13144,6 +13160,11 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
+        {
+            return Ok(Err(error));
+        }
         let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
         let expanded = match query::expand_dml_ctes(
             statement,
@@ -13815,6 +13836,11 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) =
+            query::validate_dml_assignment_casts(statement, &self.storage, txn.txid, arena, None)
+        {
+            return Ok(Err(error));
+        }
         let invocations = query::RoutineInvocationState::new(arena);
         loop {
             self.work.reset();
@@ -14967,6 +14993,15 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = query::validate_dml_assignment_casts(
+            &Stmt::With { ctes, statement },
+            &self.storage,
+            txn.txid,
+            arena,
+            None,
+        ) {
+            return Ok(Err(error));
+        }
         let dml_mats = match self.run_dml_ctes(ctes, txn, arena, params, guc, responder) {
             Ok(materialized) => materialized.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),

@@ -36,6 +36,10 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn is_empty_scope(&self) -> bool {
+        self.scope.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
             (0..t)
@@ -367,6 +371,10 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn is_empty_scope(&self) -> bool {
+        self.0.n == 0
+    }
+
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,

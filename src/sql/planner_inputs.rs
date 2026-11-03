@@ -445,10 +445,10 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "planner admission shares the statement transaction, session, bounded arena and response sink"
     )]
-    pub(crate) fn prepare_planner_inputs<'a>(
+    pub(crate) fn prepare_planner_inputs<'a, 'source>(
         &mut self,
-        statement: &Stmt<'_>,
-        outer: Option<&dyn ColumnLookup<'_>>,
+        statement: &Stmt<'source>,
+        outer: Option<&dyn ColumnLookup<'source>>,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -473,10 +473,10 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "recursive planner admission retains explicit routine ancestry and statement execution context"
     )]
-    fn prepare_planner_inputs_under<'a>(
+    fn prepare_planner_inputs_under<'a, 'source>(
         &mut self,
-        statement: &Stmt<'_>,
-        outer: Option<&dyn ColumnLookup<'_>>,
+        statement: &Stmt<'source>,
+        outer: Option<&dyn ColumnLookup<'source>>,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,

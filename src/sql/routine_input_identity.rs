@@ -62,8 +62,22 @@ fn encode(
     }
     let composite = match routine.kind {
         RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
-            if let super::types::ColType::Composite(slot) = result.ctype {
-                Some(storage.composite_for(slot as usize, txid))
+            if let super::types::ColType::Composite(Some(creation)) = result.ctype {
+                let target = crate::storage::TypeDefinitionTarget::by_creation(
+                    storage,
+                    crate::storage::NamedTypeKind::Composite,
+                    creation,
+                )?;
+                Some(
+                    storage
+                        .read_composite_definition(target, txid)?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "SQL routine result type is unavailable"
+                            )
+                        })?,
+                )
             } else {
                 None
             }
@@ -72,6 +86,11 @@ fn encode(
     };
     if let Some(composite) = composite {
         emit(&[1])?;
+        let result = match routine.kind {
+            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
+            _ => unreachable!("only a function result has a named composite descriptor"),
+        };
+        emit(&type_oid(result.ctype, result.user_type)?.to_le_bytes())?;
         emit(&(composite.n_fields as u32).to_le_bytes())?;
         for field in composite.fields() {
             emit(&(field.name.as_str().len() as u32).to_le_bytes())?;
@@ -83,6 +102,9 @@ fn encode(
         }
     } else {
         emit(&[u8::from(routine.result_column_count != 0)])?;
+        if routine.result_column_count != 0 {
+            emit(&super::types::oid::RECORD.to_le_bytes())?;
+        }
         emit(&(routine.result_column_count as u32).to_le_bytes())?;
         for field in &routine.result_columns[..routine.result_column_count] {
             emit(&(field.name.as_str().len() as u32).to_le_bytes())?;

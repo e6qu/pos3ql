@@ -21928,8 +21928,8 @@ impl Engine {
         let out = arena.with_remaining_region(|frame| {
             let captured = cursors.execution_parts(at).0.with_query(|parsed, _, _| {
                 let statement = match parsed {
-                    cursor::CursorStatement::Select(select) => Stmt::Select(select),
-                    cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(query),
+                    cursor::CursorStatement::Select(select) => Stmt::Select(*select),
+                    cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(*query),
                 };
                 planner_inputs::capture_planner_inputs(&statement, None, &self.storage, txid, frame)
             });
@@ -22094,44 +22094,9 @@ impl Engine {
                 return Ok(false);
             }
             let txid = txn.txid;
-            let row = arena.with_remaining_region(|frame| {
-                let passes = self.execute_retained_expression(
-                    frame,
-                    source_snapshot,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    |storage, work, sequences, invocations, cursors| {
-                        if cursors.plan_owner(at)? != owner {
-                            return Err(sql_err!(
-                                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                                "cursor source changed during evaluation"
-                            ));
-                        }
-                        let (query, _, _) = cursors.execution_parts(at);
-                        query.evaluate_predicate(
-                            storage,
-                            txid,
-                            work,
-                            Some(sequences),
-                            invocations,
-                            frame,
-                        )
-                    },
-                )?;
-                let passes = match passes {
-                    Ok(passes) => passes,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if !passes {
-                    return Ok(Ok(false));
-                }
-                let count = cursors.execution_parts(at).0.items_len();
-                let mut projected = crate::mem::arena::ArenaList::new(frame);
-                for index in 0..count {
-                    let values = self.execute_retained_expression(
+            let row =
+                arena.with_remaining_region(|frame| -> Result<Result<bool, SqlError>, WireFull> {
+                    let passes = self.execute_retained_expression(
                         frame,
                         source_snapshot,
                         txn,
@@ -22147,8 +22112,7 @@ impl Engine {
                                 ));
                             }
                             let (query, _, _) = cursors.execution_parts(at);
-                            query.evaluate_item(
-                                index,
+                            query.evaluate_predicate(
                                 storage,
                                 txid,
                                 work,
@@ -22158,54 +22122,91 @@ impl Engine {
                             )
                         },
                     )?;
-                    let values = match values {
-                        Ok(values) => values,
+                    let passes = match passes {
+                        Ok(passes) => passes,
                         Err(error) => return Ok(Err(error)),
                     };
-                    for value in values {
-                        if projected.len() == MAX_PROJ {
-                            return Ok(Err(sql_err!(
-                                sqlstate::TOO_MANY_COLUMNS,
-                                "cursor output has too many columns"
-                            )));
-                        }
-                        if projected.push(*value).is_err() {
-                            return Ok(Err(eval::arena_full()));
+                    if !passes {
+                        return Ok(Ok(false));
+                    }
+                    let count = cursors.execution_parts(at).0.items_len();
+                    let mut projected = crate::mem::arena::ArenaList::new(frame);
+                    for index in 0..count {
+                        let values = self.execute_retained_expression(
+                            frame,
+                            source_snapshot,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            responder,
+                            |storage, work, sequences, invocations, cursors| {
+                                if cursors.plan_owner(at)? != owner {
+                                    return Err(sql_err!(
+                                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                                        "cursor source changed during evaluation"
+                                    ));
+                                }
+                                let (query, _, _) = cursors.execution_parts(at);
+                                query.evaluate_item(
+                                    index,
+                                    storage,
+                                    txid,
+                                    work,
+                                    Some(sequences),
+                                    invocations,
+                                    frame,
+                                )
+                            },
+                        )?;
+                        let values = match values {
+                            Ok(values) => values,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        for value in values {
+                            if projected.len() == MAX_PROJ {
+                                return Ok(Err(sql_err!(
+                                    sqlstate::TOO_MANY_COLUMNS,
+                                    "cursor output has too many columns"
+                                )));
+                            }
+                            if projected.push(*value).is_err() {
+                                return Ok(Err(eval::arena_full()));
+                            }
                         }
                     }
-                }
-                let actual_owner = match cursors.plan_owner(at) {
-                    Ok(owner) => owner,
-                    Err(error) => return Ok(Err(error)),
-                };
-                if actual_owner != owner {
-                    return Ok(Err(sql_err!(
-                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                        "cursor source changed during evaluation"
-                    )));
-                }
-                if cursors.execution_parts(at).0.skip_row() {
-                    return Ok(Ok(false));
-                }
-                let (_, description, rows) = cursors.execution_parts(at);
-                let output = if saved {
-                    crate::pg::respond::CursorRowOutput::Save(rows)
-                } else {
-                    crate::pg::respond::CursorRowOutput::Discard
-                };
-                let mut capture = Responder::for_cursor(description, output);
-                capture.set_render(guc.render());
-                match query::emit_data_row(
-                    &self.storage,
-                    txid,
-                    frame,
-                    &mut capture,
-                    projected.as_slice(),
-                )? {
-                    Ok(()) => Ok(Ok(true)),
-                    Err(error) => Ok(Err(error)),
-                }
-            });
+                    let actual_owner = match cursors.plan_owner(at) {
+                        Ok(owner) => owner,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if actual_owner != owner {
+                        return Ok(Err(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "cursor source changed during evaluation"
+                        )));
+                    }
+                    if cursors.execution_parts(at).0.skip_row() {
+                        return Ok(Ok(false));
+                    }
+                    let (_, description, rows) = cursors.execution_parts(at);
+                    let output = if saved {
+                        crate::pg::respond::CursorRowOutput::Save(rows)
+                    } else {
+                        crate::pg::respond::CursorRowOutput::Discard
+                    };
+                    let mut capture = Responder::for_cursor(description, output);
+                    capture.set_render(guc.render());
+                    match query::emit_data_row(
+                        &self.storage,
+                        txid,
+                        frame,
+                        &mut capture,
+                        projected.as_slice(),
+                    )? {
+                        Ok(()) => Ok(Ok(true)),
+                        Err(error) => Ok(Err(error)),
+                    }
+                });
             let emitted = match row {
                 Ok(result) => result.map_err(|_| cursor_result_too_large())??,
                 Err(error) => {

@@ -14008,6 +14008,10 @@ impl Engine {
             let _ = statistics::finish_function_timing(timed);
             return Ok(Err(error));
         }
+        #[expect(
+            clippy::large_enum_variant,
+            reason = "SQL errors remain inline because runtime heap allocation is forbidden"
+        )]
         enum BodyError {
             Sql(SqlError),
             Wire(WireFull),

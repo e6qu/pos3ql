@@ -759,7 +759,8 @@ pub(crate) use describe::{
     visit_array_constructor_conversions, wire_column_description,
 };
 pub(crate) use describe::{
-    bound_parameter_type_oid, enter_routine_parameter_types, with_bound_parameter_types,
+    bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
+    with_bound_parameter_types,
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 

@@ -101,18 +101,20 @@ fn constant_value_in(
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS
     };
-    crate::sql::eval::eval_full(
-        expression,
-        arena,
-        crate::sql::eval::NO_PARAMS,
-        &crate::sql::eval::NoColumns,
-        &hooks,
-    )
-    .map(|value| {
-        Some(match value {
-            Datum::Null => ConstantValue::Null,
-            Datum::Bool(value) => ConstantValue::Boolean(value),
-            _ => ConstantValue::NonNull,
+    super::inspect_parameters(|parameters| {
+        crate::sql::eval::eval_full(
+            expression,
+            arena,
+            parameters.unwrap_or(crate::sql::eval::NO_PARAMS),
+            &crate::sql::eval::NoColumns,
+            &hooks,
+        )
+        .map(|value| {
+            Some(match value {
+                Datum::Null => ConstantValue::Null,
+                Datum::Bool(value) => ConstantValue::Boolean(value),
+                _ => ConstantValue::NonNull,
+            })
         })
     })
 }
@@ -124,6 +126,11 @@ fn builtin_constant(
     txid: u32,
 ) -> Result<bool, SqlError> {
     let safe = match expression {
+        Expr::Param(index) => super::inspect_parameters(|parameters| {
+            index.checked_sub(1).is_some_and(|index| {
+                parameters.is_some_and(|parameters| (index as usize) < parameters.len())
+            })
+        }),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)
@@ -382,6 +389,12 @@ fn known_null(
     }
     Ok(match expression {
         Expr::Null => true,
+        Expr::Param(index) => super::inspect_parameters(|parameters| {
+            index
+                .checked_sub(1)
+                .and_then(|index| parameters.and_then(|parameters| parameters.get(index as usize)))
+                .is_some_and(|value| value.is_null())
+        }),
         Expr::BoundLiteral { encoded, .. } => {
             crate::sql::type_inputs::value(encoded, arena)?.is_null()
         }
@@ -783,6 +796,15 @@ fn expression_properties(
         | Expr::Str(_)
         | Expr::BitLit(_)
         | Expr::BoundLiteral { .. } => Properties::EMPTY,
+        Expr::Param(index)
+            if super::inspect_parameters(|parameters| {
+                index.checked_sub(1).is_some_and(|index| {
+                    parameters.is_some_and(|parameters| (index as usize) < parameters.len())
+                })
+            }) =>
+        {
+            Properties::EMPTY
+        }
         Expr::Column { .. }
         | Expr::SchemaColumn { .. }
         | Expr::WholeRow(_)

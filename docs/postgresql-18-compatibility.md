@@ -146,7 +146,8 @@ when first reached and reuse the backend's plan; dynamic `EXECUTE` prepares
 each command afresh. Views, rules, SQL `BEGIN ATOMIC` bodies and stored defaults
 retain their checked inputs with the definition, including domain and
 view-column defaults. See [plan lifetimes](architecture.md#the-request-path).
-`DISCARD PLANS` releases cached routine-input plans; `DISCARD ALL` also clears
+`DISCARD PLANS` releases cached routine-input plans for future requests; existing
+portals and cursors keep their checked values. `DISCARD ALL` also clears
 prepared statements. Attempting either while a routine-input plan is executing
 returns `0A000` before invalidation. Stored definition inputs are unaffected.
 

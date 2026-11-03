@@ -24,6 +24,23 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
                LANGUAGE sql SET search_path=public AS 'SELECT cardinality(''{a}''::body_collation_checked[])'; \
              CREATE CAST(text AS integer) WITH FUNCTION body_collation_cast(text) AS ASSIGNMENT; \
              CREATE TABLE body_collation_numbers(value integer); \
+             CREATE TABLE body_collation_texts(value text COLLATE \"C\"); \
+             INSERT INTO body_collation_texts VALUES('a'); \
+             CREATE FUNCTION body_collation_default(input text DEFAULT ('a' COLLATE \"C\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_pair(first_input text, second_input text DEFAULT ('a' COLLATE \"POSIX\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_srf(input text DEFAULT ('a' COLLATE \"C\")) \
+               RETURNS SETOF body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE PROCEDURE body_collation_procedure(input text DEFAULT ('a' COLLATE \"C\")) \
+               LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_identity(input text) RETURNS text LANGUAGE sql AS 'SELECT input'; \
+             CREATE FUNCTION body_collation_nested(input text DEFAULT body_collation_identity('a' COLLATE \"C\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
              ALTER SEQUENCE body_collation_checks RESTART WITH 1", true);
         for (query, expected) in [
             ("SELECT body_collation('first' COLLATE \"C\")", "1"),
@@ -50,6 +67,23 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
                 "INSERT INTO body_collation_numbers VALUES('48'::text COLLATE \"POSIX\")",
                 "5",
             ),
+            ("SELECT body_collation_default()", "6"),
+            ("SELECT body_collation_default('a' COLLATE \"C\")", "6"),
+            ("SELECT body_collation_default('a'::text)", "7"),
+            (
+                "SELECT body_collation_pair(value) FROM body_collation_texts",
+                "8",
+            ),
+            ("SELECT body_collation_pair('a' COLLATE \"POSIX\")", "8"),
+            ("SELECT * FROM body_collation_srf()", "9"),
+            ("SELECT * FROM body_collation_srf('a' COLLATE \"C\")", "9"),
+            ("SELECT * FROM body_collation_srf('a'::text)", "10"),
+            ("CALL body_collation_procedure()", "11"),
+            ("CALL body_collation_procedure('a' COLLATE \"C\")", "11"),
+            ("CALL body_collation_procedure('a'::text)", "12"),
+            ("SELECT body_collation_nested()", "13"),
+            ("SELECT body_collation_nested('a' COLLATE \"C\")", "13"),
+            ("SELECT body_collation_nested('a'::text)", "14"),
         ] {
             session.success(&mut engine, query, true);
             let output = session.success(
@@ -59,6 +93,22 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
             );
             assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
         }
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT body_collation_pair('a' COLLATE \"C\")",
+                true
+            )),
+            [sqlstate::COLLATION_MISMATCH]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM body_collation_checks",
+                true
+            )),
+            ["14"]
+        );
     }
 }
 

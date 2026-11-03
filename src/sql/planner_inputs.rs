@@ -18,6 +18,68 @@ use super::{
 };
 
 #[derive(Clone, Copy)]
+struct Parameters {
+    values: *const (),
+    count: usize,
+}
+
+std::thread_local! {
+    static PARAMETERS: core::cell::Cell<Option<Parameters>> = const { core::cell::Cell::new(None) };
+}
+
+struct ParameterScope {
+    prior: Option<Parameters>,
+    thread: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for ParameterScope {
+    fn drop(&mut self) {
+        PARAMETERS.with(|slot| slot.set(self.prior));
+    }
+}
+
+/// A custom plan sees its already decoded values; a generic plan sees none.
+/// The private scope cannot outlive the borrowed values or move to a new thread.
+pub(crate) fn with_parameters<R>(
+    parameters: Option<&[super::types::Datum<'_>]>,
+    run: impl FnOnce() -> R,
+) -> R {
+    let current = parameters.map(|values| Parameters {
+        values: values.as_ptr().cast(),
+        count: values.len(),
+    });
+    let _scope = ParameterScope {
+        prior: PARAMETERS.with(|slot| slot.replace(current)),
+        thread: core::marker::PhantomData,
+    };
+    run()
+}
+
+/// Only copied facts may leave inspection; borrowed text/array values cannot.
+fn inspect_parameters<R>(
+    inspect: impl for<'parameters> FnOnce(Option<&'parameters [super::types::Datum<'parameters>]>) -> R,
+) -> R {
+    // The declaration context already has a scoped guard; it prevents a
+    // routine's $1 from reading the client's unrelated first parameter.
+    if !super::exec::bound_parameter_context_active() {
+        return inspect(None);
+    }
+    let current = PARAMETERS.with(core::cell::Cell::get);
+    let values = current.map(|current| {
+        // SAFETY: with_parameters keeps the immutable slice and its values live
+        // until its private scope restores the previous pointer. Inspection is
+        // confined to that thread and cannot return a reference into the slice.
+        unsafe {
+            core::slice::from_raw_parts(
+                current.values.cast::<super::types::Datum<'_>>(),
+                current.count,
+            )
+        }
+    });
+    inspect(values)
+}
+
+#[derive(Clone, Copy)]
 struct Candidate<'a> {
     oid: i32,
     version: u64,
@@ -759,5 +821,64 @@ impl Engine {
             }
         }
         Ok(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+    use crate::{mem::budget::Budget, sql::types::Datum};
+
+    #[test]
+    fn planner_parameters_confine_borrows_and_restore_nested_and_formal_scopes() {
+        let mut budget = Budget::new(4096);
+        let mut arena = Arena::new(&mut budget, "planner parameter ownership", 4096).unwrap();
+        let text = arena.alloc_str("client value").unwrap();
+        let outer = [Datum::Text(text), Datum::Null, Datum::Int4(9)];
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(inspect_parameters(|values| values.is_none()));
+            with_parameters(Some(&outer), || {
+                assert!(inspect_parameters(|values| matches!(
+                    values,
+                    Some([Datum::Text("client value"), Datum::Null, Datum::Int4(9)])
+                )));
+                let inner = [Datum::Text("nested value")];
+                let failed = with_parameters(Some(&inner), || {
+                    assert!(inspect_parameters(|values| matches!(
+                        values,
+                        Some([Datum::Text("nested value")])
+                    )));
+                    Err::<(), _>(())
+                });
+                assert!(failed.is_err());
+                with_parameters(None, || {
+                    assert!(inspect_parameters(|values| values.is_none()))
+                });
+                with_parameters(Some(&[]), || {
+                    assert!(inspect_parameters(|values| matches!(values, Some([]))))
+                });
+                let formal = super::super::exec::enter_routine_parameter_types(&[], None).unwrap();
+                assert!(inspect_parameters(|values| values.is_none()));
+                drop(formal);
+                assert!(inspect_parameters(|values| matches!(
+                    values,
+                    Some([Datum::Text("client value"), Datum::Null, Datum::Int4(9)])
+                )));
+            });
+            assert!(inspect_parameters(|values| values.is_none()));
+        });
+        arena.reset();
+        let replacement = arena.alloc_str("reused storage").unwrap();
+        let values = [Datum::Text(replacement)];
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(inspect_parameters(|values| values.is_none()));
+            with_parameters(Some(&values), || {
+                assert!(inspect_parameters(|values| matches!(
+                    values,
+                    Some([Datum::Text("reused storage")])
+                )));
+            });
+            assert!(inspect_parameters(|values| values.is_none()));
+        });
     }
 }

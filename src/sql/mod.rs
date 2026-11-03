@@ -475,6 +475,10 @@ impl core::ops::DerefMut for QueryWorkspaces {
 pub(crate) enum ProtocolReset {
     #[default]
     None,
+    Plans {
+        first: u64,
+        count: usize,
+    },
     Statements,
     All,
 }
@@ -9849,7 +9853,20 @@ impl Engine {
                 self.protocol_reset = ProtocolReset::All;
             }
             ast::DiscardTarget::Sequences => guc.seq_session().discard(),
-            ast::DiscardTarget::Plans => sqlprep.routine_inputs.clear(),
+            ast::DiscardTarget::Plans => {
+                let count = sqlprep.capacity();
+                let first = match sqlprep.reserve_plan_ids(count) {
+                    Ok(first) => first,
+                    Err(error) => return Ok(Err(error)),
+                };
+                sqlprep.routine_inputs.discard_unpinned_plans();
+                if matches!(
+                    self.protocol_reset,
+                    ProtocolReset::None | ProtocolReset::Plans { .. }
+                ) {
+                    self.protocol_reset = ProtocolReset::Plans { first, count };
+                }
+            }
             ast::DiscardTarget::Temporary => {}
         }
         responder.command_complete(match target {
@@ -12616,6 +12633,7 @@ impl Engine {
     pub(crate) fn admit_extended_plan(
         &mut self,
         text: &str,
+        params: &[Datum],
         parameter_oids: &[i32],
         bound_inputs: &[u8],
         arena: &Arena,
@@ -12669,8 +12687,14 @@ impl Engine {
                         text,
                         bindings,
                         || {
-                            self.prepare_planner_inputs(
-                                &statement, None, arena, txn, sqlprep, cursors, guc, responder,
+                            planner_inputs::with_parameters(
+                                (!params.is_empty()).then_some(params),
+                                || {
+                                    self.prepare_planner_inputs(
+                                        &statement, None, arena, txn, sqlprep, cursors, guc,
+                                        responder,
+                                    )
+                                },
                             )
                         },
                     )
@@ -17009,11 +17033,6 @@ impl Engine {
                 sequences: Some(&sequences),
                 ..NO_HOOKS
             };
-            let input_collation =
-                match eval::routine_input_collation(arguments, &NoColumns, hooks.catalog) {
-                    Ok(collation) => collation,
-                    Err(error) => return Ok(Err(error)),
-                };
             let mut declared = self.storage.routine_for(slot, txn.txid);
             let mapping = declared
                 .procedure_call_mapping(argument_names, arguments.len(), variadic)
@@ -17025,7 +17044,7 @@ impl Engine {
                     arguments,
                     argument_type_oids: &type_oids[..arguments.len()],
                     argument_collation: &|argument| {
-                        eval::routine_input_collation(&[argument], &NoColumns, hooks.catalog)
+                        eval::routine_argument_collation(argument, &NoColumns, hooks.catalog)
                     },
                     mapping: &mapping,
                     variadic,
@@ -17043,6 +17062,8 @@ impl Engine {
                 }
                 Err(error) => return Ok(Err(error)),
             };
+            let input_collation = completed.input_collation;
+            let completed = completed.values;
             let routine = &declared;
             let owner = match self
                 .storage
@@ -18184,9 +18205,11 @@ impl Engine {
                 | Stmt::Delete(_)
                 | Stmt::Merge(_)
         ) {
-            let planned = self.prepare_planner_inputs(
-                statement, None, arena, txn, sqlprep, cursors, guc, responder,
-            )?;
+            let planned = planner_inputs::with_parameters(Some(params), || {
+                self.prepare_planner_inputs(
+                    statement, None, arena, txn, sqlprep, cursors, guc, responder,
+                )
+            })?;
             if planned.is_err() {
                 return Ok(planned);
             }
@@ -22101,13 +22124,24 @@ impl Engine {
         let snapshot = self.storage.read_snapshot();
         let owner = cursors.plan_owner(at)?;
         let out = arena.with_remaining_region(|frame| {
-            let captured = cursors.execution_parts(at).0.with_query(|parsed, _, _| {
-                let statement = match parsed {
-                    cursor::CursorStatement::Select(select) => Stmt::Select(*select),
-                    cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(*query),
-                };
-                planner_inputs::capture_planner_inputs(&statement, None, &self.storage, txid, frame)
-            });
+            let captured = cursors
+                .execution_parts(at)
+                .0
+                .with_query(|parsed, params, _| {
+                    let statement = match parsed {
+                        cursor::CursorStatement::Select(select) => Stmt::Select(*select),
+                        cursor::CursorStatement::SetQuery(query) => Stmt::SetQuery(*query),
+                    };
+                    planner_inputs::with_parameters(Some(params), || {
+                        planner_inputs::capture_planner_inputs(
+                            &statement,
+                            None,
+                            &self.storage,
+                            txid,
+                            frame,
+                        )
+                    })
+                });
             let captured = match captured {
                 Ok(Ok(captured)) => captured,
                 Ok(Err(error)) | Err(error) => return Ok(Err(error)),

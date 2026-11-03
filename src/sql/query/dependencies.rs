@@ -221,7 +221,22 @@ pub(crate) fn collect_runtime_statement(
         dependencies,
         arena,
         CollectionContext::ordinary(&path, None),
-    )
+    )?;
+    // Rewriting a view brings its selected base definitions into the caller's
+    // plan. Stored definitions retain only their direct dependencies.
+    let mut next = 0;
+    while next < dependencies.entries().len() {
+        let dependency = dependencies.entries()[next];
+        next += 1;
+        if let StoredDependencyIdentity::View(_) = dependency.identity {
+            let view = storage.view(usize::from(dependency.slot));
+            let selected = storage.rule_dependencies(usize::from(view.return_rule), txid);
+            for entry in selected.view().entries() {
+                dependencies.push(*entry)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn collect_routine_parameter_defaults(

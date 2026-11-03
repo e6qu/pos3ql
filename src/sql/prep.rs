@@ -213,7 +213,7 @@ impl SqlPreparedPool {
                 "too many prepared-statement result columns"
             ));
         }
-        let plan = self.new_plan()?;
+        let plan = self.reserve_plan_ids(1)?;
         let Some(slot) = self.slots.iter_mut().find(|s| !s.active) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -359,15 +359,25 @@ impl SqlPreparedPool {
         }
     }
 
-    pub(crate) fn new_plan(&mut self) -> Result<u64, SqlError> {
+    pub(crate) fn reserve_plan_ids(&mut self, count: usize) -> Result<u64, SqlError> {
         let id = self.next_plan;
-        self.next_plan = id.checked_add(1).ok_or_else(|| {
+        let count = u64::try_from(count).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL plan identities exhausted"
+            )
+        })?;
+        self.next_plan = id.checked_add(count).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "SQL plan identities exhausted"
             )
         })?;
         Ok(id)
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.len()
     }
 
     pub(crate) fn transient_owner(
@@ -385,7 +395,7 @@ impl SqlPreparedPool {
         let generation = match self.transient_plan {
             Some(generation) => generation,
             None => {
-                let generation = self.new_plan()?;
+                let generation = self.reserve_plan_ids(1)?;
                 self.transient_plan = Some(generation);
                 generation
             }
@@ -436,7 +446,7 @@ impl SqlPreparedPool {
             arena,
             || {
                 let result = (|| {
-                    let generation = self.new_plan()?;
+                    let generation = self.reserve_plan_ids(1)?;
                     let bytes = arena
                         .alloc_slice_copy(&generation.to_le_bytes())
                         .map_err(|_| super::eval::arena_full())?;

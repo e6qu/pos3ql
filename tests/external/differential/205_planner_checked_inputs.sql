@@ -27,6 +27,21 @@ COMMIT;
 SELECT CASE WHEN false THEN '{a}'::planner_checked[] ELSE NULL END;
 SELECT 'parse_input',last_value,is_called FROM planner_checks;
 
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+PREPARE planner_parameter(integer) AS SELECT CASE WHEN $1=0 THEN planner_scalar() ELSE 17 END;
+EXECUTE planner_parameter(1);
+SELECT 'unreached_parameter_branch',last_value,is_called FROM planner_checks;
+EXECUTE planner_parameter(0);
+SELECT 'reached_parameter_branch',last_value,is_called FROM planner_checks;
+DEALLOCATE planner_parameter;
+ALTER SEQUENCE planner_checks RESTART WITH 1;
+PREPARE planner_text_parameter(text) AS SELECT CASE WHEN $1='go' THEN planner_scalar() ELSE 17 END;
+EXECUTE planner_text_parameter('stop');
+SELECT 'unreached_text_branch',last_value,is_called FROM planner_checks;
+EXECUTE planner_text_parameter('go');
+SELECT 'reached_text_branch',last_value,is_called FROM planner_checks;
+DEALLOCATE planner_text_parameter;
+
 -- Each rejected inline attempt checks its own body; execution then shares the
 -- function's first runtime body across all following statement sites.
 CREATE FUNCTION planner_text(integer) RETURNS text LANGUAGE sql AS

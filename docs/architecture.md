@@ -116,7 +116,16 @@ check during planning even when the caller returns no rows; a rejected attempt
 does not replace the first runtime check. Cursor plans retain accepted inputs
 across separate `FETCH` commands and while a `WITH HOLD` cursor survives commit.
 
-`DISCARD PLANS` and `DISCARD ALL` release cached routine-input plans and their
+Parameterized Bind attempts keep separate checked planner values. Parameterless
+Bind messages share their prepared statement's plan; each bound portal keeps
+that plan alive. Bind retains decoded parameters through a preparation wait,
+and cancellation releases the unfinished portal before another Bind can reuse
+its slot. Planning can inspect already decoded parameters to skip a branch
+such as `CASE WHEN $1=0 THEN checked_function() ELSE 17 END`, without running
+the skipped function's constraints.
+
+`DISCARD PLANS` releases plans for future requests while bound portals and
+cursors retain their checked values until close. `DISCARD ALL` releases cached routine-input plans and their
 value owners. They do not re-evaluate inputs saved in schema definitions.
 Invalidating an executing routine-input plan returns `0A000` before clearing it.
 The [compatibility guide](postgresql-18-compatibility.md) records procedural

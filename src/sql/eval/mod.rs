@@ -1643,17 +1643,12 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "selected routine keeps call and argument collations alongside its evaluator"
-    )]
     fn call_routine<'a>(
         &self,
         _target: RoutineCallTarget<'_>,
         _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
-        _input_collation: super::ast::Collation,
-        _argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<super::ast::Collation, SqlError>,
+        _argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<Option<DerivedCollation>, SqlError>,
         _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -3970,8 +3965,7 @@ fn eval_full_inner<'a>(
                             target,
                             args,
                             types,
-                            routine_input_collation(args, row, hooks.catalog)?,
-                            &|argument| routine_input_collation(&[argument], row, hooks.catalog),
+                            &|argument| routine_argument_collation(argument, row, hooks.catalog),
                             &mut |argument| eval_full(argument, arena, params, row, hooks),
                             arena,
                         );
@@ -5139,7 +5133,7 @@ fn required_comparison_collation(
 
 /// PostgreSQL's collation-combination rule, shared by every expression that
 /// produces a collatable result.
-fn merge_derived_collations(
+pub(crate) fn merge_derived_collations(
     left: Option<DerivedCollation>,
     right: Option<DerivedCollation>,
 ) -> Result<Option<DerivedCollation>, SqlError> {
@@ -5149,22 +5143,15 @@ fn merge_derived_collations(
         {
             Err(sql_err!(
                 sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
+                "collation mismatch between explicit collations \"{}\" and \"{}\"",
                 left.value.name(),
                 right.value.name()
             ))
         }
         (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
         (Some(_left), Some(right)) if right.explicit => Ok(Some(right)),
-        (Some(left), Some(right)) if left.indeterminate && right.indeterminate => {
-            Ok(Some(DerivedCollation {
-                value: crate::sql::ast::Collation::None,
-                explicit: false,
-                indeterminate: true,
-            }))
-        }
-        (Some(left), Some(right)) if left.indeterminate => Ok(Some(right)),
-        (Some(left), Some(right)) if right.indeterminate => Ok(Some(left)),
+        (Some(left), Some(_right)) if left.indeterminate => Ok(Some(left)),
+        (Some(_left), Some(right)) if right.indeterminate => Ok(Some(right)),
         (Some(left), Some(right))
             if left.value != crate::sql::ast::Collation::Default
                 && right.value != crate::sql::ast::Collation::Default
@@ -5188,11 +5175,34 @@ fn merge_derived_collations(
     }
 }
 
+/// A collation choice retains explicit, implicit, and unresolved derivation.
 #[derive(Clone, Copy)]
-struct DerivedCollation {
+pub struct DerivedCollation {
     value: crate::sql::ast::Collation,
     explicit: bool,
     indeterminate: bool,
+}
+
+impl DerivedCollation {
+    pub(crate) fn input_collation(self) -> Collation {
+        if self.indeterminate {
+            Collation::None
+        } else {
+            self.value
+        }
+    }
+
+    pub(crate) fn for_input_type(source: Option<Self>, target: ColType) -> Option<Self> {
+        if target.is_collatable() {
+            Some(source.unwrap_or(Self {
+                value: Collation::Default,
+                explicit: false,
+                indeterminate: false,
+            }))
+        } else {
+            None
+        }
+    }
 }
 
 fn expression_collation<'a>(
@@ -5327,6 +5337,12 @@ fn expression_collation<'a>(
             }
             Ok(derived)
         }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("nullif") => {
+            match args.first() {
+                Some(argument) => expression_collation(argument, row, catalog),
+                None => Ok(None),
+            }
+        }
         Expr::Array(args) => {
             let mut derived = None;
             for argument in *args {
@@ -5352,6 +5368,30 @@ fn expression_collation<'a>(
             }
             Ok(derived)
         }
+        Expr::Call { args, .. } if catalog.is_some() => {
+            let hooks = EvalHooks {
+                catalog,
+                ..NO_HOOKS
+            };
+            let result = expression_type_identity(expression, row, &hooks)?.routine_argument_oid();
+            let ctype = constructor_type_from_oid(result, &|oid| {
+                catalog.and_then(|catalog| catalog.domain_base_type(oid))
+            });
+            if !ctype.is_some_and(ColType::is_collatable) {
+                return Ok(None);
+            }
+            let mut derived = None;
+            for argument in *args {
+                derived = merge_derived_collations(
+                    derived,
+                    routine_argument_collation(argument, row, catalog)?,
+                )?;
+            }
+            Ok(DerivedCollation::for_input_type(
+                derived,
+                ctype.expect("collatable result was resolved"),
+            ))
+        }
         _ => Ok(None),
     }
 }
@@ -5365,21 +5405,27 @@ pub(crate) fn routine_input_collation<'a>(
 ) -> Result<super::ast::Collation, SqlError> {
     let mut derived = None;
     for argument in arguments {
-        let value = expression_collation(argument, row, catalog)?.or_else(|| {
-            static_type(argument, row)
-                .is_some_and(ColType::is_collatable)
-                .then_some(DerivedCollation {
-                    value: super::ast::Collation::Default,
-                    explicit: false,
-                    indeterminate: false,
-                })
-        });
+        let value = routine_argument_collation(argument, row, catalog)?;
         derived = merge_derived_collations(derived, value)?;
     }
-    Ok(match derived {
-        Some(value) if !value.indeterminate => value.value,
-        _ => super::ast::Collation::None,
-    })
+    Ok(derived.map_or(Collation::None, DerivedCollation::input_collation))
+}
+
+/// Keep derivation strength until written arguments and inserted defaults merge.
+pub(crate) fn routine_argument_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Option<DerivedCollation>, SqlError> {
+    Ok(expression_collation(expression, row, catalog)?.or_else(|| {
+        static_type(expression, row)
+            .is_some_and(ColType::is_collatable)
+            .then_some(DerivedCollation {
+                value: Collation::Default,
+                explicit: false,
+                indeterminate: false,
+            })
+    }))
 }
 
 /// Returns the collation required by an operation that compares or orders an
@@ -6594,8 +6640,7 @@ fn call<'a>(
                 target,
                 args,
                 argument_type_oids,
-                routine_input_collation(args, row, hooks.catalog)?,
-                &|argument| routine_input_collation(&[argument], row, hooks.catalog),
+                &|argument| routine_argument_collation(argument, row, hooks.catalog),
                 &mut |argument| eval_full(argument, arena, params, row, hooks),
                 arena,
             );
@@ -9967,6 +10012,24 @@ mod tests {
                 assert_eq!(
                     routine_input_collation(&[&c, &posix], &Columns, None).unwrap(),
                     Collation::None
+                );
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix, &c], &Columns, None).unwrap(),
+                    Collation::None
+                );
+                let explicit =
+                    crate::sql::parser::parse_expression("'a' COLLATE \"C\"", arena).unwrap();
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix, explicit], &Columns, None).unwrap(),
+                    Collation::C
+                );
+                let derived = routine_argument_collation(explicit, &Columns, None).unwrap();
+                assert!(DerivedCollation::for_input_type(derived, ColType::Int4).is_none());
+                assert_eq!(
+                    DerivedCollation::for_input_type(None, ColType::Text)
+                        .unwrap()
+                        .input_collation(),
+                    Collation::Default
                 );
             });
         });

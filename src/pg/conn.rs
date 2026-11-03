@@ -163,6 +163,7 @@ struct Prepared {
     oid_bytes: usize,
     n_params: u16,
     plan: u64,
+    planner_ready: bool,
 }
 
 impl Prepared {
@@ -191,7 +192,7 @@ struct Portal {
     active: bool,
     name: SqlName,
     statement: usize,
-    plan: u64,
+    plan: crate::sql::type_input_plans::Owner,
     /// Resolved parameter OIDs followed by one encoded, already checked row.
     params: FixedBuf,
     n_params: u16,
@@ -469,26 +470,30 @@ pub struct Conn {
 }
 
 impl Conn {
+    fn abandon_pending_bind(&mut self) {
+        let Some(slot) = self.pending_bind.take() else {
+            return;
+        };
+        let portal = &mut self.portals[slot];
+        if matches!(
+            portal.plan,
+            crate::sql::type_input_plans::Owner::ProtocolPortal(_)
+        ) || !self.prepared[portal.statement].planner_ready
+        {
+            self.sqlprep.routine_inputs.retire(portal.plan);
+        }
+        portal.active = false;
+        portal.plan = crate::sql::type_input_plans::Owner::Unlocated;
+        portal.params.clear();
+    }
+
     fn release_closed_statement_plans(&mut self) {
-        for (slot, portal) in self.portals.iter().enumerate() {
-            if !portal.active && self.pending_bind != Some(slot) {
-                self.sqlprep.routine_inputs.retire(
-                    crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
-                );
-            }
-        }
-        for (slot, statement) in self.prepared.iter().enumerate() {
-            if !statement.active
-                && !self
-                    .portals
-                    .iter()
-                    .any(|portal| portal.active && portal.statement == slot)
-            {
-                self.sqlprep.routine_inputs.retire(
-                    crate::sql::type_input_plans::Owner::ProtocolPrepared(statement.plan),
-                );
-            }
-        }
+        self.sqlprep.routine_inputs.retire_invalid_protocol_owners(|owner| {
+            (matches!(owner, crate::sql::type_input_plans::Owner::ProtocolPrepared(plan)
+                if self.prepared.iter().any(|statement| statement.active && statement.plan == plan)))
+                || self.portals.iter().enumerate().any(|(slot, portal)|
+                    (portal.active || self.pending_bind == Some(slot)) && portal.plan == owner)
+        });
     }
 
     fn clear_protocol_state(&mut self) {
@@ -508,6 +513,20 @@ impl Conn {
     fn apply_protocol_reset(&mut self, engine: &mut Engine) {
         match engine.take_protocol_reset() {
             crate::sql::ProtocolReset::None => {}
+            crate::sql::ProtocolReset::Plans { first, count } => {
+                assert_eq!(
+                    count,
+                    self.prepared.len(),
+                    "protocol and SQL prepared namespaces share startup capacity"
+                );
+                for (index, prepared) in self.prepared.iter_mut().enumerate() {
+                    if prepared.active {
+                        prepared.plan = first + index as u64;
+                        prepared.planner_ready = false;
+                    }
+                }
+                self.release_closed_statement_plans();
+            }
             crate::sql::ProtocolReset::Statements => {
                 // Bound portals retain their original statement bytes until closed.
                 for statement in &mut self.prepared {
@@ -531,6 +550,7 @@ impl Conn {
                 oid_bytes: 0,
                 n_params: 0,
                 plan: 0,
+                planner_ready: false,
             });
         }
         let mut portals = Vec::with_capacity(config.max_portals);
@@ -539,7 +559,7 @@ impl Conn {
                 active: false,
                 name: empty,
                 statement: 0,
-                plan: 0,
+                plan: crate::sql::type_input_plans::Owner::Unlocated,
                 params: FixedBuf::new(budget, "portal_params", config.portal_bytes)?,
                 n_params: 0,
                 result_formats: ResultFmt::ALL_TEXT,
@@ -792,13 +812,7 @@ impl Conn {
             .filter(|length| *length <= self.recv.len())
             .unwrap_or(self.recv.len());
         self.recv.consume(message_bytes);
-        if let Some(slot) = self.pending_bind.take() {
-            self.sqlprep.routine_inputs.retire(
-                crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
-            );
-            self.portals[slot].active = false;
-            self.portals[slot].params.clear();
-        }
+        self.abandon_pending_bind();
         self.finish_lock_wait();
         self.sqlprep.clear_request_type_inputs();
         crate::sql::sequence::finish_statement(self.guc.seq_session());
@@ -2033,13 +2047,7 @@ impl Conn {
         }
         if msg_type == wire::FMSG_BIND && !matches!(step, Step::Parked) {
             crate::sql::query::disarm_timeout();
-            if let Some(slot) = self.pending_bind.take() {
-                self.sqlprep.routine_inputs.retire(
-                    crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
-                );
-                self.portals[slot].active = false;
-                self.portals[slot].params.clear();
-            }
+            self.abandon_pending_bind();
             if self.phase == Phase::SkipToSync {
                 crate::sql::sequence::finish_statement(self.guc.seq_session());
                 if self.txn.is_explicit() {
@@ -3063,7 +3071,7 @@ impl Conn {
                 "statement name too long",
             );
         };
-        let plan = match self.sqlprep.new_plan() {
+        let plan = match self.sqlprep.reserve_plan_ids(1) {
             Ok(plan) => plan,
             Err(error) => {
                 return ext_err(
@@ -3161,6 +3169,7 @@ impl Conn {
         entry.oid_bytes = param_oid_bytes.len();
         entry.n_params = n_params as u16;
         entry.plan = plan;
+        entry.planner_ready = false;
         self.sqlprep.clear_request_type_inputs();
         if name.is_empty()
             && let Some(prior) = unnamed
@@ -3435,20 +3444,27 @@ impl Conn {
                 }
             };
             let portal = &mut self.portals[slot];
-            let plan = match self.sqlprep.new_plan() {
-                Ok(plan) => plan,
-                Err(error) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        error.sqlstate,
-                        error.message.as_str(),
-                    );
+            let plan = if n_params == 0 {
+                crate::sql::type_input_plans::Owner::ProtocolPrepared(self.prepared[stmt_slot].plan)
+            } else {
+                match self.sqlprep.reserve_plan_ids(1) {
+                    Ok(plan) => crate::sql::type_input_plans::Owner::ProtocolPortal(plan),
+                    Err(error) => {
+                        return ext_err(
+                            &mut self.send,
+                            &mut self.phase,
+                            error.sqlstate,
+                            error.message.as_str(),
+                        );
+                    }
                 }
             };
-            self.sqlprep.routine_inputs.retire(
-                crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
-            );
+            if matches!(
+                portal.plan,
+                crate::sql::type_input_plans::Owner::ProtocolPortal(_)
+            ) {
+                self.sqlprep.routine_inputs.retire(portal.plan);
+            }
             portal.plan = plan;
             portal.active = false;
             portal.params.clear();
@@ -3464,7 +3480,7 @@ impl Conn {
             portal.statement = stmt_slot;
             self.pending_bind = Some(slot);
         }
-        let (_, param_oids) = match restore_portal_parameters(
+        let (params, param_oids) = match restore_portal_parameters(
             self.portals[slot].params.readable(),
             n_params,
             &self.arena,
@@ -3480,25 +3496,23 @@ impl Conn {
             }
         };
         let prepared = &self.prepared[stmt_slot];
-        let planned = crate::sql::type_input_plans::with_owner(
-            crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
-            || {
-                let mut responder = Responder::new(&mut self.send);
-                engine.admit_extended_plan(
-                    prepared.query(),
-                    param_oids,
-                    prepared.type_inputs(),
-                    &self.arena,
-                    &mut self.txn,
-                    &mut self.sqlprep,
-                    &mut self.cursors,
-                    &self.guc,
-                    &mut responder,
-                    &mut snapshot,
-                    resumed,
-                )
-            },
-        );
+        let planned = crate::sql::type_input_plans::with_owner(self.portals[slot].plan, || {
+            let mut responder = Responder::new(&mut self.send);
+            engine.admit_extended_plan(
+                prepared.query(),
+                params,
+                param_oids,
+                prepared.type_inputs(),
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &self.guc,
+                &mut responder,
+                &mut snapshot,
+                resumed,
+            )
+        });
         match planned {
             Ok(Ok(())) => {}
             Ok(Err(error))
@@ -3525,6 +3539,9 @@ impl Conn {
             Err(WireFull) => return Step::Close,
         }
         self.pending_bind = None;
+        if n_params == 0 {
+            self.prepared[stmt_slot].planner_ready = true;
+        }
         let portal = &mut self.portals[slot];
         portal.active = true;
         portal.name = sql_name;
@@ -3736,45 +3753,42 @@ impl Conn {
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
             let send_mark = self.send.mark();
-            let result = crate::sql::type_input_plans::with_owner(
-                crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
-                || {
-                    if paged {
-                        portal.result.clear();
-                        let mut responder = Responder::for_execute(&mut portal.result, rfmt);
-                        engine.execute_extended_selected(
-                            text,
-                            &self.arena,
-                            params,
-                            param_oids,
-                            &mut self.txn,
-                            &mut self.sqlprep,
-                            &mut self.cursors,
-                            &self.guc,
-                            &mut responder,
-                            self.id,
-                            lock_timeout_expired,
-                            prepared.type_inputs(),
-                        )
-                    } else {
-                        let mut responder = Responder::for_execute(&mut self.send, rfmt);
-                        engine.execute_extended_selected(
-                            text,
-                            &self.arena,
-                            params,
-                            param_oids,
-                            &mut self.txn,
-                            &mut self.sqlprep,
-                            &mut self.cursors,
-                            &self.guc,
-                            &mut responder,
-                            self.id,
-                            lock_timeout_expired,
-                            prepared.type_inputs(),
-                        )
-                    }
-                },
-            );
+            let result = crate::sql::type_input_plans::with_owner(portal.plan, || {
+                if paged {
+                    portal.result.clear();
+                    let mut responder = Responder::for_execute(&mut portal.result, rfmt);
+                    engine.execute_extended_selected(
+                        text,
+                        &self.arena,
+                        params,
+                        param_oids,
+                        &mut self.txn,
+                        &mut self.sqlprep,
+                        &mut self.cursors,
+                        &self.guc,
+                        &mut responder,
+                        self.id,
+                        lock_timeout_expired,
+                        prepared.type_inputs(),
+                    )
+                } else {
+                    let mut responder = Responder::for_execute(&mut self.send, rfmt);
+                    engine.execute_extended_selected(
+                        text,
+                        &self.arena,
+                        params,
+                        param_oids,
+                        &mut self.txn,
+                        &mut self.sqlprep,
+                        &mut self.cursors,
+                        &self.guc,
+                        &mut responder,
+                        self.id,
+                        lock_timeout_expired,
+                        prepared.type_inputs(),
+                    )
+                }
+            });
             let pending_copy = engine.take_pending_copy();
             if !matches!(
                 result,

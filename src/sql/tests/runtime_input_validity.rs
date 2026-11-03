@@ -57,6 +57,42 @@ fn runtime_checked_inputs_follow_selected_definitions_and_replace_changed_paths(
                 [expected]
             );
         }
+        session.success(&mut engine,
+            "CREATE FUNCTION validity_outer() RETURNS integer LANGUAGE sql \
+             SET search_path=public,path_alternative AS 'SELECT cardinality(public.validity_body())'", true);
+        session.success(&mut engine, "SELECT validity_outer()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["6"]
+        );
+        session.success(&mut engine, "SELECT validity_body()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["7"]
+        );
+        session.success(&mut engine,
+            "CREATE VIEW validity_view AS SELECT id FROM validity_anchor; \
+             CREATE FUNCTION validity_view_body() RETURNS validity_checked[] LANGUAGE sql SECURITY DEFINER \
+             AS 'SELECT ''{a}''::public.validity_checked[] FROM public.validity_view LIMIT 1'", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["8"]
+        );
+        session.success(&mut engine, "SELECT validity_view_body()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["9"]
+        );
+        session.success(
+            &mut engine,
+            "ALTER TABLE validity_anchor ADD COLUMN through_view text",
+            true,
+        );
+        session.success(&mut engine, "SELECT validity_view_body()", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["10"]
+        );
         drop((session, engine));
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }

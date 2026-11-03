@@ -2019,10 +2019,17 @@ pub(super) struct RoutineCallInputs<'call, 'expression> {
     pub arguments: &'call [&'expression Expr<'expression>],
     pub argument_type_oids: &'call [i32],
     pub argument_collation:
-        &'call dyn Fn(&'expression Expr<'expression>) -> Result<super::ast::Collation, SqlError>,
+        &'call dyn Fn(
+            &'expression Expr<'expression>,
+        ) -> Result<Option<super::eval::DerivedCollation>, SqlError>,
     pub mapping: &'call [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
     pub variadic: bool,
     pub context: RoutineInputContext,
+}
+
+pub(super) struct CompletedRoutineInputs<'a> {
+    pub values: &'a [Datum<'a>],
+    pub input_collation: super::ast::Collation,
 }
 
 impl StorageCatalog<'_, '_, '_, '_> {
@@ -2037,7 +2044,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         inputs: RoutineCallInputs<'_, 'a>,
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
-    ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    ) -> Result<Option<CompletedRoutineInputs<'a>>, SqlError> {
         use super::eval::CatalogAccess as _;
         let _input_scope = input_progress::enter();
         let RoutineCallInputs {
@@ -2059,6 +2066,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let mut input_type_oids =
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_collations = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut default_collations = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut call_collation = None;
         let default_dependencies = if captured.is_none()
             && (0..declared.argument_count)
                 .any(|index| !mapping[..arguments.len()].contains(&(index as u8)))
@@ -2071,6 +2081,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
             None
         };
         for input_index in 0..declared.argument_count {
+            for (call_index, expression) in arguments.iter().enumerate() {
+                if usize::from(mapping[call_index]) == input_index {
+                    let derived = argument_collation(expression)?;
+                    argument_collations[call_index] = derived;
+                }
+            }
             let parameter = declared
                 .parameter_for_input(input_index)
                 .expect("input signature has a declared parameter");
@@ -2123,6 +2139,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         }),
                     arena,
                 )?);
+                let expression = default_expressions[input_index].expect("default was bound");
+                let derived = argument_collation(expression)?;
+                default_collations[input_index] = derived;
             }
         }
         let input_count = declared.argument_count;
@@ -2135,6 +2154,25 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 )
             })?;
         let routine = &*declared;
+        for (input_index, argument) in routine.arguments().iter().enumerate() {
+            for (call_index, _) in arguments.iter().enumerate() {
+                if usize::from(mapping[call_index]) == input_index {
+                    let derived = super::eval::DerivedCollation::for_input_type(
+                        argument_collations[call_index],
+                        argument.ctype,
+                    );
+                    call_collation =
+                        super::eval::merge_derived_collations(call_collation, derived)?;
+                }
+            }
+            if default_expressions[input_index].is_some() {
+                let derived = super::eval::DerivedCollation::for_input_type(
+                    default_collations[input_index],
+                    argument.ctype,
+                );
+                call_collation = super::eval::merge_derived_collations(call_collation, derived)?;
+            }
+        }
         let input_contract = |input_index: usize, expanded: bool| {
             let mut argument = routine.arguments()[input_index];
             if expanded {
@@ -2259,7 +2297,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 source,
                                 argument,
                                 expected,
-                                argument_collation(expression)?,
+                                argument_collations[call_index].map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                ),
                             )
                         },
                     )?;
@@ -2287,7 +2328,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 source,
                                 argument,
                                 expected,
-                                argument_collation(expression)?,
+                                default_collations[input_index].map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                ),
                             )
                         },
                     )?;
@@ -2341,7 +2385,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 argument_type_oids[call_index],
                                 argument,
                                 expected,
-                                argument_collation(expression)?,
+                                argument_collations[call_index].map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                ),
                             )
                         },
                     )?,
@@ -2385,7 +2432,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 input_type_oids[input_index],
                                 argument,
                                 expected,
-                                argument_collation(expression)?,
+                                default_collations[input_index].map_or(
+                                    super::ast::Collation::None,
+                                    super::eval::DerivedCollation::input_collation,
+                                ),
                             )
                         },
                     )?,
@@ -2400,7 +2450,13 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if declared.attributes.strict && completed.iter().any(Datum::is_null) {
             return Ok(None);
         }
-        Ok(Some(completed))
+        Ok(Some(CompletedRoutineInputs {
+            values: completed,
+            input_collation: call_collation.map_or(
+                super::ast::Collation::None,
+                super::eval::DerivedCollation::input_collation,
+            ),
+        }))
     }
 
     /// The composite rowtype fields of a table or view: column name, resolved
@@ -4152,17 +4208,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )?))
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "selected routine keeps call and argument collations alongside its evaluator"
-    )]
     fn call_routine<'a>(
         &self,
         target: super::eval::RoutineCallTarget<'_>,
         arguments: &[&'a Expr<'a>],
         argument_type_oids: &[i32],
-        input_collation: super::ast::Collation,
-        argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<super::ast::Collation, SqlError>,
+        argument_collation: &dyn Fn(
+            &'a Expr<'a>,
+        )
+            -> Result<Option<super::eval::DerivedCollation>, SqlError>,
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -4183,9 +4237,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let collations = arena
                     .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
                     .map_err(|_| arena_full())?;
+                let mut derived = None;
                 for (output, expression) in collations.iter_mut().zip(arguments) {
-                    *output = argument_collation(expression)?;
+                    let argument = argument_collation(expression)?;
+                    *output = argument.map_or(
+                        super::ast::Collation::None,
+                        super::eval::DerivedCollation::input_collation,
+                    );
+                    derived = super::eval::merge_derived_collations(derived, argument)?;
                 }
+                let input_collation = derived.map_or(
+                    super::ast::Collation::None,
+                    super::eval::DerivedCollation::input_collation,
+                );
                 let values = arena
                     .alloc_slice_with(arguments.len(), |_| Datum::Null)
                     .map_err(|_| arena_full())?;
@@ -4248,8 +4312,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_routine(
             slot,
             routine,
-            &completed[..declared.argument_count],
-            input_collation,
+            &completed.values[..declared.argument_count],
+            completed.input_collation,
             arena,
         )?
         .ok_or_else(|| {

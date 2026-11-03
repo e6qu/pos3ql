@@ -1124,7 +1124,7 @@ fn merge_set_collations(
         (Explicit, Explicit) if left.value != right.value => {
             return Err(sql_err!(
                 sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
+                "collation mismatch between explicit collations \"{}\" and \"{}\"",
                 left.value.name(),
                 right.value.name()
             ));

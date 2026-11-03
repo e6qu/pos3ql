@@ -86,13 +86,19 @@ fn parse(conn: &mut Conn, engine: &mut Engine, sql: &str, oids: &[i32]) {
     ));
 }
 
-fn bind_payload(parameters: &[&[u8]]) -> Vec<u8> {
-    let mut payload = b"result\0bound\0".to_vec();
+fn bind_payload(portal: &str, parameters: &[Option<&[u8]>]) -> Vec<u8> {
+    let mut payload = portal.as_bytes().to_vec();
+    payload.extend_from_slice(b"\0bound\0");
     payload.extend_from_slice(&0u16.to_be_bytes());
     payload.extend_from_slice(&(parameters.len() as u16).to_be_bytes());
     for parameter in parameters {
-        payload.extend_from_slice(&(parameter.len() as i32).to_be_bytes());
-        payload.extend_from_slice(parameter);
+        match parameter {
+            Some(parameter) => {
+                payload.extend_from_slice(&(parameter.len() as i32).to_be_bytes());
+                payload.extend_from_slice(parameter);
+            }
+            None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
     }
     payload.extend_from_slice(&0u16.to_be_bytes());
     payload
@@ -157,7 +163,7 @@ fn checked_function_planning_happens_at_bind_after_parameter_validation() {
             &mut conn,
             &mut engine,
             wire::FMSG_BIND,
-            &bind_payload(&[b"invalid"]),
+            &bind_payload("result", &[Some(b"invalid")]),
             true,
         );
         assert!(invalid.windows(5).any(|bytes| bytes == b"22P02"));
@@ -177,7 +183,7 @@ fn checked_function_planning_happens_at_bind_after_parameter_validation() {
                 &mut conn,
                 &mut engine,
                 wire::FMSG_BIND,
-                &bind_payload(&[b"9"]),
+                &bind_payload("result", &[Some(b"9")]),
                 false
             ),
             wire::MSG_BIND_COMPLETE
@@ -215,6 +221,32 @@ fn checked_function_planning_happens_at_bind_after_parameter_validation() {
             )),
             "1"
         );
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("result", &[Some(b"20")]),
+            false,
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT last_value FROM bind_checks"
+            )),
+            "2"
+        );
+        assert_eq!(
+            first_row(&message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"result\0\0\0\0\0",
+                false
+            )),
+            "21"
+        );
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
     }
 }
 
@@ -261,7 +293,7 @@ fn bind_planner_waits_keep_unpublished_parameters_and_release_them_on_abort() {
                 "BEGIN; UPDATE bind_wait_gate SET hits=hits WHERE id=1",
             );
             conn.send.clear();
-            let bind = frontend(wire::FMSG_BIND, &bind_payload(&[b"9"]));
+            let bind = frontend(wire::FMSG_BIND, &bind_payload("result", &[Some(b"9")]));
             assert!(conn.recv.append(&bind));
             let mut deadline = None;
             let mut retained = None;
@@ -377,6 +409,265 @@ fn bind_planner_waits_keep_unpublished_parameters_and_release_them_on_abort() {
                 )),
                 if cancel || timeout { "0" } else { "1" }
             );
+            if cancel || timeout {
+                assert!(has_message(
+                    &message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_BIND,
+                        &bind_payload("result", &[Some(b"20")]),
+                        false
+                    ),
+                    wire::MSG_BIND_COMPLETE
+                ));
+                assert_eq!(
+                    first_row(&query(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT last_value FROM bind_wait_checks"
+                    )),
+                    "2"
+                );
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        b"result\0\0\0\0\0",
+                        false
+                    )),
+                    "21"
+                );
+                message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+                assert_eq!(
+                    first_row(&query(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT hits FROM bind_wait_gate"
+                    )),
+                    "1"
+                );
+            }
         }
+    }
+}
+
+#[test]
+fn generic_bind_inputs_are_shared_and_pinned_by_old_portals_after_statement_close() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("bind-generic-inputs", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        observer.id = 2;
+        conn.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE SEQUENCE bind_generic_checks; CREATE TYPE bind_generic_choice AS ENUM('a'); \
+             CREATE DOMAIN bind_generic_checked AS bind_generic_choice CHECK(nextval('bind_generic_checks')>0); \
+             CREATE FUNCTION bind_generic() RETURNS bind_generic_checked[] LANGUAGE sql AS \
+             $$SELECT '{a}'::bind_generic_checked[]$$; ALTER SEQUENCE bind_generic_checks RESTART WITH 1; BEGIN",
+        );
+        parse(&mut conn, &mut engine, "SELECT bind_generic()", &[]);
+        for portal in ["first", "second"] {
+            assert!(has_message(
+                &message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_BIND,
+                    &bind_payload(portal, &[]),
+                    false
+                ),
+                wire::MSG_BIND_COMPLETE
+            ));
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT last_value FROM bind_generic_checks"
+                )),
+                "1"
+            );
+        }
+        query(&mut conn, &mut engine, "DISCARD PLANS");
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Pfirst\0", false);
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("fresh", &[]),
+            false,
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT last_value FROM bind_generic_checks"
+            )),
+            "2"
+        );
+        message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+        parse(&mut conn, &mut engine, "SELECT 99", &[]);
+        for (execute, close) in [
+            (&b"second\0\0\0\0\0"[..], &b"Psecond\0"[..]),
+            (&b"fresh\0\0\0\0\0"[..], &b"Pfresh\0"[..]),
+        ] {
+            assert_eq!(
+                first_row(&message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_EXECUTE,
+                    execute,
+                    false
+                )),
+                "{a}"
+            );
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, close, false);
+        }
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("result", &[]),
+            false,
+        );
+        assert_eq!(
+            first_row(&message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"result\0\0\0\0\0",
+                false
+            )),
+            "99"
+        );
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT last_value FROM bind_generic_checks"
+            )),
+            "2"
+        );
+        query(&mut conn, &mut engine, "COMMIT");
+    }
+}
+
+#[test]
+fn custom_bind_parameters_prune_unreached_inputs_before_checking_function_bodies() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("bind-parameter-pruning", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        observer.id = 2;
+        conn.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut conn,
+            &mut engine,
+            "CREATE SEQUENCE bind_branch_checks; CREATE TYPE bind_branch_choice AS ENUM('a'); \
+             CREATE DOMAIN bind_branch_checked AS bind_branch_choice CHECK(nextval('bind_branch_checks')>0); \
+             CREATE FUNCTION bind_branch() RETURNS integer LANGUAGE sql AS \
+             $$SELECT cardinality('{a}'::bind_branch_checked[])$$; \
+             CREATE FUNCTION bind_branch_strict(integer) RETURNS integer LANGUAGE sql STRICT AS \
+             $$SELECT $1+cardinality('{a}'::bind_branch_checked[])$$; \
+             ALTER SEQUENCE bind_branch_checks RESTART WITH 1",
+        );
+        for (sql, oid, inputs) in [
+            (
+                "SELECT CASE WHEN $1=0 THEN bind_branch() ELSE 17 END",
+                crate::sql::types::oid::INT4,
+                [Some(&b"1"[..]), Some(&b"0"[..])],
+            ),
+            (
+                "SELECT CASE WHEN $1='go' THEN bind_branch() ELSE 17 END",
+                crate::sql::types::oid::TEXT,
+                [Some(&b"stop"[..]), Some(&b"go"[..])],
+            ),
+        ] {
+            parse(&mut conn, &mut engine, sql, &[oid]);
+            for (parameter, expected_row, expected_checks) in
+                [(inputs[0], "17", "f"), (inputs[1], "1", "t")]
+            {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_BIND,
+                    &bind_payload("result", &[parameter]),
+                    false,
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT is_called FROM bind_branch_checks"
+                    )),
+                    expected_checks
+                );
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        b"result\0\0\0\0\0",
+                        false
+                    )),
+                    expected_row
+                );
+                message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            }
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+            query(
+                &mut conn,
+                &mut engine,
+                "ALTER SEQUENCE bind_branch_checks RESTART WITH 1",
+            );
+        }
+        parse(
+            &mut conn,
+            &mut engine,
+            "SELECT bind_branch_strict($1)",
+            &[crate::sql::types::oid::INT4],
+        );
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("result", &[None]),
+            false,
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT is_called FROM bind_branch_checks"
+            )),
+            "f"
+        );
+        assert_eq!(
+            first_row(&message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"result\0\0\0\0\0",
+                false
+            )),
+            "NULL"
+        );
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
     }
 }

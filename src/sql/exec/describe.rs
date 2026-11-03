@@ -2216,6 +2216,10 @@ pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
     })
 }
 
+pub(crate) fn bound_parameter_context_active() -> bool {
+    matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Bound)
+}
+
 /// Restores the enclosing routine's declaration when nested SQL routines
 /// return.  A parameter type is execution context, not a process-wide default.
 pub(crate) struct RoutineParameterScope(RoutineParameterTypes, ParameterContext);

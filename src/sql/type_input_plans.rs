@@ -108,6 +108,9 @@ struct Slot {
     state: State,
     specialization: SharedSlice<u8>,
     validity: Option<crate::storage::RuntimeInputValidity>,
+    // An executing obsolete generation remains pinned but cannot become current
+    // again when its caller later restores the former search path.
+    invalidated: bool,
 }
 
 impl Slot {
@@ -115,6 +118,7 @@ impl Slot {
         self.state = State::Vacant;
         self.specialization = SharedSlice::EMPTY;
         self.validity = None;
+        self.invalidated = false;
     }
 }
 
@@ -139,6 +143,7 @@ impl RoutineInputPlans {
                     state: State::Vacant,
                     specialization: SharedSlice::EMPTY,
                     validity: None,
+                    invalidated: false,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -212,8 +217,9 @@ impl RoutineInputPlans {
                 "SQL routine body specialization is empty"
             ));
         }
-        let mut invalid = None;
-        for (index, slot) in self.slots.iter().enumerate() {
+        let mut current = None;
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
             let key = match &slot.state {
                 State::Vacant => continue,
                 State::Preparing { key, .. } | State::Ready { key, .. } => *key,
@@ -231,27 +237,25 @@ impl RoutineInputPlans {
                 && version == definition_version
                 && slot.specialization.as_ref() == canonical
             {
-                if !valid(slot.validity.as_ref())? {
-                    invalid = Some(PlanId {
+                if !slot.invalidated && valid(slot.validity.as_ref())? {
+                    current = Some(key);
+                } else {
+                    let plan = PlanId {
                         slot: index,
                         generation: slot.generation,
-                    });
-                    break;
+                    };
+                    self.slots[index].invalidated = true;
+                    if !plan_is_active(plan) {
+                        self.abandon(plan)?;
+                    }
                 }
-                return Ok(BodyAdmission {
-                    key,
-                    reserved: None,
-                });
             }
         }
-        if let Some(plan) = invalid {
-            if has_active_plan() {
-                return Err(sql_err!(
-                    sqlstate::OBJECT_IN_USE,
-                    "cannot replace SQL routine input plans during nested execution"
-                ));
-            }
-            self.abandon(plan)?;
+        if let Some(key) = current {
+            return Ok(BodyAdmission {
+                key,
+                reserved: None,
+            });
         }
         let (index, generation) = self.available_slot()?;
         let specialization = freeze(canonical)?;
@@ -338,6 +342,7 @@ impl RoutineInputPlans {
             },
             specialization,
             validity: None,
+            invalidated: false,
         };
         PlanId {
             slot: index,
@@ -474,6 +479,48 @@ impl RoutineInputPlans {
         }
     }
 
+    pub(crate) fn retire_invalid_protocol_owners(
+        &mut self,
+        mut retained: impl FnMut(Owner) -> bool,
+    ) {
+        loop {
+            let owner = self.slots.iter().find_map(|slot| {
+                let key = match &slot.state {
+                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Vacant => return None,
+                };
+                (matches!(
+                    key.owner,
+                    Owner::ProtocolPrepared(_) | Owner::ProtocolPortal(_)
+                ) && !retained(key.owner))
+                .then_some(key.owner)
+            });
+            let Some(owner) = owner else { break };
+            self.retire(owner);
+        }
+    }
+
+    pub(crate) fn discard_unpinned_plans(&mut self) {
+        loop {
+            let owner = self.slots.iter().find_map(|slot| {
+                let key = match &slot.state {
+                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Vacant => return None,
+                };
+                (!matches!(
+                    key.owner,
+                    Owner::ProtocolPrepared(_)
+                        | Owner::ProtocolPortal(_)
+                        | Owner::Cursor(_)
+                        | Owner::Nested(_)
+                ))
+                .then_some(key.owner)
+            });
+            let Some(owner) = owner else { break };
+            self.retire(owner);
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         for slot in self.slots.iter_mut() {
             slot.vacate();
@@ -523,6 +570,27 @@ fn stale() -> SqlError {
 thread_local! {
     static OWNER: core::cell::Cell<Option<Owner>> = const { core::cell::Cell::new(None) };
     static ACTIVE_PLANS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static ACTIVE_INPUTS: core::cell::Cell<*const ActiveInputPlan> = const { core::cell::Cell::new(core::ptr::null()) };
+}
+
+struct ActiveInputPlan {
+    plan: PlanId,
+    previous: *const Self,
+}
+
+fn plan_is_active(plan: PlanId) -> bool {
+    ACTIVE_INPUTS.with(|active| {
+        let mut pointer = active.get();
+        // Each link borrows an immutable with_owner stack frame. Its guard
+        // restores the previous link before that frame leaves scope.
+        while let Some(frame) = unsafe { pointer.as_ref() } {
+            if frame.plan == plan {
+                return true;
+            }
+            pointer = frame.previous;
+        }
+        false
+    })
 }
 
 pub(crate) fn has_active_plan() -> bool {
@@ -539,21 +607,37 @@ pub(crate) fn owner() -> Result<Owner, SqlError> {
 }
 
 pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
-    struct Restore {
+    struct Restore<'a> {
         owner: Option<Owner>,
         depth: usize,
+        inputs: *const ActiveInputPlan,
+        _frame: &'a Option<ActiveInputPlan>,
     }
-    impl Drop for Restore {
+    impl Drop for Restore<'_> {
         fn drop(&mut self) {
             OWNER.with(|owner| owner.set(self.owner));
             ACTIVE_PLANS.with(|active| active.set(self.depth));
+            ACTIVE_INPUTS.with(|active| active.set(self.inputs));
         }
     }
     let depth = ACTIVE_PLANS.with(core::cell::Cell::get);
+    let inputs = ACTIVE_INPUTS.with(core::cell::Cell::get);
+    let frame = match owner {
+        Owner::Nested(plan) => Some(ActiveInputPlan {
+            plan,
+            previous: inputs,
+        }),
+        _ => None,
+    };
     let _restore = Restore {
         owner: OWNER.with(|active| active.replace(Some(owner))),
         depth,
+        inputs,
+        _frame: &frame,
     };
+    if let Some(frame) = &frame {
+        ACTIVE_INPUTS.with(|active| active.set(frame));
+    }
     if matches!(owner, Owner::Nested(_) | Owner::Cursor(_)) {
         ACTIVE_PLANS.with(|active| {
             active.set(
@@ -570,6 +654,85 @@ pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::mem::lease_pool::{LeasePool, Purpose};
+
+    #[test]
+    fn discarding_plans_preserves_bound_protocol_and_cursor_owners_until_release() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 8;
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let keys = [
+                Owner::ProtocolPrepared(1),
+                Owner::ProtocolPortal(2),
+                Owner::Cursor(3),
+                Owner::Backend,
+                Owner::SqlPrepared(4),
+            ]
+            .map(|owner| Key {
+                owner,
+                source: source(0),
+            });
+            let mut ids = [None; 5];
+            for (at, key) in keys.iter().enumerate() {
+                let id = plans.reserve(*key).unwrap();
+                let bytes = if at == 0 {
+                    pool.copy_slice(b"TIP2\0\0\0\0").unwrap()
+                } else {
+                    SharedSlice::EMPTY
+                };
+                plans.complete(id, InputImage::Runtime(bytes)).unwrap();
+                ids[at] = Some(id);
+            }
+            let parent = ids[0].unwrap();
+            let child = Key {
+                owner: Owner::Nested(parent),
+                source: source(1),
+            };
+            let child_id = plans.reserve(child).unwrap();
+            plans
+                .complete(child_id, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
+            let Some(Lookup::Ready(_, pinned)) = plans.find(keys[0]).unwrap() else {
+                panic!("ready generic plan")
+            };
+            plans.discard_unpinned_plans();
+            for key in &keys[..3] {
+                assert!(matches!(
+                    plans.find(*key).unwrap(),
+                    Some(Lookup::Ready(_, _))
+                ));
+            }
+            assert!(matches!(
+                plans.find(child).unwrap(),
+                Some(Lookup::Ready(_, _))
+            ));
+            for key in &keys[3..] {
+                assert!(plans.find(*key).unwrap().is_none());
+            }
+            plans.retire_invalid_protocol_owners(|owner| owner == Owner::ProtocolPortal(2));
+            assert!(plans.find(keys[0]).unwrap().is_none());
+            assert!(plans.find(child).is_err());
+            assert!(matches!(
+                plans.find(keys[1]).unwrap(),
+                Some(Lookup::Ready(_, _))
+            ));
+            assert!(matches!(
+                plans.find(keys[2]).unwrap(),
+                Some(Lookup::Ready(_, _))
+            ));
+            assert!(pool.lease::<u8>(1).is_err());
+            drop(pinned);
+            assert!(pool.lease::<u8>(64).is_ok());
+            plans.retire_invalid_protocol_owners(|_| false);
+            plans.retire_invalid_cursors(|_| false);
+            for key in keys {
+                assert!(plans.find(key).unwrap().is_none());
+            }
+        });
+    }
 
     #[test]
     fn runtime_sql_body_keys_compare_exact_bytes_and_share_ready_and_waiting_owners() {
@@ -734,7 +897,7 @@ mod tests {
     #[test]
     fn invalid_runtime_body_inputs_retire_generations_and_preserve_pinned_images() {
         let mut config = Config::default_dev();
-        config.routine_input_slots = 1;
+        config.routine_input_slots = 3;
         let mut budget =
             Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(256, 4));
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 256, 4).unwrap();
@@ -757,21 +920,68 @@ mod tests {
             let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
                 panic!("ready body")
             };
-            with_owner(Owner::Nested(old), || {
-                let error = plans
-                    .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
-                    .unwrap_err();
-                assert_eq!(error.sqlstate, sqlstate::OBJECT_IN_USE);
+            let other = plans
+                .sql_body_key(100_002, 7, b"int4", |_| Ok(true), freeze)
+                .unwrap();
+            plans
+                .complete(
+                    other.reserved.unwrap(),
+                    InputImage::Runtime(SharedSlice::EMPTY),
+                )
+                .unwrap();
+            let recursive = with_owner(Owner::Nested(old), || {
+                let replaced_other = plans
+                    .sql_body_key(100_002, 7, b"int4", |_| Ok(false), freeze)
+                    .unwrap();
+                assert_ne!(replaced_other.key, other.key);
+                with_owner(
+                    Owner::Dynamic {
+                        epoch: 1,
+                        generation: 2,
+                    },
+                    || {
+                        let replacement = plans
+                            .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
+                            .unwrap();
+                        let new = replacement.reserved.unwrap();
+                        assert_ne!(new, old);
+                        plans
+                            .complete(new, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        let reused = plans
+                            .sql_body_key(
+                                100_001,
+                                7,
+                                b"int4",
+                                |_| Ok(true),
+                                |_| panic!("active obsolete ancestor must not hide a current plan"),
+                            )
+                            .unwrap();
+                        assert_eq!(reused.key, replacement.key);
+                        assert!(reused.reserved.is_none());
+                        assert!(matches!(
+                            plans.find(first.key).unwrap(),
+                            Some(Lookup::Ready(_, _))
+                        ));
+                        replacement
+                    },
+                )
             });
             assert!(matches!(
                 plans.find(first.key).unwrap(),
                 Some(Lookup::Ready(_, _))
             ));
             let replacement = plans
-                .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
+                .sql_body_key(
+                    100_001,
+                    7,
+                    b"int4",
+                    |_| Ok(true),
+                    |_| panic!("retire only the now-inactive obsolete generation"),
+                )
                 .unwrap();
-            assert_ne!(replacement.key, first.key);
-            assert_ne!(replacement.reserved.unwrap(), old);
+            assert_eq!(replacement.key, recursive.key);
+            assert!(replacement.reserved.is_none());
             assert!(plans.find(first.key).unwrap().is_none());
             assert!(
                 matches!(pinned, InputImage::Runtime(ref bytes) if bytes.as_ref() == b"TIP2\0\0\0\0")

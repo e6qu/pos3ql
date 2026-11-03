@@ -21,7 +21,7 @@ jobs:
           POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_INITDB_ARGS: '--lc-collate=C --lc-ctype=C --encoding=UTF8'
         options: >-
-          --health-cmd 'pg_isready -U postgres'
+          --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20

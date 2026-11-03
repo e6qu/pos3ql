@@ -5750,8 +5750,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     arguments: args,
                     argument_type_oids: &argument_type_oids[..args.len()],
                     argument_collation: &|argument| {
-                        crate::sql::eval::routine_input_collation(
-                            &[argument],
+                        crate::sql::eval::routine_argument_collation(
+                            argument,
                             columns,
                             hooks.catalog,
                         )
@@ -5771,8 +5771,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             else {
                 return Ok(&[]);
             };
-            let input_collation =
-                crate::sql::eval::routine_input_collation(args, columns, hooks.catalog)?;
+            let input_collation = routine_params.input_collation;
+            let routine_params = routine_params.values;
             let _input_body = super::input_progress::enter_body();
             composite = routine_composite_result(routine, storage, txid)?;
             let table_columns = routine.table_columns();

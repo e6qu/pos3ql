@@ -191,15 +191,16 @@ fn registered_cast_and_operator_inputs_follow_planning_and_runtime_phases() {
         session.success(&mut engine,
             "CREATE OR REPLACE FUNCTION operator_cast(integer) RETURNS text LANGUAGE sql CALLED ON NULL INPUT AS \
                $$SELECT format('%s',$1)||CASE WHEN cardinality('{a}'::operator_checked[])=1 THEN '' ELSE '' END$$", true);
-        for (sql, checks) in [
-            ("SELECT ARRAY[11,22]::text[]", "2"),
-            ("SELECT ARRAY[11,NULL::integer,22]::text[]", "3"),
-            ("SELECT ARRAY[ARRAY[11,22],ARRAY[33,44]]::text[]", "4"),
+        for (sql, declared, fetched) in [
+            ("SELECT ARRAY[11,22]::text[]", "2", "2"),
+            ("SELECT ARRAY[11,NULL::integer,22]::text[]", "3", "3"),
+            ("SELECT ARRAY[ARRAY[11,22],ARRAY[33,44]]::text[]", "4", "4"),
             (
                 "SELECT ARRAY[ARRAY[11,22]::integer[],ARRAY[33,44]::integer[]]::text[]",
                 "2",
+                "3",
             ),
-            ("SELECT ARRAY[11::text,22]::text[]", "2"),
+            ("SELECT ARRAY[11::text,22]::text[]", "2", "2"),
         ] {
             session.success(
                 &mut engine,
@@ -213,13 +214,13 @@ fn registered_cast_and_operator_inputs_follow_planning_and_runtime_phases() {
             );
             assert_eq!(
                 data_rows(&session.success(&mut engine, counter, true)),
-                [checks],
+                [declared],
                 "DECLARE accepted {sql}"
             );
             session.success(&mut engine, "FETCH ALL FROM operator_cursor", true);
             assert_eq!(
                 data_rows(&session.success(&mut engine, counter, true)),
-                [checks],
+                [fetched],
                 "FETCH accepted {sql}"
             );
             session.success(&mut engine, "CLOSE operator_cursor; COMMIT", true);

@@ -622,6 +622,12 @@ fn capture_cast_function<'a>(
     let source_facts = inline::cast_source_argument(
         inline::argument_facts(&[expression], columns, storage, txid, arena)?[0],
         cast.leaf_source_oid,
+        storage
+            .routine_result_for_oid(cast.source_oid, txid)
+            .is_some_and(|source| {
+                matches!(source.ctype, super::types::ColType::Array(element)
+                    if element.array_oid() != cast.leaf_source_oid)
+            }),
     );
     if routine.attributes.strict && source_facts.known_null {
         return Ok(None);

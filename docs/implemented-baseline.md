@@ -137,6 +137,13 @@ wait for its transaction, including a prepared transaction after recovery;
 other roles and catalog readers can proceed. Repeated grants emit a NOTICE,
 while revoking a missing grant emits a WARNING, matching PostgreSQL's fields.
 
+Owner privileges follow inherited membership; permission to `SET ROLE` is
+separate. For example, an `app` account with INHERIT FALSE and SET TRUE for
+`owners` cannot alter their table until it executes `SET ROLE owners`. With
+INHERIT TRUE and SET FALSE, it can alter the table directly, but `SET ROLE owners`
+returns `42501`. The same distinction applies to changing default privileges
+and dropping or reassigning owned objects.
+
 Default privileges describe what new objects receive. Their catalog identifier
 belongs to the owner, schema and object class, while their permission list is
 sorted by account identifier. For example, granting SELECT on future tables to
@@ -204,6 +211,13 @@ polygon to a path column is allowed; assigning a box to a point column needs
 an explicit `::point` cast. Those rules also apply to typed NULL values and
 arrays. Converting an open path to a polygon fails with `22023`, whether written
 as `polygon(value)` or `value::polygon`.
+Registered conversion functions receive the declared size limit and whether the
+SQL requested an explicit conversion. For example, `SELECT 7::varchar(5)` passes
+modifier `9` (PostgreSQL's length-plus-four encoding) and true to a three-argument
+integer-to-varchar cast. Inserting `7` into a `varchar(5)` column passes the same
+modifier and false. Element conversions inside arrays and domains keep that
+size limit too.
+
 Explicit array conversions honor a registered whole-array cast first, then
 element conversions when applicable. Element conversions run once in array
 order and preserve dimensions and starting subscripts. A user function that

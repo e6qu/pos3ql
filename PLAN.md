@@ -75,6 +75,8 @@ schema edits, commit, rollback, search paths and roles against PostgreSQL;
 unrelated table changes must not repeat a constraint.
 Compare procedural specialization, nested arguments, sized casts, selected
 operator/cast support functions and inherited ownership with PostgreSQL.
+Preserve the distinction between a constant argument and the element placeholder
+used when converting an existing array; their input-check timing can differ.
 Cover index, policy, rule and privilege changes, plus TRUNCATE commit, rollback
 and prepared transactions, including immediate delivery to other sessions
 before an ANALYZE commits. Retain the selected table identity through these

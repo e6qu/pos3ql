@@ -582,12 +582,23 @@ pub(crate) fn literal_argument(
     })
 }
 
-pub(crate) fn cast_source_argument(mut argument: ArgumentFacts, leaf_source: i32) -> ArgumentFacts {
+pub(crate) fn cast_source_argument(
+    mut argument: ArgumentFacts,
+    leaf_source: i32,
+    array_element: bool,
+) -> ArgumentFacts {
     if argument.type_oid != leaf_source {
         argument.constant = None;
-        // An array's nullness says nothing about the planner's per-element
-        // placeholder, which is analyzed even for an empty or NULL array.
+    }
+    if array_element {
+        // Array coercion supplies a context-bound element placeholder, not
+        // the original array value. It prevents SQL-body substitution.
+        argument.constant = None;
         argument.known_null = false;
+        argument.properties = Properties {
+            context_dependent: true,
+            ..Properties::EMPTY
+        };
     }
     argument.type_oid = leaf_source;
     argument
@@ -1772,6 +1783,29 @@ mod tests {
             },
         };
         crate::mem::guard::forbid_alloc(|| {
+            let array = ArgumentFacts {
+                type_oid: crate::sql::types::ArrElem::Int4.array_oid(),
+                known_null: true,
+                ..argument
+            };
+            let element = cast_source_argument(array, oid::INT4, true);
+            assert!(!element.known_null);
+            assert!(element.properties.context_dependent);
+            assert!(!post_analysis(
+                RoutineVolatility::Volatile,
+                false,
+                Properties::EMPTY,
+                &[1],
+                &[element]
+            ));
+            let scalar = cast_source_argument(argument, oid::INT4, false);
+            assert!(post_analysis(
+                RoutineVolatility::Volatile,
+                false,
+                Properties::EMPTY,
+                &[1],
+                &[scalar]
+            ));
             assert!(post_analysis(
                 RoutineVolatility::Volatile,
                 false,

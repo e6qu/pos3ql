@@ -4073,12 +4073,31 @@ pub(crate) fn builtin_routine_properties(
     if mixed_family { None } else { family }
 }
 
+fn builtin_operator_exact(name: &str, left: Option<i32>, right: Option<i32>) -> Option<i32> {
+    // PostgreSQL tries an unknown literal as the other operand's type before
+    // ranking coercible overloads, which can otherwise tie mixed-width inputs.
+    let (left, right) = match (left.unwrap_or(0), right.unwrap_or(0)) {
+        (super::types::oid::UNKNOWN, right) if right != 0 => (right, right),
+        (left, super::types::oid::UNKNOWN) if left != 0 => (left, left),
+        pair => pair,
+    };
+    builtin_properties::OPERATORS.iter().find_map(
+        |&(candidate, expected_left, expected_right, procedure)| {
+            (candidate == name && expected_left == left && expected_right == right)
+                .then_some(procedure)
+        },
+    )
+}
+
 pub(crate) fn builtin_operator_properties(
     name: &str,
     left: Option<i32>,
     right: Option<i32>,
 ) -> Option<(bool, bool)> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if let Some(procedure) = builtin_operator_exact(name, left, right) {
+        return builtin_procedure_properties(procedure);
+    }
     let mut best = None;
     let mut best_score = None;
     let mut ambiguous = false;
@@ -4122,6 +4141,9 @@ pub(crate) fn builtin_operator_procedure(
     right: Option<i32>,
 ) -> Option<i32> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if let Some(procedure) = builtin_operator_exact(name, left, right) {
+        return Some(procedure);
+    }
     let mut best = None;
     let mut best_score = None;
     let mut ambiguous = false;
@@ -4562,6 +4584,29 @@ fn builtin_argument_properties(actual: i32, expected: i32) -> Option<(usize, boo
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod builtin_property_tests {
     use super::*;
+
+    #[test]
+    fn unknown_operator_operands_try_the_known_types_exact_overload_first() {
+        use super::super::types::oid;
+        crate::mem::guard::forbid_alloc(|| {
+            for (known, procedure) in [(oid::INT4, 65), (oid::TEXT, 67)] {
+                for (left, right) in [(known, oid::UNKNOWN), (oid::UNKNOWN, known)] {
+                    assert_eq!(
+                        builtin_operator_procedure("=", Some(left), Some(right)),
+                        Some(procedure)
+                    );
+                    assert_eq!(
+                        builtin_operator_properties("=", Some(left), Some(right)),
+                        builtin_procedure_properties(procedure)
+                    );
+                }
+            }
+            assert_eq!(
+                builtin_operator_procedure("=", Some(oid::UNKNOWN), Some(oid::UNKNOWN)),
+                None
+            );
+        });
+    }
 
     #[test]
     fn pg18_builtin_properties_distinguish_operators_casts_and_io() {

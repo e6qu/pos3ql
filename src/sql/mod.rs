@@ -8422,14 +8422,16 @@ impl Engine {
         // released. Recovery therefore reaches the same outcome if the process
         // stops anywhere in the in-memory promotion below.
         txn.swap_prepared_state(&mut self.prepared_transactions.slot_mut(slot).transaction);
-        let result = if commit {
-            self.storage
-                .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
-            self.promote_transaction_state(txn, resolution_lsn, None)
-        } else {
-            self.rollback_transaction_state(txn, false);
-            Ok(())
-        };
+        let result = txn.with_detached_plan_owner(|txn| {
+            if commit {
+                self.storage
+                    .end_transaction_snapshots(txn.txid, crate::storage::SnapshotCleanup::Schedule);
+                self.promote_transaction_state(txn, resolution_lsn, None)
+            } else {
+                self.rollback_transaction_state(txn, false);
+                Ok(())
+            }
+        });
         #[cfg(test)]
         let result = result
             .and_then(|()| self.observe_publication(commit::PublicationPoint::PreparedInstalled));
@@ -13904,6 +13906,40 @@ impl Engine {
                                 )));
                             }
                         };
+                    if let Some(cached) = column.default.constant() {
+                        let expression = (|| {
+                            let source = arena
+                                .alloc_str(
+                                    column
+                                        .default
+                                        .expression()
+                                        .expect("a cached default retains its source")
+                                        .as_str(),
+                                )
+                                .map_err(|_| query::arena_full_pub())?;
+                            let source = parser::parse_expr(source, arena)?;
+                            let value = enum_values::materialize(
+                                cached.as_datum(),
+                                storage,
+                                txn.txid,
+                                arena,
+                            )?;
+                            arena
+                                .alloc(Expr::BoundLiteral {
+                                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                                    type_oid,
+                                    type_mod: column.type_mod,
+                                    collation: Some(column.collation),
+                                    source,
+                                })
+                                .map(|value| &*value)
+                                .map_err(|_| query::arena_full_pub())
+                        })();
+                        rule_defaults[index] = match expression {
+                            Ok(expression) => Some(expression),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    }
                     let type_name =
                         match catalog::user_type_name_text(storage, txn.txid, type_oid, arena) {
                             Ok(Some(name)) => name,
@@ -28163,3 +28199,6 @@ impl Engine {
 // Native SQL fixtures are separate from the ownership tests beside runtime modules.
 #[cfg(all(test, not(miri)))]
 mod tests;
+
+#[cfg(all(test, not(miri)))]
+pub(crate) use tests::object_reads::HttpObjectServer;

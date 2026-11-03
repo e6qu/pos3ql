@@ -9766,6 +9766,36 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     sql_ok()
 }
 
+/// Stop the producer immediately after the requested number of completed
+/// rows. The local flag identifies this consumer's private completion only.
+pub(crate) fn consume_query_rows(
+    limit: core::num::NonZeroU64,
+    evaluate: impl FnOnce(
+        &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    const CONSUMER_COMPLETE: &str = "PZ004";
+    let mut remaining = limit.get();
+    let mut completed = false;
+    let result = evaluate(&mut |values| {
+        emit(values)?;
+        remaining -= 1;
+        if remaining == 0 {
+            completed = true;
+            return Err(sql_err!(
+                CONSUMER_COMPLETE,
+                "bounded query consumer completed"
+            ));
+        }
+        Ok(())
+    });
+    match result {
+        Err(error) if completed && error.sqlstate == CONSUMER_COMPLETE => Ok(()),
+        result => result,
+    }
+}
+
 /// Streams SELECT output to INSERT, subqueries and routine bodies, including
 /// grouping, ordering, windows and set-returning projections. The consumer
 /// copies each emitted row before returning.

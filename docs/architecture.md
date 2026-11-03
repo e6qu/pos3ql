@@ -214,8 +214,10 @@ runs, and ending a row preserves those command records.
 
 This does not complete every query continuation. Complex plans, functions with
 subqueries or set expansion, named/custom casts and function bodies still have
-restart paths. The cursor reader retains simple table scans and one-row queries
-without a table source, including scalar function calls and built-in casts.
+restart paths. The cursor reader retains simple table scans, constant derived
+VALUES rows and one-row queries without a table source, including scalar function
+calls and built-in casts. A typed syntax marker distinguishes comma-separated
+VALUES from explicit set operations when selecting PostgreSQL's scroll behavior.
 Other cursor plans still materialize their results when opened. Cursors and results already sent to the
 client need the same once-only execution positions before all storage waits can
 yield. Exhaustion remains a named error; no extra per-table or per-query backing

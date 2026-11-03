@@ -1,5 +1,55 @@
 use super::*;
 
+// PG18.6 execution-reference.zip, SQL SHA256:
+// f0793cd42fbcbffd777ee574a5283fd2a159bbfff1df3063b6bb30ee5222c5b1.
+#[test]
+fn procedural_queries_finish_nested_calls_before_publishing_rows_or_locals() {
+    let fixture =
+        include_str!("../../../tests/external/differential/218_live_procedural_queries.sql");
+    let setup = fixture
+        .split("-- Execute and inspect the completed results.")
+        .next()
+        .unwrap();
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("live-procedural-queries-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, setup, true);
+        session.success(&mut engine, "CALL procedural_query_run()", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT kind,value FROM procedural_query_log ORDER BY position; \
+             SELECT last_value FROM procedural_query_calls; SELECT last_value FROM procedural_query_checks", true)),
+            ["perform|3", "select|6", "for|7", "for|9", "record|9", "record|11",
+             "execute_into|11", "execute_for|12", "execute_for|14", "execute_record|14",
+             "execute_record|16", "execute_discard|1", "14", "1"], "{mode:?}");
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT * FROM procedural_query_rows(); SELECT last_value FROM procedural_query_calls; \
+             SELECT last_value FROM procedural_query_checks", true)),
+            ["17", "19", "19", "21", "18", "1"], "{mode:?}");
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT * FROM procedural_query_caught(); SELECT last_value FROM procedural_query_calls; \
+             SELECT * FROM procedural_query_caught_dynamic(); SELECT last_value FROM procedural_query_calls; \
+             SELECT last_value FROM procedural_query_checks", true)),
+            ["31", "99", "20", "33", "98", "22", "1"], "{mode:?}");
+        let setup = fixture
+            .split("-- Bounded INTO setup.")
+            .nth(1)
+            .unwrap()
+            .split("-- Execute bounded INTO cases.")
+            .next()
+            .unwrap();
+        session.success(&mut engine, setup, true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "CALL procedural_into_run(); SELECT kind,selected,effects,consumed FROM procedural_into_log ORDER BY kind", true)),
+            ["dynamic|4|6|3", "dynamic_strict|4|9|3", "static|1|1|1", "static_strict|1|3|2"], "{mode:?}");
+    }
+}
+
 // PostgreSQL 18.6 SQL SHA256:
 // a6d12a932def651411044e1d08dbd2bb3d67c958d9c9ada897433d434a310f1a.
 #[test]
@@ -37,7 +87,6 @@ fn checked_trigger_inputs_preserve_visibility_or_reject_before_constraint_effect
     ] {
         let mut config = test_config(&format!("trigger-input-boundary-{mode:?}"));
         config.transaction_mode = mode;
-        let server = object_reads::HttpObjectServer::start(&mut config);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -87,8 +136,6 @@ fn checked_trigger_inputs_preserve_visibility_or_reject_before_constraint_effect
              SELECT count(*) FROM event_input_audit; SELECT count(*) FROM trigger_input_rows", true)),
             ["3", "1", "2", "3"]);
         drop((session, engine));
-        drop(server);
-        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }
 
@@ -169,6 +216,19 @@ fn template_inputs_keep_copied_type_and_member_lifetimes_after_source_drop_and_r
     ] {
         let mut config = test_config(&format!("cloned-input-owners-{mode:?}"));
         config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!(
+            "cloned-input-owners-{}-{}",
+            std::process::id(),
+            if mode == crate::config::TransactionMode::Mvcc {
+                "mvcc"
+            } else {
+                "locking"
+            }
+        );
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let server = object_reads::HttpObjectServer::start(&mut config);
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -263,6 +323,19 @@ fn stored_query_inputs_follow_enum_resolution_and_schema_edits_without_recheckin
         for checkpoint in [false, true] {
             let mut config = test_config(&format!("resolved-input-sources-{mode:?}-{checkpoint}"));
             config.transaction_mode = mode;
+            config.object_store_on = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!(
+                "resolved-input-sources-{}-{}-{checkpoint}",
+                std::process::id(),
+                if mode == crate::config::TransactionMode::Mvcc {
+                    "mvcc"
+                } else {
+                    "locking"
+                }
+            );
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             let server = object_reads::HttpObjectServer::start(&mut config);
             let mut budget = test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();

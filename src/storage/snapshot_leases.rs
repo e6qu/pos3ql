@@ -65,12 +65,12 @@ pub(super) fn snapshot_owner_bytes() -> usize {
 
 impl SnapshotState {
     pub(super) fn retains_for(&self, transaction: u32) -> bool {
-        !self.exported.is_empty()
-            || self.active.iter().any(|(owner, _)| *owner != transaction)
-            || self
-                .statements
-                .iter()
-                .any(|statement| statement.lsn.is_some() && statement.transaction != transaction)
+        self.transaction_mode == crate::config::TransactionMode::Mvcc
+            && (!self.exported.is_empty()
+                || self.active.iter().any(|(owner, _)| *owner != transaction)
+                || self.statements.iter().any(|statement| {
+                    statement.lsn.is_some() && statement.transaction != transaction
+                }))
     }
     pub(super) fn oldest(&self) -> Option<u64> {
         if self.transaction_mode == crate::config::TransactionMode::Locking {
@@ -633,6 +633,90 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn locking_statement_leases_keep_selected_bytes_without_reserving_row_history() {
+        let mut config = test_config();
+        config.transaction_mode = crate::config::TransactionMode::Locking;
+        config.row_history_slots = 0;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(make_def("locking_lease", &[("id", ColType::Int4, true)]))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let original = storage.heap.append_row(&[Datum::Int4(1)]).unwrap();
+            storage.tables[table]
+                .rows
+                .insert(1, RowState::committed_only_at(original, 7))
+                .unwrap();
+            storage.set_lsn(7);
+            storage.restore_visible_lsn(7);
+            let reader = storage.retain_statement_snapshot(99, |lsn| lsn).unwrap();
+            assert!(!storage.snapshot_state().retains_for(8));
+            assert_eq!(
+                storage.schema_lock_blocker(8),
+                Some(super::super::SchemaLockBlocker::Transaction(99))
+            );
+            let selected = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    99,
+                    crate::storage::SNAPSHOT_ALL,
+                    reader.snapshot(),
+                )
+                .unwrap()
+                .unwrap();
+            let replacement = storage.heap.append_row(&[Datum::Int4(20)]).unwrap();
+            storage
+                .write_pending(table, 1, 8, 1, Some(replacement))
+                .unwrap();
+            storage
+                .validate_row_history_publication(8, [(table, 1)].into_iter())
+                .unwrap();
+            storage.commit_row(table, 1, 8, 9).unwrap();
+            assert!(
+                storage
+                    .resident_row_state(table, 1)
+                    .unwrap()
+                    .unwrap()
+                    .history
+                    .is_empty()
+            );
+            storage
+                .with_row_bytes(table, 1, selected, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(1));
+                    Ok(())
+                })
+                .unwrap();
+            let current = storage
+                .visible_row_home_at(
+                    table,
+                    1,
+                    storage.resident_row_state(table, 1).unwrap().unwrap(),
+                    99,
+                    crate::storage::SNAPSHOT_ALL,
+                    reader.snapshot(),
+                )
+                .unwrap()
+                .unwrap();
+            storage
+                .with_row_bytes(table, 1, current, |bytes| {
+                    let mut values = [Datum::Null];
+                    crate::storage::rowenc::decode(bytes, &[ColType::Int4], &mut values)?;
+                    assert_eq!(values[0], Datum::Int4(20));
+                    Ok(())
+                })
+                .unwrap();
+            drop(reader);
+            assert_eq!(storage.schema_lock_blocker(8), None);
+            assert!(!storage.has_active_snapshots());
+        });
     }
 
     #[test]

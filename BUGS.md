@@ -28,6 +28,9 @@ change the role observed inside its body or permit direct unauthorized calls.
 Transaction handoffs must preserve the waiting frontend's plan owner and release
 free-worker ownership. Keep legitimate lock waits in regressions and resume the
 same suspended state; distinguish those waits from lost state or repeated effects.
+Preserve PostgreSQL's completed RETURN QUERY rows after caught SQL errors while
+preventing duplicates across private retries. Recovery fixtures must enable and
+exercise their declared durable tier before deleting caches.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

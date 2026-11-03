@@ -3452,7 +3452,7 @@ impl Conn {
                 &mut self.send,
                 &mut self.phase,
                 sqlstate::DUPLICATE_CURSOR,
-                crate::stack_format!(96, "portal \"{portal_name}\" already exists").as_str(),
+                crate::stack_format!(96, "cursor \"{portal_name}\" already exists").as_str(),
             );
         }
         let slot = self
@@ -4160,6 +4160,14 @@ impl Conn {
                 }
             }
         };
+        if matches!(result, Ok(crate::sql::ExecutionStatus::Complete))
+            && self.txn.mode == crate::sql::txn::TxnMode::Idle
+        {
+            for portal in &mut self.portals {
+                portal.active = false;
+            }
+            self.release_closed_statement_plans();
+        }
         self.apply_protocol_reset(engine);
         self.arena.reset();
         self.recv.consume(total);
@@ -5437,6 +5445,7 @@ fn restore_portal_parameters<'a>(
     Ok((values, oids))
 }
 
+#[derive(Debug)]
 enum Step {
     Continue,
     NeedMoreData,
@@ -6032,7 +6041,11 @@ mod tests {
                         &mut engine,
                         "SELECT last_value::text||':'||is_called::text FROM input_wait_checks",
                     );
-                    assert!(contains_value(&state, b"2:true"));
+                    assert!(
+                        contains_value(&state, b"2:true"),
+                        "mode {mode:?}, Parse {parse}, cancel {cancel}, timeout {timeout}: {}",
+                        String::from_utf8_lossy(&state)
+                    );
                     if cancel || timeout {
                         if cancel {
                             assert!(crate::mem::guard::forbid_alloc(
@@ -6193,10 +6206,15 @@ mod tests {
                     wire::FMSG_QUERY,
                     b"SELECT '{a}'::receipt_checked[]\0"
                 )));
-                assert!(matches!(
-                    crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
-                    Step::Parked
-                ));
+                assert!(
+                    matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Parked
+                    ),
+                    "mode {mode:?}, cancel {cancel}: {}, fatal {:?}",
+                    String::from_utf8_lossy(writer.send.readable()),
+                    engine.fatal_commit_failure()
+                );
                 assert!(writer.send.is_empty());
                 assert_eq!(
                     writer.cursors.len(),

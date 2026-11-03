@@ -64,3 +64,15 @@ creation publishes before `Sync`; concurrent index commands expose intermediate
 catalog states before their final transaction ends. Bound integer and text
 parameters skip unreached function checks. Extract it and run
 `python3 verify-protocol-reference.py .` to check file hashes and these observations.
+
+[execution-reference.zip](execution-reference.zip), SHA256
+`ad4cfd16a752ff34ec8ab52255f9d1a6b3326cfb398938476bde9305fb4c2756`,
+retains the cursor-source and procedural-query probes. Two comma-separated VALUES
+rows allow backward fetching by default; one VALUES row and explicit UNION ALL
+do not. Declaring these cursors does not run their sequence calls. Procedural
+queries reuse checked inputs, and a caught `RETURN QUERY` error preserves rows
+already produced before its handler runs. Static SELECT INTO stops after one row,
+or two with STRICT; dynamic EXECUTE INTO
+evaluates the full query. The archive includes raw output, exact
+sources, provenance and `verify-execution-reference.py`; extract it and run
+`python3 verify-execution-reference.py .` to verify the observations and 21 hashes.

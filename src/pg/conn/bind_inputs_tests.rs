@@ -52,16 +52,25 @@ fn first_row(mut bytes: &[u8]) -> String {
 fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8], error: bool) -> Vec<u8> {
     conn.send.clear();
     assert!(conn.recv.append(&frontend(kind, payload)));
-    assert!(matches!(
-        crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
-        Step::Continue
-    ));
+    let step = crate::mem::guard::forbid_alloc(|| conn.process_message(engine));
+    assert!(
+        matches!(step, Step::Continue),
+        "frontend {} {:?}, step {step:?}: {}, fatal {:?}",
+        char::from(kind),
+        payload,
+        String::from_utf8_lossy(conn.send.readable()),
+        engine.fatal_commit_failure()
+    );
     let response = conn.send.readable().to_vec();
     assert_eq!(
         has_message(&response, wire::MSG_ERROR_RESPONSE),
         error,
-        "{}",
-        String::from_utf8_lossy(&response)
+        "frontend {} {:?}: {}, transaction {:?}, fatal {:?}",
+        char::from(kind),
+        payload,
+        String::from_utf8_lossy(&response),
+        conn.txn.mode,
+        engine.fatal_commit_failure()
     );
     response
 }
@@ -180,14 +189,40 @@ fn prepared_resolution_distinguishes_bind_from_an_executed_pipeline() {
                     )),
                     "bind-held"
                 );
-                assert_eq!(
-                    first_row(&query(
-                        &mut conn,
-                        &mut engine,
-                        "SELECT value FROM bind_prepared WHERE id=1"
-                    )),
-                    "before"
-                );
+                match mode {
+                    crate::config::TransactionMode::Mvcc => assert_eq!(
+                        first_row(&query(
+                            &mut conn,
+                            &mut engine,
+                            "SELECT value FROM bind_prepared WHERE id=1"
+                        )),
+                        "before"
+                    ),
+                    crate::config::TransactionMode::Locking => {
+                        conn.send.clear();
+                        assert!(conn.recv.append(&frontend(
+                            wire::FMSG_QUERY,
+                            b"SELECT value FROM bind_prepared WHERE id=1\0"
+                        )));
+                        let step =
+                            crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine));
+                        assert!(
+                            matches!(step, Step::Parked),
+                            "{step:?}: {}",
+                            String::from_utf8_lossy(conn.send.readable())
+                        );
+                        assert!(crate::mem::guard::forbid_alloc(
+                            || conn.cancel_parked(&mut engine)
+                        ));
+                        assert!(
+                            conn.send
+                                .readable()
+                                .windows(5)
+                                .any(|bytes| bytes == b"57014")
+                        );
+                        assert_eq!(conn.txn.mode, crate::sql::txn::TxnMode::Idle);
+                    }
+                }
                 match context {
                     "pipeline" => {
                         bind_command(&mut conn, &mut engine, "SELECT 1");
@@ -319,18 +354,19 @@ fn immediate_utilities_publish_before_sync_with_postgresql_completion_tags() {
 }
 
 #[test]
+#[cfg(not(miri))]
 fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
     let mut config = config(
         "immediate-utility-wait",
         crate::config::TransactionMode::Mvcc,
     );
     config.object_store_on = true;
-    config.object_store_sim = true;
     config.object_store_bucket = format!("immediate-utility-wait-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 1 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let server = crate::sql::HttpObjectServer::start(&mut config);
     let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut conn = Conn::new(&config, &mut budget).unwrap();
@@ -429,7 +465,58 @@ fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
     );
     drop(recovered_conn);
     drop(recovered);
+    drop(server);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn duplicate_named_bind_aborts_the_block_and_rollback_releases_the_portal() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("duplicate-bind-recovery", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.id = 1;
+        conn.phase = Phase::Ready;
+        query(&mut conn, &mut engine, "BEGIN");
+        parse(&mut conn, &mut engine, "SELECT 7", &[]);
+        message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("duplicate_portal", &[]),
+            false,
+        );
+        let duplicate = message(
+            &mut conn,
+            &mut engine,
+            wire::FMSG_BIND,
+            &bind_payload("duplicate_portal", &[]),
+            true,
+        );
+        assert!(duplicate.windows(5).any(|bytes| bytes == b"42P03"));
+        assert!(
+            duplicate
+                .windows(b"cursor \"duplicate_portal\" already exists".len())
+                .any(|bytes| bytes == b"cursor \"duplicate_portal\" already exists")
+        );
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(conn.txn.status_byte(), b'E');
+        let execute = b"duplicate_portal\0\0\0\0\0";
+        let failed = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, execute, true);
+        assert!(failed.windows(5).any(|bytes| bytes == b"25P02"));
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        query(&mut conn, &mut engine, "ROLLBACK");
+        assert_eq!(conn.txn.status_byte(), b'I');
+        assert!(conn.portals.iter().all(|portal| !portal.active));
+        let gone = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, execute, true);
+        assert!(gone.windows(5).any(|bytes| bytes == b"34000"));
+        message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(first_row(&query(&mut conn, &mut engine, "SELECT 9")), "9");
+    }
 }
 
 #[test]
@@ -1072,7 +1159,8 @@ fn custom_bind_parameters_prune_unreached_inputs_before_checking_function_bodies
                         &mut engine,
                         "SELECT is_called FROM bind_branch_checks"
                     )),
-                    expected_checks
+                    expected_checks,
+                    "mode {mode:?}: {sql}, parameter {parameter:?}"
                 );
                 assert_eq!(
                     first_row(&message(

@@ -1,4 +1,4 @@
-//! Owned physical input positions for cursors and suspended statement rows.
+//! Retained input positions for cursors and suspended statement rows.
 
 use super::*;
 use crate::mem::arena::ArenaMark;
@@ -20,6 +20,7 @@ struct PendingRow<'a> {
 
 enum RetainedRow<'a> {
     Physical(CursorRow<'a>),
+    Literal(&'a [u8]),
     Singleton,
 }
 
@@ -27,15 +28,23 @@ enum RetainedRow<'a> {
     clippy::large_enum_variant,
     reason = "physical cursors retain their existing inline control storage; singleton sources need no additional arena owner"
 )]
-enum RetainedSource {
+enum RetainedSource<'a> {
     Physical(RowCursor),
-    Singleton { available: bool },
+    Literals {
+        rows: &'a [&'a [u8]],
+        next: usize,
+        scrollable: bool,
+    },
+    Singleton {
+        available: bool,
+    },
 }
 
-impl RetainedSource {
+impl RetainedSource<'_> {
     fn close(&mut self) {
         match self {
             Self::Physical(cursor) => cursor.close(),
+            Self::Literals { rows, next, .. } => *next = rows.len(),
             Self::Singleton { available } => *available = false,
         }
     }
@@ -47,6 +56,13 @@ impl PendingRow<'_> {
         scope: &QueryScope<'_>,
         values: &mut [Datum<'row>; MAX_COLUMNS],
     ) -> Result<(), SqlError> {
+        if let RetainedRow::Literal(bytes) = self.row {
+            let definition = scope.defs.get(0).expect("literal source definition");
+            for (column, value) in values[..definition.n_columns].iter_mut().enumerate() {
+                *value = crate::sql::exec::decode_projected_pub(bytes, column);
+            }
+            return Ok(());
+        }
         let RetainedRow::Physical(row) = &self.row else {
             return Ok(());
         };
@@ -94,7 +110,7 @@ pub(crate) struct RetainedSelect<'a> {
     predicate: Option<&'a Expr<'a>>,
     bounds: RowBounds<'a>,
     scope: QueryScope<'a>,
-    source: RetainedSource,
+    source: RetainedSource<'a>,
     decoded_columns: Option<[bool; MAX_COLUMNS]>,
     pending: Option<PendingRow<'a>>,
     state: ReaderState,
@@ -810,10 +826,78 @@ fn bind_defaults<'a>(
     Ok((bound.as_slice(), explicit_variadic, true))
 }
 
+// VALUES is parsed as SELECT leaves joined by UNION ALL. Encoding primitive
+// literals cannot execute casts, constraints or user code while opening a cursor.
+fn literal_source(select: &Select<'_>) -> Option<usize> {
+    if select.from.is_some()
+        || select.where_clause.is_some()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.with_ties
+        || !select.with.is_empty()
+        || !select.locking.is_empty()
+    {
+        return None;
+    }
+    if let Some(tree) = select.set_body {
+        return literal_source_tree(tree);
+    }
+    select
+        .items
+        .iter()
+        .all(|item| {
+            matches!(item, SelectItem::Expr { expression, .. } if matches!(expression,
+            Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_)
+                | Expr::NumericLit(_) | Expr::Str(_) | Expr::BitLit(_)))
+        })
+        .then_some(1)
+}
+
+fn literal_source_tree(tree: &crate::sql::ast::SetTree<'_>) -> Option<usize> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => literal_source(select),
+        crate::sql::ast::SetTree::Op {
+            operator: crate::sql::ast::SetOp::Union,
+            all: true,
+            left,
+            right,
+            ..
+        } => literal_source_tree(left)?.checked_add(literal_source_tree(right)?),
+        crate::sql::ast::SetTree::Op { .. } => None,
+    }
+}
+
+fn literal_source_scrollable(tree: &crate::sql::ast::SetTree<'_>) -> bool {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            select.set_body.is_some_and(literal_source_scrollable)
+        }
+        crate::sql::ast::SetTree::Op {
+            syntax: crate::sql::ast::SetOperationSyntax::Values,
+            ..
+        } => true,
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            literal_source_scrollable(left) && literal_source_scrollable(right)
+        }
+    }
+}
+
 impl<'a> RetainedSelect<'a> {
     pub(crate) fn default_scrollable(&self) -> bool {
-        matches!(self.source, RetainedSource::Physical(_))
-            && !matches!(self.state, ReaderState::Eliminated)
+        matches!(
+            self.source,
+            RetainedSource::Physical(_)
+                | RetainedSource::Literals {
+                    scrollable: true,
+                    ..
+                }
+        ) && !matches!(self.state, ReaderState::Eliminated)
     }
 
     pub(crate) fn uses_table(&self, table: usize) -> bool {
@@ -878,13 +962,20 @@ impl<'a> RetainedSelect<'a> {
         mode: RetainedMode,
     ) -> Result<Option<Self>, SqlError> {
         let from = statement.from.as_ref();
+        let literal_count = (mode == RetainedMode::Cursor)
+            .then(|| {
+                from.and_then(|from| from.base.subquery)
+                    .and_then(literal_source)
+            })
+            .flatten();
+        let literals = literal_count.is_some();
         if from.is_none() && mode == RetainedMode::Statement {
             return Ok(None);
         }
         if from.is_some_and(|from| {
             !from.joins.is_empty()
                 || from.base.is_function_source()
-                || from.base.subquery.is_some()
+                || from.base.subquery.is_some() && !literals
                 || from.base.cte.is_some()
                 || from.base.sample.is_some()
                 || matches!(
@@ -928,7 +1019,42 @@ impl<'a> RetainedSelect<'a> {
         let scope = match from {
             Some(from) => {
                 let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-                if scope.n != 1 || scope.derived[0].is_some() || scope.slots[0] == usize::MAX {
+                if let Some(count) = literal_count {
+                    let rows = arena
+                        .alloc_slice_with(count, |_| &[][..])
+                        .map_err(|_| arena_full())?;
+                    let mut next = 0;
+                    select_into_rows(
+                        storage,
+                        txid,
+                        from.base.subquery.expect("literal source"),
+                        arena,
+                        params,
+                        None,
+                        None,
+                        &mut |values| {
+                            let row = rows.get_mut(next).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "literal source row count changed"
+                                )
+                            })?;
+                            *row = crate::sql::exec::encode_projected_pub(values, arena)?;
+                            next += 1;
+                            Ok(())
+                        },
+                    )?;
+                    if next != count {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "literal source row count changed"
+                        ));
+                    }
+                    scope.derived[0] = Some(rows);
+                }
+                if scope.n != 1
+                    || !literals && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
+                {
                     return Ok(None);
                 }
                 scope
@@ -986,7 +1112,7 @@ impl<'a> RetainedSelect<'a> {
             }
         }
         let binding_columns = Some(&columns);
-        let table = if let Some(from) = from {
+        let table = if let Some(from) = from.filter(|_| !literals) {
             let table = scope.slots[0];
             let definition = scope.defs.stored(0).expect("resolved physical source");
             if definition.kind != crate::storage::TableKind::Local
@@ -1012,7 +1138,7 @@ impl<'a> RetainedSelect<'a> {
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         check_select_constants(statement, arena, storage, txid)?;
-        let demand = from.map(|from| {
+        let demand = from.filter(|_| table.is_some()).map(|from| {
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause)
         });
         if let Some(demand) = demand {
@@ -1159,6 +1285,17 @@ impl<'a> RetainedSelect<'a> {
                 source.open(storage, table, txid, arena)?;
             }
             RetainedSource::Physical(source)
+        } else if literals {
+            let rows = scope.derived[0].expect("literal derived source owns encoded rows");
+            let scrollable = from
+                .and_then(|from| from.base.subquery)
+                .and_then(|query| query.set_body)
+                .is_some_and(literal_source_scrollable);
+            RetainedSource::Literals {
+                rows,
+                next: if eliminated { rows.len() } else { 0 },
+                scrollable,
+            }
         } else {
             RetainedSource::Singleton {
                 available: !eliminated,
@@ -1241,6 +1378,13 @@ impl<'a> RetainedSelect<'a> {
                 RetainedSource::Singleton { available } => {
                     Ok(core::mem::replace(available, false).then_some(RetainedRow::Singleton))
                 }
+                RetainedSource::Literals { rows, next, .. } => {
+                    let row = rows.get(*next).copied();
+                    if row.is_some() {
+                        *next += 1;
+                    }
+                    Ok(row.map(RetainedRow::Literal))
+                }
             };
             let row = match next {
                 Ok(row) => row,
@@ -1282,6 +1426,7 @@ impl<'a> RetainedSelect<'a> {
         let rowids = [match &pending.row {
             RetainedRow::Physical(row) => Some(row.rowid),
             RetainedRow::Singleton => None,
+            RetainedRow::Literal(_) => None,
         }];
         each(&scan::JoinRow {
             scope: &self.scope,

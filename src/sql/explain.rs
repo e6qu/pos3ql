@@ -1331,6 +1331,7 @@ fn push_set_tree(
             all,
             left,
             right,
+            ..
         } => {
             let at = plan.count;
             plan.push(PlanNode::EMPTY)?;

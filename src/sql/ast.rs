@@ -3098,11 +3098,19 @@ pub enum SetOp {
 pub enum SetTree<'a> {
     Select(&'a Select<'a>),
     Op {
+        /// VALUES and explicit UNION ALL differ in automatic cursor scrolling.
+        syntax: SetOperationSyntax,
         operator: SetOp,
         all: bool,
         left: &'a SetTree<'a>,
         right: &'a SetTree<'a>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperationSyntax {
+    Explicit,
+    Values,
 }
 
 /// A set-operation query plus the trailing ORDER BY / LIMIT / OFFSET that apply

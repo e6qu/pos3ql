@@ -1,6 +1,126 @@
 use super::*;
 
 #[test]
+fn literal_values_cursors_defer_projections_and_preserve_source_positions() {
+    let config = test_config("literal-values-cursor-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE literal_effects START 10; \
+         CREATE FUNCTION literal_value(value integer) RETURNS bigint LANGUAGE sql VOLATILE \
+         SET search_path=public AS $$SELECT nextval('literal_effects')+$1$$; BEGIN; \
+         DECLARE literal_cursor NO SCROLL CURSOR FOR \
+         SELECT literal_value(id) FROM (VALUES(1),(2),(3)) source(id)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM literal_effects; FETCH 0 FROM literal_cursor; \
+         SELECT last_value,is_called FROM literal_effects",
+            true
+        )),
+        ["10|f", "10|f"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "FETCH 1 FROM literal_cursor; FETCH 1 FROM literal_cursor; FETCH ALL FROM literal_cursor; \
+         FETCH 1 FROM literal_cursor; SELECT last_value FROM literal_effects; \
+         CLOSE literal_cursor; COMMIT", true)), ["11", "13", "15", "12"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE literal_held NO SCROLL CURSOR WITH HOLD FOR \
+         SELECT literal_value(id) FROM (VALUES(7),(8)) source(id); \
+         SELECT last_value FROM literal_effects; COMMIT; FETCH ALL FROM literal_held; \
+         SELECT last_value FROM literal_effects; CLOSE literal_held",
+            true
+        )),
+        ["12", "20", "22", "14"]
+    );
+    for (source, expected) in [
+        ("(VALUES(1))", "f"),
+        ("(VALUES(1),(2))", "t"),
+        ("(SELECT 1 UNION ALL SELECT 2)", "f"),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE literal_auto CURSOR FOR SELECT * FROM {source} source(id)"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='literal_auto'",
+                true
+            )),
+            [expected],
+            "{source}"
+        );
+        session.success(&mut engine, "CLOSE literal_auto; COMMIT", true);
+    }
+}
+
+#[test]
+fn literal_values_cursor_retries_keep_the_current_row_and_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("literal-values-cursor-wait-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        reader.success(
+            &mut engine,
+            "CREATE SEQUENCE literal_wait_effects; CREATE TABLE literal_gate(value integer); \
+             INSERT INTO literal_gate VALUES(0); CREATE FUNCTION literal_wait(requested integer) \
+             RETURNS integer LANGUAGE plpgsql AS $$BEGIN PERFORM nextval('literal_wait_effects'); \
+             UPDATE literal_gate SET value=value+1; RETURN requested; END$$",
+            true,
+        );
+        writer.success(
+            &mut engine,
+            "BEGIN; UPDATE literal_gate SET value=value+1",
+            true,
+        );
+        reader.success(&mut engine, "BEGIN; DECLARE literal_wait_cursor NO SCROLL CURSOR FOR SELECT literal_wait(id) FROM (VALUES(4),(5)) source(id)", true);
+        let status = reader.execute_status(&mut engine, "FETCH 1 FROM literal_wait_cursor", true);
+        assert!(
+            matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::Lock,
+                    ..
+                }
+            ),
+            "{mode:?}: {status:?}: {}",
+            String::from_utf8_lossy(reader.send.readable())
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT last_value FROM literal_wait_effects",
+                true
+            )),
+            ["1"]
+        );
+        writer.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, "FETCH 1 FROM literal_wait_cursor", true)),
+            ["4"]
+        );
+        assert_eq!(data_rows(&reader.success(&mut engine, "FETCH ALL FROM literal_wait_cursor; SELECT last_value FROM literal_wait_effects; CLOSE literal_wait_cursor; COMMIT", true)), ["5", "2"]);
+        drop((reader, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn singleton_cursor_wildcards_require_relations_and_preserve_zero_column_rows() {
     let config = test_config("singleton-cursor-wildcards");
     let mut budget = test_engine_budget(&config, 1 << 29);

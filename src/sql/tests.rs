@@ -18,7 +18,7 @@ mod geometric_casts;
 mod geometry_assignments;
 mod key_preparation;
 mod nested_planner_inputs;
-mod object_reads;
+pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod prepared_object_capacity;

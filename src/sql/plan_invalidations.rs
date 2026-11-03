@@ -474,6 +474,38 @@ mod tests {
                     .sqlstate,
                 sqlstate::OBJECT_IN_USE
             );
+            let resolver = other.stamp(false).unwrap();
+            let resolved: Result<(), ()> = replacement.with_detached_plan_owner(|transaction| {
+                assert!(transaction.plan_invalidation_owner().is_none());
+                transaction.clear();
+                Err(())
+            });
+            assert!(resolved.is_err());
+            assert!(resolver.matches().unwrap());
+            replacement.bind_plan_invalidations(&other).unwrap();
+            replacement.mode = super::super::txn::TxnMode::Explicit;
+            assert_eq!(
+                replacement
+                    .bind_plan_invalidations(&first)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_IN_USE
+            );
         });
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replacement.with_detached_plan_owner(|transaction| {
+                assert!(transaction.plan_invalidation_owner().is_none());
+                panic!("prepared resolution unwinds");
+            });
+        }));
+        assert!(unwind.is_err());
+        replacement.bind_plan_invalidations(&other).unwrap();
+        assert_eq!(
+            replacement
+                .bind_plan_invalidations(&first)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::OBJECT_IN_USE
+        );
     }
 }

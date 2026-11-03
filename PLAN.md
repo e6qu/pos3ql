@@ -110,7 +110,7 @@ row changes, local variables, branch position and transition rows while input
 preparation waits. Verify that constraints see the preceding transaction and
 statement changes, run once, and do not fire in unreached branches. Do not route
 these checks through a retry that first undoes the rows they must observe.
-Keep simple table and one-row cursor expressions deferred until fetching,
+Keep simple table, constant VALUES and one-row cursor expressions deferred until fetching,
 including scalar calls, then extend those positions to the remaining cursor
 plans that currently execute when opened. Ordinary PL statements without any
 checked or planner inputs must not consume checked-plan slots. Keep running
@@ -118,6 +118,13 @@ images alive when `DISCARD PLANS` refreshes future query admissions.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.
+Procedural query handoffs must publish rows and local assignments at their proper
+boundary. A real caught RETURN QUERY error preserves its completed row prefix;
+a private retry must not publish that prefix twice. Compare static SELECT INTO's
+one/two-row consumption with dynamic EXECUTE INTO, which evaluates the query fully.
+Cold-recovery tests must explicitly enable object storage and synchronous journal
+publication before deleting local files; starting an HTTP fixture alone proves
+neither configuration nor durability.
 
 Extend those positions through function bodies and object-store waits, complex
 plans, named/custom casts, SQL cursors and results already sent to the client.

@@ -3007,6 +3007,7 @@ impl<'a> Parser<'a> {
             let all = self.set_all()?;
             let right = self.set_intersect()?;
             left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                 operator,
                 all,
                 left,
@@ -3023,6 +3024,7 @@ impl<'a> Parser<'a> {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
             left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                 operator: SetOp::Intersect,
                 all,
                 left,
@@ -3136,6 +3138,7 @@ impl<'a> Parser<'a> {
                 tree = Some(match tree {
                     None => leaf,
                     Some(l) => self.alloc_set(SetTree::Op {
+                        syntax: crate::sql::ast::SetOperationSyntax::Values,
                         operator: SetOp::Union,
                         all: true,
                         left: l,

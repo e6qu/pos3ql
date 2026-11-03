@@ -22588,6 +22588,89 @@ fn eval_trigger_expression<'a>(
     eval_full(expression, context.arena, context.params, row, &hooks)
 }
 
+/// A query attempt owns its counts and captured rows. Its caller publishes
+/// those results only after every deferred routine invocation has completed.
+/// Completed RETURN QUERY rows remain visible across a caught SQL error.
+struct ProceduralQueryRows<'a> {
+    rows: &'a [&'a [u8]],
+    terminal_error: Option<SqlError>,
+}
+
+impl<'a> ProceduralQueryRows<'a> {
+    fn complete(rows: &'a [&'a [u8]], result: Result<(), SqlError>) -> Result<Self, SqlError> {
+        match result {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        | sqlstate::INTERNAL_LOCK_WAIT
+                        | sqlstate::INTERNAL_IO_WAIT
+                        | sqlstate::QUERY_CANCELED
+                ) =>
+            {
+                Err(error)
+            }
+            result => Ok(Self {
+                rows,
+                terminal_error: result.err(),
+            }),
+        }
+    }
+}
+
+fn execute_procedural_query<T>(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    mut evaluate: impl FnMut(&Storage, &dyn crate::sql::eval::SequenceAccess) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let txid = context.txn.txid;
+    match &mut context.host {
+        PlpgsqlExecHost::Atomic {
+            storage,
+            seq_session,
+            ..
+        } => {
+            let sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+            evaluate(storage, &sequence)
+        }
+        PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            ..
+        } => {
+            let snapshot = engine.storage.read_snapshot();
+            let arena = context.arena;
+            engine
+                .execute_retained_expression(
+                    arena,
+                    snapshot,
+                    context.txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    context.responder,
+                    |storage, _work, sequence, _invocations, _cursors| {
+                        let mark = arena.mark();
+                        let result = evaluate(storage, sequence);
+                        if result.is_err() {
+                            // Pending calls and replay receipts own persistent-tail
+                            // bytes; failed attempts retain no front-allocated rows.
+                            unsafe { arena.rewind_to(mark) };
+                        }
+                        result
+                    },
+                )
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "PL/pgSQL query exceeds the send buffer"
+                    )
+                })?
+        }
+    }
+}
+
 fn eval_procedural_expression<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
@@ -22960,42 +23043,59 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
 }
 
 fn execute_bound_plpgsql_dynamic_query<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     query: BoundPlpgsqlCommand<'a>,
-    sequence: &dyn crate::sql::eval::SequenceAccess,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
-    let input_source = plpgsql_command_source(query.source, context.arena)?;
-    super::type_input_plans::with_owner(query.owner, || {
+    let arena = context.arena;
+    let txid = context.txn.txid;
+    let input_source = plpgsql_command_source(query.source, arena)?;
+    let rows = super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
-            with_bound_parameter_types(query.parameter_types, || match query.statement {
-                Stmt::Select(select) => super::query::select_into_rows(
-                    context.storage(),
-                    context.txn.txid,
-                    select,
-                    context.arena,
-                    query.arguments,
-                    None,
-                    Some(sequence),
-                    emit,
-                ),
-                Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
-                    context.storage(),
-                    context.txn.txid,
-                    set_query,
-                    context.arena,
-                    query.arguments,
-                    Some(sequence),
-                    emit,
-                ),
-                _ => Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
-                )),
+            with_bound_parameter_types(query.parameter_types, || {
+                execute_procedural_query(context, |storage, sequence| {
+                    let mut rows = ArenaList::new(arena);
+                    let mut capture = |values: &[Datum]| {
+                        rows.push(encode_projected_pub(values, arena)?)
+                            .map_err(|_| super::query::arena_full_pub())
+                    };
+                    let result = match query.statement {
+                        Stmt::Select(select) => super::query::select_into_rows(
+                            storage,
+                            txid,
+                            select,
+                            arena,
+                            query.arguments,
+                            None,
+                            Some(sequence),
+                            &mut capture,
+                        ),
+                        Stmt::SetQuery(set_query) => super::query::set_query_into_rows(
+                            storage,
+                            txid,
+                            set_query,
+                            arena,
+                            query.arguments,
+                            Some(sequence),
+                            &mut capture,
+                        ),
+                        _ => Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
+                        )),
+                    };
+                    ProceduralQueryRows::complete(rows.as_slice(), result)
+                })
             })
         })
-    })
+    })?;
+    for row in rows.rows {
+        let mut values = [Datum::Null; MAX_PROJ];
+        let width = decode_projected_row_into(row, arena, &mut values)?;
+        emit(&values[..width])?;
+    }
+    rows.terminal_error.map_or(Ok(()), Err)
 }
 
 /// Executes a parsed dynamic data-modifying statement through the same
@@ -25566,28 +25666,32 @@ fn trigger_loop_integer(value: Datum<'_>, arena: &Arena) -> Result<i64, SqlError
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "query materialization retains explicit query/result lifetimes and live evaluation context"
+)]
 fn materialize_trigger_for_query<'result, 'query>(
     storage: &'query Storage,
     query: &'query Select<'query>,
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
-    execution: TriggerQueryExecution<'_, '_, 'result>,
+    params: &[Datum<'result>],
+    sequence: &dyn crate::sql::eval::SequenceAccess,
     scope: &TriggerLocalScope<'_, 'result>,
 ) -> Result<&'result [Datum<'result>], SqlError>
 where
     'result: 'query,
 {
     let mut rows = ArenaList::new(result_arena);
-    let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
     super::query::select_into_rows(
         storage,
         txid,
         query,
         query_arena,
-        execution.params,
+        params,
         Some(scope),
-        Some(&live),
+        Some(sequence),
         &mut |values| {
             if values.len() != 1 {
                 return Err(sql_err!(
@@ -25608,6 +25712,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     scope: &TriggerLocalScope<'_, 'a>,
     record_target: bool,
 ) -> Result<&'a [Datum<'a>], SqlError> {
+    let arena = context.arena;
     let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     with_bound_parameter_types(query.parameter_types, || {
@@ -25617,7 +25722,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 select,
                 context.storage(),
                 context.txn.txid,
-                context.arena,
+                arena,
                 &mut columns,
             )?,
             Stmt::SetQuery(set_query) => super::query::describe_set_query(
@@ -25625,7 +25730,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 context.txn.txid,
                 set_query,
                 &mut columns,
-                context.arena,
+                arena,
             )?,
             _ => 0,
         };
@@ -25635,13 +25740,8 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 "FOR EXECUTE query must return exactly one column"
             ));
         }
-        let mut rows = ArenaList::new(context.arena);
-        let live = crate::sql::sequence::SeqEval::new(
-            context.storage(),
-            context.seq_session(),
-            context.txn.txid,
-        );
-        execute_bound_plpgsql_dynamic_query(context, query, &live, &mut |values| {
+        let mut rows = ArenaList::new(arena);
+        execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
             if values.len() != width {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -25656,21 +25756,19 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 }; MAX_PROJ];
                 for index in 0..width {
                     fields[index] = RecordField {
-                        name: context
-                            .arena
+                        name: arena
                             .alloc_str(columns[index].name)
                             .map_err(|_| super::query::arena_full_pub())?,
                         type_oid: columns[index].type_oid,
-                        value: detached_trigger_datum(values[index], context.arena)?,
+                        value: detached_trigger_datum(values[index], arena)?,
                     };
                 }
-                let fields = context
-                    .arena
+                let fields = arena
                     .alloc_slice_copy(&fields[..width])
                     .map_err(|_| super::query::arena_full_pub())?;
                 Datum::Record(&*fields)
             } else {
-                detached_trigger_datum(values[0], context.arena)?
+                detached_trigger_datum(values[0], arena)?
             };
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
@@ -25678,13 +25776,18 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "query materialization retains explicit query/result lifetimes and live evaluation context"
+)]
 fn materialize_trigger_for_record_query<'result, 'query>(
     storage: &'query Storage,
     query: &'query Select<'query>,
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
-    execution: TriggerQueryExecution<'_, '_, 'result>,
+    params: &[Datum<'result>],
+    sequence: &dyn crate::sql::eval::SequenceAccess,
     scope: &TriggerLocalScope<'_, 'result>,
 ) -> Result<&'result [Datum<'result>], SqlError>
 where
@@ -25693,15 +25796,14 @@ where
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
     let mut rows = ArenaList::new(result_arena);
-    let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
     super::query::select_into_rows(
         storage,
         txid,
         query,
         query_arena,
-        execution.params,
+        params,
         Some(scope),
-        Some(&live),
+        Some(sequence),
         &mut |values| {
             if values.len() != width {
                 return Err(sql_err!(
@@ -26035,34 +26137,41 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                );
-                super::query::select_into_rows(
-                    context.storage(),
-                    context.txn.txid,
-                    query,
-                    context.arena,
-                    context.params,
-                    Some(&scope),
-                    Some(&sequence),
-                    &mut |values| {
-                        if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
-                            return Err(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "RETURN QUERY produced too many columns"
-                            ));
-                        }
-                        let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
-                        for (index, value) in values.iter().copied().enumerate() {
-                            detached[index] = detached_trigger_datum(value, context.arena)?;
-                        }
-                        status.emit_set_row(&detached[..values.len()], context.arena)
-                    },
-                )?;
+                let arena = context.arena;
+                let params = context.params;
+                let txid = context.txn.txid;
+                let rows = execute_procedural_query(context, |storage, sequence| {
+                    let mut rows = ArenaList::new(arena);
+                    let result = super::query::select_into_rows(
+                        storage,
+                        txid,
+                        query,
+                        arena,
+                        params,
+                        Some(&scope),
+                        Some(sequence),
+                        &mut |values| {
+                            if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
+                                return Err(sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "RETURN QUERY produced too many columns"
+                                ));
+                            }
+                            rows.push(encode_projected_pub(values, arena)?)
+                                .map_err(|_| super::query::arena_full_pub())
+                        },
+                    );
+                    ProceduralQueryRows::complete(rows.as_slice(), result)
+                })?;
+                for row in rows.rows {
+                    let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
+                    let width = decode_projected_row_into(row, arena, &mut values)?;
+                    status.emit_set_row(&values[..width], arena)?;
+                }
 
+                if let Some(error) = rows.terminal_error {
+                    return Err(error);
+                }
                 Ok(None)
             }),
             TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
@@ -26084,12 +26193,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     &scope,
                     DynamicCommandKind::Statement,
                 )?;
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                );
-                execute_bound_plpgsql_dynamic_query(context, query, &sequence, &mut |values| {
+                let arena = context.arena;
+                execute_bound_plpgsql_dynamic_query(context, query, &mut |values| {
                     if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -26098,9 +26203,9 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     }
                     let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                     for (index, value) in values.iter().copied().enumerate() {
-                        detached[index] = detached_trigger_datum(value, context.arena)?;
+                        detached[index] = detached_trigger_datum(value, arena)?;
                     }
-                    status.emit_set_row(&detached[..values.len()], context.arena)
+                    status.emit_set_row(&detached[..values.len()], arena)
                 })?;
 
                 Ok(None)
@@ -26745,70 +26850,78 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 } else {
                     0
                 };
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                );
-                let mut selected = [Datum::Null; MAX_COLUMNS];
-                let mut found = false;
-                let mut row_count = 0usize;
-                super::query::select_into_rows(
-                    context.storage(),
-                    context.txn.txid,
-                    query,
-                    context.arena,
-                    context.params,
-                    Some(&scope),
-                    Some(&sequence),
-                    &mut |values| {
-                        if !record_target && values.len() != statement.targets.len() {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "query returned {} columns but SELECT INTO expects {}",
-                                values.len(),
-                                statement.targets.len()
-                            ));
-                        }
-                        if record_target && values.len() != record_width {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "SELECT INTO record shape changed during execution"
-                            ));
-                        }
-                        if !found {
-                            if record_target {
-                                let mut fields = [RecordField {
-                                    name: "",
-                                    type_oid: 0,
-                                    value: Datum::Null,
-                                }; MAX_PROJ];
-                                for (index, value) in values.iter().copied().enumerate() {
-                                    fields[index] = RecordField {
-                                        name: context
-                                            .arena
-                                            .alloc_str(columns[index].name)
-                                            .map_err(|_| super::query::arena_full_pub())?,
-                                        type_oid: columns[index].type_oid,
-                                        value: detached_trigger_datum(value, context.arena)?,
-                                    };
+                let arena = context.arena;
+                let params = context.params;
+                let txid = context.txn.txid;
+                let (selected, row_count) =
+                    execute_procedural_query(context, |storage, sequence| {
+                        let mut selected = [Datum::Null; MAX_COLUMNS];
+                        let mut found = false;
+                        let mut row_count = 0usize;
+                        super::query::consume_query_rows(
+                            core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
+                                .expect("SELECT INTO consumes one or two rows"),
+                            |emit| {
+                                super::query::select_into_rows(
+                                    storage,
+                                    txid,
+                                    query,
+                                    arena,
+                                    params,
+                                    Some(&scope),
+                                    Some(sequence),
+                                    emit,
+                                )
+                            },
+                            &mut |values| {
+                                if !record_target && values.len() != statement.targets.len() {
+                                    return Err(sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "query returned {} columns but SELECT INTO expects {}",
+                                        values.len(),
+                                        statement.targets.len()
+                                    ));
                                 }
-                                let fields = context
-                                    .arena
-                                    .alloc_slice_copy(&fields[..values.len()])
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                selected[0] = Datum::Record(&*fields);
-                            } else {
-                                for (index, value) in values.iter().copied().enumerate() {
-                                    selected[index] = detached_trigger_datum(value, context.arena)?;
+                                if record_target && values.len() != record_width {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "SELECT INTO record shape changed during execution"
+                                    ));
                                 }
-                            }
-                            found = true;
-                        }
-                        row_count += 1;
-                        Ok(())
-                    },
-                )?;
+                                if !found {
+                                    if record_target {
+                                        let mut fields = [RecordField {
+                                            name: "",
+                                            type_oid: 0,
+                                            value: Datum::Null,
+                                        };
+                                            MAX_PROJ];
+                                        for (index, value) in values.iter().copied().enumerate() {
+                                            fields[index] = RecordField {
+                                                name: arena
+                                                    .alloc_str(columns[index].name)
+                                                    .map_err(|_| super::query::arena_full_pub())?,
+                                                type_oid: columns[index].type_oid,
+                                                value: detached_trigger_datum(value, arena)?,
+                                            };
+                                        }
+                                        let fields = arena
+                                            .alloc_slice_copy(&fields[..values.len()])
+                                            .map_err(|_| super::query::arena_full_pub())?;
+                                        selected[0] = Datum::Record(&*fields);
+                                    } else {
+                                        for (index, value) in values.iter().copied().enumerate() {
+                                            selected[index] = detached_trigger_datum(value, arena)?;
+                                        }
+                                    }
+                                    found = true;
+                                }
+                                row_count += 1;
+                                Ok(())
+                            },
+                        )?;
+                        Ok((selected, row_count))
+                    })?;
                 status.set_rows(row_count as u64)?;
                 if statement.strict {
                     match row_count {
@@ -26908,6 +27021,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         }
                         (record_width, names, type_oids)
                     };
+                    let arena = context.arena;
                     let mut capture = |values: &[Datum]| {
                         if !record_target && values.len() != statement.targets.len() {
                             return Err(sql_err!(
@@ -26932,22 +27046,20 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 }; MAX_PROJ];
                                 for (index, value) in values.iter().copied().enumerate() {
                                     fields[index] = RecordField {
-                                        name: context
-                                            .arena
+                                        name: arena
                                             .alloc_str(record_names[index].as_str())
                                             .map_err(|_| super::query::arena_full_pub())?,
                                         type_oid: record_type_oids[index],
-                                        value: detached_trigger_datum(value, context.arena)?,
+                                        value: detached_trigger_datum(value, arena)?,
                                     };
                                 }
-                                let fields = context
-                                    .arena
+                                let fields = arena
                                     .alloc_slice_copy(&fields[..values.len()])
                                     .map_err(|_| super::query::arena_full_pub())?;
                                 selected[0] = Datum::Record(&*fields);
                             } else {
                                 for (index, value) in values.iter().copied().enumerate() {
-                                    selected[index] = detached_trigger_datum(value, context.arena)?;
+                                    selected[index] = detached_trigger_datum(value, arena)?;
                                 }
                             }
                             found = true;
@@ -27058,17 +27170,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             }
                         }
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
-                            let sequence = crate::sql::sequence::SeqEval::new(
-                                context.storage(),
-                                context.seq_session(),
-                                context.txn.txid,
-                            );
-                            execute_bound_plpgsql_dynamic_query(
-                                context,
-                                query,
-                                &sequence,
-                                &mut capture,
-                            )?;
+                            execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
                         }
                         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
                             let affected = execute_bound_plpgsql_dynamic_dml(
@@ -27140,26 +27242,16 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 with_bound_parameter_types(query.parameter_types, || {
                     let row_count = match query.statement {
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
-                            let sequence = crate::sql::sequence::SeqEval::new(
-                                context.storage(),
-                                context.seq_session(),
-                                context.txn.txid,
-                            );
                             let mut rows = 0u64;
-                            execute_bound_plpgsql_dynamic_query(
-                                context,
-                                query,
-                                &sequence,
-                                &mut |_| {
-                                    rows = rows.checked_add(1).ok_or_else(|| {
-                                        sql_err!(
-                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                            "PL/pgSQL dynamic query returned too many rows"
-                                        )
-                                    })?;
-                                    Ok(())
-                                },
-                            )?;
+                            execute_bound_plpgsql_dynamic_query(context, query, &mut |_| {
+                                rows = rows.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL dynamic query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            })?;
                             rows
                         }
                         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
@@ -27232,25 +27324,31 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session(),
-                    context.txn.txid,
-                );
-                let mut row_count = 0u64;
-                super::query::select_into_rows(
-                    context.storage(),
-                    context.txn.txid,
-                    query,
-                    context.arena,
-                    context.params,
-                    Some(&scope),
-                    Some(&sequence),
-                    &mut |_| {
-                        row_count += 1;
-                        Ok(())
-                    },
-                )?;
+                let arena = context.arena;
+                let params = context.params;
+                let txid = context.txn.txid;
+                let row_count = execute_procedural_query(context, |storage, sequence| {
+                    let mut row_count = 0u64;
+                    super::query::select_into_rows(
+                        storage,
+                        txid,
+                        query,
+                        arena,
+                        params,
+                        Some(&scope),
+                        Some(sequence),
+                        &mut |_| {
+                            row_count = row_count.checked_add(1).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "PL/pgSQL query returned too many rows"
+                                )
+                            })?;
+                            Ok(())
+                        },
+                    )?;
+                    Ok(row_count)
+                })?;
                 status.set_rows(row_count)?;
 
                 Ok(None)
@@ -27997,33 +28095,22 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 invocation,
                                 transition: &transition,
                             };
-                            if locals[target].ctype == ColType::Record {
-                                materialize_trigger_for_record_query(
-                                    context.storage(),
-                                    query,
-                                    context.arena,
-                                    context.arena,
-                                    context.txn.txid,
-                                    TriggerQueryExecution {
-                                        params: context.params,
-                                        seq_session: context.seq_session(),
-                                    },
-                                    &scope,
-                                )?
-                            } else {
-                                materialize_trigger_for_query(
-                                    context.storage(),
-                                    query,
-                                    context.arena,
-                                    context.arena,
-                                    context.txn.txid,
-                                    TriggerQueryExecution {
-                                        params: context.params,
-                                        seq_session: context.seq_session(),
-                                    },
-                                    &scope,
-                                )?
-                            }
+                            let arena = context.arena;
+                            let params = context.params;
+                            let txid = context.txn.txid;
+                            execute_procedural_query(context, |storage, sequence| {
+                                if locals[target].ctype == ColType::Record {
+                                    materialize_trigger_for_record_query(
+                                        storage, query, arena, arena, txid, params, sequence,
+                                        &scope,
+                                    )
+                                } else {
+                                    materialize_trigger_for_query(
+                                        storage, query, arena, arena, txid, params, sequence,
+                                        &scope,
+                                    )
+                                }
+                            })?
                         };
                         let prior_target = local_values[target];
                         status.shadow_output_local(target)?;

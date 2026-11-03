@@ -151,6 +151,114 @@ fn accepted_assignment_inline_inputs_follow_expanded_projection_positions() {
              CREATE CAST(integer AS text) WITH FUNCTION projection_text(integer) AS ASSIGNMENT; \
              CREATE TABLE projection_values(id integer PRIMARY KEY,value text); \
              ALTER SEQUENCE projection_checks RESTART WITH 1", true);
+        {
+            let routine = engine
+                .storage
+                .function_for_call_syntax_oids(
+                    "projection_text",
+                    &[crate::sql::types::oid::INT4],
+                    false,
+                    session.transaction.txid,
+                )
+                .unwrap();
+            let body = routine.body.as_str();
+            let mut parser = Parser::new(body, &session.arena)
+                .unwrap()
+                .with_routine_parameters("projection_text", routine.arguments())
+                .unwrap();
+            parser.capture_type_inputs();
+            let statement = parser.next_stmt().unwrap().unwrap();
+            assert!(parser.next_stmt().unwrap().is_none());
+            {
+                let catalog = query::storage_catalog(
+                    &engine.storage,
+                    &session.arena,
+                    session.transaction.txid,
+                );
+                let _formal = exec::enter_routine_parameter_types(
+                    routine.arguments(),
+                    Some(&catalog),
+                    ast::Collation::None,
+                )
+                .unwrap();
+                query::capture_contextual_type_inputs(
+                    &parser,
+                    &statement,
+                    &engine.storage,
+                    session.transaction.txid,
+                    &session.arena,
+                )
+                .unwrap();
+            }
+            let bindings = type_input_plans::with_owner(type_input_plans::Owner::Backend, || {
+                engine.bind_type_inputs(
+                    parser.type_input_candidates(),
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &session.guc,
+                    &mut Responder::new(&mut session.send),
+                )
+            })
+            .unwrap()
+            .unwrap();
+            assert!(
+                bindings.iter().any(|binding| !binding.encoded.is_empty()),
+                "checked input was admitted"
+            );
+            let mut parser = Parser::new(body, &session.arena)
+                .unwrap()
+                .with_routine_parameters("projection_text", routine.arguments())
+                .unwrap();
+            parser.capture_type_inputs();
+            parser.set_type_inputs(bindings);
+            let statements = [parser.next_stmt().unwrap().unwrap()];
+            type_inputs::validate_restored(&parser, &engine.storage, session.transaction.txid)
+                .unwrap();
+            let catalog =
+                query::storage_catalog(&engine.storage, &session.arena, session.transaction.txid);
+            let _formal = exec::enter_routine_parameter_types(
+                routine.arguments(),
+                Some(&catalog),
+                ast::Collation::None,
+            )
+            .unwrap();
+            let columns = exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage: &engine.storage,
+                txid: session.transaction.txid,
+                arena: &session.arena,
+            };
+            let arguments = [planner_inputs::inline::literal_argument(
+                Datum::Int4(11),
+                crate::sql::types::oid::INT4,
+                &session.arena,
+            )
+            .unwrap()];
+            assert!(
+                planner_inputs::inline::accepted(
+                    &routine,
+                    &statements,
+                    &arguments,
+                    &planner_inputs::inline::Context {
+                        storage: &engine.storage,
+                        txid: session.transaction.txid,
+                        arena: &session.arena,
+                        body_columns: &columns
+                    }
+                )
+                .unwrap(),
+                "bound checked format body must be eligible: {statements:?}"
+            );
+        }
+        session.success(
+            &mut engine,
+            "ROLLBACK; ALTER SEQUENCE projection_checks RESTART WITH 1",
+            true,
+        );
         for (query, expected) in [
             (
                 "INSERT INTO projection_values(value,id) SELECT value,id FROM (VALUES(11,1)) source(value,id)",
@@ -281,6 +389,19 @@ fn sql_procedure_inputs_keep_backend_and_stored_definition_lifetimes_through_rec
             let mut config =
                 test_config(&format!("procedure-input-lifetime-{mode:?}-{checkpoint}"));
             config.transaction_mode = mode;
+            config.object_store_on = true;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.object_store_bucket = format!(
+                "procedure-input-lifetime-{}-{}-{checkpoint}",
+                std::process::id(),
+                if mode == crate::config::TransactionMode::Mvcc {
+                    "mvcc"
+                } else {
+                    "locking"
+                }
+            );
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
             let server = object_reads::HttpObjectServer::start(&mut config);
             let mut budget = test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();

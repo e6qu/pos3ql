@@ -3,6 +3,40 @@ use crate::mem::budget::Budget;
 use crate::storage::{RoutineArgumentDef, RoutineDef, RoutineKind, RoutineResult};
 
 #[test]
+fn bounded_consumer_stops_before_another_row_effect_and_keeps_unowned_errors() {
+    crate::mem::guard::forbid_alloc(|| {
+        for limit in [1, 2] {
+            let mut evaluated = 0;
+            let mut emitted = 0;
+            consume_query_rows(
+                core::num::NonZeroU64::new(limit).unwrap(),
+                |emit| {
+                    for value in 0..4 {
+                        evaluated += 1;
+                        emit(&[Datum::Int4(value)])?;
+                    }
+                    Ok(())
+                },
+                &mut |_| {
+                    emitted += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(evaluated, limit);
+            assert_eq!(emitted, limit);
+        }
+        let error = consume_query_rows(
+            core::num::NonZeroU64::MIN,
+            |_| Err(sql_err!("PZ004", "unowned source error")),
+            &mut |_| panic!("source failed before any row"),
+        )
+        .unwrap_err();
+        assert_eq!(error.message.as_str(), "unowned source error");
+    });
+}
+
+#[test]
 fn pending_routine_contract_survives_front_rewind_and_rejects_a_reused_identity() {
     let mut budget = Budget::new(4096);
     let arena = Arena::new(&mut budget, "routine contract", 4096).unwrap();

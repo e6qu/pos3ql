@@ -2947,6 +2947,31 @@ impl TxnState {
         );
     }
 
+    /// Prepared changes never belonged to the resolving backend's local plans.
+    /// Their commit publishes shared invalidations; rollback publishes none.
+    pub(crate) fn with_detached_plan_owner<R>(
+        &mut self,
+        resolve: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        struct RestoreOwner<'a> {
+            transaction: &'a mut TxnState,
+            owner: Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+        }
+        impl Drop for RestoreOwner<'_> {
+            fn drop(&mut self) {
+                self.transaction.plan_invalidations = self.owner.take();
+            }
+        }
+        let owner = self.plan_invalidations.take();
+        let restore = RestoreOwner {
+            transaction: self,
+            owner,
+        };
+        let result = resolve(&mut *restore.transaction);
+        assert!(restore.transaction.plan_invalidations.is_none());
+        result
+    }
+
     /// A queued commit and its waiting frontend share the same backend until
     /// the frontend collects its durable result.
     pub(crate) fn stage_commit_state(&mut self, worker: &mut Self) {

@@ -94,8 +94,8 @@ notifications, sequence-session state and session advisory locks. A temporary
 cleanup capacity error leaves those other session settings intact.
 
 `DISCARD SEQUENCES` clears this connection's remembered sequence values; it does
-not rewind the sequence. `DISCARD PLANS` succeeds because execution rebuilds
-plans rather than retaining a reusable execution-plan cache. Temporary schemas
+not rewind the sequence. `DISCARD PLANS` refreshes future preparation; running
+calls, bound portals and open cursors keep their checked values. Temporary schemas
 currently support tables, views and sequences; named types and routines require
 ordinary schemas.
 
@@ -263,6 +263,12 @@ one input row: `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')`
 does not issue a number until its first nonzero fetch. `FETCH 0` issues none,
 and fetching after its one row issues no further number. A holdable cursor
 evaluates an unread row when commit saves its remaining results.
+Fixed input rows use the same fetch boundary. For example,
+`SELECT nextval('order_numbers') FROM (VALUES(10),(20)) input(id)` issues one
+number per fetched row. These constant VALUES sources retain their rows without
+running the outer expressions. Two comma-separated VALUES rows allow backward
+fetching by default; one row and explicit UNION ALL remain forward-only unless
+`SCROLL` is requested. Other cursor plans still execute when opened.
 `BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
 and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
 the lower comparison is false. PostgreSQL can evaluate the tested expression

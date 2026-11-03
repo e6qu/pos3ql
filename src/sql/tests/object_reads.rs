@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// Real HTTP clients run under the allocation guard; provider state lives on
 /// the server thread, matching an external object-store service.
-pub(super) struct HttpObjectServer {
+pub(crate) struct HttpObjectServer {
     stop: Arc<AtomicBool>,
     pub(super) requests: Arc<AtomicUsize>,
     pub(super) uploads: Arc<AtomicUsize>,
@@ -20,7 +20,7 @@ pub(super) struct HttpObjectServer {
 }
 
 impl HttpObjectServer {
-    pub(super) fn start(config: &mut Config) -> Self {
+    pub(crate) fn start(config: &mut Config) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         config.object_store_sim = false;

@@ -1021,6 +1021,7 @@ pub(crate) fn rule_transition_source<'a>(
                         Some(left) => arena
                             .alloc(SetTree::Op {
                                 operator: SetOp::Union,
+                                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                                 all: true,
                                 left,
                                 right: leaf,
@@ -1221,6 +1222,7 @@ pub(crate) fn attach_rule_source<'a>(
                     tree = arena
                         .alloc(SetTree::Op {
                             operator: SetOp::Union,
+                            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                             all: true,
                             left: tree,
                             right: leaf,
@@ -1276,8 +1278,10 @@ fn attach_rule_source_to_set_tree<'a>(
             all,
             left,
             right,
+            syntax,
         } => SetTree::Op {
             operator: *operator,
+            syntax: *syntax,
             all: *all,
             left: attach_rule_source_to_set_tree(left, source, condition, arena)?,
             right: attach_rule_source_to_set_tree(right, source, condition, arena)?,
@@ -1819,6 +1823,7 @@ fn filter_set_view_conjunct<'a>(
             all,
             left,
             right,
+            syntax,
         } => {
             let Some(left) = filter_set_view_conjunct(
                 left,
@@ -1848,6 +1853,7 @@ fn filter_set_view_conjunct<'a>(
             };
             SetTree::Op {
                 operator: *operator,
+                syntax: *syntax,
                 all: *all,
                 left,
                 right,
@@ -3289,6 +3295,7 @@ fn recursive_parts<'a>(
         all,
         left,
         right,
+        ..
     }) = q.set_body
     else {
         return Err(sql_err!(
@@ -5203,8 +5210,10 @@ fn subst_set_tree<'a>(
             all,
             left,
             right,
+            syntax,
         } => SetTree::Op {
             operator: *operator,
+            syntax: *syntax,
             all: *all,
             left: subst_set_tree(left, context, arena)?,
             right: subst_set_tree(right, context, arena)?,

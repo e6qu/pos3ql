@@ -6,7 +6,10 @@ use super::*;
 // 622bafc3e7ffb7f83fc3282fab8ecb0c941a1bb8f72fc87a1b382644c92b242b.
 #[test]
 fn cursor_function_plans_keep_their_owner_and_row_handoffs() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config(&format!("cursor-function-input-owner-{mode:?}"));
         config.transaction_mode = mode;
         let mut budget = test_engine_budget(&config, 1 << 29);
@@ -25,20 +28,37 @@ fn cursor_function_plans_keep_their_owner_and_row_handoffs() {
         assert_eq!(data_rows(&session.success(&mut engine,
             "BEGIN; DECLARE values_cursor NO SCROLL CURSOR FOR \
              SELECT cursor_constant(),cursor_row(id) FROM cursor_values; SELECT last_value FROM cursor_checks", true)), ["1"]);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks", true)), ["{1}|11", "2"]);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks", true)), ["{1}|13", "2"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks",
+                true
+            )),
+            ["{1}|11", "2"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks",
+                true
+            )),
+            ["{1}|13", "2"]
+        );
         assert_eq!(data_rows(&session.success(&mut engine,
             "CLOSE values_cursor; DECLARE values_cursor NO SCROLL CURSOR FOR \
              SELECT cursor_constant(),cursor_row(id) FROM cursor_values; FETCH ALL FROM values_cursor; \
              SELECT last_value FROM cursor_checks; CLOSE values_cursor; COMMIT", true)),
             ["{1}|13", "{1}|15", "2"]);
-        assert_eq!(data_rows(&session.success(&mut engine,
-            "BEGIN; DECLARE held_values NO SCROLL CURSOR WITH HOLD FOR \
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "BEGIN; DECLARE held_values NO SCROLL CURSOR WITH HOLD FOR \
              SELECT cursor_constant(),cursor_row(id) FROM cursor_values; COMMIT; \
-             FETCH ALL FROM held_values; SELECT last_value FROM cursor_checks; CLOSE held_values", true)),
-            ["{1}|15", "{1}|17", "2"]);
+             FETCH ALL FROM held_values; SELECT last_value FROM cursor_checks; CLOSE held_values",
+                true
+            )),
+            ["{1}|15", "{1}|17", "2"]
+        );
     }
 }
 

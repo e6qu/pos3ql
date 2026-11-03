@@ -72,8 +72,10 @@ pub(crate) use cte::captured_type_oid;
 mod dependencies;
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
-pub(crate) use type_inputs::{capture_contextual_type_inputs, visit_planner_calls};
 pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
+pub(crate) use type_inputs::{
+    capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
+};
 pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
@@ -898,6 +900,7 @@ pub(crate) struct PendingRoutineInvocation<'a> {
     pub arguments: &'a [u8],
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
+    pub input_collation: super::ast::Collation,
     pub plan_owner: super::type_input_plans::Owner,
 }
 
@@ -1251,6 +1254,7 @@ impl<'a> RoutineInvocationState<'a> {
         statement_arena: &'a Arena,
         query_arena: &'query Arena,
         source_position: Option<InvocationSite>,
+        input_collation: super::ast::Collation,
     ) -> Result<Option<Datum<'query>>, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1267,6 +1271,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position,
+            input_collation,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1302,6 +1307,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
+            input_collation: super::ast::Collation::None,
             target: PendingRoutineTarget::Intrinsic(oid),
             arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
@@ -1337,6 +1343,7 @@ impl<'a> RoutineInvocationState<'a> {
         arguments: &[Datum],
         statement_arena: &'a Arena,
         source_position: Option<usize>,
+        input_collation: super::ast::Collation,
     ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1353,6 +1360,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
+            input_collation,
             target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
                 routine,
                 statement_arena,
@@ -1953,6 +1961,7 @@ pub(crate) fn execute_index_comparison<'a>(
             slot,
             &storage.routine_for(slot, txid),
             &[left, right],
+            super::ast::Collation::None,
             arena,
         )?
         .ok_or_else(|| {
@@ -2594,8 +2603,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     arguments[2] =
                         Datum::Bool(matches!(context, super::eval::DefinedCastContext::Explicit));
                 }
-                self.execute_routine(slot, &routine, &arguments[..routine.argument_count], arena)?
-                    .unwrap_or(Datum::Null)
+                self.execute_routine(
+                    slot,
+                    &routine,
+                    &arguments[..routine.argument_count],
+                    super::ast::Collation::None,
+                    arena,
+                )?
+                .unwrap_or(Datum::Null)
             }
         };
         self.coerce_result(result, cast.target, arena)
@@ -2748,6 +2763,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             function,
             &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
+            super::ast::Collation::None,
             arena,
         )?
         .ok_or_else(|| {
@@ -2769,6 +2785,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum<'a>],
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
@@ -2823,10 +2840,18 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         .expect("routine invocation state has statement arena"),
                     arena,
                     source_position,
+                    input_collation,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(routine, arguments, statement_arena, arena, source_position);
+                return invocations.resolve(
+                    routine,
+                    arguments,
+                    statement_arena,
+                    arena,
+                    source_position,
+                    input_collation,
+                );
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2869,10 +2894,18 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         .expect("routine invocation state has statement arena"),
                     arena,
                     source_position,
+                    input_collation,
                 );
             }
             if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(routine, arguments, statement_arena, arena, source_position);
+                return invocations.resolve(
+                    routine,
+                    arguments,
+                    statement_arena,
+                    arena,
+                    source_position,
+                    input_collation,
+                );
             }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4085,6 +4118,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         target: super::eval::RoutineCallTarget<'_>,
         arguments: &[&'a Expr<'a>],
         argument_type_oids: &[i32],
+        input_collation: super::ast::Collation,
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -4158,13 +4192,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             return Ok(Datum::Null);
         };
         let routine = &declared;
-        self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)?
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "resolved routine has no scalar result"
-                )
-            })
+        self.execute_routine(
+            slot,
+            routine,
+            &completed[..declared.argument_count],
+            input_collation,
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "resolved routine has no scalar result"
+            )
+        })
     }
 
     fn call_routine_oid<'a>(
@@ -4261,7 +4301,13 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(slot, &routine, arguments, arena)
+        self.execute_routine(
+            slot,
+            &routine,
+            arguments,
+            super::ast::Collation::None,
+            arena,
+        )
     }
 
     fn cast_evaluation(
@@ -7120,7 +7166,10 @@ pub(crate) fn describe_query_under<'a>(
     describe_select(select, storage, txid, arena, out)
 }
 
-#[expect(clippy::too_many_arguments, reason = "stored query metadata uses its captured source, path, and dependencies")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored query metadata uses its captured source, path, and dependencies"
+)]
 pub(crate) fn describe_stored_query<'a>(
     sql: &'a str,
     input_source: &str,

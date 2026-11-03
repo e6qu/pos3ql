@@ -427,14 +427,20 @@ impl CursorPool {
         hold: bool,
         binary: bool,
     ) -> Result<usize, SqlError> {
-        if self.slots.iter().any(|slot| (slot.active || slot.plan_generation.is_some()) && slot.name.as_str() == name) {
+        if self.slots.iter().any(|slot| {
+            (slot.active || slot.plan_generation.is_some()) && slot.name.as_str() == name
+        }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_CURSOR,
                 "cursor \"{}\" already exists",
                 name
             ));
         }
-        let Some(at) = self.slots.iter().position(|s| !s.active && s.plan_generation.is_none()) else {
+        let Some(at) = self
+            .slots
+            .iter()
+            .position(|s| !s.active && s.plan_generation.is_none())
+        else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many open cursors (limit {})",
@@ -450,9 +456,18 @@ impl CursorPool {
                 CURSOR_STATEMENT_BYTES
             ));
         }
-        let exhausted = || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cursor plan identities exhausted");
-        let generation = core::num::NonZeroU64::new(self.next_plan_generation).ok_or_else(exhausted)?;
-        let next_generation = self.next_plan_generation.checked_add(1).ok_or_else(exhausted)?;
+        let exhausted = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor plan identities exhausted"
+            )
+        };
+        let generation =
+            core::num::NonZeroU64::new(self.next_plan_generation).ok_or_else(exhausted)?;
+        let next_generation = self
+            .next_plan_generation
+            .checked_add(1)
+            .ok_or_else(exhausted)?;
         self.next_plan_generation = next_generation;
         let slot = &mut self.slots[at];
         slot.plan_generation = Some(generation);
@@ -485,18 +500,32 @@ impl CursorPool {
         hold: bool,
         binary: bool,
     ) -> Result<CursorOpenAttempt, SqlError> {
-        if let Some((index, slot)) = self.slots.iter().enumerate().find(|(_, slot)|
-            !slot.active && slot.plan_generation.is_some() && slot.open_site == Some(site)) {
-            if slot.name.as_str() != name || slot.statement.as_str() != statement
-                || slot.scroll != scroll || slot.hold != hold || slot.binary != binary {
-                return Err(sql_err!(sqlstate::SERIALIZATION_FAILURE, "cursor opening definition changed while waiting"));
+        if let Some((index, slot)) = self.slots.iter().enumerate().find(|(_, slot)| {
+            !slot.active && slot.plan_generation.is_some() && slot.open_site == Some(site)
+        }) {
+            if slot.name.as_str() != name
+                || slot.statement.as_str() != statement
+                || slot.scroll != scroll
+                || slot.hold != hold
+                || slot.binary != binary
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "cursor opening definition changed while waiting"
+                ));
             }
-            return Ok(CursorOpenAttempt { index, generation: slot.plan_generation.expect("selected opening generation") });
+            return Ok(CursorOpenAttempt {
+                index,
+                generation: slot.plan_generation.expect("selected opening generation"),
+            });
         }
         let index = self.open(name, statement, scroll, hold, binary)?;
         let slot = &mut self.slots[index];
         slot.open_site = Some(site);
-        Ok(CursorOpenAttempt { index, generation: slot.plan_generation.expect("fresh opening generation") })
+        Ok(CursorOpenAttempt {
+            index,
+            generation: slot.plan_generation.expect("fresh opening generation"),
+        })
     }
 
     pub(crate) fn opening_query_bound(&self, at: usize) -> bool {
@@ -505,16 +534,34 @@ impl CursorPool {
     }
 
     pub(crate) fn abandon_attempt(&mut self, attempt: CursorOpenAttempt) -> Result<(), SqlError> {
-        if !self.slots.get(attempt.index).is_some_and(|slot| slot.plan_generation == Some(attempt.generation)) {
-            return Err(sql_err!(sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE, "cursor opening source is no longer retained"));
+        if !self
+            .slots
+            .get(attempt.index)
+            .is_some_and(|slot| slot.plan_generation == Some(attempt.generation))
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor opening source is no longer retained"
+            ));
         }
         self.abandon(attempt.index);
         Ok(())
     }
 
-    pub(crate) fn restart_opening_output(&mut self, attempt: CursorOpenAttempt) -> Result<(), SqlError> {
-        let slot = self.slots.get_mut(attempt.index).filter(|slot| !slot.active && slot.plan_generation == Some(attempt.generation))
-            .ok_or_else(|| sql_err!(sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE, "cursor opening source is no longer retained"))?;
+    pub(crate) fn restart_opening_output(
+        &mut self,
+        attempt: CursorOpenAttempt,
+    ) -> Result<(), SqlError> {
+        let slot = self
+            .slots
+            .get_mut(attempt.index)
+            .filter(|slot| !slot.active && slot.plan_generation == Some(attempt.generation))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cursor opening source is no longer retained"
+                )
+            })?;
         slot.description.clear();
         slot.rows.clear();
         slot.spans.clear();
@@ -524,13 +571,23 @@ impl CursorPool {
     }
 
     pub(crate) fn plan_owner(&self, at: usize) -> Result<super::type_input_plans::Owner, SqlError> {
-        self.slots.get(at).and_then(|slot| slot.plan_generation)
+        self.slots
+            .get(at)
+            .and_then(|slot| slot.plan_generation)
             .map(|generation| super::type_input_plans::Owner::Cursor(generation.get()))
-            .ok_or_else(|| sql_err!(sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE, "cursor plan source is no longer retained"))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cursor plan source is no longer retained"
+                )
+            })
     }
 
     pub(crate) fn contains_plan_owner(&self, generation: u64) -> bool {
-        self.slots.iter().any(|slot| slot.plan_generation.is_some_and(|current| current.get() == generation))
+        self.slots.iter().any(|slot| {
+            slot.plan_generation
+                .is_some_and(|current| current.get() == generation)
+        })
     }
 
     /// Description and typed-row storage for the cursor producer.
@@ -539,7 +596,10 @@ impl CursorPool {
         (&mut slot.description, &mut slot.rows)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "cursor binding retains SQL, values, local types and checked inputs together")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cursor binding retains SQL, values, local types and checked inputs together"
+    )]
     pub(crate) fn bind_query(
         &mut self,
         at: usize,
@@ -685,6 +745,8 @@ impl CursorPool {
             }
             slot.failed = true;
             slot.query.clear();
+            slot.plan_generation = None;
+            slot.open_site = None;
         }
     }
 
@@ -992,31 +1054,106 @@ mod ownership_tests {
         let mut budget = Budget::new(CursorPool::budget_bytes(&config));
         let mut pool = CursorPool::new(&config, &mut budget).unwrap();
         let site = CursorOpenSite {
-            owner: super::super::type_input_plans::Owner::Transient { generation: 7, statement: 0 },
+            owner: super::super::type_input_plans::Owner::Transient {
+                generation: 7,
+                statement: 0,
+            },
             source: super::super::type_inputs::Source::RootCommand { statement: 0 },
             position: 31,
         };
         crate::mem::guard::forbid_alloc(|| {
-            let attempt = pool.open_at(site, "resume", "SELECT 1", CursorScroll::Default, false, false).unwrap();
+            let attempt = pool
+                .open_at(
+                    site,
+                    "resume",
+                    "SELECT 1",
+                    CursorScroll::Default,
+                    false,
+                    false,
+                )
+                .unwrap();
             let at = attempt.index();
             let owner = pool.plan_owner(at).unwrap();
             assert!(!pool.opening_query_bound(at));
-            pool.slots[at].query.bind("SELECT 1", &[], &[], &[], owner, |_| Ok(())).unwrap();
+            pool.slots[at]
+                .query
+                .bind("SELECT 1", &[], &[], &[], owner, |_| Ok(()))
+                .unwrap();
             assert!(pool.opening_query_bound(at));
-            let retained = pool.slots[at].query.with_query(|_, _, arena| arena.used()).unwrap();
-            let resumed = pool.open_at(site, "resume", "SELECT 1", CursorScroll::Default, false, false).unwrap();
+            let retained = pool.slots[at]
+                .query
+                .with_query(|_, _, arena| arena.used())
+                .unwrap();
+            let resumed = pool
+                .open_at(
+                    site,
+                    "resume",
+                    "SELECT 1",
+                    CursorScroll::Default,
+                    false,
+                    false,
+                )
+                .unwrap();
             assert_eq!(resumed, attempt);
             assert_eq!(pool.plan_owner(at).unwrap(), owner);
             assert!(pool.opening_query_bound(at));
-            assert_eq!(pool.slots[at].query.with_query(|_, _, arena| arena.used()).unwrap(), retained);
-            assert_eq!(pool.open_at(site, "resume", "SELECT 2", CursorScroll::Default, false, false).unwrap_err().sqlstate, sqlstate::SERIALIZATION_FAILURE);
-            let other_site = CursorOpenSite { position: 32, ..site };
-            assert_eq!(pool.open_at(other_site, "resume", "SELECT 1", CursorScroll::Default, false, false).unwrap_err().sqlstate, sqlstate::DUPLICATE_CURSOR);
+            assert_eq!(
+                pool.slots[at]
+                    .query
+                    .with_query(|_, _, arena| arena.used())
+                    .unwrap(),
+                retained
+            );
+            assert_eq!(
+                pool.open_at(
+                    site,
+                    "resume",
+                    "SELECT 2",
+                    CursorScroll::Default,
+                    false,
+                    false
+                )
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let other_site = CursorOpenSite {
+                position: 32,
+                ..site
+            };
+            assert_eq!(
+                pool.open_at(
+                    other_site,
+                    "resume",
+                    "SELECT 1",
+                    CursorScroll::Default,
+                    false,
+                    false
+                )
+                .unwrap_err()
+                .sqlstate,
+                sqlstate::DUPLICATE_CURSOR
+            );
             pool.abandon_attempt(attempt).unwrap();
-            let replacement = pool.open_at(site, "resume", "SELECT 1", CursorScroll::Default, false, false).unwrap();
+            let replacement = pool
+                .open_at(
+                    site,
+                    "resume",
+                    "SELECT 1",
+                    CursorScroll::Default,
+                    false,
+                    false,
+                )
+                .unwrap();
             assert_ne!(replacement, attempt);
-            assert_eq!(pool.abandon_attempt(attempt).unwrap_err().sqlstate, sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE);
-            assert_eq!(pool.plan_owner(replacement.index()).unwrap(), super::super::type_input_plans::Owner::Cursor(replacement.generation.get()));
+            assert_eq!(
+                pool.abandon_attempt(attempt).unwrap_err().sqlstate,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            );
+            assert_eq!(
+                pool.plan_owner(replacement.index()).unwrap(),
+                super::super::type_input_plans::Owner::Cursor(replacement.generation.get())
+            );
             pool.abandon_attempt(replacement).unwrap();
         });
     }
@@ -1034,37 +1171,103 @@ mod ownership_tests {
             _ => panic!("cursor owner"),
         };
         crate::mem::guard::forbid_alloc(|| {
-            let at = pool.open("same", "SELECT 1", CursorScroll::Default, false, false).unwrap();
+            let at = pool
+                .open("same", "SELECT 1", CursorScroll::Default, false, false)
+                .unwrap();
             let first = generation(pool.plan_owner(at).unwrap());
             assert!(pool.contains_plan_owner(first));
-            assert_eq!(pool.open("same", "SELECT 2", CursorScroll::Default, false, false).unwrap_err().sqlstate, sqlstate::DUPLICATE_CURSOR);
-            assert_eq!(pool.open("other", "SELECT 2", CursorScroll::Default, false, false).unwrap_err().sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(
+                pool.open("same", "SELECT 2", CursorScroll::Default, false, false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_CURSOR
+            );
+            assert_eq!(
+                pool.open("other", "SELECT 2", CursorScroll::Default, false, false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
             pool.abandon(at);
             assert!(!pool.contains_plan_owner(first));
             assert!(pool.plan_owner(at).is_err());
-            let at = pool.open("same", "SELECT 2", CursorScroll::Default, true, false).unwrap();
+            let at = pool
+                .open("same", "SELECT 2", CursorScroll::Default, true, false)
+                .unwrap();
             let held = generation(pool.plan_owner(at).unwrap());
             assert_ne!(held, first);
             let (description, _) = pool.result_buffers(at);
-            crate::pg::respond::Responder::new(description).row_description(&[]).unwrap();
+            crate::pg::respond::Responder::new(description)
+                .row_description(&[])
+                .unwrap();
             pool.seal(at).unwrap();
             pool.on_commit();
             pool.on_rollback();
             assert!(pool.contains_plan_owner(held));
             assert!(pool.close("same"));
             assert!(!pool.contains_plan_owner(held));
-            let at = pool.open("same", "SELECT 3", CursorScroll::Default, false, false).unwrap();
+            let at = pool
+                .open("same", "SELECT 3", CursorScroll::Default, false, false)
+                .unwrap();
             let opening = generation(pool.plan_owner(at).unwrap());
             pool.on_rollback();
             assert!(!pool.contains_plan_owner(opening));
-            let at = pool.open("same", "SELECT 4", CursorScroll::Default, false, false).unwrap();
+            let at = pool
+                .open("same", "SELECT 4", CursorScroll::Default, false, false)
+                .unwrap();
             let before_clear = generation(pool.plan_owner(at).unwrap());
             pool.clear();
-            let at = pool.open("same", "SELECT 5", CursorScroll::Default, false, false).unwrap();
+            let at = pool
+                .open("same", "SELECT 5", CursorScroll::Default, false, false)
+                .unwrap();
             assert_ne!(generation(pool.plan_owner(at).unwrap()), before_clear);
             pool.on_commit();
             assert!(!pool.contains_plan_owner(before_clear));
             assert!(pool.plan_owner(at).is_err());
+        });
+    }
+
+    #[test]
+    fn terminal_cursor_failure_releases_plan_owner_and_preserves_failed_name() {
+        let mut config = Config::default_dev();
+        config.max_cursors = 1;
+        config.cursor_bytes = 64;
+        config.cursor_query_bytes = 1024;
+        let mut budget = Budget::new(CursorPool::budget_bytes(&config));
+        let mut pool = CursorPool::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let at = pool
+                .open("failed", "SELECT 1", CursorScroll::Default, false, false)
+                .unwrap();
+            let super::super::type_input_plans::Owner::Cursor(generation) =
+                pool.plan_owner(at).unwrap()
+            else {
+                panic!("cursor owner");
+            };
+            let (description, _) = pool.result_buffers(at);
+            crate::pg::respond::Responder::new(description)
+                .row_description(&[])
+                .unwrap();
+            pool.seal(at).unwrap();
+            pool.fail("failed");
+            assert!(!pool.contains_plan_owner(generation));
+            assert!(pool.plan_owner(at).is_err());
+            assert!(pool.exists("failed"));
+            assert_eq!(
+                pool.fetch("failed", FetchMotion::Count(1), false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE
+            );
+            assert_eq!(
+                pool.open("failed", "SELECT 2", CursorScroll::Default, false, false)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DUPLICATE_CURSOR
+            );
+            pool.fail("failed");
+            assert!(pool.close("failed"));
+            assert!(!pool.exists("failed"));
         });
     }
 
@@ -1078,7 +1281,9 @@ mod ownership_tests {
         let mut pool = CursorPool::new(&config, &mut budget).unwrap();
         pool.next_plan_generation = u64::MAX;
         crate::mem::guard::forbid_alloc(|| {
-            let error = pool.open("exhausted", "SELECT 1", CursorScroll::Default, false, false).unwrap_err();
+            let error = pool
+                .open("exhausted", "SELECT 1", CursorScroll::Default, false, false)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(error.message.as_str(), "cursor plan identities exhausted");
             assert!(pool.plan_owner(0).is_err());
@@ -1087,7 +1292,6 @@ mod ownership_tests {
             assert_eq!(pool.next_plan_generation, u64::MAX);
         });
     }
-
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

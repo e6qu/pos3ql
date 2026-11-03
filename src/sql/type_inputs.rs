@@ -171,13 +171,21 @@ pub(crate) fn active_source() -> Option<Source> {
 }
 
 pub(crate) fn active_source_position(fragment: &str) -> Result<Option<(Source, usize)>, SqlError> {
-    let Some(active) = ACTIVE_SOURCE.with(core::cell::Cell::get) else { return Ok(None); };
+    let Some(active) = ACTIVE_SOURCE.with(core::cell::Cell::get) else {
+        return Ok(None);
+    };
     // The closure-only source scope owns this text; only copied identities leave.
     let text = unsafe { &*active.text };
-    let Some(start) = (fragment.as_ptr() as usize).checked_sub(text.as_ptr() as usize) else { return Ok(None); };
+    let Some(start) = (fragment.as_ptr() as usize).checked_sub(text.as_ptr() as usize) else {
+        return Ok(None);
+    };
     let end = start.checked_add(fragment.len()).ok_or_else(invalid)?;
-    if end > text.len() { return Ok(None); }
-    if !text.is_char_boundary(start) || !text.is_char_boundary(end) { return Err(invalid()); }
+    if end > text.len() {
+        return Ok(None);
+    }
+    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        return Err(invalid());
+    }
     Ok(Some((active.source, start)))
 }
 
@@ -193,7 +201,13 @@ pub(crate) fn bindings_for_active_source<'a>(
     // SAFETY: enter_source borrows these values until its non-Send guard is
     // dropped. No reference into that scoped owner escapes this function.
     let (text, bindings) = unsafe {
-        (&*active.text, core::slice::from_raw_parts(active.bindings.cast::<Binding<'_>>(), active.binding_count))
+        (
+            &*active.text,
+            core::slice::from_raw_parts(
+                active.bindings.cast::<Binding<'_>>(),
+                active.binding_count,
+            ),
+        )
     };
     let start = text.as_ptr() as usize;
     let end = start.checked_add(text.len()).ok_or_else(invalid)?;

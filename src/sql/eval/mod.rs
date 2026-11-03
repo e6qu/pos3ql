@@ -1648,6 +1648,7 @@ pub trait CatalogAccess {
         _target: RoutineCallTarget<'_>,
         _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
+        _input_collation: super::ast::Collation,
         _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -3945,6 +3946,7 @@ fn eval_full_inner<'a>(
                             target,
                             args,
                             types,
+                            routine_input_collation(args, row, hooks.catalog)?,
                             &mut |argument| eval_full(argument, arena, params, row, hooks),
                             arena,
                         );
@@ -5319,6 +5321,32 @@ fn expression_collation<'a>(
     }
 }
 
+/// Merge function argument collations, retaining InvalidOid when implicit
+/// collations conflict. An explicit COLLATE clause takes precedence.
+pub(crate) fn routine_input_collation<'a>(
+    arguments: &[&Expr<'a>],
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<super::ast::Collation, SqlError> {
+    let mut derived = None;
+    for argument in arguments {
+        let value = expression_collation(argument, row, catalog)?.or_else(|| {
+            static_type(argument, row)
+                .is_some_and(ColType::is_collatable)
+                .then_some(DerivedCollation {
+                    value: super::ast::Collation::Default,
+                    explicit: false,
+                    indeterminate: false,
+                })
+        });
+        derived = merge_derived_collations(derived, value)?;
+    }
+    Ok(match derived {
+        Some(value) if !value.indeterminate => value.value,
+        _ => super::ast::Collation::None,
+    })
+}
+
 /// Returns the collation required by an operation that compares or orders an
 /// expression. An indeterminate collatable expression is rejected here rather
 /// than being mistaken for a non-collatable value.
@@ -6525,6 +6553,7 @@ fn call<'a>(
                 target,
                 args,
                 argument_type_oids,
+                routine_input_collation(args, row, hooks.catalog)?,
                 &mut |argument| eval_full(argument, arena, params, row, hooks),
                 arena,
             );

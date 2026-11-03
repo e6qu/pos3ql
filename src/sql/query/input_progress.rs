@@ -1584,16 +1584,26 @@ mod tests {
         let mut budget = Budget::new(16384);
         let mut statement = Arena::new(&mut budget, "pending input owner", 8192).unwrap();
         let mut work = Arena::new(&mut budget, "pending source work", 8192).unwrap();
-        for owner in [Owner::ProtocolPrepared(2), Owner::SqlPrepared(3), Owner::Dynamic { epoch: 4, generation: 5 }] {
+        for owner in [
+            Owner::ProtocolPrepared(2),
+            Owner::SqlPrepared(3),
+            Owner::Dynamic {
+                epoch: 4,
+                generation: 5,
+            },
+        ] {
             statement.reset();
             work.reset();
             let invocations = RoutineInvocationState::new(&statement);
             let pending = crate::mem::guard::forbid_alloc(|| {
                 type_input_plans::with_owner(owner, || {
-                    let expression = crate::sql::parser::parse_expr("pending_call()", &work).unwrap();
+                    let expression =
+                        crate::sql::parser::parse_expr("pending_call()", &work).unwrap();
                     let _source = enter_expression(expression).unwrap();
                     let value = work.alloc_str("retained argument").unwrap();
-                    let error = invocations.resolve_intrinsic(42, &[Datum::Text(value)], &statement, &work).unwrap_err();
+                    let error = invocations
+                        .resolve_intrinsic(42, &[Datum::Text(value)], &statement, &work)
+                        .unwrap_err();
                     assert_eq!(error.sqlstate, sqlstate::INTERNAL_ROUTINE_INVOCATION);
                     invocations.take_pending().unwrap()
                 })
@@ -1601,8 +1611,13 @@ mod tests {
             work.reset();
             crate::mem::guard::forbid_alloc(|| {
                 assert_eq!(pending.plan_owner, owner);
-                assert_eq!(pending.source_position, Some(super::super::InvocationSite::Expression(0)));
-                let value = crate::sql::exec::decode_projected_col_record(pending.arguments, 0, &work).unwrap();
+                assert_eq!(
+                    pending.source_position,
+                    Some(super::super::InvocationSite::Expression(0))
+                );
+                let value =
+                    crate::sql::exec::decode_projected_col_record(pending.arguments, 0, &work)
+                        .unwrap();
                 assert!(matches!(value, Datum::Text("retained argument")));
                 let outer = type_input_plans::owner().ok();
                 type_input_plans::with_owner(pending.plan_owner, || {
@@ -1612,5 +1627,4 @@ mod tests {
             });
         }
     }
-
 }

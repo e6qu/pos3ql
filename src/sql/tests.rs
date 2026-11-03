@@ -512,7 +512,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                 engine.commit_txn_with_triggers(
                     &mut editor.transaction,
                     &editor.guc,
-                    Some(CursorCommitContext { cursors: &mut editor.cursors, plans: &mut editor.pool, arena: &editor.arena }),
+                    Some(CursorCommitContext {
+                        cursors: &mut editor.cursors,
+                        plans: &mut editor.pool,
+                        arena: &editor.arena,
+                    }),
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -95956,7 +95960,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext { cursors: &mut reader.cursors, plans: &mut reader.pool, arena: &reader.arena }),
+                        Some(CursorCommitContext {
+                            cursors: &mut reader.cursors,
+                            plans: &mut reader.pool,
+                            arena: &reader.arena,
+                        }),
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,

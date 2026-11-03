@@ -103,11 +103,18 @@ Checked values belong to the SQL source that analyzed them:
 |---|---|
 | Simple command | Prepared at command admission; a new command analyzes its inputs again. |
 | SQL `PREPARE` or protocol Parse | Prepared once and retained with that statement and its bound portals. Describe and repeated execution reuse the values. |
-| SQL string function body | `CREATE` validation has its own input values. A caller prepares separate body inputs when its call site first runs, then reuses them for that caller's plan lifetime. |
-| SQL string procedure body | `CREATE` validation is separate. The backend prepares body inputs at the first `CALL` and reuses them for that procedure definition, including later `CALL` commands. |
+| SQL string function or procedure body | `CREATE` validation is separate. The first runtime call prepares inputs retained by the backend for the routine definition and resolved call types. Later commands reuse them. |
+| SQL function considered for inlining | The caller's planner checks the body. An accepted inline keeps its checked values with that caller plan; a rejected attempt leaves runtime preparation separate. |
 | Supported static PL/pgSQL source | Prepared when reached and retained by the backend for that routine definition and source occurrence. An unreached branch does not prepare its inputs. |
 | Dynamic `EXECUTE` | Each execution owns a fresh plan, even when the command text equals an earlier command. |
 | Stored view, rule, default or SQL `BEGIN ATOMIC` body | Prepared with the definition and retained in its immutable metadata image, including domain and view-column defaults. Recovery restores values and captured type identities without rerunning checks. |
+
+For example, an opaque SQL function containing a checked array literal checks
+once at `CREATE`, then once at its first runtime call in that backend. A later
+`SELECT` reuses that runtime value. A function considered for inlining can
+check during planning even when the caller returns no rows; a rejected attempt
+does not replace the first runtime check. Cursor plans retain accepted inputs
+across separate `FETCH` commands and while a `WITH HOLD` cursor survives commit.
 
 `DISCARD PLANS` and `DISCARD ALL` release cached routine-input plans and their
 value owners. They do not re-evaluate inputs saved in schema definitions.

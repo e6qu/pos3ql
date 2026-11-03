@@ -128,9 +128,14 @@ value at `PREPARE`; repeated `EXECUTE saved` reuses it. A literal supplied to a
 column or function parameter of that type follows the same rule. In contrast,
 `ARRAY['paid']::checked_status[]` performs its domain checks when executed.
 
-SQL string functions validate their inputs at `CREATE` and prepare separate
-inputs for each caller's plan. SQL string procedures also validate at `CREATE`,
-then retain their first `CALL`'s body inputs for that backend and definition.
+SQL string functions and procedures validate their inputs at `CREATE`, then
+retain the first runtime call's body inputs for that backend, routine definition
+and resolved call types. Considering a function for inlining checks its body
+while planning the caller. Accepted inlining retains those values in the caller
+plan. A rejected attempt does not replace the separate runtime check. For
+example, an opaque function checks once at `CREATE`, once at the first
+`SELECT`, and reuses that runtime value for later commands in the same backend.
+A cursor retains its inputs across separate `FETCH` commands.
 Supported static procedural sources prepare
 when first reached and reuse the backend's plan; dynamic `EXECUTE` prepares
 each command afresh. Views, rules, SQL `BEGIN ATOMIC` bodies and stored defaults

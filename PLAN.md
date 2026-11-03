@@ -54,8 +54,13 @@ Finish retaining values checked while SQL is prepared. For example, preparing
 describing or executing that prepared statement must reuse its checked value.
 Cover implicit column and function arguments, repeated lock waits, cancellation,
 stored definitions, renames and recovery. A SQL function checks its string body
-at creation and again when each caller's plan first needs it. A PL/pgSQL statement
-keeps its own plan across calls; dynamic `EXECUTE` makes a new plan each time.
+at creation and again on its first runtime call in a backend, retaining inputs
+for that routine definition and resolved call types. Accepted inlining instead
+keeps the planner's checked values with its caller; rejected attempts leave the
+runtime check separate. A cursor must preserve its own plan across opening
+waits, separate fetches and holdable commit, releasing it on close or rollback.
+A PL/pgSQL statement keeps its own plan across calls; dynamic `EXECUTE` makes
+a new plan each time.
 Unreached branches must not run constraints. Verify these differences against
 PostgreSQL, including function settings and `check_function_bodies=off`.
 Keep completed inputs while rolling back and safely replaying the unfinished

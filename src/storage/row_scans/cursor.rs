@@ -278,12 +278,21 @@ mod tests {
                 let skipped = query.skip_row();
                 let mut projected = crate::mem::arena::ArenaList::new(work);
                 for index in 0..query.items_len() {
-                    for value in query.evaluate_item(index, storage, txid, work, None, &invocations, work)? {
-                        projected.push(*value).map_err(|_| crate::sql::eval::arena_full())?;
+                    for value in
+                        query.evaluate_item(index, storage, txid, work, None, &invocations, work)?
+                    {
+                        projected
+                            .push(*value)
+                            .map_err(|_| crate::sql::eval::arena_full())?;
                     }
                 }
                 if !skipped {
-                    responder.data_row(projected.as_slice()).map_err(|_| crate::sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "test cursor result buffer is full"))?;
+                    responder.data_row(projected.as_slice()).map_err(|_| {
+                        crate::sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "test cursor result buffer is full"
+                        )
+                    })?;
                 }
                 query.finish_row(!skipped);
                 Ok(Some(!skipped))
@@ -369,9 +378,14 @@ mod tests {
         let mut small_rows = FixedBuf::new(&mut read_budget, "small retained rows", 1).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             query
-                .bind("SELECT n+0,payload FROM retained_plan WHERE n>0", &[], &[], &[],
+                .bind(
+                    "SELECT n+0,payload FROM retained_plan WHERE n>0",
+                    &[],
+                    &[],
+                    &[],
                     crate::sql::type_input_plans::Owner::Backend,
-                    |parser| crate::sql::type_inputs::validate_restored(parser, &storage, 0))
+                    |parser| crate::sql::type_inputs::validate_restored(parser, &storage, 0),
+                )
                 .unwrap();
             assert!(
                 query
@@ -388,7 +402,8 @@ mod tests {
         });
         assert!(rows.readable().is_empty());
         let error = crate::mem::guard::forbid_alloc(|| {
-            advance_test_cursor(&mut query,
+            advance_test_cursor(
+                &mut query,
                 &storage,
                 0,
                 0,
@@ -413,18 +428,19 @@ mod tests {
             rows.clear();
             crate::mem::guard::forbid_alloc(|| {
                 assert!(
-                    advance_test_cursor(&mut query,
-                            &storage,
-                            0,
-                            0,
-                            &work,
-                            &mut buffers,
-                            &mut Responder::for_cursor(
-                                &mut description,
-                                crate::pg::respond::CursorRowOutput::Save(&mut rows)
-                            )
+                    advance_test_cursor(
+                        &mut query,
+                        &storage,
+                        0,
+                        0,
+                        &work,
+                        &mut buffers,
+                        &mut Responder::for_cursor(
+                            &mut description,
+                            crate::pg::respond::CursorRowOutput::Save(&mut rows)
                         )
-                        .unwrap()
+                    )
+                    .unwrap()
                 )
             });
             let bytes = rows.readable();
@@ -435,18 +451,19 @@ mod tests {
             assert_eq!(decoded, [Datum::Int4(expected), Datum::Text("value")]);
         }
         assert!(
-            !advance_test_cursor(&mut query,
-                    &storage,
-                    0,
-                    0,
-                    &work,
-                    &mut buffers,
-                    &mut Responder::for_cursor(
-                        &mut description,
-                        crate::pg::respond::CursorRowOutput::Save(&mut rows)
-                    )
+            !advance_test_cursor(
+                &mut query,
+                &storage,
+                0,
+                0,
+                &work,
+                &mut buffers,
+                &mut Responder::for_cursor(
+                    &mut description,
+                    crate::pg::respond::CursorRowOutput::Save(&mut rows)
                 )
-                .unwrap()
+            )
+            .unwrap()
         );
         crate::mem::guard::forbid_alloc(|| query.clear());
         assert!(storage.heap.test_exclusive_write().is_ok());

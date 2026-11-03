@@ -789,9 +789,14 @@ pub(crate) fn parse_expression<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
-    let expression = parser.expression(0).map_err(|error| super::parse_error_to_sql(&error))?;
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
     if parser.peeked != Tok::Eof {
-        return Err(crate::sql_err!(sqlstate::SYNTAX_ERROR, "trailing tokens after expression"));
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after expression"
+        ));
     }
     Ok(expression)
 }
@@ -1007,24 +1012,24 @@ impl<'a> Parser<'a> {
                     .as_slice()
                     .iter()
                     .any(|(_, prior)| (prior.start, prior.end, prior.kind) == key)
-                {
-                    sources
-                        .borrow_mut()
-                        .restored
-                        .push((
-                            super::type_inputs::Candidate {
-                                start: source_at,
-                                end: source_end,
-                                target: super::type_inputs::CandidateTarget::ContextualOid(
-                                    binding.type_oid,
-                                ),
-                                kind: binding.kind,
-                                type_mod: binding.type_mod,
-                                expression,
-                            },
-                            binding,
-                        ))
-                        .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+            {
+                sources
+                    .borrow_mut()
+                    .restored
+                    .push((
+                        super::type_inputs::Candidate {
+                            start: source_at,
+                            end: source_end,
+                            target: super::type_inputs::CandidateTarget::ContextualOid(
+                                binding.type_oid,
+                            ),
+                            kind: binding.kind,
+                            type_mod: binding.type_mod,
+                            expression,
+                        },
+                        binding,
+                    ))
+                    .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
             }
             return self.arena_expr(Expr::BoundLiteral {
                 encoded: binding.encoded,

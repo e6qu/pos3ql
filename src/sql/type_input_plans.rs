@@ -202,7 +202,10 @@ impl RoutineInputPlans {
         freeze: impl FnOnce(&[u8]) -> Result<SharedSlice<u8>, SqlError>,
     ) -> Result<BodyAdmission, SqlError> {
         if canonical.is_empty() {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "SQL routine body specialization is empty"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL routine body specialization is empty"
+            ));
         }
         for slot in self.slots.iter() {
             let key = match &slot.state {
@@ -211,25 +214,44 @@ impl RoutineInputPlans {
             };
             if let Key {
                 owner: Owner::Backend,
-                source: Source::SqlRoutineBody { routine_oid: oid, definition_version: version, .. },
+                source:
+                    Source::SqlRoutineBody {
+                        routine_oid: oid,
+                        definition_version: version,
+                        ..
+                    },
             } = key
-                && oid == routine_oid && version == definition_version
+                && oid == routine_oid
+                && version == definition_version
                 && slot.specialization.as_ref() == canonical
             {
-                return Ok(BodyAdmission { key, reserved: None });
+                return Ok(BodyAdmission {
+                    key,
+                    reserved: None,
+                });
             }
         }
         let (index, generation) = self.available_slot()?;
         let specialization = freeze(canonical)?;
         if specialization.as_ref() != canonical {
-            return Err(sql_err!(sqlstate::DATA_EXCEPTION, "SQL routine body specialization changed during reservation"));
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL routine body specialization changed during reservation"
+            ));
         }
         let key = Key {
             owner: Owner::Backend,
-            source: Source::SqlRoutineBody { routine_oid, definition_version, specialization: generation },
+            source: Source::SqlRoutineBody {
+                routine_oid,
+                definition_version,
+                specialization: generation,
+            },
         };
         let reserved = self.install(index, generation, key, specialization);
-        Ok(BodyAdmission { key, reserved: Some(reserved) })
+        Ok(BodyAdmission {
+            key,
+            reserved: Some(reserved),
+        })
     }
 
     pub(crate) fn adopt_body(&self, plan: PlanId, key: Key) -> Result<(), SqlError> {
@@ -265,7 +287,13 @@ impl RoutineInputPlans {
         Ok((index, generation))
     }
 
-    fn install(&mut self, index: usize, generation: u64, key: Key, specialization: SharedSlice<u8>) -> PlanId {
+    fn install(
+        &mut self,
+        index: usize,
+        generation: u64,
+        key: Key,
+        specialization: SharedSlice<u8>,
+    ) -> PlanId {
         self.next_generation = generation + 1;
         self.slots[index] = Slot {
             generation,
@@ -298,8 +326,14 @@ impl RoutineInputPlans {
         Ok(())
     }
 
-    pub(crate) fn finish_inline_attempt(&mut self, plan: PlanId, disposition: InlineDisposition) -> Result<(), SqlError> {
-        let State::Ready { inputs, .. } = &mut self.slot_mut(plan)?.state else { return Err(stale()); };
+    pub(crate) fn finish_inline_attempt(
+        &mut self,
+        plan: PlanId,
+        disposition: InlineDisposition,
+    ) -> Result<(), SqlError> {
+        let State::Ready { inputs, .. } = &mut self.slot_mut(plan)?.state else {
+            return Err(stale());
+        };
         match inputs {
             InputImage::Runtime(bytes) => {
                 let bytes = match disposition {
@@ -309,7 +343,10 @@ impl RoutineInputPlans {
                 *inputs = InputImage::InlineAttempt { bytes, disposition };
                 Ok(())
             }
-            InputImage::InlineAttempt { disposition: current, .. } if *current == disposition => Ok(()),
+            InputImage::InlineAttempt {
+                disposition: current,
+                ..
+            } if *current == disposition => Ok(()),
             _ => Err(stale()),
         }
     }
@@ -389,10 +426,14 @@ impl RoutineInputPlans {
                     State::Vacant => return None,
                     State::Preparing { key, .. } | State::Ready { key, .. } => key,
                 };
-                let Owner::Cursor(generation) = key.owner else { return None; };
+                let Owner::Cursor(generation) = key.owner else {
+                    return None;
+                };
                 (!retained(generation)).then_some(key.owner)
             });
-            let Some(owner) = owner else { break; };
+            let Some(owner) = owner else {
+                break;
+            };
             self.retire(owner);
         }
     }
@@ -498,44 +539,76 @@ mod tests {
     fn runtime_sql_body_keys_compare_exact_bytes_and_share_ready_and_waiting_owners() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 3;
-        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(256, 4));
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(256, 4));
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 256, 4).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
-        let freeze = |bytes: &[u8]| pool.copy_slice(bytes).map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
         crate::mem::guard::forbid_alloc(|| {
             let mut bytes = *b"declared-int4,collation-0,result-int4";
             let original = bytes;
             let first = plans.sql_body_key(100_001, 7, &bytes, freeze).unwrap();
             let first_id = first.reserved.unwrap();
             plans.adopt_body(first_id, first.key).unwrap();
-            assert_eq!(plans.find(first.key).err().unwrap().sqlstate, sqlstate::OBJECT_IN_USE);
+            assert_eq!(
+                plans.find(first.key).err().unwrap().sqlstate,
+                sqlstate::OBJECT_IN_USE
+            );
             bytes[9] = b'X';
             let changed = plans.sql_body_key(100_001, 7, &bytes, freeze).unwrap();
             let waiting = changed.reserved.unwrap();
             assert_ne!(changed.key, first.key);
             plans.adopt_body(waiting, changed.key).unwrap();
             plans.set_waiting(waiting, true).unwrap();
-            let reused = plans.sql_body_key(100_001, 7, &bytes, |_| panic!("waiting key must retain its existing bytes")).unwrap();
+            let reused = plans
+                .sql_body_key(100_001, 7, &bytes, |_| {
+                    panic!("waiting key must retain its existing bytes")
+                })
+                .unwrap();
             assert_eq!(reused.key, changed.key);
             assert!(reused.reserved.is_none());
-            assert!(matches!(plans.find(changed.key).unwrap(), Some(Lookup::Waiting(id)) if id == waiting));
+            assert!(
+                matches!(plans.find(changed.key).unwrap(), Some(Lookup::Waiting(id)) if id == waiting)
+            );
             assert!(plans.adopt_body(waiting, changed.key).is_err());
-            plans.complete(first_id, InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap())).unwrap();
-            let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else { panic!("ready typed SQL body"); };
+            plans
+                .complete(
+                    first_id,
+                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                )
+                .unwrap();
+            let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
+                panic!("ready typed SQL body");
+            };
             let other = plans.sql_body_key(100_002, 7, &original, freeze).unwrap();
-            plans.adopt_body(other.reserved.unwrap(), other.key).unwrap();
+            plans
+                .adopt_body(other.reserved.unwrap(), other.key)
+                .unwrap();
             assert_ne!(other.key, first.key);
             assert_eq!(pool.lease::<u8>(1).unwrap_err().available_leases, 0);
-            let reused = plans.sql_body_key(100_001, 7, &original, |_| panic!("ready key must not allocate when the pool is full")).unwrap();
+            let reused = plans
+                .sql_body_key(100_001, 7, &original, |_| {
+                    panic!("ready key must not allocate when the pool is full")
+                })
+                .unwrap();
             assert_eq!(reused.key, first.key);
             assert!(reused.reserved.is_none());
-            let error = plans.sql_body_key(100_001, 8, &original, |_| panic!("control admission must precede payload reservation")).unwrap_err();
+            let error = plans
+                .sql_body_key(100_001, 8, &original, |_| {
+                    panic!("control admission must precede payload reservation")
+                })
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(error.message.as_str().contains("routine_input_slots"));
             plans.retire_invalid_definitions(|oid, version| oid == 100_002 && version == 7);
             assert!(plans.find(first.key).unwrap().is_none());
             assert!(plans.find(changed.key).unwrap().is_none());
-            assert!(matches!(plans.find(other.key).err(), Some(error) if error.sqlstate == sqlstate::OBJECT_IN_USE));
+            assert!(
+                matches!(plans.find(other.key).err(), Some(error) if error.sqlstate == sqlstate::OBJECT_IN_USE)
+            );
             assert!(plans.adopt_body(first_id, first.key).is_err());
             plans.clear();
             assert_eq!(pool.lease::<u8>(256).unwrap_err().free_bytes, 192);
@@ -548,28 +621,53 @@ mod tests {
     fn runtime_sql_body_key_exhaustion_preserves_control_and_payload_ownership() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 2;
-        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
-        let freeze = |bytes: &[u8]| pool.copy_slice(bytes).map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error));
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
         crate::mem::guard::forbid_alloc(|| {
-            let first = plans.sql_body_key(100_001, 7, b"declared-int4", freeze).unwrap();
+            let first = plans
+                .sql_body_key(100_001, 7, b"declared-int4", freeze)
+                .unwrap();
             let id = first.reserved.unwrap();
             plans.adopt_body(id, first.key).unwrap();
-            plans.complete(id, InputImage::Runtime(SharedSlice::EMPTY)).unwrap();
+            plans
+                .complete(id, InputImage::Runtime(SharedSlice::EMPTY))
+                .unwrap();
             let generation = plans.next_generation;
-            let error = plans.sql_body_key(100_001, 7, b"declared-int8", freeze).unwrap_err();
+            let error = plans
+                .sql_body_key(100_001, 7, b"declared-int8", freeze)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(plans.next_generation, generation);
-            assert!(matches!(plans.find(first.key).unwrap(), Some(Lookup::Ready(found, _)) if found == id));
-            assert_eq!(plans.slots.iter().filter(|slot| matches!(slot.state, State::Vacant)).count(), 1);
+            assert!(
+                matches!(plans.find(first.key).unwrap(), Some(Lookup::Ready(found, _)) if found == id)
+            );
+            assert_eq!(
+                plans
+                    .slots
+                    .iter()
+                    .filter(|slot| matches!(slot.state, State::Vacant))
+                    .count(),
+                1
+            );
             plans.abandon(id).unwrap();
-            let replacement = plans.sql_body_key(100_001, 7, b"declared-int8", freeze).unwrap();
+            let replacement = plans
+                .sql_body_key(100_001, 7, b"declared-int8", freeze)
+                .unwrap();
             assert_ne!(replacement.key, first.key);
             assert!(plans.adopt_body(id, replacement.key).is_err());
             plans.clear();
             plans.next_generation = u64::MAX;
-            let error = plans.sql_body_key(100_001, 7, b"declared-int4", |_| panic!("identity exhaustion must precede payload reservation")).unwrap_err();
+            let error = plans
+                .sql_body_key(100_001, 7, b"declared-int4", |_| {
+                    panic!("identity exhaustion must precede payload reservation")
+                })
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(pool.lease::<u8>(64).is_ok());
         });
@@ -587,21 +685,37 @@ mod tests {
     fn closed_cursor_owners_release_waiting_descendants_and_preserve_pinned_images() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 3;
-        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
-            let root = Key { owner: Owner::Cursor(1), source: source(1) };
+            let root = Key {
+                owner: Owner::Cursor(1),
+                source: source(1),
+            };
             let parent = plans.reserve(root).unwrap();
-            plans.complete(parent, InputImage::Runtime(bytes.clone())).unwrap();
-            let child = Key { owner: Owner::Nested(parent), source: source(2) };
+            plans
+                .complete(parent, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let child = Key {
+                owner: Owner::Nested(parent),
+                source: source(2),
+            };
             let pending = plans.reserve(child).unwrap();
             plans.set_waiting(pending, true).unwrap();
-            let current = Key { owner: Owner::Cursor(2), source: source(1) };
+            let current = Key {
+                owner: Owner::Cursor(2),
+                source: source(1),
+            };
             let current_id = plans.reserve(current).unwrap();
-            plans.complete(current_id, InputImage::Runtime(bytes.clone())).unwrap();
-            let Some(Lookup::Ready(_, pinned)) = plans.find(root).unwrap() else { panic!("ready cursor image"); };
+            plans
+                .complete(current_id, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let Some(Lookup::Ready(_, pinned)) = plans.find(root).unwrap() else {
+                panic!("ready cursor image");
+            };
             assert!(!has_active_plan());
             with_owner(root.owner, || assert!(has_active_plan()));
             assert!(!has_active_plan());
@@ -609,11 +723,15 @@ mod tests {
             assert!(plans.find(root).unwrap().is_none());
             assert!(plans.find(child).is_err());
             assert!(plans.set_waiting(pending, false).is_err());
-            assert!(matches!(plans.find(current).unwrap(), Some(Lookup::Ready(id, _)) if id == current_id));
+            assert!(
+                matches!(plans.find(current).unwrap(), Some(Lookup::Ready(id, _)) if id == current_id)
+            );
             plans.retire_invalid_cursors(|_| false);
             drop(bytes);
             assert!(pool.lease::<u8>(1).is_err());
-            assert!(matches!(&pinned, InputImage::Runtime(bytes) if bytes.as_ref() == b"TIP2\0\0\0\0"));
+            assert!(
+                matches!(&pinned, InputImage::Runtime(bytes) if bytes.as_ref() == b"TIP2\0\0\0\0")
+            );
             drop(pinned);
             assert!(pool.lease::<u8>(64).is_ok());
         });
@@ -623,20 +741,52 @@ mod tests {
     fn rejected_inline_attempts_release_values_and_accepted_attempts_keep_one_root() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 2;
-        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1));
         let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let rejected_key = Key { owner: Owner::Cursor(1), source: source(1) };
+            let rejected_key = Key {
+                owner: Owner::Cursor(1),
+                source: source(1),
+            };
             let rejected = plans.reserve(rejected_key).unwrap();
-            plans.complete(rejected, InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap())).unwrap();
-            plans.finish_inline_attempt(rejected, InlineDisposition::Rejected).unwrap();
-            assert!(matches!(plans.find(rejected_key).unwrap(), Some(Lookup::Ready(_, InputImage::InlineAttempt { bytes, disposition: InlineDisposition::Rejected })) if bytes.is_empty()));
-            let accepted_key = Key { owner: Owner::Cursor(1), source: source(2) };
+            plans
+                .complete(
+                    rejected,
+                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                )
+                .unwrap();
+            plans
+                .finish_inline_attempt(rejected, InlineDisposition::Rejected)
+                .unwrap();
+            assert!(
+                matches!(plans.find(rejected_key).unwrap(), Some(Lookup::Ready(_, InputImage::InlineAttempt { bytes, disposition: InlineDisposition::Rejected })) if bytes.is_empty())
+            );
+            let accepted_key = Key {
+                owner: Owner::Cursor(1),
+                source: source(2),
+            };
             let accepted = plans.reserve(accepted_key).unwrap();
-            plans.complete(accepted, InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap())).unwrap();
-            plans.finish_inline_attempt(accepted, InlineDisposition::Accepted).unwrap();
-            let Some(Lookup::Ready(_, InputImage::InlineAttempt { bytes, disposition: InlineDisposition::Accepted })) = plans.find(accepted_key).unwrap() else { panic!("accepted image"); };
+            plans
+                .complete(
+                    accepted,
+                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                )
+                .unwrap();
+            plans
+                .finish_inline_attempt(accepted, InlineDisposition::Accepted)
+                .unwrap();
+            let Some(Lookup::Ready(
+                _,
+                InputImage::InlineAttempt {
+                    bytes,
+                    disposition: InlineDisposition::Accepted,
+                },
+            )) = plans.find(accepted_key).unwrap()
+            else {
+                panic!("accepted image");
+            };
             plans.retire(Owner::Cursor(1));
             assert!(pool.lease::<u8>(1).is_err());
             assert_eq!(bytes.as_ref(), b"TIP2\0\0\0\0");

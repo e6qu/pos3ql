@@ -1114,6 +1114,20 @@ impl super::Storage {
     ) -> Result<(), SqlError> {
         validate_definition_inputs(inputs, source, txid, catalog)
     }
+    pub(crate) fn freeze_runtime_input_key(
+        &self,
+        canonical: &[u8],
+    ) -> Result<SharedSlice<u8>, SqlError> {
+        let mut bytes = self
+            .metadata_pool
+            .lease::<u8>(canonical.len())
+            .map_err(metadata_full)?;
+        for byte in canonical {
+            bytes.push_reserved(*byte).map_err(metadata_full)?;
+        }
+        Ok(bytes.freeze())
+    }
+
     pub(crate) fn freeze_runtime_type_inputs(
         &self,
         source: &str,

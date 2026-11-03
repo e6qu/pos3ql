@@ -18,7 +18,8 @@ belong in [PLAN.md](PLAN.md). Pending CI and uncollected measurements are
 acceptance work, not blocked defects.
 Repeated failures across native, coverage and PostgreSQL comparison jobs must
 be traced to their shared cause and repaired before acceptance. Saved defaults
-and function inputs require recovery and effect-count regressions; passing a
+and function inputs require recovery and effect-count regressions, including
+backend reuse, rejected inlining and cursor opening/fetch waits; passing a
 compiler gate alone does not establish their correctness.
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

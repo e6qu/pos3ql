@@ -22100,7 +22100,17 @@ impl PlpgsqlExecHost<'_> {
                 // The procedure stack cannot be replayed after transaction
                 // control. Drain this explicit boundary, promoting all earlier
                 // commits in log order before continuing the same invocation.
-                match engine.commit_txn_with_triggers(txn, guc, Some(super::CursorCommitContext { cursors, plans: sqlprep, arena }), arena, responder) {
+                match engine.commit_txn_with_triggers(
+                    txn,
+                    guc,
+                    Some(super::CursorCommitContext {
+                        cursors,
+                        plans: sqlprep,
+                        arena,
+                    }),
+                    arena,
+                    responder,
+                ) {
                     Err(error)
                         if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                             && txn.staged_commit().is_some() => {}
@@ -25976,8 +25986,12 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 false,
                                 captured,
                                 &mut super::CursorStatementContext {
-                                    arena: context.arena, params: arguments,
-                                    txn: context.txn, sqlprep, cursors, guc,
+                                    arena: context.arena,
+                                    params: arguments,
+                                    txn: context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
                                     responder: context.responder,
                                 },
                             )
@@ -26043,7 +26057,11 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         let arena = context.arena;
                         let (count, rows) = {
                             let PlpgsqlExecHost::Routine {
-                                engine, cursors, sqlprep, guc, ..
+                                engine,
+                                cursors,
+                                sqlprep,
+                                guc,
+                                ..
                             } = &mut context.host
                             else {
                                 return Err(sql_err!(
@@ -26056,8 +26074,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 statement.motion,
                                 statement.move_only,
                                 &mut super::CursorStatementContext {
-                                    arena, params: &[], txn: context.txn, sqlprep,
-                                    cursors, guc, responder: context.responder,
+                                    arena,
+                                    params: &[],
+                                    txn: context.txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    responder: context.responder,
                                 },
                             )?;
                             *completed = true;
@@ -26588,7 +26611,11 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             let arena = context.arena;
                             let rows = {
                                 let PlpgsqlExecHost::Routine {
-                                    engine, cursors, sqlprep, guc, ..
+                                    engine,
+                                    cursors,
+                                    sqlprep,
+                                    guc,
+                                    ..
                                 } = &mut context.host
                                 else {
                                     return Err(sql_err!(
@@ -26601,8 +26628,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                     *motion,
                                     false,
                                     &mut super::CursorStatementContext {
-                                        arena, params: &[], txn: context.txn, sqlprep,
-                                        cursors, guc, responder: context.responder,
+                                        arena,
+                                        params: &[],
+                                        txn: context.txn,
+                                        sqlprep,
+                                        cursors,
+                                        guc,
+                                        responder: context.responder,
                                     },
                                 )?;
                                 arena
@@ -35487,7 +35519,9 @@ pub(crate) fn resolve_routine_declaration(
                     Err(error) => return Err(error),
                 }
             }
-            super::ast::RoutineConfigValue::Current => StackStr::from_str(guc.capture_setting_value(config.name)?.as_str()),
+            super::ast::RoutineConfigValue::Current => {
+                StackStr::from_str(guc.capture_setting_value(config.name)?.as_str())
+            }
         };
         if value.is_truncated() {
             return Err(sql_err!(
@@ -35622,8 +35656,7 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::Function
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program =
-                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
@@ -35671,8 +35704,7 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::OutputFunction
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program =
-                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
                         .then_some(result_column_count)
@@ -35763,8 +35795,7 @@ pub(crate) fn validate_routine_body(
                 }
                 let program =
                     parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure)?;
-                let program =
-                    resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],

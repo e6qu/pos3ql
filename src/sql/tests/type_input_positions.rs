@@ -268,7 +268,10 @@ fn sql_procedure_inputs_keep_backend_and_stored_definition_lifetimes_through_rec
 // 9142d2785fc9532152ee23a1daf38adad5d0ceeab4d7133f614843cdc4e33579.
 #[test]
 fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
-    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
         let mut config = test_config(&format!("cursor-inline-input-phase-{mode:?}"));
         config.transaction_mode = mode;
         let mut budget = test_engine_budget(&config, 1 << 29);
@@ -289,22 +292,50 @@ fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
         let counter = "SELECT CASE WHEN is_called THEN last_value ELSE 0 END, \
              (SELECT count(*) FROM phase_audit),(SELECT count(*) FROM phase_mutations) FROM phase_checks";
         for (query, declared, fetched) in [
-            ("SELECT CASE WHEN false THEN phase_plain() ELSE NULL END FROM generate_series(1,2)", "0|0|0", "0|0|0"),
-            ("SELECT phase_plain() FROM generate_series(1,0)", "1|1|0", "1|1|0"),
+            (
+                "SELECT CASE WHEN false THEN phase_plain() ELSE NULL END FROM generate_series(1,2)",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT phase_plain() FROM generate_series(1,0)",
+                "1|1|0",
+                "1|1|0",
+            ),
             ("SELECT phase_plain() WHERE false", "1|1|0", "1|1|0"),
-            ("SELECT phase_opaque() FROM generate_series(1,0)", "0|0|0", "0|0|0"),
+            (
+                "SELECT phase_opaque() FROM generate_series(1,0)",
+                "0|0|0",
+                "0|0|0",
+            ),
             ("SELECT phase_where()", "1|1|0", "2|2|0"),
             ("SELECT phase_dml()", "1|1|0", "2|2|1"),
             ("SELECT phase_strict(NULL)", "0|0|0", "0|0|0"),
             ("SELECT phase_strict(id) FROM phase_empty", "1|1|0", "1|1|0"),
-            ("SELECT phase_strict(id) FROM (VALUES(1)) source(id)", "1|1|0", "2|2|0"),
+            (
+                "SELECT phase_strict(id) FROM (VALUES(1)) source(id)",
+                "1|1|0",
+                "2|2|0",
+            ),
         ] {
             session.success(&mut engine,
                 "ALTER SEQUENCE phase_checks RESTART WITH 1; TRUNCATE phase_audit,phase_mutations; BEGIN", true);
-            session.success(&mut engine, &format!("DECLARE phase_cursor NO SCROLL CURSOR FOR {query}"), true);
-            assert_eq!(data_rows(&session.success(&mut engine, counter, true)), [declared], "DECLARE {query}");
+            session.success(
+                &mut engine,
+                &format!("DECLARE phase_cursor NO SCROLL CURSOR FOR {query}"),
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                [declared],
+                "DECLARE {query}"
+            );
             session.success(&mut engine, "FETCH ALL FROM phase_cursor", true);
-            assert_eq!(data_rows(&session.success(&mut engine, counter, true)), [fetched], "FETCH {query}");
+            assert_eq!(
+                data_rows(&session.success(&mut engine, counter, true)),
+                [fetched],
+                "FETCH {query}"
+            );
             session.success(&mut engine, "CLOSE phase_cursor; COMMIT", true);
         }
     }

@@ -1489,11 +1489,8 @@ pub(crate) fn visit_dml_assignment_types(
     )
 }
 
-type AssignmentContextVisit<'visit> = dyn FnMut(
-    &Expr<'_>,
-    &crate::storage::ColumnMeta,
-    &dyn ColTypeResolver,
-) -> Result<(), SqlError> + 'visit;
+type AssignmentContextVisit<'visit> = dyn FnMut(&Expr<'_>, &crate::storage::ColumnMeta, &dyn ColTypeResolver) -> Result<(), SqlError>
+    + 'visit;
 
 pub(super) fn visit_dml_assignment_contexts(
     statement: &Stmt<'_>,
@@ -1525,13 +1522,12 @@ pub(super) fn visit_dml_assignment_contexts(
 pub(super) struct AssignmentInput<'a> {
     pub expression: &'a Expr<'a>,
     pub column: &'a crate::storage::ColumnMeta,
+    pub site: Option<crate::sql::type_inputs::AssignmentSite>,
     ordinal: usize,
 }
 
-type AssignmentGroupVisit<'visit> = dyn FnMut(
-    &[AssignmentInput<'_>],
-    &dyn ColTypeResolver,
-) -> Result<(), SqlError> + 'visit;
+type AssignmentGroupVisit<'visit> =
+    dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError> + 'visit;
 
 pub(super) fn visit_dml_assignment_groups(
     statement: &Stmt<'_>,
@@ -1594,7 +1590,7 @@ fn visit_dml_assignment_inputs(
             arena,
         };
         let mut assignments = crate::mem::arena::ArenaList::new(arena);
-        for_each_dml_assignment(statement, &mut |name, index, expression, _site| {
+        for_each_dml_assignment(statement, &mut |name, index, expression, site| {
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
@@ -1616,6 +1612,7 @@ fn visit_dml_assignment_inputs(
             let assignment = AssignmentInput {
                 expression,
                 column,
+                site,
                 ordinal,
             };
             if grouped {

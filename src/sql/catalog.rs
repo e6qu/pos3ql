@@ -4055,8 +4055,7 @@ pub(crate) fn builtin_operator_procedure(
         if candidate != name {
             continue;
         }
-        let Some((left_rank, _, _)) =
-            builtin_argument_properties(left.unwrap_or(0), expected_left)
+        let Some((left_rank, _, _)) = builtin_argument_properties(left.unwrap_or(0), expected_left)
         else {
             continue;
         };
@@ -4371,7 +4370,9 @@ pub(crate) fn builtin_cast_procedures(
     mut visit: impl FnMut(i32),
 ) -> Option<()> {
     if source == super::types::oid::UNKNOWN {
-        let &(_, input, _) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == target)?;
+        let &(_, input, _) = builtin_properties::TYPE_IO
+            .iter()
+            .find(|entry| entry.0 == target)?;
         visit(input);
         return Some(());
     }
@@ -4403,8 +4404,12 @@ pub(crate) fn builtin_inout_cast_procedures(
     target: i32,
     mut visit: impl FnMut(i32),
 ) -> Option<()> {
-    let &(_, input, _) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == target)?;
-    let &(_, _, output) = builtin_properties::TYPE_IO.iter().find(|entry| entry.0 == source)?;
+    let &(_, input, _) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == target)?;
+    let &(_, _, output) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == source)?;
     visit(output);
     visit(input);
     Some(())

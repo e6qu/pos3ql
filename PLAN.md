@@ -83,7 +83,9 @@ before an ANALYZE commits. Retain the selected table identity through these
 boundaries. Match whether whole-relation catalog statistics changed; repeating
 unchanged statistics and renaming an index must not repeat a constraint.
 Keep completed inputs while rolling back and safely replaying the unfinished
-input within its original deadline. Demonstrate the complete behavior in CI
+input within its original deadline. Cancellation must release unfinished
+metadata so a fresh statement can select a different schema and track its
+subsequent changes. Demonstrate the complete behavior in CI
 before closing this acceptance item.
 Data-change trigger statements that need checked domain-array input currently
 raise `0A000` before running the constraint; event triggers have an engine-owned

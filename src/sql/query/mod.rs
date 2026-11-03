@@ -4569,10 +4569,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "cast execution preserves target type modifier and input collation"
-    )]
     fn cast_defined<'a>(
         &self,
         source_oid: i32,

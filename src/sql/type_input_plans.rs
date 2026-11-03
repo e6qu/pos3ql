@@ -231,14 +231,18 @@ impl RoutineInputPlans {
                 State::Vacant => continue,
                 State::Preparing { key, .. } | State::Ready { key, .. } => key,
             };
-            if found == key
-                && !matches!(slot.state, State::Preparing { .. })
-                && (slot.invalidated || !valid(slot.validity.as_ref())?)
-            {
-                let plan = PlanId {
-                    slot: index,
-                    generation: slot.generation,
-                };
+            if found != key {
+                continue;
+            }
+            let plan = PlanId {
+                slot: index,
+                generation: slot.generation,
+            };
+            let obsolete = match slot.state {
+                State::Preparing { .. } => !self.is_retained(plan),
+                _ => slot.invalidated || !valid(slot.validity.as_ref())?,
+            };
+            if obsolete {
                 self.slots[index].invalidated = true;
                 if !self.is_retained(plan) {
                     self.abandon(plan)?;
@@ -323,17 +327,19 @@ impl RoutineInputPlans {
                 && version == definition_version
                 && slot.specialization.as_ref() == canonical
             {
-                // An unfinished input owns its retry receipt until completion.
-                // Catalog changes affect the next admission, not its identity.
-                if matches!(slot.state, State::Preparing { .. })
-                    || (!slot.invalidated && valid(slot.validity.as_ref())?)
-                {
+                let plan = PlanId {
+                    slot: index,
+                    generation: slot.generation,
+                };
+                // A waiting generation belongs to its recorded attempt. After
+                // cancellation it cannot supply another statement's metadata.
+                let reusable = match slot.state {
+                    State::Preparing { .. } => self.is_retained(plan),
+                    _ => !slot.invalidated && valid(slot.validity.as_ref())?,
+                };
+                if reusable {
                     current = Some(key);
                 } else {
-                    let plan = PlanId {
-                        slot: index,
-                        generation: slot.generation,
-                    };
                     self.slots[index].invalidated = true;
                     if !self.is_retained(plan) {
                         self.abandon(plan)?;
@@ -1209,16 +1215,18 @@ mod tests {
             assert_ne!(changed.key, first.key);
             plans.adopt_preparing(waiting, changed.key).unwrap();
             plans.set_waiting(waiting, true).unwrap();
-            let reused = plans
-                .runtime_routine_key(
-                    RoutineInputKind::Sql,
-                    100_001,
-                    7,
-                    &bytes,
-                    |_| Ok(true),
-                    |_| panic!("waiting key must retain its existing bytes"),
-                )
-                .unwrap();
+            let reused = with_owner(Owner::Nested(waiting), || {
+                plans
+                    .runtime_routine_key(
+                        RoutineInputKind::Sql,
+                        100_001,
+                        7,
+                        &bytes,
+                        |_| Ok(true),
+                        |_| panic!("waiting key must retain its existing bytes"),
+                    )
+                    .unwrap()
+            });
             assert_eq!(reused.key, changed.key);
             assert!(reused.reserved.is_none());
             assert!(
@@ -1312,16 +1320,18 @@ mod tests {
                 .unwrap();
             let plan = admission.reserved.unwrap();
             plans.set_waiting(plan, true).unwrap();
-            let resumed = plans
-                .runtime_routine_key(
-                    RoutineInputKind::Sql,
-                    100_001,
-                    7,
-                    b"int4",
-                    |_| panic!("an unfinished input still owns its original retry receipt"),
-                    |_| panic!("resuming an input must not allocate another generation"),
-                )
-                .unwrap();
+            let resumed = with_owner(Owner::Nested(plan), || {
+                plans
+                    .runtime_routine_key(
+                        RoutineInputKind::Sql,
+                        100_001,
+                        7,
+                        b"int4",
+                        |_| panic!("an unfinished input still owns its original retry receipt"),
+                        |_| panic!("resuming an input must not allocate another generation"),
+                    )
+                    .unwrap()
+            });
             assert_eq!(resumed.key, admission.key);
             assert!(resumed.reserved.is_none());
             assert!(
@@ -1349,7 +1359,7 @@ mod tests {
             let plan = plans.reserve(key).unwrap();
             plans.set_waiting(plan, true).unwrap();
             assert!(
-                matches!(plans.find_validated(key, |_| panic!("a waiting statement keeps its receipt")).unwrap(),
+                matches!(with_owner(Owner::Nested(plan), || plans.find_validated(key, |_| panic!("an active statement keeps its receipt"))).unwrap(),
                 Some(Lookup::Waiting(found)) if found == plan)
             );
             plans
@@ -1357,6 +1367,99 @@ mod tests {
                 .unwrap();
             assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
             assert_ne!(plans.reserve(key).unwrap(), plan);
+        });
+    }
+
+    #[test]
+    fn cancelled_preparations_release_waiting_generations_before_fresh_admission() {
+        use super::super::sequence::{
+            self, StatementEffectAttempt, StatementEffectKind, StatementEffectRetry,
+        };
+        use super::super::types::Datum;
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 1;
+        let mut budget = Budget::new(
+            RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 1) + (64 << 10),
+        );
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 1).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let arena = Arena::new(&mut budget, "cancelled routine input receipts", 64 << 10).unwrap();
+        let guc = super::super::guc::GucState::new();
+        let session = guc.seq_session();
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for specialized in [true, false] {
+                let scope = sequence::enter_statement(&arena, session, false);
+                let (key, original) = if specialized {
+                    let admitted = plans
+                        .runtime_routine_key(
+                            RoutineInputKind::Sql,
+                            100_001,
+                            7,
+                            b"int4",
+                            |_| Ok(true),
+                            freeze,
+                        )
+                        .unwrap();
+                    (admitted.key, admitted.reserved.unwrap())
+                } else {
+                    let key = Key {
+                        owner: Owner::Backend,
+                        source: source(31),
+                    };
+                    (key, plans.reserve(key).unwrap())
+                };
+                let bytes = original.key_bytes();
+                let error = sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(original, sequence::input_attempt())
+                            .unwrap();
+                        plans.set_waiting(original, true).unwrap();
+                        StatementEffectAttempt {
+                            result: Err(sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "test row lock")),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+                scope.discard(session);
+                drop(scope);
+                let fresh = sequence::enter_statement(&arena, session, false);
+                let replacement = if specialized {
+                    let admitted = plans
+                        .runtime_routine_key(
+                            RoutineInputKind::Sql,
+                            100_001,
+                            7,
+                            b"int4",
+                            |_| panic!("cancelled metadata cannot be reused"),
+                            freeze,
+                        )
+                        .unwrap();
+                    admitted.reserved.unwrap()
+                } else {
+                    assert!(
+                        plans
+                            .find_validated(key, |_| panic!("cancelled metadata cannot be reused"))
+                            .unwrap()
+                            .is_none()
+                    );
+                    plans.reserve(key).unwrap()
+                };
+                assert_ne!(replacement, original);
+                assert!(plans.lookup(original, key).is_err());
+                plans.abandon(replacement).unwrap();
+                fresh.finish(session).unwrap();
+            }
         });
     }
 

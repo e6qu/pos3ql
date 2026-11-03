@@ -1,6 +1,87 @@
 use super::*;
 
 #[test]
+fn cancelled_runtime_inputs_capture_fresh_path_dependencies() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for language in ["sql", "plpgsql"] {
+            let mut config = test_config(&format!("cancelled-runtime-path-{mode:?}-{language}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            reader.success(&mut engine,
+                "CREATE TABLE cancel_gate(id integer PRIMARY KEY,hits integer); INSERT INTO cancel_gate VALUES(1,0); \
+                 CREATE SEQUENCE cancel_checks; CREATE TYPE cancel_choice AS ENUM('a'); \
+                 CREATE FUNCTION cancel_allowed(value cancel_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 BEGIN PERFORM nextval('public.cancel_checks'); UPDATE public.cancel_gate SET hits=hits+1 WHERE id=1; RETURN true; END$$; \
+                 CREATE DOMAIN cancel_checked AS cancel_choice CHECK(cancel_allowed(VALUE)); \
+                 CREATE SCHEMA alternate; CREATE SEQUENCE alternate.cancel_checks; CREATE TYPE alternate.cancel_choice AS ENUM('a'); \
+                 CREATE FUNCTION alternate.cancel_allowed(value alternate.cancel_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 BEGIN PERFORM nextval('alternate.cancel_checks'); RETURN true; END$$; \
+                 CREATE DOMAIN alternate.cancel_checked AS alternate.cancel_choice CHECK(alternate.cancel_allowed(VALUE)); \
+                 SET check_function_bodies=off", true);
+            let body = match language {
+                "sql" => "SELECT cardinality('{a}'::cancel_checked[])",
+                "plpgsql" => "BEGIN RETURN cardinality('{a}'::cancel_checked[]); END",
+                _ => unreachable!(),
+            };
+            reader.success(&mut engine, &format!("CREATE FUNCTION cancel_body() RETURNS integer LANGUAGE {language} AS $${body}$$; SET check_function_bodies=on"), true);
+            holder.success(
+                &mut engine,
+                "BEGIN; UPDATE cancel_gate SET hits=hits WHERE id=1",
+                true,
+            );
+            assert!(matches!(
+                reader.execute_status(&mut engine, "SELECT cancel_body()", true),
+                ExecutionStatus::Blocked { .. }
+            ));
+            crate::mem::guard::forbid_alloc(|| {
+                engine.rollback_txn(&mut reader.transaction, &reader.guc)
+            });
+            assert!(!reader.guc.seq_session().retains_statement_effects());
+            holder.success(&mut engine, "ROLLBACK", true);
+            reader.success(&mut engine, "SET search_path=alternate,public", true);
+            assert_eq!(
+                data_rows(&reader.success(&mut engine, "SELECT public.cancel_body()", true)),
+                ["1"]
+            );
+            assert_eq!(
+                data_rows(&reader.success(
+                    &mut engine,
+                    "SELECT last_value FROM alternate.cancel_checks",
+                    true
+                )),
+                ["1"]
+            );
+            reader.success(
+                &mut engine,
+                "ALTER DOMAIN alternate.cancel_checked ADD CONSTRAINT additional_check CHECK(true)",
+                true,
+            );
+            assert_eq!(
+                data_rows(&reader.success(&mut engine, "SELECT public.cancel_body()", true)),
+                ["1"]
+            );
+            assert_eq!(
+                data_rows(&reader.success(
+                    &mut engine,
+                    "SELECT last_value FROM alternate.cancel_checks",
+                    true
+                )),
+                ["2"]
+            );
+            drop((reader, holder, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn extended_output_exhaustion_releases_checked_input_receipts_in_explicit_transactions() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

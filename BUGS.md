@@ -11,7 +11,8 @@ with their fixing code, tests and evidence.
 checks and failure diagnostics. Preserve ownership and allocation guards when
 repairing tests. Compare the same client-message and transaction boundaries;
 compiler success alone does not establish runtime correctness. Keep native
-expectations tied to actual PostgreSQL observations, including planner effects.
+expectations tied to actual PostgreSQL observations, including planner effects
+and cancellation followed by a fresh statement.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

@@ -10339,10 +10339,6 @@ mod tests {
             fn has_operator_candidate(&self, name: &str) -> bool {
                 name == "="
             }
-            #[expect(
-                clippy::too_many_arguments,
-                reason = "operator keeps selected and per-argument collations"
-            )]
             fn call_operator<'a>(
                 &self,
                 _: &str,
@@ -10442,10 +10438,6 @@ mod tests {
                 panic!("unexpected comment lookup in conversion metadata test")
             }
 
-            #[expect(
-                clippy::too_many_arguments,
-                reason = "cast execution preserves target type modifier and input collation"
-            )]
             fn cast_defined<'a>(
                 &self,
                 source: i32,

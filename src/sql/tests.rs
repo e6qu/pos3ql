@@ -25522,7 +25522,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    let mut operator = GucState::new();
+    let operator = GucState::new();
     operator.set_role(
         engine.role_login("parameter_operator").unwrap().identity,
         false,
@@ -25530,14 +25530,14 @@ fn parameter_acls_are_typed_enforced_and_visible() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "SET event_triggers = off",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "ALTER SYSTEM SET event_triggers = off",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
@@ -25550,7 +25550,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "ALTER SYSTEM SET event_triggers = on",
     );
     assert!(
@@ -25905,7 +25905,7 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
          GRANT SET ON PARAMETER event_triggers TO parameter_delegate WITH GRANT OPTION;",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
-    let mut delegate = GucState::new();
+    let delegate = GucState::new();
     delegate.set_role(
         engine.role_login("parameter_delegate").unwrap().identity,
         false,
@@ -25913,7 +25913,7 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut delegate,
+        &delegate,
         "GRANT SET ON PARAMETER event_triggers TO parameter_leaf",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
@@ -26503,7 +26503,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut budget,
             "CREATE PUBLICATION source_slot_publication",
             1 << 18,
-            &mut actor,
+            &actor,
         );
         assert!(
             !message_types(&output).contains(&b'E'),
@@ -26537,7 +26537,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut recovered_budget,
             "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
             1 << 18,
-            &mut unauthorized,
+            &unauthorized,
         );
         assert!(message_types(&output).contains(&b'E'));
         let mut authorized = GucState::new();
@@ -26547,7 +26547,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut recovered_budget,
             "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
             1 << 18,
-            &mut authorized,
+            &authorized,
         );
         assert!(
             !message_types(&output).contains(&b'E'),
@@ -26737,7 +26737,7 @@ fn catalog_creation_prepared_owner_keeps_role_slots_after_checkpoint() {
         &mut recovered_budget,
         "COMMIT PREPARED 'retained-owner'",
         1 << 18,
-        &mut actor,
+        &actor,
     );
     assert!(
         !message_types(&output).contains(&b'E'),
@@ -26821,7 +26821,7 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
                 &mut budget,
                 &format!("{command} PREPARED 'source-owner'"),
                 1 << 18,
-                &mut actor,
+                &actor,
             );
             assert!(
                 String::from_utf8_lossy(&output)
@@ -26864,7 +26864,7 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
                 &mut recovered_budget,
                 &format!("{command} PREPARED 'source-owner'"),
                 1 << 18,
-                &mut actor,
+                &actor,
             );
             assert!(
                 String::from_utf8_lossy(&output)
@@ -48908,44 +48908,34 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
 fn sequence_basics() {
     let (mut e, mut b) = test_engine();
     // A persistent session GucState so currval/lastval survive across statements.
-    let mut g = GucState::new();
-    run_session(
-        &mut e,
-        &mut b,
-        &mut g,
-        "CREATE SEQUENCE s START 5 INCREMENT 2",
-    );
+    let g = GucState::new();
+    run_session(&mut e, &mut b, &g, "CREATE SEQUENCE s START 5 INCREMENT 2");
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["5"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT currval('s')")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT lastval()")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT lastval()")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(
-            &mut e,
-            &mut b,
-            &mut g,
-            "SELECT setval('s', 100)"
-        )),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT setval('s', 100)")),
         ["100"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT currval('s')")),
         ["100"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["102"]
     );
     // relkind 'S' in pg_class; pg_sequences lists it.
@@ -49033,7 +49023,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
             "slot {slot}"
         );
     }
-    let mut owner_session =
+    let owner_session =
         GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49044,7 +49034,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
              SELECT currval('owned_capacity_69'); \
              SELECT lastval()",
             1 << 18,
-            &mut owner_session,
+            &owner_session,
         )),
         ["1", "1", "1"]
     );
@@ -49111,7 +49101,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
         String::from_utf8_lossy(&durable)
     );
 
-    let mut high_session =
+    let high_session =
         GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49122,7 +49112,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
              SELECT count(*) FROM pg_sequences; \
              SELECT count(*) FROM pg_class WHERE relkind = 'S'",
             1 << 18,
-            &mut high_session,
+            &high_session,
         )),
         ["1", "1", "80", "80"]
     );
@@ -49143,7 +49133,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
 
     let mut cold_budget = test_engine_budget(&config, 1 << 30);
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
-    let mut cold_session =
+    let cold_session =
         GucState::new_with_sequence_capacity(&mut cold_budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49152,7 +49142,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
             "SELECT count(*) FROM pg_sequences; \
              SELECT nextval('sequence_capacity_durable')",
             1 << 18,
-            &mut cold_session,
+            &cold_session,
         )),
         ["80", "4"]
     );
@@ -49582,15 +49572,15 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
          CREATE SEQUENCE cycling_cache MINVALUE 1 MAXVALUE 3 CACHE 5 CYCLE; \
          CREATE SEQUENCE bounded_cache MINVALUE 1 MAXVALUE 3 CACHE 5 NO CYCLE",
     );
-    let mut first = GucState::new();
-    let mut second = GucState::new();
+    let first = GucState::new();
+    let second = GucState::new();
     assert_eq!(
         data_rows(&run_with_guc(
             &mut engine,
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["1"]
     );
@@ -49600,7 +49590,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["6"]
     );
@@ -49610,7 +49600,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["2"]
     );
@@ -49620,7 +49610,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["7"]
     );
@@ -49640,7 +49630,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
         &mut budget,
         "ALTER SEQUENCE cached_sequence INCREMENT 10",
         1 << 18,
-        &mut first,
+        &first,
     );
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49648,7 +49638,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["20"]
     );
@@ -49661,7 +49651,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
              SELECT nextval('cached_sequence'); \
              SELECT last_value, log_cnt FROM cached_sequence",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["70", "100", "110", "150|32"]
     );
@@ -75714,20 +75704,20 @@ fn nontransactional_utility_commands_require_one_top_level_statement() {
 #[test]
 fn alter_system_and_discard_have_real_session_state() {
     let (mut engine, mut budget) = test_engine_with_budget(test_engine_budget_bytes(1 << 27));
-    let mut session = GucState::new();
+    let session = GucState::new();
     run_with_guc(
         &mut engine,
         &mut budget,
         "ALTER SYSTEM SET application_name = 'cluster-default'",
         1 << 18,
-        &mut session,
+        &session,
     );
     let output = run_with_guc(
         &mut engine,
         &mut budget,
         "SHOW application_name; SELECT NOT pg_reload_conf(), pg_reload_conf() AND true;",
         1 << 18,
-        &mut session,
+        &session,
     );
     assert_eq!(data_rows(&output), ["", "f|t"]);
     let output = run_with_guc(
@@ -75736,14 +75726,14 @@ fn alter_system_and_discard_have_real_session_state() {
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
         1 << 18,
-        &mut session,
+        &session,
     );
     assert_eq!(
         data_rows(&output),
         ["cluster-default", "configuration file|cluster-default"]
     );
 
-    let mut reloaded_session = GucState::new();
+    let reloaded_session = GucState::new();
     engine.apply_system_settings(&reloaded_session).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
@@ -75752,7 +75742,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "CREATE SEQUENCE discard_sequence",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75761,7 +75751,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SELECT nextval('discard_sequence')",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75771,7 +75761,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SET application_name = 'session-value'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75780,7 +75770,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "ALTER SYSTEM SET application_name = 'reloaded-cluster-default'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75791,7 +75781,7 @@ fn alter_system_and_discard_have_real_session_state() {
         "SELECT pg_reload_conf();
          SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75804,7 +75794,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "PREPARE discarded AS SELECT 1",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75813,7 +75803,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "DISCARD ALL",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75823,7 +75813,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut budget,
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75839,7 +75829,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "EXECUTE discarded",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75853,7 +75843,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SELECT currval('discard_sequence')",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75865,14 +75855,14 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut budget,
         "ALTER SYSTEM RESET application_name",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     run_with_guc(
         &mut engine,
         &mut budget,
         "SELECT pg_reload_conf()",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     let output = run_with_guc(
         &mut engine,
@@ -75880,7 +75870,7 @@ fn alter_system_and_discard_have_real_session_state() {
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     assert_eq!(data_rows(&output), ["", "default|"]);
 }
@@ -78823,14 +78813,14 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE TABLE publication_scope_target (id integer PRIMARY KEY)",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     let no_database_create = run_with_guc(
         &mut engine,
         &mut budget,
         "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&no_database_create).contains("permission denied for database"),
@@ -78847,7 +78837,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     let explicit = String::from_utf8_lossy(&explicit);
     assert!(explicit.contains("CREATE PUBLICATION"), "{explicit}");
@@ -78856,7 +78846,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&owner_without_database_create)
@@ -78874,7 +78864,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&owner_with_database_create).contains("ALTER PUBLICATION"),
@@ -78886,7 +78876,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE PUBLICATION publication_scope_all FOR ALL TABLES",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&all_tables)
@@ -78938,7 +78928,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         "CREATE TABLE publication_owner_source (id integer); \
          CREATE PUBLICATION publication_owner_changes FOR TABLE publication_owner_source",
         1 << 18,
-        &mut first_owner,
+        &first_owner,
     );
     assert_eq!(
         data_rows(&run_with(
@@ -78972,7 +78962,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         &mut budget,
         "ALTER PUBLICATION publication_owner_changes SET (publish = 'insert')",
         1 << 18,
-        &mut second_owner,
+        &second_owner,
     );
     assert!(
         !String::from_utf8_lossy(&altered).contains("ERROR"),

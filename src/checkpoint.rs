@@ -18824,6 +18824,7 @@ fn load_view(
     let sql = read_hex(words.next(), "view sql missing")?;
     let schema = read_hex(words.next(), "view schema missing")?;
     let path = read_hex(words.next(), "view path missing")?;
+    let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let name = read_hex(words.next(), "view name missing")?;
     let security = match parse_field::<u8>(words.next(), "view security missing")? {
         0 => crate::storage::ViewSecurity::Definer,
@@ -18954,7 +18955,6 @@ fn load_view(
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let definition = crate::storage::ViewDefinition {
         persistence: crate::storage::RelationPersistence::Permanent,
         default_inputs,

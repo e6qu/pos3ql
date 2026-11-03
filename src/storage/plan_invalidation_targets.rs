@@ -142,11 +142,26 @@ impl Storage {
             }
             DdlUndo::TriggerCreated(slot)
             | DdlUndo::TriggerDropped(slot)
-            | DdlUndo::TriggerAltered { slot, .. }
-            | DdlUndo::PartitionTriggerAltered { slot, .. } => self.selected_access_target(
+            | DdlUndo::TriggerAltered { slot, .. } => self.selected_access_target(
                 self.trigger(*slot as usize).target.access_object(),
                 transaction,
             )?,
+            DdlUndo::PartitionTriggerAltered { slot, prior } => {
+                let state = self.partition_trigger_state(*slot as usize);
+                let image = state
+                    .image_to(transaction)
+                    .or_else(|| prior.and_then(|pending| pending.image))
+                    .or(state.committed)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "inherited trigger change has no retained table identity"
+                        )
+                    })?;
+                Some(SelectedPlanTarget::Relation {
+                    created_at: image.table.created_at(),
+                })
+            }
             DdlUndo::StatisticsCreated(slot)
             | DdlUndo::StatisticsDropped(slot)
             | DdlUndo::StatisticsAltered { slot, .. }
@@ -287,6 +302,63 @@ mod tests {
         ColType, IndexDef, SqlName,
         tests::{make_def, test_budget, test_config},
     };
+
+    #[test]
+    fn inherited_trigger_changes_select_the_retained_partition_image() {
+        use crate::storage::{
+            CatalogIdentity, CatalogPosition, DatabaseOid, PartitionTriggerImage,
+            PartitionTriggerState, TriggerEnabled,
+            partition_triggers::PendingPartitionTriggerState,
+        };
+        let mut config = test_config();
+        config.max_tables = 2;
+        config.max_triggers = 1;
+        let mut budget = test_budget(&config);
+        let storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let slot = storage.partition_trigger_state_slot(0, 1);
+        let image = PartitionTriggerImage {
+            creation: CatalogIdentity::require(71).unwrap(),
+            trigger: CatalogPosition::new(0, 73).unwrap(),
+            table: CatalogPosition::new(1, 79).unwrap(),
+            enabled: TriggerEnabled::Origin,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for (committed, pending, prior) in [
+                (None, Some(image), None),
+                (Some(image), None, None),
+                (
+                    None,
+                    None,
+                    Some(PendingPartitionTriggerState {
+                        txid: 1,
+                        image: Some(image),
+                    }),
+                ),
+            ] {
+                storage.trigger_catalog.lock().unwrap().partition_states[slot] =
+                    PartitionTriggerState {
+                        database: DatabaseOid::POSTGRES,
+                        committed,
+                        pending: Some(PendingPartitionTriggerState {
+                            txid: 1,
+                            image: pending,
+                        }),
+                    };
+                assert_eq!(
+                    storage
+                        .selected_plan_target(
+                            &DdlUndo::PartitionTriggerAltered {
+                                slot: slot as u32,
+                                prior,
+                            },
+                            1,
+                        )
+                        .unwrap(),
+                    Some(SelectedPlanTarget::Relation { created_at: 79 })
+                );
+            }
+        });
+    }
 
     #[test]
     fn truncate_events_retain_identities_and_exact_startup_budget_through_rewind() {

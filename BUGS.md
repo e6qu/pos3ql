@@ -12,7 +12,10 @@ checks and failure diagnostics. Preserve ownership and allocation guards when
 repairing tests. Compare the same client-message and transaction boundaries;
 compiler success alone does not establish runtime correctness. Keep native
 expectations tied to actual PostgreSQL observations, including planner effects
-and cancellation followed by a fresh statement.
+and cancellation followed by a fresh statement. Repair temporary-memory leaks
+by releasing their owners; retain regressions at the original arena limits.
+Preserve distinct function effects and caught errors through retries; validate
+the original bounded-row, cursor, driver and recovery cases before merging.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

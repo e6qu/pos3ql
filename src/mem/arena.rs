@@ -68,7 +68,6 @@ fn retention_identity() -> u64 {
 
 /// A copied value in the persistent tail. Handles reject a reset, replacement
 /// or different arena before accessing bytes; they do not retain references.
-#[derive(PartialEq, Eq)]
 pub(crate) struct ArenaHandle<T> {
     identity: u64,
     offset: usize,
@@ -77,6 +76,14 @@ pub(crate) struct ArenaHandle<T> {
     value: PhantomData<T>,
     invariant: PhantomData<fn(T) -> T>,
 }
+
+impl<T> PartialEq for ArenaHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.offset == other.offset
+    }
+}
+
+impl<T> Eq for ArenaHandle<T> {}
 
 impl<T> Copy for ArenaHandle<T> {}
 

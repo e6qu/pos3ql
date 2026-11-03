@@ -3553,6 +3553,7 @@ fn normalize_array_subquery_element<'a>(
             storage,
             txid,
             arena,
+            None,
         ),
         _ => crate::sql::eval::cast_to(value, element.to_coltype(), arena),
     }

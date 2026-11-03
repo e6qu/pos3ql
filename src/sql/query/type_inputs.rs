@@ -873,6 +873,24 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
+        let arena = self.arena;
+        let mark = arena.mark();
+        let result = self.select_in_scope(select, outer, targets);
+        // Callbacks retain copied source identities or persistent facts only.
+        // The resolver and its schema owners have finished before reclamation.
+        unsafe { arena.rewind_to(mark) };
+        result
+    }
+
+    fn select_in_scope<'a>(
+        &mut self,
+        select: &'a Select<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+        targets: Option<&[(i32, i32, Option<crate::sql::type_inputs::AssignmentSite>)]>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
         let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
         if let Some(tree) = select.set_body {
             self.set_tree(tree, outer)?;

@@ -1,6 +1,111 @@
 use super::*;
 
 #[test]
+fn caught_checked_input_errors_replay_before_a_later_row_lock_wait() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for language in ["sql", "plpgsql"] {
+            let mut config = test_config(&format!("caught-input-error-wait-{mode:?}-{language}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            reader.success(&mut engine,
+                "CREATE TABLE caught_gate(id integer PRIMARY KEY,hits integer); INSERT INTO caught_gate VALUES(1,0); \
+                 CREATE SEQUENCE caught_checks; CREATE TYPE caught_choice AS ENUM('a'); \
+                 CREATE FUNCTION caught_allowed(value caught_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 BEGIN PERFORM nextval('caught_checks'); RETURN false; END$$; \
+                 CREATE DOMAIN caught_checked AS caught_choice CHECK(caught_allowed(VALUE)); \
+                 SET check_function_bodies=off; SET lock_timeout='10s'", true);
+            let body = match language {
+                "sql" => "SELECT cardinality('{a}'::caught_checked[])",
+                "plpgsql" => "BEGIN RETURN cardinality('{a}'::caught_checked[]); END",
+                _ => unreachable!(),
+            };
+            reader.success(&mut engine, &format!(
+                "CREATE FUNCTION caught_rejected() RETURNS integer LANGUAGE {language} AS $${body}$$; \
+                 CREATE FUNCTION caught_body() RETURNS integer LANGUAGE plpgsql AS $$ \
+                 DECLARE failures integer:=0; BEGIN FOR attempt IN 1..2 LOOP \
+                 BEGIN PERFORM caught_rejected(); EXCEPTION WHEN check_violation THEN failures:=failures+1; END; \
+                 END LOOP; UPDATE caught_gate SET hits=hits+1 WHERE id=1; RETURN failures; END$$; \
+                 SET check_function_bodies=on"), true);
+            holder.success(
+                &mut engine,
+                "BEGIN; UPDATE caught_gate SET hits=hits WHERE id=1",
+                true,
+            );
+            let query = "SELECT caught_body()";
+            assert!(matches!(
+                reader.execute_status(&mut engine, query, true),
+                ExecutionStatus::Blocked { .. }
+            ));
+            let deadline = reader.transaction.suspended_statement_deadline();
+            assert!(deadline.is_some());
+            for _ in 0..2 {
+                let status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        query,
+                        0,
+                        &reader.arena,
+                        &mut reader.transaction,
+                        &mut reader.pool,
+                        &mut reader.cursors,
+                        &reader.guc,
+                        &mut Responder::new(&mut reader.send),
+                        1,
+                        false,
+                    )
+                })
+                .unwrap();
+                assert!(matches!(status, ExecutionStatus::Blocked { .. }));
+                assert_eq!(reader.transaction.suspended_statement_deadline(), deadline);
+                assert!(reader.send.is_empty());
+            }
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT last_value FROM caught_checks; ROLLBACK",
+                    true
+                )),
+                ["2"]
+            );
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    query,
+                    0,
+                    &reader.arena,
+                    &mut reader.transaction,
+                    &mut reader.pool,
+                    &mut reader.cursors,
+                    &reader.guc,
+                    &mut Responder::new(&mut reader.send),
+                    1,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert_eq!(data_rows(reader.send.readable()), ["2"]);
+            assert!(error_sqlstates(reader.send.readable()).is_empty());
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT last_value FROM caught_checks; SELECT hits FROM caught_gate",
+                    true
+                )),
+                ["2", "1"]
+            );
+            drop((reader, holder, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn cancelled_runtime_inputs_capture_fresh_path_dependencies() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

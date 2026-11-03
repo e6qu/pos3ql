@@ -38,6 +38,7 @@ impl PlanId {
 pub(crate) enum Lookup {
     Ready(PlanId, InputImage),
     Waiting(PlanId),
+    Failed(PlanId, bool),
 }
 
 #[derive(Clone)]
@@ -112,6 +113,7 @@ enum State {
     Vacant,
     Preparing { key: Key, waiting: bool },
     Ready { key: Key, inputs: InputImage },
+    Failed { key: Key, output_exhausted: bool },
 }
 
 struct Slot {
@@ -229,7 +231,9 @@ impl RoutineInputPlans {
             let slot = &self.slots[index];
             let found = match slot.state {
                 State::Vacant => continue,
-                State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => key,
             };
             if found != key {
                 continue;
@@ -240,6 +244,7 @@ impl RoutineInputPlans {
             };
             let obsolete = match slot.state {
                 State::Preparing { .. } => !self.is_retained(plan),
+                State::Failed { .. } => true,
                 _ => slot.invalidated || !valid(slot.validity.as_ref())?,
             };
             if obsolete {
@@ -256,6 +261,7 @@ impl RoutineInputPlans {
         if matches!(key.source, Source::RuntimeRoutineInstance { .. }) {
             return Err(stale());
         }
+        self.retire_failed_preparations();
         if let Owner::Nested(parent) = key.owner {
             self.slot(parent)?;
         }
@@ -278,6 +284,7 @@ impl RoutineInputPlans {
                 "routine instance specialization is empty"
             ));
         }
+        self.retire_failed_preparations();
         if kind == RoutineInputKind::Sql
             && let Some(plan) = super::sequence::replayed_input_plan()?
         {
@@ -289,7 +296,9 @@ impl RoutineInputPlans {
                 return Err(stale());
             }
             let key = match slot.state {
-                State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => key,
                 State::Vacant => return Err(stale()),
             };
             if !matches!(key, Key { owner: Owner::Backend,
@@ -310,7 +319,9 @@ impl RoutineInputPlans {
             let slot = &self.slots[index];
             let key = match &slot.state {
                 State::Vacant => continue,
-                State::Preparing { key, .. } | State::Ready { key, .. } => *key,
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => *key,
             };
             if let Key {
                 owner: Owner::Backend,
@@ -335,6 +346,7 @@ impl RoutineInputPlans {
                 // cancellation it cannot supply another statement's metadata.
                 let reusable = match slot.state {
                     State::Preparing { .. } => self.is_retained(plan),
+                    State::Failed { .. } => false,
                     _ => !slot.invalidated && valid(slot.validity.as_ref())?,
                 };
                 if reusable {
@@ -500,6 +512,10 @@ impl RoutineInputPlans {
                 key: found,
                 waiting: true,
             } if *found == key => Ok(Lookup::Waiting(plan)),
+            State::Failed {
+                key: found,
+                output_exhausted,
+            } if *found == key => Ok(Lookup::Failed(plan, *output_exhausted)),
             _ => Err(stale()),
         }
     }
@@ -513,6 +529,37 @@ impl RoutineInputPlans {
             return Err(stale());
         }
         self.lookup(plan, key)
+    }
+
+    pub(crate) fn fail(&mut self, plan: PlanId, output_exhausted: bool) -> Result<(), SqlError> {
+        let slot = self.slot_mut(plan)?;
+        let key = match slot.state {
+            State::Preparing { key, .. } | State::Ready { key, .. } | State::Failed { key, .. } => {
+                key
+            }
+            State::Vacant => return Err(stale()),
+        };
+        slot.state = State::Failed {
+            key,
+            output_exhausted,
+        };
+        Ok(())
+    }
+
+    fn retire_failed_preparations(&mut self) {
+        loop {
+            let expired = self.slots.iter().enumerate().find_map(|(index, slot)| {
+                let plan = PlanId {
+                    slot: index,
+                    generation: slot.generation,
+                };
+                (matches!(slot.state, State::Failed { .. }) && !self.is_retained(plan))
+                    .then_some(plan)
+            });
+            let Some(plan) = expired else { break };
+            self.abandon(plan)
+                .expect("selected failed generation is live");
+        }
     }
 
     fn is_retained(&self, plan: PlanId) -> bool {
@@ -538,7 +585,9 @@ impl RoutineInputPlans {
                 }
                 let Ok(slot) = self.slot(current) else { break };
                 let key = match slot.state {
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                     State::Vacant => break,
                 };
                 let Owner::Nested(parent) = key.owner else {
@@ -593,7 +642,9 @@ impl RoutineInputPlans {
         for slot in self.slots.iter_mut() {
             let key = match &slot.state {
                 State::Vacant => continue,
-                State::Preparing { key, .. } | State::Ready { key, .. } => *key,
+                State::Preparing { key, .. }
+                | State::Ready { key, .. }
+                | State::Failed { key, .. } => *key,
             };
             if key.owner == owner {
                 slot.vacate();
@@ -619,6 +670,14 @@ impl RoutineInputPlans {
                                 ..
                             },
                         ..
+                    }
+                    | State::Failed {
+                        key:
+                            Key {
+                                owner: Owner::Nested(parent),
+                                ..
+                            },
+                        ..
                     } => *parent,
                     _ => continue,
                 };
@@ -638,7 +697,9 @@ impl RoutineInputPlans {
             let retired = self.slots.iter().enumerate().find_map(|(index, slot)| {
                 let key = match &slot.state {
                     State::Vacant => return None,
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                 };
                 let (oid, version) = key.source.routine_definition()?;
                 let plan = PlanId {
@@ -657,7 +718,9 @@ impl RoutineInputPlans {
             let owner = self.slots.iter().find_map(|slot| {
                 let key = match &slot.state {
                     State::Vacant => return None,
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                 };
                 let Owner::Cursor(generation) = key.owner else {
                     return None;
@@ -678,7 +741,9 @@ impl RoutineInputPlans {
         loop {
             let owner = self.slots.iter().find_map(|slot| {
                 let key = match &slot.state {
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                     State::Vacant => return None,
                 };
                 (matches!(
@@ -696,7 +761,9 @@ impl RoutineInputPlans {
         loop {
             let owner = self.slots.iter().find_map(|slot| {
                 let key = match &slot.state {
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                     State::Vacant => return None,
                 };
                 (!matches!(
@@ -723,7 +790,9 @@ impl RoutineInputPlans {
         loop {
             let owner = self.slots.iter().find_map(|slot| {
                 let key = match &slot.state {
-                    State::Preparing { key, .. } | State::Ready { key, .. } => key,
+                    State::Preparing { key, .. }
+                    | State::Ready { key, .. }
+                    | State::Failed { key, .. } => key,
                     State::Vacant => return None,
                 };
                 matches!(key.owner, Owner::Transient { generation: found, .. }
@@ -846,6 +915,145 @@ pub(crate) fn with_owner<T>(owner: Owner, run: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
     use crate::mem::lease_pool::{LeasePool, Purpose};
+
+    #[test]
+    fn caught_input_errors_keep_exact_generations_until_later_waits_finish() {
+        use super::super::sequence::{
+            self, StatementEffectAttempt, StatementEffectKind, StatementEffectRetry,
+        };
+        use super::super::types::Datum;
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 3;
+        let mut budget = Budget::new(RoutineInputPlans::budget_bytes(&config) + (64 << 10));
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let mut arena = Arena::new(&mut budget, "caught input error receipts", 64 << 10).unwrap();
+        let guc = super::super::guc::GucState::new();
+        let session = guc.seq_session();
+        let key = Key {
+            owner: Owner::Backend,
+            source: source(1),
+        };
+        let wait_key = Key {
+            source: source(2),
+            ..key
+        };
+        let calls = core::cell::Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut failed = [None; 2];
+            let waiting;
+            {
+                let _scope = sequence::enter_statement(&arena, session, false);
+                for failed in &mut failed {
+                    assert!(
+                        plans
+                            .find_validated(key, |_| panic!("a failed attempt cannot be reused"))
+                            .unwrap()
+                            .is_none()
+                    );
+                    let plan = plans.reserve(key).unwrap();
+                    *failed = Some(plan);
+                    let bytes = plan.key_bytes();
+                    let error = sequence::statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[Datum::Bytea(&bytes)],
+                        StatementEffectRetry::Restart,
+                        &arena,
+                        || {
+                            plans
+                                .retain_for_statement(plan, sequence::input_attempt())
+                                .unwrap();
+                            calls.set(calls.get() + 1);
+                            StatementEffectAttempt {
+                                result: Err(sql_err!(
+                                    sqlstate::CHECK_VIOLATION,
+                                    "test CHECK rejected the value"
+                                )),
+                                rewound_state: false,
+                            }
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::CHECK_VIOLATION);
+                    plans.fail(plan, false).unwrap();
+                    assert!(plans.find(key).unwrap().is_none());
+                }
+                waiting = plans.reserve(wait_key).unwrap();
+                let bytes = waiting.key_bytes();
+                let error = sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .retain_for_statement(waiting, sequence::input_attempt())
+                            .unwrap();
+                        plans.set_waiting(waiting, true).unwrap();
+                        StatementEffectAttempt {
+                            result: Err(sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "test row lock")),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            }
+            arena.recycle_front();
+            {
+                let scope = sequence::enter_statement(&arena, session, true);
+                for failed in failed {
+                    let plan = failed.unwrap();
+                    assert!(
+                        matches!(plans.find_validated(key, |_| panic!("replay restores the caught error")).unwrap(), Some(Lookup::Failed(found, false)) if found == plan)
+                    );
+                    let bytes = plan.key_bytes();
+                    let error = sequence::statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[Datum::Bytea(&bytes)],
+                        StatementEffectRetry::Restart,
+                        &arena,
+                        || panic!("a caught CHECK must not execute twice"),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::CHECK_VIOLATION);
+                    plans.fail(plan, false).unwrap();
+                }
+                assert!(
+                    matches!(plans.find_validated(wait_key, |_| panic!("resume the original wait")).unwrap(), Some(Lookup::Waiting(found)) if found == waiting)
+                );
+                let bytes = waiting.key_bytes();
+                sequence::statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        plans
+                            .complete(waiting, InputImage::Runtime(SharedSlice::EMPTY))
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                scope.finish(session).unwrap();
+            }
+            assert_eq!(calls.get(), 2);
+            let scope = sequence::enter_statement(&arena, session, false);
+            assert!(
+                plans
+                    .find_validated(key, |_| panic!("a failed plan has no checked values"))
+                    .unwrap()
+                    .is_none()
+            );
+            let fresh = plans.reserve(key).unwrap();
+            assert!(failed.iter().all(|failed| *failed != Some(fresh)));
+            plans.abandon(fresh).unwrap();
+            scope.finish(session).unwrap();
+        });
+    }
 
     #[test]
     fn statement_receipts_retain_each_input_generation_and_release_between_attempts() {
@@ -1108,9 +1316,11 @@ mod tests {
     fn runtime_routine_languages_keep_distinct_instances_and_reuse_owned_keys() {
         let mut config = Config::default_dev();
         config.routine_input_slots = 2;
-        let mut budget =
-            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(64, 2));
-        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 64, 2).unwrap();
+        let key_storage = 2 * 64;
+        let mut budget = Budget::new(
+            RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(key_storage, 2),
+        );
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, key_storage, 2).unwrap();
         let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
         let freeze = |bytes: &[u8]| {
             pool.copy_slice(bytes)
@@ -1165,7 +1375,7 @@ mod tests {
                 assert!(again.reserved.is_none());
             }
             plans.clear();
-            assert!(pool.lease::<u8>(64).is_ok());
+            assert!(pool.lease::<u8>(key_storage).is_ok());
         });
     }
 
@@ -1929,7 +2139,7 @@ mod tests {
                 .unwrap();
             let retained = match plans.find(old_key).unwrap().unwrap() {
                 Lookup::Ready(_, image) => image,
-                Lookup::Waiting(_) => panic!("ready image"),
+                Lookup::Waiting(_) | Lookup::Failed(_, _) => panic!("ready image"),
             };
             let next_key = Key {
                 owner: Owner::Backend,

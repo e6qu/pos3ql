@@ -112,16 +112,20 @@ fn decode_foreign_field<'a>(
     let declared = storage.declared_column_type(&table.columns()[column], txid)?;
     let value = match raw {
         Some(raw) => {
-            super::exec::decode_text_input(storage, declared.catalog_oid(), raw, arena, txid)?
+            super::exec::decode_text_input(storage, declared.catalog_oid(), raw, arena, txid, None)?
         }
-        None => {
-            super::exec::coerce_binary_input_null(storage, declared.catalog_oid(), arena, txid)?
-        }
+        None => super::exec::coerce_binary_input_null(
+            storage,
+            declared.catalog_oid(),
+            arena,
+            txid,
+            None,
+        )?,
     };
     if value.is_null() {
         return Ok(value);
     }
-    super::exec::coerce(value, &table.columns()[column], storage, txid, arena)
+    super::exec::coerce(value, &table.columns()[column], storage, txid, arena, None)
 }
 
 fn poll_client(

@@ -2287,13 +2287,15 @@ pub fn alter_foreign_server(
             name
         ));
     };
-    if let Err(error) = require_foreign_owner(
-        storage,
-        crate::storage::foreign::ForeignObjectClass::Server,
-        slot,
-        txn.txid,
-        "server",
-    ) {
+    if !matches!(action, super::ast::AlterForeignServerAction::Owner(_))
+        && let Err(error) = require_foreign_owner(
+            storage,
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot,
+            txn.txid,
+            "server",
+        )
+    {
         return sql_fail(error);
     }
     match action {
@@ -6174,6 +6176,7 @@ where
         checks,
         arena,
         params,
+        None,
     )?;
     if !dml_row_available(storage, txn, conflict.selected, "updated")? {
         return Ok(ConflictOutcome::Skip);
@@ -7457,42 +7460,30 @@ pub(crate) fn alter_materialized_view(
     )
 }
 
-pub fn alter_owner(
-    storage: &mut Storage,
-    txn: &mut TxnState,
+pub(super) fn alter_owner_target(
+    storage: &Storage,
+    txid: u32,
     kind: crate::sql::ast::AlterOwnerKind,
     name: &QualName,
-    role: &str,
-    if_exists: bool,
-    responder: &mut Responder,
-) -> Outcome {
+) -> Result<Option<crate::storage::AccessObject>, SqlError> {
     use crate::sql::ast::AlterOwnerKind;
     use crate::storage::{AccessClass, AccessObject};
-    let (noun, tag) = match kind {
-        AlterOwnerKind::Schema => ("schema", "ALTER SCHEMA"),
-        AlterOwnerKind::Type => ("type", "ALTER TYPE"),
-        AlterOwnerKind::Domain => ("domain", "ALTER DOMAIN"),
-        AlterOwnerKind::Table => ("table", "ALTER TABLE"),
-        AlterOwnerKind::ForeignTable => ("foreign table", "ALTER FOREIGN TABLE"),
-        AlterOwnerKind::View => ("view", "ALTER VIEW"),
-        AlterOwnerKind::MaterializedView => ("materialized view", "ALTER MATERIALIZED VIEW"),
-        AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
-        AlterOwnerKind::Statistics => ("statistics object", "ALTER STATISTICS"),
-    };
-    let relation = || storage.resolve_relation(name.schema, name.name, txn.txid);
-    let object = match kind {
-        AlterOwnerKind::Schema => storage
-            .find_schema_visible(name.name, txn.txid)
-            .map(|slot| AccessObject {
-                class: AccessClass::Schema,
-                slot: slot as u16,
-            }),
+    let relation = || storage.resolve_relation(name.schema, name.name, txid);
+    Ok(match kind {
+        AlterOwnerKind::Schema => {
+            storage
+                .find_schema_visible(name.name, txid)
+                .map(|slot| AccessObject {
+                    class: AccessClass::Schema,
+                    slot: slot as u16,
+                })
+        }
         AlterOwnerKind::Type => storage
-            .resolve_alter_type_target(name.schema, name.name, txn.txid)
+            .resolve_alter_type_target(name.schema, name.name, txid)
             .map(crate::storage::AlterTypeTarget::access_object),
         AlterOwnerKind::Domain => (match name.schema {
-            Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
-            None => storage.resolve_domain_slot(name.name, txn.txid),
+            Some(schema) => storage.domain_slot(schema, name.name, txid),
+            None => storage.resolve_domain_slot(name.name, txid),
         })
         .map(|slot| AccessObject {
             class: AccessClass::Domain,
@@ -7500,13 +7491,9 @@ pub fn alter_owner(
         }),
         AlterOwnerKind::Table | AlterOwnerKind::ForeignTable => match relation() {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
-                let definition = storage.table_def(slot, txn.txid);
+                let definition = storage.table_def(slot, txid);
                 storage
-                    .matview_slot(
-                        definition.schema.as_str(),
-                        definition.name.as_str(),
-                        txn.txid,
-                    )
+                    .matview_slot(definition.schema.as_str(), definition.name.as_str(), txid)
                     .map_or(
                         Some(AccessObject {
                             class: AccessClass::Table,
@@ -7525,19 +7512,19 @@ pub fn alter_owner(
                 slot: slot as u16,
             }),
             Some(_) => {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a table",
                     name.name
                 ));
             }
-            None => match resolve_sequence(storage, name, txn.txid) {
+            None => match resolve_sequence(storage, name, txid) {
                 Ok(Some(slot)) => Some(AccessObject {
                     class: AccessClass::Sequence,
                     slot: slot as u16,
                 }),
                 Ok(None) => None,
-                Err(error) => return sql_fail(error),
+                Err(error) => return Err(error),
             },
         },
         AlterOwnerKind::View => match relation() {
@@ -7546,7 +7533,7 @@ pub fn alter_owner(
                 slot: slot as u16,
             }),
             Some(_) => {
-                return sql_fail(sql_err!(
+                return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "\"{}\" is not a view",
                     name.name
@@ -7555,25 +7542,53 @@ pub fn alter_owner(
             None => None,
         },
         AlterOwnerKind::MaterializedView => {
-            match materialized_view_access_object(storage, name, txn.txid) {
+            match materialized_view_access_object(storage, name, txid) {
                 Ok(object) => object,
-                Err(error) => return sql_fail(error),
+                Err(error) => return Err(error),
             }
         }
-        AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txn.txid) {
+        AlterOwnerKind::Sequence => match resolve_sequence(storage, name, txid) {
             Ok(Some(slot)) => Some(AccessObject {
                 class: AccessClass::Sequence,
                 slot: slot as u16,
             }),
             Ok(None) => None,
-            Err(error) => return sql_fail(error),
+            Err(error) => return Err(error),
         },
         AlterOwnerKind::Statistics => storage
-            .extended_statistics_slot_on_path(name.schema, name.name, txn.txid)
+            .extended_statistics_slot_on_path(name.schema, name.name, txid)
             .map(|slot| AccessObject {
                 class: AccessClass::Statistics,
                 slot: slot as u16,
             }),
+    })
+}
+
+pub fn alter_owner(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    kind: crate::sql::ast::AlterOwnerKind,
+    name: &QualName,
+    role: &str,
+    if_exists: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::AlterOwnerKind;
+    use crate::storage::AccessClass;
+    let (noun, tag) = match kind {
+        AlterOwnerKind::Schema => ("schema", "ALTER SCHEMA"),
+        AlterOwnerKind::Type => ("type", "ALTER TYPE"),
+        AlterOwnerKind::Domain => ("domain", "ALTER DOMAIN"),
+        AlterOwnerKind::Table => ("table", "ALTER TABLE"),
+        AlterOwnerKind::ForeignTable => ("foreign table", "ALTER FOREIGN TABLE"),
+        AlterOwnerKind::View => ("view", "ALTER VIEW"),
+        AlterOwnerKind::MaterializedView => ("materialized view", "ALTER MATERIALIZED VIEW"),
+        AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
+        AlterOwnerKind::Statistics => ("statistics object", "ALTER STATISTICS"),
+    };
+    let object = match alter_owner_target(storage, txn.txid, kind, name) {
+        Ok(object) => object,
+        Err(error) => return sql_fail(error),
     };
     let Some(object) = object else {
         if if_exists {
@@ -7633,7 +7648,12 @@ pub fn alter_owner(
     {
         return sql_fail(error);
     }
-    if storage.object_owner(object, txn.txid) == new_owner {
+    if storage.object_owner(object, txn.txid) == new_owner
+        && !(object.class == AccessClass::Schema
+            && storage
+                .schema_def_for(usize::from(object.slot), txn.txid)
+                .has_database_owner(txn.txid))
+    {
         responder.command_complete(tag)?;
         return sql_ok();
     }
@@ -19409,18 +19429,24 @@ fn parse_trigger_for_header<'a>(
     let lower = source[..range_at].trim();
     let upper_step = source[range_at + 2..].trim();
     let (upper, step) = match trigger_top_level_keyword(upper_step, "by") {
-        Some(at) => (upper_step[..at].trim(), upper_step[at + 2..].trim()),
-        None => (upper_step, "1"),
+        Some(at) => (upper_step[..at].trim(), Some(upper_step[at + 2..].trim())),
+        None => (upper_step, None),
     };
-    if lower.is_empty() || upper.is_empty() || step.is_empty() {
+    if lower.is_empty() || upper.is_empty() || step.is_some_and(str::is_empty) {
         return Err(unsupported_trigger_body());
     }
+    let step = match step {
+        Some(source) => parse_plpgsql_expression(source, arena)?,
+        None => arena
+            .alloc(Expr::Int(1))
+            .map_err(|_| super::query::arena_full_pub())?,
+    };
     Ok(Some((
         target,
         TriggerForSource::Numeric {
             lower: parse_plpgsql_expression(lower, arena)?,
             upper: parse_plpgsql_expression(upper, arena)?,
-            step: parse_plpgsql_expression(step, arena)?,
+            step,
             reverse,
         },
     )))
@@ -21531,6 +21557,46 @@ mod trigger_program_tests {
     }
 
     #[test]
+    fn numeric_for_only_captures_step_expressions_written_in_the_body() {
+        let mut budget = Budget::new(1 << 18);
+        let arena = Arena::new(&mut budget, "numeric FOR original input spans", 1 << 17).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (body, step, inputs) in [
+                (
+                    "BEGIN FOR item IN 1..3 LOOP NULL; END LOOP; RETURN NEW; END",
+                    1,
+                    2,
+                ),
+                (
+                    "BEGIN FOR item IN 1..3 BY 2 LOOP NULL; END LOOP; RETURN NEW; END",
+                    2,
+                    3,
+                ),
+            ] {
+                let program = parse_trigger_program(body, &arena).unwrap();
+                let TriggerStatement::For(TriggerFor {
+                    source:
+                        TriggerForSource::Numeric {
+                            step: expression, ..
+                        },
+                    ..
+                }) = program.body.statements[0]
+                else {
+                    panic!("numeric FOR program");
+                };
+                assert!(matches!(*expression, Expr::Int(value) if value == step));
+                assert_eq!(program.input_sites.len(), inputs);
+                for site in program.input_sites {
+                    assert_eq!(
+                        body.get(site.position..site.position + site.text.len()),
+                        Some(site.text)
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
     fn labelled_loop_header_splits_before_its_first_action() {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
@@ -22056,6 +22122,7 @@ where
                 storage,
                 txid,
                 query_arena,
+                Some(&live),
             )?;
             let encoded = encode_projected_persistent_pub(values, result_arena)?;
             rows.push(encoded)
@@ -22643,6 +22710,14 @@ fn bind_plpgsql_dynamic_query<'a>(
             eval_procedural_expression(context, expression, scope)?,
             context.arena,
         )?;
+    }
+    if matches!(kind, DynamicCommandKind::Cursor) {
+        let mark = context.arena.mark();
+        let validated =
+            super::parser::parse_cursor_command(command, context.arena, &[], &[], |_| Ok(()))
+                .map(|_| ());
+        unsafe { context.arena.rewind_to(mark) };
+        validated?;
     }
     let owner = match &mut context.host {
         PlpgsqlExecHost::Routine { sqlprep, .. } => {
@@ -25195,6 +25270,11 @@ fn coerce_plpgsql_local<'a>(
     local: TriggerLocalDecl<'a>,
     value: Datum<'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session,
+        context.txn.txid,
+    );
     let value = match local.record_shape {
         Some(PlpgsqlRecordShape::Table(slot)) => {
             coerce_plpgsql_table_rowtype(context, slot, value)?
@@ -25209,6 +25289,7 @@ fn coerce_plpgsql_local<'a>(
             context.storage(),
             context.txn.txid,
             context.arena,
+            Some(&sequences),
         )?,
     };
     let value = apply_typmod(value, local.ctype, local.type_mod, context.arena)?;
@@ -25227,6 +25308,11 @@ fn coerce_plpgsql_table_rowtype<'a>(
     slot: u16,
     value: Datum<'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session,
+        context.txn.txid,
+    );
     if value.is_null() {
         return Ok(Datum::Null);
     }
@@ -25280,6 +25366,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
                 context.storage(),
                 context.txn.txid,
                 context.arena,
+                Some(&sequences),
             )?,
         };
     }
@@ -26072,6 +26159,11 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     context.storage(),
                     context.txn.txid,
                     context.arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        context.storage(),
+                        context.seq_session,
+                        context.txn.txid,
+                    )),
                 )?;
                 new.as_deref_mut().expect("checked NEW image")[column] = value;
 
@@ -37011,6 +37103,7 @@ pub fn create_aggregate(
                         value.as_bytes(),
                         arena,
                         txn.txid,
+                        None,
                     ) {
                         return sql_fail(error);
                     }
@@ -37073,6 +37166,7 @@ pub fn create_aggregate(
                 value.as_bytes(),
                 arena,
                 txn.txid,
+                None,
             ) {
                 return sql_fail(error);
             }
@@ -42458,6 +42552,7 @@ pub fn create_table_as(
     params: &[Datum],
     responder: &mut Responder,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     use crate::storage::{ColumnMeta, SqlName};
     let materialized = kind == crate::sql::ast::CreateTableAsKind::MaterializedView;
     let crate::sql::ast::TableAsOptions {
@@ -42703,12 +42798,7 @@ pub fn create_table_as(
             Ok(s) => s,
             Err(e) => return sql_fail(e),
         };
-        let replay_state = crate::sql::sequence::SequenceReplayState::empty();
-        let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
-            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
-            &replay_state,
-            arena,
-        );
+        let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
         let sel = match super::query::expand_ctes_exec(
             sel,
             storage,
@@ -42776,6 +42866,11 @@ pub fn create_table_as(
                     storage,
                     txn.txid,
                     arena,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 ) {
                     Ok(v) => *slot = v,
                     Err(e) => return sql_fail(e),
@@ -42899,6 +42994,7 @@ pub fn refresh_materialized_view(
     params: &[Datum],
     responder: &mut Responder,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     let table_index = match storage.resolve_relation(name.schema, name.name, txn.txid) {
         Some(crate::storage::ResolvedRelation::Table(idx)) => idx,
         _ => return sql_fail(undefined_kind("relation", name.name)),
@@ -42954,12 +43050,7 @@ pub fn refresh_materialized_view(
         Ok(select) => select,
         Err(error) => return sql_fail(error),
     };
-    let replay_state = crate::sql::sequence::SequenceReplayState::empty();
-    let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
-        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
-        &replay_state,
-        arena,
-    );
+    let live_sequence = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
     let dependencies = match storage.snapshot_matview_dependencies(slot, txn.txid, arena) {
         Ok(dependencies) => dependencies,
         Err(error) => return sql_fail(error),
@@ -43075,6 +43166,11 @@ pub fn refresh_materialized_view(
                 storage,
                 txn.txid,
                 arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 Ok(v) => *slot_v = v,
                 Err(e) => return sql_fail(e),
@@ -45793,6 +45889,7 @@ pub fn alter_domain(
                 },
                 txn.txid,
                 arena,
+                None,
             ) {
                 return sql_fail(error);
             }
@@ -45805,7 +45902,7 @@ pub fn alter_domain(
         Err(error) => return sql_fail(error),
     };
     if let Some(validation) = revalidation
-        && let Err(e) = validate_domain_rows(storage, slot, validation, txn.txid, arena)
+        && let Err(e) = validate_domain_rows(storage, slot, validation, txn.txid, arena, None)
     {
         storage.rollback_domain_alter(prior);
         return sql_fail(e);
@@ -45862,6 +45959,7 @@ fn validate_domain_rows(
     validation: DomainValidation,
     txid: u32,
     arena: &Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let dependencies = match validation {
         DomainValidation::All => None,
@@ -45942,6 +46040,7 @@ fn validate_domain_rows(
                             values[column_index],
                             txid,
                             arena,
+                            sequences,
                         )?;
                     }
                     Ok(())
@@ -45955,6 +46054,10 @@ fn validate_domain_rows(
 /// Validates a scalar domain value or every element of a domain-array value.
 /// A full revalidation shares write-time coercion; a DDL operation selects
 /// only the rule PostgreSQL says that operation must scan.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored domain validation preserves explicit sequence context"
+)]
 fn validate_stored_domain_value(
     storage: &Storage,
     leaf: usize,
@@ -45963,6 +46066,7 @@ fn validate_stored_domain_value(
     value: Datum,
     txid: u32,
     arena: &Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let validate = |value| match validation {
         DomainValidation::All => coerce_domain_value(
@@ -45972,6 +46076,7 @@ fn validate_stored_domain_value(
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
+            sequences,
         )
         .map(|_| ()),
         DomainValidation::NotNull { target } => {
@@ -45994,6 +46099,7 @@ fn validate_stored_domain_value(
                 value,
                 arena,
                 crate::sql::eval::NO_PARAMS,
+                sequences,
             )
         }
     };
@@ -50302,9 +50408,14 @@ fn rewrite_composite_dependent_domains(
             continue;
         }
         let prior = storage.stage_domain_alter(edit_target, spec, txn.txid)?;
-        if let Err(error) =
-            validate_domain_rows(storage, domain_slot, DomainValidation::All, txn.txid, arena)
-        {
+        if let Err(error) = validate_domain_rows(
+            storage,
+            domain_slot,
+            DomainValidation::All,
+            txn.txid,
+            arena,
+            None,
+        ) {
             storage.rollback_domain_alter(prior);
             return Err(error);
         }
@@ -56826,6 +56937,7 @@ pub(crate) fn copy_row(
     scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
+    let coercion_txid = txn.txid;
     let _files = setup.restore_snapshot(storage)?;
     let (write_target, def) = setup
         .definitions
@@ -56876,19 +56988,27 @@ pub(crate) fn copy_row(
         values[col_index] = match field {
             None => Datum::Null,
             Some(_) if use_default => Datum::Null,
-            Some(text) => {
-                coerce(Datum::Text(text), col, storage, txn.txid, arena).map_err(|error| {
-                    SqlError {
-                        sqlstate: error.sqlstate,
-                        message: stack_format!(
-                            192,
-                            "COPY column \"{}\": {}",
-                            col.name.as_str(),
-                            error.message.as_str()
-                        ),
-                    }
-                })?
-            }
+            Some(text) => coerce(
+                Datum::Text(text),
+                col,
+                storage,
+                txn.txid,
+                arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
+            )
+            .map_err(|error| SqlError {
+                sqlstate: error.sqlstate,
+                message: stack_format!(
+                    192,
+                    "COPY column \"{}\": {}",
+                    col.name.as_str(),
+                    error.message.as_str()
+                ),
+            })?,
         };
         explicit[col_index] = !use_default;
     }
@@ -56957,6 +57077,7 @@ pub(crate) fn copy_row_binary(
     scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
+    let coercion_txid = txn.txid;
     let _files = setup.restore_snapshot(storage)?;
     let (write_target, def) = setup
         .definitions
@@ -56988,9 +57109,30 @@ pub(crate) fn copy_row_binary(
             Datum::Null
         } else {
             let field = reader.take(field_len as usize).map_err(|_| malformed())?;
-            let decoded =
-                decode_binary_field_with_catalog(col.ctype, field, arena, storage, txn.txid)?;
-            coerce(decoded, &col, storage, txn.txid, arena)?
+            let decoded = decode_binary_field_with_catalog(
+                col.ctype,
+                field,
+                arena,
+                storage,
+                txn.txid,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
+            )?;
+            coerce(
+                decoded,
+                &col,
+                storage,
+                txn.txid,
+                arena,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
+            )?
         };
         explicit[col_index] = true;
     }
@@ -57062,6 +57204,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     values: &mut [Datum<'a>; MAX_COLUMNS],
     arena: &'a Arena,
 ) -> Result<CopyRowOutcome, SqlError> {
+    let coercion_txid = txn.txid;
     let logical_table = logical_target.table();
     partition_insert::with_partition_insert_row(
         storage,
@@ -57178,6 +57321,11 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 checks,
                 arena,
                 &[],
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             )?;
             if physical.kind == crate::storage::TableKind::Foreign {
                 crate::sql::foreign::insert_row(
@@ -57388,6 +57536,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 checks,
                 arena,
                 &[],
+                None,
             )?;
             store_row(
                 storage,
@@ -57447,19 +57596,28 @@ fn decode_replication_tuple<'a, Definition0: crate::storage::DefinitionBacking>(
                     .declared_column_type(column, txn.txid)?
                     .replication_oid();
                 coerce(
-                    decode_text_input(storage, oid, bytes, arena, txn.txid)?,
+                    decode_text_input(storage, oid, bytes, arena, txn.txid, None)?,
                     column,
                     storage,
                     txn.txid,
                     arena,
+                    None,
                 )?
             }
             TupleColumn::Binary(bytes) => coerce(
-                decode_binary_field_with_catalog(column.ctype, bytes, arena, storage, txn.txid)?,
+                decode_binary_field_with_catalog(
+                    column.ctype,
+                    bytes,
+                    arena,
+                    storage,
+                    txn.txid,
+                    None,
+                )?,
                 column,
                 storage,
                 txn.txid,
                 arena,
+                None,
             )?,
             TupleColumn::UnchangedToast if allow_unchanged_toast => Datum::Null,
             TupleColumn::UnchangedToast => {
@@ -57986,6 +58144,7 @@ pub(crate) fn apply_replication_update(
         &checks,
         arena,
         &[],
+        None,
     )?;
     row.available(storage, txn, "updated")?;
     store_row(
@@ -58185,7 +58344,7 @@ pub(crate) fn decode_binary_field<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_binary_field_with_context(ctype, bytes, arena, BinaryDecodeContext::Plain)
+    decode_binary_field_with_context(ctype, bytes, arena, BinaryDecodeContext::Plain, None)
 }
 
 /// Decodes binary input whose declared type was resolved through the active
@@ -58197,12 +58356,14 @@ pub(crate) fn decode_binary_field_with_catalog<'a>(
     arena: &'a Arena,
     storage: &Storage,
     txid: u32,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     decode_binary_field_with_context(
         ctype,
         bytes,
         arena,
         BinaryDecodeContext::Catalog { storage, txid },
+        sequences,
     )
 }
 
@@ -58284,6 +58445,7 @@ pub(crate) fn decode_binary_input<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     txid: u32,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     if oid == crate::sql::types::oid::REGTYPE {
         let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
@@ -58297,10 +58459,11 @@ pub(crate) fn decode_binary_input<'a>(
     }
     let decoded = match resolve_parameter_input_type(storage, oid, txid)? {
         ParameterInputType::Builtin(ctype) => {
-            decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid)
+            decode_binary_field_with_catalog(ctype, bytes, arena, storage, txid, sequences)
         }
         ParameterInputType::Domain { target: slot, base } => {
-            let value = decode_binary_field_with_catalog(base, bytes, arena, storage, txid)?;
+            let value =
+                decode_binary_field_with_catalog(base, bytes, arena, storage, txid, sequences)?;
             coerce_domain_value(
                 storage,
                 slot,
@@ -58308,11 +58471,17 @@ pub(crate) fn decode_binary_input<'a>(
                 txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
+                sequences,
             )
         }
-        ParameterInputType::DomainArray(element) => {
-            decode_binary_field_with_catalog(ColType::Array(element), bytes, arena, storage, txid)
-        }
+        ParameterInputType::DomainArray(element) => decode_binary_field_with_catalog(
+            ColType::Array(element),
+            bytes,
+            arena,
+            storage,
+            txid,
+            sequences,
+        ),
     };
     // COPY framing errors are 22P04, but a Bind value is an individual type's
     // binary input and PostgreSQL reports malformed bytes as 22P03. Keep the
@@ -58380,6 +58549,7 @@ pub(crate) fn decode_text_input<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     txid: u32,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let text = core::str::from_utf8(bytes).map_err(|_| {
         sql_err!(
@@ -58410,12 +58580,13 @@ pub(crate) fn decode_text_input<'a>(
             storage,
             txid,
             arena,
+            sequences,
         ),
         ColType::Array(
             element @ (crate::sql::types::ArrElem::Enum(_)
             | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
-        ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena),
+        ) => coerce_user_type_array(Datum::Text(text), element, storage, txid, arena, sequences),
         ColType::Array(element) if element.is_catalog_reference() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::reg_array_cast(Datum::Text(text), element, Some(&catalog), arena)
@@ -58431,9 +58602,10 @@ pub(crate) fn decode_text_input<'a>(
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
+            sequences,
         ),
         ParameterInputType::DomainArray(element) => {
-            coerce_user_type_array(Datum::Text(text), element, storage, txid, arena)
+            coerce_user_type_array(Datum::Text(text), element, storage, txid, arena, sequences)
         }
     }
 }
@@ -58443,6 +58615,7 @@ pub(crate) fn coerce_binary_input_null<'a>(
     oid: i32,
     arena: &'a Arena,
     txid: u32,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     if oid == 0 {
         return Ok(Datum::Null);
@@ -58455,6 +58628,7 @@ pub(crate) fn coerce_binary_input_null<'a>(
             txid,
             arena,
             crate::sql::eval::NO_PARAMS,
+            sequences,
         ),
         ParameterInputType::Builtin(_) | ParameterInputType::DomainArray(_) => Ok(Datum::Null),
     }
@@ -58471,6 +58645,7 @@ fn decode_binary_field_with_context<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     context: BinaryDecodeContext<'_>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     use crate::sql::types::oid as oids;
     let bad = || {
@@ -58623,11 +58798,11 @@ fn decode_binary_field_with_context<'a>(
         ColType::Macaddr8 => via(oids::MACADDR8),
         ColType::Geometry(kind) => crate::sql::geometry::decode_binary(kind, bytes, arena)
             .map(|text| Datum::Geometry { kind, text }),
-        ColType::Array(element) => decode_binary_array(element, bytes, arena, context),
+        ColType::Array(element) => decode_binary_array(element, bytes, arena, context, sequences),
         ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
         ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),
         ColType::Bit { varying } => decode_binary_bit(varying, bytes, arena),
-        ColType::Record => decode_binary_record(bytes, arena, context),
+        ColType::Record => decode_binary_record(bytes, arena, context, sequences),
         ColType::Enum(slot) => {
             let label = core::str::from_utf8(bytes).map_err(|_| bad())?;
             let BinaryDecodeContext::Catalog { storage, txid } = context else {
@@ -58645,8 +58820,8 @@ fn decode_binary_field_with_context<'a>(
                     "binary input of a named composite requires catalog context"
                 ));
             };
-            let record = decode_binary_record(bytes, arena, context)?;
-            coerce_composite_value(record, slot, storage, txid, arena)
+            let record = decode_binary_record(bytes, arena, context, sequences)?;
+            coerce_composite_value(record, slot, storage, txid, arena, sequences)
         }
     }
 }
@@ -58655,6 +58830,7 @@ fn decode_binary_record<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     context: BinaryDecodeContext<'_>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary record");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
@@ -58686,12 +58862,12 @@ fn decode_binary_record<'a>(
             match context {
                 BinaryDecodeContext::Plain => Datum::Null,
                 BinaryDecodeContext::Catalog { storage, txid } => {
-                    coerce_binary_input_null(storage, type_oid, arena, txid)?
+                    coerce_binary_input_null(storage, type_oid, arena, txid, sequences)?
                 }
             }
         } else {
             let bytes = reader.take(length as usize).map_err(|_| bad())?;
-            decode_binary_field_by_oid(type_oid, bytes, arena, context)?
+            decode_binary_field_by_oid(type_oid, bytes, arena, context, sequences)?
         };
     }
     if !reader.done() {
@@ -58709,13 +58885,14 @@ fn decode_binary_field_by_oid<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     context: BinaryDecodeContext<'_>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary record");
     if let BinaryDecodeContext::Catalog { storage, txid } = context {
-        return decode_binary_input(storage, oid, bytes, arena, txid);
+        return decode_binary_input(storage, oid, bytes, arena, txid, sequences);
     }
     let ctype = ColType::from_oid(oid).ok_or_else(bad)?;
-    decode_binary_field_with_context(ctype, bytes, arena, context)
+    decode_binary_field_with_context(ctype, bytes, arena, context, sequences)
 }
 
 #[derive(Clone, Copy)]
@@ -58828,6 +59005,7 @@ fn decode_binary_array<'a>(
     bytes: &'a [u8],
     arena: &'a Arena,
     context: BinaryDecodeContext<'_>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary array");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
@@ -58877,7 +59055,7 @@ fn decode_binary_array<'a>(
             return Err(bad());
         } else {
             let field = reader.take(len as usize).map_err(|_| bad())?;
-            decode_binary_field_with_context(element_type, field, arena, context)?
+            decode_binary_field_with_context(element_type, field, arena, context, sequences)?
         };
         *slot = match element {
             crate::sql::types::ArrElem::Domain { identity: slot, .. } => {
@@ -58903,6 +59081,7 @@ fn decode_binary_array<'a>(
                     txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
+                    sequences,
                 )?;
                 match value {
                     Datum::Composite {
@@ -60346,7 +60525,9 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
         eval_full(expression, arena, params, row, &hooks)?
     };
     let value = match assignment {
-        Some((column, cast)) => coerce_assignment(value, column, cast, storage, txid, arena)?,
+        Some((column, cast)) => {
+            coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)?
+        }
         None => value,
     };
     detached_trigger_datum(value, arena)
@@ -60679,6 +60860,7 @@ pub(crate) fn merge<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Merge(*statement),
@@ -62104,6 +62286,11 @@ pub(crate) fn merge<'a>(
                             &new_layout.checks,
                             arena,
                             params,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                coercion_txid,
+                            )),
                         ) {
                             return sql_fail(e);
                         }
@@ -62520,6 +62707,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
     scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let coercion_txid = txn.txid;
     let table_index = logical_target.table();
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
@@ -62722,6 +62910,11 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
                 checks,
                 arena,
                 params,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             )?;
             if def.kind == crate::storage::TableKind::Foreign {
                 if crate::sql::foreign::insert_row(
@@ -62811,6 +63004,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
 where
     'snapshot: 'a,
 {
+    let coercion_txid = txn.txid;
     let logical_table_index = logical_target.table();
     match partition_insert::with_partition_insert_row(
         storage,
@@ -63044,6 +63238,11 @@ where
                 checks,
                 arena,
                 params,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 return Ok(Err(error));
             }
@@ -63279,6 +63478,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     let assignment_casts =
         match prepare_dml_assignment_casts(statement, storage, txn.txid, arena, None) {
             Ok(casts) => casts,
@@ -63452,6 +63652,11 @@ pub(crate) fn instead_of_view_dml<'a>(
                             storage,
                             txn.txid,
                             arena,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                coercion_txid,
+                            )),
                         )?;
                         let bytes = encode_projected_pub(values, arena)?;
                         rows.push(bytes).map_err(|error| {
@@ -64094,6 +64299,7 @@ pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
 where
     'snapshot: 'a,
 {
+    let coercion_txid = txn.txid;
     let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Insert(*statement),
@@ -64434,6 +64640,11 @@ where
                         storage,
                         txn.txid,
                         arena,
+                        Some(&crate::sql::sequence::SeqEval::new(
+                            storage,
+                            seq_session,
+                            coercion_txid,
+                        )),
                     )?;
                     let encoded = encode_projected_persistent_pub(vals, arena)?;
                     rows.push(encoded).map_err(|_| super::eval::arena_full())?;
@@ -65425,6 +65636,7 @@ pub(crate) fn update<'a>(
     mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Update(*statement),
         storage,
@@ -66298,6 +66510,11 @@ pub(crate) fn update<'a>(
                 &new_layout.checks,
                 arena,
                 params,
+                Some(&crate::sql::sequence::SeqEval::new(
+                    storage,
+                    seq_session,
+                    coercion_txid,
+                )),
             ) {
                 return sql_fail(error);
             }
@@ -67656,6 +67873,7 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
                         &checks,
                         arena,
                         &[],
+                        None,
                     )
                 },
             )?;
@@ -69634,6 +69852,7 @@ fn alter_partition_attachment(
                             &parent_checks,
                             arena,
                             &[],
+                            None,
                         )
                     },
                 )
@@ -70238,6 +70457,7 @@ fn alter_table_relation(
     tag: &'static str,
     inheritance_scope: AlterInheritanceScope,
 ) -> Outcome {
+    let coercion_txid = txn.txid;
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
@@ -72761,6 +72981,11 @@ fn alter_table_relation(
                     &[],
                     txn.txid,
                     ddl_read,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 ) {
                     return sql_fail(e);
                 }
@@ -74765,6 +74990,7 @@ pub(crate) fn coerce<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     if !v.is_null() && col.ctype == ColType::PgStatisticArray {
         return Err(sql_err!(
@@ -74794,12 +75020,13 @@ pub(crate) fn coerce<'a>(
                 crate::sql::eval::DefinedCastContext::Assignment,
                 crate::sql::ast::Collation::None,
                 arena,
+                sequences,
             )? {
                 v = cast;
             }
         }
     }
-    coerce_column_value(v, col, storage, txid, arena)
+    coerce_column_value(v, col, storage, txid, arena, sequences)
 }
 
 #[derive(Clone, Copy)]
@@ -74952,7 +75179,7 @@ fn eval_prepared_assignment<'a>(
     let mut cast = casts.selected(expression, column, storage, txid)?;
     cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
     let value = eval_full(expression, arena, params, row, hooks)?;
-    coerce_assignment(value, column, cast, storage, txid, arena)
+    coerce_assignment(value, column, cast, storage, txid, arena, hooks.sequences)
 }
 
 fn prepare_assignment_cast(
@@ -75099,6 +75326,7 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     if values.len() > targets.len() || casts.len() != targets.len() {
         return Err(sql_err!(
@@ -75121,6 +75349,7 @@ fn coerce_insert_projection<'a, B: crate::storage::DefinitionBacking>(
             storage,
             txid,
             arena,
+            sequences,
         )?;
     }
     Ok(output)
@@ -75133,6 +75362,7 @@ fn coerce_assignment<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let _site = cast
         .site
@@ -75148,6 +75378,7 @@ fn coerce_assignment<'a>(
                 column.type_mod,
                 cast_input_collation,
                 arena,
+                sequences,
             )?
         }
         None => value,
@@ -75161,7 +75392,7 @@ fn coerce_assignment<'a>(
     {
         return apply_typmod(value, column.ctype, column.type_mod, arena);
     }
-    coerce_column_value(value, column, storage, txid, arena)
+    coerce_column_value(value, column, storage, txid, arena, sequences)
 }
 
 #[expect(
@@ -75193,6 +75424,7 @@ fn eval_assignment<'a>(
         storage,
         txid,
         arena,
+        hooks.sequences,
     )
 }
 
@@ -75202,6 +75434,7 @@ fn coerce_column_value<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     if !v.is_null() && col.ctype == ColType::PgStatisticArray {
         return Err(sql_err!(
@@ -75218,12 +75451,18 @@ fn coerce_column_value<'a>(
                 slot: actual,
                 physical_fields: 0,
                 text,
-            } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
+            } if actual == slot => {
+                decode_composite_text(text, slot, storage, txid, arena, sequences)?
+            }
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);
             }
-            Datum::Record(_) => coerce_composite_value(v, Some(slot), storage, txid, arena)?,
-            Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
+            Datum::Record(_) => {
+                coerce_composite_value(v, Some(slot), storage, txid, arena, sequences)?
+            }
+            Datum::Text(text) => {
+                decode_composite_text(text, slot, storage, txid, arena, sequences)?
+            }
             _ => {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
@@ -75263,7 +75502,7 @@ fn coerce_column_value<'a>(
         | crate::sql::types::ArrElem::Domain { .. }),
     ) = col.ctype
     {
-        return coerce_user_type_array(v, element, storage, txid, arena);
+        return coerce_user_type_array(v, element, storage, txid, arena, sequences);
     }
     if let ColType::Array(element) = col.ctype
         && element.is_catalog_reference()
@@ -75311,6 +75550,7 @@ pub(crate) fn coerce_routine_argument<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let column = ColumnMeta {
         ctype: argument.ctype,
@@ -75318,21 +75558,23 @@ pub(crate) fn coerce_routine_argument<'a>(
         ..ColumnMeta::EMPTY
     };
     if let Some(target) = constraints::column_domain_target(storage, &column, txid)? {
-        return coerce_domain_value(storage, target, value, txid, arena, &[]);
+        return coerce_domain_value(storage, target, value, txid, arena, &[], sequences);
     }
     match argument.ctype {
         ColType::Composite(slot) => match value {
             Datum::CompositeText {
                 slot: actual, text, ..
-            } if Some(actual) == slot => decode_composite_text(text, actual, storage, txid, arena),
-            value => coerce_composite_value(value, slot, storage, txid, arena),
+            } if Some(actual) == slot => {
+                decode_composite_text(text, actual, storage, txid, arena, sequences)
+            }
+            value => coerce_composite_value(value, slot, storage, txid, arena, sequences),
         },
         ColType::Enum(slot) => coerce_enum_value(value, slot, storage, txid, arena),
         ColType::Array(
             element @ (crate::sql::types::ArrElem::Enum(_)
             | crate::sql::types::ArrElem::Composite(_)
             | crate::sql::types::ArrElem::Domain { .. }),
-        ) => coerce_user_type_array(value, element, storage, txid, arena),
+        ) => coerce_user_type_array(value, element, storage, txid, arena, sequences),
         ctype if ctype.is_reg_object() => {
             let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
             crate::sql::eval::regobject_cast(value, ctype, Some(&catalog), arena)
@@ -75491,7 +75733,8 @@ fn decode_composite_stored_field<'a>(
                     arena,
                 )?;
                 if matches!(out, Datum::Composite { .. }) {
-                    *out = coerce_user_type_array_element(*out, element, storage, txid, arena)?;
+                    *out =
+                        coerce_user_type_array_element(*out, element, storage, txid, arena, None)?;
                 }
             }
             Ok(Datum::Array {
@@ -75633,6 +75876,7 @@ pub(crate) fn coerce_composite_value<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let slot = slot.ok_or_else(|| {
         sql_err!(
@@ -75640,7 +75884,15 @@ pub(crate) fn coerce_composite_value<'a>(
             "named type declaration has no bound identity"
         )
     })?;
-    coerce_composite_value_inner(value, slot, CompositeEncoding::Input, storage, txid, arena)
+    coerce_composite_value_inner(
+        value,
+        slot,
+        CompositeEncoding::Input,
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }
 
 fn coerce_composite_value_inner<'a>(
@@ -75650,6 +75902,7 @@ fn coerce_composite_value_inner<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     if value.is_null() {
         return Ok(Datum::Null);
@@ -75754,6 +76007,7 @@ fn coerce_composite_value_inner<'a>(
                 storage,
                 txid,
                 arena,
+                sequences,
             )?;
             match constraints::column_domain_target(storage, &column, txid)? {
                 Some(domain) => constraints::coerce_domain_value(
@@ -75763,6 +76017,7 @@ fn coerce_composite_value_inner<'a>(
                     txid,
                     arena,
                     crate::sql::eval::NO_PARAMS,
+                    sequences,
                 )?,
                 None => value,
             }
@@ -75797,8 +76052,9 @@ pub(crate) fn decode_composite_text<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
-    decode_composite_text_inner(text, slot, None, storage, txid, arena)
+    decode_composite_text_inner(text, slot, None, storage, txid, arena, sequences)
 }
 
 /// Decodes a row-encoded composite. Its physical field count is part of the
@@ -75818,6 +76074,7 @@ pub(crate) fn decode_stored_composite_text<'a>(
         storage,
         txid,
         arena,
+        None,
     )
 }
 
@@ -75828,6 +76085,7 @@ fn decode_composite_text_inner<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let encoding = match stored_physical_fields {
         None => CompositeEncoding::Input,
@@ -75996,7 +76254,15 @@ fn decode_composite_text_inner<'a>(
             Datum::Text(raw)
         };
     }
-    coerce_composite_value_inner(Datum::Record(values), slot, encoding, storage, txid, arena)
+    coerce_composite_value_inner(
+        Datum::Record(values),
+        slot,
+        encoding,
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }
 
 /// Coerces an array to a user-defined element type. Its raw element payloads
@@ -76008,6 +76274,7 @@ pub(crate) fn coerce_user_type_array<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let (source, raw) = match value {
         Datum::Array { element, raw }
@@ -76041,7 +76308,7 @@ pub(crate) fn coerce_user_type_array<'a>(
         .iter_mut()
         .zip(crate::sql::array::elements(raw, source))
     {
-        *item = coerce_user_type_array_element(value, target, storage, txid, arena)?;
+        *item = coerce_user_type_array_element(value, target, storage, txid, arena, sequences)?;
     }
     Ok(Datum::Array {
         element: target,
@@ -76058,6 +76325,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     Ok(match target {
         crate::sql::types::ArrElem::Enum(Some(slot)) => {
@@ -76080,6 +76348,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 txid,
                 arena,
                 crate::sql::eval::NO_PARAMS,
+                sequences,
             )?
         }
         crate::sql::types::ArrElem::Composite(slot) => {
@@ -76089,10 +76358,16 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                     slot: actual,
                     physical_fields: 0,
                     text,
-                } if actual == slot => decode_composite_text(text, slot, storage, txid, arena)?,
+                } if actual == slot => {
+                    decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                }
                 Datum::CompositeText { slot: actual, .. } if actual == slot => value,
-                Datum::Text(text) => decode_composite_text(text, slot, storage, txid, arena)?,
-                value => coerce_composite_value(value, Some(slot), storage, txid, arena)?,
+                Datum::Text(text) => {
+                    decode_composite_text(text, slot, storage, txid, arena, sequences)?
+                }
+                value => {
+                    coerce_composite_value(value, Some(slot), storage, txid, arena, sequences)?
+                }
             };
             match composite {
                 Datum::Null => Datum::Null,

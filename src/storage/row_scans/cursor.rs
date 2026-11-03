@@ -287,12 +287,19 @@ mod tests {
                     }
                 }
                 if !skipped {
-                    responder.data_row(projected.as_slice()).map_err(|_| {
+                    crate::sql::query::emit_data_row(
+                        storage,
+                        txid,
+                        work,
+                        responder,
+                        projected.as_slice(),
+                    )
+                    .map_err(|_| {
                         crate::sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "test cursor result buffer is full"
                         )
-                    })?;
+                    })??;
                 }
                 query.finish_row(!skipped);
                 Ok(Some(!skipped))

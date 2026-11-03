@@ -1116,14 +1116,16 @@ impl<'a> RoutineResultShape<'a> {
 /// a restart from ever interpreting one as the other.
 #[derive(Clone, Copy)]
 enum RoutineInvocationResult<'a> {
-    Scalar(Datum<'a>),
-    Rows(&'a [&'a [u8]]),
+    Scalar(Datum<'a>, super::sequence::StatementReplayCursor),
+    Rows(&'a [&'a [u8]], super::sequence::StatementReplayCursor),
 }
 
 pub(crate) struct RoutineInvocationState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation<'a>>>,
+    pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
+    arena: &'a Arena,
     results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
     inputs: input_progress::RoutineInputs<'a>,
 }
@@ -1239,6 +1241,8 @@ impl<'a> RoutineInvocationState<'a> {
             next: Cell::new(0),
             completed: Cell::new(0),
             pending: Cell::new(None),
+            pending_replay: Cell::new(None),
+            arena,
             results: RefCell::new(ArenaList::new_persistent(arena)),
             inputs: input_progress::RoutineInputs::new(arena),
         }
@@ -1262,15 +1266,19 @@ impl<'a> RoutineInvocationState<'a> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value) = self.results.borrow().as_slice()[ordinal]
+            let RoutineInvocationResult::Scalar(value, replay) =
+                self.results.borrow().as_slice()[ordinal]
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a table source to a scalar expression"
                 ));
             };
+            super::sequence::restore_replay_cursor(replay)?;
             return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
+        self.pending_replay
+            .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position,
@@ -1298,15 +1306,19 @@ impl<'a> RoutineInvocationState<'a> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value) = self.results.borrow().as_slice()[ordinal]
+            let RoutineInvocationResult::Scalar(value, replay) =
+                self.results.borrow().as_slice()[ordinal]
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "intrinsic invocation changed result shape"
                 ));
             };
+            super::sequence::restore_replay_cursor(replay)?;
             return super::exec::detach_routine_datum(value, query_arena);
         }
+        self.pending_replay
+            .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position: input_progress::invocation_site(),
@@ -1329,7 +1341,10 @@ impl<'a> RoutineInvocationState<'a> {
         let ordinal = self.completed.get();
         self.results
             .borrow_mut()
-            .push(RoutineInvocationResult::Scalar(result))
+            .push(RoutineInvocationResult::Scalar(
+                result,
+                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
+            ))
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1351,15 +1366,19 @@ impl<'a> RoutineInvocationState<'a> {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Rows(rows) = self.results.borrow().as_slice()[ordinal]
+            let RoutineInvocationResult::Rows(rows, replay) =
+                self.results.borrow().as_slice()[ordinal]
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a scalar expression to a table source"
                 ));
             };
+            super::sequence::restore_replay_cursor(replay)?;
             return Ok(Some(rows));
         }
+        self.pending_replay
+            .set(super::sequence::begin_replay_cursor()?);
         self.pending.set(Some(PendingRoutineInvocation {
             plan_owner: super::type_input_plans::owner()?,
             source_position: source_position.map(InvocationSite::Expression),
@@ -1381,7 +1400,10 @@ impl<'a> RoutineInvocationState<'a> {
         let ordinal = self.completed.get();
         self.results
             .borrow_mut()
-            .push(RoutineInvocationResult::Rows(rows))
+            .push(RoutineInvocationResult::Rows(
+                rows,
+                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
+            ))
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2207,11 +2229,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     super::eval::DefinedCastContext::Implicit,
                     input_collation,
                     arena,
+                    None,
                 )?
             {
                 return Ok(value);
             }
-            super::exec::coerce_routine_argument(value, argument, self.storage, self.txid, arena)
+            super::exec::coerce_routine_argument(
+                value,
+                argument,
+                self.storage,
+                self.txid,
+                arena,
+                None,
+            )
         };
         let classify_input = |expression: &Expr<'_>, source, expected| -> Result<bool, SqlError> {
             // CALL evaluates ordinary expressions at execution time. Unknown
@@ -2539,6 +2569,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         value: Datum<'a>,
         target: crate::storage::RoutineResult,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         super::exec::coerce_routine_argument(
             value,
@@ -2550,6 +2581,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.storage,
             self.txid,
             arena,
+            sequences,
         )
     }
 
@@ -2566,12 +2598,20 @@ impl StorageCatalog<'_, '_, '_, '_> {
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         let Some(cast) = self.bind_defined_cast(source_oid, target_oid, context)? else {
             return Ok(None);
         };
-        self.execute_bound_cast(&cast, value, target_type_mod, input_collation, arena)
-            .map(Some)
+        self.execute_bound_cast(
+            &cast,
+            value,
+            target_type_mod,
+            input_collation,
+            arena,
+            sequences,
+        )
+        .map(Some)
     }
 
     #[expect(
@@ -2587,6 +2627,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         value: Datum<'a>,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         let source_base = self
             .storage
@@ -2621,6 +2662,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 value,
                 input_collation,
                 arena,
+                sequences,
             )?;
             return if target_base.is_some() {
                 let target = self
@@ -2632,7 +2674,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             "cast target type is unavailable"
                         )
                     })?;
-                self.coerce_result(value, target, arena)
+                self.coerce_result(value, target, arena, sequences)
             } else {
                 Ok(value)
             };
@@ -2675,6 +2717,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         input,
                         input_collation,
                         arena,
+                        sequences,
                     )?;
                 }
                 return Ok(Datum::Array {
@@ -2694,7 +2737,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             crate::storage::CastMethod::InOut if value.is_null() => Datum::Null,
             crate::storage::CastMethod::InOut => {
                 let text = super::eval::datum_to_text(value, arena)?;
-                self.coerce_result(Datum::Text(text), cast.target, arena)?
+                self.coerce_result(Datum::Text(text), cast.target, arena, sequences)?
             }
             crate::storage::CastMethod::Function(slot) => {
                 let slot = self
@@ -2725,7 +2768,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 .unwrap_or(Datum::Null)
             }
         };
-        self.coerce_result(result, cast.target, arena)
+        self.coerce_result(result, cast.target, arena, sequences)
     }
 
     #[expect(
@@ -2845,7 +2888,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     )
                 })?;
             coerced[index] = if argument_type_oids[index] == expected_oid {
-                self.coerce_result(arguments[index], expected[index], arena)?
+                self.coerce_result(arguments[index], expected[index], arena, None)?
             } else if let Some(value) = self.execute_defined_cast(
                 argument_type_oids[index],
                 expected_oid,
@@ -2854,10 +2897,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 super::eval::DefinedCastContext::Implicit,
                 argument_collations[index],
                 arena,
+                None,
             )? {
                 value
             } else {
-                self.coerce_result(arguments[index], expected[index], arena)?
+                self.coerce_result(arguments[index], expected[index], arena, None)?
             };
         }
         let function_oid = operator
@@ -3766,6 +3810,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             self.storage,
             self.txid,
             arena,
+            None,
         )
     }
 
@@ -4413,10 +4458,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         super::eval::DefinedCastContext::Implicit,
                         input_collation,
                         arena,
+                        None,
                     )? {
                     value
                 } else {
-                    self.coerce_result(arguments[index], contract, arena)?
+                    self.coerce_result(arguments[index], contract, arena, None)?
                 };
             }
             if declaration.catalog.strict && values.iter().any(|value| value.is_null()) {
@@ -4557,6 +4603,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         target_type_mod: i32,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         self.execute_cast_path(
             cast,
@@ -4566,6 +4613,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             value,
             input_collation,
             arena,
+            sequences,
         )
     }
 
@@ -4578,6 +4626,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         context: super::eval::DefinedCastContext,
         input_collation: super::ast::Collation,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         self.execute_defined_cast(
             source_oid,
@@ -4587,6 +4636,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             context,
             input_collation,
             arena,
+            sequences,
         )
     }
 
@@ -5819,6 +5869,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_name: &str,
         value: Datum<'a>,
         arena: &'a Arena,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         if let Some(element_name) = type_name.strip_suffix("[]") {
             if let Some(slot) = self.storage.resolve_enum_slot(element_name, self.txid) {
@@ -5830,6 +5881,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     self.storage,
                     self.txid,
                     arena,
+                    sequences,
                 )
                 .map(Some);
             }
@@ -5849,6 +5901,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     self.storage,
                     self.txid,
                     arena,
+                    sequences,
                 )
                 .map(Some);
             }
@@ -5861,6 +5914,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     self.storage,
                     self.txid,
                     arena,
+                    sequences,
                 )
                 .map(Some);
             }
@@ -5876,6 +5930,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 self.txid,
                 arena,
                 super::eval::NO_PARAMS,
+                sequences,
             )
             .map(Some);
         }
@@ -5887,6 +5942,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     self.storage,
                     self.txid,
                     arena,
+                    sequences,
                 ),
                 value => super::exec::coerce_composite_value(
                     value,
@@ -5894,6 +5950,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     self.storage,
                     self.txid,
                     arena,
+                    sequences,
                 ),
             }
             .map(Some);

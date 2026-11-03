@@ -173,7 +173,8 @@ pub(crate) fn capture_planner_inputs<'a, 'source>(
     arena: &'a Arena,
 ) -> Result<CapturedPlannerInputs<'a>, SqlError> {
     let mut candidates = ArenaList::new_persistent(arena);
-    query::visit_planner_calls(
+    let mark = arena.mark();
+    let captured = query::visit_planner_calls(
         statement,
         storage,
         txid,
@@ -193,7 +194,11 @@ pub(crate) fn capture_planner_inputs<'a, 'source>(
                 capture_expression_into(expression, columns, storage, txid, arena, &mut candidates)
             }
         },
-    )?;
+    );
+    // Schema and argument scratch is temporary; candidate facts own only
+    // persistent allocations and checked handles into the persistent tail.
+    unsafe { arena.rewind_to(mark) };
+    captured?;
     Ok(CapturedPlannerInputs {
         candidates: candidates.as_slice(),
     })
@@ -384,8 +389,12 @@ fn capture<'a>(
     let Some(RoutineCallSelection::Stored(slot)) = selection else {
         return Ok(None);
     };
+    let declared = storage.routine_for(slot, txid);
+    if !matches!(declared.kind, crate::storage::RoutineKind::Function { .. }) {
+        return Ok(None);
+    }
     let Some(routine) = storage.function_for_captured_call(
-        crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+        crate::storage::routine_oid(&declared),
         argument_names,
         &oids[..args.len()],
         *variadic,
@@ -847,7 +856,8 @@ impl Engine {
                 let expression = parser
                     .expression(0)
                     .map_err(|error| super::parse_error_to_sql(&error))?;
-                query::visit_planner_expression(
+                let mark = arena.mark();
+                let captured = query::visit_planner_expression(
                     expression,
                     &self.storage,
                     txn.txid,
@@ -863,7 +873,9 @@ impl Engine {
                             &mut candidates,
                         )
                     },
-                )?;
+                );
+                unsafe { arena.rewind_to(mark) };
+                captured?;
             } else {
                 while let Some(statement) = parser
                     .next_stmt()
@@ -1074,10 +1086,14 @@ impl Engine {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        let existing = match sqlprep.routine_inputs.find(key) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
+        let existing =
+            match super::sequence::replayed_input_plan().and_then(|replayed| match replayed {
+                Some(plan) => sqlprep.routine_inputs.lookup_replayed(plan, key).map(Some),
+                None => sqlprep.routine_inputs.find(key),
+            }) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
         let rejected = matches!(
             &existing,
             Some(Lookup::Ready(

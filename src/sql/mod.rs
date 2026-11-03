@@ -3483,8 +3483,19 @@ impl Engine {
         oid: i32,
         arena: &'a Arena,
         txid: u32,
+        sequence_session: Option<&crate::sql::guc::SeqSession>,
     ) -> Result<Datum<'a>, SqlError> {
-        exec::coerce_binary_input_null(&self.storage, oid, arena, txid)
+        let sequences =
+            sequence_session.map(|session| sequence::SeqEval::new(&self.storage, session, txid));
+        exec::coerce_binary_input_null(
+            &self.storage,
+            oid,
+            arena,
+            txid,
+            sequences
+                .as_ref()
+                .map(|sequences| sequences as &dyn eval::SequenceAccess),
+        )
     }
 
     pub(crate) fn decode_binary_parameter<'a>(
@@ -3493,8 +3504,20 @@ impl Engine {
         bytes: &'a [u8],
         arena: &'a Arena,
         txid: u32,
+        sequence_session: Option<&crate::sql::guc::SeqSession>,
     ) -> Result<Datum<'a>, SqlError> {
-        exec::decode_binary_input(&self.storage, oid, bytes, arena, txid)
+        let sequences =
+            sequence_session.map(|session| sequence::SeqEval::new(&self.storage, session, txid));
+        exec::decode_binary_input(
+            &self.storage,
+            oid,
+            bytes,
+            arena,
+            txid,
+            sequences
+                .as_ref()
+                .map(|sequences| sequences as &dyn eval::SequenceAccess),
+        )
     }
 
     pub(crate) fn decode_text_parameter<'a>(
@@ -3503,8 +3526,20 @@ impl Engine {
         bytes: &'a [u8],
         arena: &'a Arena,
         txid: u32,
+        sequence_session: Option<&crate::sql::guc::SeqSession>,
     ) -> Result<Datum<'a>, SqlError> {
-        exec::decode_text_input(&self.storage, oid, bytes, arena, txid)
+        let sequences =
+            sequence_session.map(|session| sequence::SeqEval::new(&self.storage, session, txid));
+        exec::decode_text_input(
+            &self.storage,
+            oid,
+            bytes,
+            arena,
+            txid,
+            sequences
+                .as_ref()
+                .map(|sequences| sequences as &dyn eval::SequenceAccess),
+        )
     }
 
     pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
@@ -12397,7 +12432,9 @@ impl Engine {
                         Err(error) => return Ok(Err(parse_error_to_sql(&error))),
                     }
                 }
-                if parser.type_input_candidates().is_empty() {
+                if parser.type_input_candidates().iter().all(|candidate| {
+                    type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate).is_none()
+                }) {
                     return Ok(Ok(&[]));
                 }
                 if let Err(error) = self.ensure_txn(txn, TxnMode::Implicit, guc) {
@@ -12847,7 +12884,14 @@ impl Engine {
                                         "bound array input type is unavailable"
                                     ));
                                 };
-                                exec::coerce_user_type_array(value, element, storage, txid, scratch)
+                                exec::coerce_user_type_array(
+                                    value,
+                                    element,
+                                    storage,
+                                    txid,
+                                    scratch,
+                                    Some(sequences),
+                                )
                             } else {
                                 Ok(value)
                             }
@@ -14677,12 +14721,17 @@ impl Engine {
             unsafe { arena.rewind_to(mark) };
         }
         let invocations = query::RoutineInvocationState::new(arena);
-        let sequence_state = sequence::SequenceReplayState::empty();
+        let replay = match sequence::begin_replay_cursor() {
+            Ok(replay) => replay,
+            Err(error) => return Ok(Err(error)),
+        };
         loop {
+            if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                return Ok(Err(error));
+            }
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            sequence_state.begin_attempt();
             let output_mark = responder.buffer.mark();
             let outcome = self.execute_select_once(
                 statement,
@@ -14691,7 +14740,6 @@ impl Engine {
                 txn,
                 guc,
                 Some(&invocations),
-                Some(&sequence_state),
                 responder,
             )?;
             let Err(error) = outcome else {
@@ -14741,19 +14789,20 @@ impl Engine {
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
         let invocations = query::RoutineInvocationState::new(frame);
-        let sequence_state = sequence::SequenceReplayState::empty();
+        let replay = match sequence::begin_replay_cursor() {
+            Ok(replay) => replay,
+            Err(error) => return Ok(Err(error)),
+        };
         loop {
+            if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                return Ok(Err(error));
+            }
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            sequence_state.begin_attempt();
             let output_mark = responder.buffer.mark();
             let outcome = {
-                let sequence = sequence::ReplaySeqEval::new(
-                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                    &sequence_state,
-                    frame,
-                );
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 let _scope = query::enter_routine_invocation_scope(Some(
                     query::RoutineInvocationContext::new(&invocations, frame),
                 ));
@@ -14942,7 +14991,14 @@ impl Engine {
             return Ok(Err(error));
         }
         let invocations = query::RoutineInvocationState::new(arena);
+        let replay = match sequence::begin_replay_cursor() {
+            Ok(replay) => replay,
+            Err(error) => return Ok(Err(error)),
+        };
         loop {
+            if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                return Ok(Err(error));
+            }
             self.work.reset();
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
@@ -15206,7 +15262,6 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
         invocations: Option<&'statement query::RoutineInvocationState<'statement>>,
-        sequence_state: Option<&sequence::SequenceReplayState>,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let _routine_invocation_scope = query::enter_routine_invocation_scope(
@@ -15216,13 +15271,7 @@ impl Engine {
             Ok(materialized) => materialized.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),
         };
-        let base_sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-        let replay_sequence =
-            sequence_state.map(|state| sequence::ReplaySeqEval::new(base_sequence, state, arena));
-        let sequence: &dyn SequenceAccess = replay_sequence
-            .as_ref()
-            .map(|sequence| sequence as &dyn SequenceAccess)
-            .unwrap_or(&base_sequence);
+        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_ctes_exec(
             statement,
             &self.storage,
@@ -15230,7 +15279,7 @@ impl Engine {
             &self.work,
             params,
             dml_mats,
-            Some(sequence),
+            Some(&sequence),
         ) {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
@@ -15246,7 +15295,7 @@ impl Engine {
                 statement,
                 &self.work,
                 params,
-                Some(sequence),
+                Some(&sequence),
                 invocations,
                 invocations.map(|_| arena),
                 responder,
@@ -15258,7 +15307,7 @@ impl Engine {
                 statement,
                 &self.work,
                 params,
-                Some(sequence),
+                Some(&sequence),
                 invocations,
                 invocations.map(|_| arena),
                 responder,
@@ -15336,17 +15385,18 @@ impl Engine {
             }
             Ok(())
         };
-        let sequence_replay = sequence::SequenceReplayState::empty();
+        let result_replay = match sequence::begin_replay_cursor() {
+            Ok(replay) => replay,
+            Err(error) => return Ok(Err(error)),
+        };
         let outcome = match program.result {
             query::RoutineFunctionResult::Query(result_query) => loop {
+                if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                    return Ok(Err(error));
+                }
                 self.work.reset();
                 nested_invocations.begin_attempt();
-                sequence_replay.begin_attempt();
-                let sequence = sequence::ReplaySeqEval::new(
-                    sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                    &sequence_replay,
-                    arena,
-                );
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                 let outcome = query::execute_bound_routine_query(
                     result_query,
                     &self.storage,
@@ -15396,6 +15446,9 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
                 loop {
+                    if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                        return Ok(Err(error));
+                    }
                     self.work.reset();
                     nested_invocations.begin_attempt();
                     has_result.set(false);
@@ -15456,6 +15509,9 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
                 loop {
+                    if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                        return Ok(Err(error));
+                    }
                     self.work.reset();
                     nested_invocations.begin_attempt();
                     let mark =
@@ -15749,7 +15805,10 @@ impl Engine {
             Ok(prior) => prior,
             Err(error) => return Ok(Err(error)),
         };
-        let ready = matches!(prior, Some(type_input_plans::Lookup::Ready(_, _)));
+        let ready = matches!(
+            prior,
+            Some(type_input_plans::Lookup::Ready(_, _) | type_input_plans::Lookup::Failed(_, _))
+        );
         let reserved = if prior.is_none() {
             match sqlprep.routine_inputs.reserve(key) {
                 Ok(plan) => Some(plan),
@@ -15964,19 +16023,19 @@ impl Engine {
         };
         let prior = match key
             .filter(|_| reserved.is_none())
-            .map(|key| sqlprep.routine_inputs.find(key))
+            .map(|key| match sequence::replayed_input_plan()? {
+                Some(plan) => sqlprep.routine_inputs.lookup_replayed(plan, key).map(Some),
+                None => sqlprep.routine_inputs.find(key),
+            })
             .transpose()
         {
             Ok(prior) => prior.flatten(),
             Err(error) => return Ok(Err(error)),
         };
-        let ready = match prior {
-            Some(Lookup::Ready(_, image)) => Some(image),
-            Some(Lookup::Waiting(_)) | None => None,
-        };
+        let ready = matches!(prior, Some(Lookup::Ready(_, _) | Lookup::Failed(_, _)));
         let mut captured = None;
         let mut parser = None;
-        if ready.is_none() {
+        if !ready {
             if routine.body_kind != crate::storage::RoutineBodyKind::String {
                 let dependencies = self.storage.routine_dependencies_for(slot, txn.txid);
                 captured = Some(InputImage::Stored(
@@ -16103,7 +16162,7 @@ impl Engine {
                 .routine_inputs
                 .retire_invalid_cursors(|generation| cursors.contains_plan_owner(generation));
         }
-        let (plan, ready) = if let Some(plan) = reserved {
+        let (plan, ready, output_exhausted) = if let Some(plan) = reserved {
             let Some(key) = key else {
                 return Ok(Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -16113,7 +16172,7 @@ impl Engine {
             if let Err(error) = sqlprep.routine_inputs.adopt_preparing(plan, key) {
                 return Ok(Err(error));
             }
-            (Some(plan), None)
+            (Some(plan), None, false)
         } else {
             let prior = match key
                 .map(|key| match sequence::replayed_input_plan()? {
@@ -16126,9 +16185,12 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
             match prior {
-                Some(Lookup::Ready(plan, image)) => (Some(plan), Some(image)),
-                Some(Lookup::Waiting(plan)) => (Some(plan), None),
-                None => (None, None),
+                Some(Lookup::Ready(plan, image)) => (Some(plan), Some(image), false),
+                Some(Lookup::Waiting(plan)) => (Some(plan), None, false),
+                Some(Lookup::Failed(plan, output_exhausted)) => {
+                    (Some(plan), None, output_exhausted)
+                }
+                None => (None, None, false),
             }
         };
         let Some(key) = key else {
@@ -16158,8 +16220,22 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             },
         };
+        if let Some(image) = ready {
+            if let Err(error) = sequence::ready_routine_input(plan, arena).and_then(|()| {
+                sqlprep
+                    .routine_inputs
+                    .retain_for_statement(plan, sequence::input_attempt())
+            }) {
+                return Ok(Err(error));
+            }
+            return Ok(image.bindings(arena).map(|bindings| PreparedTypeInputs {
+                owner: Owner::Nested(plan),
+                source,
+                bindings,
+            }));
+        }
         let bytes = plan.key_bytes();
-        let mut wire_full = false;
+        let mut wire_full = output_exhausted;
         let result = sequence::statement_effect(
             sequence::StatementEffectKind::RoutineInput,
             &[Datum::Bytea(&bytes)],
@@ -16184,9 +16260,6 @@ impl Engine {
                         sqlprep
                             .routine_inputs
                             .retain_for_statement(plan, sequence::input_attempt())?;
-                        if ready.is_some() {
-                            return Ok(());
-                        }
                         sqlprep.routine_inputs.set_waiting(plan, false)?;
                         let image = match captured.take() {
                             Some(image) => image,
@@ -16239,7 +16312,9 @@ impl Engine {
             },
         );
         if wire_full {
-            let _ = sqlprep.routine_inputs.abandon(plan);
+            if let Err(error) = sqlprep.routine_inputs.fail(plan, true) {
+                return Ok(Err(error));
+            }
             return Err(WireFull);
         }
         if let Err(error) = result {
@@ -16249,7 +16324,7 @@ impl Engine {
                 if let Err(error) = sqlprep.routine_inputs.set_waiting(plan, true) {
                     return Ok(Err(error));
                 }
-            } else if let Err(error) = sqlprep.routine_inputs.abandon(plan) {
+            } else if let Err(error) = sqlprep.routine_inputs.fail(plan, false) {
                 return Ok(Err(error));
             }
             return Ok(Err(error));
@@ -16739,18 +16814,20 @@ impl Engine {
                     len.set(len.get() + 1);
                     Ok(())
                 };
-                let sequence_replay = sequence::SequenceReplayState::empty();
+                let result_replay = match sequence::begin_replay_cursor() {
+                    Ok(replay) => replay,
+                    Err(error) => return Ok(Err(error)),
+                };
                 let outcome = match program.result {
                     query::RoutineFunctionResult::Query(result) => loop {
+                        if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                            return Ok(Err(error));
+                        }
                         self.work.reset();
                         nested_invocations.begin_attempt();
                         len.set(0);
-                        sequence_replay.begin_attempt();
-                        let sequence = sequence::ReplaySeqEval::new(
-                            sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                            &sequence_replay,
-                            arena,
-                        );
+                        let sequence =
+                            sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
                         let outcome = query::execute_bound_routine_query(
                             result,
                             &self.storage,
@@ -16800,6 +16877,9 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         };
                         loop {
+                            if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                                return Ok(Err(error));
+                            }
                             self.work.reset();
                             nested_invocations.begin_attempt();
                             len.set(0);
@@ -16857,6 +16937,9 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         };
                         loop {
+                            if let Err(error) = sequence::rewind_replay_cursor(result_replay) {
+                                return Ok(Err(error));
+                            }
                             self.work.reset();
                             nested_invocations.begin_attempt();
                             let mark = txn.statement_mark(
@@ -16927,7 +17010,7 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Select(select) => {
-                self.execute_select_once(select, arena, params, txn, guc, None, None, responder)
+                self.execute_select_once(select, arena, params, txn, guc, None, responder)
             }
             Stmt::SetQuery(query) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -22416,12 +22499,7 @@ impl Engine {
                         );
                         capture.set_render(guc.render());
                         query.with_query(|parsed, params, arena| {
-                            query.sequence_replay.begin_attempt();
-                            let sequence = sequence::ReplaySeqEval::new(
-                                sequence::SeqEval::new(storage, guc.seq_session(), txid),
-                                &query.sequence_replay,
-                                arena,
-                            );
+                            let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txid);
                             match parsed {
                                 cursor::CursorStatement::Select(select) => {
                                     let select = match query::expand_ctes_exec(

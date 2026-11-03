@@ -1013,6 +1013,7 @@ impl<'a> AggState<'a> {
                     initial.as_bytes(),
                     arena,
                     txid,
+                    None,
                 )?);
                 self.custom_state_initialized = true;
             }
@@ -1227,6 +1228,7 @@ impl<'a> AggState<'a> {
                 initial.as_bytes(),
                 arena,
                 txid,
+                None,
             )?);
             self.custom_state_initialized = true;
         }

@@ -327,6 +327,7 @@ enum InputState<'a> {
         next_input: usize,
         next_invocation: usize,
         next_call: usize,
+        replay: super::super::sequence::StatementReplayCursor,
     },
     Definition(&'a InputDefinition<'a>),
     CastDefinition(Option<&'a super::super::eval::BoundCast>),
@@ -507,7 +508,9 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 next_input,
                 next_invocation,
                 next_call,
+                replay,
             } => {
+                super::super::sequence::restore_replay_cursor(replay)?;
                 self.next.set(next_input);
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
@@ -525,12 +528,15 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             InputState::Definition(_) | InputState::CastDefinition(_) => return Err(changed()),
         }
         // A nested expression may append frames; never hold a borrow across it.
+        let before = super::super::sequence::begin_replay_cursor()?;
         let result = evaluate()?;
+        let replay = super::super::sequence::finish_replay_cursor(before, self.arena)?;
         frame.state = InputState::Value {
             value: InputValue::Evaluated(self.arena.alloc(result).map_err(|_| full())?),
             next_input: self.next.get(),
             next_invocation: self.invocation.get(),
             next_call: self.registry.next.get(),
+            replay,
         };
         self.frames
             .borrow_mut()
@@ -615,6 +621,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                             next_input,
                             next_invocation,
                             next_call,
+                            replay,
                         } => InputState::Value {
                             value: InputValue::Encoded(match value {
                                 InputValue::Evaluated(value) => {
@@ -628,6 +635,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                             next_input,
                             next_invocation,
                             next_call,
+                            replay,
                         },
                         InputState::Definition(definition) => {
                             let definition = definition.retain(arena)?;
@@ -1073,6 +1081,69 @@ fn changed() -> SqlError {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn retained_input_values_advance_typed_journals_past_arguments_and_completed_bodies() {
+        use crate::sql::sequence;
+        let mut budget = Budget::new(64 << 10);
+        let statement = Arena::new(&mut budget, "input effect replay", 32 << 10).unwrap();
+        let mut work = Arena::new(&mut budget, "input effect scratch", 16 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let invocations = RoutineInvocationState::new(&statement);
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let scope = sequence::enter_statement(&statement, guc.seq_session(), false);
+            let start = sequence::begin_replay_cursor().unwrap();
+            let _invocations = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+                &invocations,
+                &statement,
+            )));
+            let effect = |tag| {
+                let values = sequence::statement_effect(
+                    sequence::StatementEffectKind::StatisticsVoid,
+                    &[Datum::Int4(tag)],
+                    sequence::StatementEffectRetry::Restart,
+                    &statement,
+                    || {
+                        actions.set(actions.get() + 1);
+                        sequence::StatementEffectAttempt {
+                            result: Ok(statement.alloc_slice_copy(&[Datum::Int4(tag)]).unwrap()),
+                            rewound_state: false,
+                        }
+                    },
+                )?;
+                Ok::<_, SqlError>(values[0])
+            };
+            for attempt in 0..2 {
+                sequence::rewind_replay_cursor(start).unwrap();
+                work.reset();
+                invocations.begin_attempt();
+                let result = call(&work, || {
+                    let _inputs = enter();
+                    let argument =
+                        value(InputSite::Query(InputQuery::Scalar), &work, || effect(11))?;
+                    crate::sql::type_input_plans::with_owner(
+                        crate::sql::type_input_plans::Owner::Backend,
+                        || invocations.resolve_intrinsic(42, &[argument], &statement, &work),
+                    )
+                });
+                if attempt == 0 {
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    );
+                    assert!(invocations.take_pending().is_some());
+                    let body = effect(22).unwrap();
+                    invocations.complete(body).unwrap();
+                } else {
+                    assert_eq!(result.unwrap(), Datum::Int4(22));
+                    assert_eq!(effect(33).unwrap(), Datum::Int4(33));
+                }
+            }
+            assert_eq!(actions.get(), 3);
+            scope.finish(guc.seq_session()).unwrap();
+        });
+    }
 
     fn captured_cast(function: i32) -> crate::sql::eval::BoundCast {
         crate::sql::eval::BoundCast {

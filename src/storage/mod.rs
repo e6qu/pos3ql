@@ -10997,6 +10997,19 @@ pub(crate) struct SequenceReplaySource {
 }
 
 impl SequenceReplaySource {
+    #[cfg(test)]
+    pub(crate) fn test_source(slot: usize, created_at: u64) -> Self {
+        Self {
+            origin: type_references::CatalogOrigin::new().unwrap(),
+            slot,
+            created_at,
+            database: DatabaseOid::POSTGRES,
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("journal_source").unwrap(),
+            private_version: None,
+        }
+    }
+
     pub(crate) fn session_identity(self) -> (usize, u64) {
         (self.slot, self.created_at)
     }

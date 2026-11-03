@@ -477,7 +477,7 @@ pub(super) fn resolve_default(
             ColType::Array(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(v, element, storage, txid, arena)?,
+            ) => super::coerce_user_type_array(v, element, storage, txid, arena, None)?,
             ColType::Array(element) if element.is_catalog_reference() => {
                 let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
                 crate::sql::eval::reg_array_cast(v, element, Some(&catalog), arena)?

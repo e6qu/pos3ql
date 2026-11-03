@@ -430,6 +430,8 @@ mod tests {
             assert!(reused.matches().unwrap());
             first.change(DdlUndo::SchemaCreated(3).catalog_plan_change());
             transaction.mode = super::super::txn::TxnMode::Explicit;
+            let same_backend = Arc::clone(transaction.plan_invalidation_owner().unwrap());
+            transaction.bind_plan_invalidations(&same_backend).unwrap();
             assert_eq!(
                 transaction
                     .bind_plan_invalidations(&other)

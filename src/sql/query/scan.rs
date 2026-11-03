@@ -5857,6 +5857,7 @@ fn scan_source_mode<'a>(
                     storage,
                     txid,
                     arena,
+                    hooks.sequences,
                 )?;
                 known[index] = true;
                 Ok(true)

@@ -515,6 +515,7 @@ fn projection_type_visits_keep_selected_cast_snapshots() {
                 -1,
                 ast::Collation::None,
                 &arena,
+                None,
             )
             .unwrap();
         assert!(matches!(

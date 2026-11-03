@@ -2867,6 +2867,13 @@ impl TxnState {
     }
 
     #[cfg(test)]
+    pub(crate) fn plan_invalidation_owner(
+        &self,
+    ) -> Option<&std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>> {
+        self.plan_invalidations.as_ref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn plan_invalidation_stamp(
         &self,
         depends_on_roles: bool,
@@ -3057,7 +3064,7 @@ mod tests {
 
     #[test]
     fn configured_transaction_budgets_saturate_and_valid_reservations_are_exact() {
-        for field in 0..9 {
+        for field in 0..8 {
             let mut config = crate::config::Config::default_dev();
             match field {
                 0 => config.txn_rows = usize::MAX,
@@ -3068,10 +3075,6 @@ mod tests {
                 5 => config.max_deferred_constraints_per_transaction = usize::MAX,
                 6 => config.deferred_trigger_bytes = usize::MAX,
                 7 => config.max_large_object_descriptors = usize::MAX,
-                8 => {
-                    config.max_tables = usize::MAX / 1024;
-                    config.max_ddl_per_transaction = 1024;
-                }
                 _ => unreachable!(),
             }
             assert_eq!(

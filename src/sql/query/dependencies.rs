@@ -1983,98 +1983,49 @@ fn collect_select<'a>(
     arena: &Arena,
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
-    let mut visible_ctes = inherited_ctes;
-    for cte in select.with {
-        // A CTE can reference earlier entries, not itself unless recursive.
-        let definition_scope = if cte.recursive {
-            let mut scope = visible_ctes;
-            scope.push(cte.name)?;
-            scope
-        } else {
-            visible_ctes
-        };
-        collect_select(
-            cte.query,
-            storage,
-            txid,
-            definition_scope,
-            dependencies,
-            arena,
-            context,
-        )?;
-        visible_ctes.push(cte.name)?;
-    }
-
-    for item in select.items {
-        match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                collect_expression(
-                    expression,
-                    storage,
-                    txid,
-                    visible_ctes,
-                    dependencies,
-                    arena,
-                    context,
-                )?;
-            }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+    let mark = arena.mark();
+    let result = (|| {
+        let mut visible_ctes = inherited_ctes;
+        for cte in select.with {
+            // A CTE can reference earlier entries, not itself unless recursive.
+            let definition_scope = if cte.recursive {
+                let mut scope = visible_ctes;
+                scope.push(cte.name)?;
+                scope
+            } else {
+                visible_ctes
+            };
+            collect_select(
+                cte.query,
+                storage,
+                txid,
+                definition_scope,
+                dependencies,
+                arena,
+                context,
+            )?;
+            visible_ctes.push(cte.name)?;
         }
-    }
-    for expression in select.distinct_on {
-        collect_expression(
-            expression,
-            storage,
-            txid,
-            visible_ctes,
-            dependencies,
-            arena,
-            context,
-        )?;
-    }
-    for expression in select
-        .where_clause
-        .into_iter()
-        .chain(select.group_by.iter().copied())
-        .chain(select.having)
-        .chain(select.order_by.iter().map(|order| order.expression))
-        .chain(select.limit)
-        .chain(select.offset)
-    {
-        collect_expression(
-            expression,
-            storage,
-            txid,
-            visible_ctes,
-            dependencies,
-            arena,
-            context,
-        )?;
-    }
-    if let Some(tree) = select.set_body {
-        collect_set_tree(
-            tree,
-            storage,
-            txid,
-            visible_ctes,
-            dependencies,
-            arena,
-            context,
-        )?;
-    }
-    if let Some(from) = select.from {
-        collect_table_ref(
-            &from.base,
-            storage,
-            txid,
-            visible_ctes,
-            dependencies,
-            arena,
-            context,
-        )?;
-        for join in from.joins {
-            collect_table_ref(
-                &join.table,
+
+        for item in select.items {
+            match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    collect_expression(
+                        expression,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        context,
+                    )?;
+                }
+                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            }
+        }
+        for expression in select.distinct_on {
+            collect_expression(
+                expression,
                 storage,
                 txid,
                 visible_ctes,
@@ -2082,9 +2033,50 @@ fn collect_select<'a>(
                 arena,
                 context,
             )?;
-            if let Some(on) = join.on {
-                collect_expression(
-                    on,
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
+            )?;
+        }
+        if let Some(tree) = select.set_body {
+            collect_set_tree(
+                tree,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
+            )?;
+        }
+        if let Some(from) = select.from {
+            collect_table_ref(
+                &from.base,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
+            )?;
+            for join in from.joins {
+                collect_table_ref(
+                    &join.table,
                     storage,
                     txid,
                     visible_ctes,
@@ -2092,89 +2084,107 @@ fn collect_select<'a>(
                     arena,
                     context,
                 )?;
+                if let Some(on) = join.on {
+                    collect_expression(
+                        on,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        context,
+                    )?;
+                }
             }
-        }
-        let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
-        let mut all_tables = true;
-        for source in sources {
-            if source.subquery.is_some()
-                || source.is_function_source()
-                || (source.schema.is_none() && visible_ctes.contains(source.table))
-                || !matches!(
-                    context.resolve_relation(storage, txid, source.schema, source.table)?,
-                    Some(ResolvedRelation::Table(_))
-                )
-            {
-                all_tables = false;
-                break;
+            let sources =
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+            let mut all_tables = true;
+            for source in sources {
+                if source.subquery.is_some()
+                    || source.is_function_source()
+                    || (source.schema.is_none() && visible_ctes.contains(source.table))
+                    || !matches!(
+                        context.resolve_relation(storage, txid, source.schema, source.table)?,
+                        Some(ResolvedRelation::Table(_))
+                    )
+                {
+                    all_tables = false;
+                    break;
+                }
             }
-        }
-        if all_tables {
-            let bound = context.bound_from(&from, storage, txid, visible_ctes, arena)?;
-            let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
-            for item in select.items {
-                match item {
-                    SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                        record_column_references(expression, &scope, dependencies, context)?;
-                    }
-                    SelectItem::Wildcard => {
-                        for table in 0..scope.n {
-                            for column in 0..scope.defs.get(table).expect("resolved").n_columns {
-                                dependencies.mark_referenced_column(
-                                    DependencyClass::Table,
-                                    scope.slots[table],
-                                    column,
+            if all_tables {
+                let bound = context.bound_from(&from, storage, txid, visible_ctes, arena)?;
+                let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
+                for item in select.items {
+                    match item {
+                        SelectItem::Expr { expression, .. }
+                        | SelectItem::RecordStar(expression) => {
+                            record_column_references(expression, &scope, dependencies, context)?;
+                        }
+                        SelectItem::Wildcard => {
+                            for table in 0..scope.n {
+                                for column in 0..scope.defs.get(table).expect("resolved").n_columns
+                                {
+                                    dependencies.mark_referenced_column(
+                                        DependencyClass::Table,
+                                        scope.slots[table],
+                                        column,
+                                    )?;
+                                }
+                            }
+                        }
+                        SelectItem::TableWildcard(name) => {
+                            for index in 0..scope.qualified_star_columns(name)? {
+                                mark_resolved_column(
+                                    &scope,
+                                    scope.qualified_star_entry(name, index)?,
+                                    dependencies,
                                 )?;
                             }
                         }
                     }
-                    SelectItem::TableWildcard(name) => {
-                        for index in 0..scope.qualified_star_columns(name)? {
-                            mark_resolved_column(
-                                &scope,
-                                scope.qualified_star_entry(name, index)?,
-                                dependencies,
-                            )?;
-                        }
-                    }
+                }
+                for expression in select
+                    .distinct_on
+                    .iter()
+                    .copied()
+                    .chain(select.where_clause)
+                    .chain(select.group_by.iter().copied())
+                    .chain(select.having)
+                    .chain(select.order_by.iter().map(|order| order.expression))
+                    .chain(select.limit)
+                    .chain(select.offset)
+                    .chain(from.joins.iter().filter_map(|join| join.on))
+                {
+                    record_column_references(expression, &scope, dependencies, context)?;
                 }
             }
-            for expression in select
-                .distinct_on
-                .iter()
-                .copied()
-                .chain(select.where_clause)
-                .chain(select.group_by.iter().copied())
-                .chain(select.having)
-                .chain(select.order_by.iter().map(|order| order.expression))
-                .chain(select.limit)
-                .chain(select.offset)
-                .chain(from.joins.iter().filter_map(|join| join.on))
-            {
-                record_column_references(expression, &scope, dependencies, context)?;
-            }
+            record_relation_column_references(
+                storage,
+                txid,
+                context,
+                visible_ctes,
+                &from,
+                select,
+                dependencies,
+                arena,
+            )?;
         }
-        record_relation_column_references(
+        collect_routine_dependencies(
+            select,
             storage,
             txid,
-            context,
-            visible_ctes,
-            &from,
-            select,
             dependencies,
             arena,
+            context,
+            visible_ctes,
         )?;
-    }
-    collect_routine_dependencies(
-        select,
-        storage,
-        txid,
-        dependencies,
-        arena,
-        context,
-        visible_ctes,
-    )?;
-    Ok(())
+        Ok(())
+    })();
+    // Dependency entries own copied identities and names. Schema descriptions,
+    // column-name copies and expression-discovery scratch end with this visit.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 struct DependencyTypes<'scope, 'definition, 'storage> {
@@ -2890,10 +2900,16 @@ fn record_routine_call(
     for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
         match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
             Ok(oid) => *slot = oid,
-            Err(_) => {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
                 *needs_scope = true;
                 return Ok(());
             }
+            Err(error) => return Err(error),
         }
     }
     let argument_oids = &argument_oids[..args.len()];
@@ -3036,11 +3052,19 @@ fn record_operator_call(
     }
     let mut inferred = [0; 2];
     for (slot, operand) in inferred.iter_mut().zip(operands.iter().copied()) {
-        let Ok(oid) = infer(operand) else {
-            *needs_scope = true;
-            return Ok(());
+        *slot = match infer(operand) {
+            Ok(oid) => oid,
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                *needs_scope = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
-        *slot = oid;
     }
     let (left_oid, right_oid) = if operands.len() == 1 {
         (None, Some(inferred[0]))
@@ -3101,25 +3125,65 @@ fn visit_routine_expression(
         ..
     } = expression
     {
-        let source = match crate::sql::exec::infer_routine_argument_oid(operand, resolver) {
-            Ok(source) => Some(source),
-            Err(_) => {
-                *needs_scope = true;
-                None
-            }
-        };
         let target = ColType::from_sql_name(type_name)
             .map(ColType::oid)
             .or_else(|| resolver.named_type_oid(type_name));
-        if let (Some(source), Some(target)) = (source, target) {
-            record_cast_support(
-                source,
-                target,
-                crate::sql::eval::DefinedCastContext::Explicit,
-                storage,
-                txid,
-                dependencies,
-            )?;
+        let array_target = target.and_then(|target| {
+            crate::sql::eval::constructor_type_from_oid(target, &|oid| {
+                resolver.domain_base_type(oid)
+            })
+        });
+        if let (Expr::Array(_), Some(ColType::Array(element))) = (*operand, array_target) {
+            match crate::sql::exec::visit_array_constructor_conversions(
+                operand,
+                element,
+                resolver,
+                &mut |source, target| {
+                    record_cast_support(
+                        source,
+                        target,
+                        crate::sql::eval::DefinedCastContext::Explicit,
+                        storage,
+                        txid,
+                        dependencies,
+                    )
+                },
+            ) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                    ) =>
+                {
+                    *needs_scope = true
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            let source = match crate::sql::exec::infer_routine_argument_oid(operand, resolver) {
+                Ok(source) => Some(source),
+                Err(error)
+                    if matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                    ) =>
+                {
+                    *needs_scope = true;
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let (Some(source), Some(target)) = (source, target) {
+                record_cast_support(
+                    source,
+                    target,
+                    crate::sql::eval::DefinedCastContext::Explicit,
+                    storage,
+                    txid,
+                    dependencies,
+                )?;
+            }
         }
     }
     if let Expr::Call {

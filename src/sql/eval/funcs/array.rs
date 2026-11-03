@@ -261,15 +261,14 @@ pub(crate) fn dispatch<'a>(
                                         "array input type no longer exists"
                                     )
                                 })?;
-                            *value =
-                                catalog
-                                    .cast_user_type(name, *value, arena)?
-                                    .ok_or_else(|| {
-                                        sql_err!(
-                                            sqlstate::UNDEFINED_OBJECT,
-                                            "array input type no longer exists"
-                                        )
-                                    })?;
+                            *value = catalog
+                                .cast_user_type(name, *value, arena, hooks.sequences)?
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "array input type no longer exists"
+                                    )
+                                })?;
                         } else {
                             *value = cast_to(*value, target, arena)?;
                         }

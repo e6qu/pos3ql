@@ -1705,6 +1705,7 @@ pub trait CatalogAccess {
         _target_type_mod: i32,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1725,6 +1726,7 @@ pub trait CatalogAccess {
         _context: DefinedCastContext,
         _input_collation: super::ast::Collation,
         _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -2216,6 +2218,7 @@ pub trait CatalogAccess {
         _type_name: &str,
         _value: Datum<'a>,
         _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -3761,6 +3764,7 @@ fn eval_full_inner<'a>(
                         DefinedCastContext::Explicit,
                         coercion_input_collation(operand, row, hooks.catalog)?,
                         arena,
+                        hooks.sequences,
                     )?
                 {
                     if type_mod != -1
@@ -3842,7 +3846,7 @@ fn eval_full_inner<'a>(
             // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none()
                 && let Some(cat) = hooks.catalog
-                && let Some(value) = cat.cast_user_type(type_name, v, arena)?
+                && let Some(value) = cat.cast_user_type(type_name, v, arena, hooks.sequences)?
             {
                 return Ok(value);
             }
@@ -5818,6 +5822,7 @@ fn execute_array_constructor<'a>(
                         plan.target_type_mod,
                         coercion_input_collation(input.expression, row, hooks.catalog)?,
                         arena,
+                        hooks.sequences,
                     )?
             }
             None => value,
@@ -5834,6 +5839,7 @@ fn execute_array_constructor<'a>(
                             .expect("named array conversion has its declared name"),
                         value,
                         arena,
+                        hooks.sequences,
                     )?
                     .ok_or_else(|| {
                         sql_err!(
@@ -5938,7 +5944,12 @@ fn coerce_array_constructor_element<'a>(
         value = hooks
             .catalog
             .expect("named conversion has a catalog")
-            .cast_user_type(named_type.expect("prepared named conversion"), value, arena)?
+            .cast_user_type(
+                named_type.expect("prepared named conversion"),
+                value,
+                arena,
+                hooks.sequences,
+            )?
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -6361,6 +6372,7 @@ pub(crate) fn builtin_operator_function<'a>(
                     DefinedCastContext::Implicit,
                     coercion_input_collation(expression, row, hooks.catalog)?,
                     arena,
+                    hooks.sequences,
                 )?
             {
                 value
@@ -9189,7 +9201,7 @@ pub(crate) fn input_error<'a>(
                 .and_then(|value| super::exec::apply_typmod(value, target, type_mod, arena)),
         )
     } else if let Some(catalog) = hooks.catalog {
-        match catalog.cast_user_type(base_name, Datum::Text(input), arena) {
+        match catalog.cast_user_type(base_name, Datum::Text(input), arena, hooks.sequences) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
             Err(error) => {
@@ -10447,6 +10459,7 @@ mod tests {
                 context: DefinedCastContext,
                 collation: Collation,
                 _: &'a Arena,
+                _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
             ) -> Result<Option<Datum<'a>>, SqlError> {
                 if target == crate::sql::types::oid::TEXT {
                     return Ok(None);

@@ -4038,6 +4038,23 @@ pub(crate) fn collect<'a>(
             }
         }
     }
+    // A successful OWNER command is observable even when ownership is unchanged.
+    // PostgreSQL REL_18_6 src/backend/tcop/utility.c collects its returned address.
+    if let Stmt::AlterOwner { kind, name, .. } = statement
+        && let Some(object) = super::exec::alter_owner_target(storage, txid, *kind, name)?
+        && let Some(reference) = access_reference(object)
+    {
+        let reference = EventObjectRef::Primary(reference);
+        if !seen_commands.as_slice().contains(&reference) {
+            push_command(
+                &mut commands,
+                &mut command_count,
+                reference,
+                tag,
+                in_extension,
+            )?;
+        }
+    }
     debug_assert_eq!(command_count, commands.len());
     debug_assert_eq!(drop_count, drops.len());
     Ok(EventGraphs {

@@ -45,8 +45,12 @@ variadic arrays remain distinct from expanded arguments.
 Declared casts retain their selected conversions and evaluation order through
 arrays and assignments, including typed NULL values. Array children convert in
 order; `INSERT ... SELECT` converts each complete selected row before the next row.
-Temporary schema planning releases its scratch space after each visit, so
-repeated function handoffs do not retain another schema copy.
+Planning and dependency visits release their temporary schema descriptions,
+including queries without stored-function calls. Repeated visits reuse the same
+statement space; the small-arena enum and composite-query regression keeps its
+original 256 KiB limit.
+Nested query descriptions share that scratch safely. Ordinary casts do not
+reserve checked-input request storage when they have no preparation-time checks.
 Completed calls release body workspaces while preserving typed results and
 command effects, including nested calls and table-function results.
 Finish retaining values checked while SQL is prepared. For example, preparing
@@ -83,7 +87,9 @@ before an ANALYZE commits. Retain the selected table identity through these
 boundaries. Match whether whole-relation catalog statistics changed; repeating
 unchanged statistics and renaming an index must not repeat a constraint.
 Keep completed inputs while rolling back and safely replaying the unfinished
-input within its original deadline. Cancellation must release unfinished
+input within its original deadline. Caught input errors must retain their exact
+attempt and error through a later wait, without repeating the constraint.
+Cancellation must release unfinished
 metadata so a fresh statement can select a different schema and track its
 subsequent changes. Demonstrate the complete behavior in CI
 before closing this acceptance item. The original PostgreSQL probe inputs, raw

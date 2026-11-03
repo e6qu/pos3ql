@@ -1268,9 +1268,8 @@ pub enum Stmt<'a> {
     /// LOAD is intentionally not an application extension point: object-store
     /// durability cannot safely host a session-loaded native library.
     Load(&'a str),
-    /// ALTER <supported object> name OWNER TO role. Every catalog object is
-    /// owned by the one modeled role, but the target and requested role are
-    /// still validated exactly.
+    /// ALTER <supported object> name OWNER TO role, including a validated
+    /// command that leaves the current owner unchanged.
     AlterOwner {
         kind: AlterOwnerKind,
         name: QualName<'a>,

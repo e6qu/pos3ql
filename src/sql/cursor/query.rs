@@ -21,7 +21,6 @@ pub(crate) struct CursorQuery {
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
-    pub(crate) sequence_replay: crate::sql::sequence::SequenceReplayState,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
 }
@@ -60,7 +59,6 @@ impl CursorQuery {
         Ok(Self {
             bound: None,
             retained: None,
-            sequence_replay: crate::sql::sequence::SequenceReplayState::empty(),
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
         })
@@ -69,7 +67,6 @@ impl CursorQuery {
     pub(crate) fn clear(&mut self) {
         self.retained = None;
         self.bound = None;
-        self.sequence_replay = crate::sql::sequence::SequenceReplayState::empty();
         self.arena.reset();
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
     }

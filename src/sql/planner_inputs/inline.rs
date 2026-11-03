@@ -144,13 +144,13 @@ pub(crate) fn constant_value(
     txid: u32,
     arena: &Arena,
 ) -> Result<Option<ConstantValue>, SqlError> {
-    // No folded value escapes: text, numeric and array scratch is released
-    // before discovery moves on to another expression.
-    arena
-        .with_remaining_region(|scratch| {
-            constant_value_in(expression, columns, storage, txid, scratch)
-        })
-        .map_err(|_| crate::sql::eval::arena_full())?
+    let mark = arena.mark();
+    let result = constant_value_in(expression, columns, storage, txid, arena);
+    // The resolver can describe subqueries in this same arena, so it must
+    // remain available during inference. Only a copied classification escapes;
+    // every schema owner and folded value has ended before releasing scratch.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 fn constant_value_in(
@@ -657,7 +657,7 @@ pub(crate) fn convert_argument(
                         user_type: target.user_type,
                     };
                     let value = crate::sql::exec::coerce_routine_argument(
-                        value, argument, storage, txid, arena,
+                        value, argument, storage, txid, arena, None,
                     )?;
                     retain_constant(value, arena)
                 })();
@@ -950,19 +950,14 @@ fn procedure_properties(oid: i32, storage: &Storage, txid: u32) -> Properties {
             ..Properties::EMPTY
         };
     }
-    let Some(routine) = catalog::builtin_callable_by_oid(oid) else {
+    let Some(routine) = catalog::builtin_planner_procedure(oid) else {
         return Properties::UNKNOWN;
     };
     Properties {
-        volatility: match routine.catalog.volatility {
-            "i" => 0,
-            "s" => 1,
-            "v" => 2,
-            _ => return Properties::UNKNOWN,
-        },
-        strict: routine.catalog.strict,
-        cost: routine.catalog.cost,
-        forbidden: routine.kind != b'f' || routine.returns_set,
+        volatility: routine.volatility,
+        strict: routine.strict,
+        cost: routine.cost,
+        forbidden: routine.forbidden,
         ..Properties::EMPTY
     }
 }

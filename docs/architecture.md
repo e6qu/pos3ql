@@ -81,6 +81,10 @@ SQL constructors carry an explicit syntax tag through parsing and rewrites;
 a quoted routine name cannot imitate an internal operator or JSON constructor.
 The callable declarations come from PostgreSQL 18.6. Static name/OID indexes
 and streamed candidates avoid a growing candidate list or runtime sort.
+Planner safety facts also cover internal type-conversion procedures from the
+pinned PostgreSQL catalog sources. For example, numeric text input is immutable,
+while date input can depend on session settings. These facts guide planning;
+they do not make additional procedures callable from SQL.
 
 Conversion lookup also uses declared types, including typed NULL values, before
 input effects. Each array child converts before the following child runs. For
@@ -143,7 +147,9 @@ and large-object calls use the same explicit handoff classification.
 
 Waiting for another connection's lock can require restarting an unfinished
 function body. Completed cursor operations and checked routine inputs keep
-their results and sequence effects. If restarting would lose their data writes
+their results and sequence effects. A caught input-check error keeps its exact
+failed attempt too; replay restores that error without running the check again.
+If restarting would lose their data writes
 or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.

@@ -135,14 +135,26 @@ NULL',0)",
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 engine
-                    .decode_binary_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                    .decode_binary_parameter(
+                        crate::sql::types::oid::PG_NODE_TREE,
+                        bytes,
+                        &arena,
+                        0,
+                        None
+                    )
                     .unwrap_err()
                     .sqlstate,
                 "0A000"
             );
             assert_eq!(
                 engine
-                    .decode_text_parameter(crate::sql::types::oid::PG_NODE_TREE, bytes, &arena, 0)
+                    .decode_text_parameter(
+                        crate::sql::types::oid::PG_NODE_TREE,
+                        bytes,
+                        &arena,
+                        0,
+                        None
+                    )
                     .unwrap_err()
                     .sqlstate,
                 "0A000"
@@ -194,14 +206,14 @@ fn catalog_constraint_internal_statistics_types_reject_client_values() {
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 engine
-                    .decode_text_parameter(oid, b"invalid", &arena, 0)
+                    .decode_text_parameter(oid, b"invalid", &arena, 0, None)
                     .unwrap_err()
                     .sqlstate,
                 "0A000"
             );
             assert_eq!(
                 engine
-                    .decode_binary_parameter(oid, b"invalid", &arena, 0)
+                    .decode_binary_parameter(oid, b"invalid", &arena, 0, None)
                     .unwrap_err()
                     .sqlstate,
                 "0A000"

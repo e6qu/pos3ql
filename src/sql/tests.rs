@@ -7694,6 +7694,7 @@ fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
                 &first_oid.to_be_bytes(),
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -7716,6 +7717,7 @@ fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
                 &binary_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -8545,12 +8547,12 @@ fn sql_xml_validation_and_xmloption_reject_invalid_states() {
 
     let arena = Arena::new(&mut budget, "xml binary input", 1 << 16).unwrap();
     let binary = engine
-        .decode_binary_parameter(crate::sql::types::oid::XML, b"<binary/>", &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::XML, b"<binary/>", &arena, 0, None)
         .unwrap();
     assert_eq!(binary, Datum::Xml("<binary/>"));
     assert!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::XML, b"<broken>", &arena, 0)
+            .decode_binary_parameter(crate::sql::types::oid::XML, b"<broken>", &arena, 0, None)
             .is_err()
     );
 }
@@ -28620,14 +28622,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
 
     assert_eq!(
         engine
-            .decode_binary_parameter(enum_oid, b"ready", &arena, 0)
+            .decode_binary_parameter(enum_oid, b"ready", &arena, 0, None)
             .unwrap()
             .to_string(),
         "ready"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(domain_oid, &7_i32.to_be_bytes(), &arena, 0)
+            .decode_binary_parameter(domain_oid, &7_i32.to_be_bytes(), &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
@@ -28639,14 +28641,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     ];
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_oid, &composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_oid, &composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8)"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8)"
@@ -28672,7 +28674,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     composite_array_binary.extend_from_slice(&(composite_binary.len() as i32).to_be_bytes());
     composite_array_binary.extend_from_slice(&composite_binary);
     let composite_array = engine
-        .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+        .decode_binary_parameter(
+            composite_array_oid,
+            &composite_array_binary,
+            &arena,
+            0,
+            None,
+        )
         .unwrap();
     assert_eq!(composite_array.to_string(), "{\"(4,8)\"}");
     let Datum::Array { element, raw } = composite_array else {
@@ -28749,6 +28757,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &composite_domain_array_binary,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28776,14 +28785,20 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     ];
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_oid, &evolved_composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_oid, &evolved_composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8,12)"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::UNKNOWN,
+                b"wire text",
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "wire text"
@@ -28793,53 +28808,59 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     // is observed by the executor.
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::INT4, b"7", &arena, 0)
+            .decode_text_parameter(crate::sql::types::oid::INT4, b"7", &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(enum_oid, b"ready", &arena, 0)
+            .decode_text_parameter(enum_oid, b"ready", &arena, 0, None)
             .unwrap()
             .to_string(),
         "ready"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(domain_oid, b"7", &arena, 0)
+            .decode_text_parameter(domain_oid, b"7", &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .decode_text_parameter(
+                crate::sql::types::oid::UNKNOWN,
+                b"wire text",
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "wire text"
     );
     let invalid_text = engine
-        .decode_text_parameter(crate::sql::types::oid::TEXT, b"\xff", &arena, 0)
+        .decode_text_parameter(crate::sql::types::oid::TEXT, b"\xff", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_text.sqlstate, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
     let invalid_text_enum = engine
-        .decode_text_parameter(enum_oid, b"missing", &arena, 0)
+        .decode_text_parameter(enum_oid, b"missing", &arena, 0, None)
         .unwrap_err();
     assert_eq!(
         invalid_text_enum.sqlstate,
         sqlstate::INVALID_TEXT_REPRESENTATION
     );
     let invalid_text_domain = engine
-        .decode_text_parameter(domain_oid, b"-1", &arena, 0)
+        .decode_text_parameter(domain_oid, b"-1", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_text_domain.sqlstate, sqlstate::CHECK_VIOLATION);
     let invalid_enum = engine
-        .decode_binary_parameter(enum_oid, b"missing", &arena, 0)
+        .decode_binary_parameter(enum_oid, b"missing", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_enum.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
     let invalid_domain = engine
-        .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0)
+        .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_domain.sqlstate, sqlstate::CHECK_VIOLATION);
     for (oid, bytes) in [
@@ -28847,7 +28868,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         (crate::sql::types::oid::JSONB, b"\x01{not json}".as_slice()),
     ] {
         let error = engine
-            .decode_binary_parameter(oid, bytes, &arena, 0)
+            .decode_binary_parameter(oid, bytes, &arena, 0, None)
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
     }
@@ -28864,7 +28885,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .creation(),
     );
     let null_domain = engine
-        .coerce_parameter_null(required_domain_oid, &arena, 0)
+        .coerce_parameter_null(required_domain_oid, &arena, 0, None)
         .unwrap_err();
     assert_eq!(null_domain.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
@@ -28907,7 +28928,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         0xff, // NULL element
     ];
     let null_domain_array = engine
-        .decode_binary_parameter(required_domain_array_oid, &required_domain_array, &arena, 0)
+        .decode_binary_parameter(
+            required_domain_array_oid,
+            &required_domain_array,
+            &arena,
+            0,
+            None,
+        )
         .unwrap_err();
     assert_eq!(null_domain_array.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
@@ -28939,6 +28966,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &enum_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28962,6 +28990,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 b"{ready,blocked}",
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28996,6 +29025,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &domain_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -29019,6 +29049,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 b"{3,5}",
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -29041,6 +29072,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             b"{3,-1}",
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29063,7 +29095,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     bit_array.extend_from_slice(&(-1_i32).to_be_bytes());
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::BIT_ARRAY, &bit_array, &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::BIT_ARRAY,
+                &bit_array,
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "{10110,00111,NULL}"
@@ -29071,7 +29109,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     bit_array[8..12].copy_from_slice(&crate::sql::types::oid::VARBIT.to_be_bytes());
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::VARBIT_ARRAY, &bit_array, &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::VARBIT_ARRAY,
+                &bit_array,
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "{10110,00111,NULL}"
@@ -29094,6 +29138,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &domain_array,
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29116,6 +29161,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &malformed_array,
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29129,6 +29175,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &[0x98], // reserved bit plus both infinity flags
             &arena,
             0,
+            None,
         )
         .unwrap();
     assert_eq!(reserved_range_flags.to_string(), "(,)");
@@ -29138,6 +29185,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &[0x00, 0xff, 0xff, 0xff, 0xff], // finite bound cannot be NULL
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29172,7 +29220,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         record.extend_from_slice(value);
     }
     let record_value = engine
-        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0, None)
         .unwrap();
     let Datum::Record(fields) = record_value else {
         panic!("binary record must decode as a record")
@@ -29197,6 +29245,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &record_with_null_domain_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap_err()
             .sqlstate,
@@ -29223,6 +29272,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &direct_null_domain_record,
                 &arena,
                 0,
+                None,
             )
             .unwrap_err()
             .sqlstate,
@@ -29230,7 +29280,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     );
     record[25..29].copy_from_slice(&(-1_i32).to_be_bytes());
     let invalid_record = engine
-        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_record.sqlstate, sqlstate::CHECK_VIOLATION);
     let missing_type = engine
@@ -29239,6 +29289,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             b"ready",
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(missing_type.sqlstate, sqlstate::UNDEFINED_OBJECT);
@@ -29269,6 +29320,10 @@ fn run_txn_bytes(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = txn.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
     let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
@@ -29298,6 +29353,10 @@ fn run_txn_conn(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = txn.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
     let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
@@ -35876,13 +35935,14 @@ fn jsonpath_type_is_validated_canonical_and_durable() {
             b"\x01strict $.a[0]",
             &arena,
             0,
+            None,
         )
         .unwrap();
     assert_eq!(binary.to_string(), "strict $.\"a\"[0]");
     assert_eq!(binary.type_oid(), crate::sql::types::oid::JSONPATH);
     assert!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::JSONPATH, b"\x02$", &arena, 0,)
+            .decode_binary_parameter(crate::sql::types::oid::JSONPATH, b"\x02$", &arena, 0, None)
             .is_err()
     );
 
@@ -40164,6 +40224,10 @@ fn run_session_transaction(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = transaction.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -59659,7 +59723,7 @@ fn describe_preserves_builtin_function_result_types() {
     let arena = Arena::new(&mut budget, "regtype Bind", 256).unwrap();
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"integer", &arena, 0)
+            .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"integer", &arena, 0, None)
             .unwrap()
             .to_string(),
         "integer"
@@ -59671,17 +59735,24 @@ fn describe_preserves_builtin_function_result_types() {
                 &crate::sql::types::oid::INT4.to_be_bytes(),
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
         "integer"
     );
     let invalid_regtype = engine
-        .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"not_a_type", &arena, 0)
+        .decode_text_parameter(
+            crate::sql::types::oid::REGTYPE,
+            b"not_a_type",
+            &arena,
+            0,
+            None,
+        )
         .unwrap_err();
     assert_eq!(invalid_regtype.sqlstate, sqlstate::UNDEFINED_OBJECT);
     let invalid_binary_regtype = engine
-        .decode_binary_parameter(crate::sql::types::oid::REGTYPE, b"\x00", &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::REGTYPE, b"\x00", &arena, 0, None)
         .unwrap_err();
     assert_eq!(
         invalid_binary_regtype.sqlstate,
@@ -89113,6 +89184,7 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
                 &outer,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),

@@ -25,6 +25,24 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_planner_properties.rs"]
+mod planner_properties;
+
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinPlannerProcedure {
+    pub volatility: u8,
+    pub strict: bool,
+    pub cost: f64,
+    pub forbidden: bool,
+}
+
+pub(crate) fn builtin_planner_procedure(oid: i32) -> Option<BuiltinPlannerProcedure> {
+    let index = planner_properties::PROCEDURES
+        .binary_search_by_key(&oid, |(oid, _)| *oid)
+        .ok()?;
+    Some(planner_properties::PROCEDURES[index].1)
+}
+
 #[path = "catalog_rewrite.rs"]
 mod rewrite;
 #[path = "catalog_view_definitions.rs"]
@@ -293,6 +311,41 @@ pub(crate) fn builtin_callable_by_oid(oid: i32) -> Option<&'static BuiltinCallab
 #[cfg(test)]
 mod callable_contract_tests {
     use super::*;
+
+    #[test]
+    fn planner_procedures_include_type_io_without_exposing_new_callables() {
+        let numeric = builtin_planner_procedure(1701).unwrap();
+        assert_eq!(numeric.volatility, 0);
+        assert!(numeric.strict && !numeric.forbidden);
+        assert_eq!(numeric.cost, 1.0);
+        assert!(builtin_callable_by_oid(1701).is_none());
+        for oid in [1084, 1150, 750] {
+            assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
+        }
+        for signature in callable_signatures::CALLABLES {
+            let Some(properties) = builtin_planner_procedure(signature.oid) else {
+                assert!(signature.name.starts_with("postgres_fdw_"));
+                continue;
+            };
+            assert_eq!(
+                properties.volatility,
+                match signature.catalog.volatility {
+                    "i" => 0,
+                    "s" => 1,
+                    "v" => 2,
+                    _ => panic!("declared procedure volatility"),
+                },
+                "{}",
+                signature.name
+            );
+            assert_eq!(properties.strict, signature.catalog.strict);
+            assert_eq!(properties.cost, signature.catalog.cost);
+            assert_eq!(
+                properties.forbidden,
+                signature.kind != b'f' || signature.returns_set
+            );
+        }
+    }
 
     #[test]
     fn every_modeled_intrinsic_has_a_shared_callable_contract() {
@@ -4284,6 +4337,7 @@ pub(crate) fn validate_enum_input_literal(
                     storage,
                     txid,
                     scratch,
+                    None,
                 )?;
             } else {
                 super::exec::coerce_enum_value(

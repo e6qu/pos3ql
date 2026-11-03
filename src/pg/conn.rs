@@ -2204,6 +2204,7 @@ impl Conn {
                     bytes,
                     &self.arena,
                     self.txn.txid,
+                    Some(self.guc.seq_session()),
                 )
             } else {
                 engine.decode_text_parameter(
@@ -2211,6 +2212,7 @@ impl Conn {
                     bytes,
                     &self.arena,
                     self.txn.txid,
+                    Some(self.guc.seq_session()),
                 )
             };
             match decoded {
@@ -3432,6 +3434,7 @@ impl Conn {
                 parameter_data,
                 &self.arena,
                 &self.txn,
+                self.guc.seq_session(),
             ) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -5281,6 +5284,7 @@ fn decode_bind_parameters<'a>(
     raw: &'a [u8],
     arena: &'a Arena,
     txn: &TxnState,
+    sequence_session: &crate::sql::guc::SeqSession,
 ) -> Result<&'a [u8], SqlError> {
     let count = usize::from(prepared.n_params);
     let oids = engine.infer_param_types(
@@ -5304,7 +5308,12 @@ fn decode_bind_parameters<'a>(
     for (index, value) in values.iter_mut().enumerate() {
         let length = message.i32().expect("validated Bind parameter length");
         if length == -1 {
-            *value = engine.coerce_parameter_null(oids[index], arena, txn.txid)?;
+            *value = engine.coerce_parameter_null(
+                oids[index],
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?;
             continue;
         }
         let bytes = message
@@ -5316,9 +5325,21 @@ fn decode_bind_parameters<'a>(
             _ => codes[index * 2..index * 2 + 2] == [0, 1],
         };
         *value = if binary {
-            engine.decode_binary_parameter(oids[index], bytes, arena, txn.txid)?
+            engine.decode_binary_parameter(
+                oids[index],
+                bytes,
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?
         } else {
-            engine.decode_text_parameter(oids[index], bytes, arena, txn.txid)?
+            engine.decode_text_parameter(
+                oids[index],
+                bytes,
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?
         };
     }
     let row = crate::sql::exec::encode_projected_pub(values, arena)?;

@@ -115,11 +115,12 @@ pub(crate) fn coerce_domain_value<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage
         .read_domain_definition(target, txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
-    coerce_selected_domain_value(storage, &domain, value, txid, arena, params)
+    coerce_selected_domain_value(storage, &domain, value, txid, arena, params, sequences)
 }
 
 fn coerce_selected_domain_value<'a>(
@@ -129,6 +130,7 @@ fn coerce_selected_domain_value<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = if let Some(parent_name) = domain.base_domain {
         let reference = crate::storage::TypeReference::from_bound_name(parent_name)?;
@@ -142,7 +144,7 @@ fn coerce_selected_domain_value<'a>(
                     parent_name.name.as_str()
                 )
             })?;
-        coerce_selected_domain_value(storage, &parent, value, txid, arena, params)?
+        coerce_selected_domain_value(storage, &parent, value, txid, arena, params, sequences)?
     } else {
         match domain.base {
             crate::sql::types::ColType::Enum(slot) => {
@@ -158,19 +160,22 @@ fn coerce_selected_domain_value<'a>(
                     storage,
                     txid,
                     arena,
+                    sequences,
                 )?,
-                value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
+                value => {
+                    super::coerce_composite_value(value, slot, storage, txid, arena, sequences)?
+                }
             },
             crate::sql::types::ColType::Array(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Composite(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(value, element, storage, txid, arena)?,
+            ) => super::coerce_user_type_array(value, element, storage, txid, arena, sequences)?,
             base => crate::sql::eval::cast_to(value, base, arena)?,
         }
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(storage, txid, domain, value, arena, params)?;
+    validate_domain_value(storage, txid, domain, value, arena, params, sequences)?;
     Ok(value)
 }
 
@@ -181,13 +186,13 @@ fn validate_domain_value(
     value: Datum,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     validate_domain_not_null(domain, value)?;
-    if value.is_null() {
-        return Ok(());
-    }
     for check in domain.checks() {
-        validate_domain_check(storage, txid, domain, check, value, arena, params)?;
+        validate_domain_check(
+            storage, txid, domain, check, value, arena, params, sequences,
+        )?;
     }
     Ok(())
 }
@@ -212,6 +217,10 @@ pub(crate) fn validate_domain_not_null(
 /// Enforces one named domain CHECK. This is deliberately separate from the
 /// full write-time domain coercion path: `VALIDATE CONSTRAINT` scans exactly
 /// the named constraint and does not validate unrelated `NOT VALID` checks.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain checks preserve the selected definition and explicit sequence context"
+)]
 pub(crate) fn validate_domain_check<'a>(
     storage: &Storage,
     txid: u32,
@@ -220,14 +229,13 @@ pub(crate) fn validate_domain_check<'a>(
     value: Datum<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
-    if value.is_null() {
-        return Ok(());
-    }
     let context = ValueLookup { value };
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
     let source = crate::sql::enum_values::checks::resolve(
@@ -290,6 +298,7 @@ pub(crate) fn check_domain_constraints(
     txid: u32,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
         let Some(slot) = column_domain_target(storage, col, txid)? else {
@@ -299,7 +308,7 @@ pub(crate) fn check_domain_constraints(
         // The column was already coerced to the base representation. Reusing
         // the catalog-aware path applies every inherited constraint as well as
         // the leaf domain's rules.
-        let _ = coerce_domain_value(storage, slot, value, txid, arena, params)?;
+        let _ = coerce_domain_value(storage, slot, value, txid, arena, params, sequences)?;
     }
     Ok(())
 }
@@ -1855,6 +1864,7 @@ pub(crate) fn enforce_row_constraints(
     checks: &ParsedChecks,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let self_rowid = row.excluded();
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
@@ -1938,8 +1948,8 @@ pub(crate) fn enforce_row_constraints(
         )?;
     }
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params)?;
-    check_domain_constraints(storage, def, values, txid, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_or_defer_fk_child(storage, constraint_table, def, values, row, txid, txn)?;
     Ok(())
 }
@@ -1960,12 +1970,13 @@ pub(crate) fn check_row_content(
     params: &[Datum],
     txid: u32,
     read: ValidationRead,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params)?;
-    check_domain_constraints(storage, def, values, txid, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_fk_child(storage, def, values, txid, read)?;
     Ok(())
 }
@@ -1994,6 +2005,10 @@ fn check_detached_partition_bound(
 
 /// Evaluates each CHECK predicate against the candidate row. A predicate that
 /// is FALSE raises 23514; NULL and TRUE both pass, per SQL three-valued logic.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row checks preserve row and statement sequence contexts"
+)]
 fn check_row_checks(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -2002,6 +2017,7 @@ fn check_row_checks(
     txid: u32,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let context = RowCtx {
         def: crate::storage::RelationDefinition::from_definition(def),
@@ -2011,6 +2027,7 @@ fn check_row_checks(
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
     for (i, c) in def.checks().iter().enumerate() {
@@ -2886,6 +2903,7 @@ pub(crate) fn apply_fk_parent_actions(
     seq_session: &crate::sql::guc::SeqSession,
     depth: u32,
 ) -> Result<(), SqlError> {
+    let coercion_txid = txn.txid;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3132,6 +3150,11 @@ pub(crate) fn apply_fk_parent_actions(
                                     storage,
                                     txn.txid,
                                     arena,
+                                    Some(&crate::sql::sequence::SeqEval::new(
+                                        storage,
+                                        seq_session,
+                                        coercion_txid,
+                                    )),
                                 )?
                             }
                             crate::storage::ColumnDefault::Generated(_) => {
@@ -3161,6 +3184,11 @@ pub(crate) fn apply_fk_parent_actions(
                     &checks,
                     arena,
                     params,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 )?;
                 // The child's own referenced keys may have changed — recurse.
                 apply_fk_parent_actions(

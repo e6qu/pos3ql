@@ -3332,7 +3332,8 @@ sql_arena_bytes = 4096
             );
         let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
         let copy_transition = crate::sql::exec::CopyTransitionRows::budget_bytes(&c);
-        let per_connection = 890
+        let per_connection = 830
+            + crate::sql::prep::SqlPreparedPool::budget_bytes(&c)
             + copy_transition
             + publication_selection
             + cursor_pool

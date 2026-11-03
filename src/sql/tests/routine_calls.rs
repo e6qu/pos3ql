@@ -1029,7 +1029,7 @@ fn retained_query_errors_rollback_completed_writes_and_session_changes() {
 
 #[test]
 fn retained_query_call_state_is_reused_between_rows() {
-    const ROWS: usize = 1024;
+    const ROWS: usize = 1100;
     let config = test_config("retained-query-bounded-rows");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -1076,7 +1076,7 @@ fn retained_query_call_state_is_reused_between_rows() {
              SELECT count(*),count(DISTINCT value),sum(value) FROM query_bounded_audit",
             true,
         )),
-        ["1024", "1024|1024|524800"]
+        ["1100", "1100|1100|605550"]
     );
 }
 
@@ -3305,5 +3305,107 @@ fn sql_and_plpgsql_formals_preserve_observed_postgresql_input_collations() {
                 "{statement}, {mode:?}"
             );
         }
+    }
+}
+
+#[test]
+fn domain_checks_keep_sequence_context_through_casts_arrays_and_assignments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("domain-check-sequences-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE direct_domain_checks; \
+             CREATE DOMAIN direct_checked AS integer CHECK(nextval('direct_domain_checks')>0); \
+             CREATE TABLE direct_values(value direct_checked,items direct_checked[])",
+            true,
+        );
+        for (statement, expected) in [
+            ("SELECT 7::direct_checked", "1"),
+            ("SELECT ARRAY[8,9]::direct_checked[]", "3"),
+            ("SELECT '{8,9}'::direct_checked[]", "5"),
+            ("INSERT INTO direct_values VALUES(1,ARRAY[2,3])", "8"),
+            ("SELECT NULL::direct_checked", "9"),
+            ("SELECT ARRAY[NULL]::direct_checked[]", "10"),
+        ] {
+            session.success(&mut engine, statement, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM direct_domain_checks",
+                    true
+                )),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+        session.success(&mut engine,
+            "CREATE FUNCTION direct_body() RETURNS direct_checked[] LANGUAGE sql SET search_path=public \
+               AS $$SELECT '{11,12}'::direct_checked[]$$", true);
+        let created = session.success(
+            &mut engine,
+            "SELECT last_value FROM direct_domain_checks",
+            true,
+        );
+        assert_eq!(data_rows(&created), ["12"]);
+        for expected in ["14", "14"] {
+            session.success(&mut engine, "SELECT direct_body()", true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM direct_domain_checks",
+                    true
+                )),
+                [expected]
+            );
+        }
+        let input_arena = Arena::new(&mut budget, "domain parameter inputs", 256 << 10).unwrap();
+        let oid = crate::sql::catalog::user_type_oid(&engine.storage, 0, "direct_checked").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                engine
+                    .decode_text_parameter(
+                        oid,
+                        b"15",
+                        &input_arena,
+                        0,
+                        Some(session.guc.seq_session())
+                    )
+                    .unwrap(),
+                Datum::Int4(15)
+            );
+            assert_eq!(
+                engine
+                    .decode_binary_parameter(
+                        oid,
+                        &16_i32.to_be_bytes(),
+                        &input_arena,
+                        0,
+                        Some(session.guc.seq_session())
+                    )
+                    .unwrap(),
+                Datum::Int4(16)
+            );
+            assert_eq!(
+                engine
+                    .coerce_parameter_null(oid, &input_arena, 0, Some(session.guc.seq_session()))
+                    .unwrap(),
+                Datum::Null
+            );
+        });
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM direct_domain_checks",
+                true
+            )),
+            ["17"]
+        );
     }
 }

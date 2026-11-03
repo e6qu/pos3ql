@@ -274,7 +274,9 @@ are not acceptance evidence.
 Cached function inputs must retain their original attempt while a lock or storage
 request is pending. Compare casts with declared size limits, operator calls,
 reached procedural statements and inherited ownership against PostgreSQL;
-validate runtime effects as well as parsing and compilation.
+validate runtime effects as well as parsing and compilation. Cover TRUNCATE
+commit, rollback and prepared transactions with captured table identities;
+statistics updates and index labels must not refresh unrelated saved inputs.
 
 ## Rules throughout
 

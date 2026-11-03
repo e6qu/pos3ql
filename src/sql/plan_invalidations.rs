@@ -224,6 +224,10 @@ impl LocalPlanStamp {
         if global != self.global || roles != self.roles {
             return Ok(false);
         }
+        self.selected_matches()
+    }
+
+    pub(crate) fn selected_matches(&self) -> Result<bool, SqlError> {
         if let Some(token) = self.watch {
             let watches = self.owner.watches.lock().expect("plan watch lock poisoned");
             let watch = watches
@@ -371,6 +375,8 @@ mod tests {
                 roles: false,
             });
             assert!(!other.matches().unwrap());
+            assert!(other.selected_matches().unwrap());
+            assert!(!first.selected_matches().unwrap());
             other.finish_environment().unwrap();
             assert!(other.matches().unwrap());
             first.finish_environment().unwrap();

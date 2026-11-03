@@ -841,7 +841,7 @@ mod tests {
             if !pending {
                 definition.columns[0].collation = invalid;
             }
-            let table = storage.create_table_in(definition, 7).unwrap();
+            let table = storage.create_table_in(definition.clone(), 7).unwrap();
             storage.commit_create(table);
             if pending {
                 definition.columns[0].collation = invalid;

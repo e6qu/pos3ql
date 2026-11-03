@@ -736,7 +736,7 @@ mod tests {
             let first_change = storage
                 .write_table_def(
                     storage.select_table_definition(table, 7).0,
-                    first,
+                    first.clone(),
                     &mapping("renamed_id"),
                     true,
                     crate::storage::ColumnSet::EMPTY,
@@ -748,7 +748,7 @@ mod tests {
             let second_change = storage
                 .write_table_def(
                     storage.select_table_definition(table, 7).0,
-                    second,
+                    second.clone(),
                     &mapping("final_id"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -833,7 +833,7 @@ mod tests {
                 storage
                     .write_table_def(
                         storage.select_table_definition(first, 8).0,
-                        changed,
+                        changed.clone(),
                         &mapping("id"),
                         false,
                         crate::storage::ColumnSet::EMPTY,
@@ -902,7 +902,7 @@ mod tests {
                 storage
                     .write_table_def(
                         storage.select_table_definition(first, 7).0,
-                        definition,
+                        definition.clone(),
                         &mapping("id"),
                         false,
                         crate::storage::ColumnSet::EMPTY,
@@ -912,12 +912,12 @@ mod tests {
                 sqlstate::SERIALIZATION_FAILURE
             );
             assert!(storage.pending_table_def(first).is_none());
-            let next = storage.create_table_in(definition, 9).unwrap();
+            let next = storage.create_table_in(definition.clone(), 9).unwrap();
             assert_eq!(next, first);
             let first_change = storage
                 .write_table_def(
                     storage.select_table_definition(next, 9).0,
-                    definition,
+                    definition.clone(),
                     &mapping("id"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -933,7 +933,7 @@ mod tests {
                 storage
                     .write_table_def(
                         storage.select_table_definition(next, 9).0,
-                        definition,
+                        definition.clone(),
                         &mapping("id"),
                         false,
                         crate::storage::ColumnSet::EMPTY,
@@ -995,7 +995,7 @@ mod tests {
             let error = storage
                 .write_table_def(
                     storage.select_table_definition(first, 9).0,
-                    renamed,
+                    renamed.clone(),
                     &mapping("id"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -1048,7 +1048,7 @@ mod tests {
             let first_change = storage
                 .write_table_def(
                     original_target,
-                    first,
+                    first.clone(),
                     &mapping("first_column"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -1132,7 +1132,7 @@ mod tests {
             let change = storage
                 .write_table_def(
                     target,
-                    definition,
+                    definition.clone(),
                     &mapping("id"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -1141,7 +1141,7 @@ mod tests {
             let error = foreign
                 .write_table_def(
                     target,
-                    definition,
+                    definition.clone(),
                     &mapping("id"),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -1152,7 +1152,7 @@ mod tests {
             assert!(foreign.pending_table_def(foreign_table).is_none());
             storage.rollback_table_def(change);
             storage.commit_drop(table);
-            let replacement = storage.create_table_in(definition, 7).unwrap();
+            let replacement = storage.create_table_in(definition.clone(), 7).unwrap();
             assert_eq!(replacement, table);
             let (replacement_target, replacement_definition) =
                 storage.select_table_definition(replacement, 7);

@@ -180,18 +180,18 @@ pub(crate) fn capture_planner_inputs<'a, 'source>(
         arena,
         outer,
         &mut |expression, columns, assignment| {
-            let candidate = match assignment {
-                Some(assignment) => {
+            if let Some(assignment) = assignment {
+                if let Some(candidate) =
                     capture_assignment(expression, columns, assignment, storage, txid, arena)?
+                {
+                    candidates
+                        .push(candidate)
+                        .map_err(|_| super::eval::arena_full())?;
                 }
-                None => capture(expression, columns, storage, txid, arena)?,
-            };
-            if let Some(candidate) = candidate {
-                candidates
-                    .push(candidate)
-                    .map_err(|_| super::eval::arena_full())?;
+                Ok(())
+            } else {
+                capture_expression_into(expression, columns, storage, txid, arena, &mut candidates)
             }
-            Ok(())
         },
     )?;
     Ok(CapturedPlannerInputs {
@@ -204,6 +204,107 @@ fn missing_contract() -> SqlError {
         sqlstate::INTERNAL_ERROR,
         "selected planner input contract is unavailable"
     )
+}
+
+fn capture_expression_into<'a>(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    candidates: &mut ArenaList<'a, Candidate<'a>>,
+) -> Result<(), SqlError> {
+    if let Expr::Cast {
+        operand: Expr::Array(items),
+        binding: super::ast::CastBinding::Resolve,
+        source_position,
+        type_mod,
+        ..
+    } = expression
+        && let Some(position) = source_position.get()
+        && let Some(super::types::ColType::Array(element)) = storage
+            .routine_result_for_oid(infer_routine_argument_oid(expression, columns)?, txid)
+            .map(|result| result.ctype)
+    {
+        return capture_array_constructor(
+            items,
+            columns,
+            (position, *type_mod, element),
+            storage,
+            txid,
+            arena,
+            &mut 0,
+            candidates,
+        );
+    }
+    if let Some(candidate) = capture(expression, columns, storage, txid, arena)? {
+        candidates
+            .push(candidate)
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "constructor leaves preserve the cast source, target type, and shared lexical ordinal"
+)]
+fn capture_array_constructor<'a>(
+    items: &[&Expr<'_>],
+    columns: &dyn ColTypeResolver,
+    context: (usize, i32, super::types::ArrElem),
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    next: &mut usize,
+    candidates: &mut ArenaList<'a, Candidate<'a>>,
+) -> Result<(), SqlError> {
+    let (position, type_mod, element) = context;
+    let types = super::eval::array_constructor_type(
+        items,
+        Some(element),
+        &|expression| infer_routine_argument_oid(expression, columns),
+        &|oid| storage.domain_base_type_for_oid(oid, txid),
+    )?;
+    let target = if types.multidimensional {
+        element.array_oid()
+    } else {
+        element.element_oid()
+    };
+    let catalog = query::storage_catalog(storage, arena, txid);
+    for expression in items {
+        if let Expr::Array(children) = expression {
+            capture_array_constructor(
+                children, columns, context, storage, txid, arena, next, candidates,
+            )?;
+            continue;
+        }
+        let element = *next;
+        *next = next.checked_add(1).ok_or_else(super::eval::arena_full)?;
+        let source = infer_routine_argument_oid(expression, columns)?;
+        if source == target || source == super::types::oid::UNKNOWN {
+            continue;
+        }
+        if let Some(cast) = super::eval::CatalogAccess::bind_defined_cast(
+            &catalog,
+            source,
+            target,
+            super::eval::DefinedCastContext::Explicit,
+        )? && let Some(candidate) = capture_cast_function(
+            expression,
+            columns,
+            &cast,
+            (InvocationSite::ArrayElement { position, element }, type_mod),
+            storage,
+            txid,
+            arena,
+        )? {
+            candidates
+                .push(candidate)
+                .map_err(|_| super::eval::arena_full())?;
+        }
+    }
+    Ok(())
 }
 
 fn capture<'a>(
@@ -616,6 +717,15 @@ fn capture_operator<'a>(
     if !(1..=2).contains(&arguments.len()) {
         return Err(missing_contract());
     }
+    if !storage.operators_visible_to(txid).any(|(_, operator)| {
+        operator.name.as_str() == symbol
+            && match schema {
+                Some(schema) => operator.schema.as_str() == schema,
+                None => storage.schema_is_on_path(operator.schema, txid),
+            }
+    }) {
+        return Ok(None);
+    }
     let mut actual = [super::types::oid::UNKNOWN; 2];
     for (oid, expression) in actual.iter_mut().zip(arguments) {
         *oid = infer_routine_argument_oid(expression, columns)?;
@@ -738,14 +848,14 @@ impl Engine {
                     arena,
                     row,
                     &mut |expression, columns, _assignment| {
-                        if let Some(candidate) =
-                            capture(expression, columns, &self.storage, txn.txid, arena)?
-                        {
-                            candidates
-                                .push(candidate)
-                                .map_err(|_| super::eval::arena_full())?;
-                        }
-                        Ok(())
+                        capture_expression_into(
+                            expression,
+                            columns,
+                            &self.storage,
+                            txn.txid,
+                            arena,
+                            &mut candidates,
+                        )
                     },
                 )?;
             } else {

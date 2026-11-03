@@ -1,4 +1,108 @@
 use super::*;
+#[test]
+fn runtime_input_retries_keep_their_receipts_across_namespace_changes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for language in ["sql", "plpgsql"] {
+            let mut config = test_config(&format!("runtime-plan-wait-{mode:?}-{language}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let mut observer =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(3);
+            reader.success(&mut engine,
+                "CREATE SEQUENCE runtime_wait_checks; \
+                 CREATE TABLE runtime_wait_gate(id integer PRIMARY KEY,hits integer); \
+                 INSERT INTO runtime_wait_gate VALUES(1,0); \
+                 CREATE TYPE runtime_wait_choice AS ENUM('a'); \
+                 CREATE FUNCTION runtime_wait_allowed(value runtime_wait_choice) RETURNS boolean \
+                 LANGUAGE plpgsql AS $$BEGIN PERFORM nextval('runtime_wait_checks'); \
+                 UPDATE runtime_wait_gate SET hits=hits+1 WHERE id=1; RETURN true; END$$; \
+                 CREATE DOMAIN runtime_wait_checked AS runtime_wait_choice CHECK(runtime_wait_allowed(VALUE)); \
+                 SET check_function_bodies=off; SET lock_timeout='10s'", true);
+            let body = match language {
+                "sql" => "SELECT cardinality('{a}'::runtime_wait_checked[])",
+                "plpgsql" => "BEGIN RETURN cardinality('{a}'::runtime_wait_checked[]); END",
+                _ => unreachable!(),
+            };
+            reader.success(&mut engine, &format!(
+                "CREATE FUNCTION runtime_wait_body() RETURNS integer LANGUAGE {language} AS $${body}$$; \
+                 SET check_function_bodies=on"), true);
+            holder.success(
+                &mut engine,
+                "BEGIN; UPDATE runtime_wait_gate SET hits=hits WHERE id=1",
+                true,
+            );
+            let query = "SELECT runtime_wait_body()";
+            assert!(matches!(
+                reader.execute_status(&mut engine, query, true),
+                ExecutionStatus::Blocked { .. }
+            ));
+            assert!(reader.send.is_empty());
+            let deadline = reader.transaction.suspended_statement_deadline();
+            assert!(deadline.is_some());
+            observer.success(&mut engine, "CREATE SCHEMA runtime_wait_unrelated", true);
+            for _ in 0..2 {
+                let status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        query,
+                        0,
+                        &reader.arena,
+                        &mut reader.transaction,
+                        &mut reader.pool,
+                        &mut reader.cursors,
+                        &reader.guc,
+                        &mut Responder::new(&mut reader.send),
+                        1,
+                        false,
+                    )
+                })
+                .unwrap();
+                assert!(matches!(status, ExecutionStatus::Blocked { .. }));
+                assert!(reader.send.is_empty());
+                assert_eq!(reader.transaction.suspended_statement_deadline(), deadline);
+            }
+            assert_eq!(
+                data_rows(&observer.success(
+                    &mut engine,
+                    "SELECT last_value,is_called FROM runtime_wait_checks",
+                    true
+                )),
+                ["1|t"]
+            );
+            holder.success(&mut engine, "ROLLBACK", true);
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    query,
+                    0,
+                    &reader.arena,
+                    &mut reader.transaction,
+                    &mut reader.pool,
+                    &mut reader.cursors,
+                    &reader.guc,
+                    &mut Responder::new(&mut reader.send),
+                    1,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert_eq!(data_rows(reader.send.readable()), ["1"]);
+            assert!(error_sqlstates(reader.send.readable()).is_empty());
+            assert_eq!(data_rows(&observer.success(&mut engine,
+                "SELECT last_value FROM runtime_wait_checks; SELECT hits FROM runtime_wait_gate", true)),
+                ["1", "1"]);
+            assert!(reader.transaction.suspended_statement_deadline().is_none());
+            drop((reader, holder, observer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
 
 // PostgreSQL 18.6 two-session oracle SQL/Python SHA256:
 // 3df4b20befdb50122161465bd83cc7a870e63ccc78bd6b9cb8e8c0bafc444e38,

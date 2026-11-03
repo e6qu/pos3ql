@@ -442,7 +442,7 @@ mod tests {
                 ("payload", ColType::Int4, false),
             ],
         );
-        let table = storage.create_table(source).unwrap();
+        let table = storage.create_table(source.clone()).unwrap();
         let mut target = make_def(
             "binding_target",
             &[
@@ -600,8 +600,8 @@ mod tests {
                 ("payload", ColType::Int4, false),
             ],
         );
-        let table = storage.create_table(definition).unwrap();
-        other.create_table(definition).unwrap();
+        let table = storage.create_table(definition.clone()).unwrap();
+        other.create_table(definition.clone()).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let slot = storage
                 .create_index(index("binding_index", "binding_source", 0, 1), 7)
@@ -649,7 +649,7 @@ mod tests {
                     ("payload", ColType::Int4, false),
                 ],
             );
-            let table = storage.create_table(definition).unwrap();
+            let table = storage.create_table(definition.clone()).unwrap();
             storage
                 .create_table(make_def(
                     "unrelated_source",
@@ -798,7 +798,7 @@ mod tests {
                 let second_change = storage
                     .write_table_def(
                         storage.select_table_definition(table, 7).0,
-                        second,
+                        second.clone(),
                         &second_mapping,
                         false,
                         crate::storage::ColumnSet::EMPTY,

@@ -533,6 +533,7 @@ mod tests {
             let (target, selected) = storage.select_table_definition(table, 7);
             let mut replacement = TableDefBuilder::from_definition(&selected);
             replacement.name = SqlName::parse("private_items").unwrap();
+            let replacement_name = replacement.name;
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(replacement.columns[0].name);
             let change = storage
@@ -555,7 +556,7 @@ mod tests {
                     .is_ok()
             );
             let pending = StoredQueryDependency {
-                name: replacement.name,
+                name: replacement_name,
                 ..dependency
             };
             assert!(storage.resolve_stored_query_relation(&pending, 7).is_ok());

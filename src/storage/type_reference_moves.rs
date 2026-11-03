@@ -1518,7 +1518,10 @@ mod tests {
                     TableDefBuilder::from_definition(&storage.table_def(related, 0));
                 definition.name = SqlName::parse("blocked_type_table").unwrap();
                 assert_eq!(
-                    storage.create_table_in(definition, 9).unwrap_err().sqlstate,
+                    storage
+                        .create_table_in(definition.clone(), 9)
+                        .unwrap_err()
+                        .sqlstate,
                     sqlstate::INTERNAL_LOCK_WAIT
                 );
                 assert!(
@@ -1546,7 +1549,7 @@ mod tests {
                     storage
                         .write_table_def(
                             selected,
-                            definition,
+                            definition.clone(),
                             &mapping("id"),
                             false,
                             crate::storage::ColumnSet::EMPTY,
@@ -2504,7 +2507,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 publish_move(&storage, movement, source);
                 captured.name = SqlName::parse("late_create").unwrap();
-                let created = storage.create_table_in(captured, 7).unwrap();
+                let created = storage.create_table_in(captured.clone(), 7).unwrap();
                 assert_identity(&storage, created, 7, movement.current);
                 for (index, column) in storage.table_def(created, 7).columns().iter().enumerate() {
                     assert_eq!(column.user_type, originals[index]);
@@ -2517,7 +2520,7 @@ mod tests {
                     storage
                         .write_table_def(
                             storage.select_table_definition(table, 9).0,
-                            captured,
+                            captured.clone(),
                             &mapping("id"),
                             false,
                             crate::storage::ColumnSet::EMPTY,
@@ -2724,10 +2727,13 @@ mod tests {
                                 .is_none()
                         );
                     }
-                    let mut submitted = captured;
+                    let mut submitted = captured.clone();
                     submitted.name = SqlName::parse("invalid_create").unwrap();
                     assert_eq!(
-                        storage.create_table_in(submitted, 7).unwrap_err().sqlstate,
+                        storage
+                            .create_table_in(submitted.clone(), 7)
+                            .unwrap_err()
+                            .sqlstate,
                         crate::sql::eval::sqlstate::UNDEFINED_OBJECT
                     );
                     assert_eq!(

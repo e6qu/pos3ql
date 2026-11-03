@@ -40883,7 +40883,9 @@ impl Storage {
                 subscription.name,
             )
         };
-        if self.role(role).attributes_to(txid).superuser || role == owner {
+        if self.role(role).attributes_to(txid).superuser
+            || self.role_has_privileges_of(role, owner, txid)
+        {
             return Ok(());
         }
         Err(sql_err!(

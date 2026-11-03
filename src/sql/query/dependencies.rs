@@ -626,6 +626,45 @@ fn collect_statement(
             )
         }};
     }
+    if matches!(
+        statement,
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Merge(_)
+    ) {
+        let outer = DependencyTypes {
+            scope: None,
+            excluded: None,
+            transition: context.transition,
+            storage,
+            txid,
+            returning_output: None,
+            arena,
+        };
+        visit_dml_assignment_types(
+            statement,
+            storage,
+            txid,
+            arena,
+            Some(&outer),
+            &mut |source, column| {
+                let target = storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "assignment destination type is unavailable"
+                        )
+                    })?;
+                record_cast_support(
+                    source,
+                    target,
+                    crate::sql::eval::DefinedCastContext::Assignment,
+                    storage,
+                    txid,
+                    dependencies,
+                )
+            },
+        )?;
+    }
     match statement {
         Stmt::Select(select) => collect_select(
             select,
@@ -974,41 +1013,7 @@ fn collect_dml_routine_calls_with_output<'a>(
         arena,
     };
     let mut needs_scope = false;
-    fn visit(
-        expression: &Expr<'_>,
-        storage: &Storage,
-        txid: u32,
-        resolver: &DependencyTypes<'_, '_, '_>,
-        dependencies: &mut StoredQueryDependencies,
-        needs_scope: &mut bool,
-    ) -> Result<(), SqlError> {
-        if let Expr::Call {
-            kind,
-            name,
-            args,
-            argument_names,
-            variadic,
-            ..
-        } = expression
-        {
-            record_routine_call(
-                *kind,
-                name,
-                args,
-                argument_names,
-                *variadic,
-                storage,
-                txid,
-                resolver,
-                dependencies,
-                needs_scope,
-            )?;
-        }
-        super::walk_children(expression, &mut |child| {
-            visit(child, storage, txid, resolver, dependencies, needs_scope)
-        })
-    }
-    visit(
+    visit_routine_expression(
         expression,
         storage,
         txid,
@@ -2798,6 +2803,61 @@ pub(super) fn stored_operator_dependency_for_call(
     ))
 }
 
+fn record_support_routine(
+    oid: i32,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "selected support function does not exist"
+        )
+    })?;
+    let routine = storage.routine_for(slot, txid);
+    dependencies.push(StoredQueryDependency {
+        class: DependencyClass::Routine,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::RoutineOid(oid),
+        referenced_columns: crate::storage::ColumnSet::EMPTY,
+        schema: routine.schema_for(txid),
+        name: routine.name_for(txid),
+        referenced_schema: routine.schema_for(txid),
+        referenced_name: routine.name_for(txid),
+    })
+}
+
+fn record_cast_support(
+    source_oid: i32,
+    target_oid: i32,
+    context: crate::sql::eval::DefinedCastContext,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    if source_oid == target_oid {
+        return Ok(());
+    }
+    let Some((_, cast)) =
+        crate::sql::catalog::defined_cast_path(storage, txid, source_oid, target_oid)
+    else {
+        return Ok(());
+    };
+    crate::sql::catalog::require_cast_context(
+        storage,
+        txid,
+        source_oid,
+        target_oid,
+        cast.context,
+        context,
+    )?;
+    if let crate::storage::CastMethod::Function(oid) = cast.method {
+        record_support_routine(oid, storage, txid, dependencies)?;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "routine dependency binding carries call syntax and catalog context"
@@ -2871,6 +2931,62 @@ fn record_routine_call(
         }
     };
     let routine = storage.routine_for(slot, txid);
+    let oid = crate::storage::routine_oid(&routine);
+    let bound = storage
+        .function_for_captured_call(oid, argument_names, argument_oids, variadic, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "selected function input types are unavailable"
+            )
+        })?;
+    let (_, mapping) = storage
+        .routine_call_mapping(slot, argument_names, args.len(), variadic, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "selected function input mapping is unavailable"
+            )
+        })?;
+    for (index, source) in argument_oids.iter().enumerate() {
+        let input = usize::from(mapping[index]);
+        let argument = bound.arguments[input];
+        let expanded = !variadic
+            && bound.parameter_for_input(input).is_some_and(|parameter| {
+                matches!(
+                    parameter.mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                )
+            });
+        let target = if expanded {
+            match argument.ctype {
+                ColType::Array(element) => element.element_oid(),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "variadic function input is not an array"
+                    ));
+                }
+            }
+        } else {
+            storage
+                .routine_type_oid(argument.ctype, argument.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "selected function input type is unavailable"
+                    )
+                })?
+        };
+        record_cast_support(
+            *source,
+            target,
+            crate::sql::eval::DefinedCastContext::Implicit,
+            storage,
+            txid,
+            dependencies,
+        )?;
+    }
     let (referenced_schema, referenced_name) = name
         .split_once('.')
         .map_or(("", name), |(schema, name)| (schema, name));
@@ -2936,6 +3052,28 @@ fn record_operator_call(
         return Ok(());
     };
     let operator = storage.operator_for(slot, txid);
+    if let Some(oid) = operator.implementation.routine() {
+        record_support_routine(oid, storage, txid, dependencies)?;
+    }
+    let expected = [operator.signature.left, operator.signature.right];
+    for (source, expected) in inferred.iter().zip(expected.iter().flatten()) {
+        let target = storage
+            .routine_type_oid(expected.ctype, expected.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "selected operator input type is unavailable"
+                )
+            })?;
+        record_cast_support(
+            *source,
+            target,
+            crate::sql::eval::DefinedCastContext::Implicit,
+            storage,
+            txid,
+            dependencies,
+        )?;
+    }
     dependencies.push(StoredQueryDependency {
         class: DependencyClass::Operator,
         slot: slot as u16,
@@ -2948,6 +3086,109 @@ fn record_operator_call(
     })
 }
 
+fn visit_routine_expression(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    resolver: &DependencyTypes<'_, '_, '_>,
+    dependencies: &mut StoredQueryDependencies,
+    needs_scope: &mut bool,
+) -> Result<(), SqlError> {
+    if let Expr::Cast {
+        operand,
+        type_name,
+        binding: crate::sql::ast::CastBinding::Resolve,
+        ..
+    } = expression
+    {
+        let source = match crate::sql::exec::infer_routine_argument_oid(operand, resolver) {
+            Ok(source) => Some(source),
+            Err(_) => {
+                *needs_scope = true;
+                None
+            }
+        };
+        let target = ColType::from_sql_name(type_name)
+            .map(ColType::oid)
+            .or_else(|| resolver.named_type_oid(type_name));
+        if let (Some(source), Some(target)) = (source, target) {
+            record_cast_support(
+                source,
+                target,
+                crate::sql::eval::DefinedCastContext::Explicit,
+                storage,
+                txid,
+                dependencies,
+            )?;
+        }
+    }
+    if let Expr::Call {
+        kind,
+        name,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = expression
+    {
+        if let Some((schema, operator)) = (*kind == crate::sql::ast::CallKind::SqlSyntax)
+            .then(|| crate::sql::ast::catalog_operator_call(name))
+            .flatten()
+        {
+            if (1..=2).contains(&args.len())
+                && !schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                record_operator_call(
+                    crate::sql::ast::QualName {
+                        schema,
+                        name: operator,
+                    },
+                    args,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    needs_scope,
+                )?;
+            }
+        } else {
+            record_routine_call(
+                *kind,
+                name,
+                args,
+                argument_names,
+                *variadic,
+                storage,
+                txid,
+                resolver,
+                dependencies,
+                needs_scope,
+            )?;
+        }
+    }
+    if let Expr::Binary {
+        operator,
+        left,
+        right,
+        ..
+    } = expression
+        && let Some(name) = operator.operator_name()
+    {
+        record_operator_call(
+            crate::sql::ast::QualName { schema: None, name },
+            &[left, right],
+            storage,
+            txid,
+            resolver,
+            dependencies,
+            needs_scope,
+        )?;
+    }
+    super::walk_children(expression, &mut |child| {
+        visit_routine_expression(child, storage, txid, resolver, dependencies, needs_scope)
+    })
+}
+
 fn collect_routine_dependencies_with_resolver(
     select: &Select<'_>,
     storage: &Storage,
@@ -2956,81 +3197,6 @@ fn collect_routine_dependencies_with_resolver(
     resolver: &DependencyTypes<'_, '_, '_>,
 ) -> Result<bool, SqlError> {
     let mut needs_scope = false;
-
-    fn visit_expr(
-        expression: &Expr<'_>,
-        storage: &Storage,
-        txid: u32,
-        resolver: &DependencyTypes<'_, '_, '_>,
-        dependencies: &mut StoredQueryDependencies,
-        needs_scope: &mut bool,
-    ) -> Result<(), SqlError> {
-        if let Expr::Call {
-            kind,
-            name,
-            args,
-            argument_names,
-            variadic,
-            ..
-        } = expression
-        {
-            if let Some((schema, operator)) = (*kind == crate::sql::ast::CallKind::SqlSyntax)
-                .then(|| crate::sql::ast::catalog_operator_call(name))
-                .flatten()
-            {
-                if (1..=2).contains(&args.len())
-                    && !schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                {
-                    record_operator_call(
-                        crate::sql::ast::QualName {
-                            schema,
-                            name: operator,
-                        },
-                        args,
-                        storage,
-                        txid,
-                        resolver,
-                        dependencies,
-                        needs_scope,
-                    )?;
-                }
-            } else {
-                record_routine_call(
-                    *kind,
-                    name,
-                    args,
-                    argument_names,
-                    *variadic,
-                    storage,
-                    txid,
-                    resolver,
-                    dependencies,
-                    needs_scope,
-                )?;
-            }
-        }
-        if let Expr::Binary {
-            operator,
-            left,
-            right,
-            ..
-        } = expression
-            && let Some(name) = operator.operator_name()
-        {
-            record_operator_call(
-                crate::sql::ast::QualName { schema: None, name },
-                &[left, right],
-                storage,
-                txid,
-                resolver,
-                dependencies,
-                needs_scope,
-            )?;
-        }
-        super::walk_children(expression, &mut |child| {
-            visit_expr(child, storage, txid, resolver, dependencies, needs_scope)
-        })
-    }
 
     fn record_table_call(
         table: &TableRef<'_>,
@@ -3070,14 +3236,16 @@ fn collect_routine_dependencies_with_resolver(
 
     for item in select.items {
         match item {
-            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => visit_expr(
-                expression,
-                storage,
-                txid,
-                resolver,
-                dependencies,
-                &mut needs_scope,
-            )?,
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                visit_routine_expression(
+                    expression,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    &mut needs_scope,
+                )?
+            }
             SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
         }
     }
@@ -3092,7 +3260,7 @@ fn collect_routine_dependencies_with_resolver(
         .chain(select.limit)
         .chain(select.offset)
     {
-        visit_expr(
+        visit_routine_expression(
             expression_node,
             storage,
             txid,
@@ -3104,7 +3272,7 @@ fn collect_routine_dependencies_with_resolver(
     if let Some(from) = select.from {
         for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
             if let Some(sample) = table.sample {
-                visit_expr(
+                visit_routine_expression(
                     sample.percentage,
                     storage,
                     txid,
@@ -3113,7 +3281,7 @@ fn collect_routine_dependencies_with_resolver(
                     &mut needs_scope,
                 )?;
                 if let Some(repeatable) = sample.repeatable {
-                    visit_expr(
+                    visit_routine_expression(
                         repeatable,
                         storage,
                         txid,
@@ -3134,7 +3302,7 @@ fn collect_routine_dependencies_with_resolver(
                     &mut needs_scope,
                 )?;
                 for argument in args {
-                    visit_expr(
+                    visit_routine_expression(
                         argument,
                         storage,
                         txid,
@@ -3157,7 +3325,7 @@ fn collect_routine_dependencies_with_resolver(
                             &mut needs_scope,
                         )?;
                         for argument in args {
-                            visit_expr(
+                            visit_routine_expression(
                                 argument,
                                 storage,
                                 txid,
@@ -3172,7 +3340,14 @@ fn collect_routine_dependencies_with_resolver(
         }
         for join in from.joins {
             if let Some(on) = join.on {
-                visit_expr(on, storage, txid, resolver, dependencies, &mut needs_scope)?;
+                visit_routine_expression(
+                    on,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    &mut needs_scope,
+                )?;
             }
         }
     }

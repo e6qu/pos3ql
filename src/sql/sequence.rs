@@ -1656,7 +1656,14 @@ mod tests {
         let prefix = SEQUENCE_VALUES_PER_CHUNK as i64 + 3;
         crate::mem::guard::forbid_alloc(|| {
             query
-                .bind("SELECT $1", &[crate::sql::types::Datum::Null], &[])
+                .bind(
+                    "SELECT $1",
+                    &[crate::sql::types::Datum::Null],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Cursor(1),
+                    |_| Ok(()),
+                )
                 .unwrap();
             query
                 .with_query(|_, _, arena| {
@@ -1711,7 +1718,16 @@ mod tests {
                 .unwrap();
             assert_eq!(calls.get(), prefix + 1);
             moved.clear();
-            moved.bind("SELECT 1", &[], &[]).unwrap();
+            moved
+                .bind(
+                    "SELECT 1",
+                    &[],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Cursor(1),
+                    |_| Ok(()),
+                )
+                .unwrap();
             moved
                 .with_query(|_, _, arena| {
                     assert_eq!(

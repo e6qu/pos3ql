@@ -288,7 +288,7 @@ pub(crate) struct Candidate<'a> {
     pub expression: &'a Expr<'a>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Binding<'a> {
     pub kind: InputKind,
     pub start: usize,

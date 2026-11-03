@@ -377,6 +377,15 @@ The transaction's fixed DDL log retains matching invalidation receipts, so
 commit and rollback use the selected object even if a name has changed or a
 catalog slot is later reused. Other backends receive committed changes; an
 aborted edit affects only its originating backend's cache.
+The existing transaction TRUNCATE log also retains each affected table's creation
+identity. Each logged table uses a two-byte slot and an eight-byte identity,
+reserved at startup for `max_ddl_per_transaction * (max_tables + 1)` entries.
+No catalog lookup is needed after a table's definition has been released.
+`ANALYZE` and index renames do not discard saved inputs; index creation, index
+deletion and TRUNCATE refresh plans that depend on the affected table.
+A compiled procedural function tracks its own definition. Each reached SQL
+statement separately tracks its schemas, role-sensitive dependencies and
+selected support functions, including custom operators and casts.
 
 `statistics_bytes` and `statistics_leases` reserve a separate shared pool for
 analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.

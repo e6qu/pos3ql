@@ -15679,14 +15679,10 @@ impl Engine {
                     |bytes| self.storage.freeze_runtime_input_key(bytes),
                 )?;
                 if let Some(plan) = admission.reserved {
-                    let validity = match (|| {
-                        let dependencies = self.storage.empty_stored_query_dependencies(scratch)?;
-                        self.storage.capture_runtime_input_validity(
-                            &dependencies,
-                            txn,
-                            Some(crate::storage::routine_oid(routine)),
-                        )
-                    })() {
+                    let validity = match self
+                        .storage
+                        .capture_runtime_routine_validity(txn, crate::storage::routine_oid(routine))
+                    {
                         Ok(validity) => validity,
                         Err(error) => {
                             sqlprep.routine_inputs.abandon(plan)?;

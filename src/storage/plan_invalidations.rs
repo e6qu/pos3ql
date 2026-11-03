@@ -18,7 +18,7 @@ impl Storage {
 
     pub(crate) fn publish_plan_invalidations(
         &self,
-        events: &[crate::sql::plan_invalidations::PlanInvalidationEvent],
+        events: impl IntoIterator<Item = crate::sql::plan_invalidations::PlanInvalidationEvent>,
     ) {
         for event in events {
             let change = event.change;

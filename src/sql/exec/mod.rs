@@ -2087,7 +2087,7 @@ fn require_foreign_owner(
     let owner = storage.foreign_catalog_owner_to(class, slot, txid) as usize;
     if storage.role(current).attributes_to(txid).superuser
         || current == owner
-        || storage.role_can_set(current, owner, txid)
+        || storage.role_has_privileges_of(current, owner, txid)
     {
         return Ok(());
     }
@@ -2106,7 +2106,6 @@ fn alter_foreign_owner(
     role: &str,
     noun: &'static str,
 ) -> Result<(), SqlError> {
-    require_foreign_owner(storage, class, slot, txn.txid, noun)?;
     let role = resolve_role_name(role);
     let owner = storage
         .find_role_visible(role.as_str(), txn.txid)
@@ -2117,6 +2116,10 @@ fn alter_foreign_owner(
                 role.as_str()
             )
         })?;
+    if storage.foreign_catalog_owner_to(class, slot, txn.txid) as usize == owner {
+        return Ok(());
+    }
+    require_foreign_owner(storage, class, slot, txn.txid, noun)?;
     let current = storage.current_role_slot(txn.txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -7620,6 +7623,16 @@ pub fn alter_owner(
     if let Err(error) = storage.role_reference_ready(new_owner, txn.txid) {
         return sql_fail(error);
     }
+    if matches!(
+        object.class,
+        AccessClass::Table
+            | AccessClass::View
+            | AccessClass::MaterializedView
+            | AccessClass::Sequence
+    ) && let Err(error) = storage.require_owner(object, txn.txid, noun)
+    {
+        return sql_fail(error);
+    }
     if storage.object_owner(object, txn.txid) == new_owner {
         responder.command_complete(tag)?;
         return sql_ok();
@@ -9676,7 +9689,7 @@ pub fn alter_default_privileges(
                     resolved.as_str()
                 ));
             };
-            if !current_superuser && !storage.role_can_set(current, owner, txn.txid) {
+            if !current_superuser && !storage.role_has_privileges_of(current, owner, txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
                     "permission denied to change default privileges"
@@ -9929,7 +9942,7 @@ fn resolve_owned_roles(
                     resolved.as_str()
                 )
             })?;
-        if !superuser && !storage.role_can_set(current, role, txid) {
+        if !superuser && !storage.role_has_privileges_of(current, role, txid) {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied to drop objects"
@@ -9985,7 +9998,7 @@ pub fn reassign_owned(
         .find_role_visible(current_name.as_str(), txn.txid)
         .expect("current role was resolved with the source roles");
     if !storage.role(current).attributes_to(txn.txid).superuser
-        && !storage.role_can_set(current, target, txn.txid)
+        && !storage.role_has_privileges_of(current, target, txn.txid)
     {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -31539,7 +31552,7 @@ fn current_role_owns_type(
         return false;
     };
     let owner = storage.object_owner(object, txid);
-    current == owner || storage.role_can_set(current, owner, txid)
+    current == owner || storage.role_has_privileges_of(current, owner, txid)
 }
 
 fn result_is_domain(storage: &Storage, result: crate::storage::RoutineResult, txid: u32) -> bool {
@@ -32237,7 +32250,7 @@ fn require_definition_owner(
         || storage.role_oid(current) == owner
         || storage
             .role_slot_by_oid(owner, txid)
-            .is_some_and(|owner| storage.role_can_set(current, owner, txid))
+            .is_some_and(|owner| storage.role_has_privileges_of(current, owner, txid))
     {
         Ok(())
     } else {
@@ -58158,7 +58171,7 @@ pub fn apply_replication_truncate(
             restart_owned_sequences(storage, txn, table)?;
         }
     }
-    txn.record_truncate(tables, cascade, restart_identity, txn.command_id())?;
+    txn.record_truncate(storage, tables, cascade, restart_identity, txn.command_id())?;
     for &table in tables {
         storage.record_relation_transaction_truncate(txn.txid, table)?;
     }
@@ -67441,6 +67454,15 @@ pub(crate) fn truncate(
             return sql_fail(error);
         }
     }
+    if let Err(error) = txn.record_truncate(
+        storage,
+        &list[..n],
+        cascade,
+        restart_identity,
+        txn.command_id(),
+    ) {
+        return sql_fail(error);
+    }
     for (&table_index, &target) in list[..n].iter().zip(targets.iter()) {
         let definition = (*storage.table_def(table_index, txn.txid)).clone();
         if let Err(error) = target.validate(storage) {
@@ -67466,10 +67488,6 @@ pub(crate) fn truncate(
         ) {
             return sql_fail(error);
         }
-    }
-    if let Err(error) = txn.record_truncate(&list[..n], cascade, restart_identity, txn.command_id())
-    {
-        return sql_fail(error);
     }
     for &table_index in &list[..n] {
         if let Err(error) = storage.record_relation_transaction_truncate(txn.txid, table_index) {

@@ -2057,10 +2057,10 @@ mod tests {
         let original = create(&storage, "original_view", 7);
         let selected = storage.prepare_view_edit(original.slot(), 7).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
+            storage.finish_view_publication(original.clone(), CatalogDdlDecision::Rollback);
             let replacement = create(&storage, "replacement_view", 9);
             assert_eq!(replacement.slot(), original.slot());
-            storage.finish_view_publication(original, CatalogDdlDecision::Commit);
+            storage.finish_view_publication(original.clone(), CatalogDdlDecision::Commit);
             storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
             assert!(storage.find_view("public", "replacement_view", 9).is_some());
             assert!(storage.find_view("public", "replacement_view", 0).is_none());
@@ -2081,9 +2081,10 @@ mod tests {
     fn query_lifecycle_view_edits_and_undo_follow_one_revision() {
         let storage = fixture(1);
         let created = create(&storage, "original_view", 7);
+        let created_slot = created.slot();
         storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
-            let selected = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let selected = storage.prepare_view_edit(created_slot, 9).unwrap();
             let first = storage
                 .stage_view_rename(selected, name("first_view"), 9)
                 .unwrap();
@@ -2094,21 +2095,21 @@ mod tests {
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let current = storage.prepare_view_edit(created_slot, 9).unwrap();
             let second = storage
                 .stage_view_rename(current, name("second_view"), 9)
                 .unwrap();
-            storage.rollback_view_alter(first);
+            storage.rollback_view_alter(first.clone());
             assert!(storage.find_view("public", "second_view", 9).is_some());
-            storage.rollback_view_alter(second);
+            storage.rollback_view_alter(second.clone());
             assert!(storage.find_view("public", "first_view", 9).is_some());
             storage.rollback_view_alter(first);
             assert!(storage.find_view("public", "original_view", 9).is_some());
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let current = storage.prepare_view_edit(created_slot, 9).unwrap();
             let third = storage
                 .stage_view_rename(current, name("third_view"), 9)
                 .unwrap();
-            storage.rollback_view_alter(second);
+            storage.rollback_view_alter(second.clone());
             storage.commit_view_alter(second);
             assert!(storage.find_view("public", "third_view", 9).is_some());
             storage.commit_view_alter(third);
@@ -2120,6 +2121,7 @@ mod tests {
     fn query_lifecycle_view_drop_undo_cannot_finalize_a_later_drop() {
         let mut storage = fixture(1);
         let created = create(&storage, "original_view", 7);
+        let created_slot = created.slot();
         storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let first = storage
@@ -2137,7 +2139,7 @@ mod tests {
             assert!(storage.find_view("public", "original_view", 9).is_none());
             storage.commit_view_drop(second);
             let replacement = create(&storage, "replacement_view", 11);
-            assert_eq!(replacement.slot(), created.slot());
+            assert_eq!(replacement.slot(), created_slot);
             storage.commit_view_drop(second);
             storage.rollback_view_drop(second);
             assert!(
@@ -2158,7 +2160,7 @@ mod tests {
         let mut second = fixture(1);
         let replacement = create(&second, "replacement_view", 11);
         crate::mem::guard::forbid_alloc(|| {
-            second.finish_view_publication(selected, CatalogDdlDecision::Commit);
+            second.finish_view_publication(selected.clone(), CatalogDdlDecision::Commit);
             second.finish_view_publication(selected, CatalogDdlDecision::Rollback);
             assert_eq!(
                 second
@@ -2182,10 +2184,11 @@ mod tests {
     fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
         let mut storage = fixture(2);
         let view = create(&storage, "rule_parent", 7);
+        let view_slot = view.slot();
         storage.finish_view_publication(view, CatalogDdlDecision::Commit);
         let definition = super::super::RuleDefinition {
             name: name("first_rule"),
-            target: super::super::RuleTarget::View(view.slot() as u16),
+            target: super::super::RuleTarget::View(view_slot as u16),
             event: super::super::RewriteEvent::Insert,
             ..super::super::RuleDefinition::EMPTY
         };

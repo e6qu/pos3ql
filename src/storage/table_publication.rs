@@ -1551,7 +1551,10 @@ mod tests {
             let mut definition = TableDefBuilder::from_definition(&storage.table_def(child, 0));
             definition.name = SqlName::parse("blocked_fk_child").unwrap();
             assert_eq!(
-                storage.create_table_in(definition, 9).unwrap_err().sqlstate,
+                storage
+                    .create_table_in(definition.clone(), 9)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::INTERNAL_LOCK_WAIT
             );
             assert!(
@@ -1565,7 +1568,7 @@ mod tests {
                 storage
                     .write_table_def(
                         selected,
-                        definition,
+                        definition.clone(),
                         &mapping(),
                         false,
                         crate::storage::ColumnSet::EMPTY,
@@ -1579,7 +1582,7 @@ mod tests {
             let self_reference = storage
                 .write_table_def(
                     selected,
-                    definition,
+                    definition.clone(),
                     &mapping(),
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -1971,6 +1974,8 @@ mod tests {
             definition.columns[0].name = SqlName::parse("renamed_id").unwrap();
             let mut columns = [None; MAX_COLUMNS];
             columns[0] = Some(definition.columns[0].name);
+            let table_schema = definition.schema;
+            let table_name = definition.name;
             let change = storage
                 .write_table_def(
                     target,
@@ -1983,9 +1988,9 @@ mod tests {
             let index = storage
                 .create_index(
                     super::super::IndexDef {
-                        schema: definition.schema,
+                        schema: table_schema,
                         name: SqlName::parse("publication_private_key").unwrap(),
-                        table: definition.name,
+                        table: table_name,
                         n_cols: 1,
                         collations: [crate::sql::ast::Collation::None;
                             super::super::MAX_INDEX_COLS],
@@ -2046,6 +2051,8 @@ mod tests {
             make_def("publication_release_parent", &[("id", ColType::Int4, true)]);
         parent_definition.columns[0].primary = true;
         parent_definition.columns[0].unique = true;
+        let parent_schema = parent_definition.schema;
+        let parent_name = parent_definition.name;
         let parent = storage.create_table(parent_definition).unwrap();
         assert!(child < parent);
         crate::mem::guard::forbid_alloc(|| {
@@ -2055,8 +2062,8 @@ mod tests {
             definition.fkeys[0] = ForeignKey {
                 identity: None,
                 name: SqlName::parse("publication_parent_link").unwrap(),
-                parent_schema: parent_definition.schema,
-                parent: parent_definition.name,
+                parent_schema,
+                parent: parent_name,
                 n_cols: 1,
                 n_parent_cols: 1,
                 ..ForeignKey::EMPTY

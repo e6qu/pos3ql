@@ -17307,6 +17307,7 @@ mod tests {
     fn metadata_wal_positions_and_restart_flags_reject_corruption() {
         let identity = crate::storage::CatalogPosition::new(7, 42).unwrap();
         let backing = crate::storage::CatalogPosition::new(8, 43).unwrap();
+        let empty_dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let operations = [
             WalOp::CreateMatview {
                 identity,
@@ -17315,9 +17316,7 @@ mod tests {
                 name: "report",
                 sql: "SELECT 1 AS value",
                 path: "public",
-                dependencies: WalStoredQueryDependencies::Captured(
-                    crate::storage::StoredQueryDependencies::EMPTY.view(),
-                ),
+                dependencies: WalStoredQueryDependencies::Captured(empty_dependencies.view()),
                 populated: true,
             },
             WalOp::DropMatview {
@@ -17408,12 +17407,11 @@ mod tests {
             },
             ..crate::storage::RoutineDef::EMPTY
         };
+        let empty_dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let operation = WalOp::CreateRoutine {
             identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
             definition: &definition,
-            dependencies: WalStoredQueryDependencies::Captured(
-                crate::storage::StoredQueryDependencies::EMPTY.view(),
-            ),
+            dependencies: WalStoredQueryDependencies::Captured(empty_dependencies.view()),
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(
@@ -17426,10 +17424,8 @@ mod tests {
         assert!(decode_op(KIND_CREATE_ROUTINE, payload.readable()).is_some());
         let (_, restored, _) = decode_routine_payload(payload.readable(), false).unwrap();
         assert_eq!(restored.ownership.owner, 42);
-        let dependencies_len = WalStoredQueryDependencies::Captured(
-            crate::storage::StoredQueryDependencies::EMPTY.view(),
-        )
-        .encoded_len();
+        let dependencies_len =
+            WalStoredQueryDependencies::Captured(empty_dependencies.view()).encoded_len();
         let path_offset = payload.len() - dependencies_len - 1 - "public".len();
         assert_eq!(payload.readable()[path_offset], "public".len() as u8);
         assert_eq!(
@@ -17681,12 +17677,11 @@ mod tests {
                 value: StackStr::from_str(&"v".repeat(crate::storage::ROUTINE_CONFIG_VALUE_MAX)),
             };
         }
+        let empty_dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let operation = WalOp::CreateRoutine {
             identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
             definition: &definition,
-            dependencies: WalStoredQueryDependencies::Captured(
-                crate::storage::StoredQueryDependencies::EMPTY.view(),
-            ),
+            dependencies: WalStoredQueryDependencies::Captured(empty_dependencies.view()),
         };
         let mut budget = Budget::new(256 << 10);
         let mut payload = FixedBuf::new(

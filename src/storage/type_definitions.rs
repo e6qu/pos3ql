@@ -1996,7 +1996,7 @@ mod tests {
         }
     }
 
-    fn check_type_undo_lifetimes<Undo: Copy>(
+    fn check_type_undo_lifetimes<Undo: Clone>(
         source: NamedTypeSlot,
         select: impl Fn(&Storage, u32) -> super::super::TypeEditTarget,
         stage: impl Fn(&Storage, super::super::TypeEditTarget, &str) -> Result<Undo, SqlError>,
@@ -2031,10 +2031,10 @@ mod tests {
             );
             let latest = stage(&first, select(&first, 7), "22").unwrap();
             assert_eq!(first.catalog_identity_sequence(), catalog_sequence);
-            commit(&mut first, earlier);
+            commit(&mut first, earlier.clone());
             assert_eq!(label(&first).as_str(), "22");
             let foreign = stage(&other, select(&other, 7), "11").unwrap();
-            commit(&mut other, earlier);
+            commit(&mut other, earlier.clone());
             assert_eq!(label(&other).as_str(), "11");
             assert_eq!(
                 other
@@ -2044,7 +2044,7 @@ mod tests {
                 sqlstate::INTERNAL_LOCK_WAIT
             );
             assert!(other.type_catalog.try_lock().is_ok());
-            rollback(&other, earlier);
+            rollback(&other, earlier.clone());
             assert_eq!(label(&other).as_str(), "11");
             rollback(&other, foreign);
             other.wake_transaction_waiters(7);
@@ -2065,11 +2065,11 @@ mod tests {
             other.finish_type_ddl(dropped, crate::storage::TypeDdlDecision::Rollback);
             assert_eq!(label(&other).as_str(), "before");
 
-            rollback(&first, earlier);
+            rollback(&first, earlier.clone());
             assert_eq!(label(&first).as_str(), "22");
             rollback(&first, latest);
             assert_eq!(label(&first).as_str(), "11");
-            rollback(&first, earlier);
+            rollback(&first, earlier.clone());
             assert_eq!(label(&first).as_str(), "before");
 
             retire(&mut first, source);
@@ -2079,7 +2079,7 @@ mod tests {
                 sqlstate::UNDEFINED_OBJECT
             );
             let replacement = stage(&first, select(&first, 7), "22").unwrap();
-            commit(&mut first, earlier);
+            commit(&mut first, earlier.clone());
             rollback(&first, earlier);
             assert_eq!(label(&first).as_str(), "22");
             rollback(&first, replacement);

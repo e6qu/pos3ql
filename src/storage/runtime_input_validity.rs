@@ -88,7 +88,15 @@ impl RuntimeInputScope {
     }
 }
 
-pub(crate) struct RuntimeInputValidity {
+pub(crate) enum RuntimeInputValidity {
+    Plan(RuntimePlanValidity),
+    RoutineDefinition {
+        scope: RuntimeInputScope,
+        local: crate::sql::plan_invalidations::LocalPlanStamp,
+    },
+}
+
+pub(crate) struct RuntimePlanValidity {
     global: super::plan_invalidations::PlanInvalidationStamp,
     local: crate::sql::plan_invalidations::LocalPlanStamp,
     scope: RuntimeInputScope,
@@ -105,6 +113,23 @@ impl Storage {
             database: super::current_database(),
         }
     }
+
+    pub(crate) fn capture_runtime_routine_validity(
+        &self,
+        transaction: &crate::sql::txn::TxnState,
+        routine_oid: i32,
+    ) -> Result<RuntimeInputValidity, SqlError> {
+        Ok(RuntimeInputValidity::RoutineDefinition {
+            scope: self.runtime_input_scope(),
+            local: transaction.watch_plan_inputs(
+                self,
+                false,
+                SharedSlice::EMPTY,
+                Some(routine_oid),
+            )?,
+        })
+    }
+
     pub(crate) fn capture_runtime_input_validity(
         &self,
         dependencies: &StoredQueryDependencies,
@@ -222,7 +247,7 @@ impl Storage {
         };
         let selected = selected.freeze();
         let local = txn.watch_plan_inputs(self, depends_on_roles, selected.clone(), own_routine)?;
-        Ok(RuntimeInputValidity {
+        Ok(RuntimeInputValidity::Plan(RuntimePlanValidity {
             global: self
                 .plan_invalidations
                 .stamp(super::current_database(), depends_on_roles)?,
@@ -232,11 +257,35 @@ impl Storage {
             explicit_catalog: path.explicit_catalog(),
             dependencies: selected,
             role,
-        })
+        }))
     }
 }
 
 impl RuntimeInputValidity {
+    pub(crate) fn finish_preparation(
+        &mut self,
+        storage: &Storage,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        match self {
+            Self::Plan(plan) => plan.finish_preparation(storage, transaction),
+            Self::RoutineDefinition { .. } => Ok(()),
+        }
+    }
+
+    pub(crate) fn matches(&self, storage: &Storage, transaction: u32) -> Result<bool, SqlError> {
+        match self {
+            Self::Plan(plan) => plan.matches(storage, transaction),
+            Self::RoutineDefinition { scope, local } => {
+                // Compiled PL/pgSQL instances follow the pg_proc tuple. Their
+                // reached SQL plans separately validate path and role settings.
+                Ok(*scope == storage.runtime_input_scope() && local.selected_matches()?)
+            }
+        }
+    }
+}
+
+impl RuntimePlanValidity {
     pub(crate) fn finish_preparation(
         &mut self,
         storage: &Storage,

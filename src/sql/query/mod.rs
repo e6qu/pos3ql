@@ -893,6 +893,7 @@ pub fn check_timeout() -> Result<(), SqlError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvocationSite {
     Expression(usize),
+    ArrayElement { position: usize, element: usize },
     Assignment(super::type_inputs::AssignmentSite),
 }
 

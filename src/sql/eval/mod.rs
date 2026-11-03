@@ -5614,7 +5614,13 @@ struct ArrayConstructorInput<'a> {
     expression: &'a Expr<'a>,
     nested: Option<&'a ArrayConstructorPlan<'a>>,
     cast: Option<&'a BoundCast>,
+    site: Option<super::query::InvocationSite>,
     named_conversion: bool,
+}
+
+struct ArrayConstructorSites {
+    position: Option<usize>,
+    next: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -5626,11 +5632,16 @@ struct ArrayConstructorPlan<'a> {
     target_type_mod: i32,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "array conversion selection retains each lexical leaf and its explicit target type"
+)]
 fn prepare_array_constructor<'a>(
     items: &[&'a Expr<'a>],
     expected: Option<ArrElem>,
     target_type_mod: i32,
     binding: CastBinding,
+    sites: &mut ArrayConstructorSites,
     arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
@@ -5661,6 +5672,7 @@ fn prepare_array_constructor<'a>(
             expression: &Expr::Null,
             nested: None,
             cast: None,
+            site: None,
             named_conversion: false,
         })
         .map_err(|_| arena_full())?;
@@ -5673,11 +5685,21 @@ fn prepare_array_constructor<'a>(
                 expected,
                 target_type_mod,
                 binding,
+                sites,
                 arena,
                 row,
                 hooks,
             )?;
             Some(&*arena.alloc(child).map_err(|_| arena_full())?)
+        } else {
+            None
+        };
+        let site = if nested.is_none() {
+            let element = sites.next;
+            sites.next = sites.next.checked_add(1).ok_or_else(arena_full)?;
+            sites
+                .position
+                .map(|position| super::query::InvocationSite::ArrayElement { position, element })
         } else {
             None
         };
@@ -5721,6 +5743,7 @@ fn prepare_array_constructor<'a>(
             expression,
             nested,
             cast,
+            site,
             named_conversion,
         };
     }
@@ -5747,8 +5770,23 @@ fn eval_array_constructor<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let plan =
-        prepare_array_constructor(items, expected, target_type_mod, binding, arena, row, hooks)?;
+    let mut sites = ArrayConstructorSites {
+        position: match (expected, super::query::input_progress::invocation_site()) {
+            (Some(_), Some(super::query::InvocationSite::Expression(position))) => Some(position),
+            _ => None,
+        },
+        next: 0,
+    };
+    let plan = prepare_array_constructor(
+        items,
+        expected,
+        target_type_mod,
+        binding,
+        &mut sites,
+        arena,
+        row,
+        hooks,
+    )?;
     execute_array_constructor(&plan, arena, params, row, hooks)
 }
 
@@ -5767,16 +5805,21 @@ fn execute_array_constructor<'a>(
             None => eval_full(input.expression, arena, params, row, hooks)?,
         };
         let value = match input.cast {
-            Some(cast) => hooks
-                .catalog
-                .expect("selected cast has a catalog")
-                .execute_bound_cast(
-                    cast,
-                    value,
-                    plan.target_type_mod,
-                    coercion_input_collation(input.expression, row, hooks.catalog)?,
-                    arena,
-                )?,
+            Some(cast) => {
+                let _site = input
+                    .site
+                    .map(super::query::input_progress::enter_array_element);
+                hooks
+                    .catalog
+                    .expect("selected cast has a catalog")
+                    .execute_bound_cast(
+                        cast,
+                        value,
+                        plan.target_type_mod,
+                        coercion_input_collation(input.expression, row, hooks.catalog)?,
+                        arena,
+                    )?
+            }
             None => value,
         };
         *target = if plan.multidimensional {
@@ -10240,6 +10283,59 @@ mod tests {
         use crate::sql::ast::Collation;
         struct Operator(core::cell::Cell<Collation>, core::cell::Cell<usize>);
         impl CatalogAccess for Operator {
+            fn relation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected relation lookup in conversion metadata test")
+            }
+            fn type_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected type visibility lookup in conversion metadata test")
+            }
+            fn function_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected function visibility lookup in conversion metadata test")
+            }
+            fn collation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected collation visibility lookup in conversion metadata test")
+            }
+            fn relation_is_publishable(&self, _: i32) -> Option<bool> {
+                panic!("unexpected publication lookup in conversion metadata test")
+            }
+            fn index_def<'a>(
+                &self,
+                _: i32,
+                _: i32,
+                _: bool,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected index lookup in conversion metadata test")
+            }
+            fn constraint_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected constraint lookup in conversion metadata test")
+            }
+            fn partition_key_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected partition lookup in conversion metadata test")
+            }
+            fn relname<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected relation name lookup in conversion metadata test")
+            }
+            fn reloid(&self, _: &str) -> Result<Option<i32>, SqlError> {
+                panic!("unexpected relation identity lookup in conversion metadata test")
+            }
+            fn comment<'a>(
+                &self,
+                _: DescriptionTarget<'_>,
+                _: u32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected comment lookup in conversion metadata test")
+            }
+
             fn has_operator_candidate(&self, name: &str) -> bool {
                 name == "="
             }
@@ -10293,6 +10389,59 @@ mod tests {
         use crate::sql::ast::Collation;
         struct Cast(core::cell::Cell<Collation>);
         impl CatalogAccess for Cast {
+            fn relation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected relation lookup in conversion metadata test")
+            }
+            fn type_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected type visibility lookup in conversion metadata test")
+            }
+            fn function_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected function visibility lookup in conversion metadata test")
+            }
+            fn collation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected collation visibility lookup in conversion metadata test")
+            }
+            fn relation_is_publishable(&self, _: i32) -> Option<bool> {
+                panic!("unexpected publication lookup in conversion metadata test")
+            }
+            fn index_def<'a>(
+                &self,
+                _: i32,
+                _: i32,
+                _: bool,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected index lookup in conversion metadata test")
+            }
+            fn constraint_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected constraint lookup in conversion metadata test")
+            }
+            fn partition_key_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected partition lookup in conversion metadata test")
+            }
+            fn relname<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected relation name lookup in conversion metadata test")
+            }
+            fn reloid(&self, _: &str) -> Result<Option<i32>, SqlError> {
+                panic!("unexpected relation identity lookup in conversion metadata test")
+            }
+            fn comment<'a>(
+                &self,
+                _: DescriptionTarget<'_>,
+                _: u32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected comment lookup in conversion metadata test")
+            }
+
             #[expect(
                 clippy::too_many_arguments,
                 reason = "cast execution preserves target type modifier and input collation"

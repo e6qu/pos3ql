@@ -54,7 +54,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
             let first_change = storage
                 .write_table_def(
                     storage.select_table_definition(table, 7).0,
-                    definition,
+                    definition.clone(),
                     &mapping,
                     true,
                     crate::storage::ColumnSet::EMPTY,
@@ -218,7 +218,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         let first_change = storage
             .write_table_def(
                 storage.select_table_definition(created, 7).0,
-                updated,
+                updated.clone(),
                 &[None; MAX_COLUMNS],
                 false,
                 crate::storage::ColumnSet::EMPTY,

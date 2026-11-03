@@ -97,3 +97,102 @@ fn runtime_checked_inputs_follow_selected_definitions_and_replace_changed_paths(
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+#[test]
+fn selected_operator_and_cast_functions_participate_in_runtime_plan_validity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("support-function-validity-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE FUNCTION selected_operator(integer,integer) RETURNS integer LANGUAGE sql AS $$SELECT $1+$2$$; \
+             CREATE OPERATOR public.##(LEFTARG=integer,RIGHTARG=integer,FUNCTION=selected_operator); \
+             CREATE FUNCTION selected_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'x'::varchar$$; \
+             CREATE CAST(integer AS varchar) WITH FUNCTION selected_cast(integer,integer,boolean) AS IMPLICIT; \
+             CREATE FUNCTION consume_varchar(varchar) RETURNS integer LANGUAGE sql AS $$SELECT 1$$; \
+             CREATE FUNCTION unselected_support() RETURNS integer LANGUAGE sql AS $$SELECT 1$$; \
+             CREATE TABLE selected_destination(value varchar(5),items varchar(5)[])", true);
+        let arena =
+            Arena::new(&mut budget, "support function dependency metadata", 2 << 20).unwrap();
+        for (statement, support, replacement) in [
+            (
+                "SELECT 1 OPERATOR(public.##) 2",
+                "selected_operator",
+                "CREATE OR REPLACE FUNCTION selected_operator(integer,integer) RETURNS integer LANGUAGE sql AS $$SELECT $1-$2$$",
+            ),
+            (
+                "SELECT 7::varchar(5)",
+                "selected_cast",
+                "CREATE OR REPLACE FUNCTION selected_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'a'::varchar$$",
+            ),
+            (
+                "SELECT ARRAY[7,8]::varchar(5)[]",
+                "selected_cast",
+                "CREATE OR REPLACE FUNCTION selected_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'b'::varchar$$",
+            ),
+            (
+                "SELECT consume_varchar(7)",
+                "selected_cast",
+                "CREATE OR REPLACE FUNCTION selected_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'c'::varchar$$",
+            ),
+            (
+                "INSERT INTO selected_destination VALUES(7,ARRAY[7,8])",
+                "selected_cast",
+                "CREATE OR REPLACE FUNCTION selected_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'd'::varchar$$",
+            ),
+        ] {
+            let validity = crate::mem::guard::forbid_alloc(|| {
+                let statement = parser::parse_stored_statement(statement, &arena).unwrap();
+                let mut dependencies = engine
+                    .storage
+                    .empty_stored_query_dependencies(&arena)
+                    .unwrap();
+                query::collect_runtime_statement(
+                    statement,
+                    &engine.storage,
+                    session.transaction.txid,
+                    &mut dependencies,
+                    &arena,
+                    None,
+                )
+                .unwrap();
+                assert!(
+                    dependencies.entries().iter().any(|entry| {
+                        entry.class == crate::storage::DependencyClass::Routine
+                            && entry.name.as_str() == support
+                    }),
+                    "{statement:?}: {support}"
+                );
+                engine
+                    .storage
+                    .capture_runtime_input_validity(&dependencies, &session.transaction, None)
+                    .unwrap()
+            });
+            assert!(
+                validity
+                    .matches(&engine.storage, session.transaction.txid)
+                    .unwrap()
+            );
+            session.success(&mut engine,
+                "CREATE OR REPLACE FUNCTION unselected_support() RETURNS integer LANGUAGE sql AS $$SELECT 2$$", true);
+            assert!(
+                validity
+                    .matches(&engine.storage, session.transaction.txid)
+                    .unwrap(),
+                "unrelated replacement: {statement}"
+            );
+            session.success(&mut engine, replacement, true);
+            assert!(
+                !validity
+                    .matches(&engine.storage, session.transaction.txid)
+                    .unwrap(),
+                "selected replacement: {statement}"
+            );
+        }
+    }
+}

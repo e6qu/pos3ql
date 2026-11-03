@@ -680,7 +680,7 @@ thread_local! {
     static AVAILABLE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static ACTIVE_INPUT: Cell<Option<ActiveInput>> = const { Cell::new(None) };
     static CURRENT_CALL: Cell<Option<usize>> = const { Cell::new(None) };
-    static CURRENT_SOURCE_POSITION: Cell<Option<usize>> = const { Cell::new(None) };
+    static CURRENT_SOURCE_POSITION: Cell<Option<super::InvocationSite>> = const { Cell::new(None) };
     static CURRENT_ASSIGNMENT_SITE: Cell<Option<crate::sql::type_inputs::AssignmentSite>> = const { Cell::new(None) };
     static IN_BODY: Cell<bool> = const { Cell::new(false) };
 }
@@ -713,7 +713,7 @@ pub(super) fn evaluation(
 
 pub(crate) struct ExpressionPosition {
     previous: Option<usize>,
-    previous_source: Option<usize>,
+    previous_source: Option<super::InvocationSite>,
     pub(crate) target: Option<i32>,
     _thread: core::marker::PhantomData<*const ()>,
 }
@@ -759,6 +759,7 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
             source_position, ..
         } => source_position
             .get()
+            .map(super::InvocationSite::Expression)
             .or_else(|| CURRENT_SOURCE_POSITION.with(Cell::get)),
         _ => CURRENT_SOURCE_POSITION.with(Cell::get),
     };
@@ -795,19 +796,34 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
 }
 
 pub(crate) fn invocation_site() -> Option<super::InvocationSite> {
-    CURRENT_SOURCE_POSITION
-        .with(Cell::get)
-        .map(super::InvocationSite::Expression)
-        .or_else(|| {
-            CURRENT_ASSIGNMENT_SITE
-                .with(Cell::get)
-                .map(super::InvocationSite::Assignment)
-        })
+    CURRENT_SOURCE_POSITION.with(Cell::get).or_else(|| {
+        CURRENT_ASSIGNMENT_SITE
+            .with(Cell::get)
+            .map(super::InvocationSite::Assignment)
+    })
+}
+
+pub(crate) struct ArrayElementScope {
+    previous: Option<super::InvocationSite>,
+    _thread: core::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ArrayElementScope {
+    fn drop(&mut self) {
+        CURRENT_SOURCE_POSITION.with(|current| current.set(self.previous));
+    }
+}
+
+pub(crate) fn enter_array_element(site: super::InvocationSite) -> ArrayElementScope {
+    ArrayElementScope {
+        previous: CURRENT_SOURCE_POSITION.with(|current| current.replace(Some(site))),
+        _thread: core::marker::PhantomData,
+    }
 }
 
 pub(crate) struct AssignmentScope {
     previous: Option<crate::sql::type_inputs::AssignmentSite>,
-    previous_source: Option<usize>,
+    previous_source: Option<super::InvocationSite>,
     _thread: core::marker::PhantomData<*const ()>,
 }
 
@@ -857,7 +873,7 @@ pub(crate) struct BodyScope {
     active: Option<ActiveInput>,
     available: Option<ActiveInput>,
     expression: Option<usize>,
-    source_position: Option<usize>,
+    source_position: Option<super::InvocationSite>,
     assignment: Option<crate::sql::type_inputs::AssignmentSite>,
     in_body: bool,
 }
@@ -1126,6 +1142,39 @@ mod tests {
                         invocation_site(),
                         Some(super::super::InvocationSite::Expression(0))
                     );
+                }
+                assert_eq!(
+                    invocation_site(),
+                    Some(super::super::InvocationSite::Assignment(site))
+                );
+                {
+                    let first = super::super::InvocationSite::ArrayElement {
+                        position: 7,
+                        element: 0,
+                    };
+                    let _element = enter_array_element(first);
+                    assert_eq!(invocation_site(), Some(first));
+                    {
+                        let _second =
+                            enter_array_element(super::super::InvocationSite::ArrayElement {
+                                position: 7,
+                                element: 1,
+                            });
+                        assert_ne!(invocation_site(), Some(first));
+                        let expression =
+                            crate::sql::parser::parse_expr("leaf_call(1)", &arena).unwrap();
+                        let _expression = enter_expression(expression).unwrap();
+                        assert_eq!(
+                            invocation_site(),
+                            Some(super::super::InvocationSite::Expression(0))
+                        );
+                    }
+                    assert_eq!(invocation_site(), Some(first));
+                    {
+                        let _body = enter_body();
+                        assert_eq!(invocation_site(), None);
+                    }
+                    assert_eq!(invocation_site(), Some(first));
                 }
                 assert_eq!(
                     invocation_site(),

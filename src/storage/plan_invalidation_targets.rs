@@ -262,6 +262,61 @@ mod tests {
     };
 
     #[test]
+    fn truncate_events_retain_identities_and_exact_startup_budget_through_rewind() {
+        use crate::sql::txn::TxnState;
+        let config = test_config();
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(make_def(
+                "truncate_identity",
+                &[("id", ColType::Int4, false)],
+            ))
+            .unwrap();
+        let target = SelectedPlanTarget::Relation {
+            created_at: storage.table_def(table, 0).identity().created_at,
+        };
+        let mut transaction_budget =
+            crate::mem::Budget::new(TxnState::budget_bytes_with_large_objects(1, 0, 2));
+        let mut transaction =
+            TxnState::new_with_large_objects(&mut transaction_budget, 1, 0, 2).unwrap();
+        assert_eq!(transaction_budget.remaining(), 0);
+        transaction.txid = 7;
+        crate::mem::guard::forbid_alloc(|| {
+            transaction
+                .record_truncate(&storage, &[table], false, false, 1)
+                .unwrap();
+            transaction
+                .record_truncate(&storage, &[table], false, true, 2)
+                .unwrap();
+            assert_eq!(
+                transaction
+                    .record_truncate(&storage, &[table], false, false, 3)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(transaction.plan_events().count(), 2);
+            transaction.rewind_truncates(1);
+            assert_eq!(transaction.plan_events().count(), 1);
+            transaction
+                .record_truncate(&storage, &[table], false, false, 3)
+                .unwrap();
+        });
+        let _dropped = storage.drop_table_in(table, 7).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for event in transaction.plan_events() {
+                assert_eq!(event.scope, storage.runtime_input_scope());
+                assert_eq!(event.selected, Some(target));
+            }
+            storage.publish_plan_invalidations(transaction.plan_events());
+            transaction.detach_prepared_plan_invalidations();
+            transaction.clear();
+            assert_eq!(transaction.plan_events().count(), 0);
+        });
+    }
+
+    #[test]
     fn index_invalidations_keep_the_parent_identity_while_its_drop_is_pending() {
         let config = test_config();
         let mut budget = test_budget(&config);

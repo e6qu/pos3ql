@@ -3239,3 +3239,71 @@ fn function_casts_receive_target_type_modifiers_and_conversion_context() {
         );
     }
 }
+
+#[test]
+fn sql_and_plpgsql_formals_preserve_observed_postgresql_input_collations() {
+    // PostgreSQL 18.6 oracle at 233fb021, fixture SHA256:
+    // b903aff00968acddaa4815009a1836ee74c4630016800d904c5588402ae11b79.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("formal-input-collations-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/208_routine_parameter_collations.sql"
+        );
+        let (definitions, _) = fixture
+            .split_once("ALTER SEQUENCE parameter_checks RESTART WITH 1;")
+            .unwrap();
+        session.success(&mut engine, definitions, true);
+        for (statement, expected) in [
+            (
+                "ALTER SEQUENCE parameter_checks RESTART WITH 1; SELECT parameter_sql('a' COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT parameter_sql('a' COLLATE \"POSIX\")", "2"),
+            ("SELECT parameter_sql('a' COLLATE \"C\")", "2"),
+            (
+                "DISCARD PLANS; ALTER SEQUENCE parameter_checks RESTART WITH 1; SELECT parameter_pl('a' COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT parameter_pl('a' COLLATE \"POSIX\")", "2"),
+            ("SELECT parameter_pl('a' COLLATE \"C\")", "2"),
+            (
+                "SELECT * FROM parameter_pl_table('a' COLLATE \"C\"); SELECT * FROM parameter_pl_table('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "SELECT parameter_local('a' COLLATE \"C\"); SELECT parameter_local('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "CALL parameter_sql_procedure('a' COLLATE \"C\"); CALL parameter_sql_procedure('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "CALL parameter_pl_procedure('a' COLLATE \"C\"); CALL parameter_pl_procedure('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "PREPARE parameter_statement(text) AS SELECT parameter_sql($1 COLLATE \"C\"); EXECUTE parameter_statement('a'); EXECUTE parameter_statement('b')",
+                "2",
+            ),
+        ] {
+            session.success(&mut engine, statement, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM parameter_checks",
+                    true
+                )),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+    }
+}

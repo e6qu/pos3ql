@@ -1090,7 +1090,7 @@ fn table_catalog_lifecycle_capacity_rollback_and_reuse_preserve_retained_identit
         assert!(!storage.table(slot).visible_to(8));
         assert!(!storage.table(slot).is_free());
         let replacement = make_def("lifecycle_replacement", &[("id", ColType::Int4, true)]);
-        let error = storage.create_table_in(replacement, 8).unwrap_err();
+        let error = storage.create_table_in(replacement.clone(), 8).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(error.message.as_str(), "too many tables (limit 1)");
         storage.finish_table_drop(dropped, crate::storage::CatalogDdlDecision::Rollback);
@@ -1216,7 +1216,7 @@ fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings()
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let mut retained = make_def("retained", &[("id", ColType::Int4, true)]);
     retained.columns[0].unique = true;
-    let retained_slot = storage.create_table(retained).unwrap();
+    let retained_slot = storage.create_table(retained.clone()).unwrap();
     let mut rejected = make_def(
         "rejected",
         &[("a", ColType::Int4, true), ("b", ColType::Int4, true)],
@@ -1227,8 +1227,8 @@ fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings()
         let slot = storage.tables.iter().position(Table::is_free).unwrap();
         for owner in [None, Some(7)] {
             let result = match owner {
-                None => storage.create_table(rejected),
-                Some(txid) => storage.create_table_in(rejected, txid),
+                None => storage.create_table(rejected.clone()),
+                Some(txid) => storage.create_table_in(rejected.clone(), txid),
             };
             assert_eq!(
                 result.unwrap_err().sqlstate,
@@ -1250,7 +1250,7 @@ fn cluster_metadata_failed_table_creation_releases_identity_and_value_bindings()
             assert_eq!(rejected.enforcer_count(), 0);
             assert!(rejected.enforcers().iter().all(Option::is_none));
             assert_eq!(storage.tables[retained_slot].enforcer_count(), 1);
-            let mut replacement = retained;
+            let mut replacement = retained.clone();
             replacement.name = SqlName::parse("replacement").unwrap();
             let reused = storage.create_table_in(replacement, 8).unwrap();
             assert_eq!(reused, slot);
@@ -1670,7 +1670,7 @@ fn cluster_metadata_table_names_reserve_only_within_their_database() {
             storage
                 .write_table_def(
                     target,
-                    renamed,
+                    renamed.clone(),
                     &[None; MAX_COLUMNS],
                     false,
                     crate::storage::ColumnSet::EMPTY,
@@ -9550,7 +9550,7 @@ fn create_find_drop_reuse() {
     let mut budget = test_budget(&config);
     let mut s = Storage::new(&config, &mut budget, 0).unwrap();
     let def = make_def("t1", &[("id", ColType::Int4, true)]);
-    let index = s.create_table(def).unwrap();
+    let index = s.create_table(def.clone()).unwrap();
     assert_eq!(s.find_table("public", "t1"), Some(index));
     assert_eq!(
         s.create_table(def).unwrap_err().sqlstate,

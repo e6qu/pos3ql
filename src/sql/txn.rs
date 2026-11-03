@@ -122,11 +122,25 @@ const DEFAULT_MAX_TRUNCATE_TABLES: usize = 16;
 /// from the row deletes used by the heap.
 #[derive(Clone, Copy)]
 pub(crate) struct TruncateEvent {
+    scope: crate::storage::RuntimeInputScope,
     pub command_id: u32,
     pub table_offset: usize,
     pub table_count: usize,
     pub cascade: bool,
     pub restart_identity: bool,
+}
+
+impl TruncateEvent {
+    fn plan_event(self, created_at: u64) -> super::plan_invalidations::PlanInvalidationEvent {
+        super::plan_invalidations::PlanInvalidationEvent {
+            scope: self.scope,
+            change: super::plan_invalidations::CatalogPlanChange {
+                global: false,
+                roles: false,
+            },
+            selected: Some(crate::storage::SelectedPlanTarget::Relation { created_at }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +335,7 @@ pub struct TxnState {
     touched: FixedVec<(u32, u64, PriorPending)>,
     truncates: FixedVec<TruncateEvent>,
     truncate_table_slots: FixedVec<u16>,
+    truncate_table_births: FixedVec<u64>,
     truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
@@ -850,7 +865,7 @@ impl TxnState {
                 capacity
                     .ddl
                     .saturating_mul(capacity.tables)
-                    .saturating_mul(core::mem::size_of::<u16>()),
+                    .saturating_mul(core::mem::size_of::<u16>() + core::mem::size_of::<u64>()),
             )
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<DdlUndo>()))
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<u32>()))
@@ -1011,6 +1026,11 @@ impl TxnState {
             truncate_table_slots: FixedVec::new(
                 budget,
                 "txn_truncate_table_slots",
+                capacity.ddl * capacity.tables,
+            )?,
+            truncate_table_births: FixedVec::new(
+                budget,
+                "txn_truncate_table_births",
                 capacity.ddl * capacity.tables,
             )?,
             truncate_wal_tables: FixedBuf::new(
@@ -1749,6 +1769,7 @@ impl TxnState {
 
     pub(crate) fn record_truncate(
         &mut self,
+        storage: &Storage,
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
@@ -1763,19 +1784,28 @@ impl TxnState {
             ));
         }
         let table_offset = self.truncate_table_slots.len();
+        let event = TruncateEvent {
+            scope: storage.runtime_input_scope(),
+            command_id,
+            table_offset,
+            table_count: tables.len(),
+            cascade,
+            restart_identity,
+        };
         for &table in tables {
+            let birth = storage.table_def(table, self.txid).identity().created_at;
             self.truncate_table_slots
                 .push(u16::try_from(table).expect("validated physical table slot"))
                 .expect("one full table set reserved per TRUNCATE event");
+            self.truncate_table_births
+                .push(birth)
+                .expect("table identities parallel reserved TRUNCATE slots");
+            if let Some(owner) = &self.plan_invalidations {
+                owner.apply(event.plan_event(birth));
+            }
         }
         self.truncates
-            .push(TruncateEvent {
-                command_id,
-                table_offset,
-                table_count: tables.len(),
-                cascade,
-                restart_identity,
-            })
+            .push(event)
             .expect("TRUNCATE event capacity checked before mutation");
         Ok(())
     }
@@ -2553,6 +2583,13 @@ impl TxnState {
             let event = self.truncates.pop().expect("nonempty TRUNCATE event list");
             while self.truncate_table_slots.len() > event.table_offset {
                 self.truncate_table_slots.pop();
+                let birth = self
+                    .truncate_table_births
+                    .pop()
+                    .expect("TRUNCATE identities parallel table slots");
+                if let Some(owner) = &self.plan_invalidations {
+                    owner.apply(event.plan_event(birth));
+                }
             }
         }
     }
@@ -2858,8 +2895,8 @@ impl TxnState {
 
     pub(crate) fn detach_prepared_plan_invalidations(&mut self) {
         if let Some(owner) = self.plan_invalidations.take() {
-            for event in self.ddl_plan_events.iter() {
-                owner.apply(*event);
+            for event in self.plan_events() {
+                owner.apply(event);
             }
         }
     }
@@ -2868,8 +2905,18 @@ impl TxnState {
         &self.ddl
     }
 
-    pub(crate) fn plan_events(&self) -> &[super::plan_invalidations::PlanInvalidationEvent] {
-        &self.ddl_plan_events
+    pub(crate) fn plan_events(
+        &self,
+    ) -> impl Iterator<Item = super::plan_invalidations::PlanInvalidationEvent> + '_ {
+        self.ddl_plan_events
+            .iter()
+            .copied()
+            .chain(self.truncates.iter().flat_map(|event| {
+                self.truncate_table_births.as_slice()
+                    [event.table_offset..event.table_offset + event.table_count]
+                    .iter()
+                    .map(move |&birth| event.plan_event(birth))
+            }))
     }
 
     pub(crate) fn ddl_capacity(&self) -> usize {
@@ -2900,8 +2947,8 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         if let Some(owner) = &self.plan_invalidations {
-            for event in self.ddl_plan_events.iter() {
-                owner.apply(*event);
+            for event in self.plan_events() {
+                owner.apply(event);
             }
         }
         self.staged_commit = None;
@@ -2927,6 +2974,7 @@ impl TxnState {
         self.truncates.clear();
         self.truncate_wal_tables.clear();
         self.truncate_table_slots.clear();
+        self.truncate_table_births.clear();
         self.ddl.clear();
         self.ddl_origins.clear();
         self.ddl_plan_events.clear();

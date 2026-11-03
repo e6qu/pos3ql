@@ -57251,7 +57251,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
     let mut transaction = TxnState::new(&mut b, 128).unwrap();
     let mut pool = test_pool(&mut b);
     let mut cursors = test_cursors(&mut b);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder =
             Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
@@ -100198,3 +100198,5 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
         }
     }
 }
+
+mod relation_input_granularity;

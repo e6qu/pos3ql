@@ -1,0 +1,34 @@
+-- Relation changes refresh saved inputs; statistics and index labels preserve them.
+CREATE SEQUENCE granularity_checks;
+CREATE TYPE granularity_choice AS ENUM('a');
+CREATE DOMAIN granularity_checked AS granularity_choice CHECK(nextval('granularity_checks')>0);
+CREATE TABLE granularity_anchor(id integer);
+INSERT INTO granularity_anchor VALUES(1);
+CREATE FUNCTION granularity_body() RETURNS granularity_checked[] LANGUAGE sql
+SET search_path=public AS $$SELECT '{a}'::granularity_checked[] FROM granularity_anchor LIMIT 1$$;
+ALTER SEQUENCE granularity_checks RESTART WITH 1;
+SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+ANALYZE granularity_anchor; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+CREATE INDEX granularity_index ON granularity_anchor(id); SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+ALTER INDEX granularity_index RENAME TO granularity_renamed; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+ALTER INDEX granularity_renamed SET(fillfactor=80); SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+BEGIN; TRUNCATE granularity_anchor; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+ROLLBACK; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+BEGIN; TRUNCATE granularity_anchor; COMMIT; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+INSERT INTO granularity_anchor VALUES(2); SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+DROP INDEX granularity_renamed; SELECT granularity_body();
+SELECT last_value FROM granularity_checks;
+DROP FUNCTION granularity_body();
+DROP TABLE granularity_anchor;
+DROP DOMAIN granularity_checked;
+DROP TYPE granularity_choice;
+DROP SEQUENCE granularity_checks;

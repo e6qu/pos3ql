@@ -3013,8 +3013,8 @@ fn eval_binary_values<'a>(
             [left_oid, right_oid],
             routine_input_collation(&[left, right], row, hooks.catalog)?,
             [
-                routine_input_collation(&[left], row, hooks.catalog)?,
-                routine_input_collation(&[right], row, hooks.catalog)?,
+                coercion_input_collation(left, row, hooks.catalog)?,
+                coercion_input_collation(right, row, hooks.catalog)?,
             ],
             nulls,
             arena,
@@ -3743,7 +3743,7 @@ fn eval_full_inner<'a>(
                         target_oid,
                         v,
                         DefinedCastContext::Explicit,
-                        routine_input_collation(&[operand], row, hooks.catalog)?,
+                        coercion_input_collation(operand, row, hooks.catalog)?,
                         arena,
                     )?
                 {
@@ -5411,7 +5411,7 @@ pub(crate) fn routine_input_collation<'a>(
     Ok(derived.map_or(Collation::None, DerivedCollation::input_collation))
 }
 
-/// Keep derivation strength until written arguments and inserted defaults merge.
+/// Keep derivation strength until supplied argument collations combine.
 pub(crate) fn routine_argument_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
@@ -5426,6 +5426,25 @@ pub(crate) fn routine_argument_collation<'a>(
                 indeterminate: false,
             })
     }))
+}
+
+/// PostgreSQL moves a top-level COLLATE outside a coercion. The conversion
+/// function sees the underlying source; projected column collations stay intact.
+pub(crate) fn coercion_source<'source, 'a>(mut expression: &'source Expr<'a>) -> &'source Expr<'a> {
+    while let Expr::Collate { operand, .. } = expression {
+        expression = operand;
+    }
+    expression
+}
+
+pub(crate) fn coercion_input_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Collation, SqlError> {
+    // Name/type validation precedes moving the parsed COLLATE decoration.
+    let _ = routine_input_collation(&[expression], row, catalog)?;
+    routine_input_collation(&[coercion_source(expression)], row, catalog)
 }
 
 /// Returns the collation required by an operation that compares or orders an
@@ -5674,7 +5693,7 @@ fn execute_array_constructor<'a>(
                 .execute_bound_cast(
                     cast,
                     value,
-                    routine_input_collation(&[input.expression], row, hooks.catalog)?,
+                    coercion_input_collation(input.expression, row, hooks.catalog)?,
                     arena,
                 )?,
             None => value,
@@ -6215,7 +6234,7 @@ pub(crate) fn builtin_operator_function<'a>(
                     target.oid(),
                     value,
                     DefinedCastContext::Implicit,
-                    routine_input_collation(&[expression], row, hooks.catalog)?,
+                    coercion_input_collation(expression, row, hooks.catalog)?,
                     arena,
                 )?
             {
@@ -10089,7 +10108,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_function_cast_receives_its_source_expression_collation() {
+    fn explicit_function_cast_moves_top_level_collation_outside_conversion() {
         use crate::sql::ast::Collation;
         struct Cast(core::cell::Cell<Collation>);
         impl CatalogAccess for Cast {
@@ -10128,7 +10147,7 @@ mod tests {
                     eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks).unwrap(),
                     Datum::Int4(42)
                 );
-                assert_eq!(catalog.0.get(), Collation::C);
+                assert_eq!(catalog.0.get(), Collation::Default);
             });
         });
     }

@@ -79,6 +79,8 @@ INSERT INTO planner_projection_values(value,id) SELECT source.* FROM (VALUES(33,
 SELECT 'qualified_wildcard',last_value FROM planner_checks;
 INSERT INTO planner_projection_values(value,id) SELECT (source).* FROM (VALUES(44,4)) source(value,id);
 SELECT 'record_wildcard',last_value FROM planner_checks;
+INSERT INTO planner_projection_values(value,id) SELECT 55,5 UNION ALL SELECT 66,6;
+SELECT 'set_output',last_value FROM planner_checks;
 SELECT id,value FROM planner_projection_values ORDER BY id;
 DROP TABLE planner_projection_values;
 DROP CAST(integer AS text);

@@ -4,6 +4,8 @@ use super::*;
 fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() {
     // PostgreSQL REL_18_6 funccache.c:268-300 keys by input collation and
     // declared argument OIDs, resolving only polymorphic/RECORD declarations.
+    // PG18.6 run41661367458 fixture SHA256:
+    // 43c3f393296f801672182516141a08e3ba69f50a56f706bf9292691054fb23c0.
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -54,10 +56,10 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
             ("SELECT body_collation(NULL::text COLLATE \"C\")", "3"),
             ("SELECT ('42'::text COLLATE \"C\")::integer", "4"),
             ("SELECT ('43'::text COLLATE \"C\")::integer", "4"),
-            ("SELECT ('44'::text COLLATE \"POSIX\")::integer", "5"),
+            ("SELECT ('44'::text COLLATE \"POSIX\")::integer", "4"),
             (
                 "SELECT ARRAY['45'::text COLLATE \"C\", '46'::text COLLATE \"C\"]::integer[]",
-                "5",
+                "4",
             ),
             (
                 "INSERT INTO body_collation_numbers SELECT '47'::text COLLATE \"C\" FROM generate_series(1,2)",
@@ -68,22 +70,22 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
                 "5",
             ),
             ("SELECT body_collation_default()", "6"),
-            ("SELECT body_collation_default('a' COLLATE \"C\")", "6"),
-            ("SELECT body_collation_default('a'::text)", "7"),
+            ("SELECT body_collation_default('a' COLLATE \"C\")", "7"),
+            ("SELECT body_collation_default('a'::text)", "8"),
             (
                 "SELECT body_collation_pair(value) FROM body_collation_texts",
-                "8",
+                "9",
             ),
-            ("SELECT body_collation_pair('a' COLLATE \"POSIX\")", "8"),
-            ("SELECT * FROM body_collation_srf()", "9"),
-            ("SELECT * FROM body_collation_srf('a' COLLATE \"C\")", "9"),
-            ("SELECT * FROM body_collation_srf('a'::text)", "10"),
-            ("CALL body_collation_procedure()", "11"),
-            ("CALL body_collation_procedure('a' COLLATE \"C\")", "11"),
-            ("CALL body_collation_procedure('a'::text)", "12"),
-            ("SELECT body_collation_nested()", "13"),
-            ("SELECT body_collation_nested('a' COLLATE \"C\")", "13"),
-            ("SELECT body_collation_nested('a'::text)", "14"),
+            ("SELECT body_collation_pair('a' COLLATE \"POSIX\")", "10"),
+            ("SELECT * FROM body_collation_srf()", "11"),
+            ("SELECT * FROM body_collation_srf('a' COLLATE \"C\")", "12"),
+            ("SELECT * FROM body_collation_srf('a'::text)", "13"),
+            ("CALL body_collation_procedure()", "14"),
+            ("CALL body_collation_procedure('a' COLLATE \"C\")", "15"),
+            ("CALL body_collation_procedure('a'::text)", "16"),
+            ("SELECT body_collation_nested()", "17"),
+            ("SELECT body_collation_nested('a' COLLATE \"C\")", "18"),
+            ("SELECT body_collation_nested('a'::text)", "19"),
         ] {
             session.success(&mut engine, query, true);
             let output = session.success(
@@ -93,10 +95,15 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
             );
             assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
         }
+        session.success(
+            &mut engine,
+            "SELECT body_collation_pair('a' COLLATE \"C\")",
+            true,
+        );
         assert_eq!(
             error_sqlstates(&session.execute(
                 &mut engine,
-                "SELECT body_collation_pair('a' COLLATE \"C\")",
+                "SELECT body_collation_pair('a' COLLATE \"C\", 'a' COLLATE \"POSIX\")",
                 true
             )),
             [sqlstate::COLLATION_MISMATCH]
@@ -107,7 +114,7 @@ fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() 
                 "SELECT last_value FROM body_collation_checks",
                 true
             )),
-            ["14"]
+            ["19"]
         );
     }
 }

@@ -168,6 +168,10 @@ fn accepted_assignment_inline_inputs_follow_expanded_projection_positions() {
                 "INSERT INTO projection_values(value,id) SELECT (source).* FROM (VALUES(44,4)) source(value,id)",
                 "4",
             ),
+            (
+                "INSERT INTO projection_values(value,id) SELECT 55,5 UNION ALL SELECT 66,6",
+                "5",
+            ),
         ] {
             session.success(&mut engine, query, true);
             assert_eq!(
@@ -186,7 +190,7 @@ fn accepted_assignment_inline_inputs_follow_expanded_projection_positions() {
                 "SELECT id,value FROM projection_values ORDER BY id",
                 true
             )),
-            ["1|11", "2|22", "3|33", "4|44"]
+            ["1|11", "2|22", "3|33", "4|44", "5|55", "6|66"]
         );
     }
 }

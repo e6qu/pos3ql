@@ -680,19 +680,24 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 }
                 for (condition, result) in *whens {
                     self.expression(condition, columns, row)?;
-                    let comparison;
-                    let condition = if let Some(operand) = operand {
-                        comparison = Expr::Binary {
+                    let folded = if let Some(operand) = operand {
+                        let comparison = Expr::Binary {
                             source_position: ast::SourcePosition::UNKNOWN,
                             operator: ast::BinaryOp::Eq,
                             left: operand,
                             right: condition,
                         };
-                        &comparison
+                        crate::sql::planner_inputs::inline::constant_value(
+                            &comparison,
+                            columns,
+                            storage,
+                            txid,
+                            arena,
+                        )?
                     } else {
-                        condition
+                        constant(condition)?
                     };
-                    match constant(condition)? {
+                    match folded {
                         Some(ConstantValue::Boolean(false) | ConstantValue::Null) => continue,
                         Some(ConstantValue::Boolean(true)) => {
                             return self.expression(result, columns, row);
@@ -861,6 +866,59 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         let select = super::expand_ctes(select, self.storage, self.txid, self.arena)?;
         if let Some(tree) = select.set_body {
             self.set_tree(tree, outer)?;
+            let storage = self.storage;
+            let txid = self.txid;
+            let arena = self.arena;
+            if let Some(targets) = targets
+                && let Some(planner) = &mut self.planner
+            {
+                let mark = arena.mark();
+                let result: Result<(), SqlError> = (|| {
+                    let output = super::srf::describe_derived_definition(
+                        storage, select, "", None, txid, arena, None,
+                    )?;
+                    // Set outputs can repeat names such as ?column?. Bind by
+                    // ordinal so one output never acquires a sibling's type.
+                    let output_columns = arena
+                        .alloc_slice_with(output.n_columns, |index| output.columns()[index])
+                        .map_err(|_| super::arena_full())?;
+                    for (index, column) in output_columns.iter_mut().enumerate() {
+                        column.name = crate::storage::SqlName::parse(
+                            crate::stack_format!(32, "output{index}").as_str(),
+                        )?;
+                    }
+                    let output = crate::storage::RelationDefinition {
+                        schema: output.schema,
+                        name: output.name,
+                        n_columns: output.n_columns,
+                        columns: output_columns,
+                    };
+                    let columns = crate::sql::exec::CatalogCols {
+                        definition: Some(output),
+                        alias: None,
+                        output_aliases: &[],
+                        storage,
+                        txid,
+                        arena,
+                    };
+                    for (index, column) in output.columns().iter().enumerate() {
+                        if let Some((target, _, Some(site))) = targets.get(index) {
+                            planner(
+                                &Expr::Column {
+                                    qualifier: None,
+                                    name: column.name.as_str(),
+                                },
+                                &columns,
+                                Some((*target, *site)),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                // Callbacks retain only detached facts in the persistent tail.
+                unsafe { arena.rewind_to(mark) };
+                result?;
+            }
         }
         let scope = match select.from.as_ref() {
             Some(from) => Some(super::QueryScope::resolve_schema(

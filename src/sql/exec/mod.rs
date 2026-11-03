@@ -25794,8 +25794,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     context.txn.txid,
                     context.arena,
                 )?;
-                let input_collation = super::eval::routine_input_collation(
-                    &[assignment.expression],
+                let input_collation = super::eval::coercion_input_collation(
+                    assignment.expression,
                     &scope,
                     hooks.catalog,
                 )?;
@@ -74500,7 +74500,7 @@ fn eval_prepared_assignment<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let mut cast = casts.selected(expression, column, storage, txid)?;
-    cast.input_collation = super::eval::routine_input_collation(&[expression], row, hooks.catalog)?;
+    cast.input_collation = super::eval::coercion_input_collation(expression, row, hooks.catalog)?;
     let value = eval_full(expression, arena, params, row, hooks)?;
     coerce_assignment(value, column, cast, storage, txid, arena)
 }
@@ -74735,11 +74735,7 @@ fn eval_assignment<'a>(
         value,
         column,
         PlannedAssignmentCast {
-            input_collation: super::eval::routine_input_collation(
-                &[expression],
-                row,
-                hooks.catalog,
-            )?,
+            input_collation: super::eval::coercion_input_collation(expression, row, hooks.catalog)?,
             defined: cast.as_ref(),
             site: None,
         },

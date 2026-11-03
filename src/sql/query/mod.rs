@@ -2067,6 +2067,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_expressions = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_collations = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut conversion_collations = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut default_collations = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut call_collation = None;
         let default_dependencies = if captured.is_none()
@@ -2085,6 +2086,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 if usize::from(mapping[call_index]) == input_index {
                     let derived = argument_collation(expression)?;
                     argument_collations[call_index] = derived;
+                    conversion_collations[call_index] =
+                        argument_collation(super::eval::coercion_source(expression))?;
                 }
             }
             let parameter = declared
@@ -2164,13 +2167,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     call_collation =
                         super::eval::merge_derived_collations(call_collation, derived)?;
                 }
-            }
-            if default_expressions[input_index].is_some() {
-                let derived = super::eval::DerivedCollation::for_input_type(
-                    default_collations[input_index],
-                    argument.ctype,
-                );
-                call_collation = super::eval::merge_derived_collations(call_collation, derived)?;
             }
         }
         let input_contract = |input_index: usize, expanded: bool| {
@@ -2297,7 +2293,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 source,
                                 argument,
                                 expected,
-                                argument_collations[call_index].map_or(
+                                conversion_collations[call_index].map_or(
                                     super::ast::Collation::None,
                                     super::eval::DerivedCollation::input_collation,
                                 ),
@@ -2385,7 +2381,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 argument_type_oids[call_index],
                                 argument,
                                 expected,
-                                argument_collations[call_index].map_or(
+                                conversion_collations[call_index].map_or(
                                     super::ast::Collation::None,
                                     super::eval::DerivedCollation::input_collation,
                                 ),
@@ -4240,7 +4236,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 let mut derived = None;
                 for (output, expression) in collations.iter_mut().zip(arguments) {
                     let argument = argument_collation(expression)?;
-                    *output = argument.map_or(
+                    *output = argument_collation(super::eval::coercion_source(expression))?.map_or(
                         super::ast::Collation::None,
                         super::eval::DerivedCollation::input_collation,
                     );

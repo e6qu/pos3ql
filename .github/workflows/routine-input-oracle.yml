@@ -6,6 +6,8 @@ on:
       - '.github/workflows/routine-input-oracle.yml'
       - 'tests/external/routine-input-oracle.sql'
       - 'tests/external/routine-input-oracle.py'
+      - 'tests/external/differential/205_planner_checked_inputs.sql'
+      - 'tests/external/differential/206_runtime_input_collations.sql'
 
 permissions:
   contents: read

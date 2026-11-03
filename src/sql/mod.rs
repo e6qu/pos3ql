@@ -563,12 +563,13 @@ struct CommandSnapshot {
     _files: Option<crate::storage::StatementFileScope>,
 }
 
-#[derive(Clone, Copy, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum RoutineBodyInputOrigin {
     CallSite(Option<query::InvocationSite>),
     Procedure,
 }
 
+#[derive(Clone, Copy)]
 struct PreparedTypeInputs<'a> {
     owner: type_input_plans::Owner,
     source: type_inputs::Source,

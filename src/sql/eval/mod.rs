@@ -5,12 +5,21 @@
 
 use crate::mem::arena::Arena;
 use crate::stack_format;
-pub use crate::storage::RoutineCallSelection;
 use crate::util::StackStr;
 
 use super::ast::{BinaryOp, CastBinding, Collation, Expr, GroupingSet, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ArrElem, ColType, Datum, RecordField};
+
+/// The selected callable identity, or the reason no unique callable was selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineCallSelection {
+    Stored(usize),
+    Builtin { oid: i32, schema: &'static str },
+    Absent,
+    Ambiguous,
+    WrongKind { is_procedure: bool },
+}
 
 mod cast;
 pub mod funcs;
@@ -720,7 +729,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
-    ) -> Option<crate::storage::RoutineCallSelection> {
+    ) -> Option<RoutineCallSelection> {
         self.catalog?.routine_call_selection(
             name,
             kind,
@@ -1592,7 +1601,7 @@ pub trait CatalogAccess {
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _arguments: &[i32],
-    ) -> Option<crate::storage::RoutineCallSelection> {
+    ) -> Option<RoutineCallSelection> {
         None
     }
 

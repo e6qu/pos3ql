@@ -2,20 +2,11 @@
 
 use super::{
     MAX_ROUTINE_ARGUMENTS, PolymorphicBinding, PolymorphicType, RoutineCallKind,
-    RoutineInputSignature, RoutineParameterMode, SqlName, Storage, current_database,
+    RoutineCallSelection, RoutineInputSignature, RoutineParameterMode, SqlName, Storage,
+    current_database,
 };
 use crate::sql::catalog::{BuiltinCallableSignature, builtin_callable_signatures};
 use crate::sql::types::{ColType, oid, type_category};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// The selected callable identity, or the reason no unique callable was selected.
-pub enum RoutineCallSelection {
-    Stored(usize),
-    Builtin { oid: i32, schema: &'static str },
-    Absent,
-    Ambiguous,
-    WrongKind { is_procedure: bool },
-}
 
 struct Candidate {
     selected: RoutineCallSelection,

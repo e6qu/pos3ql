@@ -73,6 +73,7 @@ mod dependencies;
 mod type_inputs;
 pub(crate) use type_inputs::capture_contextual_expression_type_inputs;
 pub(crate) use type_inputs::capture_contextual_type_inputs;
+pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
 pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;

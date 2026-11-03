@@ -5889,6 +5889,196 @@ mod tests {
     }
 
     #[test]
+    fn checked_inputs_keep_completed_cursor_and_statistics_effects_through_lock_retries() {
+        fn request(conn: &mut Conn, engine: &mut Engine, text: &str) {
+            conn.send.clear();
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            for cancel in [false, true] {
+                let mut config = Config::default_dev();
+                config.data_dir = std::env::temp_dir()
+                    .join(format!(
+                        "pos3ql-cursor-receipts-{}-{mode:?}-{cancel}",
+                        std::process::id()
+                    ))
+                    .to_string_lossy()
+                    .into_owned();
+                config.remove_test_data_dir_on_drop();
+                config.transaction_mode = mode;
+                config.max_tables = 8;
+                config.row_overlay_slots = 128;
+                config.max_connections = 3;
+                config.prepared_bytes = 32 << 10;
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut writer = Conn::new(&config, &mut budget).unwrap();
+                let mut holder = Conn::new(&config, &mut budget).unwrap();
+                let mut observer = Conn::new(&config, &mut budget).unwrap();
+                writer.id = 1;
+                holder.id = 2;
+                observer.id = 3;
+                writer.phase = Phase::Ready;
+                holder.phase = Phase::Ready;
+                observer.phase = Phase::Ready;
+                request(
+                    &mut writer,
+                    &mut engine,
+                    "CREATE SEQUENCE receipt_checks CACHE 1; \
+                     CREATE TABLE receipt_probe(id integer); INSERT INTO receipt_probe VALUES(1); \
+                     CREATE TABLE receipt_gate(id integer PRIMARY KEY,hits integer); INSERT INTO receipt_gate VALUES(1,0); \
+                     CREATE TYPE receipt_choice AS ENUM('a'); \
+                     CREATE FUNCTION receipt_allowed(value receipt_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                     DECLARE handle refcursor; fetched bigint; observed bigint; issued bigint; BEGIN \
+                       OPEN handle NO SCROLL FOR SELECT nextval('receipt_checks'); \
+                       FETCH NEXT FROM handle INTO fetched; CLOSE handle; \
+                       observed:=currval('receipt_checks'); issued:=nextval('receipt_checks'); \
+                       PERFORM pg_stat_reset_single_table_counters('receipt_probe'::regclass); \
+                       UPDATE receipt_gate SET hits=hits+1 WHERE id=1; \
+                       RETURN fetched=1 AND observed=1 AND issued=2; END$$; \
+                     CREATE DOMAIN receipt_checked AS receipt_choice CHECK(receipt_allowed(VALUE))",
+                );
+                let probe = engine
+                    .publication_storage_for_tests()
+                    .find_visible("public", "receipt_probe", 0)
+                    .unwrap();
+                let sequence = engine
+                    .publication_storage_for_tests()
+                    .sequence_slot("public", "receipt_checks", 0)
+                    .unwrap();
+                request(
+                    &mut holder,
+                    &mut engine,
+                    "BEGIN; UPDATE receipt_gate SET hits=hits WHERE id=1",
+                );
+                writer.send.clear();
+                assert!(writer.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT '{a}'::receipt_checked[]\0"
+                )));
+                assert!(matches!(
+                    crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                    Step::Parked
+                ));
+                assert!(writer.send.is_empty());
+                assert_eq!(
+                    writer.cursors.len(),
+                    0,
+                    "completed CLOSE remains applied while admission waits"
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .relation_cumulative_statistics(probe)
+                        .n_tup_ins,
+                    0
+                );
+                request(
+                    &mut observer,
+                    &mut engine,
+                    "INSERT INTO receipt_probe VALUES(2)",
+                );
+                for _ in 0..2 {
+                    assert!(matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Parked
+                    ));
+                    assert!(writer.send.is_empty());
+                    assert_eq!(writer.cursors.len(), 0);
+                    assert_eq!(
+                        engine
+                            .publication_storage_for_tests()
+                            .sequence_value_for(sequence, 0)
+                            .0,
+                        2
+                    );
+                    assert_eq!(
+                        engine
+                            .publication_storage_for_tests()
+                            .relation_cumulative_statistics(probe)
+                            .n_tup_ins,
+                        1,
+                        "completed statistics reset must not run again"
+                    );
+                }
+                if cancel {
+                    assert!(crate::mem::guard::forbid_alloc(
+                        || writer.cancel_parked(&mut engine)
+                    ));
+                    assert!(
+                        writer
+                            .send
+                            .readable()
+                            .windows(5)
+                            .any(|state| state == b"57014")
+                    );
+                }
+                request(&mut holder, &mut engine, "COMMIT");
+                if !cancel {
+                    assert!(matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Continue
+                    ));
+                    assert!(
+                        !has_backend_message(writer.send.readable(), wire::MSG_ERROR_RESPONSE),
+                        "{}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                    assert!(has_backend_message(
+                        writer.send.readable(),
+                        wire::MSG_DATA_ROW
+                    ));
+                }
+                assert!(!writer.guc.seq_session().retains_statement_effects());
+                assert_eq!(writer.cursors.len(), 0);
+                assert_eq!(
+                    writer.cursors.unnamed_name().unwrap().as_str(),
+                    "<unnamed portal 2>",
+                    "OPEN must allocate its name only once"
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .relation_cumulative_statistics(probe)
+                        .n_tup_ins,
+                    1
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .sequence_value_for(sequence, 0)
+                        .0,
+                    2
+                );
+                request(&mut writer, &mut engine, "SELECT hits FROM receipt_gate");
+                let expected = if cancel { b'0' } else { b'1' };
+                let frame = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, expected];
+                assert!(
+                    writer
+                        .send
+                        .readable()
+                        .windows(frame.len())
+                        .any(|value| value == frame)
+                );
+            }
+        }
+    }
+
+    #[test]
     // PostgreSQL 18.6 PREPARE/EXECUTE reference SQL SHA256:
     // 79d26366490991a38ea78b54b9a2c055f6de593702a37f58307054a5e22f20b0.
     fn serialized_domain_inputs_are_bound_once_per_prepared_source() {

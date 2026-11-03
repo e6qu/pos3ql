@@ -96,3 +96,75 @@ fn implicit_assignment_cast_bodies_use_each_static_dml_site_once() {
         );
     }
 }
+
+#[test]
+fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cursor-sequence-session-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut connection = ConfiguredTransactionSession::new(&config, &mut budget);
+        connection.success(&mut engine, "CREATE SEQUENCE receipt_values CACHE 1", true);
+        let slot = engine
+            .storage
+            .sequence_slot("public", "receipt_values", 0)
+            .unwrap();
+        let birth = engine.storage.sequence(slot).created_at;
+        let mut arena = Arena::new(&mut budget, "cursor sparse session replay", 64 << 10).unwrap();
+        let session = connection.guc.seq_session();
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _scope = crate::sql::sequence::enter_statement(&arena, session, false);
+                let values = crate::sql::sequence::statement_effect(
+                    crate::sql::sequence::StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    crate::sql::sequence::StatementEffectRetry::Continue,
+                    &arena,
+                    || {
+                        let value =
+                            crate::sql::sequence::next_cached(&engine.storage, session, slot, 0)
+                                .unwrap();
+                        crate::sql::sequence::StatementEffectAttempt {
+                            result: Ok(arena.alloc_slice_copy(&[Datum::Int8(value)]).unwrap()),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(matches!(values, [Datum::Int8(1)]));
+                assert_eq!(
+                    crate::sql::sequence::next_cached(&engine.storage, session, slot, 0).unwrap(),
+                    2
+                );
+                assert_eq!(session.currval(slot, birth), Some(2));
+            }
+            arena.recycle_front();
+            {
+                let scope = crate::sql::sequence::enter_statement(&arena, session, true);
+                let values = crate::sql::sequence::statement_effect(
+                    crate::sql::sequence::StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    crate::sql::sequence::StatementEffectRetry::Continue,
+                    &arena,
+                    || panic!("completed cursor source must not advance again"),
+                )
+                .unwrap();
+                assert!(matches!(values, [Datum::Int8(1)]));
+                assert_eq!(session.currval(slot, birth), Some(1));
+                assert_eq!(session.lastval(), Some(1));
+                assert_eq!(
+                    crate::sql::sequence::next_cached(&engine.storage, session, slot, 0).unwrap(),
+                    2
+                );
+                assert_eq!(session.currval(slot, birth), Some(2));
+                scope.finish(session).unwrap();
+            }
+            assert_eq!(engine.storage.sequence_value_for(slot, 0).0, 2);
+            assert!(!session.retains_statement_effects());
+        });
+    }
+}

@@ -486,4 +486,104 @@ mod tests {
             assert!(plans.find(first).unwrap().is_none());
         });
     }
+
+    #[test]
+    fn retired_definitions_and_dynamic_epochs_release_only_their_owned_plans() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 4;
+        let mut budget = Budget::new(
+            RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(1024, 4),
+        );
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 1024, 4).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let bytes = pool.copy_slice(b"TIP2\0\0\0\0").unwrap();
+            let old_key = Key {
+                owner: Owner::Backend,
+                source: source(1),
+            };
+            let old = plans.reserve(old_key).unwrap();
+            plans
+                .complete(old, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let child_key = Key {
+                owner: Owner::Nested(old),
+                source: source(2),
+            };
+            let child = plans.reserve(child_key).unwrap();
+            plans
+                .complete(child, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let retained = match plans.find(old_key).unwrap().unwrap() {
+                Lookup::Ready(_, image) => image,
+                Lookup::Waiting(_) => panic!("ready image"),
+            };
+            let next_key = Key {
+                owner: Owner::Backend,
+                source: Source::SqlRoutineCallSite {
+                    routine_oid: 100_001,
+                    definition_version: 8,
+                    callsite: 1,
+                },
+            };
+            let next = plans.reserve(next_key).unwrap();
+            plans
+                .complete(next, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            plans.retire_invalid_definitions(|oid, version| oid == 100_001 && version == 8);
+            assert!(plans.find(old_key).unwrap().is_none());
+            assert!(plans.find(child_key).is_err());
+            assert!(
+                matches!(plans.find(next_key).unwrap(), Some(Lookup::Ready(id, _)) if id == next)
+            );
+            assert!(
+                matches!(&retained, InputImage::Runtime(value) if value.as_ref() == b"TIP2\0\0\0\0")
+            );
+            let dynamic_key = Key {
+                owner: Owner::Dynamic {
+                    epoch: 11,
+                    generation: 19,
+                },
+                source: source(3),
+            };
+            let dynamic = plans.reserve(dynamic_key).unwrap();
+            plans
+                .complete(dynamic, InputImage::Runtime(bytes.clone()))
+                .unwrap();
+            let transient_key = Key {
+                owner: Owner::Transient {
+                    generation: 11,
+                    statement: 0,
+                },
+                source: source(4),
+            };
+            let transient = plans.reserve(transient_key).unwrap();
+            plans
+                .complete(transient, InputImage::Runtime(bytes))
+                .unwrap();
+            assert!(!has_active_plan());
+            with_owner(Owner::Backend, || {
+                assert!(!has_active_plan());
+                with_owner(Owner::Nested(next), || {
+                    assert!(has_active_plan());
+                    with_owner(dynamic_key.owner, || {
+                        assert!(has_active_plan());
+                        assert_eq!(owner().unwrap(), dynamic_key.owner);
+                    });
+                    assert_eq!(owner().unwrap(), Owner::Nested(next));
+                });
+                assert!(!has_active_plan());
+                assert_eq!(owner().unwrap(), Owner::Backend);
+            });
+            assert!(!has_active_plan());
+            plans.retire_transient(11);
+            assert!(plans.find(dynamic_key).unwrap().is_none());
+            assert!(plans.find(transient_key).unwrap().is_none());
+            assert!(
+                matches!(plans.find(next_key).unwrap(), Some(Lookup::Ready(id, _)) if id == next)
+            );
+            assert!(plans.set_waiting(old, false).is_err());
+            drop(retained);
+        });
+    }
 }

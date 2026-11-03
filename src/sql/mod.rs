@@ -15327,9 +15327,8 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn prepare_plpgsql_inputs<'a>(
         &mut self,
+        key: type_input_plans::Key,
         site: plpgsql_inputs::Site<'a>,
-        routine_oid: i32,
-        definition_version: u64,
         row: &dyn eval::ColumnLookup<'a>,
         arena: &'a Arena,
         txn: &mut TxnState,
@@ -15338,20 +15337,7 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<PreparedTypeInputs<'a>, SqlError>, WireFull> {
-        let source = type_inputs::Source::PlpgsqlBodyExpression {
-            routine_oid,
-            definition_version,
-            expression: site.position,
-        };
-        let owner = if routine_oid > 0 {
-            type_input_plans::Owner::Backend
-        } else {
-            match type_input_plans::owner() {
-                Ok(owner) => owner,
-                Err(error) => return Ok(Err(error)),
-            }
-        };
-        let key = type_input_plans::Key { owner, source };
+        let source = key.source;
         let ready = match sqlprep.routine_inputs.find(key) {
             Ok(Some(type_input_plans::Lookup::Ready(_, _))) => true,
             Ok(_) => false,
@@ -15389,12 +15375,15 @@ impl Engine {
                             .next_stmt()
                             .map_err(|error| parse_error_to_sql(&error))?
                         {
-                            query::capture_contextual_type_inputs(
+                            let statement =
+                                arena.alloc(statement).map_err(|_| eval::arena_full())?;
+                            query::capture_procedural_statement_type_inputs(
                                 &parser,
-                                &statement,
+                                statement,
                                 &self.storage,
                                 txn.txid,
                                 arena,
+                                row,
                             )?;
                         }
                     }

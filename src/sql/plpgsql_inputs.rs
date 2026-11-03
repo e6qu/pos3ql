@@ -97,3 +97,55 @@ fn invalid_source() -> SqlError {
         "PL/pgSQL input plan has no original body span"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::Budget;
+
+    #[test]
+    fn parse_frames_copy_synthetic_sources_and_restore_nested_authority() {
+        let mut budget = Budget::new(16 << 10);
+        let arena = Arena::new(&mut budget, "PL source frames", 16 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let body = arena.alloc_str("RETURN 1; RETURN 2").unwrap();
+            let nested_body = arena.alloc_str("RETURN 3").unwrap();
+            let mut synthetic = *b"SELECT 1";
+            let (_, outer) = capture(body, &arena, || {
+                record(Kind::Expression, 1, &body[7..8], &body[7..8])?;
+                let (_, nested) = capture(nested_body, &arena, || {
+                    record(
+                        Kind::Query,
+                        2,
+                        core::str::from_utf8(&synthetic).unwrap(),
+                        nested_body,
+                    )
+                })?;
+                assert_eq!(nested.len(), 1);
+                assert_eq!(nested[0].text, "SELECT 1");
+                synthetic.fill(b'x');
+                assert_eq!(nested[0].text, "SELECT 1");
+                let foreign = *b"RETURN 1";
+                assert!(
+                    record(
+                        Kind::Statement,
+                        3,
+                        "SELECT 1",
+                        core::str::from_utf8(&foreign).unwrap()
+                    )
+                    .is_err()
+                );
+                let failed: Result<((), &[Site<'_>]), SqlError> =
+                    capture(nested_body, &arena, || Err(invalid_source()));
+                assert!(failed.is_err());
+                record(Kind::Expression, 4, &body[17..18], &body[17..18])
+            })
+            .unwrap();
+            assert_eq!(outer.len(), 2);
+            assert_eq!((outer[0].position, outer[0].text), (7, "1"));
+            assert_eq!((outer[1].position, outer[1].text), (17, "2"));
+            assert_eq!((outer[0].key, outer[1].key), (1, 4));
+            record(Kind::Statement, 9, "not retained", "outside a parse frame").unwrap();
+        });
+    }
+}

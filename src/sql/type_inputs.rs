@@ -26,7 +26,7 @@ pub(crate) struct AssignmentSite {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
     CreateRoutineValidation {
-        statement: usize,
+        statement: Option<usize>,
     },
     RootCommand {
         statement: usize,

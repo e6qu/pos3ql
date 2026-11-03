@@ -3752,6 +3752,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         context.txn.txid,
         context.arena,
     )?;
+    let invocation = invocation.with_input_sites(program.input_sites);
     let transition_relations =
         trigger_transition_relations(trigger, definition, transition_rows, context.arena)?;
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
@@ -16862,6 +16863,24 @@ impl<'a> TriggerInvocation<'a> {
         self
     }
 
+    fn input_plan_key(
+        self,
+        site: super::plpgsql_inputs::Site<'_>,
+    ) -> Result<super::type_input_plans::Key, SqlError> {
+        Ok(super::type_input_plans::Key {
+            owner: if self.routine_oid > 0 {
+                super::type_input_plans::Owner::Backend
+            } else {
+                super::type_input_plans::owner()?
+            },
+            source: super::type_inputs::Source::PlpgsqlBodyExpression {
+                routine_oid: self.routine_oid,
+                definition_version: self.routine_version,
+                expression: site.position,
+            },
+        })
+    }
+
     fn with_exception(mut self, exception: TriggerExceptionDiagnostic<'a>) -> Self {
         self.exception = Some(exception);
         self
@@ -22165,9 +22184,8 @@ fn eval_procedural_expression<'a>(
         Some(site) => Some(
             engine
                 .prepare_plpgsql_inputs(
+                    row.invocation.input_plan_key(site)?,
                     site,
-                    row.invocation.routine_oid,
-                    row.invocation.routine_version,
                     row,
                     arena,
                     context.txn,
@@ -25005,60 +25023,28 @@ fn materialize_trigger_for_query<'result, 'query>(
 where
     'result: 'query,
 {
-    let mut count = 0usize;
-    let count_mark = query_arena.mark();
-    {
-        let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
-        super::query::select_into_rows_recycling(
-            storage,
-            txid,
-            query,
-            query_arena,
-            execution.params,
-            Some(scope),
-            Some(&dry),
-            &mut |values| {
-                if values.len() != 1 {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "FOR query must return exactly one column"
-                    ));
-                }
-                count += 1;
-                Ok(())
-            },
-        )?;
-    }
-    // Only the count survives this pass; all caller-owned inputs precede it.
-    unsafe { query_arena.rewind_to(count_mark) };
-    let rows = result_arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| super::query::arena_full_pub())?;
-    let mut at = 0usize;
-    {
-        let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
-        super::query::select_into_rows(
-            storage,
-            txid,
-            query,
-            query_arena,
-            execution.params,
-            Some(scope),
-            Some(&live),
-            &mut |values| {
-                if values.len() != 1 {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "FOR query must return exactly one column"
-                    ));
-                }
-                rows[at] = detached_trigger_datum(values[0], result_arena)?;
-                at += 1;
-                Ok(())
-            },
-        )?;
-    }
-    Ok(&*rows)
+    let mut rows = ArenaList::new(result_arena);
+    let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
+    super::query::select_into_rows(
+        storage,
+        txid,
+        query,
+        query_arena,
+        execution.params,
+        Some(scope),
+        Some(&live),
+        &mut |values| {
+            if values.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "FOR query must return exactly one column"
+                ));
+            }
+            let value = detached_trigger_datum(values[0], result_arena)?;
+            rows.push(value).map_err(|_| super::query::arena_full_pub())
+        },
+    )?;
+    Ok(rows.as_slice())
 }
 
 fn materialize_plpgsql_dynamic_for_query<'a>(
@@ -25094,32 +25080,12 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 "FOR EXECUTE query must return exactly one column"
             ));
         }
-        let mut count = 0usize;
-        let dry = crate::sql::sequence::SeqEval::dry(
-            context.storage(),
-            context.seq_session(),
-            context.txn.txid,
-        );
-        execute_bound_plpgsql_dynamic_query(context, query, &dry, &mut |values| {
-            if values.len() != width {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "FOR EXECUTE row shape changed during execution"
-                ));
-            }
-            count += 1;
-            Ok(())
-        })?;
-        let rows = context
-            .arena
-            .alloc_slice_with(count, |_| Datum::Null)
-            .map_err(|_| super::query::arena_full_pub())?;
+        let mut rows = ArenaList::new(context.arena);
         let live = crate::sql::sequence::SeqEval::new(
             context.storage(),
             context.seq_session(),
             context.txn.txid,
         );
-        let mut at = 0usize;
         execute_bound_plpgsql_dynamic_query(context, query, &live, &mut |values| {
             if values.len() != width {
                 return Err(sql_err!(
@@ -25127,7 +25093,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     "FOR EXECUTE row shape changed during execution"
                 ));
             }
-            rows[at] = if record_target {
+            let value = if record_target {
                 let mut fields = [RecordField {
                     name: "",
                     type_oid: 0,
@@ -25151,10 +25117,9 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             } else {
                 detached_trigger_datum(values[0], context.arena)?
             };
-            at += 1;
-            Ok(())
+            rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
-        Ok(&*rows)
+        Ok(rows.as_slice())
     })
 }
 
@@ -25172,36 +25137,8 @@ where
 {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
-    let mut count = 0usize;
-    let count_mark = query_arena.mark();
-    let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
-    super::query::select_into_rows_recycling(
-        storage,
-        txid,
-        query,
-        query_arena,
-        execution.params,
-        Some(scope),
-        Some(&dry),
-        &mut |values| {
-            if values.len() != width {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "trigger FOR row shape changed during execution"
-                ));
-            }
-            count += 1;
-            Ok(())
-        },
-    )?;
-    // Preserve the described column names below the mark, but not the dry
-    // execution's temporary scope or row values.
-    unsafe { query_arena.rewind_to(count_mark) };
-    let rows = result_arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| super::query::arena_full_pub())?;
+    let mut rows = ArenaList::new(result_arena);
     let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
-    let mut at = 0usize;
     super::query::select_into_rows(
         storage,
         txid,
@@ -25211,6 +25148,12 @@ where
         Some(scope),
         Some(&live),
         &mut |values| {
+            if values.len() != width {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "trigger FOR row shape changed during execution"
+                ));
+            }
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
@@ -25228,12 +25171,11 @@ where
             let fields = result_arena
                 .alloc_slice_copy(&fields[..width])
                 .map_err(|_| super::query::arena_full_pub())?;
-            rows[at] = Datum::Record(&*fields);
-            at += 1;
-            Ok(())
+            rows.push(Datum::Record(&*fields))
+                .map_err(|_| super::query::arena_full_pub())
         },
     )?;
-    Ok(&*rows)
+    Ok(rows.as_slice())
 }
 
 #[expect(
@@ -28872,6 +28814,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             context.txn.txid,
             context.arena,
         )?;
+        let invocation = invocation.with_input_sites(program.input_sites);
         let transition_relations =
             trigger_transition_relations(&trigger, definition, rows, context.arena)?;
         let mut no_new = None;

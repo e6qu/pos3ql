@@ -13,6 +13,62 @@ use crate::storage::{NamedTypeKind, RoutineCallKind, RoutineCallSelection, Stora
 
 type Visit<'a> = dyn FnMut(&Expr<'_>, i32, i32, InputKind) -> Result<(), SqlError> + 'a;
 
+// Discovery can borrow storage briefly even when caller values live for the
+// entire execution. This adapter exposes the same declared identities only.
+struct MetadataOnly<'s, 'v> {
+    row: &'s dyn ColumnLookup<'v>,
+    columns: &'s dyn ColTypeResolver,
+}
+
+impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
+    fn lookup(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> Result<crate::sql::types::Datum<'a>, SqlError> {
+        Err(sql_err!(
+            super::sqlstate::INTERNAL_ERROR,
+            "SQL input discovery cannot read row values"
+        ))
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        self.row.resolve_column_type(qualifier, name)
+    }
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
+        self.row.col_type(qualifier, name)
+    }
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row.column_user_type(qualifier, name)
+    }
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
+        self.row.collation(qualifier, name)
+    }
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.row.column_identity(qualifier, name)
+    }
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        self.row.whole_row_type(table)
+    }
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row.whole_row_is_scalar(table)
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, self.columns)
+            .map_or(ast::Collation::None, |meta| meta.collation)
+    }
+}
+
 pub(crate) fn capture_contextual_type_inputs(
     parser: &crate::sql::parser::Parser<'_>,
     statement: &Stmt<'_>,
@@ -36,13 +92,49 @@ pub(crate) fn capture_contextual_expression_type_inputs<'a>(
     row: &dyn ColumnLookup<'a>,
 ) -> Result<(), SqlError> {
     capture_discovered_type_inputs(parser, storage, txid, arena, |visit| {
+        let metadata = MetadataOnly { row, columns };
         let mut walker = Walker {
             storage,
             txid,
             arena,
             visit,
         };
-        walker.expression(expression, columns, row)
+        walker.expression(expression, columns, &metadata)
+    })
+}
+
+pub(crate) fn capture_procedural_statement_type_inputs<'a>(
+    parser: &crate::sql::parser::Parser<'_>,
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    capture_discovered_type_inputs(parser, storage, txid, arena, |visit| {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let columns = RuntimeColumnTypes {
+            row: outer,
+            catalog: Some(&catalog),
+        };
+        let outer = MetadataOnly {
+            row: outer,
+            columns: &columns,
+        };
+        let mut walker = Walker {
+            storage,
+            txid,
+            arena,
+            visit,
+        };
+        match statement {
+            Stmt::Select(select) => walker.select(select, Some(&outer), None),
+            Stmt::SetQuery(query) => walker.set_tree(query.body, Some(&outer)),
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                walker.dml(statement, Some(&outer))
+            }
+            _ => walker.statement(statement),
+        }
     })
 }
 
@@ -748,13 +840,17 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 )
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.dml(statement)
+                self.dml(statement, None)
             }
             _ => Ok(()),
         }
     }
 
-    fn dml<'a>(&mut self, statement: &'a Stmt<'a>) -> Result<(), SqlError>
+    fn dml<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<(), SqlError>
     where
         'storage: 'a,
     {
@@ -790,7 +886,11 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             self.txid,
             self.arena,
         )?;
-        let row = super::materialize::ScopeSchema(&scope);
+        let schema = super::materialize::ScopeSchema(&scope);
+        let row = super::Chained {
+            inner: &schema,
+            outer,
+        };
         let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
         let columns = RuntimeColumnTypes {
             row: &row,
@@ -854,7 +954,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             storage,
             txid,
             arena,
-            None,
+            outer,
             &mut |group, assignment_columns| {
                 for assignment in group {
                     self.expression(assignment.expression, assignment_columns, &row)?;

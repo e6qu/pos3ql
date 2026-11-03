@@ -2917,6 +2917,11 @@ fn conflict_condition_types_preserve_qualified_scope_errors() {
                 "42703",
                 "column excluded.missing does not exist",
             ),
+            (
+                "excluded.missing>0",
+                "42703",
+                "column excluded.missing does not exist",
+            ),
         ] {
             let sql = format!(
                 "INSERT INTO reference_scope.source VALUES(1,9) \

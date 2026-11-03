@@ -2393,6 +2393,10 @@ pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_enum_input_literal(text, target_oid)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.is_none_or(|scope| scope.n == 0)
             && self.outer.is_none_or(|outer| outer.is_empty_scope())

@@ -2801,6 +2801,16 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_enum_input_literal(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.routine_workspace,
+        )
+    }
+
     fn validate_explicit_cast(
         &self,
         source: i32,
@@ -11567,6 +11577,16 @@ pub(crate) struct CatalogScopeCols<'scope, 'definition, 'outer_definition, 'stor
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        super::catalog::validate_enum_input_literal(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.n == 0 && self.outer_scope.is_none_or(|scope| scope.n == 0)
     }

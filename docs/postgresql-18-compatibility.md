@@ -115,6 +115,12 @@ null inputs. For example, `ARRAY(SELECT d FROM unnest(orders.days) d)` keeps
 the declared element type of `orders.days`; a single-column function alias
 denotes its scalar value. Result descriptions do not require a sample row.
 
+Enum labels written directly in SQL are checked before choosing rows. If
+`order_status` contains `new` and `paid`, `'missing'::order_status` raises
+`22P02` even inside an unused `CASE` arm. A value already declared `text`
+converts when its expression runs: the same unused arm containing
+`'missing'::text::order_status` is skipped.
+
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.
 Arrays of domains whose base is an array of user-defined values are rejected:

@@ -5273,9 +5273,15 @@ where
             }
             self.existing
         };
-        match self.def.column_index(name) {
-            Some(i) => Ok(src[i]),
-            None => Err(sql_err!(
+        match (self.def.column_index(name), qualifier) {
+            (Some(i), _) => Ok(src[i]),
+            (None, Some(qualifier)) if qualifier.eq_ignore_ascii_case("excluded") => Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column {}.{} does not exist",
+                qualifier,
+                name
+            )),
+            (None, _) => Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
                 name
@@ -20081,7 +20087,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
-        &context,
+        &mut context,
         invocation,
         TriggerTransition {
             definition: crate::storage::RelationDefinition::from_definition(&definition),
@@ -20157,7 +20163,7 @@ pub(crate) fn execute_event_trigger<'a>(
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
-        &context,
+        &mut context,
         invocation,
         TriggerTransition {
             definition: crate::storage::RelationDefinition::from_definition(&definition),
@@ -20308,7 +20314,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
-        &context,
+        &mut context,
         invocation,
         TriggerTransition {
             definition: crate::storage::RelationDefinition::from_definition(&definition),
@@ -20485,7 +20491,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
-        &context,
+        &mut context,
         invocation,
         TriggerTransition {
             definition: crate::storage::RelationDefinition::from_definition(&definition),
@@ -20648,7 +20654,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     initialize_trigger_locals(
-        &context,
+        &mut context,
         invocation,
         TriggerTransition {
             definition: crate::storage::RelationDefinition::from_definition(&definition),
@@ -21710,6 +21716,57 @@ fn eval_trigger_expression<'a>(
     eval_full(expression, context.arena, context.params, row, &hooks)
 }
 
+fn eval_procedural_expression<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    expression: &Expr<'a>,
+    row: &TriggerLocalScope<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let arena = context.arena;
+    let params = context.params;
+    let PlpgsqlExecHost::Routine {
+        engine,
+        guc,
+        sqlprep,
+        cursors,
+        ..
+    } = &mut context.host
+    else {
+        return eval_trigger_expression(context, expression, row);
+    };
+    let txid = context.txn.txid;
+    let snapshot = engine.storage.read_snapshot();
+    engine
+        .execute_retained_expression(
+            arena,
+            snapshot,
+            context.txn,
+            sqlprep,
+            cursors,
+            guc,
+            context.responder,
+            |storage, _work, sequences, invocations| {
+                let _scope = super::query::enter_routine_invocation_scope(Some(
+                    super::query::RoutineInvocationContext::new(invocations, arena),
+                ));
+                let catalog = super::query::storage_catalog(storage, arena, txid);
+                let subqueries = super::query::ProceduralSubqueries { storage, txid };
+                let hooks = EvalHooks {
+                    catalog: Some(&catalog),
+                    sequences: Some(sequences),
+                    subquery_executor: Some(&subqueries),
+                    ..NO_HOOKS
+                };
+                eval_full(expression, arena, params, row, &hooks)
+            },
+        )
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL expression exceeds the send buffer"
+            )
+        })?
+}
+
 #[derive(Clone, Copy)]
 enum DynamicCommandKind {
     Statement,
@@ -21717,12 +21774,12 @@ enum DynamicCommandKind {
 }
 
 fn bind_plpgsql_dynamic_query<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     kind: DynamicCommandKind,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
-    let command = eval_trigger_expression(context, query.command, scope)?;
+    let command = eval_procedural_expression(context, query.command, scope)?;
     if command.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -21738,20 +21795,25 @@ fn bind_plpgsql_dynamic_query<'a>(
         .arena
         .alloc_slice_with(query.arguments.len(), |_| 0)
         .map_err(|_| super::query::arena_full_pub())?;
-    let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
-    let hooks = EvalHooks {
-        catalog: Some(&catalog),
-        ..NO_HOOKS
-    };
+    {
+        let catalog =
+            super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..NO_HOOKS
+        };
+        for (index, expression) in query.arguments.iter().copied().enumerate() {
+            parameter_types[index] =
+                match super::eval::expression_type_identity(expression, scope, &hooks)? {
+                    super::eval::ExpressionTypeIdentity::Known(oid) => oid,
+                    // A USING expression is a standalone PL/pgSQL SELECT target.
+                    super::eval::ExpressionTypeIdentity::Unresolved => super::types::oid::TEXT,
+                };
+        }
+    }
     for (index, expression) in query.arguments.iter().copied().enumerate() {
-        parameter_types[index] =
-            match super::eval::expression_type_identity(expression, scope, &hooks)? {
-                super::eval::ExpressionTypeIdentity::Known(oid) => oid,
-                // A USING expression is a standalone PL/pgSQL SELECT target.
-                super::eval::ExpressionTypeIdentity::Unresolved => super::types::oid::TEXT,
-            };
         arguments[index] = detached_trigger_datum(
-            eval_trigger_expression(context, expression, scope)?,
+            eval_procedural_expression(context, expression, scope)?,
             context.arena,
         )?;
     }
@@ -21902,17 +21964,6 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
             "PL/pgSQL dynamic query must be SELECT, VALUES, or a set operation"
         )),
     })
-}
-
-fn execute_plpgsql_dynamic_query<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
-    query: PlpgsqlDynamicQuery<'a>,
-    scope: &TriggerLocalScope<'_, 'a>,
-    sequence: &dyn crate::sql::eval::SequenceAccess,
-    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
-) -> Result<(), SqlError> {
-    let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
-    execute_bound_plpgsql_dynamic_query(context, query, sequence, emit)
 }
 
 /// Executes a parsed dynamic data-modifying statement through the same
@@ -24157,7 +24208,7 @@ fn empty_plpgsql_local<'a>() -> TriggerLocalDecl<'a> {
 }
 
 fn initialize_trigger_locals<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     invocation: TriggerInvocation<'a>,
     transition: TriggerTransition<'_, '_, 'a>,
     locals: &[TriggerLocalDecl<'a>],
@@ -24187,7 +24238,7 @@ fn initialize_trigger_locals<'a>(
             invocation,
             transition: &transition,
         };
-        let value = eval_trigger_expression(context, initial, &scope)?;
+        let value = eval_procedural_expression(context, initial, &scope)?;
         values[index] = coerce_plpgsql_local(context, *local, value)?;
     }
     Ok(())
@@ -24324,7 +24375,7 @@ fn assign_trigger_local<'a>(
 fn trigger_format_message<'a>(
     format: &str,
     arguments: &[&'a Expr<'a>],
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<192>, SqlError> {
     use core::fmt::Write as _;
@@ -24341,7 +24392,7 @@ fn trigger_format_message<'a>(
             let _ = message.write_char('%');
             continue;
         }
-        let value = eval_trigger_expression(context, arguments[argument], scope)?;
+        let value = eval_procedural_expression(context, arguments[argument], scope)?;
         argument += 1;
         if value.is_null() {
             let _ = message.write_str("<NULL>");
@@ -24358,12 +24409,12 @@ fn trigger_format_message<'a>(
     Ok(message)
 }
 
-fn trigger_diagnostic_text<const N: usize>(
-    expression: &Expr<'_>,
-    context: &TriggerExecContext<'_, '_, '_>,
-    scope: &TriggerLocalScope<'_, '_>,
+fn trigger_diagnostic_text<'a, const N: usize>(
+    expression: &Expr<'a>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<N>, SqlError> {
-    let value = eval_trigger_expression(context, expression, scope)?;
+    let value = eval_procedural_expression(context, expression, scope)?;
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -24380,10 +24431,10 @@ fn trigger_diagnostic_text<const N: usize>(
     Ok(value)
 }
 
-fn trigger_raise_sqlstate(
-    state: TriggerRaiseSqlState<'_>,
-    context: &TriggerExecContext<'_, '_, '_>,
-    scope: &TriggerLocalScope<'_, '_>,
+fn trigger_raise_sqlstate<'a>(
+    state: TriggerRaiseSqlState<'a>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<crate::sql::eval::SqlState, SqlError> {
     match state {
         TriggerRaiseSqlState::Parsed(state) => Ok(state),
@@ -24407,7 +24458,7 @@ fn trigger_notice_to_sql(_: WireFull) -> SqlError {
     reason = "a trigger condition evaluates against the complete typed firing context"
 )]
 fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
     definition: &crate::storage::TableDefinition<Definition0>,
     invocation: TriggerInvocation<'a>,
@@ -24417,7 +24468,7 @@ fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
     values: &[Datum<'a>],
     found: Option<bool>,
 ) -> Result<bool, SqlError> {
-    match eval_trigger_expression(
+    match eval_procedural_expression(
         context,
         expression,
         &TriggerLocalScope {
@@ -24517,7 +24568,7 @@ where
 }
 
 fn materialize_plpgsql_dynamic_for_query<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     record_target: bool,
@@ -24739,7 +24790,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             invocation,
                             transition: &transition,
                         };
-                        match eval_trigger_expression(context, expression, &scope)? {
+                        match eval_procedural_expression(context, expression, &scope)? {
                             Datum::Record(fields) => {
                                 if fields.len() > values.len() {
                                     return Err(sql_err!(
@@ -24843,12 +24894,18 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
+                let query = bind_plpgsql_dynamic_query(
+                    context,
+                    query,
+                    &scope,
+                    DynamicCommandKind::Statement,
+                )?;
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
                     context.seq_session(),
                     context.txn.txid,
                 );
-                execute_plpgsql_dynamic_query(context, query, &scope, &sequence, &mut |values| {
+                execute_bound_plpgsql_dynamic_query(context, query, &sequence, &mut |values| {
                     if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -24885,7 +24942,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             invocation,
                             transition: &transition,
                         };
-                        TriggerReturnValue::Value(eval_trigger_expression(
+                        TriggerReturnValue::Value(eval_procedural_expression(
                             context, expression, &scope,
                         )?)
                     }
@@ -24944,7 +25001,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     context.txn.txid,
                     context.arena,
                 )?;
-                let value = eval_trigger_expression(context, assignment.expression, &scope)?;
+                let value = eval_procedural_expression(context, assignment.expression, &scope)?;
                 let value = coerce_assignment(
                     value,
                     &definition.columns()[column],
@@ -24970,7 +25027,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
-                let value = eval_trigger_expression(context, assignment.expression, &scope)?;
+                let value = eval_procedural_expression(context, assignment.expression, &scope)?;
                 if locals.iter().any(|local| local.name == assignment.name) {
                     assign_trigger_local(context, locals, local_values, assignment.name, value)?;
                     let local = trigger_local_index(locals, assignment.name)?;
@@ -25048,15 +25105,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         }
                     }
                     PlpgsqlCursorQuery::Dynamic(query) => {
-                        let bound = resolve_plpgsql_dynamic_prepared(
+                        let bound = bind_plpgsql_dynamic_query(
                             context,
-                            bind_plpgsql_dynamic_query(
-                                context,
-                                query,
-                                &scope,
-                                DynamicCommandKind::Cursor,
-                            )?,
+                            query,
+                            &scope,
+                            DynamicCommandKind::Cursor,
                         )?;
+                        let bound = resolve_plpgsql_dynamic_prepared(context, bound)?;
                         if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
                             return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
                         }
@@ -25505,15 +25560,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 let mut selected = [Datum::Null; MAX_COLUMNS];
                 let mut found = false;
                 let mut row_count = 0usize;
-                let query = resolve_plpgsql_dynamic_prepared(
+                let query = bind_plpgsql_dynamic_query(
                     context,
-                    bind_plpgsql_dynamic_query(
-                        context,
-                        statement.query,
-                        &scope,
-                        DynamicCommandKind::Statement,
-                    )?,
+                    statement.query,
+                    &scope,
+                    DynamicCommandKind::Statement,
                 )?;
+                let query = resolve_plpgsql_dynamic_prepared(context, query)?;
                 with_bound_parameter_types(query.parameter_types, || {
                     let record_target = statement.targets.len() == 1
                         && matches!(
@@ -25760,15 +25813,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     invocation,
                     transition: &transition,
                 };
-                let query = resolve_plpgsql_dynamic_prepared(
+                let query = bind_plpgsql_dynamic_query(
                     context,
-                    bind_plpgsql_dynamic_query(
-                        context,
-                        query,
-                        &scope,
-                        DynamicCommandKind::Statement,
-                    )?,
+                    query,
+                    &scope,
+                    DynamicCommandKind::Statement,
                 )?;
+                let query = resolve_plpgsql_dynamic_prepared(context, query)?;
                 with_bound_parameter_types(query.parameter_types, || {
                     let row_count = match query.statement {
                         Stmt::Select(_) | Stmt::SetQuery(_) => {
@@ -25909,7 +25960,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 };
                 let message = match assertion.message {
                     Some(message) => {
-                        let value = eval_trigger_expression(context, message, &scope)?;
+                        let value = eval_procedural_expression(context, message, &scope)?;
                         if value.is_null() {
                             stack_format!(192, "assertion failed")
                         } else {
@@ -26509,15 +26560,15 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             transition: &transition,
                         };
                         let lower = trigger_loop_integer(
-                            eval_trigger_expression(context, lower, &scope)?,
+                            eval_procedural_expression(context, lower, &scope)?,
                             context.arena,
                         )?;
                         let upper = trigger_loop_integer(
-                            eval_trigger_expression(context, upper, &scope)?,
+                            eval_procedural_expression(context, upper, &scope)?,
                             context.arena,
                         )?;
                         let step = trigger_loop_integer(
-                            eval_trigger_expression(context, step, &scope)?,
+                            eval_procedural_expression(context, step, &scope)?,
                             context.arena,
                         )?;
                         if step <= 0 {
@@ -26817,7 +26868,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 invocation,
                                 transition: &transition,
                             };
-                            let array = eval_trigger_expression(context, expression, &scope)?;
+                            let array = eval_procedural_expression(context, expression, &scope)?;
                             let Datum::Array { element, raw } = array else {
                                 if array.is_null() {
                                     return Ok(None);
@@ -27032,7 +27083,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 for branch in program.branches {
                     let selected = match branch.condition {
                         None => true,
-                        Some(condition) => match eval_trigger_expression(
+                        Some(condition) => match eval_procedural_expression(
                             context,
                             condition,
                             &TriggerLocalScope {
@@ -27097,11 +27148,11 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 };
                 let operand = program
                     .operand
-                    .map(|expression| eval_trigger_expression(context, expression, &scope))
+                    .map(|expression| eval_procedural_expression(context, expression, &scope))
                     .transpose()?;
                 let mut selected = None;
                 for branch in program.branches {
-                    let value = eval_trigger_expression(context, branch.when, &scope)?;
+                    let value = eval_procedural_expression(context, branch.when, &scope)?;
                     let matches = match operand {
                         Some(operand) => {
                             let catalog = crate::sql::query::storage_catalog(
@@ -27980,7 +28031,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
         let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
-            &context,
+            &mut context,
             invocation,
             TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
@@ -38599,6 +38650,10 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
 }
 
 impl ColTypeResolver for RuleConditionColumns<'_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_enum_input_literal(text, target_oid)
+    }
+
     fn type_name_fixed(&self, oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
         self.catalog.type_name_fixed(oid)
     }

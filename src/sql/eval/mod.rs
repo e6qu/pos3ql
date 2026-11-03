@@ -693,6 +693,17 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "enum input validation requires a catalog"
+                )
+            })?
+            .validate_enum_input_literal(text, target_oid)
+    }
+
     fn validate_explicit_cast(
         &self,
         source: i32,
@@ -1253,6 +1264,13 @@ pub enum RoutineCallTarget<'name> {
 }
 
 pub trait CatalogAccess {
+    fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input validation requires a catalog"
+        ))
+    }
+
     fn validate_explicit_cast(
         &self,
         source: i32,
@@ -2506,13 +2524,18 @@ fn catalog_evaluation(
             if found.is_none()
                 && let Some((kind, _, _)) = crate::storage::NamedTypeKind::from_oid(target)
             {
-                // Enum input needs this catalog even when no pg_cast row is
-                // involved. Domains and composite fields can execute checks.
-                found = Some(if kind == crate::storage::NamedTypeKind::Enum {
-                    ExpressionEvaluation::Immutable
-                } else {
-                    ExpressionEvaluation::Runtime
-                });
+                // UNKNOWN labels have already passed effect-free type input.
+                // Typed text uses stable enum input at runtime; domain and
+                // composite conversions can execute checks.
+                found = Some(
+                    if kind == crate::storage::NamedTypeKind::Enum
+                        && (source == super::types::oid::UNKNOWN || source == target)
+                    {
+                        ExpressionEvaluation::Immutable
+                    } else {
+                        ExpressionEvaluation::Runtime
+                    },
+                );
             }
             if *binding == CastBinding::Resolve
                 && let Some(ColType::Array(element)) =
@@ -2527,10 +2550,23 @@ fn catalog_evaluation(
                     element,
                     &columns,
                     &mut |source, target| {
-                        if found != Some(ExpressionEvaluation::Runtime)
-                            && let Some(evaluation) = catalog.cast_evaluation(source, target)?
-                        {
-                            found = Some(evaluation);
+                        if found != Some(ExpressionEvaluation::Runtime) {
+                            if let Some(evaluation) = catalog.cast_evaluation(source, target)? {
+                                found = Some(evaluation);
+                            } else if let Some((kind, _, _)) =
+                                crate::storage::NamedTypeKind::from_oid(target)
+                            {
+                                found = Some(
+                                    if kind == crate::storage::NamedTypeKind::Enum
+                                        && (source == super::types::oid::UNKNOWN
+                                            || source == target)
+                                    {
+                                        ExpressionEvaluation::Immutable
+                                    } else {
+                                        ExpressionEvaluation::Runtime
+                                    },
+                                );
+                            }
                         }
                         Ok(())
                     },

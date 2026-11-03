@@ -645,6 +645,16 @@ pub(crate) fn visit_catalog_rowtype_fields(
 }
 
 impl ColTypeResolver for CatalogCols<'_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_enum_input_literal(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.definition.is_none()
     }
@@ -1917,6 +1927,13 @@ pub(crate) fn function_lookup_error(
 }
 
 pub trait ColTypeResolver {
+    fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input validation requires a catalog"
+        ))
+    }
+
     /// True only when no relation scope can answer a column reference.
     fn is_empty_scope(&self) -> bool {
         false
@@ -4256,6 +4273,11 @@ pub(crate) fn visit_array_constructor_conversions(
         if matches!(item, Expr::Array(_)) {
             visit_array_constructor_conversions(item, target, columns, visit)?;
         } else {
+            if let Expr::Str(text) = item
+                && matches!(target.to_coltype(), ColType::Enum(_))
+            {
+                columns.validate_enum_input_literal(text, target_oid)?;
+            }
             visit(infer_routine_argument_oid(item, columns)?, target_oid)?;
         }
     }
@@ -5064,6 +5086,12 @@ pub fn infer_type_res(
                 infer_type_res(operand, columns)?;
             }
             if let (Some(target), Some(target_oid)) = (target, target_oid) {
+                if let Expr::Str(text) = operand
+                    && (matches!(target, ColType::Enum(_))
+                        || matches!(target, ColType::Array(element) if matches!(element.to_coltype(), ColType::Enum(_))))
+                {
+                    columns.validate_enum_input_literal(text, target_oid)?;
+                }
                 let source_oid =
                     if matches!(*operand, Expr::Array(_)) && matches!(target, ColType::Array(_)) {
                         target_oid

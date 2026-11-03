@@ -1920,6 +1920,16 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_enum_input_literal(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }

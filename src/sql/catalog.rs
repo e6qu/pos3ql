@@ -4213,6 +4213,57 @@ pub(crate) fn require_cast_context(
     ))
 }
 
+/// UNKNOWN literals use the base type's input routine during SQL analysis.
+/// Domain constraints and registered conversion functions remain runtime work.
+pub(crate) fn validate_enum_input_literal(
+    storage: &Storage,
+    txid: u32,
+    text: &str,
+    target_oid: i32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let target = super::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    });
+    let (creation, array) = match target {
+        Some(ColType::Enum(creation)) => (creation, false),
+        Some(ColType::Array(element)) if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            let ColType::Enum(creation) = element.to_coltype() else {
+                unreachable!()
+            };
+            (creation, true)
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "enum input type identity is unavailable"
+            ));
+        }
+    };
+    arena
+        .with_remaining_region(|scratch| {
+            if array {
+                super::exec::coerce_user_type_array(
+                    Datum::Text(text),
+                    super::types::ArrElem::Enum(creation),
+                    storage,
+                    txid,
+                    scratch,
+                )?;
+            } else {
+                super::exec::coerce_enum_value(
+                    Datum::Text(text),
+                    creation,
+                    storage,
+                    txid,
+                    scratch,
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
 pub(crate) fn validate_explicit_cast(
     storage: &Storage,
     txid: u32,

@@ -20,6 +20,7 @@ mod key_preparation;
 mod object_reads;
 mod oid_alias_comparisons;
 mod prepared_object_capacity;
+mod procedural_expression_calls;
 mod query_execution;
 mod routine_calls;
 mod routine_selection;

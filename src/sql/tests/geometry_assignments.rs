@@ -1,7 +1,9 @@
 use super::*;
 
 // PostgreSQL 18.6 reference SQL SHA256:
-// 9d652291010b05af1db990218c988f1290d3d42bc115096c8717858096b8430d.
+// 9d652291010b05af1db990218c988f1290d3d42bc115096c8717858096b8430d;
+// 4b14060536a8a0532fcb8289fb5e0a12906c2560adc8d46ca64643e2e67ec050;
+// f275e93197dc099df1eeed76bcf49fe3b91835e1c1c9a3a1e207026c028343ea.
 #[test]
 fn named_array_folding_retains_empty_constructor_context() {
     for mode in [
@@ -33,6 +35,49 @@ fn named_array_folding_retains_empty_constructor_context() {
                 true
             )),
             ["22P02"]
+        );
+        // PostgreSQL input admission and stable text coercion differ even
+        // when WHERE or CASE will discard the expression.
+        for sql in [
+            "SELECT 'missing'::fold_enum WHERE false",
+            "SELECT CASE WHEN false THEN 'missing'::fold_enum ELSE 'a'::fold_enum END",
+            "SELECT CASE WHEN false THEN ARRAY['missing']::fold_enum[] ELSE ARRAY['a']::fold_enum[] END",
+            "SELECT 'missing'::fold_domain WHERE false",
+            "SELECT ARRAY['missing']::fold_domain[] WHERE false",
+        ] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, sql, true)),
+                ["22P02"],
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT 'missing'::text::fold_enum WHERE false",
+            "SELECT ARRAY['missing'::text]::fold_enum[] WHERE false",
+            "SELECT '{missing}'::text::fold_enum[] WHERE false",
+            "SELECT 'a'::fold_enum,'a'::text::fold_enum WHERE false",
+            "SELECT 'b'::fold_domain WHERE false",
+            "SELECT ARRAY['b']::fold_domain[] WHERE false",
+        ] {
+            assert!(
+                data_rows(&session.success(&mut engine, sql, true)).is_empty(),
+                "{sql}"
+            );
+        }
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT CASE WHEN false THEN 'missing'::text::fold_enum ELSE 'a'::fold_enum END; \
+             SELECT CASE WHEN false THEN ARRAY['missing'::text]::fold_enum[] ELSE ARRAY['a']::fold_enum[] END; \
+             SELECT CASE WHEN false THEN 'a'::fold_enum ELSE 'b'::fold_enum END; \
+             SELECT CASE WHEN false THEN 'a'::text::fold_enum ELSE 'b'::fold_enum END", true)),
+            ["a", "{a}", "b", "b"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT 'a'::fold_enum,'{a}'::fold_enum[],ARRAY['a']::fold_enum[] \
+             FROM generate_series(1,2) AS source(id) ORDER BY id",
+                true
+            )),
+            ["a|{a}|{a}", "a|{a}|{a}"]
         );
     }
 }

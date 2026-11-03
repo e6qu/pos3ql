@@ -63,6 +63,12 @@ A PL/pgSQL statement keeps its own plan across calls; dynamic `EXECUTE` makes
 a new plan each time.
 Unreached branches must not run constraints. Verify these differences against
 PostgreSQL, including function settings and `check_function_bodies=off`.
+Extended-protocol Bind must validate parameters before planning function inputs,
+retain decoded values through planning waits, and publish its portal only after
+preparation succeeds. Closing or cancelling one portal must release its plan
+without changing another portal's checked values. Verify cache changes across
+schema edits, commit, rollback, search paths and roles against PostgreSQL;
+unrelated table changes must not repeat a constraint.
 Keep completed inputs while rolling back and safely replaying the unfinished
 input within its original deadline. Demonstrate the complete behavior in CI
 before closing this acceptance item.

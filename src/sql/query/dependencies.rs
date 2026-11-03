@@ -206,6 +206,24 @@ pub(crate) fn collect(
     Ok(dependencies)
 }
 
+pub(crate) fn collect_runtime_statement(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let path = storage.path();
+    collect_statement(
+        statement,
+        storage,
+        txid,
+        dependencies,
+        arena,
+        CollectionContext::ordinary(&path, None),
+    )
+}
+
 pub(crate) fn collect_routine_parameter_defaults(
     parameters: &[crate::storage::RoutineParameterDef],
     inputs: &[crate::storage::StoredInputSource<'_>],
@@ -1645,7 +1663,7 @@ pub(crate) fn visit_projection_types(
     txid: u32,
     arena: &Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
-    visit: &mut dyn FnMut(i32) -> Result<(), SqlError>,
+    visit: &mut dyn FnMut(i32, crate::sql::ast::Collation) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
@@ -1662,8 +1680,8 @@ pub(crate) fn visit_projection_types(
                 arena,
                 Some(&mut oids),
             )?;
-            for oid in &oids[..count] {
-                visit(*oid)?;
+            for (oid, column) in oids[..count].iter().zip(&columns[..count]) {
+                visit(*oid, column.collation)?;
             }
             return Ok(());
         }
@@ -1692,6 +1710,11 @@ pub(crate) fn visit_projection_types(
             match item {
                 SelectItem::Expr { expression, .. } => visit(
                     crate::sql::exec::infer_routine_argument_oid(expression, &columns)?,
+                    crate::sql::eval::routine_input_collation(
+                        &[expression],
+                        &columns,
+                        Some(&catalog),
+                    )?,
                 )?,
                 SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
                     if let Some(scope) = &scope {
@@ -1716,7 +1739,7 @@ pub(crate) fn visit_projection_types(
                                             "source column type identity is unavailable"
                                         )
                                     })?;
-                            visit(metadata.type_oid)?;
+                            visit(metadata.type_oid, metadata.collation)?;
                         }
                     }
                 }
@@ -1727,7 +1750,7 @@ pub(crate) fn visit_projection_types(
                         &columns,
                         |_, metadata| {
                             if result.is_ok() {
-                                result = visit(metadata.type_oid);
+                                result = visit(metadata.type_oid, metadata.collation);
                             }
                         },
                     )?;
@@ -1745,7 +1768,7 @@ pub(crate) fn visit_projection_types(
         }
         Ok(())
     })();
-    // Visitors receive only OIDs; retained cast snapshots use the persistent tail.
+    // Visitors receive copied type/collation facts; retained casts use the persistent tail.
     // Drop schema owners before releasing their temporary definitions and syntax.
     unsafe { arena.rewind_to(mark) };
     result
@@ -2101,6 +2124,46 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         [&'definition str; 2],
     )>,
     arena: &'storage Arena,
+}
+
+impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
+    fn lookup(&self, _: Option<&str>, _: &str) -> Result<crate::sql::types::Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "schema analysis cannot read row values"
+        ))
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.resolve(qualifier, name)
+    }
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.resolve(qualifier, name).ok()
+    }
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.column_meta(qualifier, name)
+            .map_or(crate::sql::ast::Collation::None, |metadata| {
+                metadata.collation
+            })
+    }
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.storage
+            .routine_result_for_oid(self.column_meta(qualifier, name)?.type_oid, self.txid)?
+            .user_type
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        crate::sql::exec::record_field_metadata(base, field, self)
+            .map_or(crate::sql::ast::Collation::None, |metadata| {
+                metadata.collation
+            })
+    }
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {

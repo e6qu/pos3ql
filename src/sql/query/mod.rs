@@ -277,6 +277,7 @@ pub(crate) fn parse_stored_rule_statement<'a>(
 
 pub(crate) use dependencies::collect as collect_query_dependencies;
 pub(crate) use dependencies::collect_routine_parameter_defaults;
+pub(crate) use dependencies::collect_runtime_statement;
 pub(crate) use dependencies::{
     for_each_dml_assignment, validate_dml_assignment_casts, visit_dml_assignment_types,
     visit_projection_types,
@@ -2017,6 +2018,8 @@ pub(super) enum RoutineInputContext {
 pub(super) struct RoutineCallInputs<'call, 'expression> {
     pub arguments: &'call [&'expression Expr<'expression>],
     pub argument_type_oids: &'call [i32],
+    pub argument_collation:
+        &'call dyn Fn(&'expression Expr<'expression>) -> Result<super::ast::Collation, SqlError>,
     pub mapping: &'call [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
     pub variadic: bool,
     pub context: RoutineInputContext,
@@ -2040,6 +2043,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let RoutineCallInputs {
             arguments,
             argument_type_oids,
+            argument_collation,
             mapping,
             variadic,
             context,
@@ -2156,13 +2160,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
         let coerce_input = |value,
                             source,
                             argument: crate::storage::RoutineArgumentDef,
-                            expected| {
+                            expected,
+                            input_collation| {
             if source != expected
                 && let Some(value) = self.execute_defined_cast(
                     source,
                     expected,
                     value,
                     super::eval::DefinedCastContext::Implicit,
+                    input_collation,
                     arena,
                 )?
             {
@@ -2247,7 +2253,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             target: expected,
                         },
                         arena,
-                        || coerce_input(evaluate(expression)?, source, argument, expected),
+                        || {
+                            coerce_input(
+                                evaluate(expression)?,
+                                source,
+                                argument,
+                                expected,
+                                argument_collation(expression)?,
+                            )
+                        },
                     )?;
                     constant_values[call_index] = Some(value);
                     // A null array member does not make the array null.
@@ -2267,7 +2281,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
                             target: expected,
                         },
                         arena,
-                        || coerce_input(evaluate(expression)?, source, argument, expected),
+                        || {
+                            coerce_input(
+                                evaluate(expression)?,
+                                source,
+                                argument,
+                                expected,
+                                argument_collation(expression)?,
+                            )
+                        },
                     )?;
                     constant_defaults[input_index] = Some(value);
                     constant_null |= value.is_null();
@@ -2319,6 +2341,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 argument_type_oids[call_index],
                                 argument,
                                 expected,
+                                argument_collation(expression)?,
                             )
                         },
                     )?,
@@ -2362,6 +2385,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                                 input_type_oids[input_index],
                                 argument,
                                 expected,
+                                argument_collation(expression)?,
                             )
                         },
                     )?,
@@ -2480,12 +2504,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
         target_oid: i32,
         value: Datum<'a>,
         context: super::eval::DefinedCastContext,
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         let Some(cast) = self.bind_defined_cast(source_oid, target_oid, context)? else {
             return Ok(None);
         };
-        self.execute_bound_cast(&cast, value, arena).map(Some)
+        self.execute_bound_cast(&cast, value, input_collation, arena)
+            .map(Some)
     }
 
     fn execute_cast_path<'a>(
@@ -2494,6 +2520,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         source_oid: i32,
         target_oid: i32,
         value: Datum<'a>,
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         let source_base = self
@@ -2510,6 +2537,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 source_base.unwrap_or(source_oid),
                 target_base.unwrap_or(target_oid),
                 value,
+                input_collation,
                 arena,
             )?;
             return if target_base.is_some() {
@@ -2562,6 +2590,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         source.element_oid(),
                         target.element_oid(),
                         input,
+                        input_collation,
                         arena,
                     )?;
                 }
@@ -2607,7 +2636,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     slot,
                     &routine,
                     &arguments[..routine.argument_count],
-                    super::ast::Collation::None,
+                    input_collation,
                     arena,
                 )?
                 .unwrap_or(Datum::Null)
@@ -2616,16 +2645,25 @@ impl StorageCatalog<'_, '_, '_, '_> {
         self.coerce_result(result, cast.target, arena)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected operator contract includes its expression collation"
+    )]
     fn execute_catalog_operator<'a>(
         &self,
         schema: Option<&str>,
         name: &str,
         arguments: &[Datum<'a>],
         argument_type_oids: &[i32],
+        input_collation: super::ast::Collation,
+        argument_collations: &[super::ast::Collation],
         nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
     ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
-        if arguments.len() != argument_type_oids.len() || !(1..=2).contains(&arguments.len()) {
+        if arguments.len() != argument_type_oids.len()
+            || arguments.len() != argument_collations.len()
+            || !(1..=2).contains(&arguments.len())
+        {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "operator expression has an invalid argument contract"
@@ -2730,6 +2768,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 expected_oid,
                 arguments[index],
                 super::eval::DefinedCastContext::Implicit,
+                argument_collations[index],
                 arena,
             )? {
                 value
@@ -2763,7 +2802,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             function,
             &self.storage.routine_for(function, self.txid),
             &coerced[..expected_count],
-            super::ast::Collation::None,
+            input_collation,
             arena,
         )?
         .ok_or_else(|| {
@@ -4113,12 +4152,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )?))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected routine keeps call and argument collations alongside its evaluator"
+    )]
     fn call_routine<'a>(
         &self,
         target: super::eval::RoutineCallTarget<'_>,
         arguments: &[&'a Expr<'a>],
         argument_type_oids: &[i32],
         input_collation: super::ast::Collation,
+        argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<super::ast::Collation, SqlError>,
         evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -4136,6 +4180,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 bound_strict,
             } => (oid, argument_mapping, variadic, bound_strict),
             super::eval::RoutineCallTarget::Operator { schema, name } => {
+                let collations = arena
+                    .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
+                    .map_err(|_| arena_full())?;
+                for (output, expression) in collations.iter_mut().zip(arguments) {
+                    *output = argument_collation(expression)?;
+                }
                 let values = arena
                     .alloc_slice_with(arguments.len(), |_| Datum::Null)
                     .map_err(|_| arena_full())?;
@@ -4148,6 +4198,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         name,
                         values,
                         argument_type_oids,
+                        input_collation,
+                        collations,
                         super::eval::OperatorNulls::RoutineStrictness,
                         arena,
                     )?
@@ -4181,6 +4233,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             RoutineCallInputs {
                 arguments,
                 argument_type_oids,
+                argument_collation,
                 mapping: &mapping,
                 variadic,
                 context: RoutineInputContext::Scalar,
@@ -4212,6 +4265,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         oid: i32,
         arguments: &[Datum<'a>],
         argument_type_oids: &[i32],
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         let Some(slot) = self.storage.routine_slot_by_oid(oid, self.txid) else {
@@ -4261,6 +4315,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         target,
                         arguments[index],
                         super::eval::DefinedCastContext::Implicit,
+                        input_collation,
                         arena,
                     )? {
                     value
@@ -4301,13 +4356,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(
-            slot,
-            &routine,
-            arguments,
-            super::ast::Collation::None,
-            arena,
-        )
+        self.execute_routine(slot, &routine, arguments, input_collation, arena)
     }
 
     fn cast_evaluation(
@@ -4409,9 +4458,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         cast: &super::eval::BoundCast,
         value: Datum<'a>,
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        self.execute_cast_path(cast, cast.source_oid, cast.target_oid, value, arena)
+        self.execute_cast_path(
+            cast,
+            cast.source_oid,
+            cast.target_oid,
+            value,
+            input_collation,
+            arena,
+        )
     }
 
     fn cast_defined<'a>(
@@ -4420,9 +4477,17 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         target_oid: i32,
         value: Datum<'a>,
         context: super::eval::DefinedCastContext,
+        input_collation: super::ast::Collation,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        self.execute_defined_cast(source_oid, target_oid, value, context, arena)
+        self.execute_defined_cast(
+            source_oid,
+            target_oid,
+            value,
+            context,
+            input_collation,
+            arena,
+        )
     }
 
     fn operator_first_argument_type(
@@ -4441,15 +4506,30 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(|meta| meta.map(|meta| meta.type_oid))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "operator keeps selected and per-argument collations"
+    )]
     fn call_operator<'a>(
         &self,
         name: &str,
         arguments: [Datum<'a>; 2],
         argument_type_oids: [i32; 2],
+        input_collation: super::ast::Collation,
+        argument_collations: [super::ast::Collation; 2],
         nulls: super::eval::OperatorNulls,
         arena: &'a Arena,
     ) -> Result<Option<super::eval::OperatorEvaluation<'a>>, SqlError> {
-        self.execute_catalog_operator(None, name, &arguments, &argument_type_oids, nulls, arena)
+        self.execute_catalog_operator(
+            None,
+            name,
+            &arguments,
+            &argument_type_oids,
+            input_collation,
+            &argument_collations,
+            nulls,
+            arena,
+        )
     }
 
     fn subquery_type(

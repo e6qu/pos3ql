@@ -192,6 +192,7 @@ pub(crate) struct AggState<'a> {
     custom_moving_state_oid: i32,
     custom_direct_oids: &'a [i32],
     custom_argument_oids: &'a [i32],
+    custom_input_collation: Collation,
     star: bool,
     count: u64,
     sum_int: i128,
@@ -469,6 +470,7 @@ impl Default for AggState<'_> {
             custom_moving_state_oid: 0,
             custom_direct_oids: &[],
             custom_argument_oids: &[],
+            custom_input_collation: Collation::None,
             star: false,
             count: 0,
             sum_int: 0,
@@ -666,6 +668,29 @@ impl<'a> AggState<'a> {
         let Some(aggregate) = self.custom else {
             return Ok(());
         };
+        let Expr::Call { args, order_by, .. } = node else {
+            unreachable!("aggregate state belongs to a call")
+        };
+        let mut expressions = [&Expr::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let count = if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+            args.len()
+        } else {
+            args.len() + order_by.len()
+        };
+        if count > expressions.len() {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_ARGUMENTS,
+                "aggregate has too many arguments"
+            ));
+        }
+        expressions[..args.len()].copy_from_slice(args);
+        if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+            for (output, ordering) in expressions[args.len()..count].iter_mut().zip(*order_by) {
+                *output = ordering.expression;
+            }
+        }
+        self.custom_input_collation =
+            crate::sql::eval::routine_input_collation(&expressions[..count], row, hooks.catalog)?;
         if self.custom_direct_initialized || aggregate.direct_argument_count == 0 {
             return Ok(());
         }
@@ -718,6 +743,7 @@ impl<'a> AggState<'a> {
                     serde.serialize_oid,
                     &[incoming],
                     &[self.custom_state_oid],
+                    self.custom_input_collation,
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -734,6 +760,7 @@ impl<'a> AggState<'a> {
                         crate::sql::types::oid::BYTEA,
                         crate::sql::types::oid::INTERNAL,
                     ],
+                    self.custom_input_collation,
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -766,6 +793,7 @@ impl<'a> AggState<'a> {
                     partial.combine_oid,
                     &[current, incoming],
                     &[self.custom_state_oid, self.custom_state_oid],
+                    self.custom_input_collation,
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -1253,6 +1281,7 @@ impl<'a> AggState<'a> {
                 moving.inverse_oid,
                 &arguments[..1 + args.len()],
                 &argument_type_oids[..1 + args.len()],
+                self.custom_input_collation,
                 arena,
             )?
             .ok_or_else(|| {
@@ -1598,6 +1627,7 @@ impl<'a> AggState<'a> {
                 transition_oid,
                 &arguments[..1 + values.len()],
                 &argument_type_oids[..1 + values.len()],
+                self.custom_input_collation,
                 arena,
             )?
             .ok_or_else(|| {
@@ -2743,6 +2773,7 @@ impl<'a> AggState<'a> {
                 final_function.function_oid,
                 &arguments[..count],
                 &argument_type_oids[..count],
+                self.custom_input_collation,
                 arena,
             )?
             .ok_or_else(|| {

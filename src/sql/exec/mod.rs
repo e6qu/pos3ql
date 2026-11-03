@@ -25011,6 +25011,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
                 source.value,
                 column,
                 PlannedAssignmentCast {
+                    input_collation: crate::sql::ast::Collation::None,
                     defined: cast.as_ref(),
                     site: None,
                 },
@@ -25792,11 +25793,17 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     context.txn.txid,
                     context.arena,
                 )?;
+                let input_collation = super::eval::routine_input_collation(
+                    &[assignment.expression],
+                    &scope,
+                    hooks.catalog,
+                )?;
                 let value = eval_procedural_expression(context, assignment.expression, &scope)?;
                 let value = coerce_assignment(
                     value,
                     &definition.columns()[column],
                     PlannedAssignmentCast {
+                        input_collation,
                         defined: cast.as_ref(),
                         site: None,
                     },
@@ -28369,7 +28376,7 @@ fn cursor_effect_error_fields<'a>(
     let copy = |text: &str| {
         arena
             .alloc_str(text)
-            .map(|text| Datum::Text(text))
+            .map(Datum::Text)
             .map_err(|_| super::query::arena_full_pub())
     };
     output[0] = copy(error.sqlstate.as_str())?;
@@ -74334,6 +74341,7 @@ pub(crate) fn coerce<'a>(
                 target_oid,
                 v,
                 crate::sql::eval::DefinedCastContext::Assignment,
+                crate::sql::ast::Collation::None,
                 arena,
             )? {
                 v = cast;
@@ -74345,12 +74353,14 @@ pub(crate) fn coerce<'a>(
 
 #[derive(Clone, Copy)]
 struct PlannedAssignmentCast<'a> {
+    input_collation: crate::sql::ast::Collation,
     defined: Option<&'a super::eval::BoundCast>,
     site: Option<super::type_inputs::AssignmentSite>,
 }
 
 impl PlannedAssignmentCast<'_> {
     const NONE: Self = Self {
+        input_collation: crate::sql::ast::Collation::None,
         defined: None,
         site: None,
     };
@@ -74387,6 +74397,7 @@ impl<'a> AssignmentCasts<'a> {
             .iter()
             .find(|entry| core::ptr::eq(entry.expression, expression) && entry.target_oid == target)
             .map(|entry| PlannedAssignmentCast {
+                input_collation: crate::sql::ast::Collation::None,
                 defined: entry.cast,
                 site: entry.site,
             })
@@ -74487,7 +74498,8 @@ fn eval_prepared_assignment<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let cast = casts.selected(expression, column, storage, txid)?;
+    let mut cast = casts.selected(expression, column, storage, txid)?;
+    cast.input_collation = super::eval::routine_input_collation(&[expression], row, hooks.catalog)?;
     let value = eval_full(expression, arena, params, row, hooks)?;
     coerce_assignment(value, column, cast, storage, txid, arena)
 }
@@ -74559,53 +74571,61 @@ fn prepare_insert_select_casts<'a>(
         .alloc_slice_with(count, |_| PlannedAssignmentCast::NONE)
         .map_err(|_| super::eval::arena_full())?;
     let mut index = 0;
-    super::query::visit_projection_types(select, storage, txid, arena, outer, &mut |source| {
-        let target = if statement.columns.is_empty() {
-            index
-        } else {
-            let name = statement.columns.get(index).ok_or_else(|| {
+    super::query::visit_projection_types(
+        select,
+        storage,
+        txid,
+        arena,
+        outer,
+        &mut |source, input_collation| {
+            let target = if statement.columns.is_empty() {
+                index
+            } else {
+                let name = statement.columns.get(index).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "INSERT has more expressions than target columns"
+                    )
+                })?;
+                definition
+                    .column_index(name)
+                    .ok_or_else(|| undefined_column(name))?
+            };
+            let column = definition.columns().get(target).ok_or_else(|| {
                 sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "INSERT has more expressions than target columns"
                 )
             })?;
-            definition
-                .column_index(name)
-                .ok_or_else(|| undefined_column(name))?
-        };
-        let column = definition.columns().get(target).ok_or_else(|| {
-            sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "INSERT has more expressions than target columns"
-            )
-        })?;
-        let selected = prepare_assignment_cast(source, column, storage, txid, arena)?;
-        let out = casts.get_mut(index).ok_or_else(|| {
-            sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "INSERT has more expressions than target columns"
-            )
-        })?;
-        let defined = selected
-            .map(|cast| {
-                arena
-                    .alloc_persistent_slice_with(1, |_| cast)
-                    .map(|values| &values[0])
-                    .map_err(|_| super::eval::arena_full())
-            })
-            .transpose()?;
-        *out = PlannedAssignmentCast {
-            defined,
-            site: statement.source_position.get().map(|statement_position| {
-                super::type_inputs::AssignmentSite {
-                    statement_position,
-                    node: super::type_inputs::AssignmentNode::SelectOutput { output: index },
-                }
-            }),
-        };
-        index += 1;
-        Ok(())
-    })?;
+            let selected = prepare_assignment_cast(source, column, storage, txid, arena)?;
+            let out = casts.get_mut(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "INSERT has more expressions than target columns"
+                )
+            })?;
+            let defined = selected
+                .map(|cast| {
+                    arena
+                        .alloc_persistent_slice_with(1, |_| cast)
+                        .map(|values| &values[0])
+                        .map_err(|_| super::eval::arena_full())
+                })
+                .transpose()?;
+            *out = PlannedAssignmentCast {
+                input_collation,
+                defined,
+                site: statement.source_position.get().map(|statement_position| {
+                    super::type_inputs::AssignmentSite {
+                        statement_position,
+                        node: super::type_inputs::AssignmentNode::SelectOutput { output: index },
+                    }
+                }),
+            };
+            index += 1;
+            Ok(())
+        },
+    )?;
     if !statement.columns.is_empty() && index != count {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -74666,10 +74686,17 @@ fn coerce_assignment<'a>(
     let _site = cast
         .site
         .map(|site| super::query::input_progress::enter_assignment(Some(site)));
+    let cast_input_collation = cast.input_collation;
     let value = match cast.defined {
         Some(cast) => {
             let catalog = super::query::storage_catalog(storage, arena, txid);
-            super::eval::CatalogAccess::execute_bound_cast(&catalog, cast, value, arena)?
+            super::eval::CatalogAccess::execute_bound_cast(
+                &catalog,
+                cast,
+                value,
+                cast_input_collation,
+                arena,
+            )?
         }
         None => value,
     };
@@ -74707,6 +74734,11 @@ fn eval_assignment<'a>(
         value,
         column,
         PlannedAssignmentCast {
+            input_collation: super::eval::routine_input_collation(
+                &[expression],
+                row,
+                hooks.catalog,
+            )?,
             defined: cast.as_ref(),
             site: None,
         },
@@ -75267,6 +75299,7 @@ fn coerce_composite_value_inner<'a>(
                 input[index].value,
                 &column,
                 PlannedAssignmentCast {
+                    input_collation: crate::sql::ast::Collation::None,
                     defined: cast.as_ref(),
                     site: None,
                 },

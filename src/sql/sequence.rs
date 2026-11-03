@@ -188,7 +188,7 @@ pub(super) fn enter_statement<'arena, 'session>(
     }
 }
 
-pub(super) fn finish_statement(session: &SeqSession) {
+pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
 }
 

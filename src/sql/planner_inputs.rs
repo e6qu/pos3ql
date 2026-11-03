@@ -263,10 +263,6 @@ fn capture<'a>(
     .map(Some)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a typed assignment retains its selected conversion and exact DML source site"
-)]
 fn capture_assignment<'a>(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
@@ -445,11 +441,11 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "planner admission shares the statement transaction, session, bounded arena and response sink"
     )]
-    pub(crate) fn prepare_planner_inputs<'a, 'source>(
+    pub(crate) fn prepare_planner_inputs<'source>(
         &mut self,
         statement: &Stmt<'source>,
         outer: Option<&dyn ColumnLookup<'source>>,
-        arena: &'a Arena,
+        arena: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut CursorPool,
@@ -473,11 +469,11 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "recursive planner admission retains explicit routine ancestry and statement execution context"
     )]
-    fn prepare_planner_inputs_under<'a, 'source>(
+    fn prepare_planner_inputs_under<'source>(
         &mut self,
         statement: &Stmt<'source>,
         outer: Option<&dyn ColumnLookup<'source>>,
-        arena: &'a Arena,
+        arena: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut CursorPool,

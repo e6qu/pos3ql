@@ -21,6 +21,9 @@ be traced to their shared cause and repaired before acceptance. Saved defaults
 and function inputs require recovery and effect-count regressions, including
 backend reuse, rejected inlining and cursor opening/fetch waits; passing a
 compiler gate alone does not establish their correctness.
+Bind preparation also requires parameter-error timing, retained-value and
+cancelled-portal regressions; cache invalidation needs PostgreSQL comparisons
+across schema changes and transaction boundaries.
 Current guarantees belong in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).
 

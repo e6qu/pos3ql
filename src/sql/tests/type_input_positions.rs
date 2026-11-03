@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn planner_constant_facts_release_numeric_scratch_without_heap_allocation() {
+    let config = test_config("planner-constant-scratch");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let arena = Arena::new(&mut budget, "planner constant scratch", 4096).unwrap();
+    let digits = "1234567890".repeat(40);
+    let literal = Expr::Str(&digits);
+    let expression = Expr::Cast {
+        source_position: ast::SourcePosition::UNKNOWN,
+        operand: &literal,
+        type_name: "numeric",
+        type_mod: -1,
+        binding: ast::CastBinding::Builtin,
+    };
+    let before = arena.used();
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..1024 {
+            assert_eq!(
+                planner_inputs::inline::constant_value(
+                    &expression,
+                    &exec::NoCols,
+                    &engine.storage,
+                    0,
+                    &arena,
+                )
+                .unwrap(),
+                Some(planner_inputs::inline::ConstantValue::NonNull),
+            );
+            assert_eq!(arena.used(), before);
+        }
+    });
+}
+
+#[test]
 fn expression_source_positions_do_not_change_grouping_or_ordering_identity() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -33,7 +67,8 @@ fn expression_source_positions_do_not_change_grouping_or_ordering_identity() {
 }
 
 #[test]
-fn implicit_assignment_cast_bodies_use_each_static_dml_site_once() {
+// PostgreSQL compares these assignment counts in differential/205_planner_checked_inputs.sql.
+fn assignment_cast_planner_attempts_share_one_backend_runtime_body() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -54,25 +89,25 @@ fn implicit_assignment_cast_bodies_use_each_static_dml_site_once() {
              CREATE TABLE assignment_values(id integer PRIMARY KEY,value text); \
              ALTER SEQUENCE assignment_input_checks RESTART WITH 1",true);
         for (query, expected) in [
-            ("INSERT INTO assignment_values VALUES(1,1),(2,2)", "2"),
+            ("INSERT INTO assignment_values VALUES(1,1),(2,2)", "3"),
             (
                 "INSERT INTO assignment_values SELECT value,value FROM generate_series(3,5) source(value)",
-                "3",
+                "4",
             ),
-            ("UPDATE assignment_values SET value=id", "4"),
+            ("UPDATE assignment_values SET value=id", "5"),
             (
                 "UPDATE assignment_values target SET value=source.value FROM (VALUES(1,11),(2,12)) source(id,value) WHERE target.id=source.id",
-                "5",
+                "6",
             ),
             (
                 "INSERT INTO assignment_values VALUES(1,'ignored'),(2,'ignored') ON CONFLICT(id) DO UPDATE SET value=excluded.id",
-                "6",
+                "7",
             ),
             (
                 "MERGE INTO assignment_values target USING (VALUES(1,21),(6,26)) source(id,value) ON target.id=source.id \
               WHEN MATCHED THEN UPDATE SET value=source.value \
               WHEN NOT MATCHED THEN INSERT(id,value) VALUES(source.id,source.value)",
-                "8",
+                "9",
             ),
         ] {
             session.success(&mut engine, query, true);
@@ -93,6 +128,65 @@ fn implicit_assignment_cast_bodies_use_each_static_dml_site_once() {
                 true
             )),
             ["1|21", "2|2", "3|3", "4|4", "5|5", "6|26"]
+        );
+    }
+}
+
+#[test]
+fn accepted_assignment_inline_inputs_follow_expanded_projection_positions() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("expanded-assignment-inputs-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE projection_checks; CREATE TYPE projection_choice AS ENUM('a'); \
+             CREATE DOMAIN projection_checked AS projection_choice CHECK(nextval('projection_checks')>0); \
+             CREATE FUNCTION projection_text(integer) RETURNS text LANGUAGE sql AS \
+             $$SELECT format('%s',$1) || CASE WHEN cardinality('{a}'::projection_checked[])=1 THEN '' ELSE '' END$$; \
+             CREATE CAST(integer AS text) WITH FUNCTION projection_text(integer) AS ASSIGNMENT; \
+             CREATE TABLE projection_values(id integer PRIMARY KEY,value text); \
+             ALTER SEQUENCE projection_checks RESTART WITH 1", true);
+        for (query, expected) in [
+            (
+                "INSERT INTO projection_values(value,id) SELECT value,id FROM (VALUES(11,1)) source(value,id)",
+                "1",
+            ),
+            (
+                "INSERT INTO projection_values(value,id) SELECT * FROM (VALUES(22,2)) source(value,id)",
+                "2",
+            ),
+            (
+                "INSERT INTO projection_values(value,id) SELECT source.* FROM (VALUES(33,3)) source(value,id)",
+                "3",
+            ),
+            (
+                "INSERT INTO projection_values(value,id) SELECT (source).* FROM (VALUES(44,4)) source(value,id)",
+                "4",
+            ),
+        ] {
+            session.success(&mut engine, query, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM projection_checks",
+                    true
+                )),
+                [expected],
+                "{query}"
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT id,value FROM projection_values ORDER BY id",
+                true
+            )),
+            ["1|11", "2|22", "3|33", "4|44"]
         );
     }
 }
@@ -264,8 +358,9 @@ fn sql_procedure_inputs_keep_backend_and_stored_definition_lifetimes_through_rec
     }
 }
 
-// PostgreSQL 18.6 SQL SHA256:
+// Original PostgreSQL 18.6 cursor-phase probe SQL SHA256:
 // 9142d2785fc9532152ee23a1daf38adad5d0ceeab4d7133f614843cdc4e33579.
+// Additional constant cases are compared in differential/205_planner_checked_inputs.sql.
 #[test]
 fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
     for mode in [
@@ -285,6 +380,7 @@ fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
               PERFORM nextval('phase_checks'); INSERT INTO phase_audit VALUES(value); RETURN true; END$$; \
              CREATE DOMAIN phase_checked AS phase_choice CHECK(phase_allowed(VALUE)); \
              CREATE FUNCTION phase_plain() RETURNS phase_checked[] LANGUAGE sql AS 'SELECT ''{a}''::phase_checked[]'; \
+             CREATE FUNCTION phase_scalar() RETURNS integer LANGUAGE sql AS 'SELECT cardinality(''{a}''::phase_checked[])'; \
              CREATE FUNCTION phase_opaque() RETURNS phase_checked[] LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::phase_checked[]'; \
              CREATE FUNCTION phase_where() RETURNS phase_checked[] LANGUAGE sql AS 'SELECT ''{a}''::phase_checked[] WHERE true'; \
              CREATE FUNCTION phase_dml() RETURNS phase_checked[] LANGUAGE sql AS 'INSERT INTO phase_mutations VALUES(1) RETURNING ''{a}''::phase_checked[]'; \
@@ -297,6 +393,37 @@ fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
                 "0|0|0",
                 "0|0|0",
             ),
+            (
+                "SELECT CASE WHEN NOT true THEN phase_plain() ELSE NULL END",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT CASE WHEN 1=2 THEN phase_plain() ELSE NULL END",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT CASE 1 WHEN 2 THEN phase_plain() ELSE NULL END",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT CASE 1 WHEN 1 THEN NULL ELSE phase_plain() END",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT false AND cardinality(phase_plain())=1",
+                "0|0|0",
+                "0|0|0",
+            ),
+            (
+                "SELECT true OR cardinality(phase_plain())=1",
+                "0|0|0",
+                "0|0|0",
+            ),
+            ("SELECT coalesce(1+1,phase_scalar())", "0|0|0", "0|0|0"),
             (
                 "SELECT phase_plain() FROM generate_series(1,0)",
                 "1|1|0",

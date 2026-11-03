@@ -123,6 +123,11 @@ converts when its expression runs: the same unused arm containing
 `'missing'::text::order_status` is skipped.
 
 An untyped serialized array can run domain checks during input preparation.
+For extended-protocol clients, Bind validates parameter values before preparing
+function inputs. A portal keeps the decoded parameters and its own checked
+planner values; Execute reuses them. For example, an invalid integer parameter
+fails at Bind before a function's domain constraint runs. Parameters and their
+resolved type OIDs share `portal_bytes`; exhaustion reports `54000`.
 For example, `PREPARE saved AS SELECT '{paid}'::checked_status[]` checks that
 value at `PREPARE`; repeated `EXECUTE saved` reuses it. A literal supplied to a
 column or function parameter of that type follows the same rule. In contrast,

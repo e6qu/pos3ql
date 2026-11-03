@@ -1643,12 +1643,17 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected routine keeps call and argument collations alongside its evaluator"
+    )]
     fn call_routine<'a>(
         &self,
         _target: RoutineCallTarget<'_>,
         _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
         _input_collation: super::ast::Collation,
+        _argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<super::ast::Collation, SqlError>,
         _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -1665,6 +1670,7 @@ pub trait CatalogAccess {
         _oid: i32,
         _arguments: &[Datum<'a>],
         _argument_type_oids: &[i32],
+        _input_collation: super::ast::Collation,
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
@@ -1701,6 +1707,7 @@ pub trait CatalogAccess {
         &self,
         _cast: &BoundCast,
         _value: Datum<'a>,
+        _input_collation: super::ast::Collation,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
@@ -1715,6 +1722,7 @@ pub trait CatalogAccess {
         _target_oid: i32,
         _value: Datum<'a>,
         _context: DefinedCastContext,
+        _input_collation: super::ast::Collation,
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
@@ -1735,11 +1743,17 @@ pub trait CatalogAccess {
     /// Executes a search-path-resolved user-defined binary operator. `None`
     /// means the catalog has no matching definition and builtin resolution
     /// continues.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "operator keeps selected and per-argument collations"
+    )]
     fn call_operator<'a>(
         &self,
         _name: &str,
         _arguments: [Datum<'a>; 2],
         _argument_type_oids: [i32; 2],
+        _input_collation: super::ast::Collation,
+        _argument_collations: [super::ast::Collation; 2],
         _nulls: OperatorNulls,
         _arena: &'a Arena,
     ) -> Result<Option<OperatorEvaluation<'a>>, SqlError> {
@@ -2998,9 +3012,18 @@ fn eval_binary_values<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) =
-            catalog.call_operator(name, [l, r], [left_oid, right_oid], nulls, arena)?
-        {
+        if let Some(value) = catalog.call_operator(
+            name,
+            [l, r],
+            [left_oid, right_oid],
+            routine_input_collation(&[left, right], row, hooks.catalog)?,
+            [
+                routine_input_collation(&[left], row, hooks.catalog)?,
+                routine_input_collation(&[right], row, hooks.catalog)?,
+            ],
+            nulls,
+            arena,
+        )? {
             return Ok(value);
         }
     }
@@ -3725,6 +3748,7 @@ fn eval_full_inner<'a>(
                         target_oid,
                         v,
                         DefinedCastContext::Explicit,
+                        routine_input_collation(&[operand], row, hooks.catalog)?,
                         arena,
                     )?
                 {
@@ -3947,6 +3971,7 @@ fn eval_full_inner<'a>(
                             args,
                             types,
                             routine_input_collation(args, row, hooks.catalog)?,
+                            &|argument| routine_input_collation(&[argument], row, hooks.catalog),
                             &mut |argument| eval_full(argument, arena, params, row, hooks),
                             arena,
                         );
@@ -5302,6 +5327,16 @@ fn expression_collation<'a>(
             }
             Ok(derived)
         }
+        Expr::Array(args) => {
+            let mut derived = None;
+            for argument in *args {
+                derived = merge_derived_collations(
+                    derived,
+                    expression_collation(argument, row, catalog)?,
+                )?;
+            }
+            Ok(derived)
+        }
         Expr::Call { name, args, .. }
             if name.eq_ignore_ascii_case("coalesce")
                 || name.eq_ignore_ascii_case("greatest")
@@ -5590,7 +5625,12 @@ fn execute_array_constructor<'a>(
             Some(cast) => hooks
                 .catalog
                 .expect("selected cast has a catalog")
-                .execute_bound_cast(cast, value, arena)?,
+                .execute_bound_cast(
+                    cast,
+                    value,
+                    routine_input_collation(&[input.expression], row, hooks.catalog)?,
+                    arena,
+                )?,
             None => value,
         };
         *target = if plan.multidimensional {
@@ -6129,6 +6169,7 @@ pub(crate) fn builtin_operator_function<'a>(
                     target.oid(),
                     value,
                     DefinedCastContext::Implicit,
+                    routine_input_collation(&[expression], row, hooks.catalog)?,
                     arena,
                 )?
             {
@@ -6554,6 +6595,7 @@ fn call<'a>(
                 args,
                 argument_type_oids,
                 routine_input_collation(args, row, hooks.catalog)?,
+                &|argument| routine_input_collation(&[argument], row, hooks.catalog),
                 &mut |argument| eval_full(argument, arena, params, row, hooks),
                 arena,
             );
@@ -9879,6 +9921,153 @@ mod tests {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "test", 1 << 18).unwrap();
         f(&arena);
+    }
+
+    #[test]
+    fn routine_input_collation_preserves_explicit_and_indeterminate_arguments() {
+        use crate::sql::ast::Collation;
+        with_arena(|arena| {
+            crate::mem::guard::forbid_alloc(|| {
+                for (source, expected) in [
+                    ("'a'", Collation::Default),
+                    ("42", Collation::None),
+                    ("'a' COLLATE \"C\"", Collation::C),
+                    ("'a' COLLATE \"POSIX\"", Collation::Posix),
+                ] {
+                    let expression = crate::sql::parser::parse_expression(source, arena).unwrap();
+                    assert_eq!(
+                        routine_input_collation(&[expression], &NoColumns, None).unwrap(),
+                        expected
+                    );
+                }
+                struct Columns;
+                impl<'a> ColumnLookup<'a> for Columns {
+                    fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                        panic!("collation inference must not evaluate an argument")
+                    }
+                    fn col_type(&self, _: Option<&str>, _: &str) -> Option<ColType> {
+                        Some(ColType::Text)
+                    }
+                    fn collation(&self, _: Option<&str>, name: &str) -> Collation {
+                        if name == "c" {
+                            Collation::C
+                        } else {
+                            Collation::Posix
+                        }
+                    }
+                }
+                let c = Expr::Column {
+                    qualifier: None,
+                    name: "c",
+                };
+                let posix = Expr::Column {
+                    qualifier: None,
+                    name: "posix",
+                };
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix], &Columns, None).unwrap(),
+                    Collation::None
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn catalog_operator_receives_argument_collation_without_evaluating_twice() {
+        use crate::sql::ast::Collation;
+        struct Operator(core::cell::Cell<Collation>, core::cell::Cell<usize>);
+        impl CatalogAccess for Operator {
+            fn has_operator_candidate(&self, name: &str) -> bool {
+                name == "="
+            }
+            #[expect(
+                clippy::too_many_arguments,
+                reason = "operator keeps selected and per-argument collations"
+            )]
+            fn call_operator<'a>(
+                &self,
+                _: &str,
+                arguments: [Datum<'a>; 2],
+                _: [i32; 2],
+                collation: Collation,
+                _: [Collation; 2],
+                _: OperatorNulls,
+                _: &'a Arena,
+            ) -> Result<Option<OperatorEvaluation<'a>>, SqlError> {
+                self.0.set(collation);
+                self.1.set(self.1.get() + 1);
+                Ok(Some(OperatorEvaluation {
+                    value: Datum::Bool(true),
+                    first_argument: arguments[0],
+                }))
+            }
+        }
+        with_arena(|arena| {
+            let catalog = Operator(
+                core::cell::Cell::new(Collation::None),
+                core::cell::Cell::new(0),
+            );
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..NO_HOOKS
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                let expression =
+                    crate::sql::parser::parse_expression("('a' COLLATE \"C\") = 'b'", arena)
+                        .unwrap();
+                assert_eq!(
+                    eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks).unwrap(),
+                    Datum::Bool(true)
+                );
+                assert_eq!(catalog.0.get(), Collation::C);
+                assert_eq!(catalog.1.get(), 1);
+            });
+        });
+    }
+
+    #[test]
+    fn explicit_function_cast_receives_its_source_expression_collation() {
+        use crate::sql::ast::Collation;
+        struct Cast(core::cell::Cell<Collation>);
+        impl CatalogAccess for Cast {
+            fn cast_defined<'a>(
+                &self,
+                source: i32,
+                target: i32,
+                _: Datum<'a>,
+                context: DefinedCastContext,
+                collation: Collation,
+                _: &'a Arena,
+            ) -> Result<Option<Datum<'a>>, SqlError> {
+                if target == crate::sql::types::oid::TEXT {
+                    return Ok(None);
+                }
+                assert_eq!(source, crate::sql::types::oid::TEXT);
+                assert_eq!(target, crate::sql::types::oid::INT4);
+                assert_eq!(context, DefinedCastContext::Explicit);
+                self.0.set(collation);
+                Ok(Some(Datum::Int4(42)))
+            }
+        }
+        with_arena(|arena| {
+            let catalog = Cast(core::cell::Cell::new(Collation::None));
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..NO_HOOKS
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                let expression = crate::sql::parser::parse_expression(
+                    "('42'::text COLLATE \"C\")::integer",
+                    arena,
+                )
+                .unwrap();
+                assert_eq!(
+                    eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks).unwrap(),
+                    Datum::Int4(42)
+                );
+                assert_eq!(catalog.0.get(), Collation::C);
+            });
+        });
     }
 
     #[test]

@@ -586,7 +586,7 @@ impl CursorCommitContext<'_> {
     }
 }
 
-struct CommandSnapshot {
+pub(crate) struct CommandSnapshot {
     lease: Option<crate::storage::StatementSnapshotLease>,
     _files: Option<crate::storage::StatementFileScope>,
 }
@@ -12573,6 +12573,157 @@ impl Engine {
         result
     }
 
+    pub(crate) fn begin_extended_bind(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        conn_id: i32,
+        lock_timeout_expired: bool,
+    ) -> Result<CommandSnapshot, SqlError> {
+        self.bind_query_connection(conn_id);
+        if txn.failed {
+            return Err(sql_err!(
+                sqlstate::IN_FAILED_SQL_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block"
+            ));
+        }
+        txn.begin_statement_clock();
+        self.ensure_txn(txn, TxnMode::Implicit, guc)?;
+        guc.refresh_identities(&self.storage, txn.txid);
+        eval::funcs::system::set_session_user(guc.session_identity());
+        eval::funcs::system::set_current_user(guc.current_identity());
+        self.publish_session_context(guc, txn, guc.current_role().as_str())?;
+        timezone::set_session(guc.timezone());
+        if let Some(deadline) = txn.suspended_statement_deadline() {
+            query::restore_statement_deadline(deadline);
+        } else {
+            query::arm_timeout(guc.statement_timeout_ms());
+        }
+        if lock_timeout_expired {
+            return Err(sql_err!(
+                sqlstate::LOCK_NOT_AVAILABLE,
+                "canceling statement due to lock timeout"
+            ));
+        }
+        query::check_timeout()?;
+        self.begin_command_snapshot(txn, true, true, true, true)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Bind planning shares the prepared inputs, bounded connection workspace and transaction"
+    )]
+    pub(crate) fn admit_extended_plan(
+        &mut self,
+        text: &str,
+        parameter_oids: &[i32],
+        bound_inputs: &[u8],
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+        snapshot: &mut CommandSnapshot,
+        resumed: bool,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let result = (|| {
+            let bindings = match type_inputs::decode(bound_inputs, arena) {
+                Ok(bindings) => bindings,
+                Err(error) => return Ok(Err(error)),
+            };
+            let mut parser = match Parser::new(text, arena) {
+                Ok(parser) => parser,
+                Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+            };
+            parser.set_type_inputs(bindings);
+            let statement = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                Ok(None) => return Ok(Ok(())),
+                Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+            };
+            if let Err(error) = type_inputs::validate_restored(&parser, &self.storage, txn.txid) {
+                return Ok(Err(error));
+            }
+            let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let settings = guc.statement_settings();
+            let descriptors = match txn.statement_large_object_descriptors(arena) {
+                Ok(descriptors) => descriptors,
+                Err(error) => return Ok(Err(error)),
+            };
+            let scope = sequence::enter_statement(arena, guc.seq_session(), resumed);
+            let output_mark = responder.buffer.mark();
+            let effect_reads = self
+                .ckpt
+                .as_ref()
+                .map(Checkpointer::deferred_atomic_block_read_scope);
+            let _effects = query::enter_statement_read_effect_scope(effect_reads.as_ref());
+            let planned = if let Err(error) =
+                query::check_timeout().and_then(|()| self.storage.begin_advisory_statement())
+            {
+                Ok(Err(error))
+            } else {
+                exec::with_bound_parameter_types(parameter_oids, || {
+                    type_inputs::with_source(
+                        type_inputs::Source::RootCommand { statement: 0 },
+                        text,
+                        bindings,
+                        || {
+                            self.prepare_planner_inputs(
+                                &statement, None, arena, txn, sqlprep, cursors, guc, responder,
+                            )
+                        },
+                    )
+                })
+            };
+            match planned {
+                Ok(Ok(())) => {
+                    txn.release_suspended_statement();
+                    Ok(scope.finish(guc.seq_session()))
+                }
+                Ok(Err(error)) => {
+                    responder.buffer.truncate_to(output_mark);
+                    let error = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    {
+                        sequence::ensure_statement_effects_replayable()
+                            .err()
+                            .unwrap_or(error)
+                    } else {
+                        error
+                    };
+                    if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    {
+                        self.storage.preserve_advisory_statement();
+                        self.rollback_waiting_statement(txn, mark);
+                        guc.restore_statement_settings(settings);
+                        txn.restore_statement_large_object_descriptors(descriptors);
+                        txn.suspend_statement(
+                            snapshot.lease.take(),
+                            datetime::statement_clock(),
+                            query::statement_deadline(),
+                            exec::PlpgsqlTransactionContext::Atomic,
+                        );
+                    } else {
+                        scope.discard(guc.seq_session());
+                        self.rollback_waiting_statement(txn, mark);
+                        txn.release_suspended_statement();
+                    }
+                    Ok(Err(error))
+                }
+                Err(error) => {
+                    scope.discard(guc.seq_session());
+                    self.rollback_waiting_statement(txn, mark);
+                    txn.release_suspended_statement();
+                    Err(error)
+                }
+            }
+        })();
+        query::disarm_timeout();
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_type_inputs<'a>(
         &mut self,
@@ -15617,6 +15768,13 @@ impl Engine {
                 routine_oid,
                 routine.version,
                 canonical,
+                |validity| match validity {
+                    Some(validity) => validity.matches(&self.storage, txn.txid),
+                    None => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "SQL routine input plan has no validity image"
+                    )),
+                },
                 |bytes| self.storage.freeze_runtime_input_key(bytes),
             ) {
                 Ok(admission) => admission,
@@ -15669,6 +15827,7 @@ impl Engine {
                         })
                         .map_err(|error| parse_error_to_sql(&error))?;
                     parser.capture_type_inputs();
+                    let mut dependencies = self.storage.empty_stored_query_dependencies(arena)?;
                     while let Some(statement) = parser
                         .next_stmt()
                         .map_err(|error| parse_error_to_sql(&error))?
@@ -15680,6 +15839,19 @@ impl Engine {
                             txn.txid,
                             arena,
                         )?;
+                        query::collect_runtime_statement(
+                            &statement,
+                            &self.storage,
+                            txn.txid,
+                            &mut dependencies,
+                            arena,
+                        )?;
+                    }
+                    let validity = self
+                        .storage
+                        .capture_runtime_input_validity(&dependencies, txn.txid)?;
+                    if let Some(plan) = reserved {
+                        sqlprep.routine_inputs.set_body_validity(plan, validity)?;
                     }
                     Ok(parser)
                 })();
@@ -16852,6 +17024,9 @@ impl Engine {
                 query::RoutineCallInputs {
                     arguments,
                     argument_type_oids: &type_oids[..arguments.len()],
+                    argument_collation: &|argument| {
+                        eval::routine_input_collation(&[argument], &NoColumns, hooks.catalog)
+                    },
                     mapping: &mapping,
                     variadic,
                     context: query::RoutineInputContext::Procedure,

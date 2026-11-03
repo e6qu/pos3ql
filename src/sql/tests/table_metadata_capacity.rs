@@ -149,7 +149,7 @@ fn projection_type_visitors_release_schema_scratch_on_success_and_error() {
                     0,
                     &arena,
                     None,
-                    &mut |oid| {
+                    &mut |oid, _| {
                         assert_eq!(oid, crate::sql::types::oid::INT4);
                         columns += 1;
                         Ok(())
@@ -167,7 +167,7 @@ fn projection_type_visitors_release_schema_scratch_on_success_and_error() {
                 0,
                 &arena,
                 None,
-                &mut |_| Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "visitor failed")),
+                &mut |_, _| Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "visitor failed")),
             )
         })
         .unwrap_err();

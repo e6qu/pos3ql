@@ -1,6 +1,68 @@
 use super::*;
 
 #[test]
+fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() {
+    // PostgreSQL REL_18_6 funccache.c:268-300 keys by input collation and
+    // declared argument OIDs, resolving only polymorphic/RECORD declarations.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("runtime-body-collation-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE body_collation_checks; \
+             CREATE TYPE body_collation_choice AS ENUM('a'); \
+             CREATE DOMAIN body_collation_checked AS body_collation_choice \
+               CHECK(nextval('body_collation_checks')>0); \
+             CREATE FUNCTION body_collation(input text) RETURNS body_collation_checked[] \
+               LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_cast(input text) RETURNS integer \
+               LANGUAGE sql SET search_path=public AS 'SELECT cardinality(''{a}''::body_collation_checked[])'; \
+             CREATE CAST(text AS integer) WITH FUNCTION body_collation_cast(text) AS ASSIGNMENT; \
+             CREATE TABLE body_collation_numbers(value integer); \
+             ALTER SEQUENCE body_collation_checks RESTART WITH 1", true);
+        for (query, expected) in [
+            ("SELECT body_collation('first' COLLATE \"C\")", "1"),
+            (
+                "SELECT body_collation('second'::varchar COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT body_collation('third' COLLATE \"POSIX\")", "2"),
+            ("SELECT body_collation('fourth'::text)", "3"),
+            ("SELECT body_collation('fifth'::varchar)", "3"),
+            ("SELECT body_collation(NULL::text COLLATE \"C\")", "3"),
+            ("SELECT ('42'::text COLLATE \"C\")::integer", "4"),
+            ("SELECT ('43'::text COLLATE \"C\")::integer", "4"),
+            ("SELECT ('44'::text COLLATE \"POSIX\")::integer", "5"),
+            (
+                "SELECT ARRAY['45'::text COLLATE \"C\", '46'::text COLLATE \"C\"]::integer[]",
+                "5",
+            ),
+            (
+                "INSERT INTO body_collation_numbers SELECT '47'::text COLLATE \"C\" FROM generate_series(1,2)",
+                "5",
+            ),
+            (
+                "INSERT INTO body_collation_numbers VALUES('48'::text COLLATE \"POSIX\")",
+                "5",
+            ),
+        ] {
+            session.success(&mut engine, query, true);
+            let output = session.success(
+                &mut engine,
+                "SELECT last_value FROM body_collation_checks",
+                true,
+            );
+            assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
+        }
+    }
+}
+
+#[test]
 fn sorted_and_paged_projection_effects_follow_postgresql_in_memory() {
     sorted_and_paged_projection_effects(false);
 }
@@ -2800,6 +2862,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     177,
                     &[Datum::Int2(1), Datum::Int4(2)],
                     &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
                     &arena
                 )
                 .unwrap(),
@@ -2811,6 +2874,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     141,
                     &[Datum::Int2(3), Datum::Int4(2)],
                     &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
                     &arena
                 )
                 .unwrap(),
@@ -2822,6 +2886,7 @@ fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
                     177,
                     &[Datum::Null, Datum::Int4(2)],
                     &[crate::sql::types::oid::INT4, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
                     &arena
                 )
                 .unwrap(),

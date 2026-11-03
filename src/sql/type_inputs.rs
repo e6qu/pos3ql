@@ -166,7 +166,8 @@ pub(crate) fn with_source<R>(
     execute()
 }
 
-pub(crate) fn active_source() -> Option<Source> {
+#[cfg(test)]
+fn active_source() -> Option<Source> {
     ACTIVE_SOURCE.with(|active| active.get().map(|source| source.source))
 }
 

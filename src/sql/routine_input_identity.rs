@@ -86,11 +86,7 @@ fn encode(
     };
     if let Some(composite) = composite {
         emit(&[1])?;
-        let result = match routine.kind {
-            RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
-            _ => unreachable!("only a function result has a named composite descriptor"),
-        };
-        emit(&type_oid(result.ctype, result.user_type)?.to_le_bytes())?;
+        emit(&super::types::oid::composite_oid(composite.creation()).to_le_bytes())?;
         emit(&(composite.n_fields as u32).to_le_bytes())?;
         for field in composite.fields() {
             emit(&(field.name.as_str().len() as u32).to_le_bytes())?;

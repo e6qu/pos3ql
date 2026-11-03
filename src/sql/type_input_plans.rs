@@ -71,6 +71,7 @@ pub(crate) enum Owner {
     Transient { generation: u64, statement: usize },
     Dynamic { epoch: u64, generation: u64 },
     ProtocolPrepared(u64),
+    ProtocolPortal(u64),
     SqlPrepared(u64),
     Cursor(u64),
     Backend,
@@ -106,12 +107,14 @@ struct Slot {
     generation: u64,
     state: State,
     specialization: SharedSlice<u8>,
+    validity: Option<crate::storage::RuntimeInputValidity>,
 }
 
 impl Slot {
     fn vacate(&mut self) {
         self.state = State::Vacant;
         self.specialization = SharedSlice::EMPTY;
+        self.validity = None;
     }
 }
 
@@ -135,6 +138,7 @@ impl RoutineInputPlans {
                     generation: 0,
                     state: State::Vacant,
                     specialization: SharedSlice::EMPTY,
+                    validity: None,
                 })
                 .expect("startup reserved every routine-input control");
         }
@@ -199,6 +203,7 @@ impl RoutineInputPlans {
         routine_oid: i32,
         definition_version: u64,
         canonical: &[u8],
+        mut valid: impl FnMut(Option<&crate::storage::RuntimeInputValidity>) -> Result<bool, SqlError>,
         freeze: impl FnOnce(&[u8]) -> Result<SharedSlice<u8>, SqlError>,
     ) -> Result<BodyAdmission, SqlError> {
         if canonical.is_empty() {
@@ -207,7 +212,8 @@ impl RoutineInputPlans {
                 "SQL routine body specialization is empty"
             ));
         }
-        for slot in self.slots.iter() {
+        let mut invalid = None;
+        for (index, slot) in self.slots.iter().enumerate() {
             let key = match &slot.state {
                 State::Vacant => continue,
                 State::Preparing { key, .. } | State::Ready { key, .. } => *key,
@@ -225,11 +231,27 @@ impl RoutineInputPlans {
                 && version == definition_version
                 && slot.specialization.as_ref() == canonical
             {
+                if !valid(slot.validity.as_ref())? {
+                    invalid = Some(PlanId {
+                        slot: index,
+                        generation: slot.generation,
+                    });
+                    break;
+                }
                 return Ok(BodyAdmission {
                     key,
                     reserved: None,
                 });
             }
+        }
+        if let Some(plan) = invalid {
+            if has_active_plan() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "cannot replace SQL routine input plans during nested execution"
+                ));
+            }
+            self.abandon(plan)?;
         }
         let (index, generation) = self.available_slot()?;
         let specialization = freeze(canonical)?;
@@ -264,6 +286,19 @@ impl RoutineInputPlans {
         } else {
             Err(stale())
         }
+    }
+
+    pub(crate) fn set_body_validity(
+        &mut self,
+        plan: PlanId,
+        validity: crate::storage::RuntimeInputValidity,
+    ) -> Result<(), SqlError> {
+        let slot = self.slot_mut(plan)?;
+        if slot.specialization.is_empty() || !matches!(slot.state, State::Preparing { .. }) {
+            return Err(stale());
+        }
+        slot.validity = Some(validity);
+        Ok(())
     }
 
     fn available_slot(&self) -> Result<(usize, u64), SqlError> {
@@ -302,6 +337,7 @@ impl RoutineInputPlans {
                 waiting: false,
             },
             specialization,
+            validity: None,
         };
         PlanId {
             slot: index,
@@ -550,7 +586,9 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let mut bytes = *b"declared-int4,collation-0,result-int4";
             let original = bytes;
-            let first = plans.sql_body_key(100_001, 7, &bytes, freeze).unwrap();
+            let first = plans
+                .sql_body_key(100_001, 7, &bytes, |_| Ok(true), freeze)
+                .unwrap();
             let first_id = first.reserved.unwrap();
             plans.adopt_body(first_id, first.key).unwrap();
             assert_eq!(
@@ -558,15 +596,21 @@ mod tests {
                 sqlstate::OBJECT_IN_USE
             );
             bytes[9] = b'X';
-            let changed = plans.sql_body_key(100_001, 7, &bytes, freeze).unwrap();
+            let changed = plans
+                .sql_body_key(100_001, 7, &bytes, |_| Ok(true), freeze)
+                .unwrap();
             let waiting = changed.reserved.unwrap();
             assert_ne!(changed.key, first.key);
             plans.adopt_body(waiting, changed.key).unwrap();
             plans.set_waiting(waiting, true).unwrap();
             let reused = plans
-                .sql_body_key(100_001, 7, &bytes, |_| {
-                    panic!("waiting key must retain its existing bytes")
-                })
+                .sql_body_key(
+                    100_001,
+                    7,
+                    &bytes,
+                    |_| Ok(true),
+                    |_| panic!("waiting key must retain its existing bytes"),
+                )
                 .unwrap();
             assert_eq!(reused.key, changed.key);
             assert!(reused.reserved.is_none());
@@ -583,23 +627,33 @@ mod tests {
             let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
                 panic!("ready typed SQL body");
             };
-            let other = plans.sql_body_key(100_002, 7, &original, freeze).unwrap();
+            let other = plans
+                .sql_body_key(100_002, 7, &original, |_| Ok(true), freeze)
+                .unwrap();
             plans
                 .adopt_body(other.reserved.unwrap(), other.key)
                 .unwrap();
             assert_ne!(other.key, first.key);
             assert_eq!(pool.lease::<u8>(1).unwrap_err().available_leases, 0);
             let reused = plans
-                .sql_body_key(100_001, 7, &original, |_| {
-                    panic!("ready key must not allocate when the pool is full")
-                })
+                .sql_body_key(
+                    100_001,
+                    7,
+                    &original,
+                    |_| Ok(true),
+                    |_| panic!("ready key must not allocate when the pool is full"),
+                )
                 .unwrap();
             assert_eq!(reused.key, first.key);
             assert!(reused.reserved.is_none());
             let error = plans
-                .sql_body_key(100_001, 8, &original, |_| {
-                    panic!("control admission must precede payload reservation")
-                })
+                .sql_body_key(
+                    100_001,
+                    8,
+                    &original,
+                    |_| Ok(true),
+                    |_| panic!("control admission must precede payload reservation"),
+                )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(error.message.as_str().contains("routine_input_slots"));
@@ -631,7 +685,7 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             let first = plans
-                .sql_body_key(100_001, 7, b"declared-int4", freeze)
+                .sql_body_key(100_001, 7, b"declared-int4", |_| Ok(true), freeze)
                 .unwrap();
             let id = first.reserved.unwrap();
             plans.adopt_body(id, first.key).unwrap();
@@ -640,7 +694,7 @@ mod tests {
                 .unwrap();
             let generation = plans.next_generation;
             let error = plans
-                .sql_body_key(100_001, 7, b"declared-int8", freeze)
+                .sql_body_key(100_001, 7, b"declared-int8", |_| Ok(true), freeze)
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(plans.next_generation, generation);
@@ -657,19 +711,72 @@ mod tests {
             );
             plans.abandon(id).unwrap();
             let replacement = plans
-                .sql_body_key(100_001, 7, b"declared-int8", freeze)
+                .sql_body_key(100_001, 7, b"declared-int8", |_| Ok(true), freeze)
                 .unwrap();
             assert_ne!(replacement.key, first.key);
             assert!(plans.adopt_body(id, replacement.key).is_err());
             plans.clear();
             plans.next_generation = u64::MAX;
             let error = plans
-                .sql_body_key(100_001, 7, b"declared-int4", |_| {
-                    panic!("identity exhaustion must precede payload reservation")
-                })
+                .sql_body_key(
+                    100_001,
+                    7,
+                    b"declared-int4",
+                    |_| Ok(true),
+                    |_| panic!("identity exhaustion must precede payload reservation"),
+                )
                 .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert!(pool.lease::<u8>(64).is_ok());
+        });
+    }
+
+    #[test]
+    fn invalid_runtime_body_inputs_retire_generations_and_preserve_pinned_images() {
+        let mut config = Config::default_dev();
+        config.routine_input_slots = 1;
+        let mut budget =
+            Budget::new(RoutineInputPlans::budget_bytes(&config) + LeasePool::budget_bytes(256, 4));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, 256, 4).unwrap();
+        let mut plans = RoutineInputPlans::new(&config, &mut budget).unwrap();
+        let freeze = |bytes: &[u8]| {
+            pool.copy_slice(bytes)
+                .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let first = plans
+                .sql_body_key(100_001, 7, b"int4", |_| Ok(true), freeze)
+                .unwrap();
+            let old = first.reserved.unwrap();
+            plans
+                .complete(
+                    old,
+                    InputImage::Runtime(pool.copy_slice(b"TIP2\0\0\0\0").unwrap()),
+                )
+                .unwrap();
+            let Some(Lookup::Ready(_, pinned)) = plans.find(first.key).unwrap() else {
+                panic!("ready body")
+            };
+            with_owner(Owner::Nested(old), || {
+                let error = plans
+                    .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
+                    .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::OBJECT_IN_USE);
+            });
+            assert!(matches!(
+                plans.find(first.key).unwrap(),
+                Some(Lookup::Ready(_, _))
+            ));
+            let replacement = plans
+                .sql_body_key(100_001, 7, b"int4", |_| Ok(false), freeze)
+                .unwrap();
+            assert_ne!(replacement.key, first.key);
+            assert_ne!(replacement.reserved.unwrap(), old);
+            assert!(plans.find(first.key).unwrap().is_none());
+            assert!(
+                matches!(pinned, InputImage::Runtime(ref bytes) if bytes.as_ref() == b"TIP2\0\0\0\0")
+            );
+            drop(pinned);
         });
     }
 

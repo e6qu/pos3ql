@@ -2520,8 +2520,11 @@ impl ColType {
     ///
     /// Keeping this on the type prevents each catalog, DDL, and recovery path
     /// from making its own incomplete list of collatable types.
-    pub const fn is_collatable(self) -> bool {
-        matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name)
+    pub fn is_collatable(self) -> bool {
+        match self {
+            Self::Array(element) => element.to_coltype().is_collatable(),
+            _ => matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name),
+        }
     }
 
     /// Pseudo-types describe executor contracts rather than stored values.

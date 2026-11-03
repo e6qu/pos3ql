@@ -645,18 +645,58 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         'storage: 'a,
     {
         if self.planner.is_some() {
+            use crate::sql::planner_inputs::inline::ConstantValue;
+            let storage = self.storage;
+            let txid = self.txid;
+            let arena = self.arena;
+            let constant = |expression| {
+                crate::sql::planner_inputs::inline::constant_value(
+                    expression, columns, storage, txid, arena,
+                )
+            };
+            if let Expr::Binary {
+                operator: operator @ (ast::BinaryOp::And | ast::BinaryOp::Or),
+                left,
+                right,
+                ..
+            } = expression
+            {
+                self.expression(left, columns, row)?;
+                if !matches!(constant(left)?, Some(ConstantValue::Boolean(value)) if value == (*operator == ast::BinaryOp::Or))
+                {
+                    self.expression(right, columns, row)?;
+                }
+                return Ok(());
+            }
             if let Expr::Case {
-                operand: None,
+                operand,
                 whens,
                 otherwise,
                 ..
             } = expression
             {
+                if let Some(operand) = operand {
+                    self.expression(operand, columns, row)?;
+                }
                 for (condition, result) in *whens {
                     self.expression(condition, columns, row)?;
-                    match condition {
-                        Expr::Bool(false) | Expr::Null => continue,
-                        Expr::Bool(true) => return self.expression(result, columns, row),
+                    let comparison;
+                    let condition = if let Some(operand) = operand {
+                        comparison = Expr::Binary {
+                            source_position: ast::SourcePosition::UNKNOWN,
+                            operator: ast::BinaryOp::Eq,
+                            left: operand,
+                            right: condition,
+                        };
+                        &comparison
+                    } else {
+                        condition
+                    };
+                    match constant(condition)? {
+                        Some(ConstantValue::Boolean(false) | ConstantValue::Null) => continue,
+                        Some(ConstantValue::Boolean(true)) => {
+                            return self.expression(result, columns, row);
+                        }
                         _ => self.expression(result, columns, row)?,
                     }
                 }
@@ -674,7 +714,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             {
                 for argument in *args {
                     self.expression(argument, columns, row)?;
-                    if matches!(argument, Expr::Bool(_) | Expr::Int(_) | Expr::Str(_)) {
+                    if constant(argument)?.is_some_and(|value| value != ConstantValue::Null) {
                         break;
                     }
                 }
@@ -881,25 +921,76 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             if targets.is_some() {
                 let width = match item {
                     SelectItem::Expr { .. } => 1,
-                    SelectItem::Wildcard => scope.as_ref().map_or(0, |scope| scope.star_columns()),
-                    SelectItem::TableWildcard(name) => scope
-                        .as_ref()
-                        .ok_or_else(|| {
+                    SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                        let scope = scope.as_ref().ok_or_else(|| {
                             sql_err!(
                                 super::sqlstate::UNDEFINED_TABLE,
-                                "missing FROM-clause entry for table \"{}\"",
-                                name
+                                "SELECT * has no source relation"
+                            )
+                        })?;
+                        let count = match item {
+                            SelectItem::TableWildcard(name) => {
+                                scope.qualified_star_columns(name)?
+                            }
+                            _ => scope.star_columns(),
+                        };
+                        if let Some(planner) = &mut self.planner {
+                            for index in 0..count {
+                                let entry = match item {
+                                    SelectItem::TableWildcard(name) => {
+                                        scope.qualified_star_entry(name, index)?
+                                    }
+                                    _ => scope.star_entry(index),
+                                };
+                                let expression = Expr::Column {
+                                    qualifier: match entry {
+                                        super::ResolvedColumn::Table(table, _) => {
+                                            Some(scope.names[table])
+                                        }
+                                        super::ResolvedColumn::Merged(_) => None,
+                                    },
+                                    name: scope.output_name(entry),
+                                };
+                                if let Some((target, _, Some(site))) =
+                                    targets.and_then(|targets| targets.get(output_index + index))
+                                {
+                                    planner(&expression, &columns, Some((*target, *site)))?;
+                                }
+                            }
+                        }
+                        count
+                    }
+                    SelectItem::RecordStar(expression) => {
+                        let mut index = output_index;
+                        let mut result = Ok(());
+                        let width = crate::sql::exec::record_shape_metadata(
+                            expression,
+                            &columns,
+                            |name, _| {
+                                if result.is_ok()
+                                    && let Some(planner) = &mut self.planner
+                                    && let Some((target, _, Some(site))) =
+                                        targets.and_then(|targets| targets.get(index))
+                                {
+                                    result = planner(
+                                        &Expr::Field {
+                                            base: expression,
+                                            field: name,
+                                        },
+                                        &columns,
+                                        Some((*target, *site)),
+                                    );
+                                }
+                                index += 1;
+                            },
+                        )?;
+                        result?;
+                        width.ok_or_else(|| {
+                            sql_err!(
+                                super::sqlstate::FEATURE_NOT_SUPPORTED,
+                                "record output shape is unavailable"
                             )
                         })?
-                        .qualified_star_columns(name)?,
-                    SelectItem::RecordStar(expression) => {
-                        crate::sql::exec::record_shape(expression, &columns, |_, _| {})?
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    super::sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "record output shape is unavailable"
-                                )
-                            })?
                     }
                 };
                 output_index = output_index
@@ -1077,7 +1168,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 .alloc_slice_with(count, |_| (0, -1, None))
                 .map_err(|_| super::arena_full())?;
             for (index, target) in targets.iter_mut().enumerate() {
-                let index = if insert.columns.is_empty() {
+                let column_index = if insert.columns.is_empty() {
                     index
                 } else {
                     definition
@@ -1090,7 +1181,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                             )
                         })?
                 };
-                let column = &definition.columns()[index];
+                let column = &definition.columns()[column_index];
                 *target = (
                     storage
                         .routine_type_oid(column.ctype, column.user_type, txid)

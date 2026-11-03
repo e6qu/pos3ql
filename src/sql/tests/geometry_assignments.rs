@@ -484,25 +484,37 @@ fn projection_type_visits_keep_selected_cast_snapshots() {
     let catalog = query::storage_catalog(&engine.storage, &arena, 0);
     crate::mem::guard::forbid_alloc(|| {
         let mut selected = None;
-        query::visit_projection_types(select, &engine.storage, 0, &arena, None, &mut |source| {
-            let cast = catalog
-                .bind_defined_cast(
-                    source,
-                    ColType::Geometry(crate::sql::types::GeometryKind::Box).oid(),
-                    crate::sql::eval::DefinedCastContext::Assignment,
-                )?
-                .expect("registered cast");
-            selected = Some(
-                &arena
-                    .alloc_persistent_slice_with(1, |_| cast)
-                    .map_err(|_| crate::sql::eval::arena_full())?[0],
-            );
-            Ok(())
-        })
+        query::visit_projection_types(
+            select,
+            &engine.storage,
+            0,
+            &arena,
+            None,
+            &mut |source, _| {
+                let cast = catalog
+                    .bind_defined_cast(
+                        source,
+                        ColType::Geometry(crate::sql::types::GeometryKind::Box).oid(),
+                        crate::sql::eval::DefinedCastContext::Assignment,
+                    )?
+                    .expect("registered cast");
+                selected = Some(
+                    &arena
+                        .alloc_persistent_slice_with(1, |_| cast)
+                        .map_err(|_| crate::sql::eval::arena_full())?[0],
+                );
+                Ok(())
+            },
+        )
         .unwrap();
         arena.alloc_slice_with(8192, |_| 0xcc_u8).unwrap();
         let value = catalog
-            .execute_bound_cast(selected.expect("retained cast"), Datum::Null, &arena)
+            .execute_bound_cast(
+                selected.expect("retained cast"),
+                Datum::Null,
+                ast::Collation::None,
+                &arena,
+            )
             .unwrap();
         assert!(matches!(
             value,

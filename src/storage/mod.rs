@@ -6,10 +6,12 @@
 //! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
+mod runtime_input_validity;
 pub(crate) use catalog_history::{
     CatalogHistory, CatalogHistoryBatch, CatalogPublication, CatalogRelationIdentity,
     CatalogRowImage, HistoricalCatalogRow,
 };
+pub(crate) use runtime_input_validity::RuntimeInputValidity;
 mod catalog_identities;
 mod catalog_keys;
 mod catalog_sources;

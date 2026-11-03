@@ -19,6 +19,203 @@ pub(crate) struct Context<'a> {
     pub body_columns: &'a dyn ColTypeResolver,
 }
 
+/// Fold only operations whose selected implementation cannot enter a stored
+/// routine. Planner discovery must not execute a function body to find inputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConstantValue {
+    Null,
+    Boolean(bool),
+    NonNull,
+}
+
+pub(crate) fn constant_value(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<ConstantValue>, SqlError> {
+    // No folded value escapes: text, numeric and array scratch is released
+    // before discovery moves on to another expression.
+    arena
+        .with_remaining_region(|scratch| {
+            constant_value_in(expression, columns, storage, txid, scratch)
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?
+}
+
+fn constant_value_in(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<ConstantValue>, SqlError> {
+    use crate::sql::types::Datum;
+    if let Expr::Binary {
+        operator: operator @ (BinaryOp::And | BinaryOp::Or),
+        left,
+        right,
+        ..
+    } = expression
+    {
+        let settles = *operator == BinaryOp::Or;
+        let left = constant_value_in(left, columns, storage, txid, arena)?;
+        if left == Some(ConstantValue::Boolean(settles)) {
+            return Ok(Some(ConstantValue::Boolean(settles)));
+        }
+        let right = constant_value_in(right, columns, storage, txid, arena)?;
+        if right == Some(ConstantValue::Boolean(settles)) {
+            return Ok(Some(ConstantValue::Boolean(settles)));
+        }
+        return Ok(match (left, right) {
+            (Some(ConstantValue::Boolean(_)), Some(ConstantValue::Boolean(_))) => {
+                Some(ConstantValue::Boolean(!settles))
+            }
+            (Some(ConstantValue::Null), Some(ConstantValue::Boolean(_) | ConstantValue::Null))
+            | (Some(ConstantValue::Boolean(_)), Some(ConstantValue::Null)) => {
+                Some(ConstantValue::Null)
+            }
+            _ => None,
+        });
+    }
+    if let Expr::Unary {
+        operator: UnaryOp::Not,
+        operand,
+        ..
+    } = expression
+    {
+        return Ok(
+            match constant_value_in(operand, columns, storage, txid, arena)? {
+                Some(ConstantValue::Boolean(value)) => Some(ConstantValue::Boolean(!value)),
+                Some(ConstantValue::Null) => Some(ConstantValue::Null),
+                _ => None,
+            },
+        );
+    }
+    if !builtin_constant(expression, columns, storage, txid)? {
+        return Ok(None);
+    }
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = crate::sql::eval::EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    crate::sql::eval::eval_full(
+        expression,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        &crate::sql::eval::NoColumns,
+        &hooks,
+    )
+    .map(|value| {
+        Some(match value {
+            Datum::Null => ConstantValue::Null,
+            Datum::Bool(value) => ConstantValue::Boolean(value),
+            _ => ConstantValue::NonNull,
+        })
+    })
+}
+
+fn builtin_constant(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    let safe = match expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BitLit(_)
+        | Expr::BoundLiteral { .. } => true,
+        Expr::IsNull { .. } | Expr::Collate { .. } | Expr::Array(_) => true,
+        Expr::Unary {
+            operator: UnaryOp::Not,
+            ..
+        }
+        | Expr::Binary {
+            operator: BinaryOp::And | BinaryOp::Or,
+            ..
+        } => true,
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => {
+            let Some(name) = operator.operator_name() else {
+                return Ok(false);
+            };
+            let left = infer_routine_argument_oid(left, columns)?;
+            let right = infer_routine_argument_oid(right, columns)?;
+            if storage
+                .operator_slot_for_oids(None, name, Some(left), Some(right), txid)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            let Some(oid) = catalog::builtin_operator_procedure(name, Some(left), Some(right))
+            else {
+                return Ok(false);
+            };
+            let Some(signature) = catalog::builtin_callable_by_oid(oid) else {
+                return Ok(false);
+            };
+            if [left, right]
+                .into_iter()
+                .zip(signature.arguments)
+                .any(|(source, target)| {
+                    source != *target
+                        && catalog::defined_cast_path(storage, txid, source, *target).is_some()
+                })
+            {
+                return Ok(false);
+            }
+            let properties =
+                operator_properties(storage, txid, None, name, Some(left), Some(right))?;
+            properties.known && properties.volatility == 0
+        }
+        Expr::Cast {
+            operand,
+            type_name,
+            binding,
+            ..
+        } => {
+            let Some(target) = ColType::from_sql_name(type_name) else {
+                return Ok(false);
+            };
+            let source = infer_routine_argument_oid(operand, columns)?;
+            if *binding == CastBinding::Resolve
+                && source != target.oid()
+                && catalog::defined_cast_path(storage, txid, source, target.oid()).is_some()
+            {
+                return Ok(false);
+            }
+            let properties = builtin_cast_properties(storage, txid, source, target.oid());
+            properties.known && properties.volatility == 0
+        }
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name: "coalesce",
+            ..
+        } => true,
+        _ => false,
+    };
+    if !safe {
+        return Ok(false);
+    }
+    let mut children_safe = true;
+    crate::sql::query::walk_children(expression, &mut |child| {
+        children_safe &= builtin_constant(child, columns, storage, txid)?;
+        Ok(())
+    })?;
+    Ok(children_safe)
+}
+
 #[derive(Clone, Copy)]
 struct Properties {
     volatility: u8,

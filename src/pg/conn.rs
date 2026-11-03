@@ -191,7 +191,8 @@ struct Portal {
     active: bool,
     name: SqlName,
     statement: usize,
-    /// Validated Bind format codes, lengths, and values in wire order.
+    plan: u64,
+    /// Resolved parameter OIDs followed by one encoded, already checked row.
     params: FixedBuf,
     n_params: u16,
     /// Per-column result format requested by Bind.
@@ -438,6 +439,8 @@ pub struct Conn {
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     prepared: Vec<Prepared>,
     portals: Vec<Portal>,
+    /// Unpublished portal whose decoded parameters survive a planning wait.
+    pending_bind: Option<usize>,
     phase: Phase,
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
@@ -467,6 +470,13 @@ pub struct Conn {
 
 impl Conn {
     fn release_closed_statement_plans(&mut self) {
+        for (slot, portal) in self.portals.iter().enumerate() {
+            if !portal.active && self.pending_bind != Some(slot) {
+                self.sqlprep.routine_inputs.retire(
+                    crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
+                );
+            }
+        }
         for (slot, statement) in self.prepared.iter().enumerate() {
             if !statement.active
                 && !self
@@ -482,6 +492,7 @@ impl Conn {
     }
 
     fn clear_protocol_state(&mut self) {
+        self.pending_bind = None;
         self.sqlprep.clear_request_type_inputs();
         self.sqlprep.routine_inputs.clear();
         for prepared in &mut self.prepared {
@@ -528,6 +539,7 @@ impl Conn {
                 active: false,
                 name: empty,
                 statement: 0,
+                plan: 0,
                 params: FixedBuf::new(budget, "portal_params", config.portal_bytes)?,
                 n_params: 0,
                 result_formats: ResultFmt::ALL_TEXT,
@@ -579,6 +591,7 @@ impl Conn {
             )?,
             prepared,
             portals,
+            pending_bind: None,
             phase: Phase::Startup,
             minor: 0,
             id: 0,
@@ -779,8 +792,16 @@ impl Conn {
             .filter(|length| *length <= self.recv.len())
             .unwrap_or(self.recv.len());
         self.recv.consume(message_bytes);
+        if let Some(slot) = self.pending_bind.take() {
+            self.sqlprep.routine_inputs.retire(
+                crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
+            );
+            self.portals[slot].active = false;
+            self.portals[slot].params.clear();
+        }
         self.finish_lock_wait();
         self.sqlprep.clear_request_type_inputs();
+        crate::sql::sequence::finish_statement(self.guc.seq_session());
         engine.cancel_backend_wait(self.id);
         if self.copy.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
@@ -1918,6 +1939,7 @@ impl Conn {
                         portal.active = false;
                     }
                 }
+                self.release_closed_statement_plans();
                 let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
                 if responder.ready_for_query(status).is_err() {
@@ -1983,6 +2005,7 @@ impl Conn {
                         portal.active = false;
                     }
                 }
+                self.release_closed_statement_plans();
                 let status = self.txn.status_byte();
                 match Responder::new(&mut self.send).ready_for_query(status) {
                     Ok(()) => Step::Continue,
@@ -2007,6 +2030,26 @@ impl Conn {
         };
         if !matches!(step, Step::Close | Step::Parked) && msg_type != wire::FMSG_QUERY {
             self.recv.consume(total);
+        }
+        if msg_type == wire::FMSG_BIND && !matches!(step, Step::Parked) {
+            crate::sql::query::disarm_timeout();
+            if let Some(slot) = self.pending_bind.take() {
+                self.sqlprep.routine_inputs.retire(
+                    crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
+                );
+                self.portals[slot].active = false;
+                self.portals[slot].params.clear();
+            }
+            if self.phase == Phase::SkipToSync {
+                crate::sql::sequence::finish_statement(self.guc.seq_session());
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                    self.cursors.on_rollback();
+                }
+            }
+            self.finish_lock_wait();
         }
         step
     }
@@ -3245,12 +3288,30 @@ impl Conn {
                 "bind parameter count differs from the statement",
             );
         }
+        if self.pending_bind.is_some() || self.guc.seq_session().retains_statement_effects() {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
+        let timeout = self.lock_timeout_expired();
+        let resumed = self.parked;
+        let mut snapshot =
+            match engine.begin_extended_bind(&mut self.txn, &self.guc, self.id, timeout) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
         if !result_formats.matches_column_count(1) || result_formats.any_binary() {
             // A per-column result-format list needs the query's described
             // shape. Probe that same typed boundary before a portal exists,
             // discard its provisional response, and retain only a valid
             // format state for execution.
-            self.arena.reset();
             let text = self.prepared[stmt_slot].query();
             let param_oids = match engine.infer_param_types(
                 text,
@@ -3328,48 +3389,6 @@ impl Conn {
                 );
             }
         }
-        // PostgreSQL validates text parameters at Bind after resolving the
-        // statement. Walk the compact metadata a second time so malformed
-        // text cannot enter a portal without retaining one span per value.
-        let mut parameter_message = MsgIn::new(parameter_data);
-        let n_formats = usize::from(
-            parameter_message
-                .u16()
-                .expect("validated Bind format count"),
-        );
-        let format_bytes = parameter_message
-            .take(n_formats * 2)
-            .expect("validated Bind format codes");
-        let stored_count = usize::from(
-            parameter_message
-                .u16()
-                .expect("validated Bind parameter count"),
-        );
-        debug_assert_eq!(stored_count, n_params);
-        for index in 0..n_params {
-            let len = parameter_message
-                .i32()
-                .expect("validated Bind parameter length");
-            if len < 0 {
-                continue;
-            }
-            let value = parameter_message
-                .take(len as usize)
-                .expect("validated Bind parameter value");
-            let binary = match n_formats {
-                0 => false,
-                1 => format_bytes == [0, 1],
-                _ => format_bytes[index * 2..index * 2 + 2] == [0, 1],
-            };
-            if !binary && core::str::from_utf8(value).is_err() {
-                return ext_err(
-                    &mut self.send,
-                    &mut self.phase,
-                    "22021",
-                    "invalid UTF-8 in parameter value",
-                );
-            }
-        }
         let existing = self
             .portals
             .iter()
@@ -3382,7 +3401,10 @@ impl Conn {
                 crate::stack_format!(96, "portal \"{portal_name}\" already exists").as_str(),
             );
         }
-        let slot = existing.or_else(|| self.portals.iter().position(|portal| !portal.active));
+        let slot = self
+            .pending_bind
+            .or(existing)
+            .or_else(|| self.portals.iter().position(|portal| !portal.active));
         let Some(slot) = slot else {
             return ext_err(&mut self.send, &mut self.phase, "54000", "too many portals");
         };
@@ -3394,18 +3416,116 @@ impl Conn {
                 "portal name too long",
             );
         };
-        // Retain the validated wire-order metadata and values. Execute walks
-        // this compact representation directly within `portal_bytes`.
-        let portal = &mut self.portals[slot];
-        portal.params.clear();
-        if !portal.params.append(parameter_data) {
-            return ext_err(
-                &mut self.send,
-                &mut self.phase,
-                "54000",
-                "parameters exceed portal_bytes",
+        if self.pending_bind.is_none() {
+            let encoded = match decode_bind_parameters(
+                engine,
+                &self.prepared[stmt_slot],
+                parameter_data,
+                &self.arena,
+                &self.txn,
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
+            let portal = &mut self.portals[slot];
+            let plan = match self.sqlprep.new_plan() {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
+            self.sqlprep.routine_inputs.retire(
+                crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
             );
+            portal.plan = plan;
+            portal.active = false;
+            portal.params.clear();
+            if !portal.params.append(encoded) {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    "54000",
+                    "parameters exceed portal_bytes",
+                );
+            }
+            portal.n_params = n_params as u16;
+            portal.statement = stmt_slot;
+            self.pending_bind = Some(slot);
         }
+        let (_, param_oids) = match restore_portal_parameters(
+            self.portals[slot].params.readable(),
+            n_params,
+            &self.arena,
+        ) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
+        let prepared = &self.prepared[stmt_slot];
+        let planned = crate::sql::type_input_plans::with_owner(
+            crate::sql::type_input_plans::Owner::ProtocolPortal(self.portals[slot].plan),
+            || {
+                let mut responder = Responder::new(&mut self.send);
+                engine.admit_extended_plan(
+                    prepared.query(),
+                    param_oids,
+                    prepared.type_inputs(),
+                    &self.arena,
+                    &mut self.txn,
+                    &mut self.sqlprep,
+                    &mut self.cursors,
+                    &self.guc,
+                    &mut responder,
+                    &mut snapshot,
+                    resumed,
+                )
+            },
+        );
+        match planned {
+            Ok(Ok(())) => {}
+            Ok(Err(error))
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
+            {
+                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                    crate::sql::StatementWait::ObjectIo
+                } else {
+                    crate::sql::StatementWait::Lock
+                };
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                engine.park_backend_statement(self.id, wait);
+                return Step::Parked;
+            }
+            Ok(Err(error)) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+            Err(WireFull) => return Step::Close,
+        }
+        self.pending_bind = None;
+        let portal = &mut self.portals[slot];
         portal.active = true;
         portal.name = sql_name;
         portal.statement = stmt_slot;
@@ -3596,34 +3716,12 @@ impl Conn {
                 paged = false;
                 self.arena.reset();
             }
-            let parameter_count = usize::from(portal.n_params);
-            let params = match self
-                .arena
-                .alloc_slice_with(parameter_count, |_| Datum::Null)
-            {
-                Ok(params) => params,
-                Err(_) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "bound parameters exceed the statement arena",
-                    );
-                }
-            };
-            let raw = portal.params.readable();
-            // Resolve every parameter the client left untyped (OID 0) from
-            // its use in the query before decoding either wire format. Text
-            // Bind values are values of the inferred type, not SQL literals.
-            let param_oids = match engine.infer_param_types(
-                text,
+            let (params, param_oids) = match restore_portal_parameters(
+                portal.params.readable(),
+                usize::from(portal.n_params),
                 &self.arena,
-                &self.txn,
-                parameter_count,
-                prepared.parameter_oid_bytes(),
-                prepared.type_inputs(),
             ) {
-                Ok(oids) => oids,
+                Ok(parameters) => parameters,
                 Err(error) => {
                     return ext_err(
                         &mut self.send,
@@ -3633,80 +3731,13 @@ impl Conn {
                     );
                 }
             };
-            let mut message = MsgIn::new(raw);
-            let n_formats = usize::from(message.u16().expect("validated Bind format count"));
-            let format_bytes = message
-                .take(n_formats * 2)
-                .expect("validated Bind format codes");
-            let stored_count = usize::from(message.u16().expect("validated Bind parameter count"));
-            debug_assert_eq!(stored_count, parameter_count);
-            for i in 0..parameter_count {
-                let len = message.i32().expect("validated Bind parameter length");
-                if len == -1 {
-                    match engine.coerce_parameter_null(param_oids[i], &self.arena, self.txn.txid) {
-                        Ok(value) => params[i] = value,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                let bytes = message
-                    .take(len as usize)
-                    .expect("validated Bind parameter value");
-                let binary = match n_formats {
-                    0 => false,
-                    1 => format_bytes == [0, 1],
-                    _ => format_bytes[i * 2..i * 2 + 2] == [0, 1],
-                };
-                if binary {
-                    match engine.decode_binary_parameter(
-                        param_oids[i],
-                        bytes,
-                        &self.arena,
-                        self.txn.txid,
-                    ) {
-                        Ok(v) => params[i] = v,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                } else {
-                    match engine.decode_text_parameter(
-                        param_oids[i],
-                        bytes,
-                        &self.arena,
-                        self.txn.txid,
-                    ) {
-                        Ok(value) => params[i] = value,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                }
-            }
 
             // Paged execution goes through the portal's result buffer so
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
             let send_mark = self.send.mark();
             let result = crate::sql::type_input_plans::with_owner(
-                crate::sql::type_input_plans::Owner::ProtocolPrepared(prepared.plan),
+                crate::sql::type_input_plans::Owner::ProtocolPortal(portal.plan),
                 || {
                     if paged {
                         portal.result.clear();
@@ -5230,6 +5261,104 @@ fn parse_publication_names_impl(
     }
 }
 
+fn decode_bind_parameters<'a>(
+    engine: &Engine,
+    prepared: &Prepared,
+    raw: &'a [u8],
+    arena: &'a Arena,
+    txn: &TxnState,
+) -> Result<&'a [u8], SqlError> {
+    let count = usize::from(prepared.n_params);
+    let oids = engine.infer_param_types(
+        prepared.query(),
+        arena,
+        txn,
+        count,
+        prepared.parameter_oid_bytes(),
+        prepared.type_inputs(),
+    )?;
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut message = MsgIn::new(raw);
+    let formats = usize::from(message.u16().expect("validated Bind format count"));
+    let codes = message.take(formats * 2).expect("validated Bind formats");
+    assert_eq!(
+        usize::from(message.u16().expect("validated Bind parameter count")),
+        count
+    );
+    for (index, value) in values.iter_mut().enumerate() {
+        let length = message.i32().expect("validated Bind parameter length");
+        if length == -1 {
+            *value = engine.coerce_parameter_null(oids[index], arena, txn.txid)?;
+            continue;
+        }
+        let bytes = message
+            .take(length as usize)
+            .expect("validated Bind parameter value");
+        let binary = match formats {
+            0 => false,
+            1 => codes == [0, 1],
+            _ => codes[index * 2..index * 2 + 2] == [0, 1],
+        };
+        *value = if binary {
+            engine.decode_binary_parameter(oids[index], bytes, arena, txn.txid)?
+        } else {
+            engine.decode_text_parameter(oids[index], bytes, arena, txn.txid)?
+        };
+    }
+    let row = crate::sql::exec::encode_projected_pub(values, arena)?;
+    let type_bytes = count
+        .checked_mul(4)
+        .ok_or_else(crate::sql::eval::arena_full)?;
+    let length = type_bytes
+        .checked_add(row.len())
+        .ok_or_else(crate::sql::eval::arena_full)?;
+    let image = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (bytes, oid) in image[..type_bytes]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(oids)
+    {
+        *bytes = oid.to_be_bytes();
+    }
+    image[type_bytes..].copy_from_slice(row);
+    Ok(image)
+}
+
+type PortalParameters<'a> = (&'a [Datum<'a>], &'a [i32]);
+
+fn restore_portal_parameters<'a>(
+    raw: &'a [u8],
+    count: usize,
+    arena: &'a Arena,
+) -> Result<PortalParameters<'a>, SqlError> {
+    let (types, row) = raw.split_at(count * 4);
+    let oids = arena
+        .alloc_slice_with(count, |index| {
+            i32::from_be_bytes(
+                types[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("stored parameter OID"),
+            )
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let width = crate::sql::exec::decode_projected_row_into(row, arena, values)?;
+    if width != count {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored portal parameter count changed"
+        ));
+    }
+    Ok((values, oids))
+}
+
 enum Step {
     Continue,
     NeedMoreData,
@@ -5674,6 +5803,10 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
     *phase = Phase::SkipToSync;
     Step::Continue
 }
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[path = "conn/bind_inputs_tests.rs"]
+mod bind_inputs_tests;
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {

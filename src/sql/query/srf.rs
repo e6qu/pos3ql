@@ -5749,6 +5749,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 super::RoutineCallInputs {
                     arguments: args,
                     argument_type_oids: &argument_type_oids[..args.len()],
+                    argument_collation: &|argument| {
+                        crate::sql::eval::routine_input_collation(
+                            &[argument],
+                            columns,
+                            hooks.catalog,
+                        )
+                    },
                     mapping: &mapping,
                     variadic: tref.func_variadic,
                     context: super::RoutineInputContext::Table,

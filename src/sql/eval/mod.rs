@@ -9794,7 +9794,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-                (super::types::oid::INT4, 4)
+                (crate::sql::types::oid::INT4, 4)
             );
             assert_eq!(
                 crate::sql::exec::infer_type_res(
@@ -9805,7 +9805,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-                (super::types::oid::RECORD, -1)
+                (crate::sql::types::oid::RECORD, -1)
             );
         });
     }

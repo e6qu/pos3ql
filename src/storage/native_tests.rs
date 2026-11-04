@@ -11178,12 +11178,33 @@ fn index_ready_transitions_publish_and_rollback_owned_binding_roots() {
         assert_eq!(storage.tables[table].enforcer_count(), 1);
         let mut dead = ready;
         dead.kind = IndexKind::OrdinaryDead;
-        let prior = storage.alter_index_definition(index, dead, 9).unwrap();
+        let prior_dead = storage.alter_index_definition(index, dead, 9).unwrap();
         storage
             .prepare_index_definition_enforcers(index, 9, IndexBindingOperation::State)
             .unwrap();
         assert_eq!(storage.tables[table].enforcer_count(), 0);
-        storage.rollback_index_definition(index, prior);
+        let prior_ready = storage.alter_index_definition(index, ready, 9).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 9, IndexBindingOperation::State)
+            .unwrap();
+        assert_eq!(storage.tables[table].enforcer_count(), 1);
+        let prior_dead_again = storage.alter_index_definition(index, dead, 9).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 9, IndexBindingOperation::State)
+            .unwrap();
+        assert_eq!(storage.tables[table].enforcer_count(), 0);
+        storage
+            .prepare_index_definition_enforcers(index, 9, IndexBindingOperation::State)
+            .unwrap();
+        assert_eq!(
+            storage.tables[table].publication().binding_versions.len(),
+            3
+        );
+        storage.rollback_index_definition(index, prior_dead_again);
+        assert_eq!(storage.tables[table].enforcer_count(), 1);
+        storage.rollback_index_definition(index, prior_ready);
+        assert_eq!(storage.tables[table].enforcer_count(), 0);
+        storage.rollback_index_definition(index, prior_dead);
         assert_eq!(storage.index(index).mutable.kind, IndexKind::OrdinaryReady);
         assert_eq!(storage.tables[table].enforcer_count(), 1);
     });

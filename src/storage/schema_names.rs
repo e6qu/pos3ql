@@ -397,6 +397,7 @@ impl Storage {
         }
         indexes[slot].pending_definition = Some(super::PendingIndexDefinition {
             txid: transaction,
+            revision: self.catalog_sequence.next()?,
             definition: definition.mutable_for(transaction),
             expressions: definition.expressions,
             predicate: definition.predicate,

@@ -4263,7 +4263,7 @@ struct EnforcerSnapshot {
 pub(crate) enum BindingChange {
     IndexCreate { created_at: u64 },
     IndexDrop { created_at: u64 },
-    IndexState { created_at: u64, kind: IndexKind },
+    IndexState { created_at: u64, revision: u64 },
     TableDefinition { revision: u64 },
 }
 
@@ -11864,6 +11864,7 @@ impl IndexMutableDefinition {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingIndexDefinition {
     pub txid: u32,
+    pub revision: u64,
     pub definition: IndexMutableDefinition,
     pub expressions: [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
     pub predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
@@ -38519,6 +38520,15 @@ impl Storage {
         }
         if matches!(operation, IndexBindingOperation::State)
             && index.mutable.kind.ready() == index.mutable_for(transaction).kind.ready()
+            && !self.tables[table]
+                .publication()
+                .binding_versions
+                .iter()
+                .any(|version| {
+                    version.transaction == transaction
+                        && matches!(version.change, BindingChange::IndexState { created_at, .. }
+                        if created_at == index.created_at)
+                })
         {
             return Ok(());
         }
@@ -38531,7 +38541,10 @@ impl Storage {
             },
             IndexBindingOperation::State => BindingChange::IndexState {
                 created_at: index.created_at,
-                kind: index.mutable_for(transaction).kind,
+                revision: index
+                    .pending_definition
+                    .expect("owned index state has a pending image")
+                    .revision,
             },
         };
         self.prepare_index_enforcers(table, transaction, change)
@@ -49098,6 +49111,7 @@ impl Storage {
         let current = index.definition_for(txid);
         index.pending_definition = Some(PendingIndexDefinition {
             txid,
+            revision: self.catalog_sequence.next()?,
             definition,
             expressions: current.expressions,
             predicate: current.predicate,
@@ -49156,20 +49170,17 @@ impl Storage {
         prior: Option<PendingIndexDefinition>,
     ) {
         let selected = self.index(slot);
-        if let Some(pending) = selected.pending_definition {
-            let prior_kind = prior.map_or(selected.mutable.kind, |prior| prior.definition.kind);
-            if prior_kind.ready() != pending.definition.kind.ready()
-                && let Some(table) = self.index_table_slot_to(slot, pending.txid)
-            {
-                self.rollback_binding_change(
-                    table,
-                    pending.txid,
-                    BindingChange::IndexState {
-                        created_at: selected.created_at,
-                        kind: pending.definition.kind,
-                    },
-                );
-            }
+        if let Some(pending) = selected.pending_definition
+            && let Some(table) = self.index_table_slot_to(slot, pending.txid)
+        {
+            self.rollback_binding_change(
+                table,
+                pending.txid,
+                BindingChange::IndexState {
+                    created_at: selected.created_at,
+                    revision: pending.revision,
+                },
+            );
         }
         self.index_catalog()[slot].pending_definition = prior;
     }

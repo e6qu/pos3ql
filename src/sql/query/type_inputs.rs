@@ -1116,6 +1116,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 self.arena,
                 outer,
             )?),
+            None if matches!(self.planner, PlannerPass::Analyze) => Some(
+                super::QueryScope::singleton(self.storage, self.txid, self.arena)?,
+            ),
             None => None,
         };
         let schema = scope.as_ref().map(super::materialize::ScopeSchema);
@@ -1141,6 +1144,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         let mut output_index = 0usize;
         let mut target_inputs = crate::mem::arena::ArenaList::new(self.arena);
         for item in select.items {
+            if matches!(self.planner, PlannerPass::Analyze) {
+                super::validate_projection_source(
+                    item,
+                    scope
+                        .as_ref()
+                        .expect("analysis owns a source or singleton scope"),
+                )?;
+                if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) =
+                    item
+                {
+                    crate::sql::exec::infer_type_res(expression, &columns)?;
+                }
+            }
             if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
                 if matches!(item, SelectItem::Expr { .. })
                     && let Some((target, type_mod, _)) =

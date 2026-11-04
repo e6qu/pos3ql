@@ -4,6 +4,13 @@ SET search_path=planner_order,pg_catalog;
 CREATE TABLE fz(id integer,a integer,b integer,s text,flag boolean);
 INSERT INTO fz VALUES(1,10,3,'apple',true),(2,-7,0,'banana',false),(3,NULL,5,NULL,NULL),
  (4,2147483647,1,'pear',true),(5,0,-4,'',false),(6,42,NULL,'a_b',true);
+SELECT *,1/0 LIMIT 0;
+SELECT missing,1/0;
+SELECT 1/0 AS answer ORDER BY answer;
+SELECT 1 AS answer ORDER BY answer;
+PREPARE parameter_null(integer) AS SELECT pg_typeof($1)::text;
+EXECUTE parameter_null(NULL);
+DEALLOCATE parameter_null;
 SELECT id,min(a),min(flag) FROM fz WHERE ((((999999 / (5 - 0.0)) * (0 * (0.0 + -2.25))) = (7 / ((3 + -2.25) * (0.0 % 2))) AND a < 999999) OR (a < (10.0 % 0.04) OR s NOT LIKE '_pp%')) GROUP BY id ORDER BY 1 NULLS LAST;
 SELECT repeat('a_b',2), CASE WHEN '' NOT LIKE 'a%' THEN (-1 / 999999) WHEN 0.0 >= ((-1 * (100 / 0.0)) / 2147483647) THEN a WHEN a IN (7,100,42,1) THEN (((100+a)+-2.25)*((b- -1)/(42+3.14))) END FROM fz;
 SELECT CASE WHEN (b IS NULL AND flag) THEN 1 ELSE ((2.0 % -1) * (-7 - (-2147483648 -999999))) END, div(100.0,7.0),s FROM fz WHERE (-2147483648 <= (100 / 0.0) OR (0 % -7.5) >= (((100 -3.14)*(b /1.5))-3.14));

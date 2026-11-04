@@ -19,7 +19,13 @@ fn planner_analysis_precedes_folding_and_unreached_conditions_stay_unevaluated()
             .map(str::trim)
             .filter(|sql| !sql.is_empty())
         {
-            let error = if statement.starts_with("SELECT id,min")
+            let error = if statement.starts_with("SELECT *,") {
+                Some("42601")
+            } else if statement.starts_with("SELECT missing,") {
+                Some("42703")
+            } else if statement.starts_with("SELECT 1/0 AS") {
+                Some("22012")
+            } else if statement.starts_with("SELECT id,min")
                 || statement.starts_with("SELECT CASE WHEN true THEN 1 ELSE min")
             {
                 Some("42883")
@@ -42,8 +48,8 @@ fn planner_analysis_precedes_folding_and_unreached_conditions_stay_unevaluated()
         assert_eq!(
             rows,
             [
-                "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "7", "1|t",
-                "2|f", "t", "t", "2", "t", "9",
+                "1", "integer", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0",
+                "a_ba_b|0", "7", "1|t", "2|f", "t", "t", "2", "t", "9",
             ],
             "{mode:?}"
         );

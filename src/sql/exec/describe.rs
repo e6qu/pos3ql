@@ -2396,50 +2396,6 @@ pub(crate) fn with_temporary_record_shapes<R>(run: impl FnOnce() -> R) -> R {
     run()
 }
 
-#[cfg(test)]
-mod temporary_shape_tests {
-    use super::*;
-
-    #[test]
-    fn repeated_metadata_probes_reclaim_shapes_without_invalidating_outer_handles() {
-        init_record_shapes(1);
-        reset_record_shapes();
-        let mut budget = crate::mem::budget::Budget::new(512 << 10);
-        let arena =
-            crate::mem::arena::Arena::new(&mut budget, "metadata shapes", 512 << 10).unwrap();
-        let field = RecordShapeField {
-            name: crate::util::StackStr::from_str("preserved"),
-            ctype: ColType::Int4,
-            type_oid: oid::INT4,
-            type_mod: -1,
-            collation: crate::sql::ast::Collation::None,
-            nested: -1,
-        };
-        let outer = register_record_shape(&[field], &arena).unwrap();
-        let before = arena.used();
-        crate::mem::guard::forbid_alloc(|| {
-            for _ in 0..512 {
-                arena
-                    .with_remaining_region(|scratch| {
-                        with_temporary_record_shapes(|| {
-                            for _ in 1..MAX_TRANSIENT_SHAPES {
-                                assert!(register_record_shape(&[field], scratch).is_some());
-                            }
-                            assert!(register_record_shape(&[field], scratch).is_none());
-                        });
-                    })
-                    .unwrap();
-                assert_eq!(arena.used(), before);
-                assert_eq!(
-                    record_shape_field(outer, "preserved"),
-                    Some((ColType::Int4, -1))
-                );
-                assert!(record_shape_field(outer + 1, "preserved").is_none());
-            }
-        });
-    }
-}
-
 /// Publishes the durable fields of one named composite for this statement.
 /// Both the name and fields are copied into fixed storage, making planner
 /// access independent of runtime values and without post-startup allocation.
@@ -6590,4 +6546,48 @@ pub fn infer_type_res(
             _ => (oid::TEXT, -1),
         },
     })
+}
+
+#[cfg(test)]
+mod temporary_shape_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_metadata_probes_reclaim_shapes_without_invalidating_outer_handles() {
+        init_record_shapes(1);
+        reset_record_shapes();
+        let mut budget = crate::mem::budget::Budget::new(512 << 10);
+        let arena =
+            crate::mem::arena::Arena::new(&mut budget, "metadata shapes", 512 << 10).unwrap();
+        let field = RecordShapeField {
+            name: crate::util::StackStr::from_str("preserved"),
+            ctype: ColType::Int4,
+            type_oid: oid::INT4,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::None,
+            nested: -1,
+        };
+        let outer = register_record_shape(&[field], &arena).unwrap();
+        let before = arena.used();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..512 {
+                arena
+                    .with_remaining_region(|scratch| {
+                        with_temporary_record_shapes(|| {
+                            for _ in 1..MAX_TRANSIENT_SHAPES {
+                                assert!(register_record_shape(&[field], scratch).is_some());
+                            }
+                            assert!(register_record_shape(&[field], scratch).is_none());
+                        });
+                    })
+                    .unwrap();
+                assert_eq!(arena.used(), before);
+                assert_eq!(
+                    record_shape_field(outer, "preserved"),
+                    Some((ColType::Int4, -1))
+                );
+                assert!(record_shape_field(outer + 1, "preserved").is_none());
+            }
+        });
+    }
 }

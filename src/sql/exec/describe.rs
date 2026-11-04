@@ -2381,18 +2381,13 @@ pub(crate) fn with_temporary_record_shapes<R>(run: impl FnOnce() -> R) -> R {
             });
         }
     }
-    let _restore = RECORD_SHAPES.with(|slot| {
-        slot.borrow().as_ref().map_or(
-            Restore {
-                transient: 0,
-                named: 0,
-            },
-            |pool| Restore {
-                transient: pool.n,
-                named: pool.named_n,
-            },
-        )
+    // Cleanup can borrow the registry only after this read borrow has ended.
+    let (transient, named) = RECORD_SHAPES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or((0, 0), |pool| (pool.n, pool.named_n))
     });
+    let _restore = Restore { transient, named };
     run()
 }
 
@@ -6570,17 +6565,19 @@ mod temporary_shape_tests {
         let outer = register_record_shape(&[field], &arena).unwrap();
         let before = arena.used();
         crate::mem::guard::forbid_alloc(|| {
-            for _ in 0..512 {
-                arena
+            for attempt in 0..512 {
+                let result = arena
                     .with_remaining_region(|scratch| {
                         with_temporary_record_shapes(|| {
                             for _ in 1..MAX_TRANSIENT_SHAPES {
                                 assert!(register_record_shape(&[field], scratch).is_some());
                             }
                             assert!(register_record_shape(&[field], scratch).is_none());
-                        });
+                            if attempt % 2 == 0 { Ok(()) } else { Err(()) }
+                        })
                     })
                     .unwrap();
+                assert_eq!(result.is_ok(), attempt % 2 == 0);
                 assert_eq!(arena.used(), before);
                 assert_eq!(
                     record_shape_field(outer, "preserved"),

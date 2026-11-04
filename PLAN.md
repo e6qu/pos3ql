@@ -41,7 +41,8 @@ Simple table scans already preserve their source position and completed values
 when a function pauses. Extend that behavior to the remaining query shapes and
 statement bodies described below. Preserve declared types, selected objects,
 defaults, null handling and evaluation order. Reclaim temporary memory between
-calls; ordinary expressions without preparation-time checks must not reserve
+calls and preserve enclosing row descriptions after both successful and failed
+metadata probes. Ordinary expressions without preparation-time checks must not reserve
 checked-input storage. The [architecture](docs/architecture.md#the-request-path)
 owns the current execution details and memory rules.
 Finish retaining values checked while SQL is prepared. For example, preparing

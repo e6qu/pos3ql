@@ -23,6 +23,8 @@ Check predecessor flags and live/dead counts after replacement; command completi
 alone cannot prove that an old index stayed retired.
 Check complete comparison metadata before journaling a constraint-created index.
 Native crashes require thread backtraces; a retry or a longer deadline is not a fix.
+Metadata cleanup must restore its enclosing state on success and error, without
+retaining a registry borrow while cleanup itself needs to update that registry.
 Projection errors must retain their order before constant evaluation, including
 invalid wildcards and missing columns.
 Table-drop undo must restore only indexes dropped by that operation. Verify

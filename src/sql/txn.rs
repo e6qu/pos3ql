@@ -229,6 +229,10 @@ pub(crate) fn validate_isolation_mode(
 pub(crate) enum CommitTarget {
     Ordinary,
     Utility(super::UtilityCommand),
+    ConcurrentIndex {
+        command: u64,
+        phase: super::concurrent_index::CommitPhase,
+    },
     Prepare {
         slot: usize,
         gid: super::ast::PreparedTransactionId,
@@ -331,6 +335,8 @@ pub struct TxnState {
     /// A concurrent partition detach published its first durable phase. The
     /// protocol executor commits that phase before it parks for finalization.
     concurrent_partition_detach_pending: bool,
+    pub(super) concurrent_index: Option<super::concurrent_index::Command>,
+    pub(super) immediate_index_utility: Option<super::UtilityCommand>,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
@@ -931,6 +937,8 @@ impl TxnState {
             .saturating_add(core::mem::size_of::<
                 Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
             >())
+            .saturating_add(core::mem::size_of::<Option<super::concurrent_index::Command>>())
+            .saturating_add(core::mem::size_of::<Option<super::UtilityCommand>>())
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -985,6 +993,11 @@ impl TxnState {
             >(),
             "transaction plan invalidation owner",
         )?;
+        budget.draw(
+            core::mem::size_of::<Option<super::concurrent_index::Command>>()
+                + core::mem::size_of::<Option<super::UtilityCommand>>(),
+            "concurrent index command",
+        )?;
         let mut large_object_descriptors =
             FixedVec::new(budget, "large_object_descriptors", capacity.descriptors)?;
         for _ in 0..capacity.descriptors {
@@ -1018,6 +1031,8 @@ impl TxnState {
             rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
             concurrent_partition_detach_pending: false,
+            concurrent_index: None,
+            immediate_index_utility: None,
             touched: FixedVec::new(budget, "txn_touched", capacity.rows)?,
             truncates: FixedVec::new(budget, "txn_truncates", capacity.ddl)?,
             truncate_wal_tables: FixedBuf::new(
@@ -1232,6 +1247,12 @@ impl TxnState {
     pub(crate) fn begin_implicit_block(&mut self) {
         if self.mode == TxnMode::Implicit {
             self.mode = TxnMode::ImplicitBlock;
+        }
+    }
+
+    pub(crate) fn defer_concurrent_index_cancel(&mut self) {
+        if let Some(command) = &mut self.concurrent_index {
+            command.cancel_after_commit = true;
         }
     }
 
@@ -3036,6 +3057,8 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.concurrent_index = None;
+        self.immediate_index_utility = None;
         if let Some(owner) = &self.plan_invalidations {
             for event in self.plan_events() {
                 owner.apply(event);

@@ -151,6 +151,14 @@ database publishes before protocol `Sync`, while concurrent index commands have
 intermediate committed catalog states and a final transaction. A common
 "commit every utility immediately" rule is incorrect.
 
+Concurrent reindexing must replace the index while preserving its owning
+constraint's identity. For example, an application's saved primary-key
+constraint identifier must still identify that constraint after its index is
+rebuilt. Store those identities separately, update the backing-index link, and
+preserve comments, dependencies and partition links. Verify the intermediate
+commits, failure cleanup and empty-cache recovery for ordinary and
+constraint-owned indexes.
+
 ### Share fixed memory and disk capacity according to demand
 
 **Example:** configuring many possible tables must not reserve a large private

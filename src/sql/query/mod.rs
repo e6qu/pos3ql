@@ -3305,10 +3305,8 @@ fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlE
             .index_visible_to(slot, txid)
             .expect("resolved index slot remains visible");
         if index.method != crate::sql::ast::IndexAccessMethod::Brin
-            || !matches!(
-                index.mutable_for(txid).kind,
-                crate::storage::IndexKind::Ordinary
-            )
+            || index.mutable_for(txid).kind.is_partitioned()
+            || !index.mutable_for(txid).kind.ready()
         {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,

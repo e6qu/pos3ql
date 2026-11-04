@@ -158,7 +158,7 @@ pub(super) struct StatementSequenceReplay {
 
 impl StatementSequenceReplay {
     pub(super) fn is_retained(self) -> bool {
-        self.head.is_some() || self.effects_head.is_some()
+        self.input_attempt.is_some() || self.head.is_some() || self.effects_head.is_some()
     }
 
     pub(super) const EMPTY: Self = Self {
@@ -1565,6 +1565,51 @@ mod tests {
                 ready_routine_input(changed, &arena).unwrap();
                 scope.finish(session).unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn cursor_only_statements_keep_exact_identity_across_waits_and_finish() {
+        let mut budget = Budget::new(8192);
+        let mut arena = Arena::new(&mut budget, "cursor-only statement", 8192).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        crate::mem::guard::forbid_alloc(|| {
+            let cursor;
+            {
+                let _statement = enter_statement(&arena, session, false);
+                cursor = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+                assert!(session.statement_replay.get().is_retained());
+            }
+            for _ in 0..3 {
+                let _statement = enter_statement(&arena, session, true);
+                restore_replay_cursor(cursor).unwrap();
+            }
+            {
+                let statement = enter_statement(&arena, session, true);
+                restore_replay_cursor(cursor).unwrap();
+                statement.finish(session).unwrap();
+                assert!(!session.statement_replay.get().is_retained());
+            }
+            {
+                let statement = enter_statement(&arena, session, false);
+                assert_eq!(
+                    restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+                restore_replay_cursor(fresh).unwrap();
+                statement.finish(session).unwrap();
+            }
+            arena.reset();
+            let statement = enter_statement(&arena, session, false);
+            let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+            assert_eq!(
+                restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            restore_replay_cursor(fresh).unwrap();
+            statement.finish(session).unwrap();
         });
     }
 

@@ -1219,3 +1219,564 @@ fn custom_bind_parameters_prune_unreached_inputs_before_checking_function_bodies
         message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
     }
 }
+
+#[test]
+fn concurrent_index_commands_publish_their_real_states_before_sync() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("concurrent-index-phases", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut builder = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        builder.id = 1;
+        observer.id = 2;
+        builder.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TABLE phase_index_rows(id integer); INSERT INTO phase_index_rows VALUES(1),(2)",
+        );
+        let flags = "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+            JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='phase_index_rows_idx'";
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "CREATE INDEX CONCURRENTLY phase_index_rows_idx ON phase_index_rows(id)",
+        );
+        let response = message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(command_completion_in(&response), Some("CREATE INDEX"));
+        assert_eq!(
+            first_row(&query(&mut observer, &mut engine, flags)),
+            "f|t|t"
+        );
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(
+            first_row(&query(&mut observer, &mut engine, flags)),
+            "t|t|t"
+        );
+
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS phase_index_rows_idx ON phase_index_rows(id)",
+        );
+        message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "DROP INDEX CONCURRENTLY phase_index_rows_idx",
+        );
+        let response = message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(command_completion_in(&response), Some("DROP INDEX"));
+        assert_eq!(
+            first_row(&query(&mut observer, &mut engine, flags)),
+            "f|f|f"
+        );
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT count(*) FROM pg_class WHERE relname='phase_index_rows_idx'"
+            )),
+            "0"
+        );
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "DROP INDEX CONCURRENTLY IF EXISTS phase_index_rows_idx",
+        );
+        message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TEMP TABLE phase_index_temp(id integer)",
+        );
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "CREATE INDEX CONCURRENTLY phase_index_temp_idx ON phase_index_temp(id)",
+        );
+        message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "DROP INDEX CONCURRENTLY phase_index_temp_idx",
+        );
+        message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+    }
+}
+
+#[test]
+fn concurrent_index_build_waits_for_earlier_writers_and_keeps_published_failures() {
+    let config = config(
+        "concurrent-index-writer-wait",
+        crate::config::TransactionMode::Mvcc,
+    );
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut builder = Conn::new(&config, &mut budget).unwrap();
+    let mut writer = Conn::new(&config, &mut budget).unwrap();
+    let mut observer = Conn::new(&config, &mut budget).unwrap();
+    builder.id = 1;
+    writer.id = 2;
+    observer.id = 3;
+    builder.phase = Phase::Ready;
+    writer.phase = Phase::Ready;
+    observer.phase = Phase::Ready;
+    query(
+        &mut builder,
+        &mut engine,
+        "CREATE TABLE phase_wait_rows(id integer)",
+    );
+    let flags = "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+        JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='phase_wait_idx'";
+    for cancel in [true, false] {
+        query(
+            &mut writer,
+            &mut engine,
+            "BEGIN; INSERT INTO phase_wait_rows VALUES(1)",
+        );
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "CREATE UNIQUE INDEX CONCURRENTLY phase_wait_idx ON phase_wait_rows(id)",
+        );
+        builder.send.clear();
+        assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+        let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+        assert!(
+            matches!(step, Step::Parked),
+            "{step:?}: {}",
+            String::from_utf8_lossy(builder.send.readable())
+        );
+        assert_eq!(
+            first_row(&query(&mut observer, &mut engine, flags)),
+            "f|f|t"
+        );
+        query(
+            &mut observer,
+            &mut engine,
+            "INSERT INTO phase_wait_rows VALUES(2)",
+        );
+        if cancel {
+            assert!(crate::mem::guard::forbid_alloc(
+                || builder.cancel_parked(&mut engine)
+            ));
+            assert!(
+                builder
+                    .send
+                    .readable()
+                    .windows(5)
+                    .any(|bytes| bytes == b"57014")
+            );
+            message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(&mut observer, &mut engine, flags)),
+                "f|f|t"
+            );
+        } else {
+            query(&mut writer, &mut engine, "COMMIT");
+            let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+            assert!(
+                matches!(step, Step::Continue),
+                "{step:?}: {}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            assert!(
+                !has_message(builder.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(&mut observer, &mut engine, flags)),
+                "t|t|t"
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT count(*) FROM phase_wait_rows WHERE id IN(1,2)"
+                )),
+                "2"
+            );
+        }
+        query(&mut writer, &mut engine, "ROLLBACK");
+        query(
+            &mut builder,
+            &mut engine,
+            "DROP INDEX CONCURRENTLY phase_wait_idx",
+        );
+        query(&mut builder, &mut engine, "TRUNCATE phase_wait_rows");
+    }
+    query(
+        &mut builder,
+        &mut engine,
+        "INSERT INTO phase_wait_rows VALUES(1),(1)",
+    );
+    bind_command(
+        &mut builder,
+        &mut engine,
+        "CREATE UNIQUE INDEX CONCURRENTLY phase_wait_idx ON phase_wait_rows(id)",
+    );
+    let response = message(&mut builder, &mut engine, wire::FMSG_EXECUTE, &[0; 5], true);
+    assert!(
+        response.windows(5).any(|bytes| bytes == b"23505"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+    assert_eq!(
+        first_row(&query(&mut observer, &mut engine, flags)),
+        "f|f|t"
+    );
+    query(
+        &mut writer,
+        &mut engine,
+        "INSERT INTO phase_wait_rows VALUES(1)",
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT count(*) FROM phase_wait_rows"
+        )),
+        "3"
+    );
+    query(
+        &mut builder,
+        &mut engine,
+        "DROP INDEX CONCURRENTLY phase_wait_idx",
+    );
+}
+
+#[test]
+#[cfg(not(miri))]
+fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
+    for with_triggers in [false, true] {
+        for cancel_after_registration in [false, true] {
+            let mut config = config(
+                &format!("concurrent-index-receipts-{with_triggers}-{cancel_after_registration}"),
+                crate::config::TransactionMode::Mvcc,
+            );
+            config.object_store_on = true;
+            config.object_store_bucket = format!(
+                "index-receipts-{}-{with_triggers}-{cancel_after_registration}",
+                std::process::id()
+            );
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            config.wal_upload_buffer_bytes = 1 << 20;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let server = crate::sql::HttpObjectServer::start(&mut config);
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut builder = Conn::new(&config, &mut budget).unwrap();
+            let mut observer = Conn::new(&config, &mut budget).unwrap();
+            builder.id = 1;
+            observer.id = 2;
+            builder.phase = Phase::Ready;
+            observer.phase = Phase::Ready;
+            query(
+                &mut builder,
+                &mut engine,
+                "CREATE TABLE receipt_index_rows(id integer); INSERT INTO receipt_index_rows VALUES(1),(2)",
+            );
+            if with_triggers {
+                query(
+                    &mut builder,
+                    &mut engine,
+                    "CREATE SEQUENCE receipt_index_start; CREATE SEQUENCE receipt_index_end; \
+                     CREATE FUNCTION receipt_index_started() RETURNS event_trigger LANGUAGE plpgsql AS \
+                     $$BEGIN PERFORM nextval('receipt_index_start'); END$$; \
+                     CREATE FUNCTION receipt_index_finished() RETURNS event_trigger LANGUAGE plpgsql AS \
+                     $$BEGIN PERFORM nextval('receipt_index_end'); END$$; \
+                     CREATE EVENT TRIGGER receipt_index_start_trigger ON ddl_command_start \
+                     WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION receipt_index_started(); \
+                     CREATE EVENT TRIGGER receipt_index_end_trigger ON ddl_command_end \
+                     WHEN TAG IN ('CREATE INDEX') EXECUTE FUNCTION receipt_index_finished()",
+                );
+            }
+            engine.commit_wal().unwrap();
+            engine.enable_async_durability();
+            bind_command(
+                &mut builder,
+                &mut engine,
+                "CREATE INDEX CONCURRENTLY receipt_index_idx ON receipt_index_rows(id)",
+            );
+            builder.send.clear();
+            assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+            for _ in 0..3 {
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                assert!(
+                    matches!(step, Step::Parked),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert!(matches!(
+                    builder.txn.staged_commit().unwrap().target,
+                    crate::sql::txn::CommitTarget::ConcurrentIndex { .. }
+                ));
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_COMMAND_COMPLETE
+                ));
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+            }
+            if cancel_after_registration {
+                assert!(!crate::mem::guard::forbid_alloc(
+                    || builder.cancel_parked(&mut engine)
+                ));
+                assert!(builder.txn.staged_commit().is_some());
+            }
+            engine.commit_wal().unwrap();
+            let mut completed = false;
+            for _ in 0..6 {
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                if matches!(step, Step::Continue) {
+                    completed = true;
+                    break;
+                }
+                assert!(
+                    matches!(step, Step::Parked),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert!(matches!(
+                    builder.txn.staged_commit().unwrap().target,
+                    crate::sql::txn::CommitTarget::ConcurrentIndex { .. }
+                ));
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_COMMAND_COMPLETE
+                ));
+                engine.commit_wal().unwrap();
+            }
+            assert!(
+                completed,
+                "bounded index phases did not complete: {}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            if cancel_after_registration {
+                assert!(has_message(
+                    builder.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                assert!(
+                    builder
+                        .send
+                        .readable()
+                        .windows(5)
+                        .any(|bytes| bytes == b"57014"),
+                    "{}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_COMMAND_COMPLETE
+                ));
+                message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+            } else {
+                assert!(
+                    !has_message(builder.send.readable(), wire::MSG_ERROR_RESPONSE),
+                    "{}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert_eq!(
+                    command_completion_in(builder.send.readable()),
+                    Some("CREATE INDEX")
+                );
+                builder.send.clear();
+                assert!(builder.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                assert!(
+                    matches!(step, Step::Parked),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert!(builder.txn.staged_commit().is_some());
+                let selected_table = engine
+                    .storage
+                    .find_visible("public", "receipt_index_rows", 0)
+                    .unwrap();
+                let unavailable = crate::mem::guard::forbid_alloc(|| {
+                    engine.storage.lock_table(
+                        u32::MAX,
+                        selected_table,
+                        crate::sql::ast::TableLockMode::AccessExclusive,
+                        true,
+                    )
+                });
+                assert_eq!(
+                    unavailable.unwrap_err().sqlstate,
+                    sqlstate::LOCK_NOT_AVAILABLE
+                );
+                let mut held_by_final_transaction = false;
+                engine.storage.visit_object_locks(|owner, _, target, mode| {
+                    held_by_final_transaction |= owner
+                        == crate::storage::ObjectLockOwner::Transaction(builder.txn.txid)
+                        && target == crate::storage::ObjectLockTarget::Table(selected_table)
+                        && mode == crate::sql::ast::TableLockMode::ShareUpdateExclusive;
+                });
+                assert!(
+                    held_by_final_transaction,
+                    "final index transaction retains its selected table lock until publication"
+                );
+                observer.send.clear();
+                assert!(observer.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"DROP TABLE receipt_index_rows\0"
+                )));
+                let step =
+                    crate::mem::guard::forbid_alloc(|| observer.process_message(&mut engine));
+                assert!(
+                    matches!(step, Step::Parked),
+                    "final index transaction must protect its selected table: {step:?}: {}",
+                    String::from_utf8_lossy(observer.send.readable())
+                );
+                assert!(crate::mem::guard::forbid_alloc(
+                    || observer.cancel_parked(&mut engine)
+                ));
+                engine.commit_wal().unwrap();
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                assert!(
+                    matches!(step, Step::Continue),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+            }
+            assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+            if with_triggers {
+                assert_eq!(
+                    first_row(&query(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT last_value,is_called FROM receipt_index_start"
+                    )),
+                    "1|t"
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT last_value,is_called FROM receipt_index_end"
+                    )),
+                    if cancel_after_registration {
+                        "1|f"
+                    } else {
+                        "1|t"
+                    }
+                );
+            }
+            engine.commit_wal().unwrap();
+            drop(builder);
+            drop(observer);
+            drop(engine);
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut recovered_budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+            let mut recovered_conn = Conn::new(&config, &mut recovered_budget).unwrap();
+            recovered_conn.id = 1;
+            recovered_conn.phase = Phase::Ready;
+            assert_eq!(
+                first_row(&query(
+                    &mut recovered_conn,
+                    &mut recovered,
+                    "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+                 JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='receipt_index_idx'"
+                )),
+                if cancel_after_registration {
+                    "f|f|t"
+                } else {
+                    "t|t|t"
+                }
+            );
+            if cancel_after_registration {
+                query(
+                    &mut recovered_conn,
+                    &mut recovered,
+                    "REINDEX INDEX receipt_index_idx",
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut recovered_conn,
+                        &mut recovered,
+                        "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+                     JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='receipt_index_idx'"
+                    )),
+                    "t|t|t"
+                );
+            }
+            query(
+                &mut recovered_conn,
+                &mut recovered,
+                "DROP INDEX CONCURRENTLY receipt_index_idx",
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut recovered_conn,
+                    &mut recovered,
+                    "SELECT count(*) FROM pg_class WHERE relname='receipt_index_idx'"
+                )),
+                "0"
+            );
+            drop(recovered_conn);
+            drop(recovered);
+            drop(server);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
+}

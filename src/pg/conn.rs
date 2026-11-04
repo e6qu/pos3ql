@@ -787,7 +787,11 @@ impl Conn {
     }
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
-        if !self.parked || self.txn.staged_commit().is_some() {
+        if !self.parked {
+            return false;
+        }
+        if self.txn.staged_commit().is_some() {
+            self.txn.defer_concurrent_index_cancel();
             return false;
         }
         let extended = self.copy.as_ref().map_or_else(

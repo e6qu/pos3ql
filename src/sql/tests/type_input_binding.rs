@@ -126,7 +126,7 @@ fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_data
             &mut engine,
             "CREATE TYPE cascade_choice AS ENUM('a'); \
              CREATE DOMAIN cascade_checked AS cascade_choice CHECK(VALUE='a'); \
-             CREATE DOMAIN cascade_array AS cascade_checked[]; \
+             CREATE DOMAIN cascade_array AS cascade_checked[] DEFAULT '{a}'; \
              CREATE TABLE cascade_domain_rows(value cascade_array); \
              INSERT INTO cascade_domain_rows VALUES('{a}'); \
              CREATE FUNCTION cascade_value() RETURNS cascade_choice LANGUAGE sql \
@@ -152,15 +152,22 @@ fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_data
         engine
             .select_database(crate::storage::DatabaseOid::TEMPLATE1)
             .unwrap();
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "BEGIN; DROP TYPE cascade_choice CASCADE; \
+             SELECT count(*) FROM pg_type WHERE typname IN ('cascade_choice','cascade_checked','cascade_array'); \
+             SELECT count(*) FROM pg_attrdef; ROLLBACK; \
+             SELECT value::text FROM cascade_domain_rows", true)), ["0", "0", "{a}"]);
         session.success(&mut engine, "DROP TYPE cascade_choice CASCADE", true);
         assert_eq!(
             data_rows(&session.success(
                 &mut engine,
                 "SELECT count(*) FROM pg_proc WHERE proname='cascade_value'; \
-             SELECT count(*) FROM pg_class WHERE relname IN ('cascade_view','cascade_matview')",
+             SELECT count(*) FROM pg_class WHERE relname IN ('cascade_view','cascade_matview'); \
+             SELECT count(*) FROM pg_type WHERE typname IN ('cascade_choice','cascade_checked','cascade_array'); \
+             SELECT count(*) FROM pg_attrdef",
                 true
             )),
-            ["0", "0"]
+            ["0", "0", "0", "0"]
         );
         engine.select_database(copied).unwrap();
         assert_eq!(
@@ -180,6 +187,99 @@ fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_data
 
 // PostgreSQL 18.6 SQL SHA256:
 // a6d12a932def651411044e1d08dbd2bb3d67c958d9c9ada897433d434a310f1a.
+#[test]
+fn domain_array_containment_cascades_close_before_catalog_history_and_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("domain-array-drop-closure-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for (setup, command) in [
+            (
+                "CREATE TYPE containment_root AS ENUM('a'); \
+                 CREATE DOMAIN containment_array AS containment_root[] DEFAULT '{a}'; \
+                 CREATE DOMAIN containment_leaf AS containment_array; \
+                 CREATE TABLE containment_rows(value containment_leaf)",
+                "DROP TYPE containment_root CASCADE",
+            ),
+            (
+                "CREATE DOMAIN containment_root AS integer; \
+                 CREATE DOMAIN containment_array AS containment_root[] DEFAULT '{1}'; \
+                 CREATE DOMAIN containment_leaf AS containment_array; \
+                 CREATE TABLE containment_rows(value containment_leaf)",
+                "DROP DOMAIN containment_root CASCADE",
+            ),
+            (
+                "CREATE TYPE containment_root AS(value integer); \
+                 CREATE DOMAIN containment_array AS containment_root[]; \
+                 CREATE DOMAIN containment_leaf AS containment_array; \
+                 CREATE TABLE containment_rows(value containment_leaf)",
+                "DROP TYPE containment_root CASCADE",
+            ),
+        ] {
+            session.success(&mut engine, setup, true);
+            let inspect = "SELECT count(*) FROM pg_type WHERE typname IN ('containment_root','containment_array','containment_leaf'); \
+                           SELECT count(*) FROM pg_attribute WHERE attrelid='containment_rows'::regclass AND attnum>0 AND NOT attisdropped";
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    &format!("BEGIN; {command}; {inspect}; ROLLBACK; {inspect}"),
+                    true
+                )),
+                ["0", "0", "3", "1"],
+                "{mode:?}: {command}"
+            );
+            session.success(&mut engine, command, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    &format!("{inspect}; SELECT count(*) FROM pg_attrdef"),
+                    true
+                )),
+                ["0", "0", "0"],
+                "{mode:?}: {command}"
+            );
+            session.success(&mut engine, "DROP TABLE containment_rows", true);
+        }
+        for (root, array_default, expression) in [
+            (
+                "CREATE TYPE containment_schema.choice AS ENUM('a')",
+                "DEFAULT '{a}'",
+                "'{a}'::containment_leaf",
+            ),
+            (
+                "CREATE TYPE containment_schema.choice AS(value integer)",
+                "",
+                "NULL::containment_leaf",
+            ),
+        ] {
+            session.success(
+                &mut engine,
+                &format!(
+                    "CREATE SCHEMA containment_schema; {root}; \
+                 CREATE DOMAIN containment_root AS containment_schema.choice; \
+                 CREATE DOMAIN containment_array AS containment_root[] {array_default}; \
+                 CREATE DOMAIN containment_leaf AS containment_array; \
+                 CREATE TABLE containment_rows(value containment_leaf); \
+                 CREATE VIEW containment_view AS SELECT {expression} AS value"
+                ),
+                true,
+            );
+            session.success(&mut engine, "DROP SCHEMA containment_schema CASCADE", true);
+            assert_eq!(data_rows(&session.success(&mut engine,
+                "SELECT count(*) FROM pg_type WHERE typname IN ('containment_root','containment_array','containment_leaf'); \
+                 SELECT count(*) FROM pg_attrdef; \
+                 SELECT count(*) FROM pg_class WHERE relname='containment_view'; \
+                 SELECT count(*) FROM pg_attribute WHERE attrelid='containment_rows'::regclass AND attnum>0 AND NOT attisdropped", true)), ["0", "0", "0", "0"], "{mode:?}: {root}");
+            session.success(&mut engine, "DROP TABLE containment_rows", true);
+        }
+    }
+}
+
 #[test]
 fn procedural_for_queries_execute_source_effects_once() {
     for mode in [
@@ -561,9 +661,9 @@ fn rewrite_defaults_reuse_cached_scalars_arrays_and_nulls_in_mixed_rows() {
             )),
             [
                 "7|given|{3}|9",
-                "41|defaulted|{1,2}|",
+                "41|defaulted|{1,2}|NULL",
                 "7|given|{3}|9",
-                "41|defaulted|{1,2}|"
+                "41|defaulted|{1,2}|NULL"
             ]
         );
         let arena = Arena::new(&mut budget, "cached default value provenance", 8192).unwrap();

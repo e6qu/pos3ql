@@ -469,6 +469,19 @@ tests the inserted row's identifier. A scalar subquery with no rows returns
 NULL; more than one row fails with `21000`. A subquery in a skipped `CASE` or
 boolean branch does not run.
 
+Numeric `FOR` loops create a private integer variable. For example, if a routine
+declares `value text := 'outer'`, then `FOR value IN 1..2 LOOP NULL; END LOOP`
+leaves that outer `value` unchanged. Query `FOR` loops and `FOREACH` instead assign
+their declared target, which keeps the last assigned row or element after the
+loop. An empty query loop assigns a null row; an empty array loop leaves the
+target unchanged. These distinctions also apply to function output variables.
+The [PostgreSQL reference evidence](https://github.com/e6qu/pos3ql/blob/bcbaba7ba47b735c123198a03d14e80935340a3e/tests/external/reference/2026-11-03-input-plans/README.md)
+includes matching examples and raw results.
+
+An `EXCEPTION WHEN OTHERS` handler excludes query cancellation and assertion
+failures. Catch those deliberately with `WHEN query_canceled` or
+`WHEN assert_failure`; a broad handler does not keep cancelled work running.
+
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success
 tag first. Supported static DDL in a `DO` block or routine uses the same

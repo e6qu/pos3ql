@@ -4724,7 +4724,7 @@ fn lock_state_is_synchronized_and_startup_bounded() {
                         locks
                             .table
                             .push(ObjectLock {
-                                owner,
+                                owner: ObjectLockOwner::Transaction(owner),
                                 wait_owner: crate::sql::lock::prepared_wait_owner(owner),
                                 relation: ObjectLockTarget::Table(0),
                                 modes,
@@ -11210,4 +11210,122 @@ fn index_ready_transitions_publish_and_rollback_owned_binding_roots() {
         assert_eq!(storage.index(index).mutable.kind, IndexKind::OrdinaryReady);
         assert_eq!(storage.tables[table].enforcer_count(), 1);
     });
+}
+
+#[test]
+fn session_table_leases_keep_exact_lifetimes_across_transaction_cleanup() {
+    use crate::sql::ast::TableLockMode;
+
+    let mut config = test_config();
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage
+        .create_table(make_def("phase_lock", &[("id", ColType::Int4, false)]))
+        .unwrap();
+    let previous = crate::sql::execution_connection_id();
+    crate::mem::guard::forbid_alloc(|| {
+        crate::sql::set_execution_connection_id(41);
+        let first = storage.start_transaction_identity().unwrap();
+        storage
+            .lock_table(first, table, TableLockMode::ShareUpdateExclusive, false)
+            .unwrap();
+        let lease = storage.hold_table_across_commits(first, table).unwrap();
+        assert_eq!(storage.object_lock_view_count(), 1);
+        storage.rollback_locks_to(first, 0);
+        storage.release_object_locks(first);
+        storage.finish_transaction_identity(first, true);
+        assert_eq!(storage.object_lock_view_count(), 1);
+        let second = storage.start_transaction_identity().unwrap();
+        assert_eq!(
+            storage.validate_session_table_lock(&lease, second).unwrap(),
+            table
+        );
+        storage
+            .lock_table(second, table, TableLockMode::AccessExclusive, false)
+            .unwrap();
+        storage.release_object_locks(second);
+        storage.release_connection_object_locks(41);
+        let replacement = storage.hold_table_across_commits(second, table).unwrap();
+        assert_eq!(
+            storage
+                .validate_session_table_lock(&lease, second)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::SERIALIZATION_FAILURE
+        );
+        assert_eq!(
+            storage
+                .validate_session_table_lock(&replacement, second)
+                .unwrap(),
+            table
+        );
+
+        crate::sql::set_execution_connection_id(42);
+        let writer = storage.start_transaction_identity().unwrap();
+        storage
+            .lock_table(writer, table, TableLockMode::RowExclusive, false)
+            .unwrap();
+        storage.release_object_locks(writer);
+        assert_eq!(
+            storage
+                .lock_table(writer, table, TableLockMode::AccessExclusive, false)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        let mut blockers = [0; 2];
+        assert_eq!(storage.blocking_backend_pids(42, &mut blockers), 1);
+        assert_eq!(blockers[0], 41);
+        storage.cancel_backend_wait(42);
+        assert_eq!(storage.blocking_backend_pid_count(42), 0);
+        assert_eq!(storage.object_lock_view_count(), 1);
+        storage.release_connection_object_locks(42);
+        assert_eq!(storage.object_lock_view_count(), 1);
+        drop(lease);
+        assert_eq!(
+            storage
+                .validate_session_table_lock(&replacement, second)
+                .unwrap(),
+            table
+        );
+        drop(replacement);
+        storage
+            .lock_table(writer, table, TableLockMode::AccessExclusive, false)
+            .unwrap();
+        storage.release_object_locks(writer);
+        storage.finish_transaction_identity(writer, false);
+        storage.finish_transaction_identity(second, true);
+        assert_eq!(storage.object_lock_view_count(), 0);
+    });
+    crate::sql::set_execution_connection_id(previous);
+}
+
+#[test]
+fn session_table_lease_acquisition_exhaustion_does_not_recycle_an_owner() {
+    let config = test_config();
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage
+        .create_table(make_def(
+            "phase_exhaustion",
+            &[("id", ColType::Int4, false)],
+        ))
+        .unwrap();
+    let previous = crate::sql::execution_connection_id();
+    crate::sql::set_execution_connection_id(41);
+    crate::mem::guard::forbid_alloc(|| {
+        let transaction = storage.start_transaction_identity().unwrap();
+        storage.lock_state().sequence = u64::MAX;
+        assert_eq!(
+            storage
+                .hold_table_across_commits(transaction, table)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(storage.object_lock_view_count(), 0);
+        storage.finish_transaction_identity(transaction, false);
+    });
+    crate::sql::set_execution_connection_id(previous);
 }

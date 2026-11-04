@@ -13601,6 +13601,11 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "cannot reference OLD",
         ),
         (
+            "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
+             DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
+            "cannot reference NEW",
+        ),
+        (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
              WHERE NEW.id = 1 DO NOTIFY conditional_rule",
             "can only have SELECT, INSERT, UPDATE, or DELETE actions",
@@ -13609,9 +13614,12 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         let rejected = run_with(&mut engine, &mut budget, sql);
         assert!(
             String::from_utf8_lossy(&rejected).contains(expected),
-            "{}",
+            "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
+        if expected.starts_with("cannot reference") {
+            assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
+        }
     }
 }
 
@@ -14298,6 +14306,43 @@ fn event_trigger_original_routine_uses_the_typed_signature() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output), ["t|16"]);
+}
+
+#[test]
+fn event_trigger_drop_roots_retain_the_selected_search_path_objects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("event-drop-search-path-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential/220_event_drop_search_path.sql"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "function|drop_path_a|shared_function|t",
+                "function|drop_path_b|shared_function|f",
+                "index|drop_path_a|shared_index|t",
+                "operator|drop_path_a|##|t",
+                "table|drop_path_a|shared_base|t",
+                "type|drop_path_a|shared_domain|t",
+                "view|drop_path_b|shared_view|f",
+                "0",
+                "5|106",
+                "1",
+                "1",
+            ],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
 }
 
 #[test]
@@ -46343,6 +46388,40 @@ fn statement_trigger_for_query_materializes_transition_rows_before_dml() {
     assert_eq!(
         data_rows(&output),
         ["1", "3"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn statement_trigger_for_record_query_rebinds_each_transition_rowset() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_record_driver(id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_for_record_audit(value integer, observed integer);
+         CREATE FUNCTION trigger_for_record_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item record;
+            BEGIN
+              FOR item IN SELECT value, value + 100 AS observed FROM changed_rows ORDER BY value LOOP
+                INSERT INTO trigger_for_record_audit VALUES(item.value, item.observed);
+              END LOOP;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_for_record_after AFTER UPDATE ON trigger_for_record_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_for_record_program();
+         INSERT INTO trigger_for_record_driver VALUES(1,1),(2,2),(3,3),(4,4);
+         UPDATE trigger_for_record_driver SET value=value+10;
+         UPDATE trigger_for_record_driver SET value=value+10;
+         SELECT value,observed FROM trigger_for_record_audit ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "11|111", "12|112", "13|113", "14|114", "21|121", "22|122", "23|123", "24|124"
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -92360,7 +92439,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
     );
     let mut owned = false;
     engine.storage.visit_object_locks(|owner, _, target, mode| {
-        owned |= owner == session.transaction.txid
+        owned |= owner == crate::storage::ObjectLockOwner::Transaction(session.transaction.txid)
             && target == crate::storage::ObjectLockTarget::View(view)
             && mode == ast::TableLockMode::RowExclusive;
     });

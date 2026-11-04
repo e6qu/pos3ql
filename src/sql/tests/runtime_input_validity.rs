@@ -584,7 +584,7 @@ fn set_query_metadata_keeps_shared_cte_shapes_without_running_sources() {
             ),
             (
                 "WITH c AS (SELECT * FROM unnest(ARRAY[1,2], ARRAY['p']) AS u(id,label)) SELECT id,label FROM c UNION ALL SELECT 3,'tail' ORDER BY 1",
-                vec!["1|p", "2|", "3|tail"],
+                vec!["1|p", "2|NULL", "3|tail"],
             ),
             (
                 "WITH c AS (SELECT nextval('set_query_effects')::integer AS id) SELECT set_query_identity(id) FROM c UNION ALL SELECT 99 ORDER BY 1",

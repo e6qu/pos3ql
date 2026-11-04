@@ -18,6 +18,15 @@ results, runner, commands, binary hashes and provenance. Extract it and run
 `python3 verify-loop-reference.py .` to verify the evidence. This establishes
 reference behavior; the matching pos3ql tests must still pass in CI.
 
+[event-drop-reference.zip](event-drop-reference.zip), SHA256
+`2c585c8d1d4394bb90eb689fbc0ee456d08ba4f0e45da1606a4d1a0127ab5de2`,
+records search-path selection and original-versus-dependent DROP events on the
+same PostgreSQL build. Dropping `shared_base` selects the first schema's table;
+another schema's dependent view is reported separately, and its unrelated table
+and foreign key survive. The archive includes exact SQL, raw results, commands,
+binary hashes and provenance. Extract it and run
+`python3 verify-event-drop-reference.py .` to verify the evidence.
+
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the
 [original runner artifact](https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290).

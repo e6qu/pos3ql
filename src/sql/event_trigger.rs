@@ -4,7 +4,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
-use crate::sql::ast::{DropTable, Stmt};
+use crate::sql::ast::Stmt;
 use crate::sql::catalog;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::txn::DdlUndo;
@@ -18,12 +18,15 @@ type EventAddressPart = StackStr<512>;
 
 pub(crate) struct BeforeDdl<'a> {
     altered_table: Option<(usize, crate::storage::TableDefinitionImages)>,
+    // Keep the selected objects while their names and search-path entries exist.
+    original_drops: &'a [ObjectRef],
     dependent_drops: &'a [(EventObjectRef, bool)],
 }
 
 impl BeforeDdl<'_> {
     pub(crate) const EMPTY: Self = Self {
         altered_table: None,
+        original_drops: &[],
         dependent_drops: &[],
     };
 }
@@ -35,6 +38,7 @@ pub(crate) fn capture_before<'a>(
     arena: &'a Arena,
 ) -> Result<BeforeDdl<'a>, SqlError> {
     let mut before = BeforeDdl::EMPTY;
+    before.original_drops = capture_original_drops(storage, txid, statement, arena)?;
     let mut dependent_drops = ArenaList::new(arena);
     let alter_root = match statement {
         Stmt::AlterTable(alter)
@@ -64,17 +68,14 @@ pub(crate) fn capture_before<'a>(
     }
 
     let table_is_explicitly_dropped = |slot: usize| {
-        let (table_schema, table_name) = {
+        let table_schema = {
             let table = storage.table_def(slot, txid);
-            (table.schema, table.name)
+            table.schema
         };
         match statement {
-            Stmt::DropTable(drop) => drop.names.iter().any(|name| {
-                name.name == table_name.as_str()
-                    && name
-                        .schema
-                        .is_none_or(|schema| schema == table_schema.as_str())
-            }),
+            Stmt::DropTable(_) | Stmt::DropForeignTable(_) => {
+                before.original_drops.contains(&ObjectRef::Table(slot))
+            }
             Stmt::DropSchema { names, .. } => {
                 names.iter().any(|schema| *schema == table_schema.as_str())
             }
@@ -2859,227 +2860,293 @@ pub(crate) fn catalog_object(
     }
 }
 
-fn explicit_table_drop(statement: &Stmt<'_>, object: &EventObject) -> bool {
-    let Stmt::DropTable(DropTable { names, .. }) = statement else {
-        return false;
-    };
-    names.iter().any(|name| {
-        name.name
-            == object
-                .object_name
-                .as_ref()
-                .map_or("", |value| value.as_str())
-            && Some(name.schema.unwrap_or("public"))
-                == object.schema_name.as_ref().map(|value| value.as_str())
-    })
-}
-
-fn qualified_name_matches(name: crate::sql::ast::QualName<'_>, object: &EventObject) -> bool {
-    name.name
-        == object
-            .object_name
-            .as_ref()
-            .map_or("", |value| value.as_str())
-        && Some(name.schema.unwrap_or("public"))
-            == object.schema_name.as_ref().map(|value| value.as_str())
-}
-
-fn routine_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::RoutineIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let routine = storage.routine_for(slot, txid);
-    if identity.name.name != routine.name_for(txid).as_str()
-        || identity.name.schema.unwrap_or("public") != routine.schema_for(txid).as_str()
-    {
-        return Ok(false);
-    }
-    if !identity.signature_is_explicit {
-        return Ok(true);
-    }
-    if routine.arguments().len() != identity.argument_types.len() {
-        return Ok(false);
-    }
-    let resolved =
-        crate::sql::exec::resolve_routine_signature(storage, txid, identity.argument_types)?;
-    Ok(routine
-        .arguments()
-        .iter()
-        .zip(resolved)
-        .all(|(stored, written)| {
-            stored.ctype == written.ctype && stored.user_type == written.user_type
-        }))
-}
-
-fn aggregate_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::AggregateIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let mut names = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-    let count = identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
-    if count > names.len() {
-        return Ok(false);
-    }
-    names[..identity.direct_argument_types.len()].copy_from_slice(identity.direct_argument_types);
-    names[identity.direct_argument_types.len()..count]
-        .copy_from_slice(identity.aggregated_argument_types);
-    routine_identity_matches(
-        storage,
-        txid,
-        slot,
-        crate::sql::ast::RoutineIdentity {
-            name: identity.name,
-            argument_types: &names[..count],
-            signature_is_explicit: true,
-        },
-    )
-}
-
-fn operator_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::OperatorIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let definition = storage.operator(slot).definition_for(txid);
-    if identity.name.name != definition.name.as_str()
-        || identity.name.schema.unwrap_or("public") != definition.schema.as_str()
-    {
-        return Ok(false);
-    }
-    let signature = match identity.operands {
-        crate::sql::ast::OperatorOperands::Prefix(right) => crate::storage::OperatorSignature {
-            left: None,
-            right: Some(crate::sql::exec::resolve_routine_type(
-                storage, txid, right,
-            )?),
-        },
-        crate::sql::ast::OperatorOperands::Binary { left, right } => {
-            crate::storage::OperatorSignature {
-                left: Some(crate::sql::exec::resolve_routine_type(storage, txid, left)?),
-                right: Some(crate::sql::exec::resolve_routine_type(
-                    storage, txid, right,
-                )?),
-            }
-        }
-    };
-    Ok(signature == definition.signature)
-}
-
-fn is_original(
+fn capture_original_drops<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
-    reference: ObjectRef,
-    object: &EventObject,
-) -> Result<bool, SqlError> {
-    Ok(match (statement, reference) {
-        (Stmt::DropTable(_), ObjectRef::Table(_)) => explicit_table_drop(statement, object),
-        (Stmt::DropView { names, .. }, ObjectRef::View(_))
-        | (Stmt::DropSequence { names, .. }, ObjectRef::Sequence(_))
-        | (Stmt::DropDomain { names, .. }, ObjectRef::Domain(_))
-        | (Stmt::DropType { names, .. }, ObjectRef::Enum(_) | ObjectRef::Composite(_))
-        | (Stmt::DropIndex { names, .. }, ObjectRef::Index(_)) => names.iter().any(|name| {
-            name.name
-                == object
-                    .object_name
-                    .as_ref()
-                    .map_or("", |value| value.as_str())
-                && Some(name.schema.unwrap_or("public"))
-                    == object.schema_name.as_ref().map(|value| value.as_str())
-        }),
-        (Stmt::DropSchema { names, .. }, ObjectRef::Schema(_)) => names.iter().any(|name| {
-            *name
-                == object
-                    .object_name
-                    .as_ref()
-                    .map_or("", |value| value.as_str())
-        }),
-        (Stmt::DropMaterializedView { names, .. }, ObjectRef::MaterializedView(_)) => names
-            .iter()
-            .any(|name| qualified_name_matches(*name, object)),
-        (Stmt::DropFunction { functions, .. }, ObjectRef::Routine(slot))
-        | (
-            Stmt::DropProcedure {
-                procedures: functions,
-                ..
-            },
-            ObjectRef::Routine(slot),
-        )
-        | (
-            Stmt::DropRoutine {
-                routines: functions,
-                ..
-            },
-            ObjectRef::Routine(slot),
-        ) => functions.iter().try_fold(false, |matched, identity| {
-            if matched {
-                Ok(true)
-            } else {
-                routine_identity_matches(storage, txid, slot, *identity)
+    arena: &'a Arena,
+) -> Result<&'a [ObjectRef], SqlError> {
+    use crate::sql::ast::{RoutineIdentity, RoutineTargetKind};
+    let mut roots = ArenaList::new(arena);
+    let mut remember = |reference: Option<ObjectRef>| -> Result<(), SqlError> {
+        if let Some(reference) = reference
+            && !roots.as_slice().contains(&reference)
+        {
+            roots.push(reference).map_err(|_| graph_full())?;
+        }
+        Ok(())
+    };
+    let relation = |name: crate::sql::ast::QualName<'_>| {
+        let (schema, _) = storage.classify_relation(name.schema, name.name, txid)?;
+        relation_reference(storage, txid, schema.as_str(), name.name)
+    };
+    let routine = |identity: &RoutineIdentity<'_>| match crate::sql::exec::resolve_routine_identity(
+        storage,
+        txid,
+        identity,
+        RoutineTargetKind::Either,
+    ) {
+        Ok(slot) => Ok(Some(ObjectRef::Routine(slot))),
+        Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => Ok(None),
+        Err(error) => Err(error),
+    };
+    match statement {
+        Stmt::DropTable(drop) | Stmt::DropForeignTable(drop) => {
+            for name in drop.names {
+                remember(relation(*name))?;
             }
-        })?,
-        (Stmt::DropAggregate { aggregates, .. }, ObjectRef::Routine(slot)) => {
-            aggregates.iter().try_fold(false, |matched, identity| {
-                if matched {
-                    Ok(true)
-                } else {
-                    aggregate_identity_matches(storage, txid, slot, *identity)
+        }
+        Stmt::DropView { names, .. } | Stmt::DropMaterializedView { names, .. } => {
+            for name in *names {
+                remember(relation(*name))?;
+            }
+        }
+        Stmt::DropSequence { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .sequence_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::Sequence),
+                )?;
+            }
+        }
+        Stmt::DropDomain { names, .. } | Stmt::DropType { names, .. } => {
+            for name in *names {
+                let domain = match name.schema {
+                    Some(schema) => storage.domain_slot(schema, name.name, txid),
+                    None => storage.resolve_domain_slot(name.name, txid),
+                };
+                if let Some(slot) = domain {
+                    remember(Some(ObjectRef::Domain(slot)))?;
+                    continue;
                 }
-            })?
-        }
-        (Stmt::DropCast(_), ObjectRef::Cast(_)) => true,
-        (Stmt::DropOperator { identities, .. }, ObjectRef::Operator(slot)) => {
-            identities.iter().try_fold(false, |matched, identity| {
-                if matched {
-                    Ok(true)
-                } else {
-                    operator_identity_matches(storage, txid, slot, *identity)
+                if matches!(statement, Stmt::DropDomain { .. }) {
+                    continue;
                 }
-            })?
+                let enumeration = match name.schema {
+                    Some(schema) => storage.enum_slot(schema, name.name, txid),
+                    None => storage.resolve_enum_slot(name.name, txid),
+                };
+                if let Some(slot) = enumeration {
+                    remember(Some(ObjectRef::Enum(slot)))?;
+                    continue;
+                }
+                let composite = match name.schema {
+                    Some(schema) => storage.composite_slot(schema, name.name, txid),
+                    None => storage.resolve_composite_slot(name.name, txid),
+                };
+                remember(composite.map(ObjectRef::Composite))?;
+            }
         }
-        (Stmt::DropOperatorFamily { names, .. }, ObjectRef::OperatorFamily(_))
-        | (Stmt::DropOperatorClass { names, .. }, ObjectRef::OperatorClass(_))
-        | (Stmt::DropStatistics { names, .. }, ObjectRef::Statistics(_)) => names
-            .iter()
-            .any(|name| qualified_name_matches(*name, object)),
-        (Stmt::DropCollation { name, .. }, ObjectRef::Collation(_))
-        | (Stmt::DropConversion { name, .. }, ObjectRef::Conversion(_)) => {
-            qualified_name_matches(*name, object)
+        Stmt::DropIndex { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .resolve_index_slot(name.schema, name.name, txid)
+                        .map(ObjectRef::Index),
+                )?;
+            }
         }
-        (Stmt::DropTextSearch { name, .. }, ObjectRef::TextSearch(_)) => {
-            qualified_name_matches(*name, object)
+        Stmt::DropSchema { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .find_schema_visible(name, txid)
+                        .map(ObjectRef::Schema),
+                )?;
+            }
         }
-        (Stmt::DropPolicy { policy, .. }, ObjectRef::Policy(_)) => {
-            policy.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && policy.table.name == object.address_names[1].as_str()
+        Stmt::DropFunction { functions, .. }
+        | Stmt::DropProcedure {
+            procedures: functions,
+            ..
         }
-        (Stmt::DropPublication { names, .. }, ObjectRef::Publication(_))
-        | (Stmt::DropSubscription { names, .. }, ObjectRef::Subscription(_))
-        | (Stmt::DropExtension { names, .. }, ObjectRef::Extension(_))
-        | (Stmt::DropAccessMethod { names, .. }, ObjectRef::AccessMethod(_)) => {
-            names.iter().any(|name| {
-                *name
-                    == object
-                        .object_name
-                        .as_ref()
-                        .map_or("", |value| value.as_str())
-            })
+        | Stmt::DropRoutine {
+            routines: functions,
+            ..
+        } => {
+            for identity in *functions {
+                remember(routine(identity)?)?;
+            }
         }
-        (Stmt::DropTrigger { trigger, .. }, ObjectRef::Trigger(_)) => {
-            trigger.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && trigger.table.name == object.address_names[1].as_str()
+        Stmt::DropAggregate { aggregates, .. } => {
+            for identity in *aggregates {
+                let mut types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let count =
+                    identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
+                if count > types.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many aggregate arguments"
+                    ));
+                }
+                types[..identity.direct_argument_types.len()]
+                    .copy_from_slice(identity.direct_argument_types);
+                types[identity.direct_argument_types.len()..count]
+                    .copy_from_slice(identity.aggregated_argument_types);
+                remember(routine(&RoutineIdentity {
+                    name: identity.name,
+                    argument_types: &types[..count],
+                    signature_is_explicit: true,
+                })?)?;
+            }
         }
-        (Stmt::DropRule(rule), ObjectRef::Rule(_)) => {
-            rule.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && rule.table.name == object.address_names[1].as_str()
+        Stmt::DropCast(cast) => {
+            let source = crate::sql::exec::resolve_routine_type(storage, txid, cast.source_type)?;
+            let target = crate::sql::exec::resolve_routine_type(storage, txid, cast.target_type)?;
+            remember(storage.cast_slot(source, target, txid).map(ObjectRef::Cast))?;
         }
-        _ => false,
-    })
+        Stmt::DropOperator { identities, .. } => {
+            for identity in *identities {
+                match crate::sql::exec::resolve_operator_identity(storage, txid, *identity) {
+                    Ok((slot, _)) => remember(Some(ObjectRef::Operator(slot)))?,
+                    Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Stmt::DropOperatorFamily { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .operator_family_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::OperatorFamily),
+                )?;
+            }
+        }
+        Stmt::DropOperatorClass { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .operator_class_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::OperatorClass),
+                )?;
+            }
+        }
+        Stmt::DropStatistics { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .extended_statistics_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::Statistics),
+                )?;
+            }
+        }
+        Stmt::DropCollation { name, .. } => remember(
+            storage
+                .collation_slot_on_path(name.schema, name.name, txid)
+                .map(ObjectRef::Collation),
+        )?,
+        Stmt::DropConversion { name, .. } => remember(
+            storage
+                .conversion_slot_on_path(name.schema, name.name, txid)
+                .map(ObjectRef::Conversion),
+        )?,
+        Stmt::DropTextSearch { kind, name, .. } => remember(
+            storage
+                .text_search_slot_on_path(*kind, name.schema, name.name, txid)
+                .map(ObjectRef::TextSearch),
+        )?,
+        Stmt::DropPolicy { policy, .. } => {
+            if let Some(ObjectRef::Table(table)) = relation(policy.table) {
+                remember(
+                    storage
+                        .policy_slot_on(table, policy.name, txid)
+                        .map(ObjectRef::Policy),
+                )?;
+            }
+        }
+        Stmt::DropTrigger { trigger, .. } => {
+            let target = match relation(trigger.table) {
+                Some(ObjectRef::Table(table)) => {
+                    Some(crate::storage::TriggerTarget::Table(table as u16))
+                }
+                Some(ObjectRef::View(view)) => {
+                    Some(crate::storage::TriggerTarget::View(view as u16))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                remember(
+                    storage
+                        .trigger_slot_on(target, trigger.name, txid)
+                        .map(ObjectRef::Trigger),
+                )?;
+            }
+        }
+        Stmt::DropRule(rule) => {
+            let target = match relation(rule.table) {
+                Some(ObjectRef::Table(table)) => {
+                    Some(crate::storage::RuleTarget::Table(table as u16))
+                }
+                Some(ObjectRef::View(view)) => Some(crate::storage::RuleTarget::View(view as u16)),
+                _ => None,
+            };
+            if let Some(target) = target {
+                remember(
+                    storage
+                        .rule_slot(target, rule.name, txid)
+                        .map(ObjectRef::Rule),
+                )?;
+            }
+        }
+        Stmt::DropPublication { names, .. } => {
+            for (slot, definition) in storage.publications_with_slots_visible_to(txid) {
+                if names.contains(&definition.name_for(txid).as_str()) {
+                    remember(Some(ObjectRef::Publication(slot)))?;
+                }
+            }
+        }
+        Stmt::DropSubscription { names, .. } => {
+            for (slot, definition) in storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+            {
+                if names.contains(&definition.name_for(txid).as_str()) {
+                    remember(Some(ObjectRef::Subscription(slot)))?;
+                }
+            }
+        }
+        Stmt::DropExtension { names, .. } => {
+            for name in *names {
+                remember(storage.extension_slot(name, txid).map(ObjectRef::Extension))?;
+            }
+        }
+        Stmt::DropAccessMethod { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .access_method_slot(name, txid)
+                        .and_then(|slot| storage.access_method_oid_at(slot))
+                        .map(ObjectRef::AccessMethod),
+                )?;
+            }
+        }
+        Stmt::DropEventTrigger { name, .. } => remember(
+            storage
+                .event_trigger_slot(name, txid)
+                .map(ObjectRef::EventTrigger),
+        )?,
+        Stmt::DropForeignDataWrapper { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .foreign_wrapper(name, txid)
+                        .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
+                )?;
+            }
+        }
+        Stmt::DropForeignServer { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .foreign_server(name, txid)
+                        .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(roots.as_slice())
 }
 
 fn push_command(
@@ -3966,8 +4033,7 @@ pub(crate) fn collect<'a>(
             let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
-            let object = primary_object(storage, txid, reference)?;
-            let original = is_original(storage, txid, statement, reference, &object)?;
+            let original = before.original_drops.contains(&reference);
             if original != original_pass {
                 continue;
             }

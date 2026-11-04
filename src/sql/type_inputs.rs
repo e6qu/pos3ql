@@ -189,6 +189,12 @@ fn active_source() -> Option<Source> {
     ACTIVE_SOURCE.with(|active| active.get().map(|source| source.source))
 }
 
+pub(crate) fn inspect_active_source<R>(inspect: impl FnOnce(Source, &str) -> R) -> Option<R> {
+    let active = ACTIVE_SOURCE.with(core::cell::Cell::get)?;
+    // SAFETY: the source guard retains this text for the entire callback.
+    Some(inspect(active.source, unsafe { &*active.text }))
+}
+
 pub(crate) fn active_source_position(fragment: &str) -> Result<Option<(Source, usize)>, SqlError> {
     let Some(active) = ACTIVE_SOURCE.with(core::cell::Cell::get) else {
         return Ok(None);

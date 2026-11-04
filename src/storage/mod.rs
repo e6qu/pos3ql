@@ -90,8 +90,8 @@ mod enum_images;
 mod type_edits;
 pub(crate) use statistics::CheckpointStatistics;
 pub(crate) use type_edits::{
-    CompositeAlterUndo, DomainAlterUndo, EnumAlterUndo, TypeCommitChange, TypeDdlDecision,
-    TypeDdlUndo, TypeEditTarget,
+    CompositeAlterUndo, DomainAlterUndo, DomainDependency, EnumAlterUndo, TypeCommitChange,
+    TypeDdlDecision, TypeDdlUndo, TypeEditTarget,
 };
 mod domain_validation;
 mod relation_identities;
@@ -14470,6 +14470,85 @@ impl From<RuleTarget> for ObjectLockTarget {
     }
 }
 
+fn object_lock_modes_conflict(left: u8, right: u8) -> bool {
+    for left_index in 0..8 {
+        if left & (1 << left_index) == 0 {
+            continue;
+        }
+        for right_index in 0..8 {
+            if right & (1 << right_index) != 0 && mode_conflicts(left_index, right_index) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn mode_conflicts(left: u8, right: u8) -> bool {
+    use crate::sql::ast::TableLockMode::*;
+    let left = match left {
+        0 => AccessShare,
+        1 => RowShare,
+        2 => RowExclusive,
+        3 => ShareUpdateExclusive,
+        4 => Share,
+        5 => ShareRowExclusive,
+        6 => Exclusive,
+        _ => AccessExclusive,
+    };
+    let right = match right {
+        0 => AccessShare,
+        1 => RowShare,
+        2 => RowExclusive,
+        3 => ShareUpdateExclusive,
+        4 => Share,
+        5 => ShareRowExclusive,
+        6 => Exclusive,
+        _ => AccessExclusive,
+    };
+    matches!(
+        (left, right),
+        (AccessShare, AccessExclusive)
+            | (RowShare, Exclusive | AccessExclusive)
+            | (
+                RowExclusive,
+                Share | ShareRowExclusive | Exclusive | AccessExclusive
+            )
+            | (
+                ShareUpdateExclusive,
+                ShareUpdateExclusive | Share | ShareRowExclusive | Exclusive | AccessExclusive
+            )
+            | (
+                Share,
+                RowExclusive
+                    | ShareUpdateExclusive
+                    | ShareRowExclusive
+                    | Exclusive
+                    | AccessExclusive
+            )
+            | (
+                ShareRowExclusive,
+                RowExclusive
+                    | ShareUpdateExclusive
+                    | Share
+                    | ShareRowExclusive
+                    | Exclusive
+                    | AccessExclusive
+            )
+            | (
+                Exclusive,
+                RowShare
+                    | RowExclusive
+                    | ShareUpdateExclusive
+                    | Share
+                    | ShareRowExclusive
+                    | Exclusive
+                    | AccessExclusive
+            )
+            | (AccessExclusive, _)
+    ) || matches!(right, AccessExclusive)
+}
+
 fn object_lock_capacity(config: &Config) -> usize {
     (config.max_connections as usize)
         .saturating_add(config.max_prepared_transactions)
@@ -14478,11 +14557,49 @@ fn object_lock_capacity(config: &Config) -> usize {
                 .saturating_add(config.max_views)
                 .saturating_add(config.max_roles),
         )
+        .saturating_add(config.max_connections as usize)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectLockOwner {
+    Transaction(u32),
+    Session { connection: i32, acquisition: u64 },
+}
+
+/// One command's hold on a specific table lifetime across internal commits.
+pub(crate) struct SessionTableLock {
+    owner: ObjectLockOwner,
+    table: usize,
+    created_at: u64,
+    locks: std::sync::Arc<Mutex<LockState>>,
+}
+
+impl core::fmt::Debug for SessionTableLock {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SessionTableLock")
+            .field("owner", &self.owner)
+            .field("table", &self.table)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl Drop for SessionTableLock {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock().expect("lock state lock poisoned");
+        if let Some(index) = locks.table.iter().position(|lock| {
+            lock.owner == self.owner && lock.relation == ObjectLockTarget::Table(self.table)
+        }) {
+            let owner = locks.table.swap_remove(index).wait_owner;
+            locks.row.resource_released(owner);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct ObjectLock {
-    owner: u32,
+    owner: ObjectLockOwner,
     wait_owner: crate::sql::lock::WaitOwner,
     relation: ObjectLockTarget,
     /// Acquisition sequence for each table-lock mode. PostgreSQL permits a
@@ -36835,7 +36952,8 @@ impl Storage {
             .index_visible_to(index_slot, txid)
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
         if index.method != crate::sql::ast::IndexAccessMethod::Brin
-            || !matches!(index.mutable_for(txid).kind, IndexKind::Ordinary)
+            || index.mutable_for(txid).kind.is_partitioned()
+            || !index.mutable_for(txid).kind.ready()
         {
             return Err(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
@@ -49463,6 +49581,112 @@ impl Storage {
             .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }
 
+    pub(crate) fn retain_index_command_source(
+        &self,
+        text: &str,
+    ) -> Result<SharedSlice<u8>, SqlError> {
+        self.metadata_pool
+            .copy_slice(text.as_bytes())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+    }
+
+    pub(crate) fn capture_index_lock_holders(
+        &self,
+        transaction: u32,
+        table: usize,
+        mode: crate::sql::ast::TableLockMode,
+    ) -> Result<SharedSlice<u32>, SqlError> {
+        let own_wait_owner = self.transaction_wait_owner(transaction);
+        let locks = self.lock_state();
+        let matches = |lock: &&ObjectLock| {
+            lock.relation == ObjectLockTarget::Table(table)
+                && lock.wait_owner != own_wait_owner
+                && object_lock_modes_conflict(1 << mode as u8, lock.mask())
+                && matches!(lock.owner, ObjectLockOwner::Transaction(_))
+        };
+        let mut holders = self
+            .metadata_pool
+            .lease(locks.table.iter().filter(matches).count())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for lock in locks.table.iter().filter(matches) {
+            let ObjectLockOwner::Transaction(owner) = lock.owner else {
+                unreachable!("selected transaction holder");
+            };
+            holders
+                .push_reserved(owner)
+                .expect("counted lock holders fit their metadata lease");
+        }
+        Ok(holders.freeze())
+    }
+
+    pub(crate) fn capture_index_snapshot_holders(
+        &self,
+        transaction: u32,
+        reference: u64,
+    ) -> Result<SharedSlice<u32>, SqlError> {
+        if self.transaction_mode == crate::config::TransactionMode::Locking {
+            return Ok(SharedSlice::EMPTY);
+        }
+        let snapshots = self.snapshot_state();
+        let holders = || {
+            snapshots
+                .active
+                .iter()
+                .filter(|(owner, snapshot)| *owner != transaction && *snapshot < reference)
+                .map(|(owner, _)| *owner)
+                .chain(
+                    snapshots
+                        .statements
+                        .iter()
+                        .filter(|statement| {
+                            statement.transaction != transaction
+                                && statement.lsn.is_some_and(|snapshot| snapshot < reference)
+                        })
+                        .map(|statement| statement.transaction),
+                )
+        };
+        let unique = || {
+            holders()
+                .enumerate()
+                .filter(|(position, owner)| !holders().take(*position).any(|prior| prior == *owner))
+                .map(|(_, owner)| owner)
+        };
+        let mut retained = self
+            .metadata_pool
+            .lease(unique().count())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        for holder in unique() {
+            retained
+                .push_reserved(holder)
+                .expect("counted snapshot holders fit their metadata lease");
+        }
+        Ok(retained.freeze())
+    }
+
+    pub(crate) fn wait_for_index_holders(
+        &self,
+        transaction: u32,
+        holders: &[u32],
+        next: &mut usize,
+    ) -> Result<(), SqlError> {
+        while let Some(&holder) = holders.get(*next) {
+            if self
+                .transaction_identity_state()
+                .active
+                .iter()
+                .any(|identity| identity.transaction_id == holder)
+            {
+                self.wait_for_transaction(transaction, holder)?;
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "concurrent index command is waiting for an earlier transaction"
+                ));
+            }
+            *next += 1;
+        }
+        Ok(())
+    }
+
     pub fn unique_indexes_for<'a>(
         &'a self,
         schema: &'a str,
@@ -50582,7 +50806,7 @@ impl Storage {
         for lock in locks
             .table
             .iter_mut()
-            .filter(|lock| lock.owner == transaction_id)
+            .filter(|lock| lock.owner == ObjectLockOwner::Transaction(transaction_id))
         {
             lock.wait_owner = prepared_owner;
         }
@@ -50937,7 +51161,7 @@ impl Storage {
     pub(crate) fn visit_object_locks(
         &self,
         mut visit: impl FnMut(
-            u32,
+            ObjectLockOwner,
             crate::sql::lock::WaitOwner,
             ObjectLockTarget,
             crate::sql::ast::TableLockMode,
@@ -50964,17 +51188,22 @@ impl Storage {
                     6 => crate::sql::ast::TableLockMode::Exclusive,
                     _ => crate::sql::ast::TableLockMode::AccessExclusive,
                 };
-                visit(lock.owner, lock.wait_owner, lock.relation, mode);
+                let duplicate = self.lock_state().table.iter().take(index).any(|prior| {
+                    prior.wait_owner == lock.wait_owner
+                        && prior.relation == lock.relation
+                        && prior.modes[mode as usize] != 0
+                });
+                if !duplicate {
+                    visit(lock.owner, lock.wait_owner, lock.relation, mode);
+                }
             }
         }
     }
 
     pub(crate) fn object_lock_view_count(&self) -> usize {
-        self.lock_state()
-            .table
-            .iter()
-            .map(|lock| lock.modes.iter().filter(|sequence| **sequence != 0).count())
-            .sum()
+        let mut count = 0;
+        self.visit_object_locks(|_, _, _, _| count += 1);
+        count
     }
 
     pub fn lock_table(
@@ -50990,6 +51219,107 @@ impl Storage {
     pub(crate) fn lock_object(
         &self,
         txid: u32,
+        relation: ObjectLockTarget,
+        mode: crate::sql::ast::TableLockMode,
+        nowait: bool,
+    ) -> Result<(), SqlError> {
+        self.lock_object_owned(
+            ObjectLockOwner::Transaction(txid),
+            self.transaction_wait_owner(txid),
+            relation,
+            mode,
+            nowait,
+        )
+    }
+
+    pub(crate) fn hold_table_across_commits(
+        &self,
+        txid: u32,
+        table: usize,
+    ) -> Result<SessionTableLock, SqlError> {
+        let connection = self
+            .transaction_identity_state()
+            .active
+            .iter()
+            .find(|identity| identity.transaction_id == txid)
+            .and_then(|identity| identity.connection_id)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "session table lock requires a connected transaction"
+                )
+            })?;
+        if !self.table(table).visible_to(txid) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "concurrent index command lost its selected table"
+            ));
+        }
+        let created_at = self.table(table).created_at();
+        let acquisition = self.lock_state().next_sequence()?;
+        let owner = ObjectLockOwner::Session {
+            connection,
+            acquisition,
+        };
+        self.lock_object_owned(
+            owner,
+            crate::sql::lock::connection_wait_owner(connection),
+            ObjectLockTarget::Table(table),
+            crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+            false,
+        )?;
+        Ok(SessionTableLock {
+            owner,
+            table,
+            created_at,
+            locks: std::sync::Arc::clone(&self.locks),
+        })
+    }
+
+    pub(crate) fn validate_session_table_lock(
+        &self,
+        lease: &SessionTableLock,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if !self.table(lease.table).visible_to(txid)
+            || self.table(lease.table).created_at() != lease.created_at
+            || !self.lock_state().table.iter().any(|lock| {
+                lock.owner == lease.owner && lock.relation == ObjectLockTarget::Table(lease.table)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "concurrent index command lost its selected table lock"
+            ));
+        }
+        Ok(lease.table)
+    }
+
+    pub(crate) fn release_connection_object_locks(&self, connection: i32) {
+        let mut locks = self.lock_state();
+        let mut index = 0;
+        let mut changed = false;
+        while index < locks.table.len() {
+            if matches!(locks.table[index].owner, ObjectLockOwner::Session { connection: owner, .. }
+                if owner == connection)
+            {
+                locks.table.swap_remove(index);
+                changed = true;
+            } else {
+                index += 1;
+            }
+        }
+        if changed {
+            locks
+                .row
+                .resource_released(crate::sql::lock::connection_wait_owner(connection));
+        }
+    }
+
+    fn lock_object_owned(
+        &self,
+        owner: ObjectLockOwner,
+        wait_owner: crate::sql::lock::WaitOwner,
         relation: ObjectLockTarget,
         mode: crate::sql::ast::TableLockMode,
         nowait: bool,
@@ -51014,95 +51344,11 @@ impl Storage {
             1 << mode as u8
         }
 
-        fn modes_conflict(left: u8, right: u8) -> bool {
-            for left_index in 0..8 {
-                if left & (1 << left_index) == 0 {
-                    continue;
-                }
-                for right_index in 0..8 {
-                    if right & (1 << right_index) != 0 && mode_conflicts(left_index, right_index) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-
-        fn mode_conflicts(left: u8, right: u8) -> bool {
-            use TableLockMode::*;
-            let left = match left {
-                0 => AccessShare,
-                1 => RowShare,
-                2 => RowExclusive,
-                3 => ShareUpdateExclusive,
-                4 => Share,
-                5 => ShareRowExclusive,
-                6 => Exclusive,
-                _ => AccessExclusive,
-            };
-            let right = match right {
-                0 => AccessShare,
-                1 => RowShare,
-                2 => RowExclusive,
-                3 => ShareUpdateExclusive,
-                4 => Share,
-                5 => ShareRowExclusive,
-                6 => Exclusive,
-                _ => AccessExclusive,
-            };
-            matches!(
-                (left, right),
-                (AccessShare, AccessExclusive)
-                    | (RowShare, Exclusive | AccessExclusive)
-                    | (
-                        RowExclusive,
-                        Share | ShareRowExclusive | Exclusive | AccessExclusive
-                    )
-                    | (
-                        ShareUpdateExclusive,
-                        ShareUpdateExclusive
-                            | Share
-                            | ShareRowExclusive
-                            | Exclusive
-                            | AccessExclusive
-                    )
-                    | (
-                        Share,
-                        RowExclusive
-                            | ShareUpdateExclusive
-                            | ShareRowExclusive
-                            | Exclusive
-                            | AccessExclusive
-                    )
-                    | (
-                        ShareRowExclusive,
-                        RowExclusive
-                            | ShareUpdateExclusive
-                            | Share
-                            | ShareRowExclusive
-                            | Exclusive
-                            | AccessExclusive
-                    )
-                    | (
-                        Exclusive,
-                        RowShare
-                            | RowExclusive
-                            | ShareUpdateExclusive
-                            | Share
-                            | ShareRowExclusive
-                            | Exclusive
-                            | AccessExclusive
-                    )
-                    | (AccessExclusive, _)
-            ) || matches!(right, AccessExclusive)
-        }
-
-        let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
-        let protection = match (relation, self.transaction_mode) {
-            (ObjectLockTarget::Role(_), _) => mode,
-            (_, crate::config::TransactionMode::Mvcc) => mode,
-            (_, crate::config::TransactionMode::Locking) => match mode {
+        let protection = match (owner, relation, self.transaction_mode) {
+            (ObjectLockOwner::Session { .. }, _, _) | (_, ObjectLockTarget::Role(_), _) => mode,
+            (_, _, crate::config::TransactionMode::Mvcc) => mode,
+            (_, _, crate::config::TransactionMode::Locking) => match mode {
                 TableLockMode::AccessShare | TableLockMode::Share => TableLockMode::Share,
                 TableLockMode::AccessExclusive => TableLockMode::AccessExclusive,
                 _ => TableLockMode::Exclusive,
@@ -51112,7 +51358,7 @@ impl Storage {
         let own_index = locks
             .table
             .iter()
-            .position(|lock| lock.owner == txid && lock.relation == relation);
+            .position(|lock| lock.owner == owner && lock.relation == relation);
         if own_index.is_some_and(|index| locks.table[index].mask() & requested == requested) {
             return Ok(());
         }
@@ -51123,9 +51369,9 @@ impl Storage {
             .table
             .iter()
             .find(|lock| {
-                lock.owner != txid
+                lock.wait_owner != wait_owner
                     && lock.relation == relation
-                    && modes_conflict(combined, lock.mask())
+                    && object_lock_modes_conflict(combined, lock.mask())
             })
             .map(|lock| lock.wait_owner);
         if let Some(blocker) = blocker {
@@ -51162,7 +51408,7 @@ impl Storage {
         locks
             .table
             .push(ObjectLock {
-                owner: txid,
+                owner,
                 wait_owner,
                 relation,
                 modes,
@@ -51212,7 +51458,11 @@ impl Storage {
 
         output.clear();
         let locks = self.lock_state();
-        for lock in locks.table.iter().filter(|lock| lock.owner == txid) {
+        for lock in locks
+            .table
+            .iter()
+            .filter(|lock| lock.owner == ObjectLockOwner::Transaction(txid))
+        {
             let (kind, schema, name) = match lock.relation {
                 ObjectLockTarget::Table(slot) => {
                     let table = &self.tables[slot];
@@ -51494,7 +51744,7 @@ impl Storage {
         let mut table_changed = false;
         let mut index = 0usize;
         while index < locks.table.len() {
-            if locks.table[index].owner != txid {
+            if locks.table[index].owner != ObjectLockOwner::Transaction(txid) {
                 index += 1;
                 continue;
             }
@@ -51524,7 +51774,7 @@ impl Storage {
         let mut changed = false;
         let mut index = 0usize;
         while index < locks.table.len() {
-            if locks.table[index].owner == txid {
+            if locks.table[index].owner == ObjectLockOwner::Transaction(txid) {
                 locks.table.swap_remove(index);
                 changed = true;
             } else {
@@ -51628,6 +51878,7 @@ impl Storage {
     }
 
     pub(crate) fn schema_lock_blocker(&self, txid: u32) -> Option<SchemaLockBlocker> {
+        let own_wait_owner = self.transaction_wait_owner(txid);
         let snapshots = self.snapshot_state();
         let locks = self.lock_state();
         snapshots
@@ -51641,9 +51892,22 @@ impl Storage {
                     .filter(|statement| statement.lsn.is_some())
                     .map(|statement| statement.transaction),
             )
-            .chain(locks.table.iter().map(|lock| lock.owner))
             .find(|owner| *owner != txid)
             .map(SchemaLockBlocker::Transaction)
+            .or_else(|| {
+                locks
+                    .table
+                    .iter()
+                    .find(|lock| lock.wait_owner != own_wait_owner)
+                    .map(|lock| match lock.owner {
+                        ObjectLockOwner::Transaction(transaction) => {
+                            SchemaLockBlocker::Transaction(transaction)
+                        }
+                        ObjectLockOwner::Session { connection, .. } => {
+                            SchemaLockBlocker::Connection(connection)
+                        }
+                    })
+            })
             .or_else(|| {
                 snapshots
                     .exported

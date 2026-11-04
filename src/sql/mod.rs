@@ -12,6 +12,7 @@ pub mod catalog_node;
 mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
+mod concurrent_index;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -1971,6 +1972,8 @@ pub(crate) enum UtilityCommand {
     CreateTablespace,
     DropTablespace,
     AlterSubscriptionOptions,
+    CreateIndexWithoutRestart,
+    DropIndexWithoutRestart,
 }
 
 impl UtilityCommand {
@@ -1983,6 +1986,8 @@ impl UtilityCommand {
             Self::CreateTablespace => "CREATE TABLESPACE",
             Self::DropTablespace => "DROP TABLESPACE",
             Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION SET",
+            Self::CreateIndexWithoutRestart => "CREATE INDEX CONCURRENTLY",
+            Self::DropIndexWithoutRestart => "DROP INDEX CONCURRENTLY",
         }
     }
 
@@ -1995,6 +2000,8 @@ impl UtilityCommand {
             Self::CreateTablespace => "CREATE TABLESPACE",
             Self::DropTablespace => "DROP TABLESPACE",
             Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION",
+            Self::CreateIndexWithoutRestart => "CREATE INDEX",
+            Self::DropIndexWithoutRestart => "DROP INDEX",
         }
     }
 }
@@ -5756,6 +5763,12 @@ impl Engine {
         target: txn::CommitTarget,
     ) -> Result<(), SqlError> {
         self.check_publication_health()?;
+        if txn.concurrent_index.is_some() {
+            return Err(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "a concurrent index command owns this transaction"
+            ));
+        }
         if let Some(staged) = txn.staged_commit() {
             if staged.target != target {
                 return Err(sql_err!(
@@ -6821,7 +6834,9 @@ impl Engine {
         if (staged_bytes != 0
             || !matches!(
                 target,
-                txn::CommitTarget::Ordinary | txn::CommitTarget::Utility(_)
+                txn::CommitTarget::Ordinary
+                    | txn::CommitTarget::Utility(_)
+                    | txn::CommitTarget::ConcurrentIndex { .. }
             ))
             && let Err(error) = self.check_writer_fence()
         {
@@ -7012,6 +7027,7 @@ impl Engine {
             let name = self.storage.database_definition(database, txn.txid).name;
             eval::funcs::system::set_current_database(name.as_str());
         }
+        let command = txn.concurrent_index.take();
         let result = match txn.commit_admission() {
             Some(
                 target @ (txn::CommitTarget::CommitPrepared { .. }
@@ -7021,6 +7037,9 @@ impl Engine {
             None => self.complete_staged_commit(txn, guc),
         };
         self.storage.swap_path(prior);
+        if result.is_err() {
+            txn.concurrent_index = command;
+        }
         result
     }
 
@@ -7147,7 +7166,9 @@ impl Engine {
                     );
                     let own = self.promote_transaction_state(txn, staged.lsn, Some(guc));
                     match target {
-                        txn::CommitTarget::Ordinary | txn::CommitTarget::Utility(_) => own,
+                        txn::CommitTarget::Ordinary
+                        | txn::CommitTarget::Utility(_)
+                        | txn::CommitTarget::ConcurrentIndex { .. } => own,
                         txn::CommitTarget::CommitPrepared { slot, .. } => own.and_then(|()| {
                             self.complete_prepared_resolution(slot, true, txn, staged.lsn)
                         }),
@@ -8050,6 +8071,13 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        if txn.concurrent_index.is_some() {
+            return Err(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "a concurrent index command owns this transaction"
+            ));
+        }
+
         if let Some(target) = txn.commit_admission() {
             let txn::CommitTarget::Prepare {
                 gid: admitted_gid, ..
@@ -10545,6 +10573,7 @@ impl Engine {
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
         self.storage.release_connection_advisory_locks(conn_id);
+        self.storage.release_connection_object_locks(conn_id);
         self.storage.drop_connection_temporary_relations(conn_id);
         if let Some(spiller) = self.temporary_spiller.as_mut() {
             spiller.cleanup(&self.storage);
@@ -11785,7 +11814,9 @@ impl Engine {
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
                         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
-                            sequence_scope.discard(guc.seq_session());
+                            if txn.concurrent_index.is_none() {
+                                sequence_scope.discard(guc.seq_session());
+                            }
                             return Ok(ExecutionStatus::Blocked {
                                 completed_statements: statement_index,
                                 output_mark,
@@ -11798,7 +11829,24 @@ impl Engine {
                                 },
                             });
                         }
-                        if txn.owns_statement_mark(statement_mark) {
+                        if txn.concurrent_index.is_some() && !lock_timeout_expired {
+                            self.storage.preserve_advisory_statement();
+                            return Ok(ExecutionStatus::Blocked {
+                                completed_statements: statement_index,
+                                output_mark,
+                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
+                            });
+                        }
+                        if txn.concurrent_index.is_some() {
+                            e = sql_err!(
+                                sqlstate::LOCK_NOT_AVAILABLE,
+                                "canceling statement due to lock timeout"
+                            );
+                        } else if txn.owns_statement_mark(statement_mark) {
                             if txn.suspended_statement_context().is_none() {
                                 txn.suspend_statement(
                                     None,
@@ -12114,14 +12162,29 @@ impl Engine {
                                 return Ok(ExtendedExecutionStatus::Complete(false));
                             }
                         };
-                        let immediate =
+                        let mut immediate =
                             top_level_only_command(&statement).and_then(TopLevelCommand::utility);
+                        let index_completion = concurrent_index::Kind::for_statement(&statement);
                         // A utility commit target records completed SQL. Retrying
                         // durability must not run its DDL or callbacks again.
                         let pending = txn
                             .staged_commit()
                             .map(|staged| staged.target)
                             .or(txn.commit_admission());
+                        if let Some(txn::CommitTarget::Utility(command)) = pending
+                            && matches!(
+                                (command, index_completion),
+                                (
+                                    UtilityCommand::CreateIndexWithoutRestart,
+                                    Some(concurrent_index::Kind::Create)
+                                ) | (
+                                    UtilityCommand::DropIndexWithoutRestart,
+                                    Some(concurrent_index::Kind::Drop)
+                                )
+                            )
+                        {
+                            immediate = Some(command);
+                        }
                         let resuming_utility =
                             matches!(pending, Some(txn::CommitTarget::Utility(_)))
                                 || (immediate.is_some() && pending.is_some());
@@ -12239,11 +12302,12 @@ impl Engine {
                                             responder,
                                         )
                                     };
-                                    let executed = if immediate.is_some() {
-                                        responder.without_command_complete(execute)
-                                    } else {
-                                        execute(responder)
-                                    };
+                                    let executed =
+                                        if immediate.is_some() || index_completion.is_some() {
+                                            responder.without_command_complete(execute)
+                                        } else {
+                                            execute(responder)
+                                        };
                                     match executed {
                                         Ok(outcome) => outcome,
                                         Err(WireFull) => {
@@ -12282,6 +12346,9 @@ impl Engine {
                             .and_then(|()| query::check_timeout())
                             .and_then(|()| sequence_scope.finish(guc.seq_session()))
                             .and_then(|()| {
+                                if let Some(command) = txn.immediate_index_utility.take() {
+                                    immediate = Some(command);
+                                }
                                 if let Some(command) = immediate {
                                     self.commit_txn_with_triggers(
                                         txn,
@@ -12303,6 +12370,8 @@ impl Engine {
                         match outcome {
                             Ok(()) => {
                                 if let Some(command) = immediate {
+                                    responder.command_complete(command.completion())?;
+                                } else if let Some(command) = index_completion {
                                     responder.command_complete(command.completion())?;
                                 }
                                 if txn.take_concurrent_partition_detach() {
@@ -12371,7 +12440,9 @@ impl Engine {
                                     if txn.staged_commit().is_some()
                                         || txn.commit_admission().is_some()
                                     {
-                                        sequence_scope.discard(guc.seq_session());
+                                        if txn.concurrent_index.is_none() {
+                                            sequence_scope.discard(guc.seq_session());
+                                        }
                                         return Ok(ExtendedExecutionStatus::Blocked {
                                             wait: if txn.staged_commit().is_some()
                                                 || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
@@ -12382,7 +12453,22 @@ impl Engine {
                                             },
                                         });
                                     }
-                                    if txn.owns_statement_mark(statement_mark) {
+                                    if txn.concurrent_index.is_some() && !lock_timeout_expired {
+                                        self.storage.preserve_advisory_statement();
+                                        return Ok(ExtendedExecutionStatus::Blocked {
+                                            wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                                StatementWait::ObjectIo
+                                            } else {
+                                                StatementWait::Lock
+                                            },
+                                        });
+                                    }
+                                    if txn.concurrent_index.is_some() {
+                                        e = sql_err!(
+                                            sqlstate::LOCK_NOT_AVAILABLE,
+                                            "canceling statement due to lock timeout"
+                                        );
+                                    } else if txn.owns_statement_mark(statement_mark) {
                                         if txn.suspended_statement_context().is_none() {
                                             txn.suspend_statement(
                                                 None,
@@ -16118,6 +16204,7 @@ impl Engine {
         key: type_input_plans::Key,
         site: plpgsql_inputs::Site<'a>,
         row: &dyn eval::ColumnLookup<'a>,
+        relations: Option<&'a [(&'a str, &'a ast::MaterializedCte<'a>)]>,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -16152,7 +16239,7 @@ impl Engine {
                     &self.storage,
                     txn.txid,
                     row,
-                    None,
+                    relations,
                     arena,
                     Some(&mut dependencies),
                 )?;
@@ -16170,11 +16257,17 @@ impl Engine {
                 type_inputs::candidate_target_oid(&self.storage, txn.txid, candidate).is_some()
             });
             if !checked {
-                let captured =
-                    match self.capture_plpgsql_planner_inputs(site, row, &[], arena, txn.txid) {
-                        Ok(captured) => captured,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                let captured = match self.capture_plpgsql_planner_inputs(
+                    site,
+                    row,
+                    relations,
+                    &[],
+                    arena,
+                    txn.txid,
+                ) {
+                    Ok(captured) => captured,
+                    Err(error) => return Ok(Err(error)),
+                };
                 if captured.is_empty() {
                     sqlprep.routine_inputs.retire_unused_site(key);
                     return Ok(Ok(PreparedTypeInputs {
@@ -16255,7 +16348,7 @@ impl Engine {
                 )
             }),
             None => self.prepare_plpgsql_planner_inputs(
-                site, row, prepared, arena, txn, sqlprep, cursors, guc, responder,
+                site, row, relations, prepared, arena, txn, sqlprep, cursors, guc, responder,
             ),
         }?;
         if let Err(error) = planned {
@@ -18386,22 +18479,88 @@ impl Engine {
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
-        let mut result = self.execute_stmt_with_workspace(
+        let index_statement = matches!(
             statement,
-            arena,
-            params,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            routine_transaction_context,
-            responder,
-            true,
-            None,
+            Stmt::CreateIndex {
+                build: ast::IndexBuildMode::Concurrent,
+                ..
+            } | Stmt::DropIndex {
+                build: ast::IndexBuildMode::Concurrent,
+                ..
+            }
         );
+        let mut result = loop {
+            if let Some(command) = &txn.concurrent_index
+                && let Some(cursor) = command.replay
+                && let Err(error) = sequence::restore_replay_cursor(cursor)
+            {
+                break Ok(Err(error));
+            }
+            let replay_start = if index_statement {
+                match sequence::begin_replay_cursor() {
+                    Ok(start) => start,
+                    Err(error) => break Ok(Err(error)),
+                }
+            } else {
+                None
+            };
+            if txn
+                .concurrent_index
+                .as_ref()
+                .is_some_and(|command| command.phase.commit().is_some())
+            {
+                if let Err(error) =
+                    self.commit_concurrent_index_phase(txn, sqlprep, cursors, guc, arena, responder)
+                {
+                    break Ok(Err(error));
+                }
+                let cursor = match sequence::finish_replay_cursor(replay_start, arena) {
+                    Ok(cursor) => cursor,
+                    Err(error) => break Ok(Err(error)),
+                };
+                txn.concurrent_index
+                    .as_mut()
+                    .expect("committed phase retains its command")
+                    .replay = Some(cursor);
+                continue;
+            }
+            let result = self.execute_stmt_with_workspace(
+                statement,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+                true,
+                None,
+            );
+            if !matches!(result, Ok(Ok(()))) || txn.concurrent_index.is_none() {
+                break result;
+            }
+            if txn
+                .concurrent_index
+                .as_ref()
+                .is_some_and(|command| command.phase == concurrent_index::Phase::Complete)
+            {
+                txn.concurrent_index = None;
+                break result;
+            }
+            let cursor = match sequence::finish_replay_cursor(replay_start, arena) {
+                Ok(cursor) => cursor,
+                Err(error) => break Ok(Err(error)),
+            };
+            txn.concurrent_index
+                .as_mut()
+                .expect("index SQL action retains its command")
+                .replay = Some(cursor);
+        };
         txn.cache_capacity_wait = None;
         txn.leave_ddl_origin(prior_origin);
         if txn.commit_admission().is_some()
+            && txn.concurrent_index.is_none()
             && !matches!(
                 statement,
                 Stmt::Commit
@@ -18423,7 +18582,9 @@ impl Engine {
             error.sqlstate == sqlstate::INTERNAL_IO_WAIT
             || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
         {
-            if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
+            if txn.concurrent_index.is_none()
+                && (txn.staged_commit().is_some() || txn.commit_admission().is_some())
+            {
                 sequence_scope.discard(guc.seq_session());
             }
             txn.suspend_statement(
@@ -18797,7 +18958,12 @@ impl Engine {
         // A data-modifying WITH statement lowers the command snapshot itself;
         // the shared command boundary guarantees it never leaks into the next
         // SQL or fast-path statement.
-        let takes_snapshot = !matches!(
+        let takes_snapshot = txn.concurrent_index.as_ref().is_none_or(|command| {
+            matches!(
+                command.phase,
+                concurrent_index::Phase::Build | concurrent_index::Phase::Validate
+            )
+        }) && !matches!(
             statement,
             Stmt::Begin(_)
                 | Stmt::Commit
@@ -18905,6 +19071,7 @@ impl Engine {
         }
         let event_tag = event_trigger_tag(statement);
         if let Some(tag) = event_tag
+            && txn.concurrent_index.is_none()
             && let Err(error) = self.fire_event_triggers(
                 EventTriggerInvocation::DdlCommandStart { tag },
                 EventTriggerExecution {
@@ -20101,6 +20268,20 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
+            Stmt::CreateIndex { .. } if txn.concurrent_index.is_some() => self
+                .execute_concurrent_index_phase(
+                    txn,
+                    concurrent_index::Kind::Create,
+                    arena,
+                    responder,
+                ),
+            Stmt::DropIndex { .. } if txn.concurrent_index.is_some() => self
+                .execute_concurrent_index_phase(
+                    txn,
+                    concurrent_index::Kind::Drop,
+                    arena,
+                    responder,
+                ),
             Stmt::CreateIndex {
                 name,
                 table,
@@ -21342,6 +21523,10 @@ impl Engine {
         }
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
+            && txn
+                .concurrent_index
+                .as_ref()
+                .is_none_or(|command| command.phase == concurrent_index::Phase::Complete)
             && let Some(tag) = event_tag
             && let Err(error) = self.fire_statement_ddl_events(
                 statement,

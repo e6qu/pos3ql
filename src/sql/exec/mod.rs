@@ -13184,24 +13184,48 @@ pub(crate) fn drop_schema(
                     == schema
             })
     };
-    let enum_uses_listed_schema =
-        |storage: &Storage, base: ColType, txid: u32| -> Result<bool, SqlError> {
-            let creation = match base {
-                ColType::Enum(creation) | ColType::Array(super::types::ArrElem::Enum(creation)) => {
-                    crate::storage::TypeCreation::require(creation)?
-                }
-                _ => return Ok(false),
-            };
-            let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage,
-                crate::storage::NamedTypeKind::Enum,
-                creation,
-            )?;
-            let definition = storage.read_enum_definition(target, txid)?.ok_or_else(|| {
-                sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type no longer exists")
-            })?;
-            Ok(in_listed(storage, definition.schema.as_str()))
+    let type_uses_listed_schema = |storage: &Storage,
+                                   base: ColType,
+                                   txid: u32|
+     -> Result<bool, SqlError> {
+        use crate::storage::NamedTypeKind;
+        let (kind, creation) = match base {
+            ColType::Enum(creation) | ColType::Array(super::types::ArrElem::Enum(creation)) => (
+                NamedTypeKind::Enum,
+                crate::storage::TypeCreation::require(creation)?,
+            ),
+            ColType::Composite(creation)
+            | ColType::Array(super::types::ArrElem::Composite(creation)) => (
+                NamedTypeKind::Composite,
+                crate::storage::TypeCreation::require(creation)?,
+            ),
+            _ => return Ok(false),
         };
+        let target = crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
+        let schema = match kind {
+            NamedTypeKind::Enum => {
+                storage
+                    .read_enum_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type no longer exists")
+                    })?
+                    .schema
+            }
+            NamedTypeKind::Composite => {
+                storage
+                    .read_composite_definition(target, txid)?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "composite type no longer exists"
+                        )
+                    })?
+                    .schema
+            }
+            NamedTypeKind::Domain => unreachable!("selected enum or composite representation"),
+        };
+        Ok(in_listed(storage, schema.as_str()))
+    };
 
     let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
     {
@@ -13384,28 +13408,39 @@ pub(crate) fn drop_schema(
         }
     }
     if cascade {
-        // Domains outside the schema can depend on a domain or enum inside it.
-        // They are catalog-only dependents, so include their entire bounded
-        // closure rather than leaving a dangling base type.
-        for domain_slot in 0..storage.domain_count() {
-            let domain = storage.domain_for(domain_slot, txn.txid);
-            if !storage.domain_slot_visible_to(domain_slot, txn.txid) || schema_domains[domain_slot]
-            {
-                continue;
-            }
-            let parent_in_schema =
-                match selected_domain_dependency(storage, domain_slot, schema_domains, txn.txid) {
+        // Include contained domain arrays before dependent columns and queries.
+        loop {
+            let mut changed = false;
+            for domain_slot in 0..storage.domain_count() {
+                if !storage.domain_slot_visible_to(domain_slot, txn.txid)
+                    || schema_domains[domain_slot]
+                {
+                    continue;
+                }
+                let domain = storage.domain_for(domain_slot, txn.txid);
+                let parent_in_schema = match selected_domain_dependency(
+                    storage,
+                    domain_slot,
+                    schema_domains,
+                    txn.txid,
+                ) {
                     Ok(parent) => parent.is_some(),
                     Err(error) => return sql_fail(error),
                 };
-            let enum_in_schema = match enum_uses_listed_schema(storage, domain.base, txn.txid) {
-                Ok(selected) => selected,
-                Err(error) => return sql_fail(error),
-            };
-            if (parent_in_schema || enum_in_schema)
-                && let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects)
-            {
-                return sql_fail(error);
+                let type_in_schema = match type_uses_listed_schema(storage, domain.base, txn.txid) {
+                    Ok(selected) => selected,
+                    Err(error) => return sql_fail(error),
+                };
+                if parent_in_schema || type_in_schema {
+                    if let Err(error) = push(SchemaObject::Domain(domain_slot), &mut n_objects) {
+                        return sql_fail(error);
+                    }
+                    schema_domains[domain_slot] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
         loop {
@@ -13451,7 +13486,7 @@ pub(crate) fn drop_schema(
                         Ok(parent) => parent.is_some(),
                         Err(error) => return sql_fail(error),
                     };
-                    let enum_in_schema = match enum_uses_listed_schema(
+                    let type_in_schema = match type_uses_listed_schema(
                         storage,
                         storage.domain_for(domain_slot, txn.txid).base,
                         txn.txid,
@@ -13459,7 +13494,7 @@ pub(crate) fn drop_schema(
                         Ok(selected) => selected,
                         Err(error) => return sql_fail(error),
                     };
-                    if parent_in_schema || enum_in_schema {
+                    if parent_in_schema || type_in_schema {
                         uses_schema_type = true;
                         break;
                     }
@@ -13509,7 +13544,7 @@ pub(crate) fn drop_schema(
                         Ok(parent) => parent.is_some(),
                         Err(error) => return sql_fail(error),
                     };
-                    let enum_in_schema = match enum_uses_listed_schema(
+                    let type_in_schema = match type_uses_listed_schema(
                         storage,
                         storage.domain_for(domain_slot, txn.txid).base,
                         txn.txid,
@@ -13517,7 +13552,7 @@ pub(crate) fn drop_schema(
                         Ok(selected) => selected,
                         Err(error) => return sql_fail(error),
                     };
-                    parent_in_schema || enum_in_schema
+                    parent_in_schema || type_in_schema
                 } else {
                     false
                 };
@@ -13547,6 +13582,8 @@ pub(crate) fn drop_schema(
         if n_objects > 0 {
             let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
                 in_listed(storage, dependency.schema.as_str())
+                    || (dependency.class == crate::storage::DependencyClass::Domain
+                        && schema_domains[usize::from(dependency.slot)])
             });
             let StoredDependencyClosure {
                 views: dependent_views,
@@ -13627,7 +13664,11 @@ pub(crate) fn drop_schema(
                 let direct_dependency = dependencies
                     .entries()
                     .iter()
-                    .find(|dependency| in_listed(storage, dependency.schema.as_str()))
+                    .find(|dependency| {
+                        in_listed(storage, dependency.schema.as_str())
+                            || (dependency.class == crate::storage::DependencyClass::Domain
+                                && schema_domains[usize::from(dependency.slot)])
+                    })
                     .copied();
                 if (direct_dependency.is_some()
                     || policy_depends_on_selected_stored_query(
@@ -13666,6 +13707,8 @@ pub(crate) fn drop_schema(
             rules: _dependent_rules,
         } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             in_listed(storage, dependency.schema.as_str())
+                || (dependency.class == crate::storage::DependencyClass::Domain
+                    && schema_domains[usize::from(dependency.slot)])
         }) {
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
@@ -13687,7 +13730,11 @@ pub(crate) fn drop_schema(
             let direct_dependency = dependencies
                 .entries()
                 .iter()
-                .find(|dependency| in_listed(storage, dependency.schema.as_str()))
+                .find(|dependency| {
+                    in_listed(storage, dependency.schema.as_str())
+                        || (dependency.class == crate::storage::DependencyClass::Domain
+                            && schema_domains[usize::from(dependency.slot)])
+                })
                 .copied();
             if (direct_dependency.is_some()
                 || policy_depends_on_selected_stored_query(
@@ -22968,6 +23015,7 @@ fn eval_procedural_expression<'a>(
                     row.invocation.input_plan_key(site)?,
                     site,
                     row,
+                    row.invocation.materialized_relations,
                     arena,
                     context.txn,
                     sqlprep,
@@ -23128,6 +23176,7 @@ fn bind_plpgsql_dynamic_query<'a>(
                     super::type_input_plans::Key { owner, source },
                     site,
                     &NoColumns,
+                    scope.invocation.materialized_relations,
                     context.arena,
                     context.txn,
                     sqlprep,
@@ -26262,6 +26311,7 @@ fn prepare_static_plpgsql_statement<'a>(
             row.invocation.input_plan_key(site)?,
             site,
             row,
+            row.invocation.materialized_relations,
             context.arena,
             context.txn,
             sqlprep,
@@ -28423,6 +28473,16 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 );
                 let values = match program.source {
                     TriggerForSource::Query(query) => {
+                        let query = match transition_relations {
+                            Some(relations) => super::query::bind_materialized_relations(
+                                query,
+                                relations,
+                                context.storage(),
+                                context.txn.txid,
+                                context.arena,
+                            )?,
+                            None => query,
+                        };
                         let transition = TriggerTransition {
                             definition: crate::storage::RelationDefinition::from_definition(
                                 definition,
@@ -31927,7 +31987,7 @@ fn resolve_operator_signature(
     Ok(crate::storage::OperatorSignature { left, right })
 }
 
-fn resolve_operator_identity(
+pub(crate) fn resolve_operator_identity(
     storage: &Storage,
     txid: u32,
     identity: crate::sql::ast::OperatorIdentity<'_>,
@@ -39258,31 +39318,26 @@ pub fn drop_routine(
                 )
             }
         };
-        let schema = identity_name.schema.unwrap_or("public");
-        let arguments = match resolve_routine_signature(storage, txn.txid, argument_types) {
-            Ok(arguments) => arguments,
-            Err(error) => return sql_fail(error),
+        let identity = super::ast::RoutineIdentity {
+            name: identity_name,
+            argument_types,
+            signature_is_explicit,
         };
-        let slot = if signature_is_explicit {
-            Ok(storage.routine_slot_by_declared_signature(
-                schema,
-                identity_name.name,
-                &arguments[..argument_types.len()],
-                txn.txid,
-            ))
-        } else {
-            storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
-        };
-        let slot = match slot {
-            Ok(Some(slot)) => slot,
-            Err(()) => {
+        let slot = match resolve_routine_identity(
+            storage,
+            txn.txid,
+            &identity,
+            crate::sql::ast::RoutineTargetKind::Either,
+        ) {
+            Ok(slot) => slot,
+            Err(error) if error.sqlstate == sqlstate::AMBIGUOUS_FUNCTION => {
                 return sql_fail(sql_err!(
                     sqlstate::AMBIGUOUS_FUNCTION,
                     "function name \"{}\" is not unique",
                     identity_name.name
                 ));
             }
-            Ok(None) => {
+            Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
                 if if_exists {
                     continue;
                 }
@@ -39293,6 +39348,7 @@ pub fn drop_routine(
                     identity_name.name
                 ));
             }
+            Err(error) => return sql_fail(error),
         };
         let actual_kind = match storage.routine(slot).kind {
             crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
@@ -40896,6 +40952,14 @@ struct RuleConditionColumns<'a> {
 }
 
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        ColTypeResolver::resolve(self, qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         self.col_type(qualifier, name)
             .map(|_| Datum::Null)
@@ -41038,6 +41102,18 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        if let Some(qualifier) = qualifier {
+            let old = qualifier.eq_ignore_ascii_case("old");
+            let new = qualifier.eq_ignore_ascii_case("new");
+            if old && !self.old || new && !self.new {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "ON {} rule cannot reference {}",
+                    if old { "INSERT" } else { "DELETE" },
+                    if old { "OLD" } else { "NEW" }
+                ));
+            }
+        }
         self.col_type(qualifier, name).ok_or_else(|| {
             if qualifier.is_some_and(|value| {
                 !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
@@ -45605,30 +45681,6 @@ pub(crate) fn drop_domain(
         selected[slot] = true;
     }
 
-    // Domains form a bounded parent chain. Resolve the whole closure before
-    // mutating any catalog entry, so CASCADE drops descendant domains too and
-    // a failure cannot leave a dangling base-domain reference.
-    for candidate in 0..storage.domain_count() {
-        if !storage.domain_slot_visible_to(candidate, txn.txid) || selected[candidate] {
-            continue;
-        }
-        let dependency = match selected_domain_dependency(storage, candidate, selected, txn.txid) {
-            Ok(dependency) => dependency,
-            Err(error) => return sql_fail(error),
-        };
-        let Some(target) = dependency else {
-            continue;
-        };
-        if !cascade {
-            return sql_fail(sql_err!(
-                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop type {} because other objects depend on it",
-                storage.domain_for(target, txn.txid).name.as_str()
-            ));
-        }
-        selected[candidate] = true;
-    }
-
     if let Err(error) = drop_domain_selection(
         storage,
         wal,
@@ -45654,7 +45706,7 @@ fn drop_domain_selection(
     wal: &mut Wal,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    selected: &[bool],
+    selected: &mut [bool],
     selected_enum: Option<usize>,
     cascade: bool,
     reserved_undo: usize,
@@ -45662,6 +45714,25 @@ fn drop_domain_selection(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
+    // Include domains of domain arrays before selecting dependent columns,
+    // routines and defaults; inheritance alone does not describe containment.
+    for candidate in 0..storage.domain_count() {
+        if !storage.domain_slot_visible_to(candidate, txn.txid) || selected[candidate] {
+            continue;
+        }
+        let dependency = selected_domain_dependency(storage, candidate, selected, txn.txid)?;
+        let Some(target) = dependency else {
+            continue;
+        };
+        if !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                storage.domain_for(target, txn.txid).name.as_str()
+            ));
+        }
+        selected[candidate] = true;
+    }
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
         drop_type_dependent_routines(
@@ -45771,7 +45842,12 @@ fn drop_domain_selection(
                 if child != candidate
                     && child_selected
                     && !ordered[..ordered_count].contains(&child)
-                    && storage.domain_depends_on(child, candidate, txn.txid)?
+                    && storage.domain_depends_on(
+                        child,
+                        candidate,
+                        crate::storage::DomainDependency::Containment,
+                        txn.txid,
+                    )?
                 {
                     has_child = true;
                     break;
@@ -46306,7 +46382,12 @@ fn domain_rewrite_columns<Definition0: crate::storage::DefinitionBacking>(
         let Some(domain) = storage.domain_reference_slot(identity, transaction)? else {
             continue;
         };
-        affected[column] = storage.domain_depends_on(domain, target, transaction)?;
+        affected[column] = storage.domain_depends_on(
+            domain,
+            target,
+            crate::storage::DomainDependency::Inheritance,
+            transaction,
+        )?;
     }
     Ok(affected)
 }
@@ -46498,7 +46579,14 @@ fn selected_domain_dependency(
     transaction: u32,
 ) -> Result<Option<usize>, SqlError> {
     for (parent, selected) in selected.iter().copied().enumerate() {
-        if selected && storage.domain_depends_on(child, parent, transaction)? {
+        if selected
+            && storage.domain_depends_on(
+                child,
+                parent,
+                crate::storage::DomainDependency::Containment,
+                transaction,
+            )?
+        {
             return Ok(Some(parent));
         }
     }
@@ -47190,9 +47278,13 @@ fn drop_composite_type(
         .enumerate()
         .take(storage.domain_count())
     {
+        if !storage.domain_slot_visible_to(domain_slot, txn.txid) {
+            continue;
+        }
         let domain = storage.domain_for(domain_slot, txn.txid);
-        *selected = domain.visible_to(txn.txid)
-            && matches!(domain.base, ColType::Composite(candidate) if candidate == Some(creation))
+        *selected = matches!(domain.base,
+            ColType::Composite(candidate) | ColType::Array(crate::sql::types::ArrElem::Composite(candidate))
+                if candidate == Some(creation))
             && domain
                 .base_user_type
                 .is_some_and(|identity| identity.is_named(definition.schema, definition.name));
@@ -52693,6 +52785,8 @@ pub fn create_index(
         return sql_fail(error);
     }
     let tdef = (*storage.table_def(table_index, txn.txid)).clone();
+    let phased = command.build == crate::sql::ast::IndexBuildMode::Concurrent
+        && tdef.persistence != crate::storage::RelationPersistence::Temporary;
     if tdef.partition.is_partitioned()
         && command.build == crate::sql::ast::IndexBuildMode::Concurrent
     {
@@ -53411,6 +53505,10 @@ pub fn create_index(
     };
     if storage.relation_name_taken(tdef.schema.as_str(), sqlname.as_str(), txn.txid) {
         if command.if_not_exists {
+            if command.build == crate::sql::ast::IndexBuildMode::Concurrent {
+                txn.immediate_index_utility =
+                    Some(super::UtilityCommand::CreateIndexWithoutRestart);
+            }
             responder.notice(
                 sqlstate::SUCCESSFUL_COMPLETION,
                 stack_format!(
@@ -53480,6 +53578,8 @@ pub fn create_index(
                 crate::storage::IndexKind::Partitioned {
                     valid: command.scope == crate::sql::ast::IndexTargetScope::Recurse,
                 }
+            } else if phased {
+                crate::storage::IndexKind::OrdinaryUnbuilt
             } else {
                 crate::storage::IndexKind::Ordinary
             },
@@ -53494,6 +53594,23 @@ pub fn create_index(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
+    if phased {
+        if let Err(error) = journal_index_creation(storage, wal, txn, slot, table_index)
+            .and_then(|()| txn.record_ddl(storage, super::txn::DdlUndo::IndexCreated(slot as u32)))
+            .and_then(|()| {
+                super::concurrent_index::Command::capture(
+                    storage,
+                    txn.txid,
+                    super::concurrent_index::Kind::Create,
+                    slot,
+                )
+                .map(|command| txn.concurrent_index = Some(command))
+            })
+        {
+            return sql_fail(error);
+        }
+        return sql_ok();
+    }
     if let Err(error) = finish_index_creation(storage, wal, txn, slot, table_index, arena) {
         return sql_fail(error);
     }
@@ -53513,6 +53630,9 @@ pub fn create_index(
         )
     {
         return sql_fail(error);
+    }
+    if command.build == crate::sql::ast::IndexBuildMode::Concurrent {
+        txn.immediate_index_utility = Some(super::UtilityCommand::CreateIndexWithoutRestart);
     }
     responder.command_complete("CREATE INDEX")?;
     sql_ok()
@@ -53538,7 +53658,7 @@ fn index_definitions_compatible(
         && left.predicate == right.predicate
 }
 
-fn stage_index_definition(
+pub(super) fn stage_index_definition(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -53596,7 +53716,14 @@ fn finish_index_creation(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let result = (|| {
-        prepare_index_creation(storage, txn, slot, table, arena)?;
+        prepare_index_creation(
+            storage,
+            txn,
+            slot,
+            table,
+            arena,
+            crate::storage::IndexBindingOperation::Create,
+        )?;
         journal_index_creation(storage, wal, txn, slot, table)?;
         txn.record_ddl(storage, super::txn::DdlUndo::IndexCreated(slot as u32))
     })();
@@ -53612,6 +53739,7 @@ fn prepare_index_creation(
     slot: usize,
     table: usize,
     arena: &Arena,
+    operation: crate::storage::IndexBindingOperation,
 ) -> Result<(), SqlError> {
     let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
         sql_err!(
@@ -53628,12 +53756,57 @@ fn prepare_index_creation(
         },
         arena,
     )?;
-    storage.prepare_index_definition_enforcers(
-        slot,
-        txn.txid,
-        crate::storage::IndexBindingOperation::Create,
-    )?;
+    storage.prepare_index_definition_enforcers(slot, txn.txid, operation)?;
     storage.write_relation_counts(table, statistics, true)
+}
+
+pub(super) fn build_concurrent_index(
+    storage: &mut Storage,
+    txn: &TxnState,
+    slot: usize,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    prepare_index_creation(
+        storage,
+        txn,
+        slot,
+        table,
+        arena,
+        crate::storage::IndexBindingOperation::State,
+    )?;
+    if storage
+        .index_visible_to(slot, txn.txid)
+        .is_some_and(|index| index.method == crate::sql::ast::IndexAccessMethod::Brin)
+    {
+        storage.rebuild_brin_maintenance(slot, txn.txid)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_concurrent_index(
+    storage: &Storage,
+    txn: &TxnState,
+    slot: usize,
+    table: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::SERIALIZATION_FAILURE,
+            "concurrent index lifetime disappeared during validation"
+        )
+    })?;
+    validate_index_rows(
+        storage,
+        table,
+        txn.txid,
+        IndexRowValidation::Create {
+            unique: index.unique,
+        },
+        arena,
+    )?;
+    Ok(())
 }
 
 fn journal_index_creation(
@@ -55660,7 +55833,7 @@ fn index_descends_from(storage: &Storage, candidate: usize, ancestor: usize, txi
     false
 }
 
-fn stage_index_drop(
+pub(super) fn stage_index_drop(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -55876,6 +56049,36 @@ pub fn drop_index(
             {
                 return sql_fail(error);
             }
+            if build == crate::sql::ast::IndexBuildMode::Concurrent
+                && storage
+                    .index_table_slot_to(slot, txn.txid)
+                    .is_some_and(|table| {
+                        storage.table_def(table, txn.txid).persistence
+                            != crate::storage::RelationPersistence::Temporary
+                    })
+            {
+                let mut invalid = definition.mutable_for(txn.txid);
+                invalid.kind = match invalid.kind {
+                    crate::storage::IndexKind::Ordinary => crate::storage::IndexKind::OrdinaryReady,
+                    other => other,
+                };
+                invalid.clustered = false;
+                invalid.replica_identity = false;
+                if let Err(error) = stage_index_definition(storage, wal, txn, slot, invalid)
+                    .and_then(|()| {
+                        super::concurrent_index::Command::capture(
+                            storage,
+                            txn.txid,
+                            super::concurrent_index::Kind::Drop,
+                            slot,
+                        )
+                        .map(|command| txn.concurrent_index = Some(command))
+                    })
+                {
+                    return sql_fail(error);
+                }
+                return sql_ok();
+            }
             for descendant in (0..storage.index_count()).rev() {
                 if index_descends_from(storage, descendant, slot, txn.txid)
                     && let Err(error) = stage_index_drop(storage, wal, txn, descendant)
@@ -55900,6 +56103,9 @@ pub fn drop_index(
                 name.name
             ));
         }
+    }
+    if build == crate::sql::ast::IndexBuildMode::Concurrent {
+        txn.immediate_index_utility = Some(super::UtilityCommand::DropIndexWithoutRestart);
     }
     responder.command_complete("DROP INDEX")?;
     sql_ok()
@@ -56078,6 +56284,36 @@ pub fn reindex(
             false,
         ) {
             return sql_fail(error);
+        }
+    }
+    if options.build == crate::sql::ast::IndexBuildMode::Blocking {
+        for slot in 0..storage.index_count() {
+            let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+                continue;
+            };
+            if (selected_index_oid.is_some() && selected_index != Some(slot))
+                || storage
+                    .index_table_slot_to(slot, txn.txid)
+                    .is_none_or(|table| !tables[..table_count].contains(&table))
+            {
+                continue;
+            }
+            let mut definition = index.mutable_for(txn.txid);
+            if definition.kind.is_partitioned() || definition.kind.valid() {
+                continue;
+            }
+            definition.kind = crate::storage::IndexKind::Ordinary;
+            if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition)
+                .and_then(|()| {
+                    storage.prepare_index_definition_enforcers(
+                        slot,
+                        txn.txid,
+                        crate::storage::IndexBindingOperation::State,
+                    )
+                })
+            {
+                return sql_fail(error);
+            }
         }
     }
     for &table in &tables[..table_count] {

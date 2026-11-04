@@ -287,3 +287,17 @@ these repairs uncommitted at `fcd4f8cc`. Extract it and run
 `python3 verify-planner-metadata.py .` to verify file hashes, 175 result rows and
 seven expected error codes. These observations qualify the PostgreSQL reference;
 the final pos3ql CI run must establish matching behavior.
+
+[index-materialization-reference.zip](index-materialization-reference.zip), SHA256
+`05f117e10f26c73124e9d8b58a7fe7ea1459bacda240d036e41579f510194809`,
+records PostgreSQL 18.6 inline primary/unique indexes before and after a blocking
+tablespace rebuild and concurrent replacement. Fixture `233_inline_index_materialization.sql`
+returns 11 rows: each index appears once and retains its primary/unique flags.
+A separate three-session probe records 35 protocol exchanges showing replacement
+publication before an earlier writer finishes; cancellation retains that index
+and the original constraint. Both ordinary and deferrable keys are covered.
+Exact SQL, raw exchanges, commands, binary/source hashes and verifiers are retained.
+The catalog fixture was uncommitted at `82c3d71d`; the writer probe ran at that
+revision. Extract it and run `python3 verify-index-materialization.py .` to
+verify both references. These are PostgreSQL observations, not pos3ql runtime
+or performance qualification.

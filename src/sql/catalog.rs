@@ -11978,6 +11978,16 @@ fn visit_indexes(
         };
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
+            if (col.primary || col.unique)
+                && storage
+                    .indexes_for(def.schema.as_str(), table_name, txid)
+                    .any(|index| {
+                        def.column_index_identity(ci)
+                            .is_some_and(|identity| identity.created_at() == index.created_at)
+                    })
+            {
+                continue;
+            }
             if col.primary {
                 let name = stack_str_64(
                     def.column_key_name(ci)
@@ -12108,6 +12118,17 @@ fn visit_indexes(
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+            let inline = def
+                .columns()
+                .iter()
+                .enumerate()
+                .find_map(|(column, metadata)| {
+                    ((metadata.primary || metadata.unique)
+                        && def
+                            .column_index_identity(column)
+                            .is_some_and(|identity| identity.created_at() == index.created_at))
+                    .then_some(column)
+                });
             let attached = def.uniques().iter().find(|key| {
                 key.index_identity
                     .is_some_and(|identity| identity.created_at() == index.created_at)
@@ -12126,6 +12147,12 @@ fn visit_indexes(
                         key.identity
                             .expect("admitted exclusion has a constraint identity")
                     })
+                })
+                .or_else(|| {
+                    inline.map(|column| {
+                        def.column_constraint_identity(column)
+                            .expect("admitted inline key has a constraint identity")
+                    })
                 });
             let mut info = mk(
                 explicit_index_oid(&index),
@@ -12136,7 +12163,8 @@ fn visit_indexes(
                 index.nulls_first,
                 index.predicate,
                 index.nulls_not_distinct,
-                attached.is_some_and(|key| key.kind.is_primary()),
+                attached.is_some_and(|key| key.kind.is_primary())
+                    || inline.is_some_and(|column| def.columns()[column].primary),
                 index.unique,
                 constraint_identity,
                 attached_exclusion.is_some(),

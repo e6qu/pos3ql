@@ -173,10 +173,11 @@ the configured stack, test parallelism and job deadlines.
 Rebuilding a table must leave retired indexes untouched. Explicit user-index
 repair and replacement must preserve the distinct flags and ownership rules.
 The current implementation gives the large-value index its own lifetime and
-preserves deferred
-uniqueness while its replacement is detached. Registration must publish replacement
+preserves deferred uniqueness while its replacement is detached. Registration must publish replacement
 catalog entries before waiting for existing writers; table-shape normalization
-belongs with the later anchor swap. Comments must follow the selected index
+belongs with the later anchor swap. Each backing index must appear once in
+catalogs and rebuild selection, including inline keys with stored physical
+metadata after a tablespace change. Comments must follow the selected index
 through name reuse, commit and cold recovery. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.

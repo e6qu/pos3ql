@@ -1543,6 +1543,17 @@ fn reindex_tablespace_moves_user_indexes_and_preserves_toast_placement() {
                 first_row(&query(
                     &mut session,
                     &mut engine,
+                    "SELECT count(*),count(DISTINCT c.oid),count(*) FILTER (WHERE i.indisprimary) \
+                     FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid \
+                     WHERE i.indrelid='reindex_space_rows'::regclass"
+                )),
+                "1|1|1",
+                "{mode:?}: each materialized key has one relation identity"
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut session,
+                    &mut engine,
                     "SELECT space.spcname FROM pg_class idx JOIN pg_tablespace space ON space.oid=idx.reltablespace \
                  WHERE idx.relname='reindex_space_rows_pkey'"
                 )),

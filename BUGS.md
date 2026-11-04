@@ -10,7 +10,9 @@ with their fixing code, tests and retained reference evidence.
 Pending CI, uncollected measurements and reproducible failures being repaired
 belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
-current behavior belongs in the [owning guides](docs/README.md).
+current behavior belongs in the [owning guides](docs/README.md). Verify catalog
+identities and physical flags before and after maintenance; command completion
+alone cannot expose duplicate or detached index metadata.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

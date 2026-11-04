@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn materialized_inline_keys_keep_one_catalog_row_and_their_constraint_identity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("materialized-inline-indexes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/233_inline_index_materialization.sql"
+        );
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+        }
+        assert_eq!(
+            rows,
+            [
+                "created|2|2|1|2",
+                "materialized|2|2|1|2",
+                "inline_key_materialization_pkey|t|t|t",
+                "inline_key_materialization_value_key|f|t|t",
+                "2|2",
+                "replaced|2|2|1|2",
+                "inline_key_materialization_pkey|t|t|t",
+                "inline_key_materialization_value_key|f|t|t",
+                "0",
+                "1|10|one",
+                "2|20|two"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn table_drop_rollback_restores_only_its_own_index_drops() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

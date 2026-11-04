@@ -371,7 +371,10 @@ retires the old indexes, and commits their removal before reporting completion.
 The table's primary-key constraint keeps its identifier and comment; its
 backing index receives a new identifier. Index registration leaves the table
 shape intact so an existing writer cannot block publication of the replacement.
-Inline keys are normalized when their backing index is swapped. Index comments
+Inline keys are normalized when their backing index is swapped. An inline key
+and its stored physical index produce one catalog row, joined by the index's
+creation identity. That row keeps the constraint's primary-key flag and the
+index's current placement and build flags. Index comments
 move through the journal with the replacement and survive restart; reusing a
 retired name cannot move another index's comment. The virtual large-value index follows
 the same lifetime rules without introducing a separate PostgreSQL chunk heap.

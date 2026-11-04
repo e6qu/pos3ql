@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 25;
+pub(crate) const RECORD_VERSION: u8 = 26;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -257,7 +257,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 16;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 17;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1133,6 +1133,11 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     };
     n += 1;
     n += 3;
+    n += def
+        .inline_key_names()
+        .iter()
+        .map(|key| 2 + 1 + key.name.as_str().len())
+        .sum::<usize>();
     n += def.table_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
     n += 4 + def.type_inputs.as_ref().bytes().len();
@@ -1145,6 +1150,7 @@ fn append_table_payload<B: DefinitionBacking>(
     def: &TableDefinition<B>,
 ) -> bool {
     let mut ok = crate::storage::Storage::validate_not_null_names(def).is_ok()
+        && crate::storage::Storage::validate_inline_key_names(def).is_ok()
         && def.attributes.validate(def.n_columns)
         && buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
         && buffer.append(&identity.encode())
@@ -1287,6 +1293,9 @@ fn append_table_payload<B: DefinitionBacking>(
         u8::from(def.row_level_security.forced),
         def.replica_identity.code(),
     ]);
+    for key in def.inline_key_names() {
+        ok &= buffer.append(&key.attribute.to_le_bytes()) && name_bytes(buffer, key.name.as_str());
+    }
     for identity in def.table_index_identities() {
         ok &= identity.is_some()
             && buffer.append(
@@ -8383,6 +8392,20 @@ fn decode_op_inner<'a>(
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
+            let inline_keys = def
+                .columns()
+                .iter()
+                .filter(|column| column.primary || column.unique)
+                .count();
+            for _ in 0..inline_keys {
+                let attribute = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                let name = SqlName::parse(take_name(&mut at)?).ok()?;
+                def.inline_key_names[def.n_inline_key_names] =
+                    crate::storage::InlineKeyName { attribute, name };
+                def.n_inline_key_names += 1;
+            }
+            crate::storage::Storage::validate_inline_key_names(&def).ok()?;
             // Stored names are authoritative during later column remapping.
             def.not_null_name_edits = crate::storage::ColumnSet::all(n_cols);
             for identity in def.table_index_identities_mut() {
@@ -15065,6 +15088,8 @@ mod tests {
         def.exclusions[0] = exclusion;
         def.n_exclusions = 1;
         def.attributes.initialize(def.n_columns).unwrap();
+        def.set_column_key_name(0, SqlName::parse("t_pkey").unwrap())
+            .unwrap();
         crate::storage::constraint_names::table(&mut def).unwrap();
         for (position, identity) in def.table_index_identities_mut().enumerate() {
             *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
@@ -15085,6 +15110,7 @@ mod tests {
             core::mem::size_of_val(&definition.not_null_identities[..attributes]),
             core::mem::size_of_val(&definition.inline_index_identities[..attributes]),
             core::mem::size_of_val(&definition.inline_constraint_identities[..attributes]),
+            core::mem::size_of_val(definition.inline_key_names()),
             core::mem::size_of_val(definition.uniques()),
             core::mem::size_of_val(definition.checks()),
             core::mem::size_of_val(definition.fkeys()),
@@ -15096,13 +15122,13 @@ mod tests {
         .sum();
         let payload_bytes = table_payload_len(&definition);
         let mut budget = Budget::new(
-            crate::mem::lease_pool::LeasePool::budget_bytes(bytes, 10) + 2 * payload_bytes,
+            crate::mem::lease_pool::LeasePool::budget_bytes(bytes, 11) + 2 * payload_bytes,
         );
         let pool = crate::mem::lease_pool::LeasePool::new(
             &mut budget,
             crate::mem::lease_pool::Purpose::TABLE_METADATA,
             bytes,
-            10,
+            11,
         )
         .unwrap();
         let mut from_builder =
@@ -15129,6 +15155,7 @@ mod tests {
             let (position, decoded, _) = decode_table_payload(from_stored.readable()).unwrap();
             assert_eq!(position, identity);
             assert_eq!(decoded.columns(), definition.columns());
+            assert_eq!(decoded.inline_key_names(), definition.inline_key_names());
             assert!(
                 decoded
                     .constraint_identities()
@@ -15188,6 +15215,35 @@ mod tests {
             .into_iter()
             .filter(|record| !record.contains(":Commit {"))
             .collect()
+    }
+
+    #[test]
+    fn inline_key_name_payload_preserves_names_and_rejects_wrong_stable_attributes() {
+        let definition = sample_def();
+        let mut budget = Budget::new(32768);
+        let mut payload =
+            FixedBuf::new(&mut budget, "inline key name journal proof", 32768).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::CreateTable {
+                identity: crate::storage::CatalogPosition::new(0, 50).unwrap(),
+                definition: (&definition).into(),
+            }
+        ));
+        let position = payload
+            .readable()
+            .windows(9)
+            .position(|bytes| bytes == b"\x01\x00\x06t_pkey")
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (_, restored, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(restored.column_key_name(0), definition.column_key_name(0));
+            for attribute in [0u16, 2, u16::MAX] {
+                payload.filled_mut()[position..position + 2]
+                    .copy_from_slice(&attribute.to_le_bytes());
+                assert!(decode_table_payload(payload.readable()).is_none());
+            }
+        });
     }
 
     #[test]

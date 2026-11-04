@@ -11966,7 +11966,11 @@ fn visit_indexes(
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
             if col.primary {
-                let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
+                let name = stack_str_64(
+                    def.column_key_name(ci)
+                        .expect("admitted inline key has a name")
+                        .as_str(),
+                );
                 visit(mk(
                     def.column_index_identity(ci)
                         .expect("admitted inline index has an identity")
@@ -11990,7 +11994,9 @@ fn visit_indexes(
                 ));
             } else if col.unique {
                 let name = stack_str_64(
-                    stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
+                    def.column_key_name(ci)
+                        .expect("admitted inline key has a name")
+                        .as_str(),
                 );
                 visit(mk(
                     def.column_index_identity(ci)

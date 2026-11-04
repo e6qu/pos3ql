@@ -564,7 +564,7 @@ mod tests {
             assert_eq!(replacement.constraint_identities().count(), 5);
 
             let mut named = super::super::UniqueKey::EMPTY;
-            named.name = SqlName::parse("id_key").unwrap();
+            named.name = replacement.take_column_key_name(0).unwrap();
             named.kind = super::super::UniqueKeyKind::Primary;
             named.columns[0] = 0;
             named.n_cols = 1;

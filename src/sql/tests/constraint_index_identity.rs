@@ -1,6 +1,206 @@
 use super::*;
 
 #[test]
+fn pending_index_and_check_names_follow_their_distinct_catalog_visibility() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for (source, pending, creation, relation, expected) in [
+            (
+                "index",
+                "CREATE TABLE a_b(c integer UNIQUE)",
+                "CREATE TABLE a(b_c integer UNIQUE)",
+                "a",
+                "a_b_c_key1",
+            ),
+            (
+                "table-check",
+                "CREATE TABLE holder(value integer CONSTRAINT a_b_c_key CHECK(value>0))",
+                "CREATE TABLE a_b(c integer UNIQUE)",
+                "a_b",
+                "a_b_c_key",
+            ),
+            (
+                "domain-check",
+                "CREATE DOMAIN holder AS integer CONSTRAINT a_b_c_key CHECK(VALUE>0)",
+                "CREATE TABLE a_b(c integer UNIQUE)",
+                "a_b",
+                "a_b_c_key",
+            ),
+        ] {
+            for outcome in ["COMMIT", "ROLLBACK"] {
+                let mut config =
+                    test_config(&format!("pending-key-name-{mode:?}-{source}-{outcome}"));
+                config.transaction_mode = mode;
+                let mut budget = test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut first = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut second =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                first.success(&mut engine, "BEGIN", true);
+                first.success(&mut engine, pending, true);
+                second.success(&mut engine, "BEGIN", true);
+                second.success(&mut engine, creation, true);
+                let query = format!(
+                    "SELECT conname FROM pg_constraint WHERE conrelid='public.{relation}'::regclass AND contype='u'"
+                );
+                assert_eq!(
+                    data_rows(&second.success(&mut engine, &query, true)),
+                    [expected],
+                    "{mode:?}, {source}, {outcome}: before first transaction resolves"
+                );
+                first.success(&mut engine, outcome, true);
+                assert_eq!(
+                    data_rows(&second.success(&mut engine, &query, true)),
+                    [expected],
+                    "{mode:?}, {source}, {outcome}: after first transaction resolves"
+                );
+                second.success(&mut engine, "COMMIT", true);
+                assert_eq!(
+                    data_rows(&first.success(&mut engine, &query, true)),
+                    [expected],
+                    "{mode:?}, {source}, {outcome}: after second transaction commits"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn owner_command_events_report_only_the_table_or_materialized_view_root() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("owner-command-events-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/227_owner_event_commands.sql");
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+        }
+        assert_eq!(
+            rows,
+            [
+                "table-changed|1|table|public.owner_event_rows|ALTER TABLE",
+                "table-unchanged|1|table|public.owner_event_rows|ALTER TABLE",
+                "view-changed|1|materialized view|public.owner_event_saved|ALTER MATERIALIZED VIEW",
+                "view-unchanged|1|materialized view|public.owner_event_saved|ALTER MATERIALIZED VIEW",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_key_names_survive_renames_collisions_and_http_cold_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("inline-key-names-{mode:?}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_bucket = format!("inline-key-names-{mode:?}-{}", std::process::id());
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!("../../../tests/external/differential/225_inline_key_names.sql");
+        let (setup, _) = fixture
+            .split_once("CREATE TABLE inline_key_names.before_names AS")
+            .unwrap();
+        let remaining = fixture.strip_prefix(setup).unwrap();
+        let expected_names = [
+            "long-primary|pppppppppppppppppppppppppppppppppppppppppppppppppppppppppp_pkey|63|t",
+            "balanced-unique|ttttttttttttttttttttttttttttt_ccccccccccccccccccccccccccccc_key|63|t",
+            "unicode-unique|éééééééééééééé_界界界界界界界界界_key|60|t",
+            "namespace-collision|a|a_b_c_key1|t",
+            "namespace-collision|a_b|a_b_c_key|t",
+        ];
+        let mut rows = Vec::new();
+        for statement in setup
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+        }
+        assert_eq!(rows, expected_names, "{mode:?}");
+        engine.commit_wal().unwrap();
+        assert!(server.uploads.load(std::sync::atomic::Ordering::Acquire) > 0);
+        drop((session, engine, budget));
+        for checkpoint in [false, true] {
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut verifier = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            let mut recovered_names = Vec::new();
+            for statement in setup
+                .split(";\n")
+                .map(str::trim)
+                .filter(|sql| sql.starts_with("SELECT"))
+            {
+                recovered_names.extend(data_rows(&verifier.success(
+                    &mut recovered,
+                    statement,
+                    true,
+                )));
+            }
+            assert_eq!(
+                recovered_names, expected_names,
+                "{mode:?}, checkpoint={checkpoint}"
+            );
+            if checkpoint {
+                let mut rows = Vec::new();
+                for statement in remaining
+                    .split(";\n")
+                    .map(str::trim)
+                    .filter(|sql| !sql.is_empty())
+                {
+                    rows.extend(data_rows(&verifier.success(
+                        &mut recovered,
+                        statement,
+                        true,
+                    )));
+                }
+                assert_eq!(
+                    rows,
+                    [
+                        "retained-after-renames|a_b_c_key|t|t",
+                        "after-reindex|t|t|t|t|t",
+                        "dropped-by-retained-name|t",
+                        "backing-relations-removed|t",
+                    ],
+                    "{mode:?}"
+                );
+            } else {
+                assert!(recovered.checkpoint().unwrap());
+            }
+            recovered.commit_wal().unwrap();
+            assert!(recovered.fatal_commit_failure().is_none());
+        }
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn index_creation_and_reindex_keep_owners_and_grants_through_http_cold_recovery() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

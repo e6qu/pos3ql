@@ -1416,19 +1416,6 @@ fn index_object<Definition0: crate::storage::DefinitionBacking>(
     ))
 }
 
-fn inline_primary_name<Definition0: crate::storage::DefinitionBacking>(
-    table: &crate::storage::TableDefinition<Definition0>,
-) -> StackStr<128> {
-    crate::stack_format!(128, "{}_pkey", table.name.as_str())
-}
-
-fn inline_unique_name<Definition0: crate::storage::DefinitionBacking>(
-    table: &crate::storage::TableDefinition<Definition0>,
-    column: &crate::storage::ColumnMeta,
-) -> StackStr<128> {
-    crate::stack_format!(128, "{}_{}_key", table.name.as_str(), column.name.as_str())
-}
-
 fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacking>(
     table: &crate::storage::TableDefinition<Definition0>,
     name: &str,
@@ -1438,13 +1425,11 @@ fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacki
         return key.columns() == parent_columns;
     }
     for (index, column) in table.columns().iter().enumerate() {
-        let generated = if column.primary {
-            Some(inline_primary_name(table))
-        } else if column.unique {
-            Some(inline_unique_name(table, column))
-        } else {
-            None
-        };
+        let generated = (column.primary || column.unique).then(|| {
+            table
+                .column_key_name(index)
+                .expect("admitted inline key has a name")
+        });
         if generated
             .as_ref()
             .is_some_and(|generated| generated.as_str() == name)
@@ -3381,9 +3366,13 @@ fn push_alter_table_drops(
                 .exclusions()
                 .iter()
                 .any(|item| item.name.as_str() == name)
-            && !new.columns().iter().any(|column| {
-                (column.primary && inline_primary_name(&new).as_str() == name)
-                    || (column.unique && inline_unique_name(&new, column).as_str() == name)
+            && !new.columns().iter().enumerate().any(|(index, column)| {
+                ((column.primary || column.unique)
+                    && new
+                        .column_key_name(index)
+                        .expect("admitted inline key has a name")
+                        .as_str()
+                        == name)
                     || (column.not_null.is_required()
                         && not_null_name(&new, column).as_str() == name)
             })
@@ -3512,10 +3501,12 @@ fn push_alter_table_drops(
                     )?;
                 } else {
                     for (column_index, column) in old.columns().iter().enumerate() {
-                        let generated = if column.primary {
-                            Some(inline_primary_name(old))
-                        } else if column.unique {
-                            Some(inline_unique_name(old, column))
+                        let generated = if column.primary || column.unique {
+                            Some(StackStr::from_str(
+                                old.column_key_name(column_index)
+                                    .expect("admitted inline key has a name")
+                                    .as_str(),
+                            ))
                         } else if column.not_null.is_required() {
                             Some(not_null_name(old, column))
                         } else {
@@ -3596,9 +3587,8 @@ fn push_alter_table_drops(
     }
     for (column_index, column) in old.columns().iter().enumerate() {
         let survives = new
-            .columns()
-            .iter()
-            .find(|new_column| new_column.name == column.name);
+            .attribute_column(old.attribute_number(column_index))
+            .map(|index| &new.columns()[index]);
         if column.not_null.is_required()
             && survives.is_none_or(|new_column| !new_column.not_null.is_required())
         {
@@ -3620,11 +3610,9 @@ fn push_alter_table_drops(
                 (column.primary && !new_column.primary) || (column.unique && !new_column.unique)
             })
         {
-            let name = if column.primary {
-                inline_primary_name(old)
-            } else {
-                inline_unique_name(old, column)
-            };
+            let name = old
+                .column_key_name(column_index)
+                .expect("admitted inline key has a name");
             let index_oid = old.implicit_index_oid(usize::from(
                 inline_positions[column_index].ok_or_else(graph_full)?,
             ));
@@ -3723,14 +3711,15 @@ fn push_table_indexes(
 ) -> Result<(), SqlError> {
     let table = storage.table_def(slot, txid);
     let mut position = 0usize;
-    for column in table.columns() {
-        let name = if column.primary {
-            Some(inline_primary_name(&table))
-        } else if column.unique {
-            Some(inline_unique_name(&table, column))
-        } else {
-            None
-        };
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let name = (column.primary || column.unique).then(|| {
+            StackStr::from_str(
+                table
+                    .column_key_name(column_index)
+                    .expect("admitted inline key has a name")
+                    .as_str(),
+            )
+        });
         if let Some(name) = name {
             push_command(
                 output,
@@ -3894,13 +3883,14 @@ fn push_table_drop_dependents(
 
     let mut position = 0usize;
     for (column_index, column) in table.columns().iter().enumerate() {
-        let name = if column.primary {
-            Some(inline_primary_name(&table))
-        } else if column.unique {
-            Some(inline_unique_name(&table, column))
-        } else {
-            None
-        };
+        let name = (column.primary || column.unique).then(|| {
+            StackStr::from_str(
+                table
+                    .column_key_name(column_index)
+                    .expect("admitted inline key has a name")
+                    .as_str(),
+            )
+        });
         if let Some(name) = name {
             push_drop(
                 output,
@@ -4233,6 +4223,24 @@ pub(crate) fn collect<'a>(
     for (reference, normal) in before.dependent_drops.iter().copied() {
         push_drop_once(&mut drops, &mut drop_count, reference, false, normal)?;
     }
+    let owner_target = match statement {
+        Stmt::AlterOwner { kind, name, .. } => {
+            super::exec::alter_owner_target(storage, txid, *kind, name)?.and_then(access_reference)
+        }
+        Stmt::AlterForeignServer {
+            name,
+            action: crate::sql::ast::AlterForeignServerAction::Owner(_),
+        } => storage
+            .foreign_server(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
+        Stmt::AlterForeignDataWrapper {
+            name,
+            action: crate::sql::ast::AlterForeignDataWrapperAction::Owner(_),
+        } => storage
+            .foreign_wrapper(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
+        _ => None,
+    };
     let mut seen_commands = ArenaList::new(arena);
     for (entry, &entry_origin) in undo.iter().cloned().zip(undo_origins) {
         if entry_origin != origin {
@@ -4262,6 +4270,10 @@ pub(crate) fn collect<'a>(
             continue;
         };
         if mutation != Mutation::Drop {
+            // Cascaded owner updates do not add commands beyond the named root.
+            if matches!(statement, Stmt::AlterOwner { .. }) && owner_target != Some(reference) {
+                continue;
+            }
             if let Stmt::AlterTable(_) = statement
                 && let Some((root, _)) = before.altered_table.as_ref()
                 && matches!(reference, ObjectRef::Table(slot) if slot != *root)
@@ -4298,24 +4310,6 @@ pub(crate) fn collect<'a>(
     }
     // A successful OWNER command is observable even when ownership is unchanged.
     // PostgreSQL REL_18_6 src/backend/tcop/utility.c collects its returned address.
-    let owner_target = match statement {
-        Stmt::AlterOwner { kind, name, .. } => {
-            super::exec::alter_owner_target(storage, txid, *kind, name)?.and_then(access_reference)
-        }
-        Stmt::AlterForeignServer {
-            name,
-            action: crate::sql::ast::AlterForeignServerAction::Owner(_),
-        } => storage
-            .foreign_server(name, txid)
-            .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
-        Stmt::AlterForeignDataWrapper {
-            name,
-            action: crate::sql::ast::AlterForeignDataWrapperAction::Owner(_),
-        } => storage
-            .foreign_wrapper(name, txid)
-            .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
-        _ => None,
-    };
     if let Some(reference) = owner_target {
         let reference = EventObjectRef::Primary(reference);
         if !seen_commands.as_slice().contains(&reference) {

@@ -94,6 +94,21 @@ survive. The fixture was uncommitted at source revision `c476eb30`; its exact
 hash and raw results are retained. Extract it and run
 `python3 verify-reindex-ownership.py .` to verify 10 hashes and four output rows.
 
+[inline-key-names.zip](inline-key-names.zip), SHA256
+`a1479a4b8e119a1e64c941b0a28d8915ca54c6510592c6e249c216b1818611b9`,
+records fixture `225_inline_key_names.sql`: long and UTF-8 names, schema
+collisions, retained names after table and column renames, rebuilding and
+dropping by the saved name. Extract it and run
+`python3 verify-inline-key-names.py .` to verify 10 hashes and nine exact rows.
+
+[index-parent-owner.zip](index-parent-owner.zip), SHA256
+`b6bd11b6e07de1b723ffe1a041e5b7316215d2b746fd0a6e955a30a48f015723`,
+records fixture `226_index_parent_ownership.sql`: table and materialized-view
+owner changes reach their indexes, both before commit and after rollback.
+Extract it and run `python3 verify-index-parent-owner.py .` to verify 10 hashes
+and seven exact rows. Both archives retain exact SQL, raw results, commands and
+binary/source hashes; their fixtures were uncommitted at revision `8800db18`.
+
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the
 [original runner artifact](https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290).
@@ -167,3 +182,38 @@ or two with STRICT; dynamic EXECUTE INTO
 evaluates the full query. The archive includes raw output, exact
 sources, provenance and `verify-execution-reference.py`; extract it and run
 `python3 verify-execution-reference.py .` to verify the observations and 21 hashes.
+
+[key-namespace-reference.zip](key-namespace-reference.zip), SHA256
+`3f215990fbb19442e889d4651d25f249e1a0f5171338714351f5b50b0d2aecac`,
+records 17 exchanges between two PostgreSQL 18.6 sessions. An uncommitted
+`a_b(c UNIQUE)` already reserves `a_b_c_key`: another session creating
+`a(b_c UNIQUE)` immediately chooses `a_b_c_key1` and retains it even if the
+first transaction rolls back. Committed table and domain CHECK names also
+force a suffix within the schema; another schema is independent. This matches
+[the pinned name-selection source](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/indexcmds.c#L2431-L2515).
+The archive retains exact SQL, raw exchanges, runner, commands and binary hashes
+at source revision `8800db18` with the naming changes uncommitted. Extract it and
+run `python3 verify-key-namespace.py .` to verify 10 hashes and 11 observed name
+rows. This qualifies PostgreSQL behavior; final pos3ql CI must still pass.
+
+[owner-event-reference.zip](owner-event-reference.zip), SHA256
+`5e9eac2fa268f34f3c7b40bbded460a454cad6659812edeb751dc6e0002c6bf2`,
+records fixture `227_owner_event_commands.sql` on PostgreSQL 18.6. Changing a
+table or materialized view's owner reports exactly the named object to the end
+callback, including when it has indexes. Repeating the same owner change still
+reports one command. Child ownership updates add no commands. The fixture was
+uncommitted at source revision `8800db18`. Exact SQL, output, commands, binary
+hashes and provenance are retained. Extract it and run
+`python3 verify-owner-event.py .` to verify 10 hashes and four output rows.
+
+[pending-key-namespace-reference.zip](pending-key-namespace-reference.zip), SHA256
+`06b7846ca825da6e8a178efecdfa25c2a5851807f4b8414359f0fa818b74b30d`,
+records the constraint visibility distinction in 26 two-session exchanges.
+Another transaction's uncommitted table or domain CHECK named `a_b_c_key` does
+not force a suffix for `a_b(c UNIQUE)`. The chosen name remains unchanged after
+the first transaction commits or rolls back. This differs from an uncommitted
+index relation, which already reserves its name. PostgreSQL's
+[constraint-name scan](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/pg_constraint.c#L425-L459)
+uses the catalog snapshot. Exact SQL, raw results, commands and binary hashes
+are retained. Extract it and run `python3 verify-pending-key-namespace.py .`
+to verify 10 hashes and 12 observed name rows.

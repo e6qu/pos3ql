@@ -1396,6 +1396,7 @@ fn create_table_kind(
         }
         Err(e) => return sql_fail(e),
     };
+    def = TableDefBuilder::from_definition(&storage.table_def(created_slot, txn.txid));
     if foreign.is_none()
         && let Err(e) =
             copy_like_statistics(storage, wal, txn, statement, &def, created_slot, arena)
@@ -5243,15 +5244,12 @@ fn arbiter_by_name<Definition0: crate::storage::DefinitionBacking>(
             return Ok(Some((cols, n, uk.kind.nulls_not_distinct())));
         }
     }
-    for (i, c) in def.columns().iter().enumerate() {
-        let synth = if c.primary {
-            ddl::auto_key_name(def, &[i as u16], "pkey", false)
-        } else if c.unique {
-            ddl::auto_key_name(def, &[i as u16], "key", true)
-        } else {
-            continue;
-        };
-        if synth.map(|nm| nm.as_str() == name).unwrap_or(false) {
+    for (i, metadata) in def.columns().iter().enumerate() {
+        if (metadata.primary || metadata.unique)
+            && def
+                .column_key_name(i)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
             cols[0] = i as u16;
             return Ok(Some((cols, 1, false)));
         }
@@ -7840,6 +7838,44 @@ pub fn alter_owner(
             rewrite_object_acl_owner(storage, txn, backing, backing_old_owner, new_owner as u16)
         {
             return sql_fail(error);
+        }
+    }
+    let index_table = match object.class {
+        AccessClass::Table => Some(usize::from(object.slot)),
+        AccessClass::MaterializedView => Some(storage.matview_table(usize::from(object.slot))),
+        _ => None,
+    };
+    if let Some(table) = index_table {
+        for slot in 0..storage.index_count() {
+            if storage.index_table_slot_to(slot, txn.txid) != Some(table)
+                || storage.index_visible_to(slot, txn.txid).is_none()
+            {
+                continue;
+            }
+            let index = AccessObject {
+                class: AccessClass::Index,
+                slot: u16::try_from(slot).expect("index capacity fits access-object positions"),
+            };
+            let old_owner = storage.object_owner(index, txn.txid) as u16;
+            if usize::from(old_owner) == new_owner {
+                continue;
+            }
+            let prior = storage.set_object_owner(index, new_owner, txn.txid);
+            if let Err(error) = txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ObjectOwnerChanged {
+                    object: index,
+                    prior,
+                },
+            ) {
+                storage.restore_object_owner(index, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) =
+                rewrite_object_acl_owner(storage, txn, index, old_owner, new_owner as u16)
+            {
+                return sql_fail(error);
+            }
         }
     }
     responder.command_complete(tag)?;
@@ -11265,7 +11301,7 @@ pub(crate) fn drop_owned(
         }
     }
 
-    // Standalone indexes can have a different owner from their table.
+    // Check surviving index entries after their owning relations.
     for slot in (0..storage.access_class_slots(AccessClass::Index)).rev() {
         let object = AccessObject {
             class: AccessClass::Index,
@@ -54703,6 +54739,7 @@ fn stage_table_definition(
                 column_mapping: wal_mapping,
             },
         )?;
+        storage.prepare_table_key_names(edit_target, &mut next, &mapping)?;
         storage.reserve_table_catalog_identities(&mut next)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
@@ -69217,32 +69254,18 @@ fn drop_named_constraint(def: &mut TableDefBuilder, name: &str) -> bool {
             return true;
         }
     }
-    // A single-column primary key is a column flag named "<table>_pkey".
-    let pkey = crate::stack_format!(96, "{}_pkey", def.name.as_str());
-    if name == pkey.as_str()
-        && let Some(column) = def.columns().iter().position(|column| column.primary)
-    {
-        def.take_column_index_identity(column);
-        def.take_column_constraint_identity(column);
-        def.columns[column].primary = false;
-        def.columns[column].unique = false;
-        return true;
-    }
-    // A single-column UNIQUE is "<table>_<column>_key".
-    for i in 0..def.n_columns {
-        if def.columns[i].unique && !def.columns[i].primary {
-            let key = crate::stack_format!(
-                128,
-                "{}_{}_key",
-                def.name.as_str(),
-                def.columns[i].name.as_str()
-            );
-            if name == key.as_str() {
-                def.take_column_index_identity(i);
-                def.take_column_constraint_identity(i);
-                def.columns[i].unique = false;
-                return true;
-            }
+    for column in 0..def.n_columns {
+        if (def.columns[column].primary || def.columns[column].unique)
+            && def
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
+            def.take_column_index_identity(column);
+            def.take_column_constraint_identity(column);
+            def.take_column_key_name(column);
+            def.columns[column].primary = false;
+            def.columns[column].unique = false;
+            return true;
         }
     }
     false
@@ -69258,25 +69281,12 @@ fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
     {
         return Some((key.columns, key.n_cols));
     }
-    let primary_name = stack_format!(96, "{}_pkey", def.name.as_str());
-    if name == primary_name.as_str()
-        && let Some((column, _)) = def
-            .columns()
-            .iter()
-            .enumerate()
-            .find(|(_, metadata)| metadata.primary)
-    {
-        let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
-        columns[0] = column as u16;
-        return Some((columns, 1));
-    }
     for (column, metadata) in def.columns().iter().enumerate() {
-        if !metadata.unique || metadata.primary {
-            continue;
-        }
-        let unique_name =
-            stack_format!(128, "{}_{}_key", def.name.as_str(), metadata.name.as_str());
-        if name == unique_name.as_str() {
+        if (metadata.primary || metadata.unique)
+            && def
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
             let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
             columns[0] = column as u16;
             return Some((columns, 1));
@@ -69515,6 +69525,7 @@ fn rename_attached_index_constraint(
             column_mapping: wal_mapping,
         },
     )?;
+    storage.prepare_table_key_names(edit_target, &mut altered, &mapping)?;
     storage.reserve_table_catalog_identities(&mut altered)?;
     let lsn = storage.bump_lsn();
     wal.stage_reserved(
@@ -69604,6 +69615,7 @@ fn drop_dependent_foreign_keys(
                 column_mapping: wal_mapping,
             },
         )?;
+        storage.prepare_table_key_names(edit_target, &mut altered, &mapping)?;
         storage.reserve_table_catalog_identities(&mut altered)?;
         let lsn = storage.bump_lsn();
         wal.stage_reserved(
@@ -69819,12 +69831,12 @@ fn rewritten_dup_name<Definition0: crate::storage::DefinitionBacking>(
     };
     for (i, c) in new_def.columns().iter().enumerate() {
         if c.unique && matches_key(&[i as u16], false)? {
-            return Ok(Some(auto_key_name(
-                new_def,
-                &[i as u16],
-                if c.primary { "pkey" } else { "key" },
-                !c.primary,
-            )?));
+            return new_def.column_key_name(i).map(Some).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "rewritten inline key has no admitted name"
+                )
+            });
         }
     }
     for uk in new_def.uniques() {
@@ -70922,7 +70934,10 @@ fn alter_table_inheritance(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.reserve_table_catalog_identities(&mut updated) {
+    if let Err(error) = storage
+        .prepare_table_key_names(child_target, &mut updated, &mapping)
+        .and_then(|()| storage.reserve_table_catalog_identities(&mut updated))
+    {
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -71207,7 +71222,9 @@ fn alter_partition_attachment(
             crate::storage::PartitionStrategy::Range | crate::storage::PartitionStrategy::List => {
                 match child_def.partition.detached_bound {
                     Some(constraint) => Some(constraint.name),
-                    None => match detached_partition_constraint_name(&child_def, scheme) {
+                    None => match detached_partition_constraint_name(
+                        storage, &child_def, scheme, txn.txid,
+                    ) {
                         Ok(name) => Some(name),
                         Err(error) => return sql_fail(error),
                     },
@@ -71369,7 +71386,10 @@ fn alter_partition_attachment(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
+    if let Err(error) = storage
+        .prepare_table_key_names(child_target, &mut new_def, &mapping)
+        .and_then(|()| storage.reserve_table_catalog_identities(&mut new_def))
+    {
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
@@ -71436,7 +71456,10 @@ fn alter_partition_attachment(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = storage.reserve_table_catalog_identities(&mut dependent) {
+                if let Err(error) = storage
+                    .prepare_table_key_names(dependent_target, &mut dependent, &mapping)
+                    .and_then(|()| storage.reserve_table_catalog_identities(&mut dependent))
+                {
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
@@ -71507,14 +71530,16 @@ fn alter_partition_attachment(
 }
 
 fn detached_partition_constraint_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
     child: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
+    transaction: u32,
 ) -> Result<SqlName, SqlError> {
     let mut referenced = ColumnSet::EMPTY;
     for key in &scheme.keys[..usize::from(scheme.n_keys)] {
         referenced.insert(usize::from(*key));
     }
-    ddl::auto_check_name(child, referenced)
+    ddl::auto_check_name(storage, child, referenced, transaction)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -72552,7 +72577,10 @@ fn alter_table_relation(
             ) {
                 return sql_fail(error);
             }
-            if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
+            if let Err(error) = storage
+                .prepare_table_key_names(edit_target, &mut new_def, &mapping)
+                .and_then(|()| storage.reserve_table_catalog_identities(&mut new_def))
+            {
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
@@ -72726,7 +72754,19 @@ fn alter_table_relation(
     let mut n_column_renames = 0usize;
     let mut replica_identity_selection: Option<Option<usize>> = None;
 
+    let mut column_mapping = [None; MAX_COLUMNS];
     for action in statement.actions {
+        column_mapping.fill(None);
+        for (column, origin) in source[..new_def.n_columns].iter().enumerate() {
+            if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } = *origin {
+                column_mapping[original] = Some(new_def.columns[column].name);
+            }
+        }
+        if let Err(error) =
+            storage.prepare_table_key_names(edit_target, &mut new_def, &column_mapping)
+        {
+            return sql_fail(error);
+        }
         match action {
             AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
             AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => {
@@ -72860,9 +72900,6 @@ fn alter_table_relation(
                         "relation \"{}\" already exists",
                         new_name
                     ));
-                }
-                if let Err(error) = materialize_flag_key_names(&mut new_def) {
-                    return sql_fail(error);
                 }
                 new_def.name = match SqlName::parse(new_name) {
                     Ok(n) => n,
@@ -73049,16 +73086,13 @@ fn alter_table_relation(
                 let mut referenced_keys = [StackStr::<128>::new(); crate::storage::MAX_UNIQUES + 1];
                 let mut referenced_key_count = 0usize;
                 if new_def.columns[i].primary || new_def.columns[i].unique {
-                    referenced_keys[referenced_key_count] = if new_def.columns[i].primary {
-                        stack_format!(128, "{}_pkey", new_def.name.as_str())
-                    } else {
-                        stack_format!(
-                            128,
-                            "{}_{}_key",
-                            new_def.name.as_str(),
-                            new_def.columns[i].name.as_str()
-                        )
+                    let Some(name) = new_def.column_key_name(i) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "dropped inline key has no admitted name"
+                        ));
                     };
+                    referenced_keys[referenced_key_count] = StackStr::from_str(name.as_str());
                     referenced_key_count += 1;
                 }
                 for key in new_def.uniques() {
@@ -74043,7 +74077,7 @@ fn alter_table_relation(
     def.schema(&mut old_schema);
     let old_schema = &old_schema[..def.n_columns];
 
-    let mut column_mapping = [None; MAX_COLUMNS];
+    column_mapping.fill(None);
     let mut wal_column_mapping = [u16::MAX; MAX_COLUMNS];
     for (new_column, source) in source[..new_def.n_columns].iter().enumerate() {
         if let ColSource::Keep(old_column)
@@ -74090,6 +74124,10 @@ fn alter_table_relation(
         {
             return sql_fail(error);
         }
+    }
+    if let Err(error) = storage.prepare_table_key_names(edit_target, &mut new_def, &column_mapping)
+    {
+        return sql_fail(error);
     }
     if let Err(error) =
         crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping)
@@ -74422,7 +74460,10 @@ fn alter_table_relation(
         ) {
             return sql_fail(e);
         }
-        if let Err(error) = storage.reserve_table_catalog_identities(&mut new_def) {
+        if let Err(error) = storage
+            .prepare_table_key_names(edit_target, &mut new_def, &column_mapping)
+            .and_then(|()| storage.reserve_table_catalog_identities(&mut new_def))
+        {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
@@ -74940,7 +74981,10 @@ fn alter_table_relation(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Err(error) = storage.reserve_table_catalog_identities(&mut dependent) {
+                    if let Err(error) = storage
+                        .prepare_table_key_names(dependent_target, &mut dependent, &mapping)
+                        .and_then(|()| storage.reserve_table_catalog_identities(&mut dependent))
+                    {
                         return sql_fail(error);
                     }
                     let lsn = storage.bump_lsn();
@@ -75351,7 +75395,10 @@ fn alter_table_replica_identity(
         ) {
             return sql_fail(error);
         }
-        if let Err(error) = storage.reserve_table_catalog_identities(&mut next) {
+        if let Err(error) = storage
+            .prepare_table_key_names(edit_target, &mut next, &mapping)
+            .and_then(|()| storage.reserve_table_catalog_identities(&mut next))
+        {
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
@@ -75382,8 +75429,8 @@ fn alter_table_replica_identity(
     sql_ok()
 }
 
-/// Inline single-column keys use compact column flags until an operation must
-/// preserve their catalog identity independently of the table name.
+/// Explicit backing relations attach to named keys. Keep both existing
+/// identities and the admitted name when materializing a compact column key.
 fn materialize_flag_key_names(def: &mut TableDefBuilder) -> Result<(), SqlError> {
     for column in 0..def.n_columns {
         let metadata = def.columns[column];
@@ -75392,9 +75439,15 @@ fn materialize_flag_key_names(def: &mut TableDefBuilder) -> Result<(), SqlError>
         }
         let mut indices = [0u16; crate::storage::MAX_INDEX_COLS];
         indices[0] = column as u16;
+        let name = def.column_key_name(column).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "inline key normalization has no admitted name"
+            )
+        })?;
         crate::sql::exec::ddl::add_unique_key(
             def,
-            None,
+            Some(name.as_str()),
             if metadata.primary { "pkey" } else { "key" },
             &indices,
             1,
@@ -75407,6 +75460,7 @@ fn materialize_flag_key_names(def: &mut TableDefBuilder) -> Result<(), SqlError>
         )?;
         def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(column);
         def.uniques[def.n_uniques - 1].identity = def.take_column_constraint_identity(column);
+        def.take_column_key_name(column);
         def.columns[column].primary = false;
         def.columns[column].unique = false;
     }
@@ -75421,46 +75475,19 @@ fn undefined_column(name: &str) -> SqlError {
     )
 }
 
-/// Renames a single-column UNIQUE/PRIMARY KEY that rides a column flag: when
-/// `from` is the flag's synthesized name (`<table>_pkey` / `<table>_<col>_key`),
-/// clears the flag and adds a named key with `new_name` so the constraint keeps
-/// its new name. Returns whether a flag key matched.
+/// Renames an admitted inline key without changing either catalog lifetime.
 fn rename_flag_key(
     def: &mut TableDefBuilder,
     from: &str,
     new_name: SqlName,
 ) -> Result<bool, SqlError> {
-    for i in 0..def.n_columns {
-        let col = def.columns[i];
-        if !(col.unique || col.primary) {
-            continue;
-        }
-        let synthesized = if col.primary {
-            stack_format!(128, "{}_pkey", def.name.as_str())
-        } else {
-            stack_format!(128, "{}_{}_key", def.name.as_str(), col.name.as_str())
-        };
-        if synthesized.as_str() == from {
-            let was_primary = col.primary;
-            def.columns[i].unique = false;
-            def.columns[i].primary = false;
-            let mut indices = [0u16; crate::storage::MAX_INDEX_COLS];
-            indices[0] = i as u16;
-            crate::sql::exec::ddl::add_unique_key(
-                def,
-                Some(new_name.as_str()),
-                if was_primary { "pkey" } else { "key" },
-                &indices,
-                1,
-                if was_primary {
-                    crate::storage::UniqueKeyKind::Primary
-                } else {
-                    crate::storage::UniqueKeyKind::UniqueNullsDistinct
-                },
-                crate::sql::ast::ConstraintTiming::NotDeferrable,
-            )?;
-            def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(i);
-            def.uniques[def.n_uniques - 1].identity = def.take_column_constraint_identity(i);
+    for column in 0..def.n_columns {
+        if (def.columns[column].primary || def.columns[column].unique)
+            && def
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == from)
+        {
+            def.set_column_key_name(column, new_name)?;
             return Ok(true);
         }
     }

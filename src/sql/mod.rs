@@ -13,6 +13,8 @@ mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
 mod concurrent_index;
+#[cfg(all(test, not(miri)))]
+pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;

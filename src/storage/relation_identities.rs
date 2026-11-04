@@ -134,6 +134,7 @@ impl Storage {
         &self,
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
+        Self::validate_inline_key_names(definition)?;
         self.reserve_constraint_identities(definition)?;
         if !definition.has_toast {
             definition.toast_index_identity = None;
@@ -173,6 +174,7 @@ impl Storage {
         definition: &super::TableDefinition<B>,
         owner_birth: u64,
     ) -> Result<(), SqlError> {
+        Self::validate_inline_key_names(definition)?;
         super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;
         for (position, identity) in definition.table_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
@@ -218,6 +220,12 @@ impl Storage {
             .expect("type catalog lock poisoned");
         let views = self.view_rule_catalog();
         let sequences = self.sequence_catalog();
+        self.validate_restored_key_names(super::RelationNameSources {
+            indexes: &indexes,
+            views: &views.views,
+            sequences: &sequences.definitions,
+            composites: &types.composites,
+        })?;
         for (_, database) in self.databases_visible_to(0) {
             // Inspect one range even when a corrupt manifest claims no reservations.
             let last = saved_sequence.clamp(1, MAX_RELATION_GENERATION);

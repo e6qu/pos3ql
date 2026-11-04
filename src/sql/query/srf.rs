@@ -1427,7 +1427,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     row,
                     hooks,
                     |bound, inputs| {
-                        let count = srf_count(bound, arena, inputs, row, hooks)?;
+                        let count = srf_count(&catalog, bound, arena, inputs, row, hooks)?;
                         let values = arena
                             .alloc_slice_with(count, |_| Datum::Null)
                             .map_err(|_| arena_full())?;
@@ -1685,6 +1685,7 @@ pub(super) fn with_bound_srf_inputs<'a, R: ColumnLookup<'a>, T>(
 
 /// Number of output rows a set-returning call yields for the current source row.
 pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
+    catalog: &super::StorageCatalog<'_, '_, '_, '_>,
     call: &'a Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -1701,7 +1702,7 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         return Ok(1);
     };
     let Some(regex_name) = regex_srf_name(name) else {
-        return srf_count_positional(name, args, arena, params, row, hooks);
+        return srf_count_positional(catalog, name, args, arena, params, row, hooks);
     };
     let mut reordered = [&Expr::Null; 3];
     let args = if argument_names.iter().any(Option::is_some) {
@@ -1721,10 +1722,11 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     } else {
         args
     };
-    srf_count_positional(regex_name, args, arena, params, row, hooks)
+    srf_count_positional(catalog, regex_name, args, arena, params, row, hooks)
 }
 
 fn srf_count_positional<'a, R: ColumnLookup<'a>>(
+    catalog: &super::StorageCatalog<'_, '_, '_, '_>,
     name: &str,
     args: &[&'a Expr<'a>],
     arena: &'a Arena,
@@ -1741,7 +1743,8 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             crate::sql::event_trigger::with_ddl_commands(|rows| {
                 rows.iter()
                     .try_fold(0, |count, command| -> Result<usize, SqlError> {
-                        Ok(count + usize::from(command.object(storage, txid)?.is_some()))
+                        Ok(count
+                            + usize::from(command.object(catalog.storage, catalog.txid)?.is_some()))
                     })
             })?
         } else {
@@ -4436,7 +4439,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     columns,
                     &argument_hooks,
                     |bound, inputs| {
-                        let count = srf_count(bound, arena, inputs, columns, &argument_hooks)?;
+                        let count = srf_count(
+                            &argument_catalog,
+                            bound,
+                            arena,
+                            inputs,
+                            columns,
+                            &argument_hooks,
+                        )?;
                         let rows = arena
                             .alloc_slice_with(count, |_| &[][..])
                             .map_err(|_| arena_full())?;

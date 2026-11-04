@@ -16,7 +16,7 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, Storage, ValidationRead, rowenc};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
 
@@ -313,37 +313,12 @@ pub(crate) fn check_domain_constraints(
     Ok(())
 }
 
-/// Names a uniqueness constraint for its 23505 message: a single-column flag
-/// synthesizes PostgreSQL's `<table>_pkey` / `<table>_<column>_key`, while a
-/// table-level key or index carries its stored name.
-pub(crate) enum ConstraintName<'a> {
-    PrimaryFlag,
-    UniqueFlag(&'a str),
-    Named(&'a str),
-}
-
-fn unique_violation(
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
-) -> SqlError {
-    match name {
-        ConstraintName::PrimaryFlag => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}_pkey\"",
-            def.name.as_str()
-        ),
-        ConstraintName::UniqueFlag(column) => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}_{}_key\"",
-            def.name.as_str(),
-            column
-        ),
-        ConstraintName::Named(constraint) => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}\"",
-            constraint
-        ),
-    }
+fn unique_violation(name: SqlName) -> SqlError {
+    sql_err!(
+        sqlstate::UNIQUE_VIOLATION,
+        "duplicate key value violates unique constraint \"{}\"",
+        name.as_str()
+    )
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -653,7 +628,7 @@ fn enforce_expression_index_uniqueness<'a>(
     collations: &[crate::sql::ast::Collation],
     operator_classes: &[crate::storage::IndexOperatorClass],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     predicate: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -704,7 +679,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -731,7 +706,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(def, name))
+        Err(unique_violation(name))
     })?;
     Ok(())
 }
@@ -755,7 +730,7 @@ fn enforce_key_uniqueness(
     txid: u32,
     columns: &[u16],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
@@ -873,7 +848,7 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(def, name)),
+                    Ok(true) => result = Err(unique_violation(name)),
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -929,7 +904,7 @@ fn committed_scan_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
+    name: SqlName,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -957,7 +932,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -980,7 +955,7 @@ fn pending_scan_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
+    name: SqlName,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1013,7 +988,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(def, name));
+            return Err(unique_violation(name));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1036,7 +1011,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     txid: u32,
     columns: &[u16],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -1080,7 +1055,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1107,7 +1082,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(def, name))
+        Err(unique_violation(name))
     })?;
     Ok(())
 }
@@ -1161,11 +1136,12 @@ pub fn check_unique(
         if !column.unique {
             continue;
         }
-        let name = if column.primary {
-            ConstraintName::PrimaryFlag
-        } else {
-            ConstraintName::UniqueFlag(column.name.as_str())
-        };
+        let name = def.column_key_name(i).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "inline unique key has no admitted name"
+            )
+        })?;
         enforce_key_uniqueness(
             storage,
             table_index,
@@ -1176,7 +1152,7 @@ pub fn check_unique(
             txid,
             &[i as u16],
             false,
-            &name,
+            name,
             UniqueKeySource::Cache,
         )?;
     }
@@ -1445,11 +1421,12 @@ pub(crate) fn check_reindex_constraints(
         {
             continue;
         }
-        let name = if metadata.primary {
-            ConstraintName::PrimaryFlag
-        } else {
-            ConstraintName::UniqueFlag(metadata.name.as_str())
-        };
+        let name = def.column_key_name(column).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "inline unique key has no admitted name"
+            )
+        })?;
         enforce_key_uniqueness(
             storage,
             table_index,
@@ -1460,7 +1437,7 @@ pub(crate) fn check_reindex_constraints(
             txid,
             &[column as u16],
             false,
-            &name,
+            name,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1481,7 +1458,7 @@ pub(crate) fn check_reindex_constraints(
             txid,
             key.columns(),
             key.kind.nulls_not_distinct(),
-            &ConstraintName::Named(key.name.as_str()),
+            key.name,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1555,7 +1532,7 @@ pub fn check_unique_indexes(
         }
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
-        let name = ConstraintName::Named(index_name.as_str());
+        let name = index_name;
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
             if let Some(source) = source {
@@ -1611,7 +1588,7 @@ pub fn check_unique_indexes(
                 &index.collations[..index.n_cols],
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
-                &name,
+                name,
                 predicate,
                 arena,
             )?;
@@ -1629,7 +1606,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 index.nulls_not_distinct,
-                &name,
+                name,
                 expression,
                 arena,
             )?;
@@ -1644,7 +1621,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 index.nulls_not_distinct,
-                &name,
+                name,
                 UniqueKeySource::Cache,
             )?;
         }
@@ -2112,7 +2089,7 @@ fn check_or_defer_unique_keys(
             txid,
             key.columns(),
             key.kind.nulls_not_distinct(),
-            &ConstraintName::Named(key.name.as_str()),
+            key.name,
             UniqueKeySource::Cache,
         )?;
     }
@@ -2420,7 +2397,7 @@ pub(crate) fn validate_constraint_obligation(
                     txid,
                     key.columns(),
                     key.kind.nulls_not_distinct(),
-                    &ConstraintName::Named(key.name.as_str()),
+                    key.name,
                     UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
@@ -2682,20 +2659,12 @@ fn named_constraint_timing(
     {
         return Some(crate::storage::ConstraintTiming::NotDeferrable);
     }
-    for column in definition.columns() {
-        let synthesized = if column.primary {
-            crate::stack_format!(128, "{}_pkey", definition.name.as_str())
-        } else if column.unique {
-            crate::stack_format!(
-                128,
-                "{}_{}_key",
-                definition.name.as_str(),
-                column.name.as_str()
-            )
-        } else {
-            continue;
-        };
-        if synthesized.as_str() == name {
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if (metadata.primary || metadata.unique)
+            && definition
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
             return Some(crate::storage::ConstraintTiming::NotDeferrable);
         }
     }

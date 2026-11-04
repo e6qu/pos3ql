@@ -4744,7 +4744,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
         outer,
         &hooks,
         |bound, inputs| {
-            let count = super::srf::srf_count(bound, arena, inputs, outer, &hooks)?;
+            let count = super::srf::srf_count(&catalog, bound, arena, inputs, outer, &hooks)?;
             for index in 1..=count {
                 let mark = arena.mark();
                 let row_hooks = EvalHooks {

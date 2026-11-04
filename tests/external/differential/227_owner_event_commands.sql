@@ -1,0 +1,26 @@
+CREATE ROLE owner_event_target;
+CREATE TABLE owner_event_rows(id integer PRIMARY KEY, payload text);
+CREATE INDEX owner_event_payload ON owner_event_rows(payload);
+INSERT INTO owner_event_rows VALUES(1,'retained');
+CREATE MATERIALIZED VIEW owner_event_saved AS SELECT id,payload FROM owner_event_rows;
+CREATE INDEX owner_event_saved_payload ON owner_event_saved(payload);
+CREATE TABLE owner_event_audit(kind text, identity text, tag text);
+CREATE FUNCTION capture_owner_commands() RETURNS event_trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO owner_event_audit SELECT object_type,object_identity,command_tag FROM pg_event_trigger_ddl_commands(); RETURN; END';
+CREATE EVENT TRIGGER owner_command_end ON ddl_command_end WHEN TAG IN ('ALTER TABLE','ALTER MATERIALIZED VIEW') EXECUTE FUNCTION capture_owner_commands();
+ALTER TABLE owner_event_rows OWNER TO owner_event_target;
+SELECT 'table-changed',count(*),min(kind),min(identity),min(tag) FROM owner_event_audit;
+TRUNCATE owner_event_audit;
+ALTER TABLE owner_event_rows OWNER TO owner_event_target;
+SELECT 'table-unchanged',count(*),min(kind),min(identity),min(tag) FROM owner_event_audit;
+TRUNCATE owner_event_audit;
+ALTER MATERIALIZED VIEW owner_event_saved OWNER TO owner_event_target;
+SELECT 'view-changed',count(*),min(kind),min(identity),min(tag) FROM owner_event_audit;
+TRUNCATE owner_event_audit;
+ALTER MATERIALIZED VIEW owner_event_saved OWNER TO owner_event_target;
+SELECT 'view-unchanged',count(*),min(kind),min(identity),min(tag) FROM owner_event_audit;
+DROP EVENT TRIGGER owner_command_end;
+DROP FUNCTION capture_owner_commands();
+DROP MATERIALIZED VIEW owner_event_saved;
+DROP TABLE owner_event_rows,owner_event_audit;
+DROP ROLE owner_event_target;

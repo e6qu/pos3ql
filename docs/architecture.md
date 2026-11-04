@@ -365,6 +365,13 @@ renames an earlier index while a later table waits, the hook reports its current
 name. If that connection drops the index, the hook omits it. An index that later
 reuses its catalog slot does not appear in that earlier event.
 
+Keys retain the name chosen at creation. For example, renaming `orders` to
+`archived_orders` preserves `orders_pkey`; rebuilding it also preserves that
+name. The saved name follows the column's stable number through column removal
+and recovery. Changing a table or materialized view's owner also changes its
+indexes' owner in the same transaction, including replacement and large-value
+indexes. Rolling back restores those owners together.
+
 These waits retain their source, selected table lifetime and bounded metadata
 leases across commits. Cancellation can leave a committed invalid replacement
 or a retired index, as in PostgreSQL; rollback cannot erase an earlier committed

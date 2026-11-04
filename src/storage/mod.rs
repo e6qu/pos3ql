@@ -66,12 +66,16 @@ pub(crate) use catalog_sources::{
     SessionIdentity, SessionRole,
 };
 mod constraint_identities;
+mod inline_key_names;
+mod key_name_admission;
+mod restored_key_names;
 #[cfg(test)]
 pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
 pub(crate) use constraint_identities::{
     ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
     validate_constraint_lifetimes,
 };
+pub(crate) use key_name_admission::{GeneratedNameClass, RelationNameSources};
 mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
@@ -1813,6 +1817,19 @@ impl UniqueKeyKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlineKeyName {
+    pub(crate) attribute: u16,
+    pub(crate) name: SqlName,
+}
+
+impl InlineKeyName {
+    pub(crate) const EMPTY: Self = Self {
+        attribute: 0,
+        name: SqlName::EMPTY,
+    };
+}
+
 /// Named, multi-column, deferred or NULLS NOT DISTINCT key constraint.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
@@ -2028,6 +2045,8 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub(crate) inline_index_identities: B::Slice<Option<RelationIdentity>, MAX_RELATION_COLUMNS>,
     pub(crate) inline_constraint_identities:
         B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
+    pub(crate) inline_key_names: B::Slice<InlineKeyName, MAX_COLUMNS>,
+    pub(crate) n_inline_key_names: usize,
     pub uniques: B::Slice<UniqueKey, MAX_UNIQUES>,
     pub n_uniques: usize,
     pub checks: B::Slice<CheckConstraint, MAX_CHECKS>,
@@ -2438,6 +2457,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             tablespace: self.tablespace,
             n_columns: self.n_columns,
             not_null_name_edits: self.not_null_name_edits,
+            n_inline_key_names: self.n_inline_key_names,
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
@@ -2458,6 +2478,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
                 [..usize::from(self.attributes.count)],
             inline_constraint_identities: &self.inline_constraint_identities.as_ref()
                 [..usize::from(self.attributes.count)],
+            inline_key_names: &self.inline_key_names.as_ref()[..self.n_inline_key_names],
             uniques: &self.uniques.as_ref()[..self.n_uniques],
             checks: &self.checks.as_ref()[..self.n_checks],
             fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
@@ -2481,6 +2502,41 @@ impl<B: DefinitionBacking> TableDefinition<B> {
 
     pub fn columns(&self) -> &[ColumnMeta] {
         &self.columns.as_ref()[..self.n_columns]
+    }
+
+    pub(crate) fn inline_key_names(&self) -> &[InlineKeyName] {
+        &self.inline_key_names.as_ref()[..self.n_inline_key_names]
+    }
+
+    pub(crate) fn column_key_name(&self, column: usize) -> Option<SqlName> {
+        let attribute = self.attributes.number(column)?;
+        self.inline_key_names()
+            .iter()
+            .find(|key| key.attribute == attribute)
+            .map(|key| key.name)
+    }
+
+    pub(crate) fn backing_index_names(
+        &self,
+    ) -> impl Iterator<Item = (SqlName, Option<RelationIdentity>)> + '_ {
+        self.columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary || column.unique)
+            .filter_map(|(column, _)| {
+                self.column_key_name(column)
+                    .map(|name| (name, self.column_index_identity(column)))
+            })
+            .chain(
+                self.uniques()
+                    .iter()
+                    .map(|key| (key.name, key.index_identity)),
+            )
+            .chain(
+                self.exclusions()
+                    .iter()
+                    .map(|key| (key.name, key.index_identity)),
+            )
     }
 
     pub fn uniques(&self) -> &[UniqueKey] {
@@ -2513,6 +2569,77 @@ impl<B: DefinitionBacking> TableDefinition<B> {
 }
 
 impl TableDefBuilder {
+    pub(crate) fn set_column_key_name(
+        &mut self,
+        column: usize,
+        name: SqlName,
+    ) -> Result<(), SqlError> {
+        if self.n_inline_key_names > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid inline key name count"
+            ));
+        }
+        let attribute = self.attributes.number(column).ok_or_else(|| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "inline key has no stable column number"
+            )
+        })?;
+        if let Some(key) = self.inline_key_names[..self.n_inline_key_names]
+            .iter_mut()
+            .find(|key| key.attribute == attribute)
+        {
+            key.name = name;
+            return Ok(());
+        }
+        if self.n_inline_key_names == MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "inline key names exceed the column reservation"
+            ));
+        }
+        self.inline_key_names[self.n_inline_key_names] = InlineKeyName { attribute, name };
+        self.n_inline_key_names += 1;
+        Ok(())
+    }
+
+    pub(crate) fn take_column_key_name(&mut self, column: usize) -> Option<SqlName> {
+        let attribute = self.attributes.number(column)?;
+        let position = self.inline_key_names[..self.n_inline_key_names]
+            .iter()
+            .position(|key| key.attribute == attribute)?;
+        let name = self.inline_key_names[position].name;
+        self.inline_key_names
+            .copy_within(position + 1..self.n_inline_key_names, position);
+        self.n_inline_key_names -= 1;
+        self.inline_key_names[self.n_inline_key_names] = InlineKeyName::EMPTY;
+        Some(name)
+    }
+
+    pub(crate) fn retain_active_inline_key_names(&mut self) -> Result<(), SqlError> {
+        if self.n_inline_key_names > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "invalid inline key name count"
+            ));
+        }
+        let mut count = 0;
+        for position in 0..self.n_inline_key_names {
+            let key = self.inline_key_names[position];
+            if self
+                .attribute_column(key.attribute)
+                .is_some_and(|column| self.columns[column].primary || self.columns[column].unique)
+            {
+                self.inline_key_names[count] = key;
+                count += 1;
+            }
+        }
+        self.inline_key_names[count..self.n_inline_key_names].fill(InlineKeyName::EMPTY);
+        self.n_inline_key_names = count;
+        Ok(())
+    }
+
     /// Copies an admitted definition into bounded edit or codec scratch.
     pub(crate) fn from_definition<B: DefinitionBacking>(source: &TableDefinition<B>) -> Self {
         let mut result = Self::empty();
@@ -2528,6 +2655,7 @@ impl TableDefBuilder {
         result.tablespace = source.tablespace;
         result.n_columns = source.n_columns;
         result.not_null_name_edits = source.not_null_name_edits;
+        result.n_inline_key_names = source.n_inline_key_names;
         result.n_uniques = source.n_uniques;
         result.n_checks = source.n_checks;
         result.n_fkeys = source.n_fkeys;
@@ -2550,6 +2678,8 @@ impl TableDefBuilder {
             .copy_from_slice(&source.inline_index_identities.as_ref()[..attribute_count]);
         result.inline_constraint_identities[..attribute_count]
             .copy_from_slice(&source.inline_constraint_identities.as_ref()[..attribute_count]);
+        result.inline_key_names[..source.n_inline_key_names]
+            .copy_from_slice(source.inline_key_names());
         result.uniques[..source.n_uniques]
             .copy_from_slice(&source.uniques.as_ref()[..source.n_uniques]);
         result.checks[..source.n_checks]
@@ -2570,6 +2700,7 @@ impl TableDefBuilder {
         let attribute_count = usize::from(self.attributes.count);
         if self.n_columns > MAX_COLUMNS
             || attribute_count > MAX_RELATION_COLUMNS
+            || self.n_inline_key_names > MAX_COLUMNS
             || self.n_uniques > MAX_UNIQUES
             || self.n_checks > MAX_CHECKS
             || self.n_fkeys > MAX_FKEYS
@@ -2595,6 +2726,7 @@ impl TableDefBuilder {
             tablespace: self.tablespace,
             n_columns: self.n_columns,
             not_null_name_edits: self.not_null_name_edits,
+            n_inline_key_names: self.n_inline_key_names,
             n_uniques: self.n_uniques,
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
@@ -2621,6 +2753,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             inline_constraint_identities: pool
                 .copy_slice(&self.inline_constraint_identities[..attribute_count])
+                .map_err(exhausted)?,
+            inline_key_names: pool
+                .copy_slice(&self.inline_key_names[..self.n_inline_key_names])
                 .map_err(exhausted)?,
             uniques: pool
                 .copy_slice(&self.uniques[..self.n_uniques])
@@ -2664,6 +2799,8 @@ impl TableDefBuilder {
             attributes: column_attributes::ColumnAttributes::<InlineDefinition>::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
             inline_constraint_identities: [None; MAX_RELATION_COLUMNS],
+            inline_key_names: [InlineKeyName::EMPTY; MAX_COLUMNS],
+            n_inline_key_names: 0,
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
             checks: [CheckConstraint::EMPTY; MAX_CHECKS],
@@ -2705,6 +2842,8 @@ impl TableDef {
             attributes: column_attributes::ColumnAttributes::<StoredDefinition>::EMPTY,
             inline_index_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             inline_constraint_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            inline_key_names: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_inline_key_names: 0,
             uniques: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_uniques: 0,
             checks: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -2745,6 +2884,8 @@ impl TableDefView<'_> {
             attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
             inline_index_identities: &[],
             inline_constraint_identities: &[],
+            inline_key_names: &[],
+            n_inline_key_names: 0,
             uniques: &[],
             n_uniques: 0,
             checks: &[],
@@ -32898,7 +33039,9 @@ impl Storage {
         if let Some(kind) = self.non_index_relation_kind_in(schema, name, txid) {
             return Some(kind);
         }
-        if self.index_slot(schema, name, txid).is_some() {
+        if self.index_slot(schema, name, txid).is_some()
+            || self.implicit_index_name_visible(schema, name, txid)
+        {
             return Some(StoredRelKind::Index);
         }
         None
@@ -39729,7 +39872,7 @@ impl Storage {
     pub(crate) fn write_table_def(
         &self,
         target: TableDefinitionTarget,
-        def: TableDefBuilder,
+        mut def: TableDefBuilder,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
         invalidated_statistics: ColumnSet,
@@ -39740,6 +39883,11 @@ impl Storage {
                 "table definition source belongs to different storage"
             ));
         }
+        let _names = self
+            .table_creation
+            .lock()
+            .expect("table creation lock poisoned");
+        self.prepare_selected_key_names(target, &mut def, column_mapping)?;
         table_edits::TableDefinitionEdit::new(self, target.table()).stage(
             target,
             def,
@@ -48644,6 +48792,18 @@ impl Storage {
                 name.as_str()
             ));
         }
+        if self.implicit_index_name_taken(
+            image.schema_for(txid),
+            name,
+            txid,
+            RelationIdentity::parse(image.created_at),
+        )? {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
+        }
         let mut comments = self.comment_catalog();
         let mut catalog = self.index_catalog();
         let index = catalog[slot];
@@ -49094,6 +49254,18 @@ impl Storage {
             .non_index_relation_kind_in(def.schema.as_str(), def.name.as_str(), txid)
             .is_some()
         {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                def.name.as_str()
+            ));
+        }
+        if self.implicit_index_name_taken(
+            def.schema,
+            def.name,
+            txid,
+            RelationIdentity::parse(def.created_at),
+        )? {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",

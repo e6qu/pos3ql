@@ -17,6 +17,7 @@ mod cursor_execution;
 mod foreign_parent_admission;
 mod geometric_casts;
 mod geometry_assignments;
+mod index_parent_ownership;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;

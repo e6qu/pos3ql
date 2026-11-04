@@ -61,6 +61,18 @@ pub(super) fn allocate(
             drop(names);
             return Err(storage.catalog_ddl_wait_error(txid, other, def.name.as_str()));
         }
+        if matches!(allocation, super::CatalogAllocation::New) {
+            if storage.implicit_index_name_taken(def.schema, def.name, transaction, None)? {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    def.name.as_str()
+                ));
+            }
+            def.inline_key_names.fill(super::InlineKeyName::EMPTY);
+            def.n_inline_key_names = 0;
+            storage.prepare_inline_key_names(&mut def, transaction, None)?;
+        }
         let (slot, lifecycle) = match allocation {
             super::CatalogAllocation::New => {
                 let Some((slot, lifecycle)) = storage

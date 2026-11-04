@@ -162,8 +162,10 @@ intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.
 Verify one final end hook reads current names and omits an earlier index dropped
 while a later table waits, including reuse of the released catalog slot.
-Choose generated key names once at admission, including legal long identifiers
-and collisions with another relation; retain them through rename and recovery.
+Verify stored generated key names with legal long identifiers, schema collisions
+and pending transactions. Index names reserve space before commit; another
+transaction's pending CHECK name does not. Retain names through rename and
+recovery, including prepared changes that replace an earlier relation.
 Qualify all four workflows on the finished revision; a source check or a
 PostgreSQL reference probe alone does not establish those runtime guarantees.
 

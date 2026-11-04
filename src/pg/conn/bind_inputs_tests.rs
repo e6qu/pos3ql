@@ -1969,7 +1969,7 @@ fn concurrent_index_build_waits_for_earlier_writers_and_keeps_published_failures
 #[test]
 #[cfg(not(miri))]
 fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart() {
-    use crate::sql::concurrent_index::CommitPhase;
+    use crate::sql::IndexCommitPhaseForTests as CommitPhase;
     for stop in [
         None,
         Some(CommitPhase::ReindexRegistered),
@@ -2388,7 +2388,7 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
 #[test]
 #[cfg(not(miri))]
 fn concurrent_reindex_keeps_old_reader_lifetimes_until_their_locks_are_released() {
-    use crate::sql::concurrent_index::{CommitPhase, Phase as IndexPhase};
+    use crate::sql::IndexCommitPhaseForTests as CommitPhase;
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -2499,10 +2499,6 @@ fn concurrent_reindex_keeps_old_reader_lifetimes_until_their_locks_are_released(
         ));
         if mode == crate::config::TransactionMode::Mvcc {
             assert_eq!(
-                builder.txn.concurrent_index.as_ref().unwrap().phase,
-                IndexPhase::ReindexDead
-            );
-            assert_eq!(
                 first_row(&query(
                     &mut observer,
                     &mut engine,
@@ -2512,7 +2508,14 @@ fn concurrent_reindex_keeps_old_reader_lifetimes_until_their_locks_are_released(
                 "f|t|t"
             );
         } else {
-            assert!(builder.txn.concurrent_index.is_none());
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT count(*) FROM pg_class WHERE relname='held_reindex_idx_ccnew'"
+                )),
+                "0"
+            );
             assert_eq!(
                 first_row(&query(
                     &mut observer,

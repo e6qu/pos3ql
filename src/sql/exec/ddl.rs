@@ -857,7 +857,7 @@ pub(super) fn attach_constraints(
                 }
                 let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
-                    None => auto_check_name(def, referenced_cols)?,
+                    None => auto_check_name(storage, def, referenced_cols, txid)?,
                 };
                 if constraint_name_taken(def, constraint_name.as_str()) {
                     return Err(sql_err!(
@@ -1011,91 +1011,77 @@ pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
     include_cols: bool,
 ) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
-    let mut nm = crate::util::StackStr::<64>::new();
-    let _ = write!(nm, "{}", def.name.as_str());
+    let mut addition = StackStr::<128>::new();
     if include_cols {
-        for &c in columns {
-            let _ = write!(nm, "_{}", def.columns()[c as usize].name.as_str());
+        for &column in columns {
+            if !addition.is_empty() {
+                addition.write_char('_').expect("fixed name writer");
+            }
+            addition
+                .write_str(def.columns()[usize::from(column)].name.as_str())
+                .expect("fixed name writer");
+            if addition.len() >= 64 {
+                break;
+            }
         }
     }
-    let _ = write!(nm, "_{}", suffix);
-    if nm.is_truncated() {
+    if addition.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "generated constraint name is too long"
+            "index name columns exceed their fixed reservation"
         ));
     }
-    SqlName::parse(nm.as_str())
+    crate::storage::constraint_names::generated(
+        def.name.as_str(),
+        (!addition.is_empty()).then_some(addition.as_str()),
+        suffix,
+    )
 }
 
-/// PostgreSQL's auto-generated CHECK name: `<table>_<column>_check` when the
-/// predicate references exactly one column, `<table>_check` when it references
-/// zero or several — with the smallest numeric suffix (`_check1`, `_check2`, …)
-/// that avoids colliding with a constraint the table already carries.
 pub(super) fn auto_check_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
     def: &crate::storage::TableDefinition<Definition0>,
     referenced_cols: ColumnSet,
+    transaction: u32,
 ) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
-    let mut base = crate::util::StackStr::<64>::new();
-    let _ = write!(base, "{}", def.name.as_str());
-    if referenced_cols.count_ones() == 1 {
-        let column = referenced_cols.first().expect("one referenced column");
-        let _ = write!(base, "_{}", def.columns()[column].name.as_str());
-    }
-    let _ = write!(base, "_check");
-    if base.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "generated constraint name is too long"
-        ));
-    }
-    disambiguate_constraint_name(def, base.as_str())
-}
-
-/// Appends the smallest numeric suffix (none, then 1, 2, …) that makes `base`
-/// unique among the table's existing constraint names — PostgreSQL's
-/// `ChooseConstraintName`. Constraint names are unique per table, so this
-/// searches the checks, keys, foreign keys, and the single-column key names
-/// synthesized from column flags.
-fn disambiguate_constraint_name<Definition0: crate::storage::DefinitionBacking>(
-    def: &crate::storage::TableDefinition<Definition0>,
-    base: &str,
-) -> Result<SqlName, SqlError> {
-    use core::fmt::Write as _;
-    if !constraint_name_taken(def, base) {
-        return SqlName::parse(base);
-    }
-    // The table's constraint arrays are all bounded (a few each), so a free
-    // suffix is found almost immediately; the ceiling is just a loud backstop.
-    for suffix in 1u32..=u16::MAX as u32 {
-        let mut candidate = crate::util::StackStr::<64>::new();
-        let _ = write!(candidate, "{}{}", base, suffix);
-        if candidate.is_truncated() {
-            return Err(sql_err!(
+    let column = (referenced_cols.count_ones() == 1)
+        .then(|| def.columns()[referenced_cols.first().expect("one referenced column")].name);
+    let exclude = storage.find_visible(def.schema.as_str(), def.name.as_str(), transaction);
+    let mut suffix = 0u32;
+    loop {
+        let mut label = StackStr::<32>::from_str("check");
+        if suffix != 0 {
+            write!(label, "{suffix}").expect("u32 check suffix fits");
+        }
+        let name = crate::storage::constraint_names::generated(
+            def.name.as_str(),
+            column.as_ref().map(SqlName::as_str),
+            label.as_str(),
+        )?;
+        if !storage.generated_name_taken(
+            def,
+            name,
+            transaction,
+            exclude,
+            crate::storage::GeneratedNameClass::Constraint,
+        ) {
+            return Ok(name);
+        }
+        suffix = suffix.checked_add(1).ok_or_else(|| {
+            sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "generated constraint name is too long"
-            ));
-        }
-        if !constraint_name_taken(def, candidate.as_str()) {
-            return SqlName::parse(candidate.as_str());
-        }
+                "generated CHECK constraint names are exhausted"
+            )
+        })?;
     }
-    Err(sql_err!(
-        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "could not find a free constraint name for \"{}\"",
-        base
-    ))
 }
 
-/// Whether `name` is already the name of any constraint on `def`: a stored
-/// CHECK, unique key, or foreign key, or one of the names synthesized for the
-/// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
+/// Whether the draft already contains a constraint with this admitted name.
 pub(super) fn constraint_name_taken<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     name: &str,
 ) -> bool {
-    use core::fmt::Write as _;
     if def.checks.as_ref()[..def.n_checks]
         .iter()
         .any(|c| c.name.as_str() == name)
@@ -1115,16 +1101,12 @@ pub(super) fn constraint_name_taken<Definition0: crate::storage::DefinitionBacki
     {
         return true;
     }
-    for c in def.columns() {
-        let mut synthesized = crate::util::StackStr::<64>::new();
-        if c.primary {
-            let _ = write!(synthesized, "{}_pkey", def.name.as_str());
-        } else if c.unique {
-            let _ = write!(synthesized, "{}_{}_key", def.name.as_str(), c.name.as_str());
-        } else {
-            continue;
-        }
-        if !synthesized.is_truncated() && synthesized.as_str() == name {
+    for (column, metadata) in def.columns().iter().enumerate() {
+        if (metadata.primary || metadata.unique)
+            && def
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
             return true;
         }
     }
@@ -1397,14 +1379,12 @@ pub(super) fn references_named_key<Definition0: crate::storage::DefinitionBackin
     columns: &[u16],
 ) -> bool {
     if columns.len() == 1 {
-        let c = &def.columns()[columns[0] as usize];
-        if c.primary {
-            return crate::stack_format!(96, "{}_pkey", def.name.as_str()).as_str() == name;
-        }
-        if c.unique {
-            return crate::stack_format!(128, "{}_{}_key", def.name.as_str(), c.name.as_str())
-                .as_str()
-                == name;
+        let column = usize::from(columns[0]);
+        let metadata = &def.columns()[column];
+        if metadata.primary || metadata.unique {
+            return def
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name);
         }
     }
     def.uniques()

@@ -217,3 +217,15 @@ index relation, which already reserves its name. PostgreSQL's
 uses the catalog snapshot. Exact SQL, raw results, commands and binary hashes
 are retained. Extract it and run `python3 verify-pending-key-namespace.py .`
 to verify 10 hashes and 12 observed name rows.
+
+[generated-key-names-reference.zip](generated-key-names-reference.zip), SHA256
+`ffc16514e51dad3a16615e6cdf6083f45e95c2dc25d5ab9a42f2733fa38fe127`,
+records fixture `228_generated_key_names.sql` on PostgreSQL 18.6. Generated
+multi-column unique and exclusion names avoid existing relations and schema
+constraint names. Foreign-key names avoid constraint names while ignoring
+unrelated relation names. Copied CHECK names remain unchanged; copied and
+partitioned unique keys choose free names. Long ASCII and Unicode names stay
+within PostgreSQL's byte limit and survive concurrent index rebuilding.
+The fixture was uncommitted at source revision `8f597543`. Exact SQL, raw output,
+commands, binary hashes and provenance are retained. Extract it and run
+`python3 verify-generated-key-names.py .` to verify 10 hashes and 13 output rows.

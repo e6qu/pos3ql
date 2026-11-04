@@ -431,7 +431,7 @@ mod tests {
         definition
     }
 
-    fn replace(storage: &Storage, table: usize, definition: &TableDefBuilder) {
+    fn replace(storage: &mut Storage, table: usize, definition: &TableDefBuilder) {
         let revision = storage.reserve_table_definition_revision().unwrap();
         let saved = definition.freeze(&storage.metadata_pool).unwrap();
         *storage.tables[table].definition_mut(revision) = saved;
@@ -464,7 +464,7 @@ mod tests {
             definition.columns[0].unique = false;
             definition.uniques[0] = key;
             definition.n_uniques = 1;
-            replace(&storage, first, &definition);
+            replace(&mut storage, first, &definition);
             let alias = IndexDef {
                 created_at: key.index_identity.unwrap().created_at(),
                 schema: definition.schema,
@@ -484,7 +484,7 @@ mod tests {
             let original = malformed.column_key_name(0).unwrap();
             for collision in [name, definition.name] {
                 malformed.set_column_key_name(0, collision).unwrap();
-                replace(&storage, second, &malformed);
+                replace(&mut storage, second, &malformed);
                 let sequence = storage.catalog_identity_sequence();
                 assert_eq!(
                     storage
@@ -496,7 +496,7 @@ mod tests {
                 assert_eq!(storage.catalog_identity_sequence(), sequence);
             }
             malformed.set_column_key_name(0, original).unwrap();
-            replace(&storage, second, &malformed);
+            replace(&mut storage, second, &malformed);
             storage
                 .validate_restored_relation_identities(storage.catalog_identity_sequence())
                 .unwrap();
@@ -519,7 +519,7 @@ mod tests {
                 .unwrap();
             let mut restored = TableDefBuilder::from_definition(&storage.table_def(new, 7));
             restored.set_column_key_name(0, name).unwrap();
-            replace(&storage, new, &restored);
+            replace(&mut storage, new, &restored);
             storage
                 .validate_restored_relation_identities(storage.catalog_identity_sequence())
                 .unwrap();

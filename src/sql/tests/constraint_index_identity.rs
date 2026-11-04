@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn generated_multicolumn_and_copied_key_names_follow_the_schema_namespace() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("generated-key-names-{mode:?}"));
+        config.transaction_mode = mode;
+        // The fixture keeps twenty relations, including occupied names, live.
+        config.max_tables = 20;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/228_generated_key_names.sql");
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+        }
+        assert_eq!(
+            rows,
+            [
+                "child|f|child_x_y_fkey|t",
+                "copied|c|source_positive|f",
+                "copied|u|copied_a_b_key1|t",
+                "deferred|u|deferred_v_key1|t",
+                "leaf|u|leaf_x_y_key1|t",
+                "multi|u|multi_x_y_key1|t",
+                "next|f|next_x_y_fkey1|t",
+                "ranges|x|ranges_a_b_excl1|t",
+                "third|f|third_x_y_fkey1|t",
+                "balanced-multi|mmmmmmmmmmmmmmmmmmmmmmmmmmmmm_ccccccccccccccccccccccccccccc_key|63|t",
+                "unicode-multi|éééééééééééééé_界界界界界界界界界_key|60|t",
+                "explicit_key|t",
+                "multi_x_y_key1|t",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn pending_index_and_check_names_follow_their_distinct_catalog_visibility() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

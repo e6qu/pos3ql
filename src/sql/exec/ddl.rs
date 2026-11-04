@@ -727,6 +727,7 @@ pub(super) fn attach_constraints(
     constraints: &[TableConstraint],
     merge_equivalent: bool,
     txid: u32,
+    exclude: Option<usize>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     // A multi-column primary key lives in `uniques`, not on a column flag, so
@@ -756,8 +757,8 @@ pub(super) fn attach_constraints(
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();
                 }
-                // An unnamed single-column key rides the column flag with a
-                // synthesized name; an explicitly named one is a first-class
+                // An unnamed single-column key retains its admitted name on
+                // the compact column flag; an explicitly named key is a first-class
                 // key so DROP / RENAME CONSTRAINT and the violation message all
                 // see the given name (its NOT NULL is already set above).
                 if n == 1 && name.is_none() && !timing.is_deferrable() {
@@ -775,10 +776,21 @@ pub(super) fn attach_constraints(
                             def.name.as_str()
                         ));
                     }
+                    let chosen = match name {
+                        Some(name) => SqlName::parse(name)?,
+                        None => auto_key_name(
+                            storage,
+                            def,
+                            &[],
+                            "pkey",
+                            txid,
+                            exclude,
+                            crate::storage::GeneratedNameClass::IndexConstraint,
+                        )?,
+                    };
                     add_unique_key(
                         def,
-                        *name,
-                        "pkey",
+                        chosen,
                         &indices,
                         n,
                         crate::storage::UniqueKeyKind::Primary,
@@ -831,7 +843,19 @@ pub(super) fn attach_constraints(
                     } else {
                         crate::storage::UniqueKeyKind::UniqueNullsDistinct
                     };
-                    add_unique_key(def, *name, "key", &indices, n, kind, *timing)?;
+                    let chosen = match name {
+                        Some(name) => SqlName::parse(name)?,
+                        None => auto_key_name(
+                            storage,
+                            def,
+                            &indices[..n],
+                            "key",
+                            txid,
+                            exclude,
+                            crate::storage::GeneratedNameClass::IndexConstraint,
+                        )?,
+                    };
+                    add_unique_key(def, chosen, &indices, n, kind, *timing)?;
                 }
             }
             TableConstraint::Check {
@@ -857,7 +881,7 @@ pub(super) fn attach_constraints(
                 }
                 let constraint_name = match name {
                     Some(n) => SqlName::parse(n)?,
-                    None => auto_check_name(storage, def, referenced_cols, txid)?,
+                    None => auto_check_name(storage, def, referenced_cols, txid, exclude)?,
                 };
                 if constraint_name_taken(def, constraint_name.as_str()) {
                     return Err(sql_err!(
@@ -916,6 +940,7 @@ pub(super) fn attach_constraints(
                     *timing,
                     *validation,
                     txid,
+                    exclude,
                     arena,
                 )?;
             }
@@ -953,7 +978,15 @@ pub(super) fn attach_constraints(
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = match name {
                     Some(name) => SqlName::parse(name)?,
-                    None => auto_key_name(def, &indices[..count], "excl", true)?,
+                    None => auto_key_name(
+                        storage,
+                        def,
+                        &indices[..count],
+                        "excl",
+                        txid,
+                        exclude,
+                        crate::storage::GeneratedNameClass::IndexConstraint,
+                    )?,
                 };
                 if !merge_equivalent && constraint_name_taken(def, exclusion.name.as_str()) {
                     return Err(sql_err!(
@@ -1005,24 +1038,25 @@ pub(super) fn attach_constraints(
 /// PostgreSQL's auto-generated constraint name: `<table>_pkey` for a primary
 /// key, otherwise `<table>_<col1>_<col2>_<suffix>` over every key column.
 pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
     def: &crate::storage::TableDefinition<Definition0>,
     columns: &[u16],
     suffix: &str,
-    include_cols: bool,
+    transaction: u32,
+    exclude: Option<usize>,
+    class: crate::storage::GeneratedNameClass,
 ) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let mut addition = StackStr::<128>::new();
-    if include_cols {
-        for &column in columns {
-            if !addition.is_empty() {
-                addition.write_char('_').expect("fixed name writer");
-            }
-            addition
-                .write_str(def.columns()[usize::from(column)].name.as_str())
-                .expect("fixed name writer");
-            if addition.len() >= 64 {
-                break;
-            }
+    for &column in columns {
+        if !addition.is_empty() {
+            addition.write_char('_').expect("fixed name writer");
+        }
+        addition
+            .write_str(def.columns()[usize::from(column)].name.as_str())
+            .expect("fixed name writer");
+        if addition.len() >= 64 {
+            break;
         }
     }
     if addition.is_truncated() {
@@ -1031,11 +1065,27 @@ pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
             "index name columns exceed their fixed reservation"
         ));
     }
-    crate::storage::constraint_names::generated(
-        def.name.as_str(),
-        (!addition.is_empty()).then_some(addition.as_str()),
-        suffix,
-    )
+    let mut number = 0u32;
+    loop {
+        let mut label = StackStr::<32>::from_str(suffix);
+        if number != 0 {
+            write!(label, "{number}").expect("u32 generated-name suffix fits");
+        }
+        let name = crate::storage::constraint_names::generated(
+            def.name.as_str(),
+            (!addition.is_empty()).then_some(addition.as_str()),
+            label.as_str(),
+        )?;
+        if !storage.generated_name_taken(def, name, transaction, exclude, class) {
+            return Ok(name);
+        }
+        number = number.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "generated constraint names are exhausted"
+            )
+        })?;
+    }
 }
 
 pub(super) fn auto_check_name<Definition0: crate::storage::DefinitionBacking>(
@@ -1043,38 +1093,22 @@ pub(super) fn auto_check_name<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     referenced_cols: ColumnSet,
     transaction: u32,
+    exclude: Option<usize>,
 ) -> Result<SqlName, SqlError> {
-    use core::fmt::Write as _;
-    let column = (referenced_cols.count_ones() == 1)
-        .then(|| def.columns()[referenced_cols.first().expect("one referenced column")].name);
-    let exclude = storage.find_visible(def.schema.as_str(), def.name.as_str(), transaction);
-    let mut suffix = 0u32;
-    loop {
-        let mut label = StackStr::<32>::from_str("check");
-        if suffix != 0 {
-            write!(label, "{suffix}").expect("u32 check suffix fits");
-        }
-        let name = crate::storage::constraint_names::generated(
-            def.name.as_str(),
-            column.as_ref().map(SqlName::as_str),
-            label.as_str(),
-        )?;
-        if !storage.generated_name_taken(
-            def,
-            name,
-            transaction,
-            exclude,
-            crate::storage::GeneratedNameClass::Constraint,
-        ) {
-            return Ok(name);
-        }
-        suffix = suffix.checked_add(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "generated CHECK constraint names are exhausted"
-            )
-        })?;
-    }
+    let column = [referenced_cols.first().unwrap_or(0) as u16];
+    auto_key_name(
+        storage,
+        def,
+        if referenced_cols.count_ones() == 1 {
+            &column
+        } else {
+            &[]
+        },
+        "check",
+        transaction,
+        exclude,
+        crate::storage::GeneratedNameClass::Constraint,
+    )
 }
 
 /// Whether the draft already contains a constraint with this admitted name.
@@ -1115,8 +1149,7 @@ pub(super) fn constraint_name_taken<Definition0: crate::storage::DefinitionBacki
 
 pub(super) fn add_unique_key(
     def: &mut TableDefBuilder,
-    name: Option<&str>,
-    suffix: &str,
+    name: SqlName,
     indices: &[u16; MAX_INDEX_COLS],
     n: usize,
     kind: crate::storage::UniqueKeyKind,
@@ -1129,13 +1162,8 @@ pub(super) fn add_unique_key(
             crate::storage::MAX_UNIQUES
         ));
     }
-    let kname = match name {
-        Some(nm) => SqlName::parse(nm)?,
-        // A primary key is `<table>_pkey`; a unique key lists every column.
-        None => auto_key_name(def, &indices[..n], suffix, !kind.is_primary())?,
-    };
     let mut k = UniqueKey::EMPTY;
-    k.name = kname;
+    k.name = name;
     k.columns[..n].copy_from_slice(&indices[..n]);
     k.n_cols = n;
     k.kind = kind;
@@ -1161,6 +1189,7 @@ fn attach_fkey(
     timing: AstConstraintTiming,
     validation: AstConstraintValidation,
     txid: u32,
+    exclude: Option<usize>,
     _arena: &Arena,
 ) -> Result<(), SqlError> {
     if def.n_fkeys == crate::storage::MAX_FKEYS {
@@ -1329,7 +1358,15 @@ fn attach_fkey(
 
     let fname = match name {
         Some(n) => SqlName::parse(n)?,
-        None => auto_key_name(def, &child_idxs[..n_child], "fkey", true)?,
+        None => auto_key_name(
+            storage,
+            def,
+            &child_idxs[..n_child],
+            "fkey",
+            txid,
+            exclude,
+            crate::storage::GeneratedNameClass::Constraint,
+        )?,
     };
     let mut fk = ForeignKey::EMPTY;
     fk.name = fname;

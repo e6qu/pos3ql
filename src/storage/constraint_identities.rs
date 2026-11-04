@@ -120,21 +120,6 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
         self.inline_constraint_identities.as_ref()[attribute]
     }
 
-    pub(crate) fn implicit_constraint_identity(
-        &self,
-        position: usize,
-    ) -> Option<ConstraintIdentity> {
-        self.columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| column.primary || column.unique)
-            .map(|(column, _)| self.column_constraint_identity(column))
-            .chain(self.uniques().iter().map(|key| key.identity))
-            .chain(self.exclusions().iter().map(|key| key.identity))
-            .nth(position)
-            .flatten()
-    }
-
     pub(crate) fn constraint_identities(
         &self,
     ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
@@ -560,7 +545,7 @@ mod tests {
                 primary.oid(),
                 replacement.column_index_identity(0).unwrap().oid()
             );
-            assert_eq!(replacement.implicit_constraint_identity(0), Some(primary));
+            assert_ne!(replacement.uniques[0].identity, Some(primary));
             assert_eq!(replacement.constraint_identities().count(), 5);
 
             let mut named = super::super::UniqueKey::EMPTY;

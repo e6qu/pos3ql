@@ -11791,9 +11791,7 @@ fn parent_constraint(
     child_slot: usize,
     index: &IdxInfo,
 ) -> Option<(crate::storage::ConstraintIdentity, i32)> {
-    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
-        return None;
-    };
+    let attachment = storage.table_def(child_slot, txid).partition.attachment?;
     let parent_slot = usize::from(attachment.parent);
     let parent = storage.table_def(parent_slot, txid);
     let columns = &index.columns[..index.n_cols];
@@ -11850,13 +11848,10 @@ fn parent_constraint(
     }
     if is_exclusion {
         let child = storage.table_def(child_slot, txid);
-        let Some(child_exclusion) = child
+        let child_exclusion = child
             .exclusions()
             .iter()
-            .find(|exclusion| exclusion.columns() == columns)
-        else {
-            return None;
-        };
+            .find(|exclusion| exclusion.columns() == columns)?;
         for exclusion in parent.exclusions() {
             if exclusion.columns() == child_exclusion.columns()
                 && exclusion.operators[..exclusion.n_cols]

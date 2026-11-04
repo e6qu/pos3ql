@@ -1214,6 +1214,7 @@ fn create_table_kind(
         statement.constraints,
         true,
         txn.txid,
+        None,
         arena,
     ) {
         return sql_fail(e);
@@ -3229,20 +3230,34 @@ fn build_partitioned_table_def(
             for index in 0..def.n_uniques {
                 let constraint = def.uniques[index];
                 def.uniques[index].name = auto_key_name(
+                    storage,
                     &def,
-                    constraint.columns(),
+                    if constraint.kind.is_primary() {
+                        &[]
+                    } else {
+                        constraint.columns()
+                    },
                     if constraint.kind.is_primary() {
                         "pkey"
                     } else {
                         "key"
                     },
-                    !constraint.kind.is_primary(),
+                    txid,
+                    None,
+                    crate::storage::GeneratedNameClass::IndexConstraint,
                 )?;
             }
             for index in 0..def.n_exclusions {
                 let constraint = def.exclusions[index];
-                def.exclusions[index].name =
-                    auto_key_name(&def, constraint.columns(), "excl", true)?;
+                def.exclusions[index].name = auto_key_name(
+                    storage,
+                    &def,
+                    constraint.columns(),
+                    "excl",
+                    txid,
+                    None,
+                    crate::storage::GeneratedNameClass::IndexConstraint,
+                )?;
             }
             let resolved_bound = resolve_partition_bound(
                 storage,
@@ -4555,7 +4570,7 @@ fn copy_like_constraints(
     txid: u32,
 ) -> Result<(), SqlError> {
     for like in statement.likes {
-        let source = like_source(storage, like, txid)?;
+        let source = (*like_source(storage, like, txid)?).clone();
         if like.constraints {
             for check in &source.checks[..source.n_checks] {
                 if def.n_checks == crate::storage::MAX_CHECKS {
@@ -4567,9 +4582,6 @@ fn copy_like_constraints(
                 }
                 let mut copied = *check;
                 copied.identity = None;
-                // The name is regenerated from the new table, as PostgreSQL
-                // does, so the two tables' constraints stay distinguishable.
-                copied.name = auto_key_name(def, &[], "check", false)?;
                 def.checks[def.n_checks] = copied;
                 def.n_checks += 1;
             }
@@ -4577,10 +4589,22 @@ fn copy_like_constraints(
         if like.indexes {
             for key in &source.uniques[..source.n_uniques] {
                 let columns = remap_columns(def, &source, &key.columns[..key.n_cols])?;
+                let name = auto_key_name(
+                    storage,
+                    def,
+                    if key.kind.is_primary() {
+                        &[]
+                    } else {
+                        &columns[..key.n_cols]
+                    },
+                    if key.kind.is_primary() { "pkey" } else { "key" },
+                    txid,
+                    None,
+                    crate::storage::GeneratedNameClass::IndexConstraint,
+                )?;
                 add_unique_key(
                     def,
-                    None,
-                    if key.kind.is_primary() { "pkey" } else { "key" },
+                    name,
                     &columns,
                     key.n_cols,
                     key.kind,
@@ -4613,8 +4637,15 @@ fn copy_like_constraints(
                 let mut exclusion = *source_exclusion;
                 exclusion.columns[..source_exclusion.n_cols]
                     .copy_from_slice(&columns[..source_exclusion.n_cols]);
-                exclusion.name =
-                    auto_key_name(def, &columns[..source_exclusion.n_cols], "excl", true)?;
+                exclusion.name = auto_key_name(
+                    storage,
+                    def,
+                    &columns[..source_exclusion.n_cols],
+                    "excl",
+                    txid,
+                    None,
+                    crate::storage::GeneratedNameClass::IndexConstraint,
+                )?;
                 def.exclusions[def.n_exclusions] = exclusion;
                 def.n_exclusions += 1;
             }
@@ -69451,8 +69482,7 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
     }
     crate::sql::exec::ddl::add_unique_key(
         new_definition,
-        Some(constraint_name.as_str()),
-        if primary { "pkey" } else { "key" },
+        constraint_name,
         &index.columns,
         index.n_cols,
         if primary {
@@ -70303,9 +70333,12 @@ enum PartitionInheritance {
 }
 
 fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
     parent: &crate::storage::TableDefinition<Definition0>,
     child: &mut TableDefBuilder,
     mode: PartitionInheritance,
+    transaction: u32,
+    child_slot: usize,
 ) -> Result<(), SqlError> {
     if parent.n_columns != child.n_columns {
         return Err(sql_err!(
@@ -70395,14 +70428,21 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(
+            storage,
             child,
-            &columns[..constraint.n_cols],
+            if constraint.kind.is_primary() {
+                &[]
+            } else {
+                &columns[..constraint.n_cols]
+            },
             if constraint.kind.is_primary() {
                 "pkey"
             } else {
                 "key"
             },
-            !constraint.kind.is_primary(),
+            transaction,
+            Some(child_slot),
+            crate::storage::GeneratedNameClass::IndexConstraint,
         )?;
         child.uniques[child.n_uniques] = inherited;
         child.n_uniques += 1;
@@ -70496,7 +70536,15 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         let mut inherited = *constraint;
         inherited.index_identity = None;
         inherited.columns = columns;
-        inherited.name = auto_key_name(child, &columns[..constraint.n_cols], "excl", true)?;
+        inherited.name = auto_key_name(
+            storage,
+            child,
+            &columns[..constraint.n_cols],
+            "excl",
+            transaction,
+            Some(child_slot),
+            crate::storage::GeneratedNameClass::IndexConstraint,
+        )?;
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
     }
@@ -71067,9 +71115,14 @@ fn alter_partition_attachment(
                 "ROW triggers with transition tables are not supported on partitions"
             ));
         }
-        if let Err(error) =
-            inherit_partition_constraints(&parent_def, &mut new_def, PartitionInheritance::Attach)
-        {
+        if let Err(error) = inherit_partition_constraints(
+            storage,
+            &parent_def,
+            &mut new_def,
+            PartitionInheritance::Attach,
+            txn.txid,
+            child,
+        ) {
             return sql_fail(error);
         }
         let resolved = match resolve_partition_bound(
@@ -71431,9 +71484,12 @@ fn alter_partition_attachment(
                     (*storage.table_def(usize::from(attachment.parent), txn.txid)).clone();
                 let mut dependent = TableDefBuilder::from_definition(&current);
                 if let Err(error) = inherit_partition_constraints(
+                    storage,
                     &direct_parent,
                     &mut dependent,
                     PartitionInheritance::ParentAlter,
+                    txn.txid,
+                    descendant,
                 ) {
                     return sql_fail(error);
                 }
@@ -71534,12 +71590,13 @@ fn detached_partition_constraint_name<Definition0: crate::storage::DefinitionBac
     child: &crate::storage::TableDefinition<Definition0>,
     scheme: crate::storage::PartitionScheme,
     transaction: u32,
+    child_slot: usize,
 ) -> Result<SqlName, SqlError> {
     let mut referenced = ColumnSet::EMPTY;
     for key in &scheme.keys[..usize::from(scheme.n_keys)] {
         referenced.insert(usize::from(*key));
     }
-    ddl::auto_check_name(storage, child, referenced, transaction)
+    ddl::auto_check_name(storage, child, referenced, transaction, Some(child_slot))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73677,6 +73734,7 @@ fn alter_table_relation(
                     core::slice::from_ref(constraint),
                     false,
                     txn.txid,
+                    Some(table_index),
                     arena,
                 ) {
                     return sql_fail(e);
@@ -74905,9 +74963,12 @@ fn alter_table_relation(
                                 )),
                             );
                             if let Err(error) = inherit_partition_constraints(
+                                storage,
                                 &direct_parent,
                                 &mut dependent,
                                 PartitionInheritance::ParentAlter,
+                                txn.txid,
+                                descendant,
                             ) {
                                 return sql_fail(error);
                             }
@@ -75447,8 +75508,7 @@ fn materialize_flag_key_names(def: &mut TableDefBuilder) -> Result<(), SqlError>
         })?;
         crate::sql::exec::ddl::add_unique_key(
             def,
-            Some(name.as_str()),
-            if metadata.primary { "pkey" } else { "key" },
+            name,
             &indices,
             1,
             if metadata.primary {

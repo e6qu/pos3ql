@@ -202,6 +202,10 @@ pub(crate) struct DdlCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "event objects stay inline in the bounded statement arena; heap boxing is forbidden"
+)]
 enum CommandReference {
     Object(EventObjectRef),
     ReindexedIndex {

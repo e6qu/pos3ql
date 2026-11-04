@@ -15176,7 +15176,7 @@ mod tests {
                 definition.exclusions[0].identity
             );
             assert_eq!(
-                decoded.implicit_constraint_identity(0),
+                decoded.column_constraint_identity(0),
                 definition.column_constraint_identity(0)
             );
         });

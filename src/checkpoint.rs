@@ -11047,7 +11047,7 @@ impl Checkpointer {
                 )?;
             }
 
-            Storage::validate_inline_key_names(&definition)?;
+            Storage::validate_inline_key_names(definition)?;
             for key in definition.inline_key_names() {
                 write_manifest(
                     &mut self.manifest_output,
@@ -20127,9 +20127,13 @@ mod stored_dependency_tests {
                         .table_index_identities()
                         .eq(before.table_index_identities())
                 );
-                for position in 0..after.implicit_index_identities().count() {
-                    let constraint = after.implicit_constraint_identity(position).unwrap();
-                    assert_ne!(constraint.oid(), after.implicit_index_oid(position));
+                for constraint in after.constraint_identities().flatten() {
+                    assert!(
+                        after
+                            .table_index_identities()
+                            .flatten()
+                            .all(|index| constraint.oid() != index.oid())
+                    );
                 }
             }
             let toast_after = restored

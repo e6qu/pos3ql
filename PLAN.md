@@ -166,6 +166,9 @@ Verify stored generated key names with legal long identifiers, schema collisions
 and pending transactions. Index names reserve space before commit; another
 transaction's pending CHECK name does not. Retain names through rename and
 recovery, including prepared changes that replace an earlier relation.
+Apply the same comparisons to multi-column keys, exclusion constraints, foreign
+keys and copied or partition indexes. Explicit names and copied CHECK names must
+retain PostgreSQL's distinct rules.
 Qualify all four workflows on the finished revision; a source check or a
 PostgreSQL reference probe alone does not establish those runtime guarantees.
 

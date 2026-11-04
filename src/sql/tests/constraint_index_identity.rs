@@ -47,6 +47,7 @@ fn generated_multicolumn_and_copied_key_names_follow_the_schema_namespace() {
         config.transaction_mode = mode;
         // The fixture keeps twenty relations, including occupied names, live.
         config.max_tables = 20;
+        config.max_value_indexes = 20;
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -192,7 +193,11 @@ fn inline_key_names_survive_renames_collisions_and_http_cold_recovery() {
         let mut config = test_config(&format!("inline-key-names-{mode:?}"));
         config.transaction_mode = mode;
         config.object_store_on = true;
-        config.object_store_bucket = format!("inline-key-names-{mode:?}-{}", std::process::id());
+        let mode_name = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        config.object_store_bucket = format!("inline-key-names-{mode_name}-{}", std::process::id());
         config.wal_upload = true;
         config.wal_upload_sync = true;
         config.block_cache_bytes = 0;
@@ -291,7 +296,12 @@ fn index_creation_and_reindex_keep_owners_and_grants_through_http_cold_recovery(
         let mut config = test_config(&format!("reindex-ownership-{mode:?}"));
         config.transaction_mode = mode;
         config.object_store_on = true;
-        config.object_store_bucket = format!("reindex-ownership-{mode:?}-{}", std::process::id());
+        let mode_name = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        config.object_store_bucket =
+            format!("reindex-ownership-{mode_name}-{}", std::process::id());
         config.wal_upload = true;
         config.wal_upload_sync = true;
         config.block_cache_bytes = 0;
@@ -323,6 +333,12 @@ fn index_creation_and_reindex_keep_owners_and_grants_through_http_cold_recovery(
                                 usize::from(index.ownership.owner_to(0)),
                                 owner,
                                 "{mode:?}: {statement}"
+                            );
+                            assert!(
+                                index.resolved_operator_classes[..index.n_cols]
+                                    .iter()
+                                    .all(Option::is_some),
+                                "{mode:?}: {statement} must preserve every key's comparison class"
                             );
                         }
                     }

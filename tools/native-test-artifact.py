@@ -35,8 +35,7 @@ def digest(path):
     return value.hexdigest()
 
 
-def prepare(build_jsonl, directory, revision, target):
-    identity(revision, target)
+def executable(build_jsonl):
     candidates = []
     finished = False
     with build_jsonl.open(encoding="utf-8") as stream:
@@ -64,6 +63,12 @@ def prepare(build_jsonl, directory, revision, target):
     regular_file(source)
     if not source.stat().st_mode & stat.S_IXUSR:
         raise ValueError("Cargo libtest output is not executable")
+    return source.resolve()
+
+
+def prepare(build_jsonl, directory, revision, target):
+    identity(revision, target)
+    source = executable(build_jsonl)
     if directory.is_symlink():
         raise ValueError("artifact directory must not be a symlink")
     directory.mkdir(parents=True, exist_ok=True)
@@ -121,6 +126,8 @@ def verify(directory, revision, target):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    select = commands.add_parser("executable")
+    select.add_argument("build_jsonl", type=pathlib.Path)
     create = commands.add_parser("prepare")
     create.add_argument("build_jsonl", type=pathlib.Path)
     create.add_argument("directory", type=pathlib.Path)
@@ -132,7 +139,9 @@ def main():
     check.add_argument("target")
     arguments = parser.parse_args()
     try:
-        if arguments.command == "prepare":
+        if arguments.command == "executable":
+            print(executable(arguments.build_jsonl))
+        elif arguments.command == "prepare":
             prepare(arguments.build_jsonl, arguments.directory,
                     arguments.revision, arguments.target)
         else:

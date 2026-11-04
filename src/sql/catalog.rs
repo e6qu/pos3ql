@@ -11915,9 +11915,18 @@ fn visit_indexes(
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
             let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+            let mut resolved_operator_classes = [None; crate::storage::MAX_INDEX_COLS];
             for (position, &column) in columns.iter().enumerate() {
                 if !expression_keys[position] {
-                    collations[position] = def.columns()[usize::from(column)].collation;
+                    let column = &def.columns()[usize::from(column)];
+                    collations[position] = column.collation;
+                    resolved_operator_classes[position] = if is_exclusion {
+                        crate::sql::types::GistOperatorClass::for_type(column.ctype)
+                            .map(crate::storage::IndexOperatorClass::Gist)
+                    } else {
+                        crate::sql::types::BtreeOperatorClass::for_type(column.ctype)
+                            .map(crate::storage::IndexOperatorClass::Btree)
+                    };
                 }
             }
             let mut info = IdxInfo {
@@ -11938,7 +11947,7 @@ fn visit_indexes(
                 collations,
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-                resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+                resolved_operator_classes,
                 operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                     crate::storage::MAX_INDEX_COLS],
                 descending,

@@ -157,6 +157,10 @@ constraint identifier must still identify that constraint after its index is
 rebuilt. Store those identities separately, update the backing-index link, and
 preserve comments, dependencies and partition links. Map a partition child's
 physical columns to the parent's selected columns when reporting those links.
+Retain each key's selected comparison rules when a constraint-created index
+becomes a stored index. Reject incomplete journal records before changing their
+buffer. Diagnose native crashes with the failing threads' stacks, preserving
+the configured stack, test parallelism and job deadlines.
 Rebuilding a table must leave retired indexes untouched. Explicit user-index
 repair and replacement must preserve the distinct flags and ownership rules.
 The current implementation gives the large-value index its own lifetime and

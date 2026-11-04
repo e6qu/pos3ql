@@ -368,7 +368,10 @@ reuses its catalog slot does not appear in that earlier event.
 Keys retain the name chosen at creation. For example, renaming `orders` to
 `archived_orders` preserves `orders_pkey`; rebuilding it also preserves that
 name. The saved name follows the column's stable number through column removal
-and recovery. Changing a table or materialized view's owner also changes its
+and recovery. The shared index description includes each key's comparison rules,
+so rebuilding a primary or unique key writes the same rules to the journal.
+Incomplete index records fail before changing the journal buffer.
+Changing a table or materialized view's owner also changes its
 live indexes' owner in the same transaction, including replacement and large-value
 indexes. Rolling back restores those owners together. An old index that the
 rebuild has stopped maintaining (`indislive=false`) keeps its former owner until

@@ -64,6 +64,19 @@ class NativeTestArtifactTests(unittest.TestCase):
         self.assertEqual(manifest["target"], TARGET)
         self.assertEqual(manifest["sha256"], hashlib.sha256(binary.read_bytes()).hexdigest())
 
+    def test_executable_selection_uses_the_checked_cargo_output_without_packaging(self):
+        self.write_records([self.record(kind="bin"), self.record(test=False), self.record()])
+        result = self.run_tool("executable", self.records)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.source.resolve()))
+        self.assertFalse(self.output.exists())
+
+    def test_executable_selection_rejects_an_unfinished_build(self):
+        self.records.write_text(json.dumps(self.record()) + "\n")
+        result = self.run_tool("executable", self.records)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing its successful build-finished", result.stderr)
+
     def test_rejects_missing_duplicate_or_wrong_library_artifacts(self):
         for records in [[], [self.record(), self.record()], [self.record(kind="test")],
                         [self.record(test=False)], [self.record(name="other")]]:

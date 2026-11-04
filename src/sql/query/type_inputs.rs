@@ -27,6 +27,10 @@ struct MetadataOnly<'s, 'v> {
 }
 
 impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        self.row.whole_row_column(table, index)
+    }
+
     fn lookup(
         &self,
         _qualifier: Option<&str>,

@@ -4741,6 +4741,7 @@ fn lock_state_is_synchronized_and_startup_bounded() {
     assert_eq!(
         locks.table.capacity(),
         transaction_capacity * (table_slot_capacity(&config) + config.max_views + config.max_roles)
+            + config.max_connections as usize
     );
     assert!(locks.table.iter().all(|lock| lock.modes[0] != 0));
 }

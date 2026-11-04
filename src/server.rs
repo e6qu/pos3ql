@@ -4113,7 +4113,14 @@ mod tests {
         }
 
         for mode in [TransactionMode::Mvcc, TransactionMode::Locking] {
-            let namespace = format!("admin-staged-publication-{mode:?}-{}", std::process::id());
+            let mode_name = match mode {
+                TransactionMode::Mvcc => "mvcc",
+                TransactionMode::Locking => "locking",
+            };
+            let namespace = format!(
+                "admin-staged-publication-{mode_name}-{}",
+                std::process::id()
+            );
             let mut config = Config::default_dev();
             config.transaction_mode = mode;
             config.data_dir = std::env::temp_dir()

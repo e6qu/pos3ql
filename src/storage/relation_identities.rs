@@ -136,6 +136,10 @@ impl Storage {
     ) -> Result<(), SqlError> {
         Self::validate_inline_key_names(definition)?;
         self.reserve_constraint_identities(definition)?;
+        definition.has_toast |= definition
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
         if !definition.has_toast {
             definition.toast_index_identity = None;
         }

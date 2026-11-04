@@ -379,6 +379,21 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        let entry = self.0.qualified_star_entry(table, index).ok()?;
+        match entry {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs.get(table)?.columns().get(column).copied()
+            }
+            super::scope::ResolvedColumn::Merged(_) => Some(crate::storage::ColumnMeta {
+                name: crate::storage::SqlName::parse(self.0.output_name(entry)).ok()?,
+                ctype: self.0.output_type(entry),
+                collation: self.0.output_collation(entry),
+                ..crate::storage::ColumnMeta::EMPTY
+            }),
+        }
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,

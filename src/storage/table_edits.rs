@@ -100,6 +100,7 @@ pub(super) struct TableDefinitionEdit<'storage> {
     definition: DefinitionWrite<'storage>,
     // Release the definition before allowing retirement or slot reuse.
     _lifecycle: MutexGuard<'storage, ()>,
+    _names: Option<MutexGuard<'storage, ()>>,
 }
 
 impl<'storage> TableDefinitionEdit<'storage> {
@@ -107,7 +108,10 @@ impl<'storage> TableDefinitionEdit<'storage> {
         target.matches_definition(self.storage, &self.definition)
     }
 
-    fn after_wait(self, wait: super::row_ownership::LockWait<'storage>) -> Self {
+    fn after_wait(
+        self,
+        wait: super::row_ownership::LockWait<'storage>,
+    ) -> (&'storage Storage, usize) {
         let storage = self.storage;
         let table = self.table;
         drop(self);
@@ -117,7 +121,51 @@ impl<'storage> TableDefinitionEdit<'storage> {
             .waits
             .fetch_add(1, core::sync::atomic::Ordering::Release);
         wait.wait();
-        Self::new(storage, table)
+        (storage, table)
+    }
+
+    pub(super) fn admit(
+        storage: &'storage Storage,
+        target: TableDefinitionTarget,
+        definition: &mut TableDefBuilder,
+        mapping: &[Option<SqlName>; MAX_COLUMNS],
+    ) -> Result<Self, SqlError> {
+        loop {
+            let names = storage
+                .table_creation
+                .lock()
+                .expect("table creation lock poisoned");
+            storage.prepare_selected_key_names(target, definition, mapping)?;
+            let table = &storage.tables[target.table()];
+            let attempt: Result<_, super::row_ownership::LockWait<'storage>> = (|| {
+                let lifecycle = super::row_ownership::try_mutex(
+                    &table.lifecycle,
+                    "table lifecycle lock poisoned",
+                )?;
+                let selected = table.definition.try_write_for_batch()?;
+                Ok((lifecycle, selected))
+            })();
+            match attempt {
+                Ok((lifecycle, selected)) => {
+                    return Ok(Self {
+                        storage,
+                        table: target.table(),
+                        definition: selected,
+                        _lifecycle: lifecycle,
+                        _names: Some(names),
+                    });
+                }
+                Err(wait) => {
+                    drop(names);
+                    #[cfg(test)]
+                    storage
+                        .definition_publication
+                        .waits
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    wait.wait();
+                }
+            }
+        }
     }
 
     pub(super) fn new(storage: &'storage Storage, table: usize) -> Self {
@@ -131,6 +179,7 @@ impl<'storage> TableDefinitionEdit<'storage> {
             table,
             definition,
             _lifecycle: lifecycle,
+            _names: None,
         }
     }
 
@@ -183,7 +232,8 @@ impl<'storage> TableDefinitionEdit<'storage> {
                     }
                     Err(wait) => {
                         drop(comments);
-                        self = self.after_wait(wait);
+                        let (storage, _) = self.after_wait(wait);
+                        self = Self::admit(storage, target, &mut definition, column_mapping)?;
                         continue;
                     }
                 }
@@ -196,7 +246,8 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 Err(wait) => {
                     drop(source);
                     drop(comments);
-                    self = self.after_wait(wait);
+                    let (storage, _) = self.after_wait(wait);
+                    self = Self::admit(storage, target, &mut definition, column_mapping)?;
                     continue;
                 }
             };
@@ -430,7 +481,8 @@ impl<'storage> TableDefinitionEdit<'storage> {
                 Ok(indexes) => break (comments, indexes),
                 Err(wait) => {
                     drop(comments);
-                    self = self.after_wait(wait);
+                    let (storage, table) = self.after_wait(wait);
+                    self = Self::new(storage, table);
                 }
             }
         };
@@ -639,10 +691,13 @@ mod tests {
             });
             let deadline = Instant::now() + Duration::from_secs(5);
             let waiting = loop {
-                match storage.tables[first].lifecycle.try_lock() {
-                    Err(std::sync::TryLockError::WouldBlock) => break true,
-                    Ok(guard) => drop(guard),
-                    Err(std::sync::TryLockError::Poisoned(_)) => break false,
+                if storage
+                    .definition_publication
+                    .waits
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    != 0
+                {
+                    break true;
                 }
                 if Instant::now() >= deadline {
                     break false;
@@ -689,7 +744,7 @@ mod tests {
             drop(held);
             assert!(
                 waiting,
-                "the selected edit never acquired its lifecycle owner"
+                "the selected edit never reached its definition wait"
             );
             assert!(
                 progress.is_ok(),

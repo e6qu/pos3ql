@@ -50,8 +50,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Install native debugger for protocol failure diagnostics
-        if: matrix.name == 'protocol-durability'
+      - name: Install native debugger for library and protocol failure diagnostics
+        if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol-durability'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gdb
@@ -77,6 +77,7 @@ jobs:
           POS3QL_PGBIN: /usr/lib/postgresql/18/bin
           POS3QL_PSQL: ${{ matrix.needs_pg18_client && format('{0}/.ci-bin/psql', github.workspace) || 'psql' }}
           COVERAGE_SHARDS: ${{ matrix.shards }}
+          COVERAGE_NATIVE_DEBUGGER: ${{ startsWith(matrix.shards, 'lib:') && 'gdb' || 'none' }}
           POS3QL_TEST_ARTIFACTS: ${{ matrix.name == 'ingest' && format('{0}/ingest-failure', runner.temp) || '' }}
         run: |
           for shard in $COVERAGE_SHARDS; do

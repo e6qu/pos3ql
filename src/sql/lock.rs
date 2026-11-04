@@ -668,8 +668,8 @@ impl AdvisoryLockManager {
             })
             .map(|lock| lock.wait_owner)
         {
-            self.clear_wait(wait_owner);
             if try_only {
+                self.clear_wait(wait_owner);
                 wait_graph.clear_wait(wait_owner);
                 if let AdvisoryOwner::Session(connection_id) = owner {
                     self.record_replay(connection_id, replay_operation, false)?;

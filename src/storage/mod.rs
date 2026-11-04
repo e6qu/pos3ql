@@ -39891,12 +39891,7 @@ impl Storage {
                 "table definition source belongs to different storage"
             ));
         }
-        let _names = self
-            .table_creation
-            .lock()
-            .expect("table creation lock poisoned");
-        self.prepare_selected_key_names(target, &mut def, column_mapping)?;
-        table_edits::TableDefinitionEdit::new(self, target.table()).stage(
+        table_edits::TableDefinitionEdit::admit(self, target, &mut def, column_mapping)?.stage(
             target,
             def,
             column_mapping,
@@ -55123,10 +55118,16 @@ impl Storage {
         right_oid: Option<i32>,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
+        let path_position = |schema: SqlName| {
+            self.path().entries().iter().position(|entry| match entry {
+                PathEntry::Schema(slot) => self.schema_def_for(*slot as usize, txid).name == schema,
+                PathEntry::Catalog | PathEntry::InformationSchema | PathEntry::Toast => false,
+            })
+        };
         // Resolve exact signatures before considering coercions. A later exact
         // match must not be hidden by two earlier coercible domain overloads.
         for exact_only in [true, false] {
-            let mut found = None;
+            let mut found: Option<(usize, OperatorSignature, SqlName)> = None;
             for (slot, definition) in self.operators_visible_to(txid) {
                 if definition.name.as_str() != name
                     || schema.is_some_and(|schema| definition.schema.as_str() != schema)
@@ -55157,16 +55158,28 @@ impl Storage {
                             _ => false,
                         })
                 };
-                if accepts && found.replace(slot).is_some() {
-                    return Err(sql_err!(
-                        sqlstate::AMBIGUOUS_FUNCTION,
-                        "operator is not unique: {}",
-                        name
-                    ));
+                if accepts {
+                    if let Some((_, signature, prior_schema)) = found {
+                        if schema.is_none()
+                            && signature == definition.signature
+                            && prior_schema != definition.schema
+                        {
+                            if path_position(definition.schema) < path_position(prior_schema) {
+                                found = Some((slot, definition.signature, definition.schema));
+                            }
+                            continue;
+                        }
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {}",
+                            name
+                        ));
+                    }
+                    found = Some((slot, definition.signature, definition.schema));
                 }
             }
             if found.is_some() {
-                return Ok(found);
+                return Ok(found.map(|(slot, _, _)| slot));
             }
         }
         Ok(None)

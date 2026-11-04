@@ -457,6 +457,14 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        if crate::sql::eval::qualifier_answers_target(self.def, self.alias, table) {
+            self.def.columns().get(index).copied()
+        } else {
+            None
+        }
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -10772,6 +10780,20 @@ pub(crate) fn drop_owned(
         Ok(values) => values,
         Err(error) => return sql_fail(error),
     };
+    let foreign_servers = match dependency_flags(
+        arena,
+        storage.access_class_slots(AccessClass::ForeignServer),
+    ) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let foreign_wrappers = match dependency_flags(
+        arena,
+        storage.access_class_slots(AccessClass::ForeignDataWrapper),
+    ) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
         (AccessClass::View, &mut views[..]),
@@ -10784,6 +10806,8 @@ pub(crate) fn drop_owned(
         (AccessClass::Statistics, &mut statistics[..]),
         (AccessClass::EventTrigger, &mut event_triggers[..]),
         (AccessClass::Schema, &mut schemas[..]),
+        (AccessClass::ForeignServer, &mut foreign_servers[..]),
+        (AccessClass::ForeignDataWrapper, &mut foreign_wrappers[..]),
     ] {
         for (slot, selected) in selected
             .iter_mut()
@@ -11262,6 +11286,8 @@ pub(crate) fn drop_owned(
         (AccessClass::Domain, &domains[..]),
         (AccessClass::Enum, &enums[..]),
         (AccessClass::Composite, &composites[..]),
+        (AccessClass::ForeignServer, &foreign_servers[..]),
+        (AccessClass::ForeignDataWrapper, &foreign_wrappers[..]),
     ] {
         for (slot, selected) in selected
             .iter()
@@ -11321,6 +11347,26 @@ pub(crate) fn drop_owned(
                         cascade,
                         arena,
                         seq_session,
+                        responder,
+                    ),
+                    AccessClass::ForeignServer => drop_foreign_server(
+                        storage,
+                        wal,
+                        txn,
+                        core::slice::from_ref(&name.as_str()),
+                        false,
+                        cascade,
+                        arena,
+                        responder,
+                    ),
+                    AccessClass::ForeignDataWrapper => drop_foreign_data_wrapper(
+                        storage,
+                        wal,
+                        txn,
+                        core::slice::from_ref(&name.as_str()),
+                        false,
+                        cascade,
+                        arena,
                         responder,
                     ),
                     _ => unreachable!(),
@@ -70419,6 +70465,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             ));
         }
         let mut inherited = *constraint;
+        inherited.identity = None;
         inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(
@@ -70528,6 +70575,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             ));
         }
         let mut inherited = *constraint;
+        inherited.identity = None;
         inherited.index_identity = None;
         inherited.columns = columns;
         inherited.name = auto_key_name(
@@ -70542,6 +70590,7 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
         child.exclusions[child.n_exclusions] = inherited;
         child.n_exclusions += 1;
     }
+    storage.prepare_inline_key_names(child, transaction, Some(child_slot))?;
     crate::storage::constraint_names::table(child)
 }
 

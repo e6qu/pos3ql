@@ -2304,6 +2304,30 @@ fn append_record(buffer: &mut FixedBuf, lsn: u64, operation: &WalOp) -> Result<(
     if let WalOp::CreateTable { definition, .. } = operation {
         definition.validate()?;
     }
+    if let WalOp::CreateIndex {
+        n_cols,
+        n_include_cols,
+        resolved_operator_classes,
+        ..
+    } = operation
+    {
+        if *n_cols > MAX_INDEX_COLS || *n_include_cols > MAX_INDEX_COLS {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "index journal column count exceeds MAX_INDEX_COLS ({})",
+                MAX_INDEX_COLS
+            ));
+        }
+        if resolved_operator_classes[..*n_cols]
+            .iter()
+            .any(Option::is_none)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "index journal record has an unresolved operator class"
+            ));
+        }
+    }
     let payload_len = encoded_payload_len(operation);
     let total = HEADER_LEN + payload_len;
     if buffer.capacity() - buffer.len() < total {
@@ -15403,9 +15427,9 @@ mod tests {
                     definition: (&definition).into(),
                 }
             ));
-            assert_eq!(current.readable()[0], 15);
+            assert_eq!(current.readable()[0], 17);
             assert!(decode_table_payload(current.readable()).is_some());
-            for version in [0, 1, 13, 14, u8::MAX] {
+            for version in (0..17).chain(core::iter::once(u8::MAX)) {
                 incompatible.clear();
                 assert!(incompatible.append(&[version]));
                 assert!(incompatible.append(&current.readable()[1..]));
@@ -16747,6 +16771,74 @@ mod tests {
         })
         .unwrap();
         assert!(seen);
+    }
+
+    #[test]
+    fn index_journal_admission_rejects_incomplete_keys_without_changing_the_prefix() {
+        let mut budget = Budget::new(4096);
+        let mut buffer = FixedBuf::new(&mut budget, "index journal admission", 4096).unwrap();
+        append_record(&mut buffer, 1, &WalOp::DatabaseScope { oid: 5 }).unwrap();
+        let mark = buffer.mark();
+        let mut prefix = [0u8; 64];
+        prefix[..mark].copy_from_slice(buffer.readable());
+        crate::mem::guard::forbid_alloc(|| {
+            for (n_cols, n_include_cols, missing) in [
+                (1, 0, true),
+                (MAX_INDEX_COLS + 1, 0, false),
+                (1, MAX_INDEX_COLS + 1, false),
+                (2, 0, false),
+            ] {
+                let mut classes = [Some(crate::storage::IndexOperatorClass::Btree(
+                    BtreeOperatorClass::Int4,
+                )); MAX_INDEX_COLS];
+                if missing {
+                    classes[0] = None;
+                }
+                let operation = WalOp::CreateIndex {
+                    relation: crate::storage::IndexRelationSource::Table,
+                    created_at: 42,
+                    schema: "public",
+                    name: "rows_pkey",
+                    table: "rows",
+                    method: crate::sql::ast::IndexAccessMethod::Btree,
+                    columns: [0; MAX_INDEX_COLS],
+                    expressions: [None; MAX_INDEX_COLS],
+                    include_columns: [0; MAX_INDEX_COLS],
+                    collations: [crate::sql::ast::Collation::None; MAX_INDEX_COLS],
+                    explicit_collations: [false; MAX_INDEX_COLS],
+                    operator_classes: [None; MAX_INDEX_COLS],
+                    resolved_operator_classes: classes,
+                    operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
+                        MAX_INDEX_COLS],
+                    descending: [false; MAX_INDEX_COLS],
+                    nulls_first: [false; MAX_INDEX_COLS],
+                    n_cols,
+                    n_include_cols,
+                    nulls_not_distinct: false,
+                    predicate: None,
+                    unique: true,
+                    definition: crate::storage::IndexMutableDefinition::DEFAULT,
+                };
+                let result = append_record(&mut buffer, 2, &operation);
+                if missing || n_cols > MAX_INDEX_COLS || n_include_cols > MAX_INDEX_COLS {
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::INVALID_OBJECT_DEFINITION
+                    );
+                    assert_eq!(buffer.readable(), &prefix[..mark]);
+                } else {
+                    result.unwrap();
+                    let Some(WalOp::CreateIndex {
+                        resolved_operator_classes,
+                        ..
+                    }) = decode_op(KIND_CREATE_INDEX, &buffer.readable()[mark + HEADER_LEN..])
+                    else {
+                        panic!("complete index journal record must decode");
+                    };
+                    assert_eq!(&resolved_operator_classes[..n_cols], &classes[..n_cols]);
+                }
+            }
+        });
     }
 
     #[test]

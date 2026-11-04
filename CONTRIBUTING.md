@@ -86,6 +86,12 @@ the Rust code compiles and passes lint, with warnings treated as failures. Build
 matrices start only after both checks pass, so one compiler error does not
 launch dozens of copies of the same failing build.
 
+Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
+CI uses `gdb` to print every thread's stack if a native test crashes. It runs
+the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,
+the same test selection and ordinary test parallelism. A crash still fails
+the job; the debugger does not retry or resume it.
+
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
 `tests/external/requirements.lock`, with links to their PyPI release metadata.

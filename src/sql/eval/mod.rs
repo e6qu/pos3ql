@@ -401,6 +401,11 @@ pub trait ColumnLookup<'a> {
         ))
     }
 
+    /// Declared fields by position, without reading or evaluating row values.
+    fn whole_row_column(&self, _table: &str, _index: usize) -> Option<crate::storage::ColumnMeta> {
+        None
+    }
+
     /// Fields used by `(row).*` and `ROW(row.*, ...)`. Unlike a whole-row
     /// value, expansion retains the declared shape of an outer-join null row.
     fn whole_row_expansion_fields(
@@ -765,6 +770,29 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .filter(|ctype| *ctype != ColType::Record)
     }
 
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let column = self.row.whole_row_column(name, index)?;
+        let type_oid = match column.user_type {
+            Some(identity) => self
+                .catalog?
+                .declared_user_type_oid(column.ctype, identity)?,
+            None => column.ctype.oid(),
+        };
+        Some((
+            StackStr::from_str(column.name.as_str()),
+            crate::sql::exec::StaticTypeMeta {
+                type_oid,
+                ctype: column.ctype,
+                type_mod: column.type_mod,
+                collation: column.collation,
+            },
+        ))
+    }
+
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.catalog
             .and_then(|catalog| catalog.domain_base_type(type_oid))
@@ -945,6 +973,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         (**self).whole_row_present(table)
+    }
+
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        (**self).whole_row_column(table, index)
     }
 
     fn whole_row_fields(

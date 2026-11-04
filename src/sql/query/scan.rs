@@ -4399,6 +4399,15 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        if self.inner.whole_row_type(table).is_some() {
+            self.inner.whole_row_column(table, index)
+        } else {
+            self.outer
+                .and_then(|outer| outer.whole_row_column(table, index))
+        }
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,

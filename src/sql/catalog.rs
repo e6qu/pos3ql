@@ -11503,6 +11503,7 @@ pub(crate) struct ToastIndexInfo {
     pub explicit_slot: Option<usize>,
     pub definition: crate::storage::IndexMutableDefinition,
     pub is_primary: bool,
+    owner: u16,
 }
 
 fn visit_toast_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(ToastIndexInfo)) {
@@ -11536,6 +11537,7 @@ fn visit_toast_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(Toast
                 // PostgreSQL index.c creates copies without IS_PRIMARY;
                 // index_concurrently_swap transfers it to the selected index.
                 is_primary: index.created_at == anchor.created_at(),
+                owner: index.ownership.owner_to(txid),
             });
         }
         if !registered_anchor {
@@ -11550,6 +11552,7 @@ fn visit_toast_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(Toast
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 },
                 is_primary: true,
+                owner: storage.table(table).ownership().owner_to(txid),
             });
         }
     }
@@ -11570,6 +11573,7 @@ pub(crate) fn collect_toast_indexes<'a>(
             explicit_slot: None,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
             is_primary: false,
+            owner: 0,
         })
         .map_err(|_| arena_full())?;
     let mut next = 0;
@@ -11766,6 +11770,7 @@ struct IdxInfo {
     table_created_at: u64,
     name: StackStr<64>,
     kind: crate::storage::IndexKind,
+    owner: u16,
     method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
@@ -11944,6 +11949,7 @@ fn visit_indexes(
                 table_database: def.identity().database,
                 table_created_at: def.identity().created_at,
                 name,
+                owner: storage.table(slot).ownership().owner_to(txid),
                 kind: if def.partition.is_partitioned() {
                     crate::storage::IndexKind::Partitioned { valid: true }
                 } else {
@@ -12192,6 +12198,7 @@ fn visit_indexes(
             info.operator_class_options = index.operator_class_options;
             info.explicit_definition = Some(index.mutable_for(txid));
             info.kind = index.mutable_for(txid).kind;
+            info.owner = index.ownership.owner_to(txid);
             if let Some(parent) = index.mutable_for(txid).parent {
                 info.index_parent_oid = storage
                     .index_visible_to(usize::from(parent), txid)
@@ -12402,6 +12409,7 @@ fn empty_index() -> IdxInfo {
         table_created_at: 0,
         name: StackStr::new(),
         kind: crate::storage::IndexKind::Ordinary,
+        owner: 0,
         method: crate::sql::ast::IndexAccessMethod::Btree,
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expression_keys: [false; crate::storage::MAX_INDEX_COLS],
@@ -20965,12 +20973,7 @@ fn pg_class<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
-        let owner = owner_oid(
-            storage,
-            crate::storage::AccessClass::Table,
-            info.table,
-            txid,
-        );
+        let owner = storage.role_oid(usize::from(info.owner));
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -21096,12 +21099,7 @@ fn pg_class<'a>(
                     crate::sql::ast::IndexAccessMethod::Btree if info.is_exclusion => 783,
                     crate::sql::ast::IndexAccessMethod::Btree => 403,
                 }),
-                Datum::Int4(owner_oid(
-                    storage,
-                    crate::storage::AccessClass::Table,
-                    info.table_slot,
-                    txid,
-                )),
+                Datum::Int4(storage.role_oid(usize::from(info.owner))),
                 Datum::Int4(0), // relchecks
                 Datum::Bool(false),
                 Datum::Bool(false),

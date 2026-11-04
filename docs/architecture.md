@@ -394,11 +394,17 @@ name. The saved name follows the column's stable number through column removal
 and recovery. The shared index description includes each key's comparison rules,
 so rebuilding a primary or unique key writes the same rules to the journal.
 Incomplete index records fail before changing the journal buffer.
+`ALTER INDEX orders_pkey RENAME TO archived_orders_pkey` works before any
+rebuild. It stores a physical index description when needed, preserving the
+index and constraint identifiers, comments and rollback behavior. Ownership is
+checked before reserving that description or taking the maintenance lock.
 Changing a table or materialized view's owner also changes its
 live indexes' owner in the same transaction, including replacement and large-value
 indexes. Rolling back restores those owners together. An old index that the
 rebuild has stopped maintaining (`indislive=false`) keeps its former owner until
 it is dropped.
+Catalog rows report each stored index's selected owner, including retired
+indexes and the separate indexes used for large values.
 
 These waits retain their source, selected table lifetime and bounded metadata
 leases across commits. Cancellation can leave a committed invalid replacement

@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn implicit_constraint_indexes_support_ddl_without_prior_rebuild() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("implicit-index-ddl-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/235_implicit_index_ddl.sql");
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let output = session.execute(&mut engine, statement, true);
+            let expected = statement
+                .contains("RENAME TO forbidden_index_name")
+                .then_some("42501");
+            assert_eq!(
+                error_sqlstates(&output),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {statement}"
+            );
+            rows.extend(data_rows(&output));
+        }
+        assert_eq!(
+            rows,
+            [
+                "t|t|primary constraint|primary index",
+                "t|t|primary constraint|primary index",
+                "{fillfactor=77}",
+                "implicit_index_exclusion_done|t|t|NULL|NULL",
+                "implicit_index_primary_done|t|t|primary constraint|primary index",
+                "implicit_index_unique_done|t|t|NULL|NULL",
+                "3|3",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn materialized_inline_keys_keep_one_catalog_row_and_their_constraint_identity() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

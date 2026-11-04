@@ -20337,6 +20337,7 @@ impl Engine {
                 name,
                 *if_exists,
                 *action,
+                arena,
                 responder,
             ),
             Stmt::AlterIndexesTablespace {

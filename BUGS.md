@@ -14,6 +14,8 @@ current behavior belongs in the [owning guides](docs/README.md). Verify catalog
 identities, comments and physical flags before and after maintenance and cold
 recovery; command completion alone cannot expose duplicate or detached index
 metadata. Preserve failing-thread stacks with native-crash repairs.
+Exercise constraint-index DDL before a rebuild and preserve retired-index owners
+through table-owner changes and recovery.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

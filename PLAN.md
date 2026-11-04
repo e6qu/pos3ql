@@ -184,6 +184,10 @@ metadata after a tablespace change. Recovery must recognize a materialized
 inline key's matching backing relation at each published cancellation point,
 while rejecting an identity reused for a different key. Partitioned indexes
 must retain their partitioned relation kind before and after materialization.
+Direct `ALTER INDEX` must resolve constraint indexes before any rebuild,
+preserving their identities, comments, permissions and rollback behavior.
+Retired indexes keep their own owner when their former table changes owner;
+catalog reports must reflect the selected index's ownership.
 Comments must follow the selected index
 through name reuse, commit and cold recovery. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache

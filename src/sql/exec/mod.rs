@@ -25333,6 +25333,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     name,
                     *if_exists,
                     *action,
+                    arena,
                     responder,
                 ),
                 Stmt::AlterIndexesTablespace {
@@ -54289,6 +54290,10 @@ fn refresh_partitioned_index_validity(
     stage_index_definition(storage, wal, txn, index_slot, definition)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "index DDL materializes implicit definitions in statement memory"
+)]
 pub fn alter_index(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -54296,24 +54301,82 @@ pub fn alter_index(
     name: &QualName,
     if_exists: bool,
     action: crate::sql::ast::AlterIndexAction,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let slot = if let Some(schema) = name.schema
-        && schema != "pg_temp"
-        && storage.find_schema_visible(schema, txn.txid).is_none()
-    {
+    let missing_schema = name.schema.is_some_and(|schema| {
+        schema != "pg_temp" && storage.find_schema_visible(schema, txn.txid).is_none()
+    });
+    let mut slot = if missing_schema {
         if if_exists {
             None
         } else {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "schema \"{}\" does not exist",
-                schema
+                name.schema.expect("missing namespace was explicit")
             ));
         }
     } else {
         storage.resolve_index_slot(name.schema, name.name, txn.txid)
     };
+    let implicit = slot.is_none();
+    if implicit && !missing_schema {
+        let materialized = (|| {
+            let Some(target) = crate::sql::catalog::index_maintenance_target(
+                storage,
+                txn.txid,
+                name.schema,
+                name.name,
+            )?
+            else {
+                return Ok(None);
+            };
+            let candidates = crate::sql::catalog::reindex_candidates(
+                storage,
+                txn.txid,
+                core::slice::from_ref(&target.table),
+                Some(target.oid),
+                arena,
+            )?;
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.definition.relation_oid() == target.oid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "selected index lifetime changed before materialization"
+                    )
+                })?;
+            if txn.txid != 0 {
+                let role = storage.current_role_slot(txn.txid).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "current role is not present in the role catalog"
+                    )
+                })?;
+                let owner = usize::from(candidate.definition.ownership.owner_to(txn.txid));
+                if role != owner && !storage.role_has_privileges_of(role, owner, txn.txid) {
+                    return Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "must be owner of index {}",
+                        name.name
+                    ));
+                }
+            }
+            storage.lock_table(
+                txn.txid,
+                target.table,
+                crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+                false,
+            )?;
+            materialize_index_definition(storage, wal, txn, candidate).map(Some)
+        })();
+        slot = match materialized {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
+        };
+    }
     let Some(slot) = slot else {
         if if_exists {
             responder.notice(
@@ -54346,12 +54409,14 @@ pub fn alter_index(
             name.name
         ));
     };
-    if let Err(error) = storage.lock_table(
-        txn.txid,
-        table,
-        crate::sql::ast::TableLockMode::ShareUpdateExclusive,
-        false,
-    ) {
+    if !implicit
+        && let Err(error) = storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+            false,
+        )
+    {
         return sql_fail(error);
     }
     let method = storage
@@ -56351,7 +56416,7 @@ fn register_reindex_definition(
     result
 }
 
-fn materialize_reindex_original(
+fn materialize_index_definition(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -56374,8 +56439,8 @@ fn materialize_reindex_original(
         }
         return Ok(slot);
     }
-    // Registration must publish the replacement before waiting for writers.
-    // Normalize inline keys with the anchor swap, after those waits finish.
+    // A catalog definition preserves the owning key's table metadata.
+    // Concurrent replacements normalize inline keys at the later anchor swap.
     register_reindex_definition(storage, wal, txn, candidate.table, original)
 }
 
@@ -56471,7 +56536,7 @@ fn register_reindex_candidates<'a>(
         original.mutable = original.mutable_for(txn.txid);
         original.pending_definition = None;
         original.pending_name = None;
-        let old_slot = materialize_reindex_original(storage, wal, txn, candidate)?;
+        let old_slot = materialize_index_definition(storage, wal, txn, candidate)?;
         let mut replacement = original;
         replacement.created_at = 0;
         replacement.name =
@@ -56547,7 +56612,7 @@ pub(super) fn register_next_reindex_table<'a>(
                     && candidate.definition.relation_kind()
                         == crate::storage::IndexRelationKind::Table
                 {
-                    let slot = materialize_reindex_original(storage, wal, txn, candidate)?;
+                    let slot = materialize_index_definition(storage, wal, txn, candidate)?;
                     let mut definition = candidate.definition.mutable_for(txn.txid);
                     definition.tablespace = tablespace;
                     stage_index_definition(storage, wal, txn, slot, definition)?;
@@ -57092,7 +57157,7 @@ pub fn reindex(
         for candidate in candidates.iter().filter(|candidate| {
             candidate.definition.relation_kind() == crate::storage::IndexRelationKind::Table
         }) {
-            if let Err(error) = materialize_reindex_original(storage, wal, txn, candidate) {
+            if let Err(error) = materialize_index_definition(storage, wal, txn, candidate) {
                 return sql_fail(error);
             }
         }
@@ -69380,7 +69445,7 @@ fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
     None
 }
 
-/// An attached key constraint and its btree relation share the constraint
+/// An attached constraint and its backing relation share the constraint
 /// name and exact key positions. This is the durable dependency proof: it
 /// survives WAL and checkpoint replay without a parallel mutable flag.
 fn attached_constraint_index<Definition0: crate::storage::DefinitionBacking>(
@@ -69400,6 +69465,20 @@ fn attached_constraint_index<Definition0: crate::storage::DefinitionBacking>(
                 .iter()
                 .find(|key| key.name.as_str() == name)
                 .and_then(|key| key.index_identity)
+        })
+        .or_else(|| {
+            definition
+                .columns()
+                .iter()
+                .enumerate()
+                .find_map(|(column, metadata)| {
+                    ((metadata.primary || metadata.unique)
+                        && definition
+                            .column_key_name(column)
+                            .is_some_and(|key| key.as_str() == name))
+                    .then(|| definition.column_index_identity(column))
+                    .flatten()
+                })
         })?;
     storage
         .indexes_for(definition.schema.as_str(), definition.name.as_str(), txid)
@@ -69641,7 +69720,9 @@ fn rename_attached_index_constraint(
         ));
     }
     let mut altered = TableDefBuilder::from_definition(&current);
-    if !rename_stored_constraint(&mut altered, old_name.as_str(), new_name) {
+    if !rename_stored_constraint(&mut altered, old_name.as_str(), new_name)
+        && !rename_flag_key(&mut altered, old_name.as_str(), new_name)?
+    {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "attached index \"{}\" has no matching constraint",

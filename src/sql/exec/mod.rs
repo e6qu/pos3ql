@@ -19817,6 +19817,8 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::TOO_MANY_ROWS
     } else if text.eq_ignore_ascii_case("raise_exception") {
         sqlstate::RAISE_EXCEPTION
+    } else if text.eq_ignore_ascii_case("query_canceled") {
+        sqlstate::QUERY_CANCELED
     } else if text.eq_ignore_ascii_case("assert_failure") {
         sqlstate::ASSERT_FAILURE
     } else {
@@ -20705,7 +20707,21 @@ fn resolve_plpgsql_program_locals<'a>(
 }
 
 fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result<(), SqlError> {
-    fn reject(target: SqlName, locals: &[TriggerLocalDecl<'_>]) -> Result<(), SqlError> {
+    struct LoopLocal<'a> {
+        name: SqlName,
+        parent: Option<&'a LoopLocal<'a>>,
+    }
+    fn reject(
+        target: SqlName,
+        locals: &[TriggerLocalDecl<'_>],
+        mut shadowed: Option<&LoopLocal<'_>>,
+    ) -> Result<(), SqlError> {
+        while let Some(local) = shadowed {
+            if local.name == target {
+                return Ok(());
+            }
+            shadowed = local.parent;
+        }
         if let Some(local) = locals
             .iter()
             .find(|local| local.name == target && local.constant)
@@ -20721,53 +20737,68 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
     fn validate_block(
         current: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl<'_>],
+        shadowed: Option<&LoopLocal<'_>>,
     ) -> Result<(), SqlError> {
         for statement in current.statements {
             match *statement {
-                TriggerStatement::LocalAssign(assignment) => reject(assignment.name, locals)?,
+                TriggerStatement::LocalAssign(assignment) => {
+                    reject(assignment.name, locals, shadowed)?
+                }
                 TriggerStatement::SelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals)?;
+                        reject(*target, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::DynamicSelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals)?;
+                        reject(*target, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::GetDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals)?;
+                        reject(assignment.target, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::GetStackedDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals)?;
+                        reject(assignment.target, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::For(statement) => {
-                    reject(statement.target, locals)?;
-                    validate_block(statement.block, locals)?;
+                    if matches!(statement.source, TriggerForSource::Numeric { .. }) {
+                        let local = LoopLocal {
+                            name: statement.target,
+                            parent: shadowed,
+                        };
+                        validate_block(statement.block, locals, Some(&local))?;
+                    } else {
+                        reject(statement.target, locals, shadowed)?;
+                        validate_block(statement.block, locals, shadowed)?;
+                    }
                 }
-                TriggerStatement::While(statement) => validate_block(statement.block, locals)?,
-                TriggerStatement::Loop(block_value) => validate_block(block_value, locals)?,
+                TriggerStatement::While(statement) => {
+                    validate_block(statement.block, locals, shadowed)?
+                }
+                TriggerStatement::Loop(block_value) => {
+                    validate_block(block_value, locals, shadowed)?
+                }
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals)?;
+                        validate_block(branch.block, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::Case(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals)?;
+                        validate_block(branch.block, locals, shadowed)?;
                     }
                     if let Some(otherwise) = statement.otherwise {
-                        validate_block(otherwise, locals)?;
+                        validate_block(otherwise, locals, shadowed)?;
                     }
                 }
                 TriggerStatement::Exception(statement) => {
-                    validate_block(statement.protected, locals)?;
+                    validate_block(statement.protected, locals, shadowed)?;
                     for handler in statement.handlers {
-                        validate_block(handler.block, locals)?;
+                        validate_block(handler.block, locals, shadowed)?;
                     }
                 }
                 _ => {}
@@ -20775,7 +20806,7 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
         }
         Ok(())
     }
-    validate_block(program.body, program.locals)
+    validate_block(program.body, program.locals, None)
 }
 
 fn resolve_plpgsql_column_type(
@@ -21846,6 +21877,43 @@ mod trigger_program_tests {
                 "END",
             ]
         );
+    }
+
+    #[test]
+    fn exception_matching_keeps_private_controls_outside_sql_handlers() {
+        crate::mem::guard::forbid_alloc(|| {
+            for state in [sqlstate::QUERY_CANCELED, sqlstate::ASSERT_FAILURE] {
+                let error = sql_err!(state, "special exception");
+                assert!(!trigger_exception_matches(
+                    TriggerExceptionCondition::Others,
+                    &error
+                ));
+                assert!(trigger_exception_matches(
+                    TriggerExceptionCondition::SqlState(crate::sql::eval::SqlState::known(state)),
+                    &error
+                ));
+            }
+            for state in [
+                sqlstate::INTERNAL_LOCK_WAIT,
+                sqlstate::INTERNAL_IO_WAIT,
+                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE,
+            ] {
+                let error = sql_err!(state, "private executor control");
+                assert!(!trigger_exception_matches(
+                    TriggerExceptionCondition::Others,
+                    &error
+                ));
+                assert!(!trigger_exception_matches(
+                    TriggerExceptionCondition::SqlState(crate::sql::eval::SqlState::known(state)),
+                    &error
+                ));
+                assert!(!trigger_exception_matches(
+                    TriggerExceptionCondition::SqlStateClass("PZ"),
+                    &error
+                ));
+            }
+        });
     }
 
     #[test]
@@ -25527,8 +25595,14 @@ fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>,
 }
 
 fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlError) -> bool {
+    if error.sqlstate.starts_with("PZ") {
+        return false;
+    }
     match condition {
-        TriggerExceptionCondition::Others => !error.sqlstate.starts_with("PZ"),
+        TriggerExceptionCondition::Others => !matches!(
+            error.sqlstate.as_str(),
+            sqlstate::QUERY_CANCELED | sqlstate::ASSERT_FAILURE
+        ),
         TriggerExceptionCondition::SqlState(state) => error.sqlstate == state,
         TriggerExceptionCondition::SqlStateClass(class) => error.sqlstate.starts_with(class),
     }
@@ -25857,11 +25931,21 @@ fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
     }
 }
 
-fn trigger_loop_integer(value: Datum<'_>, arena: &Arena) -> Result<i64, SqlError> {
-    match cast_to(value, ColType::Int8, arena)? {
-        Datum::Int8(value) => Ok(value),
-        _ => unreachable!("int8 cast must produce int8"),
+fn trigger_loop_integer(value: Datum<'_>, arena: &Arena, bound: &str) -> Result<i32, SqlError> {
+    match cast_to(value, ColType::Int4, arena)? {
+        Datum::Int4(value) => Ok(value),
+        Datum::Null => Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "{} of FOR loop cannot be null",
+            bound
+        )),
+        _ => unreachable!("integer cast must produce integer or null"),
     }
+}
+
+struct TriggerForRows<'a> {
+    values: &'a [Datum<'a>],
+    empty: Datum<'a>,
 }
 
 #[expect(
@@ -25877,7 +25961,7 @@ fn materialize_trigger_for_query<'result, 'query>(
     params: &[Datum<'result>],
     sequence: &dyn crate::sql::eval::SequenceAccess,
     scope: &TriggerLocalScope<'_, 'result>,
-) -> Result<&'result [Datum<'result>], SqlError>
+) -> Result<TriggerForRows<'result>, SqlError>
 where
     'result: 'query,
 {
@@ -25901,7 +25985,10 @@ where
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         },
     )?;
-    Ok(rows.as_slice())
+    Ok(TriggerForRows {
+        values: rows.as_slice(),
+        empty: Datum::Null,
+    })
 }
 
 fn materialize_plpgsql_dynamic_for_query<'a>(
@@ -25909,7 +25996,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     query: PlpgsqlDynamicQuery<'a>,
     scope: &TriggerLocalScope<'_, 'a>,
     record_target: bool,
-) -> Result<&'a [Datum<'a>], SqlError> {
+) -> Result<TriggerForRows<'a>, SqlError> {
     let arena = context.arena;
     let query = bind_plpgsql_dynamic_query(context, query, scope, DynamicCommandKind::Statement)?;
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
@@ -25980,7 +26067,22 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
             };
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         })?;
-        Ok(rows.as_slice())
+        let empty = if record_target && rows.as_slice().is_empty() {
+            let fields = arena
+                .alloc_slice_with(width, |index| RecordField {
+                    name: fields[index].0,
+                    type_oid: fields[index].1,
+                    value: Datum::Null,
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            Datum::Record(&*fields)
+        } else {
+            Datum::Null
+        };
+        Ok(TriggerForRows {
+            values: rows.as_slice(),
+            empty,
+        })
     })
 }
 
@@ -25997,7 +26099,7 @@ fn materialize_trigger_for_record_query<'result, 'query>(
     params: &[Datum<'result>],
     sequence: &dyn crate::sql::eval::SequenceAccess,
     scope: &TriggerLocalScope<'_, 'result>,
-) -> Result<&'result [Datum<'result>], SqlError>
+) -> Result<TriggerForRows<'result>, SqlError>
 where
     'result: 'query,
 {
@@ -26040,7 +26142,27 @@ where
                 .map_err(|_| super::query::arena_full_pub())
         },
     )?;
-    Ok(rows.as_slice())
+    let empty = if rows.as_slice().is_empty() {
+        let fields = result_arena
+            .alloc_slice_with(width, |index| RecordField {
+                name: "",
+                type_oid: columns[index].type_oid,
+                value: Datum::Null,
+            })
+            .map_err(|_| super::query::arena_full_pub())?;
+        for (field, column) in fields.iter_mut().zip(&columns[..width]) {
+            field.name = result_arena
+                .alloc_str(column.name)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        Datum::Record(&*fields)
+    } else {
+        Datum::Null
+    };
+    Ok(TriggerForRows {
+        values: rows.as_slice(),
+        empty,
+    })
 }
 
 fn restore_plpgsql_statement<'a>(
@@ -28176,19 +28298,131 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(None)
             }),
             TriggerStatement::For(program) => execute_trigger_statement(|| {
+                if let TriggerForSource::Numeric {
+                    lower,
+                    upper,
+                    step,
+                    reverse,
+                } = program.source
+                {
+                    let transition = TriggerTransition {
+                        definition: crate::storage::RelationDefinition::from_definition(definition),
+                        old,
+                        new: new.as_deref(),
+                    };
+                    // Range expressions bind outside the loop's implicit integer declaration.
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let lower = trigger_loop_integer(
+                        eval_procedural_expression(context, lower, &scope)?,
+                        context.arena,
+                        "lower bound",
+                    )?;
+                    let upper = trigger_loop_integer(
+                        eval_procedural_expression(context, upper, &scope)?,
+                        context.arena,
+                        "upper bound",
+                    )?;
+                    let step = trigger_loop_integer(
+                        eval_procedural_expression(context, step, &scope)?,
+                        context.arena,
+                        "BY value",
+                    )?;
+                    if step <= 0 {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "BY value of FOR loop must be greater than zero"
+                        ));
+                    }
+                    let existing = locals.iter().position(|local| local.name == program.target);
+                    let target = existing.unwrap_or(locals.len());
+                    let count = locals.len() + usize::from(existing.is_none());
+                    let loop_locals = context
+                        .arena
+                        .alloc_slice_with(count, |index| {
+                            if index == target {
+                                TriggerLocalDecl {
+                                    name: program.target,
+                                    ctype: ColType::Int4,
+                                    ..empty_plpgsql_local()
+                                }
+                            } else {
+                                locals[index]
+                            }
+                        })
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    let loop_values = allocate_plpgsql_local_values(context.arena, count)?;
+                    loop_values[..locals.len()].copy_from_slice(&local_values[..locals.len()]);
+                    let prior_target = loop_values[target];
+                    status.shadow_output_local(target)?;
+                    let mut iterated = false;
+                    let result = (|| {
+                        let mut value = lower;
+                        while if reverse {
+                            value >= upper
+                        } else {
+                            value <= upper
+                        } {
+                            iterated = true;
+                            loop_values[target] = Datum::Int4(value);
+                            match execute_trigger_block(
+                                context,
+                                definition,
+                                invocation,
+                                old,
+                                new,
+                                before,
+                                transition_relations,
+                                loop_locals,
+                                loop_values,
+                                program.block,
+                                status,
+                                exception,
+                            )? {
+                                Some(TriggerFlow::Return(result)) => {
+                                    return Ok(Some(TriggerFlow::Return(result)));
+                                }
+                                Some(TriggerFlow::Exit(0)) => break,
+                                Some(TriggerFlow::Continue(0)) | None => {}
+                                Some(TriggerFlow::Exit(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                                }
+                                Some(TriggerFlow::Continue(unwind)) => {
+                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                                }
+                            }
+                            let Some(next) = (if reverse {
+                                value.checked_sub(step)
+                            } else {
+                                value.checked_add(step)
+                            }) else {
+                                break;
+                            };
+                            value = next;
+                        }
+                        Ok(None)
+                    })();
+                    // Other locals retain assignments, including before an error or nonlocal exit.
+                    loop_values[target] = prior_target;
+                    local_values[..locals.len()].copy_from_slice(&loop_values[..locals.len()]);
+                    status.unshadow_output_local(target);
+                    if result.is_ok() {
+                        status.set_found(iterated);
+                    }
+                    return result;
+                }
                 let target = trigger_local_index(locals, program.target)?;
-                match program.source {
-                    TriggerForSource::Numeric {
-                        lower,
-                        upper,
-                        step,
-                        reverse,
-                    } => {
-                        // A numeric FOR target is an implicit loop-local that
-                        // shadows an existing declaration of the same name.
-                        let prior_target = local_values[target];
-                        status.set_found(false);
-                        let mut iterated = false;
+                let query_source = matches!(
+                    program.source,
+                    TriggerForSource::Query(_) | TriggerForSource::DynamicQuery(_)
+                );
+                let values = match program.source {
+                    TriggerForSource::Query(query) => {
                         let transition = TriggerTransition {
                             definition: crate::storage::RelationDefinition::from_definition(
                                 definition,
@@ -28203,438 +28437,181 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             invocation,
                             transition: &transition,
                         };
-                        let lower = trigger_loop_integer(
-                            eval_procedural_expression(context, lower, &scope)?,
-                            context.arena,
-                        )?;
-                        let upper = trigger_loop_integer(
-                            eval_procedural_expression(context, upper, &scope)?,
-                            context.arena,
-                        )?;
-                        let step = trigger_loop_integer(
-                            eval_procedural_expression(context, step, &scope)?,
-                            context.arena,
-                        )?;
-                        if step <= 0 {
-                            return Err(sql_err!(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                "FOR loop step must be greater than zero"
-                            ));
-                        }
-                        status.shadow_output_local(target)?;
-                        let mut value = lower;
-                        while if reverse {
-                            value >= upper
-                        } else {
-                            value <= upper
-                        } {
-                            iterated = true;
-                            if let Err(error) = assign_trigger_local(
-                                context,
-                                locals,
-                                local_values,
-                                program.target,
-                                Datum::Int8(value),
-                            ) {
-                                status.unshadow_output_local(target);
-                                local_values[target] = prior_target;
-                                return Err(error);
-                            }
-                            let flow = match execute_trigger_block(
-                                context,
-                                definition,
-                                invocation,
-                                old,
-                                new,
-                                before,
-                                transition_relations,
-                                locals,
-                                local_values,
-                                program.block,
-                                status,
-                                exception,
-                            ) {
-                                Ok(flow) => flow,
-                                Err(error) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Err(error);
-                                }
-                            };
-                            match flow {
-                                Some(TriggerFlow::Return(result)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Return(result)));
-                                }
-                                Some(TriggerFlow::Exit(0)) => break,
-                                Some(TriggerFlow::Continue(0)) | None => {}
-                                Some(TriggerFlow::Exit(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                                }
-                                Some(TriggerFlow::Continue(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                                }
-                            }
-                            let Some(next) = (if reverse {
-                                value.checked_sub(step)
+                        let arena = context.arena;
+                        let params = context.params;
+                        let txid = context.txn.txid;
+                        execute_procedural_query(context, |storage, sequence| {
+                            if locals[target].ctype == ColType::Record {
+                                materialize_trigger_for_record_query(
+                                    storage, query, arena, arena, txid, params, sequence, &scope,
+                                )
                             } else {
-                                value.checked_add(step)
-                            }) else {
-                                break;
-                            };
-                            value = next;
-                        }
-                        local_values[target] = prior_target;
-                        status.unshadow_output_local(target);
-                        status.set_found(iterated);
-                    }
-                    TriggerForSource::Query(query) => {
-                        status.set_found(false);
-                        let mut iterated = false;
-                        let query = match transition_relations {
-                            Some(relations) => super::query::bind_materialized_relations(
-                                query,
-                                relations,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                            )?,
-                            None => query,
-                        };
-                        let values = {
-                            let transition = TriggerTransition {
-                                definition: crate::storage::RelationDefinition::from_definition(
-                                    definition,
-                                ),
-                                old,
-                                new: new.as_deref(),
-                            };
-                            let scope = TriggerLocalScope {
-                                locals,
-                                values: &local_values[..locals.len()],
-                                found: status.found,
-                                invocation,
-                                transition: &transition,
-                            };
-                            let arena = context.arena;
-                            let params = context.params;
-                            let txid = context.txn.txid;
-                            execute_procedural_query(context, |storage, sequence| {
-                                if locals[target].ctype == ColType::Record {
-                                    materialize_trigger_for_record_query(
-                                        storage, query, arena, arena, txid, params, sequence,
-                                        &scope,
-                                    )
-                                } else {
-                                    materialize_trigger_for_query(
-                                        storage, query, arena, arena, txid, params, sequence,
-                                        &scope,
-                                    )
-                                }
-                            })?
-                        };
-                        let prior_target = local_values[target];
-                        status.shadow_output_local(target)?;
-                        for value in values.iter().copied() {
-                            iterated = true;
-                            if let Err(error) = assign_trigger_local(
-                                context,
-                                locals,
-                                local_values,
-                                program.target,
-                                value,
-                            ) {
-                                status.unshadow_output_local(target);
-                                local_values[target] = prior_target;
-                                return Err(error);
+                                materialize_trigger_for_query(
+                                    storage, query, arena, arena, txid, params, sequence, &scope,
+                                )
                             }
-                            let flow = match execute_trigger_block(
-                                context,
-                                definition,
-                                invocation,
-                                old,
-                                new,
-                                before,
-                                transition_relations,
-                                locals,
-                                local_values,
-                                program.block,
-                                status,
-                                exception,
-                            ) {
-                                Ok(flow) => flow,
-                                Err(error) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Err(error);
-                                }
-                            };
-                            match flow {
-                                Some(TriggerFlow::Return(result)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Return(result)));
-                                }
-                                Some(TriggerFlow::Exit(0)) => break,
-                                Some(TriggerFlow::Continue(0)) | None => {}
-                                Some(TriggerFlow::Exit(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                                }
-                                Some(TriggerFlow::Continue(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                                }
-                            }
-                        }
-                        local_values[target] = prior_target;
-                        status.unshadow_output_local(target);
-                        status.set_found(iterated);
+                        })?
                     }
                     TriggerForSource::DynamicQuery(query) => {
-                        status.set_found(false);
-                        let mut iterated = false;
-                        let values = {
-                            let transition = TriggerTransition {
-                                definition: crate::storage::RelationDefinition::from_definition(
-                                    definition,
-                                ),
-                                old,
-                                new: new.as_deref(),
-                            };
-                            let scope = TriggerLocalScope {
-                                locals,
-                                values: &local_values[..locals.len()],
-                                found: status.found,
-                                invocation,
-                                transition: &transition,
-                            };
-                            materialize_plpgsql_dynamic_for_query(
-                                context,
-                                query,
-                                &scope,
-                                locals[target].ctype == ColType::Record,
-                            )?
-                        };
-                        let prior_target = local_values[target];
-                        status.shadow_output_local(target)?;
-                        for value in values.iter().copied() {
-                            iterated = true;
-                            if let Err(error) = assign_trigger_local(
-                                context,
-                                locals,
-                                local_values,
-                                program.target,
-                                value,
-                            ) {
-                                status.unshadow_output_local(target);
-                                local_values[target] = prior_target;
-                                return Err(error);
-                            }
-                            let flow = match execute_trigger_block(
-                                context,
+                        let transition = TriggerTransition {
+                            definition: crate::storage::RelationDefinition::from_definition(
                                 definition,
-                                invocation,
-                                old,
-                                new,
-                                before,
-                                transition_relations,
-                                locals,
-                                local_values,
-                                program.block,
-                                status,
-                                exception,
-                            ) {
-                                Ok(flow) => flow,
-                                Err(error) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Err(error);
-                                }
-                            };
-                            match flow {
-                                Some(TriggerFlow::Return(result)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Return(result)));
-                                }
-                                Some(TriggerFlow::Exit(0)) => break,
-                                Some(TriggerFlow::Continue(0)) | None => {}
-                                Some(TriggerFlow::Exit(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                                }
-                                Some(TriggerFlow::Continue(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                                }
-                            }
-                        }
-                        local_values[target] = prior_target;
-                        status.unshadow_output_local(target);
-                        status.set_found(iterated);
+                            ),
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        materialize_plpgsql_dynamic_for_query(
+                            context,
+                            query,
+                            &scope,
+                            locals[target].ctype == ColType::Record,
+                        )?
                     }
                     TriggerForSource::Array { expression, slice } => {
-                        status.set_found(false);
-                        let mut iterated = false;
-                        let values = {
-                            let transition = TriggerTransition {
-                                definition: crate::storage::RelationDefinition::from_definition(
-                                    definition,
-                                ),
-                                old,
-                                new: new.as_deref(),
-                            };
-                            let scope = TriggerLocalScope {
-                                locals,
-                                values: &local_values[..locals.len()],
-                                found: status.found,
-                                invocation,
-                                transition: &transition,
-                            };
-                            let array = eval_procedural_expression(context, expression, &scope)?;
-                            let Datum::Array { element, raw } = array else {
-                                if array.is_null() {
-                                    return Ok(None);
-                                }
-                                return Err(sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "FOREACH expression must yield an array"
-                                ));
-                            };
-                            let shape =
-                                crate::sql::array::shape(raw).expect("array datum invariant");
-                            let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
-                            if slice_rank > shape.dimension_count() {
-                                return Err(sql_err!(
-                                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                                    "FOREACH SLICE {} exceeds array dimensions {}",
-                                    slice_rank,
-                                    shape.dimension_count()
-                                ));
-                            }
-                            let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
-                            let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
-                            for index in 0..slice_rank {
-                                let source = shape.dimension_count() - slice_rank + index;
-                                dimensions[index] = shape.dimension(source).unwrap();
-                                lower_bounds[index] = shape.lower_bound(source).unwrap();
-                            }
-                            let slice_shape = crate::sql::array::Shape::new(
-                                &dimensions[..slice_rank],
-                                &lower_bounds[..slice_rank],
-                            )?;
-                            let width = if slice_rank == 0 {
-                                1
-                            } else {
-                                slice_shape.element_count()
-                            };
-                            let values = context
-                                .arena
-                                .alloc_slice_with(crate::sql::array::len(raw) / width, |_| {
-                                    Datum::Null
-                                })
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            let mut elements = crate::sql::array::elements(raw, element);
-                            for value in values.iter_mut() {
-                                if slice_rank == 0 {
-                                    *value = detached_trigger_datum(
-                                        elements.next().expect("array datum invariant"),
-                                        context.arena,
-                                    )?;
-                                } else {
-                                    let items = context
-                                        .arena
-                                        .alloc_slice_with(width, |_| Datum::Null)
-                                        .map_err(|_| super::query::arena_full_pub())?;
-                                    for (item, source) in
-                                        items.iter_mut().zip(elements.by_ref().take(width))
-                                    {
-                                        *item = source;
-                                    }
-                                    *value = Datum::Array {
-                                        element,
-                                        raw: crate::sql::array::build_shaped(
-                                            items,
-                                            slice_shape,
-                                            context.arena,
-                                        )?,
-                                    };
-                                }
-                            }
-                            &*values
-                        };
-                        let prior_target = local_values[target];
-                        status.shadow_output_local(target)?;
-                        for value in values.iter().copied() {
-                            iterated = true;
-                            if let Err(error) = assign_trigger_local(
-                                context,
-                                locals,
-                                local_values,
-                                program.target,
-                                value,
-                            ) {
-                                status.unshadow_output_local(target);
-                                local_values[target] = prior_target;
-                                return Err(error);
-                            }
-                            let flow = match execute_trigger_block(
-                                context,
+                        let transition = TriggerTransition {
+                            definition: crate::storage::RelationDefinition::from_definition(
                                 definition,
-                                invocation,
-                                old,
-                                new,
-                                before,
-                                transition_relations,
-                                locals,
-                                local_values,
-                                program.block,
-                                status,
-                                exception,
-                            ) {
-                                Ok(flow) => flow,
-                                Err(error) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Err(error);
+                            ),
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        let array = eval_procedural_expression(context, expression, &scope)?;
+                        let Datum::Array { element, raw } = array else {
+                            if array.is_null() {
+                                return Err(sql_err!(
+                                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                    "FOREACH expression must not be null"
+                                ));
+                            }
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "FOREACH expression must yield an array"
+                            ));
+                        };
+                        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+                        let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
+                        if slice_rank > shape.dimension_count() {
+                            return Err(sql_err!(
+                                sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                                "FOREACH SLICE {} exceeds array dimensions {}",
+                                slice_rank,
+                                shape.dimension_count()
+                            ));
+                        }
+                        let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
+                        let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
+                        for index in 0..slice_rank {
+                            let source = shape.dimension_count() - slice_rank + index;
+                            dimensions[index] = shape.dimension(source).unwrap();
+                            lower_bounds[index] = shape.lower_bound(source).unwrap();
+                        }
+                        let slice_shape = crate::sql::array::Shape::new(
+                            &dimensions[..slice_rank],
+                            &lower_bounds[..slice_rank],
+                        )?;
+                        let width = if slice_rank == 0 {
+                            1
+                        } else {
+                            slice_shape.element_count()
+                        };
+                        let values = context
+                            .arena
+                            .alloc_slice_with(crate::sql::array::len(raw) / width, |_| Datum::Null)
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        let mut elements = crate::sql::array::elements(raw, element);
+                        for value in values.iter_mut() {
+                            if slice_rank == 0 {
+                                *value = detached_trigger_datum(
+                                    elements.next().expect("array datum invariant"),
+                                    context.arena,
+                                )?;
+                            } else {
+                                let items = context
+                                    .arena
+                                    .alloc_slice_with(width, |_| Datum::Null)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                for (item, source) in
+                                    items.iter_mut().zip(elements.by_ref().take(width))
+                                {
+                                    *item = source;
                                 }
-                            };
-                            match flow {
-                                Some(TriggerFlow::Return(result)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Return(result)));
-                                }
-                                Some(TriggerFlow::Exit(0)) => break,
-                                Some(TriggerFlow::Continue(0)) | None => {}
-                                Some(TriggerFlow::Exit(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                                }
-                                Some(TriggerFlow::Continue(unwind)) => {
-                                    status.unshadow_output_local(target);
-                                    local_values[target] = prior_target;
-                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                                }
+                                *value = Datum::Array {
+                                    element,
+                                    raw: crate::sql::array::build_shaped(
+                                        items,
+                                        slice_shape,
+                                        context.arena,
+                                    )?,
+                                };
                             }
                         }
-                        local_values[target] = prior_target;
-                        status.unshadow_output_local(target);
-                        status.set_found(iterated);
+                        TriggerForRows {
+                            values: &*values,
+                            empty: Datum::Null,
+                        }
+                    }
+                    TriggerForSource::Numeric { .. } => unreachable!("numeric loop handled above"),
+                };
+                if query_source && values.values.is_empty() {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        program.target,
+                        values.empty,
+                    )?;
+                    status.assign_output_local(target, local_values[target]);
+                }
+                let mut iterated = false;
+                for value in values.values.iter().copied() {
+                    iterated = true;
+                    assign_trigger_local(context, locals, local_values, program.target, value)?;
+                    status.assign_output_local(target, local_values[target]);
+                    match execute_trigger_block(
+                        context,
+                        definition,
+                        invocation,
+                        old,
+                        new,
+                        before,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        program.block,
+                        status,
+                        exception,
+                    )? {
+                        Some(TriggerFlow::Return(result)) => {
+                            status.set_found(iterated);
+                            return Ok(Some(TriggerFlow::Return(result)));
+                        }
+                        Some(TriggerFlow::Exit(0)) => break,
+                        Some(TriggerFlow::Continue(0)) | None => {}
+                        Some(TriggerFlow::Exit(unwind)) => {
+                            status.set_found(iterated);
+                            return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                        }
+                        Some(TriggerFlow::Continue(unwind)) => {
+                            status.set_found(iterated);
+                            return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                        }
                     }
                 }
-
+                status.set_found(iterated);
                 Ok(None)
             }),
             TriggerStatement::While(program) => execute_trigger_statement(|| {

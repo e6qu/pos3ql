@@ -8,6 +8,16 @@ SQL-callable functions. It supplements the historical runtime archives below.
 This archive records PostgreSQL 18.6 behavior used by the native and differential
 regressions. CI must test the final PR revision before merge.
 
+[loop-reference.zip](loop-reference.zip), SHA256
+`16bdad10534665025b24f92ae155d1aceafb6df777e684c6e56d6b8c55bb61f5`,
+records implicit integer loop variables, shadowed names, retained query and array
+targets, empty record results, range errors and exception matching on PostgreSQL
+18.6. For example, a numeric loop leaves an outer variable unchanged, while a
+query loop retains its last assigned value. It includes the exact SQL, raw
+results, runner, commands, binary hashes and provenance. Extract it and run
+`python3 verify-loop-reference.py .` to verify the evidence. This establishes
+reference behavior; the matching pos3ql tests must still pass in CI.
+
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the
 [original runner artifact](https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290).

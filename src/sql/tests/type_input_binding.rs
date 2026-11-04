@@ -1,5 +1,63 @@
 use super::*;
 
+// PostgreSQL 18.6 loop-reference.zip, fixture SHA256:
+// b934a4c6c3f4e838aa179b52d276858e35c68edbcb6c8696baccdb9f65e9c5a4.
+#[test]
+fn procedural_loop_variables_keep_their_postgresql_scope_and_final_values() {
+    let fixture =
+        include_str!("../../../tests/external/differential/219_procedural_loop_scopes.sql");
+    let setup = fixture
+        .split("-- Execute and inspect the completed results.")
+        .next()
+        .unwrap();
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-loop-scopes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, setup, true);
+        for (query, expected) in [
+            ("SELECT loop_private_scope()", vec!["outer:constant:78"]),
+            (
+                "SELECT loop_retained_targets()",
+                vec!["tt:2:t:3:6:6:f:null:f"],
+            ),
+            (
+                "SELECT * FROM loop_output_targets()",
+                vec!["41", "41", "1", "2", "3", "4", "4"],
+            ),
+            (
+                "SELECT loop_range_errors()",
+                vec!["22004,22004,22004,22023,22003,22004"],
+            ),
+            ("SELECT loop_empty_records()", vec!["null:null"]),
+            ("SELECT exception_special_classes()", vec!["assert:cancel"]),
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, query, true)),
+                expected,
+                "{mode:?}: {query}"
+            );
+        }
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION loop_outside_scope() RETURNS integer LANGUAGE plpgsql AS $$ \
+             BEGIN FOR attempt IN 1..2 LOOP NULL; END LOOP; RETURN attempt; END$$",
+            true,
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, "SELECT loop_outside_scope()", true)),
+            ["42703"]
+        );
+        assert_eq!(error_sqlstates(&session.execute(&mut engine,
+            "DO $$DECLARE fixed CONSTANT integer:=7; BEGIN FOR fixed IN 1..2 LOOP fixed:=fixed+1; END LOOP; fixed:=8; END$$", true)), ["22005"]);
+    }
+}
+
 // PG18.6 execution-reference.zip, SQL SHA256:
 // f0793cd42fbcbffd777ee574a5283fd2a159bbfff1df3063b6bb30ee5222c5b1.
 #[test]

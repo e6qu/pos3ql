@@ -4714,7 +4714,9 @@ fn lock_state_is_synchronized_and_startup_bounded() {
             scope.spawn(move || {
                 for offset in 0..1_000u32 {
                     let mut locks = locks.lock().expect("lock state lock poisoned");
-                    let sequence = locks.next_sequence();
+                    let sequence = locks
+                        .next_sequence()
+                        .expect("the bounded fixture has acquisition identities");
                     if offset == 0 {
                         let owner = 100 + worker;
                         let mut modes = [0; 8];

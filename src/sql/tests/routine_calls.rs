@@ -3546,7 +3546,7 @@ fn planner_metadata_preserves_record_shapes_target_names_and_index_comments() {
                 state.into_iter().collect::<Vec<_>>(),
                 "{mode:?}: {statement}"
             );
-            errors.extend(error_sqlstates(&output));
+            errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
             rows.extend(data_rows(&output));
         }
         assert_eq!(errors, ["42703", "42809", "42P01", "42P01"]);

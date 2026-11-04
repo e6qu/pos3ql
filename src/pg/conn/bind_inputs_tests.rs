@@ -1684,14 +1684,9 @@ fn concurrent_reindex_cancel_keeps_the_published_replacement_and_old_constraint(
             "{step:?}: {}",
             String::from_utf8_lossy(builder.send.readable())
         );
-        assert_eq!(
-            builder
-                .txn
-                .concurrent_index
-                .as_ref()
-                .expect("replacement must publish before writer wait")
-                .phase,
-            crate::sql::concurrent_index::Phase::WaitBuild,
+        assert!(
+            builder.txn.staged_commit().is_none(),
+            "the writer wait must follow durable replacement publication"
         );
         assert_eq!(
             first_row(&query(

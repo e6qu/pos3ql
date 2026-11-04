@@ -48719,7 +48719,9 @@ impl Storage {
         {
             return Ok(());
         }
-        let table = self.index_table_slot(slot);
+        let table = matches!(self.index(slot).relation, IndexRelationSource::Table)
+            .then(|| self.index_table_slot(slot))
+            .flatten();
         if let Some(table) = table {
             self.preview_index_generation(table, admitted)?;
         }
@@ -49040,7 +49042,8 @@ impl Storage {
         } else {
             0
         };
-        let ownership = self.initial_ownership(txid)?;
+        // Creation requires a live actor; the selected table owns its indexes.
+        self.initial_ownership(txid)?;
         let table = self.resolve_index_source_table(def, txid)?;
         let selected_binding = self.capture_index_binding(table, txid);
         let table_lifecycle = loop {
@@ -49080,6 +49083,10 @@ impl Storage {
             drop(table_lifecycle);
             return Err(self.catalog_ddl_wait_error(txid, owner, def.table.as_str()));
         }
+        let ownership = Ownership {
+            owner: state.identity.ownership.owner_to(txid),
+            pending: None,
+        };
         drop(state);
         let _table_lifecycle = table_lifecycle;
         def.table_binding = Some(selected_binding);
@@ -49369,9 +49376,10 @@ impl Storage {
         else {
             return Ok(());
         };
-        let table = (selected.mutable.kind.ready() != pending.definition.kind.ready())
-            .then(|| self.index_table_slot_to(slot, transaction))
-            .flatten();
+        let table = (matches!(selected.relation, IndexRelationSource::Table)
+            && selected.mutable.kind.ready() != pending.definition.kind.ready())
+        .then(|| self.index_table_slot_to(slot, transaction))
+        .flatten();
         if let Some(table) = table {
             self.preview_index_generation(table, admitted)?;
         }

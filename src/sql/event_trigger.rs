@@ -196,18 +196,45 @@ impl EventObject {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DdlCommand {
-    reference: EventObjectRef,
+    reference: CommandReference,
     pub command_tag: StackStr<64>,
     pub in_extension: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandReference {
+    Object(EventObjectRef),
+    ReindexedIndex {
+        slot: usize,
+        identity: crate::storage::RelationIdentity,
+    },
+}
+
 impl DdlCommand {
-    pub(crate) fn object(self, storage: &Storage, txid: u32) -> Result<EventObject, SqlError> {
-        self.reference.materialize(storage, txid)
+    pub(crate) fn object(
+        self,
+        storage: &Storage,
+        txid: u32,
+    ) -> Result<Option<EventObject>, SqlError> {
+        match self.reference {
+            CommandReference::Object(reference) => reference.materialize(storage, txid).map(Some),
+            CommandReference::ReindexedIndex { slot, identity } => {
+                let Some(index) = storage.index_visible_to(slot, txid) else {
+                    return Ok(None);
+                };
+                if index.created_at != identity.created_at() {
+                    return Ok(None);
+                }
+                index_definition_object(&index, txid).map(Some)
+            }
+        }
     }
 
     pub(crate) const fn addressed(self) -> bool {
-        !matches!(self.reference, EventObjectRef::Utility(_))
+        !matches!(
+            self.reference,
+            CommandReference::Object(EventObjectRef::Utility(_))
+        )
     }
 }
 
@@ -1579,6 +1606,22 @@ fn operator_object(storage: &Storage, txid: u32, slot: usize) -> Result<EventObj
     Ok(object)
 }
 
+fn index_definition_object(
+    index: &crate::storage::IndexDef,
+    txid: u32,
+) -> Result<EventObject, SqlError> {
+    let name = index.name_for(txid);
+    Ok(base_object(
+        catalog::PG_CLASS_OID,
+        catalog::explicit_index_oid(index),
+        "index",
+        Some(index.schema.as_str()),
+        Some(name.as_str()),
+        qualified(index.schema.as_str(), name.as_str())?,
+        false,
+    ))
+}
+
 fn access_method_object(
     class_id: i32,
     oid: i32,
@@ -1689,16 +1732,7 @@ fn primary_object(
             let index = storage
                 .index_for_event_trigger(slot, txid)
                 .ok_or_else(graph_full)?;
-            let name = index.name_for(txid);
-            base_object(
-                catalog::PG_CLASS_OID,
-                catalog::explicit_index_oid(&index),
-                "index",
-                Some(index.schema.as_str()),
-                Some(name.as_str()),
-                qualified(index.schema.as_str(), name.as_str())?,
-                false,
-            )
+            index_definition_object(&index, txid)?
         }
         ObjectRef::Schema(slot) => {
             let schema = storage.schema_def(slot).name;
@@ -3179,7 +3213,7 @@ fn push_command(
 ) -> Result<(), SqlError> {
     output
         .push(DdlCommand {
-            reference,
+            reference: CommandReference::Object(reference),
             command_tag: StackStr::from_str(tag),
             in_extension,
         })
@@ -4093,7 +4127,9 @@ pub(crate) struct EventGraphs<'a> {
     pub drops: &'a [DroppedObject],
 }
 
-/// Internal reindex commits have cleared their undo logs before end hooks run.
+/// PostgreSQL collects index addresses across internal commits and calls the
+/// outer end hook once; pg_event_trigger_ddl_commands resolves current names
+/// and omits addresses that have since disappeared (REL_18_6 event_trigger.c).
 pub(crate) fn completed_reindex_graphs<'a>(
     storage: &Storage,
     txid: u32,
@@ -4103,31 +4139,24 @@ pub(crate) fn completed_reindex_graphs<'a>(
     arena: &'a Arena,
 ) -> Result<EventGraphs<'a>, SqlError> {
     let mut commands = ArenaList::new(arena);
-    let mut count = 0;
     for replacement in replacements {
-        let index = storage
-            .index_visible_to(replacement.new_slot, txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::SERIALIZATION_FAILURE,
-                    "completed reindex replacement is no longer visible"
-                )
-            })?;
-        if index.created_at != replacement.new_created_at
-            || storage.index_table_slot_to(replacement.new_slot, txid) != Some(replacement.table)
-        {
-            return Err(sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "completed reindex replacement changed its selected lifetime"
-            ));
+        let Some(index) = storage.index_visible_to(replacement.new_slot, txid) else {
+            continue;
+        };
+        if index.created_at != replacement.new_created_at {
+            continue;
         }
-        push_command(
-            &mut commands,
-            &mut count,
-            EventObjectRef::Primary(ObjectRef::Index(replacement.new_slot)),
-            tag,
-            in_extension,
-        )?;
+        commands
+            .push(DdlCommand {
+                reference: CommandReference::ReindexedIndex {
+                    slot: replacement.new_slot,
+                    identity: crate::storage::RelationIdentity::parse(replacement.new_created_at)
+                        .expect("completed reindex has an admitted relation identity"),
+                },
+                command_tag: StackStr::from_str(tag),
+                in_extension,
+            })
+            .map_err(|_| graph_full())?;
     }
     Ok(EventGraphs {
         commands: commands.as_slice(),

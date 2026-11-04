@@ -254,8 +254,11 @@ fn event_trigger_rows<'a>(
             let rows = arena
                 .alloc_slice_with(commands.len(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
-            for (slot, command) in rows.iter_mut().zip(commands) {
-                let object = command.object(storage, txid)?;
+            let mut count = 0;
+            for command in commands {
+                let Some(object) = command.object(storage, txid)? else {
+                    continue;
+                };
                 let addressed = command.addressed();
                 let class_id = if addressed {
                     Datum::Oid(object.class_id as u32)
@@ -277,7 +280,7 @@ fn event_trigger_rows<'a>(
                 } else {
                     Datum::Null
                 };
-                *slot = crate::sql::exec::encode_projected_pub(
+                rows[count] = crate::sql::exec::encode_projected_pub(
                     &[
                         class_id,
                         object_id,
@@ -294,8 +297,9 @@ fn event_trigger_rows<'a>(
                     ],
                     arena,
                 )?;
+                count += 1;
             }
-            Ok(&*rows)
+            Ok(&rows[..count])
         })?;
     }
     crate::sql::event_trigger::with_dropped_objects(|objects| {
@@ -1734,7 +1738,12 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
     if is_event_trigger_introspection(name) {
         require_no_arguments(name, args)?;
         return if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
-            crate::sql::event_trigger::with_ddl_commands(|rows| rows.len())
+            crate::sql::event_trigger::with_ddl_commands(|rows| {
+                rows.iter()
+                    .try_fold(0, |count, command| -> Result<usize, SqlError> {
+                        Ok(count + usize::from(command.object(storage, txid)?.is_some()))
+                    })
+            })?
         } else {
             crate::sql::event_trigger::with_dropped_objects(|rows| rows.len())
         };

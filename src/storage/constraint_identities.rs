@@ -603,21 +603,22 @@ mod tests {
             restored
                 .restore_table(position, replacement.clone(), TableCreation::Committed)
                 .unwrap();
-            let recovered = restored.table_def(slot, 0);
-            assert!(
-                recovered
-                    .constraint_identities()
-                    .eq(replacement.constraint_identities())
-            );
-            assert!(
-                recovered
-                    .implicit_index_identities()
-                    .eq(replacement.implicit_index_identities())
-            );
+            {
+                let recovered = restored.table_def(slot, 0);
+                assert!(
+                    recovered
+                        .constraint_identities()
+                        .eq(replacement.constraint_identities())
+                );
+                assert!(
+                    recovered
+                        .implicit_index_identities()
+                        .eq(replacement.implicit_index_identities())
+                );
+            }
             restored
                 .validate_restored_constraint_identities(restored.catalog_identity_sequence())
                 .unwrap();
-            drop(recovered);
 
             let mut invalid = replacement.clone();
             invalid.uniques[0].identity = invalid.exclusions[0].identity;

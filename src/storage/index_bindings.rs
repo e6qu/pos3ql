@@ -684,6 +684,33 @@ mod tests {
             storage
                 .validate_restored_relation_identities(storage.catalog_identity_sequence())
                 .unwrap();
+            let generation = storage.table(owner).generation();
+            for kind in [IndexKind::OrdinaryUnbuilt, IndexKind::Ordinary] {
+                let mut changed = storage.index_visible_to(slot, 0).unwrap().mutable;
+                changed.kind = kind;
+                assert!(
+                    storage
+                        .alter_index_definition(slot, changed, 7)
+                        .unwrap()
+                        .is_none()
+                );
+                storage
+                    .prepare_index_definition_enforcers(slot, 7, IndexBindingOperation::State)
+                    .unwrap();
+                storage.publish_index_definition(slot, 7).unwrap();
+                assert_eq!(
+                    storage.index_visible_to(slot, 0).unwrap().mutable.kind,
+                    kind
+                );
+                assert_eq!(storage.table(owner).generation(), generation);
+                assert_eq!(storage.indexes_for("public", "toast_owner", 0).count(), 0);
+            }
+            for name in [SqlName::parse("toast_retired").unwrap(), definition.name] {
+                assert!(storage.rename_index(slot, name, 7).unwrap().is_none());
+                storage.publish_index_rename(slot, 7).unwrap();
+                assert_eq!(storage.index_visible_to(slot, 0).unwrap().name, name);
+                assert_eq!(storage.table(owner).generation(), generation);
+            }
             let mut stale = definition;
             stale.created_at = 0;
             stale.name = SqlName::parse("stale_toast").unwrap();
@@ -695,6 +722,93 @@ mod tests {
                 sqlstate::SERIALIZATION_FAILURE
             );
             assert_eq!(storage.indexes_for("public", "toast_owner", 0).count(), 0);
+        });
+    }
+
+    #[test]
+    fn index_admission_uses_the_selected_table_owner_for_live_and_replayed_definitions() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let (owner, _) = storage
+                .create_role(
+                    SqlName::parse("selected_index_owner").unwrap(),
+                    RoleAttributes::ORDINARY,
+                    7,
+                )
+                .unwrap();
+            storage.commit_role_change(owner);
+            let table = storage
+                .create_table(make_def(
+                    "owned_index_source",
+                    &[("value", ColType::Text, false)],
+                ))
+                .unwrap();
+            let table_object = AccessObject {
+                class: AccessClass::Table,
+                slot: table as u16,
+            };
+            assert!(storage.set_object_owner(table_object, owner, 7).is_none());
+            let ordinary = IndexDef {
+                schema: SqlName::parse("public").unwrap(),
+                table: SqlName::parse("owned_index_source").unwrap(),
+                name: SqlName::parse("owned_index").unwrap(),
+                n_cols: 1,
+                ..IndexDef::EMPTY
+            };
+            let ordinary_slot = storage.create_index(ordinary, 7).unwrap();
+            let admitted = storage.index_visible_to(ordinary_slot, 7).unwrap();
+            assert_eq!(admitted.ownership.owner_to(7), owner as u16);
+            assert_eq!(admitted.ownership.pending, None);
+            storage.commit_index_create(ordinary_slot).unwrap();
+            storage.commit_object_owner(table_object, 7);
+            assert_eq!(
+                storage
+                    .index_visible_to(ordinary_slot, 0)
+                    .unwrap()
+                    .ownership
+                    .owner,
+                owner as u16
+            );
+
+            let position = storage.table_position(table);
+            let anchor = storage.table_def(table, 0).toast_index_identity.unwrap();
+            let main_oid = RelationIdentity::parse(position.created_at())
+                .unwrap()
+                .oid();
+            let table_name = crate::stack_format!(64, "pg_toast_{main_oid}");
+            let index_name = crate::stack_format!(64, "pg_toast_{main_oid}_index");
+            let mut replayed = IndexDef {
+                relation: IndexRelationSource::Toast(position),
+                created_at: anchor.created_at(),
+                schema: SqlName::parse("pg_toast").unwrap(),
+                table: SqlName::parse(table_name.as_str()).unwrap(),
+                name: SqlName::parse(index_name.as_str()).unwrap(),
+                unique: true,
+                n_cols: 2,
+                collations: [Collation::None; MAX_INDEX_COLS],
+                ..IndexDef::EMPTY
+            };
+            replayed.columns[1] = 1;
+            replayed.resolved_operator_classes[0] =
+                Some(IndexOperatorClass::Btree(BtreeOperatorClass::Oid));
+            replayed.resolved_operator_classes[1] =
+                Some(IndexOperatorClass::Btree(BtreeOperatorClass::Int4));
+            let toast = storage.create_index(replayed, 0).unwrap();
+            storage.commit_index_create(toast).unwrap();
+            assert_eq!(
+                storage.index_visible_to(toast, 0).unwrap().ownership.owner,
+                owner as u16
+            );
+            assert_eq!(
+                storage
+                    .indexes_for("public", "owned_index_source", 0)
+                    .count(),
+                1
+            );
         });
     }
 

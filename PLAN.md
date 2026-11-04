@@ -160,6 +160,10 @@ also gives the large-value index its own lifetime and preserves deferred
 uniqueness while its replacement is detached. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.
+Verify one final end hook reads current names and omits an earlier index dropped
+while a later table waits, including reuse of the released catalog slot.
+Choose generated key names once at admission, including legal long identifiers
+and collisions with another relation; retain them through rename and recovery.
 Qualify all four workflows on the finished revision; a source check or a
 PostgreSQL reference probe alone does not establish those runtime guarantees.
 

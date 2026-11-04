@@ -360,6 +360,10 @@ The table's primary-key constraint keeps its identifier and comment; its
 backing index receives a new identifier. The virtual large-value index follows
 the same lifetime rules without introducing a separate PostgreSQL chunk heap.
 Schema and database rebuilds finish one table before moving to the next.
+Their end hooks run once after the complete command. If another connection
+renames an earlier index while a later table waits, the hook reports its current
+name. If that connection drops the index, the hook omits it. An index that later
+reuses its catalog slot does not appear in that earlier event.
 
 These waits retain their source, selected table lifetime and bounded metadata
 leases across commits. Cancellation can leave a committed invalid replacement

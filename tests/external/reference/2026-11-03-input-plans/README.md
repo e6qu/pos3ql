@@ -49,6 +49,15 @@ commands and source/binary hashes. Extract it and run
 `python3 verify-reindex-reference.py .` to verify its 62 hashed files. Its recorded
 source revision is `5119b065`; the reference SQL is preserved separately.
 
+PostgreSQL retains index addresses across each table's internal commits
+([indexcmds.c](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/indexcmds.c#L3235))
+and runs one outer end callback
+([utility.c](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/tcop/utility.c#L1830)).
+The callback helper reads current identities and skips missing objects
+([event_trigger.c](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/event_trigger.c#L1988)).
+An earlier index can therefore be renamed or dropped while a later table waits;
+the event list must not preserve its old name or identify a reused slot.
+
 [toast-reference.zip](toast-reference.zip), SHA256
 `42ede35ea6e1b88c6747c98003e78e1e8dc422ccae58f4dedca1d35ec7276331`,
 records the exact `222_toast_index_identities.sql` fixture on the same PostgreSQL
@@ -75,6 +84,15 @@ identity; the concurrent rebuild replaces the index identity. The fixture was
 uncommitted at recorded revision `5119b065`. Extract it and run
 `python3 verify-deferrable-reference.py .` to verify 10 hashes and four output
 rows. These are PostgreSQL observations; final pos3ql CI must still pass.
+
+[reindex-ownership.zip](reindex-ownership.zip), SHA256
+`fa7d53631f6a502683ebdd9040ae3c4989ae6cf74687bac4cb7d84a37b63762f`,
+records fixture `224_reindex_ownership.sql` on PostgreSQL 18.6. A superuser's
+index creation and a maintenance role's rebuild both keep the table owner's
+index ownership, including the large-value index. Table and column grants
+survive. The fixture was uncommitted at source revision `c476eb30`; its exact
+hash and raw results are retained. Extract it and run
+`python3 verify-reindex-ownership.py .` to verify 10 hashes and four output rows.
 
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the

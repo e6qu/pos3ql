@@ -215,11 +215,17 @@ ordering. Expression results are recomputed from fetched rows rather than
 projected directly from an index expression tuple. Native PostgreSQL index page
 layouts and custom native callbacks are not implemented.
 
-Moving indexes to a tablespace during `REINDEX` requires explicitly created
-indexes. For example, `REINDEX (TABLESPACE archive) INDEX orders_pkey` returns
+Moving indexes to a tablespace during `REINDEX` without `CONCURRENTLY` requires
+explicitly created indexes. For example,
+`REINDEX (TABLESPACE archive) INDEX orders_pkey` returns
 `0A000` if a primary-key constraint created `orders_pkey`. Table, schema and
 database targets also reject that option if they include constraint-generated
 indexes. Rejection happens before changing any selected index.
+Concurrent rebuilding creates replacements for constraint-generated indexes
+and can move those replacements. A table rebuild preserves its large-value
+index's existing tablespace; directly selecting that index with `TABLESPACE`
+returns `0A000`. An invalid large-value index is skipped with a warning by a
+table rebuild and cannot be rebuilt directly.
 
 ### Partition column order
 

@@ -1,6 +1,270 @@
 use super::*;
 
 #[test]
+fn index_creation_and_reindex_keep_owners_and_grants_through_http_cold_recovery() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("reindex-ownership-{mode:?}"));
+        config.transaction_mode = mode;
+        config.object_store_on = true;
+        config.object_store_bucket = format!("reindex-ownership-{mode:?}-{}", std::process::id());
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let server = object_reads::HttpObjectServer::start(&mut config);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/224_reindex_ownership.sql");
+        let (setup, cleanup) = fixture.split_once("DROP TABLE reindex_owned;").unwrap();
+        let mut rows = Vec::new();
+        for statement in setup
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+            if statement.starts_with("CREATE INDEX") || statement.starts_with("REINDEX") {
+                let owner = engine
+                    .storage
+                    .find_role_visible("reindex_owner", 0)
+                    .unwrap();
+                crate::mem::guard::forbid_alloc(|| {
+                    for slot in 0..engine.storage.index_count() {
+                        if let Some(index) = engine.storage.index_visible_to(slot, 0) {
+                            assert_eq!(
+                                usize::from(index.ownership.owner_to(0)),
+                                owner,
+                                "{mode:?}: {statement}"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+        assert_eq!(rows, ["t|t", "t|t", "t|t", "t|t"], "{mode:?}");
+        engine.commit_wal().unwrap();
+        assert!(server.uploads.load(std::sync::atomic::Ordering::Acquire) > 0);
+        drop((session, engine, budget));
+        // First recover solely from uploaded journal records, then from a
+        // checkpoint. Deleting the entire local directory removes both caches.
+        for checkpoint in [false, true] {
+            std::fs::remove_dir_all(&config.data_dir).unwrap();
+            let mut cold_budget = test_engine_budget(&config, 1 << 29);
+            let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+            let mut verifier = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+            let mut recovered_rows = Vec::new();
+            for statement in setup
+                .split(";\n")
+                .map(str::trim)
+                .filter(|sql| sql.starts_with("SELECT"))
+            {
+                recovered_rows.extend(data_rows(&verifier.success(
+                    &mut recovered,
+                    statement,
+                    true,
+                )));
+            }
+            assert_eq!(
+                recovered_rows,
+                ["t|t", "t|t", "t|t", "t|t"],
+                "{mode:?}, checkpoint={checkpoint}"
+            );
+            assert_eq!(
+                data_rows(&verifier.success(
+                    &mut recovered,
+                    "SELECT id,payload FROM reindex_owned",
+                    true
+                )),
+                ["1|value"]
+            );
+            let owner = recovered
+                .storage
+                .find_role_visible("reindex_owner", 0)
+                .unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                for slot in 0..recovered.storage.index_count() {
+                    if let Some(index) = recovered.storage.index_visible_to(slot, 0) {
+                        assert_eq!(
+                            usize::from(index.ownership.owner_to(0)),
+                            owner,
+                            "{mode:?}, checkpoint={checkpoint}"
+                        );
+                    }
+                }
+            });
+            if checkpoint {
+                verifier.success(&mut recovered, "DROP TABLE reindex_owned", true);
+                verifier.success(&mut recovered, cleanup, true);
+            } else {
+                verifier.success(&mut recovered, "SET ROLE reindex_maintainer", true);
+                verifier.success(
+                    &mut recovered,
+                    "REINDEX TABLE CONCURRENTLY reindex_owned",
+                    true,
+                );
+                verifier.success(&mut recovered, "RESET ROLE", true);
+                assert!(recovered.checkpoint().unwrap());
+            }
+            recovered.commit_wal().unwrap();
+            assert!(recovered.fatal_commit_failure().is_none());
+        }
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn reindex_event_receipts_resolve_renames_and_skip_dropped_or_reused_index_slots() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("reindex-event-receipts-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_indexes = 1;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let receipt_arena =
+            Arena::new(&mut budget, "completed index event receipt", 1 << 16).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE receipt_table(value integer); CREATE INDEX receipt_index ON receipt_table(value)", true);
+        let table = engine
+            .storage
+            .find_visible("public", "receipt_table", 0)
+            .unwrap();
+        let slot = engine
+            .storage
+            .index_slot("public", "receipt_index", 0)
+            .unwrap();
+        let birth = engine.storage.index_visible_to(slot, 0).unwrap().created_at;
+        let replacement = crate::storage::IndexReplacement {
+            table,
+            old_slot: slot,
+            old_created_at: birth,
+            new_slot: slot,
+            new_created_at: birth,
+        };
+        let graphs = crate::mem::guard::forbid_alloc(|| {
+            event_trigger::completed_reindex_graphs(
+                &engine.storage,
+                0,
+                &[replacement],
+                "REINDEX",
+                false,
+                &receipt_arena,
+            )
+            .unwrap()
+        });
+        assert_eq!(graphs.commands.len(), 1);
+        for (command, count, identity) in [
+            (
+                "ALTER INDEX receipt_index RENAME TO renamed_receipt",
+                "1",
+                Some("public.renamed_receipt"),
+            ),
+            ("DROP INDEX renamed_receipt", "0", None),
+            (
+                "CREATE INDEX reused_receipt ON receipt_table(value)",
+                "0",
+                None,
+            ),
+        ] {
+            session.success(&mut engine, command, true);
+            let _commands = event_trigger::enter_ddl_commands(graphs.commands);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT count(*) FROM pg_event_trigger_ddl_commands()",
+                    true
+                )),
+                [count],
+                "{mode:?}: {command}"
+            );
+            let values = data_rows(&session.success(
+                &mut engine,
+                "SELECT object_identity FROM pg_event_trigger_ddl_commands()",
+                true,
+            ));
+            assert_eq!(
+                values,
+                identity.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {command}"
+            );
+            if identity.is_none() {
+                crate::mem::guard::forbid_alloc(|| {
+                    let absent = event_trigger::completed_reindex_graphs(
+                        &engine.storage,
+                        0,
+                        &[replacement],
+                        "REINDEX",
+                        false,
+                        &receipt_arena,
+                    )
+                    .unwrap();
+                    assert!(absent.commands.is_empty());
+                });
+            }
+        }
+        assert_eq!(
+            engine.storage.index_slot("public", "reused_receipt", 0),
+            Some(slot)
+        );
+        assert_ne!(
+            engine.storage.index_visible_to(slot, 0).unwrap().created_at,
+            birth
+        );
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                graphs.commands[0]
+                    .object(&engine.storage, 0)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let current = crate::mem::guard::forbid_alloc(|| {
+            event_trigger::completed_reindex_graphs(
+                &engine.storage,
+                0,
+                &[crate::storage::IndexReplacement {
+                    new_created_at: engine.storage.index_visible_to(slot, 0).unwrap().created_at,
+                    ..replacement
+                }],
+                "REINDEX",
+                false,
+                &receipt_arena,
+            )
+            .unwrap()
+        });
+        let mixed = [graphs.commands[0], current.commands[0]];
+        let _commands = event_trigger::enter_ddl_commands(&mixed);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_event_trigger_ddl_commands()",
+                true
+            )),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT object_identity FROM pg_event_trigger_ddl_commands()",
+                true
+            )),
+            ["public.reused_receipt"]
+        );
+    }
+}
+
+#[test]
 fn deferrable_index_replacement_keeps_its_physical_immediacy_and_constraint_timing() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

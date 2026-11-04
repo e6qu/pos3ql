@@ -12472,7 +12472,7 @@ pub(crate) fn index_identity_by_oid(
     visit_toast_indexes(storage, txid, |index| {
         if index.oid == oid {
             found = Some((
-                SqlName::from_str("pg_toast"),
+                SqlName::parse("pg_toast").expect("fixed catalog namespace fits"),
                 StackStr::from_str(index.name.as_str()),
             ));
         }
@@ -12567,10 +12567,18 @@ pub(crate) fn reindex_candidates<'a>(
         })
         .map_err(|_| arena_full())?;
     let mut next = 0;
+    let mut failure = None;
     visit_indexes(storage, txid, None, |index| {
-        if !matches(&index) {
+        if failure.is_some() || !matches(&index) {
             return;
         }
+        let name = match crate::storage::SqlName::parse(index.name.as_str()) {
+            Ok(name) => name,
+            Err(error) => {
+                failure = Some(error);
+                return;
+            }
+        };
         let table = storage.table_def(index.table_slot, txid);
         let explicit = storage
             .index_slot(table.schema.as_str(), index.name.as_str(), txid)
@@ -12585,9 +12593,12 @@ pub(crate) fn reindex_candidates<'a>(
                 .expect("selected implicit index has a creation identity")
                 .created_at(),
             schema: table.schema,
-            name: crate::storage::SqlName::from_str(index.name.as_str()),
+            name,
             table: table.name,
-            ownership: table.ownership,
+            ownership: crate::storage::Ownership {
+                owner: storage.table(index.table_slot).ownership().owner_to(txid),
+                pending: None,
+            },
             method: index.method,
             columns: index.columns,
             include_columns: index.include_columns,
@@ -12622,6 +12633,9 @@ pub(crate) fn reindex_candidates<'a>(
         };
         next += 1;
     });
+    if let Some(error) = failure {
+        return Err(error);
+    }
     visit_toast_indexes(storage, txid, |index| {
         if !tables.contains(&index.table) || selected.is_some_and(|oid| oid != index.oid) {
             return;
@@ -12642,13 +12656,19 @@ pub(crate) fn reindex_candidates<'a>(
                         .toast_index_identity
                         .expect("admitted TOAST identity")
                         .created_at(),
-                    schema: crate::storage::SqlName::from_str("pg_toast"),
-                    name: crate::storage::SqlName::from_str(index.name.as_str()),
-                    table: crate::storage::SqlName::from_str(
+                    schema: crate::storage::SqlName::parse("pg_toast")
+                        .expect("fixed catalog namespace fits"),
+                    name: crate::storage::SqlName::parse(index.name.as_str())
+                        .expect("admitted TOAST index name fits"),
+                    table: crate::storage::SqlName::parse(
                         stack_format!(64, "pg_toast_{}", user_table_oid(storage, index.table))
                             .as_str(),
-                    ),
-                    ownership: table.ownership,
+                    )
+                    .expect("generated TOAST relation name fits"),
+                    ownership: crate::storage::Ownership {
+                        owner: storage.table(index.table).ownership().owner_to(txid),
+                        pending: None,
+                    },
                     columns,
                     n_cols: 2,
                     unique: true,
@@ -12836,7 +12856,9 @@ pub(super) fn relation_oid_for_name(
                 }
                 continue;
             }
-            crate::storage::PathEntry::Toast => SqlName::from_str("pg_toast"),
+            crate::storage::PathEntry::Toast => {
+                SqlName::parse("pg_toast").expect("fixed catalog namespace fits")
+            }
             crate::storage::PathEntry::Schema(slot) => {
                 let definition = storage.schema_def_for(usize::from(*slot), txid);
                 if !definition.visible_to(txid) {

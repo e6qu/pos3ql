@@ -18,7 +18,7 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    CHECK_SQL_MAX, ColumnMeta, ColumnSet, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
+    CHECK_SQL_MAX, ColumnMeta, ColumnSet, IndexDef, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
     MAX_ROUTINE_OUTPUT_COLUMNS, PartitionBound as StoredPartitionBound, PartitionBoundValue,
     PartitionDef, PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
@@ -47631,7 +47631,7 @@ fn report_composite_type_dependents(
         push(line.as_str());
     }
     if count == 0 {
-        return Ok(&[]);
+        return Ok(false);
     }
     if detail.is_truncated() {
         return Err(sql_err!(
@@ -56181,7 +56181,7 @@ fn reindex_relation_name(
         }
         let candidate = stack_format!(64, "{}{}", &original.as_str()[..prefix], ending.as_str());
         if !storage.relation_name_taken(schema.as_str(), candidate.as_str(), transaction) {
-            return Ok(SqlName::from_str(candidate.as_str()));
+            return SqlName::parse(candidate.as_str());
         }
     }
     Err(sql_err!(
@@ -56321,7 +56321,7 @@ fn register_reindex_candidates<'a>(
         .filter(|candidate| eligible(candidate))
         .count();
     if count == 0 {
-        return Ok(false);
+        return Ok(&[]);
     }
     let chosen = arena
         .alloc_slice_with(count, |_| crate::sql::catalog::ReindexCandidate {
@@ -56330,10 +56330,11 @@ fn register_reindex_candidates<'a>(
             exclusion: false,
         })
         .map_err(|_| arena_full())?;
-    let mut chosen_count = 0;
-    for candidate in candidates.iter().filter(|candidate| eligible(candidate)) {
-        chosen[chosen_count] = *candidate;
-        chosen_count += 1;
+    for (destination, candidate) in chosen
+        .iter_mut()
+        .zip(candidates.iter().filter(|candidate| eligible(candidate)))
+    {
+        *destination = *candidate;
     }
     let replacements = arena
         .alloc_slice_with(count, |_| crate::storage::IndexReplacement {
@@ -56344,8 +56345,7 @@ fn register_reindex_candidates<'a>(
             table: 0,
         })
         .map_err(|_| arena_full())?;
-    let mut next = 0;
-    for candidate in chosen {
+    for (receipt, candidate) in replacements.iter_mut().zip(chosen) {
         let table = candidate.table;
         let mut original = candidate.definition.definition_for(txn.txid);
         original.name = original.name_for(txn.txid);
@@ -56361,7 +56361,9 @@ fn register_reindex_candidates<'a>(
         replacement.mutable.parent = None;
         replacement.mutable.clustered = false;
         replacement.mutable.replica_identity = false;
-        if let Some(tablespace) = selected_tablespace {
+        if let Some(tablespace) = selected_tablespace
+            && original.relation_kind() == crate::storage::IndexRelationKind::Table
+        {
             replacement.mutable.tablespace = tablespace;
         }
         let new_slot = register_reindex_definition(storage, wal, txn, table, replacement)?;
@@ -56369,14 +56371,13 @@ fn register_reindex_candidates<'a>(
             .index_visible_to(new_slot, txn.txid)
             .expect("registered replacement")
             .created_at;
-        replacements[next] = crate::storage::IndexReplacement {
+        *receipt = crate::storage::IndexReplacement {
             old_slot,
             old_created_at: original.created_at,
             new_slot,
             new_created_at,
             table,
         };
-        next += 1;
     }
     Ok(replacements)
 }
@@ -56423,7 +56424,10 @@ pub(super) fn register_next_reindex_table<'a>(
     {
         return Ok((|| {
             for candidate in candidates {
-                if let Some(tablespace) = tablespace {
+                if let Some(tablespace) = tablespace
+                    && candidate.definition.relation_kind()
+                        == crate::storage::IndexRelationKind::Table
+                {
                     let slot = materialize_reindex_original(storage, wal, txn, candidate)?;
                     let mut definition = candidate.definition.mutable_for(txn.txid);
                     definition.tablespace = tablespace;
@@ -56557,7 +56561,7 @@ pub(super) fn swap_reindex_definitions(
         let retired_name =
             reindex_relation_name(storage, txn.txid, old.schema, original_name, "ccold")?;
         let comment = storage.comment_text(
-            crate::storage::CommentClass::Index,
+            crate::storage::CommentClass::Relation,
             old.schema.as_str(),
             original_name.as_str(),
             0,
@@ -56567,7 +56571,7 @@ pub(super) fn swap_reindex_definitions(
         stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
         for (name, text) in [(retired_name, None), (original_name, comment)] {
             if let Some((slot, prior)) = storage.set_comment(
-                crate::storage::CommentClass::Index,
+                crate::storage::CommentClass::Relation,
                 old.schema,
                 name,
                 0,
@@ -56788,6 +56792,35 @@ pub fn reindex(
             }
         }
     }
+    if target == crate::sql::ast::ReindexTarget::Index {
+        let candidates = match crate::sql::catalog::reindex_candidates(
+            storage,
+            txn.txid,
+            &tables[..table_count],
+            selected_index_oid,
+            arena,
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) => return sql_fail(error),
+        };
+        if let Some(candidate) = candidates.iter().find(|candidate| {
+            candidate.definition.relation_kind() == crate::storage::IndexRelationKind::Toast
+        }) {
+            if !candidate.definition.mutable_for(txn.txid).kind.valid() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot reindex invalid index on TOAST table"
+                ));
+            }
+            if options.tablespace.is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot move system relation \"{}\"",
+                    candidate.definition.name_for(txn.txid).as_str()
+                ));
+            }
+        }
+    }
     for &table in &tables[..table_count] {
         if options.build == crate::sql::ast::IndexBuildMode::Concurrent {
             continue;
@@ -56887,6 +56920,19 @@ pub fn reindex(
             if definition.kind.is_partitioned() || definition.kind.valid() {
                 continue;
             }
+            if index.relation_kind() == crate::storage::IndexRelationKind::Toast {
+                responder.warning(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    stack_format!(
+                        192,
+                        "cannot reindex invalid index \"{}.{}\" on TOAST table, skipping",
+                        index.schema.as_str(),
+                        index.name_for(txn.txid).as_str()
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
             definition.kind = crate::storage::IndexKind::Ordinary;
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition)
                 .and_then(|()| {
@@ -56924,7 +56970,9 @@ pub fn reindex(
             Ok(candidates) => candidates,
             Err(error) => return sql_fail(error),
         };
-        for candidate in candidates {
+        for candidate in candidates.iter().filter(|candidate| {
+            candidate.definition.relation_kind() == crate::storage::IndexRelationKind::Table
+        }) {
             if let Err(error) = materialize_reindex_original(storage, wal, txn, candidate) {
                 return sql_fail(error);
             }
@@ -56933,7 +56981,9 @@ pub fn reindex(
             let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
                 continue;
             };
-            if selected_index_oid.is_some_and(|oid| index.relation_oid() != oid) {
+            if index.relation_kind() == crate::storage::IndexRelationKind::Toast
+                || selected_index_oid.is_some_and(|oid| index.relation_oid() != oid)
+            {
                 continue;
             }
             let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {

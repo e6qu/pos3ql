@@ -1494,6 +1494,146 @@ fn concurrent_reindex_replaces_backing_indexes_and_publishes_before_sync() {
 }
 
 #[test]
+fn reindex_tablespace_moves_user_indexes_and_preserves_toast_placement() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("reindex-toast-tablespace", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = Conn::new(&config, &mut budget).unwrap();
+        session.id = 1;
+        session.phase = Phase::Ready;
+        query(
+            &mut session,
+            &mut engine,
+            "CREATE TABLESPACE reindex_first_space LOCATION '/object/reindex-first'",
+        );
+        query(
+            &mut session,
+            &mut engine,
+            "CREATE TABLESPACE reindex_second_space LOCATION '/object/reindex-second'",
+        );
+        query(
+            &mut session,
+            &mut engine,
+            "CREATE TABLE reindex_space_rows(id integer PRIMARY KEY, value text); \
+             INSERT INTO reindex_space_rows VALUES(1,'retained')",
+        );
+        let toast_before = first_row(&query(
+            &mut session,
+            &mut engine,
+            "SELECT i.indexrelid FROM pg_index i JOIN pg_class toast ON toast.oid=i.indrelid \
+             JOIN pg_class parent ON parent.reltoastrelid=toast.oid WHERE parent.relname='reindex_space_rows'",
+        ));
+        for (tablespace, concurrent) in [
+            ("reindex_first_space", false),
+            ("reindex_second_space", true),
+        ] {
+            query(
+                &mut session,
+                &mut engine,
+                &format!(
+                    "REINDEX (TABLESPACE {tablespace}) TABLE {}reindex_space_rows",
+                    if concurrent { "CONCURRENTLY " } else { "" }
+                ),
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut session,
+                    &mut engine,
+                    "SELECT space.spcname FROM pg_class idx JOIN pg_tablespace space ON space.oid=idx.reltablespace \
+                 WHERE idx.relname='reindex_space_rows_pkey'"
+                )),
+                tablespace
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut session,
+                    &mut engine,
+                    "SELECT idx.reltablespace FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid \
+                 JOIN pg_class toast ON toast.oid=i.indrelid JOIN pg_class parent ON parent.reltoastrelid=toast.oid \
+                 WHERE parent.relname='reindex_space_rows'"
+                )),
+                "0"
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut session,
+                    &mut engine,
+                    &format!(
+                        "SELECT i.indexrelid={toast_before} FROM pg_index i JOIN pg_class toast ON toast.oid=i.indrelid \
+                 JOIN pg_class parent ON parent.reltoastrelid=toast.oid WHERE parent.relname='reindex_space_rows'"
+                    )
+                )),
+                if concurrent { "f" } else { "t" }
+            );
+        }
+        let toast_name = first_row(&query(
+            &mut session,
+            &mut engine,
+            "SELECT idx.relname FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid \
+             JOIN pg_class toast ON toast.oid=i.indrelid JOIN pg_class parent ON parent.reltoastrelid=toast.oid \
+             WHERE parent.relname='reindex_space_rows'",
+        ));
+        for concurrent in [false, true] {
+            let sql = format!(
+                "REINDEX (TABLESPACE reindex_first_space) INDEX {}pg_toast.{toast_name}",
+                if concurrent { "CONCURRENTLY " } else { "" }
+            );
+            let mut payload = sql.into_bytes();
+            payload.push(0);
+            let response = message(&mut session, &mut engine, wire::FMSG_QUERY, &payload, true);
+            assert!(response.windows(5).any(|bytes| bytes == b"0A000"));
+            assert!(String::from_utf8_lossy(&response).contains("cannot move system relation"));
+        }
+        query(
+            &mut session,
+            &mut engine,
+            "CREATE TEMP TABLE reindex_temp_space(id integer PRIMARY KEY, value text)",
+        );
+        let temporary_index = first_row(&query(
+            &mut session,
+            &mut engine,
+            "SELECT conindid FROM pg_constraint WHERE conname='reindex_temp_space_pkey'",
+        ));
+        query(
+            &mut session,
+            &mut engine,
+            "REINDEX (TABLESPACE reindex_first_space) TABLE CONCURRENTLY reindex_temp_space",
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut session,
+                &mut engine,
+                "SELECT conindid FROM pg_constraint WHERE conname='reindex_temp_space_pkey'"
+            )),
+            temporary_index
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut session,
+                &mut engine,
+                "SELECT idx.reltablespace FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid \
+             JOIN pg_class toast ON toast.oid=i.indrelid JOIN pg_class parent ON parent.reltoastrelid=toast.oid \
+             WHERE parent.relname='reindex_temp_space'"
+            )),
+            "0"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut session,
+                &mut engine,
+                "SELECT space.spcname FROM pg_class idx JOIN pg_tablespace space ON space.oid=idx.reltablespace \
+             WHERE idx.relname='reindex_temp_space_pkey'"
+            )),
+            "reindex_first_space"
+        );
+    }
+}
+
+#[test]
 fn concurrent_reindex_cancel_keeps_the_published_replacement_and_old_constraint() {
     let config = config(
         "concurrent-reindex-cancel",
@@ -1824,6 +1964,616 @@ fn concurrent_index_build_waits_for_earlier_writers_and_keeps_published_failures
         &mut engine,
         "DROP INDEX CONCURRENTLY phase_wait_idx",
     );
+}
+
+#[test]
+#[cfg(not(miri))]
+fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart() {
+    use crate::sql::concurrent_index::CommitPhase;
+    for stop in [
+        None,
+        Some(CommitPhase::ReindexRegistered),
+        Some(CommitPhase::ReindexBuilt),
+        Some(CommitPhase::ReindexSwapped),
+        Some(CommitPhase::ReindexDead),
+    ] {
+        let label = match stop {
+            None => "complete",
+            Some(CommitPhase::ReindexRegistered) => "registered",
+            Some(CommitPhase::ReindexBuilt) => "built",
+            Some(CommitPhase::ReindexSwapped) => "swapped",
+            Some(CommitPhase::ReindexDead) => "dead",
+            Some(other) => panic!("unexpected stop phase {other:?}"),
+        };
+        let mut config = config(
+            &format!("reindex-receipt-prefix-{stop:?}"),
+            crate::config::TransactionMode::Mvcc,
+        );
+        config.object_store_on = true;
+        config.object_store_bucket = format!("reindex-prefix-{}-{label}", std::process::id());
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.wal_upload_buffer_bytes = 1 << 20;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let server = crate::sql::HttpObjectServer::start(&mut config);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut builder = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        builder.id = 1;
+        observer.id = 2;
+        builder.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TABLE receipt_reindex_rows(id integer PRIMARY KEY, payload text); \
+             INSERT INTO receipt_reindex_rows VALUES(1,'one'),(2,'two'); \
+             COMMENT ON CONSTRAINT receipt_reindex_rows_pkey ON receipt_reindex_rows IS 'constraint survives'; \
+             COMMENT ON INDEX receipt_reindex_rows_pkey IS 'index survives'; \
+             CREATE SEQUENCE receipt_reindex_start; CREATE SEQUENCE receipt_reindex_end; \
+             CREATE FUNCTION receipt_reindex_started() RETURNS event_trigger LANGUAGE plpgsql AS \
+             $$BEGIN PERFORM nextval('receipt_reindex_start'); END$$; \
+             CREATE FUNCTION receipt_reindex_finished() RETURNS event_trigger LANGUAGE plpgsql AS \
+             $$BEGIN PERFORM nextval('receipt_reindex_end'); END$$; \
+             CREATE EVENT TRIGGER receipt_reindex_start_trigger ON ddl_command_start WHEN TAG IN ('REINDEX') \
+             EXECUTE FUNCTION receipt_reindex_started(); \
+             CREATE EVENT TRIGGER receipt_reindex_end_trigger ON ddl_command_end WHEN TAG IN ('REINDEX') \
+             EXECUTE FUNCTION receipt_reindex_finished()",
+        );
+        let original = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT conindid FROM pg_constraint WHERE conname='receipt_reindex_rows_pkey'",
+        ));
+        let constraint = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT oid FROM pg_constraint WHERE conname='receipt_reindex_rows_pkey'",
+        ));
+        let toast = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT reltoastrelid FROM pg_class WHERE relname='receipt_reindex_rows'",
+        ));
+        if stop.is_none() {
+            query(
+                &mut builder,
+                &mut engine,
+                "CREATE ROLE receipt_reindex_maintainer; \
+                 GRANT MAINTAIN ON receipt_reindex_rows TO receipt_reindex_maintainer; \
+                 GRANT USAGE ON SEQUENCE receipt_reindex_start,receipt_reindex_end TO receipt_reindex_maintainer; \
+                 SET ROLE receipt_reindex_maintainer",
+            );
+        }
+        engine.commit_wal().unwrap();
+        engine.enable_async_durability();
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "REINDEX TABLE CONCURRENTLY receipt_reindex_rows",
+        );
+        builder.send.clear();
+        assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+        let mut cancelled = false;
+        let mut completed = false;
+        for _ in 0..16 {
+            let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+            if matches!(step, Step::Continue) {
+                completed = true;
+                break;
+            }
+            assert!(
+                matches!(step, Step::Parked),
+                "{stop:?}: {step:?}: {}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            let target = builder
+                .txn
+                .staged_commit()
+                .expect("phase must await durable object receipt")
+                .target;
+            let crate::sql::txn::CommitTarget::ConcurrentIndex { phase, .. } = target else {
+                panic!("wrong durable phase owner: {target:?}");
+            };
+            for _ in 0..2 {
+                let repeated =
+                    crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                assert!(
+                    matches!(repeated, Step::Parked),
+                    "{stop:?}: {repeated:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert_eq!(builder.txn.staged_commit().unwrap().target, target);
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_COMMAND_COMPLETE
+                ));
+                assert!(!has_message(
+                    builder.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+            }
+            if stop == Some(phase) {
+                assert!(!cancelled);
+                assert!(!crate::mem::guard::forbid_alloc(
+                    || builder.cancel_parked(&mut engine)
+                ));
+                assert!(builder.txn.staged_commit().is_some());
+                cancelled = true;
+            }
+            engine.commit_wal().unwrap();
+        }
+        assert!(
+            completed,
+            "REINDEX exceeded its bounded phase count: {stop:?}"
+        );
+        assert_eq!(cancelled, stop.is_some());
+        if cancelled {
+            assert!(
+                has_message(builder.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            assert!(
+                builder
+                    .send
+                    .readable()
+                    .windows(5)
+                    .any(|bytes| bytes == b"57014")
+            );
+            assert!(!has_message(
+                builder.send.readable(),
+                wire::MSG_COMMAND_COMPLETE
+            ));
+            message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        } else {
+            assert_eq!(
+                command_completion_in(builder.send.readable()),
+                Some("REINDEX")
+            );
+            assert!(!has_message(
+                builder.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            builder.send.clear();
+            assert!(builder.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+            let mut synced = false;
+            for _ in 0..3 {
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                if matches!(step, Step::Continue) {
+                    synced = true;
+                    break;
+                }
+                assert!(
+                    matches!(step, Step::Parked),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                assert!(builder.txn.staged_commit().is_some());
+                engine.commit_wal().unwrap();
+            }
+            assert!(synced);
+        }
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Idle);
+        engine.commit_wal().unwrap();
+        drop(builder);
+        drop(observer);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        let mut recovered_budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+        let mut verifier = Conn::new(&config, &mut recovered_budget).unwrap();
+        verifier.id = 1;
+        verifier.phase = Phase::Ready;
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT id,payload FROM receipt_reindex_rows ORDER BY id"
+            )),
+            "1|one"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT count(*) FROM receipt_reindex_rows"
+            )),
+            "2"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT last_value,is_called FROM receipt_reindex_start"
+            )),
+            "1|t"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT last_value,is_called FROM receipt_reindex_end"
+            )),
+            if cancelled { "1|f" } else { "1|t" }
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT oid,obj_description(oid,'pg_constraint') FROM pg_constraint WHERE conname='receipt_reindex_rows_pkey'"
+            )),
+            format!("{constraint}|constraint survives")
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT reltoastrelid FROM pg_class WHERE relname='receipt_reindex_rows'"
+            )),
+            toast
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT obj_description(oid,'pg_class') FROM pg_class WHERE relname='receipt_reindex_rows_pkey'"
+            )),
+            "index survives"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname='receipt_reindex_rows_pkey'"
+            )),
+            "postgres"
+        );
+        let swapped = matches!(
+            stop,
+            None | Some(CommitPhase::ReindexSwapped | CommitPhase::ReindexDead)
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                &format!(
+                    "SELECT conindid <> {original} FROM pg_constraint WHERE conname='receipt_reindex_rows_pkey'"
+                )
+            )),
+            if swapped { "t" } else { "f" }
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+             WHERE c.relname='receipt_reindex_rows_pkey'"
+            )),
+            "t|t|t"
+        );
+        match stop {
+            Some(CommitPhase::ReindexRegistered | CommitPhase::ReindexBuilt) => {
+                assert_eq!(
+                    first_row(&query(
+                        &mut verifier,
+                        &mut recovered,
+                        "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+                     WHERE c.relname='receipt_reindex_rows_pkey_ccnew'"
+                    )),
+                    if stop == Some(CommitPhase::ReindexBuilt) {
+                        "f|t|t"
+                    } else {
+                        "f|f|t"
+                    }
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut verifier,
+                        &mut recovered,
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+                     WHERE n.nspname='pg_toast' AND c.relname LIKE '%_ccnew%'"
+                    )),
+                    "1"
+                );
+            }
+            Some(CommitPhase::ReindexSwapped | CommitPhase::ReindexDead) => {
+                assert_eq!(
+                    first_row(&query(
+                        &mut verifier,
+                        &mut recovered,
+                        "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+                     WHERE c.relname='receipt_reindex_rows_pkey_ccold'"
+                    )),
+                    if stop == Some(CommitPhase::ReindexDead) {
+                        "f|f|f"
+                    } else {
+                        "f|t|t"
+                    }
+                );
+                assert_eq!(
+                    first_row(&query(
+                        &mut verifier,
+                        &mut recovered,
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+                     WHERE n.nspname='pg_toast' AND c.relname LIKE '%_ccold%'"
+                    )),
+                    "1"
+                );
+            }
+            None => {
+                assert_eq!(
+                    first_row(&query(
+                        &mut verifier,
+                        &mut recovered,
+                        &format!(
+                            "SELECT count(*) FROM pg_class WHERE oid={original} OR relname LIKE '%_ccnew%' OR relname LIKE '%_ccold%'"
+                        )
+                    )),
+                    "0"
+                );
+            }
+            Some(other) => panic!("unexpected stop phase {other:?}"),
+        }
+        if matches!(
+            stop,
+            Some(CommitPhase::ReindexRegistered | CommitPhase::ReindexDead)
+        ) {
+            let suffix = if stop == Some(CommitPhase::ReindexRegistered) {
+                "ccnew"
+            } else {
+                "ccold"
+            };
+            let leftover = first_row(&query(
+                &mut verifier,
+                &mut recovered,
+                &format!(
+                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+                 WHERE n.nspname='pg_toast' AND c.relname LIKE '%_{suffix}%'"
+                ),
+            ));
+            for concurrent in [false, true] {
+                let mut payload = format!(
+                    "REINDEX INDEX {}pg_toast.{leftover}",
+                    if concurrent { "CONCURRENTLY " } else { "" }
+                )
+                .into_bytes();
+                payload.push(0);
+                let rejected = message(
+                    &mut verifier,
+                    &mut recovered,
+                    wire::FMSG_QUERY,
+                    &payload,
+                    true,
+                );
+                assert!(rejected.windows(5).any(|bytes| bytes == b"0A000"));
+                assert!(
+                    String::from_utf8_lossy(&rejected)
+                        .contains("cannot reindex invalid index on TOAST table")
+                );
+            }
+            let rebuilt = query(
+                &mut verifier,
+                &mut recovered,
+                "REINDEX TABLE receipt_reindex_rows",
+            );
+            assert!(has_message(&rebuilt, wire::MSG_NOTICE_RESPONSE));
+            assert!(rebuilt.windows(5).any(|bytes| bytes == b"0A000"));
+            assert!(String::from_utf8_lossy(&rebuilt).contains("on TOAST table, skipping"));
+            assert_eq!(
+                first_row(&query(
+                    &mut verifier,
+                    &mut recovered,
+                    &format!(
+                        "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+                 JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='pg_toast' AND c.relname='{leftover}'"
+                    )
+                )),
+                if stop == Some(CommitPhase::ReindexRegistered) {
+                    "f|f|t"
+                } else {
+                    "f|f|f"
+                }
+            );
+        }
+        recovered.commit_wal().unwrap();
+        drop(verifier);
+        drop(recovered);
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
+#[cfg(not(miri))]
+fn concurrent_reindex_keeps_old_reader_lifetimes_until_their_locks_are_released() {
+    use crate::sql::concurrent_index::{CommitPhase, Phase as IndexPhase};
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let label = match mode {
+            crate::config::TransactionMode::Mvcc => "mvcc",
+            crate::config::TransactionMode::Locking => "locking",
+        };
+        let mut config = config(&format!("reindex-held-reader-{mode:?}"), mode);
+        config.object_store_on = true;
+        config.object_store_bucket = format!("reindex-reader-{}-{label}", std::process::id());
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.wal_upload_buffer_bytes = 1 << 20;
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let server = crate::sql::HttpObjectServer::start(&mut config);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut builder = Conn::new(&config, &mut budget).unwrap();
+        let mut reader = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        builder.id = 1;
+        reader.id = 2;
+        observer.id = 3;
+        builder.phase = Phase::Ready;
+        reader.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TABLE held_reindex_rows(id integer); INSERT INTO held_reindex_rows VALUES(1),(2); \
+             CREATE INDEX held_reindex_idx ON held_reindex_rows(id)",
+        );
+        let old = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT oid FROM pg_class WHERE relname='held_reindex_idx'",
+        ));
+        engine.commit_wal().unwrap();
+        if mode == crate::config::TransactionMode::Locking {
+            assert_eq!(
+                first_row(&query(
+                    &mut reader,
+                    &mut engine,
+                    "BEGIN; SELECT id FROM held_reindex_rows WHERE id=1"
+                )),
+                "1"
+            );
+        }
+        engine.enable_async_durability();
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "REINDEX INDEX CONCURRENTLY held_reindex_idx",
+        );
+        builder.send.clear();
+        assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+        if mode == crate::config::TransactionMode::Mvcc {
+            let mut waiting_to_swap = false;
+            for _ in 0..8 {
+                let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+                assert!(
+                    matches!(step, Step::Parked),
+                    "{step:?}: {}",
+                    String::from_utf8_lossy(builder.send.readable())
+                );
+                let target = builder
+                    .txn
+                    .staged_commit()
+                    .expect("phase must await durable receipt")
+                    .target;
+                if matches!(
+                    target,
+                    crate::sql::txn::CommitTarget::ConcurrentIndex {
+                        phase: CommitPhase::ReindexSwapped,
+                        ..
+                    }
+                ) {
+                    waiting_to_swap = true;
+                    break;
+                }
+                engine.commit_wal().unwrap();
+            }
+            assert!(waiting_to_swap);
+            // This reader enters after validation's old-snapshot check, but
+            // before the replacement is visible. It genuinely reads the table
+            // while the prior index is still a valid planning choice.
+            assert_eq!(
+                first_row(&query(
+                    &mut reader,
+                    &mut engine,
+                    "BEGIN; SELECT id FROM held_reindex_rows WHERE id=1"
+                )),
+                "1"
+            );
+            engine.commit_wal().unwrap();
+        }
+        let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+        assert!(
+            matches!(step, Step::Parked),
+            "{mode:?}: {step:?}: {}",
+            String::from_utf8_lossy(builder.send.readable())
+        );
+        assert!(builder.txn.staged_commit().is_none());
+        assert!(!has_message(
+            builder.send.readable(),
+            wire::MSG_COMMAND_COMPLETE
+        ));
+        if mode == crate::config::TransactionMode::Mvcc {
+            assert_eq!(
+                builder.txn.concurrent_index.as_ref().unwrap().phase,
+                IndexPhase::ReindexDead
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+                 WHERE c.relname='held_reindex_idx_ccold'"
+                )),
+                "f|t|t"
+            );
+        } else {
+            assert!(builder.txn.concurrent_index.is_none());
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+                 WHERE c.relname='held_reindex_idx'"
+                )),
+                "t|t|t"
+            );
+        }
+        assert_eq!(
+            first_row(&query(
+                &mut reader,
+                &mut engine,
+                "SELECT count(*) FROM held_reindex_rows"
+            )),
+            "2"
+        );
+        query(&mut reader, &mut engine, "COMMIT");
+        let mut completed = false;
+        for _ in 0..12 {
+            let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+            if matches!(step, Step::Continue) {
+                completed = true;
+                break;
+            }
+            assert!(
+                matches!(step, Step::Parked),
+                "{mode:?}: {step:?}: {}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
+            assert!(
+                builder.txn.staged_commit().is_some(),
+                "reader released its actual table lock"
+            );
+            engine.commit_wal().unwrap();
+        }
+        assert!(completed);
+        assert_eq!(
+            command_completion_in(builder.send.readable()),
+            Some("REINDEX")
+        );
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                &format!(
+                    "SELECT count(*) FROM pg_class WHERE oid={old} OR relname IN ('held_reindex_idx_ccnew','held_reindex_idx_ccold')"
+                )
+            )),
+            "0"
+        );
+        engine.commit_wal().unwrap();
+        drop(builder);
+        drop(reader);
+        drop(observer);
+        drop(engine);
+        drop(server);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
 }
 
 #[test]

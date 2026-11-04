@@ -15,7 +15,8 @@ does not establish runtime correctness. Recovery tests must exercise their
 declared durable tier before deleting caches.
 Concurrent-index verification must distinguish a cancelled command's committed
 catalog phases from its rolled-back current phase, and check constraint and
-index identities separately.
+index identities separately. Include ownership and grants after losing local
+caches; a successful rebuild under a maintenance role must not change ownership.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

@@ -93,6 +93,10 @@ the same test selection and ordinary test parallelism. A crash still fails
 the job; the debugger does not retry or resume it. GDB launches the executable
 directly: rebuilding thousands of test filters as one shell argument exceeds
 Linux's argument-size limit before the tests start.
+A historical crash reproduction records its source revision, compiler/coverage
+versions, original test partition, stack limit, ordinary test parallelism and
+process outcome. Its artifact describes that failed revision. Finish current-head
+validation separately and remove temporary historical CI jobs before merging.
 
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in

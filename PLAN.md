@@ -168,7 +168,10 @@ preserve comments, dependencies and partition links. Map a partition child's
 physical columns to the parent's selected columns when reporting those links.
 Retain each key's selected comparison rules when a constraint-created index
 becomes a stored index. Reject incomplete journal records before changing their
-buffer. Diagnose native crashes with the failing threads' stacks, preserving
+buffer. Diagnose the earlier native coverage crash by replaying its failed
+revision and original test partition under the debugger; retain the stack and
+source/tool identities, then remove the temporary historical CI job. Diagnose
+native crashes with the failing threads' stacks, preserving
 the configured stack, test parallelism and job deadlines.
 Rebuilding a table must leave retired indexes untouched. Explicit user-index
 repair and replacement must preserve the distinct flags and ownership rules.

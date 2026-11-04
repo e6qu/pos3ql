@@ -197,6 +197,9 @@ impl TablePublication {
 impl Storage {
     fn generation_index_table(&self, change: IndexGenerationChange) -> Option<usize> {
         let index = self.index(change.slot());
+        if matches!(index.relation, super::IndexRelationSource::Toast(_)) {
+            return None;
+        }
         if matches!(change, IndexGenerationChange::State(_))
             && index
                 .pending_definition

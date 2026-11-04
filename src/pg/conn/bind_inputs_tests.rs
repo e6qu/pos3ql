@@ -1357,6 +1357,332 @@ fn concurrent_index_commands_publish_their_real_states_before_sync() {
 }
 
 #[test]
+fn concurrent_reindex_replaces_backing_indexes_and_publishes_before_sync() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let config = config("concurrent-reindex-identities", mode);
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut builder = Conn::new(&config, &mut budget).unwrap();
+        let mut observer = Conn::new(&config, &mut budget).unwrap();
+        builder.id = 1;
+        observer.id = 2;
+        builder.phase = Phase::Ready;
+        observer.phase = Phase::Ready;
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TABLE reindex_identity_rows(id integer PRIMARY KEY, code integer UNIQUE, value text); \
+             CREATE INDEX reindex_identity_value ON reindex_identity_rows(value); \
+             INSERT INTO reindex_identity_rows VALUES(1,11,'one'); \
+             COMMENT ON CONSTRAINT reindex_identity_rows_pkey ON reindex_identity_rows IS 'key comment'; \
+             COMMENT ON INDEX reindex_identity_rows_pkey IS 'index comment'",
+        );
+        let old_primary = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT oid FROM pg_class WHERE relname='reindex_identity_rows_pkey'",
+        ));
+        let constraint = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT oid FROM pg_constraint WHERE conname='reindex_identity_rows_pkey'",
+        ));
+        let old_toast = first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indexrelid FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid \
+             JOIN pg_class owner ON owner.reltoastrelid=c.oid WHERE owner.relname='reindex_identity_rows'",
+        ));
+        bind_command(
+            &mut builder,
+            &mut engine,
+            "REINDEX TABLE CONCURRENTLY reindex_identity_rows",
+        );
+        let response = message(
+            &mut builder,
+            &mut engine,
+            wire::FMSG_EXECUTE,
+            &[0; 5],
+            false,
+        );
+        assert_eq!(command_completion_in(&response), Some("REINDEX"));
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                &format!("SELECT count(*) FROM pg_class WHERE oid IN ({old_primary},{old_toast})")
+            )),
+            "0"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT count(*) FROM pg_class WHERE relname LIKE 'reindex_identity%_ccnew%' \
+             OR relname LIKE 'reindex_identity%_ccold%'"
+            )),
+            "0"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                &format!(
+                    "SELECT oid,conindid <> {old_primary},obj_description(oid,'pg_constraint') \
+             FROM pg_constraint WHERE conname='reindex_identity_rows_pkey'"
+                )
+            )),
+            format!("{constraint}|t|key comment")
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT obj_description(oid,'pg_class') FROM pg_class WHERE relname='reindex_identity_rows_pkey'"
+            )),
+            "index comment"
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid \
+             WHERE c.relname='reindex_identity_rows' AND i.indisvalid AND i.indisready AND i.indislive"
+            )),
+            "3"
+        );
+        assert_eq!(builder.txn.mode, crate::sql::txn::TxnMode::Implicit);
+        message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT id,code,value FROM reindex_identity_rows"
+            )),
+            "1|11|one"
+        );
+        query(
+            &mut builder,
+            &mut engine,
+            "CREATE TABLE reindex_deferred_rows(id integer UNIQUE DEFERRABLE INITIALLY DEFERRED); \
+             INSERT INTO reindex_deferred_rows VALUES(1)",
+        );
+        query(
+            &mut builder,
+            &mut engine,
+            "REINDEX INDEX CONCURRENTLY reindex_deferred_rows_id_key",
+        );
+        query(
+            &mut builder,
+            &mut engine,
+            "BEGIN; INSERT INTO reindex_deferred_rows VALUES(2),(2); \
+             DELETE FROM reindex_deferred_rows WHERE id=2; COMMIT",
+        );
+        assert_eq!(
+            first_row(&query(
+                &mut observer,
+                &mut engine,
+                "SELECT i.indimmediate FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+             WHERE c.relname='reindex_deferred_rows_id_key'"
+            )),
+            "f"
+        );
+    }
+}
+
+#[test]
+fn concurrent_reindex_cancel_keeps_the_published_replacement_and_old_constraint() {
+    let config = config(
+        "concurrent-reindex-cancel",
+        crate::config::TransactionMode::Mvcc,
+    );
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut builder = Conn::new(&config, &mut budget).unwrap();
+    let mut writer = Conn::new(&config, &mut budget).unwrap();
+    let mut observer = Conn::new(&config, &mut budget).unwrap();
+    builder.id = 1;
+    writer.id = 2;
+    observer.id = 3;
+    builder.phase = Phase::Ready;
+    writer.phase = Phase::Ready;
+    observer.phase = Phase::Ready;
+    query(
+        &mut builder,
+        &mut engine,
+        "CREATE TABLE reindex_cancel_rows(id integer PRIMARY KEY DEFERRABLE INITIALLY DEFERRED); INSERT INTO reindex_cancel_rows VALUES(1)",
+    );
+    let old = first_row(&query(
+        &mut observer,
+        &mut engine,
+        "SELECT conindid FROM pg_constraint WHERE conname='reindex_cancel_rows_pkey'",
+    ));
+    query(
+        &mut writer,
+        &mut engine,
+        "BEGIN; INSERT INTO reindex_cancel_rows VALUES(2)",
+    );
+    bind_command(
+        &mut builder,
+        &mut engine,
+        "REINDEX INDEX CONCURRENTLY reindex_cancel_rows_pkey",
+    );
+    builder.send.clear();
+    assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+    let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+    assert!(
+        matches!(step, Step::Parked),
+        "{step:?}: {}",
+        String::from_utf8_lossy(builder.send.readable())
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indisvalid,i.indisready,i.indislive,i.indimmediate FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname='reindex_cancel_rows_pkey_ccnew'"
+        )),
+        "f|f|t|f"
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT conindid FROM pg_constraint WHERE conname='reindex_cancel_rows_pkey'"
+        )),
+        old
+    );
+    assert!(crate::mem::guard::forbid_alloc(
+        || builder.cancel_parked(&mut engine)
+    ));
+    message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+    query(&mut writer, &mut engine, "COMMIT");
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname='reindex_cancel_rows_pkey'"
+        )),
+        "t|t|t"
+    );
+    query(
+        &mut builder,
+        &mut engine,
+        "DROP INDEX reindex_cancel_rows_pkey_ccnew",
+    );
+    query(
+        &mut builder,
+        &mut engine,
+        "REINDEX INDEX CONCURRENTLY reindex_cancel_rows_pkey",
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT conindid <> 0 FROM pg_constraint WHERE conname='reindex_cancel_rows_pkey'"
+        )),
+        "t"
+    );
+}
+
+#[test]
+fn concurrent_reindex_schema_finishes_each_table_before_waiting_on_the_next() {
+    let config = config(
+        "concurrent-reindex-batch",
+        crate::config::TransactionMode::Mvcc,
+    );
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut builder = Conn::new(&config, &mut budget).unwrap();
+    let mut writer = Conn::new(&config, &mut budget).unwrap();
+    let mut observer = Conn::new(&config, &mut budget).unwrap();
+    builder.id = 1;
+    writer.id = 2;
+    observer.id = 3;
+    builder.phase = Phase::Ready;
+    writer.phase = Phase::Ready;
+    observer.phase = Phase::Ready;
+    query(
+        &mut builder,
+        &mut engine,
+        "CREATE SCHEMA reindex_batch; CREATE TABLE reindex_batch.first_rows(id integer); \
+         CREATE TABLE reindex_batch.second_rows(id integer); \
+         CREATE INDEX first_idx ON reindex_batch.first_rows(id); \
+         CREATE INDEX second_idx ON reindex_batch.second_rows(id)",
+    );
+    let first_old = first_row(&query(
+        &mut observer,
+        &mut engine,
+        "SELECT oid FROM pg_class WHERE relname='first_idx'",
+    ));
+    query(
+        &mut writer,
+        &mut engine,
+        "BEGIN; INSERT INTO reindex_batch.second_rows VALUES(1)",
+    );
+    bind_command(
+        &mut builder,
+        &mut engine,
+        "REINDEX SCHEMA CONCURRENTLY reindex_batch",
+    );
+    builder.send.clear();
+    assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+    let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+    assert!(
+        matches!(step, Step::Parked),
+        "{step:?}: {}",
+        String::from_utf8_lossy(builder.send.readable())
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            &format!("SELECT count(*) FROM pg_class WHERE oid={first_old}")
+        )),
+        "0"
+    );
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname='second_idx_ccnew'"
+        )),
+        "f|f|t"
+    );
+    query(
+        &mut observer,
+        &mut engine,
+        "BEGIN; LOCK TABLE reindex_batch.first_rows IN ACCESS EXCLUSIVE MODE NOWAIT; ROLLBACK",
+    );
+    query(&mut writer, &mut engine, "COMMIT");
+    builder.send.clear();
+    let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+    assert!(
+        matches!(step, Step::Continue),
+        "{step:?}: {}",
+        String::from_utf8_lossy(builder.send.readable())
+    );
+    assert_eq!(
+        command_completion_in(builder.send.readable()),
+        Some("REINDEX")
+    );
+    message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT count(*) FROM pg_class WHERE relname IN ('first_idx_ccnew','first_idx_ccold','second_idx_ccnew','second_idx_ccold')"
+        )),
+        "0"
+    );
+}
+
+#[test]
 fn concurrent_index_build_waits_for_earlier_writers_and_keeps_published_failures() {
     let config = config(
         "concurrent-index-writer-wait",
@@ -1649,11 +1975,11 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                 );
                 assert!(builder.txn.staged_commit().is_some());
                 let selected_table = engine
-                    .storage
+                    .publication_storage_for_tests()
                     .find_visible("public", "receipt_index_rows", 0)
                     .unwrap();
                 let unavailable = crate::mem::guard::forbid_alloc(|| {
-                    engine.storage.lock_table(
+                    engine.publication_storage_for_tests().lock_table(
                         u32::MAX,
                         selected_table,
                         crate::sql::ast::TableLockMode::AccessExclusive,
@@ -1665,12 +1991,14 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                     sqlstate::LOCK_NOT_AVAILABLE
                 );
                 let mut held_by_final_transaction = false;
-                engine.storage.visit_object_locks(|owner, _, target, mode| {
-                    held_by_final_transaction |= owner
-                        == crate::storage::ObjectLockOwner::Transaction(builder.txn.txid)
-                        && target == crate::storage::ObjectLockTarget::Table(selected_table)
-                        && mode == crate::sql::ast::TableLockMode::ShareUpdateExclusive;
-                });
+                engine.publication_storage_for_tests().visit_object_locks(
+                    |owner, _, target, mode| {
+                        held_by_final_transaction |= owner
+                            == crate::storage::ObjectLockOwner::Transaction(builder.txn.txid)
+                            && target == crate::storage::ObjectLockTarget::Table(selected_table)
+                            && mode == crate::sql::ast::TableLockMode::ShareUpdateExclusive;
+                    },
+                );
                 assert!(
                     held_by_final_transaction,
                     "final index transaction retains its selected table lock until publication"

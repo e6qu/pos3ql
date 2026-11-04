@@ -4790,6 +4790,7 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
                     name,
                     pending_name: None,
                     table: def.name,
+                    relation: crate::storage::IndexRelationSource::Table,
                     table_binding: None,
                     pending_table: None,
                     method: index.method,
@@ -5208,7 +5209,10 @@ fn unique_arbiter_matches<Definition0: crate::storage::DefinitionBacking>(
             }
         }
     }
-    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+    for index in storage
+        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+        .filter(|index| index.mutable_for(txid).immediate)
+    {
         if index.predicate.is_none() && same(&index.columns[..index.n_cols]) {
             matched = true;
             if index.nulls_not_distinct {
@@ -5279,7 +5283,10 @@ fn resolve_arbiter<'a, Definition0: crate::storage::DefinitionBacking>(
     }
     if !oc.target.is_empty() {
         if oc.target.iter().any(|target| target.column.is_none()) {
-            for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+            for index in storage
+                .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                .filter(|index| index.mutable_for(txid).immediate)
+            {
                 if index.predicate.is_some() || index.n_cols != oc.target.len() {
                     continue;
                 }
@@ -5403,6 +5410,7 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
 ) -> Result<Option<ConflictRow<'a>>, SqlError> {
     let partial_count = storage
         .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+        .filter(|index| index.mutable_for(txid).immediate)
         .filter(|index| {
             index.predicate.is_some()
                 || index.expressions[..index.n_cols]
@@ -5414,7 +5422,10 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
         .alloc_slice_with(partial_count, |_| None::<PartialArbiter<'a>>)
         .map_err(|_| crate::sql::eval::arena_full())?;
     let mut next_partial = 0usize;
-    for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+    for index in storage
+        .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+        .filter(|index| index.mutable_for(txid).immediate)
+    {
         if index.predicate.is_none()
             && index.expressions[..index.n_cols]
                 .iter()
@@ -5574,11 +5585,10 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
                                     return Ok(true);
                                 }
                             }
-                            for index in storage.unique_indexes_for(
-                                def.schema.as_str(),
-                                def.name.as_str(),
-                                txid,
-                            ) {
+                            for index in storage
+                                .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+                                .filter(|index| index.mutable_for(txid).immediate)
+                            {
                                 if index.predicate.is_none()
                                     && index.expressions[..index.n_cols]
                                         .iter()
@@ -47621,7 +47631,7 @@ fn report_composite_type_dependents(
         push(line.as_str());
     }
     if count == 0 {
-        return Ok(false);
+        return Ok(&[]);
     }
     if detail.is_truncated() {
         return Err(sql_err!(
@@ -51245,7 +51255,14 @@ fn rewrite_composite_dependent_indexes(
             definition.schema,
             definition.name,
         )?;
-        prepare_index_creation(storage, txn, *new_slot, *table, arena)?;
+        prepare_index_creation(
+            storage,
+            txn,
+            *new_slot,
+            *table,
+            arena,
+            crate::storage::IndexBindingOperation::Create,
+        )?;
         journal_index_creation(storage, wal, txn, *new_slot, *table)?;
         let old_object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::Index,
@@ -53544,6 +53561,7 @@ pub fn create_index(
         name: sqlname,
         pending_name: None,
         table: tdef.name,
+        relation: crate::storage::IndexRelationSource::Table,
         table_binding: None,
         pending_table: None,
         method: command.method,
@@ -53747,12 +53765,25 @@ fn prepare_index_creation(
             "new index is not visible to its creator"
         )
     })?;
+    if index.relation_kind() == crate::storage::IndexRelationKind::Toast {
+        // Object-native values have no separate heap of TOAST tuples. This
+        // index owns PostgreSQL catalog/lock identity; durable value objects
+        // remain covered by the owning table's publication and integrity.
+        if storage.index_table_slot_to(slot, txn.txid) != Some(table) {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "TOAST index owner changed during maintenance"
+            ));
+        }
+        return storage.prepare_index_definition_enforcers(slot, txn.txid, operation);
+    }
     let statistics = validate_index_rows(
         storage,
         table,
         txn.txid,
         IndexRowValidation::Create {
             unique: index.unique,
+            selected: index.relation_oid(),
         },
         arena,
     )?;
@@ -53797,12 +53828,23 @@ pub(super) fn validate_concurrent_index(
             "concurrent index lifetime disappeared during validation"
         )
     })?;
+    if index.relation_kind() == crate::storage::IndexRelationKind::Toast {
+        return if storage.index_table_slot_to(slot, txn.txid) == Some(table) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "TOAST index owner changed during validation"
+            ))
+        };
+    }
     validate_index_rows(
         storage,
         table,
         txn.txid,
         IndexRowValidation::Create {
             unique: index.unique,
+            selected: index.relation_oid(),
         },
         arena,
     )?;
@@ -53834,6 +53876,7 @@ fn journal_index_creation(
                 schema: index.schema.as_str(),
                 name: index.name_for(txn.txid).as_str(),
                 table: index.table.as_str(),
+                relation: index.relation,
                 method: index.method,
                 columns: index.columns,
                 expressions: index
@@ -53864,7 +53907,7 @@ fn journal_index_creation(
 /// byte sources. No row, parsed expression, or arena reference escapes.
 #[derive(Clone, Copy)]
 enum IndexRowValidation {
-    Create { unique: bool },
+    Create { unique: bool, selected: i32 },
     Reindex { selected: Option<i32> },
 }
 
@@ -53885,7 +53928,10 @@ fn validate_index_rows(
             let result = (|| {
                 check_index_tuple_sizes(storage, &definition, values, txid, arena)?;
                 match validation {
-                    IndexRowValidation::Create { unique: true } => check_unique_indexes(
+                    IndexRowValidation::Create {
+                        unique: true,
+                        selected,
+                    } => check_unique_indexes(
                         storage,
                         table_index,
                         &definition,
@@ -53894,9 +53940,11 @@ fn validate_index_rows(
                         Some(rowid),
                         txid,
                         arena,
-                        constraints::UniqueIndexCheck::Cache,
+                        constraints::UniqueIndexCheck::Rebuild {
+                            selected: Some(selected),
+                        },
                     )?,
-                    IndexRowValidation::Create { unique: false } => {}
+                    IndexRowValidation::Create { unique: false, .. } => {}
                     IndexRowValidation::Reindex { selected } => {
                         constraints::check_reindex_constraints(
                             storage,
@@ -56111,9 +56159,486 @@ pub fn drop_index(
     sql_ok()
 }
 
-/// REINDEX rebuilds the selected table's bounded value-index cache from the
-/// authoritative committed rows. The cache is disposable by design, so its
-/// reconstruction is not journaled; restart uses the same reconstruction path.
+fn reindex_relation_name(
+    storage: &Storage,
+    transaction: u32,
+    schema: SqlName,
+    original: SqlName,
+    suffix: &str,
+) -> Result<SqlName, SqlError> {
+    for ordinal in 0..=storage.index_count() {
+        let ending = if ordinal == 0 {
+            stack_format!(64, "_{}", suffix)
+        } else {
+            stack_format!(64, "_{}{}", suffix, ordinal)
+        };
+        let mut prefix = original
+            .as_str()
+            .len()
+            .min(63usize.saturating_sub(ending.as_str().len()));
+        while !original.as_str().is_char_boundary(prefix) {
+            prefix -= 1;
+        }
+        let candidate = stack_format!(64, "{}{}", &original.as_str()[..prefix], ending.as_str());
+        if !storage.relation_name_taken(schema.as_str(), candidate.as_str(), transaction) {
+            return Ok(SqlName::from_str(candidate.as_str()));
+        }
+    }
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "REINDEX replacement names exceed index capacity"
+    ))
+}
+
+fn register_reindex_definition(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    definition: IndexDef,
+) -> Result<usize, SqlError> {
+    let target =
+        storage.table_definition_target(table, txn.txid, &storage.table_def(table, txn.txid));
+    let owner = definition.ownership.owner_to(txn.txid);
+    let slot =
+        storage.create_reindex_index(definition, target, definition.relation_kind(), txn.txid)?;
+    let result = (|| {
+        journal_index_creation(storage, wal, txn, slot, table)?;
+        txn.record_ddl(storage, super::txn::DdlUndo::IndexCreated(slot as u32))?;
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Index,
+            slot: slot as u16,
+        };
+        if storage.object_owner(object, txn.txid) != usize::from(owner) {
+            let prior = storage.set_object_owner(object, usize::from(owner), txn.txid);
+            txn.record_ddl(
+                storage,
+                super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
+            )?;
+        }
+        Ok(slot)
+    })();
+    if result.is_err()
+        && !txn.ddl().iter().any(|undo| {
+            matches!(undo,
+        super::txn::DdlUndo::IndexCreated(created) if *created == slot as u32)
+        })
+    {
+        storage.rollback_index_create(slot);
+    }
+    result
+}
+
+fn materialize_reindex_original(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    candidate: &crate::sql::catalog::ReindexCandidate,
+) -> Result<usize, SqlError> {
+    let original = candidate.definition;
+    if let Some(slot) = storage.index_slot(
+        original.schema.as_str(),
+        original.name_for(txn.txid).as_str(),
+        txn.txid,
+    ) {
+        if storage
+            .index_visible_to(slot, txn.txid)
+            .is_none_or(|index| index.created_at != original.created_at)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "REINDEX selected index lifetime changed"
+            ));
+        }
+        return Ok(slot);
+    }
+    if original.relation_kind() == crate::storage::IndexRelationKind::Table {
+        let (target, current) = storage.select_table_definition(candidate.table, txn.txid);
+        let mut normalized = TableDefBuilder::from_definition(&current);
+        materialize_flag_key_names(&mut normalized)?;
+        stage_table_definition(storage, wal, txn, target, current, normalized)?;
+    }
+    register_reindex_definition(storage, wal, txn, candidate.table, original)
+}
+
+fn rebuild_reindex_table_cache(
+    storage: &mut Storage,
+    txn: &TxnState,
+    table: usize,
+    selected: Option<i32>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    validate_index_rows(
+        storage,
+        table,
+        txn.txid,
+        IndexRowValidation::Reindex { selected },
+        arena,
+    )?;
+    storage.mark_value_bindings_dirty(table);
+    storage.rebuild_value_caches(
+        table,
+        crate::storage::ValueCacheRebuild::Existing {
+            transaction: txn.txid,
+        },
+    )?;
+    for index_slot in 0..storage.index_count() {
+        let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
+            continue;
+        };
+        if index.method == crate::sql::ast::IndexAccessMethod::Brin
+            && selected.is_none_or(|oid| index.relation_oid() == oid)
+            && storage.index_table_slot_to(index_slot, txn.txid) == Some(table)
+        {
+            storage.rebuild_brin_maintenance(index_slot, txn.txid)?;
+        }
+    }
+    Ok(())
+}
+
+fn register_reindex_candidates<'a>(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    candidates: &[crate::sql::catalog::ReindexCandidate],
+    selected: Option<i32>,
+    selected_tablespace: Option<u16>,
+    arena: &'a Arena,
+) -> Result<&'a [crate::storage::IndexReplacement], SqlError> {
+    let eligible = |candidate: &crate::sql::catalog::ReindexCandidate| {
+        !candidate.exclusion
+            && !candidate
+                .definition
+                .mutable_for(txn.txid)
+                .kind
+                .is_partitioned()
+            && (selected.is_some() || candidate.definition.mutable_for(txn.txid).kind.valid())
+            && storage.table_def(candidate.table, txn.txid).persistence
+                != crate::storage::RelationPersistence::Temporary
+    };
+    let count = candidates
+        .iter()
+        .filter(|candidate| eligible(candidate))
+        .count();
+    if count == 0 {
+        return Ok(false);
+    }
+    let chosen = arena
+        .alloc_slice_with(count, |_| crate::sql::catalog::ReindexCandidate {
+            table: 0,
+            definition: IndexDef::EMPTY,
+            exclusion: false,
+        })
+        .map_err(|_| arena_full())?;
+    let mut chosen_count = 0;
+    for candidate in candidates.iter().filter(|candidate| eligible(candidate)) {
+        chosen[chosen_count] = *candidate;
+        chosen_count += 1;
+    }
+    let replacements = arena
+        .alloc_slice_with(count, |_| crate::storage::IndexReplacement {
+            old_slot: 0,
+            old_created_at: 0,
+            new_slot: 0,
+            new_created_at: 0,
+            table: 0,
+        })
+        .map_err(|_| arena_full())?;
+    let mut next = 0;
+    for candidate in chosen {
+        let table = candidate.table;
+        let mut original = candidate.definition.definition_for(txn.txid);
+        original.name = original.name_for(txn.txid);
+        original.mutable = original.mutable_for(txn.txid);
+        original.pending_definition = None;
+        original.pending_name = None;
+        let old_slot = materialize_reindex_original(storage, wal, txn, candidate)?;
+        let mut replacement = original;
+        replacement.created_at = 0;
+        replacement.name =
+            reindex_relation_name(storage, txn.txid, original.schema, original.name, "ccnew")?;
+        replacement.mutable.kind = crate::storage::IndexKind::OrdinaryUnbuilt;
+        replacement.mutable.parent = None;
+        replacement.mutable.clustered = false;
+        replacement.mutable.replica_identity = false;
+        if let Some(tablespace) = selected_tablespace {
+            replacement.mutable.tablespace = tablespace;
+        }
+        let new_slot = register_reindex_definition(storage, wal, txn, table, replacement)?;
+        let new_created_at = storage
+            .index_visible_to(new_slot, txn.txid)
+            .expect("registered replacement")
+            .created_at;
+        replacements[next] = crate::storage::IndexReplacement {
+            old_slot,
+            old_created_at: original.created_at,
+            new_slot,
+            new_created_at,
+            table,
+        };
+        next += 1;
+    }
+    Ok(replacements)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn register_next_reindex_table<'a>(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    selected: Option<i32>,
+    tablespace: Option<u16>,
+    arena: &'a Arena,
+    responder: &mut Responder,
+) -> Result<Result<&'a [crate::storage::IndexReplacement], SqlError>, crate::pg::wire::WireFull> {
+    if let Err(error) = require_table_privilege(
+        storage,
+        table,
+        crate::storage::PrivilegeSet::MAINTAIN,
+        txn.txid,
+    )
+    .and_then(|()| {
+        storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+            false,
+        )
+    }) {
+        return Ok(Err(error));
+    }
+    let candidates = match crate::sql::catalog::reindex_candidates(
+        storage,
+        txn.txid,
+        core::slice::from_ref(&table),
+        selected,
+        arena,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => return Ok(Err(error)),
+    };
+    if storage.table_def(table, txn.txid).persistence
+        == crate::storage::RelationPersistence::Temporary
+    {
+        return Ok((|| {
+            for candidate in candidates {
+                if let Some(tablespace) = tablespace {
+                    let slot = materialize_reindex_original(storage, wal, txn, candidate)?;
+                    let mut definition = candidate.definition.mutable_for(txn.txid);
+                    definition.tablespace = tablespace;
+                    stage_index_definition(storage, wal, txn, slot, definition)?;
+                }
+            }
+            rebuild_reindex_table_cache(storage, txn, table, selected, arena)?;
+            Ok(&[][..])
+        })());
+    }
+    for candidate in candidates {
+        let kind = candidate.definition.mutable_for(txn.txid).kind;
+        if selected.is_none() && !kind.valid() && !kind.is_partitioned() {
+            crate::sql::eval::stash_diagnostic(
+                None,
+                Some(crate::util::StackStr::from_str(
+                    "Use DROP INDEX or REINDEX INDEX.",
+                )),
+            );
+            responder.warning(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                stack_format!(
+                    192,
+                    "skipping reindex of invalid index \"{}.{}\"",
+                    candidate.definition.schema.as_str(),
+                    candidate.definition.name_for(txn.txid).as_str()
+                )
+                .as_str(),
+            )?;
+            continue;
+        }
+        if candidate.exclusion {
+            if selected.is_some() {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "concurrent index creation for exclusion constraints is not supported"
+                )));
+            }
+            responder.warning(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                stack_format!(
+                    192,
+                    "cannot reindex exclusion constraint index \"{}.{}\" concurrently, skipping",
+                    candidate.definition.schema.as_str(),
+                    candidate.definition.name_for(txn.txid).as_str()
+                )
+                .as_str(),
+            )?;
+        }
+    }
+    let result =
+        register_reindex_candidates(storage, wal, txn, candidates, selected, tablespace, arena);
+    if matches!(&result, Ok(replacements) if replacements.is_empty())
+        && selected.is_none()
+        && !storage
+            .table_def(table, txn.txid)
+            .partition
+            .is_partitioned()
+    {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(
+                192,
+                "table \"{}\" has no indexes that can be reindexed concurrently",
+                storage.table_def(table, txn.txid).name.as_str()
+            )
+            .as_str(),
+        )?;
+    }
+    Ok(result)
+}
+
+pub(super) fn swap_reindex_definitions(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    replacements: &[crate::storage::IndexReplacement],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for replacement in replacements {
+        let old = storage
+            .index_visible_to(replacement.old_slot, txn.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "REINDEX original index disappeared"
+                )
+            })?;
+        let new = storage
+            .index_visible_to(replacement.new_slot, txn.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "REINDEX replacement disappeared"
+                )
+            })?;
+        let old_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Index,
+            slot: replacement.old_slot as u16,
+        };
+        let new_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Index,
+            slot: replacement.new_slot as u16,
+        };
+        preserve_object_acl(storage, txn, old_object, new_object)?;
+        let mut dependencies = ArenaList::new(arena);
+        for (_, dependency) in storage.extension_dependencies_visible_to(txn.txid) {
+            if dependency.object == old_object {
+                dependencies.push(dependency).map_err(|_| arena_full())?;
+            }
+        }
+        for dependency in dependencies.as_slice() {
+            for (object, enabled) in [(new_object, true), (old_object, false)] {
+                let (slot, prior) = storage.change_extension_dependency(
+                    usize::from(dependency.extension),
+                    object,
+                    dependency.kind,
+                    enabled,
+                    txn.txid,
+                )?;
+                txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::ExtensionDependencyChanged {
+                        slot: slot as u32,
+                        prior,
+                    },
+                )?;
+            }
+        }
+        let original_name = old.name_for(txn.txid);
+        let retired_name =
+            reindex_relation_name(storage, txn.txid, old.schema, original_name, "ccold")?;
+        let comment = storage.comment_text(
+            crate::storage::CommentClass::Index,
+            old.schema.as_str(),
+            original_name.as_str(),
+            0,
+            txn.txid,
+        );
+        stage_index_rename(storage, wal, txn, replacement.old_slot, retired_name)?;
+        stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
+        for (name, text) in [(retired_name, None), (original_name, comment)] {
+            if let Some((slot, prior)) = storage.set_comment(
+                crate::storage::CommentClass::Index,
+                old.schema,
+                name,
+                0,
+                text,
+                txn.txid,
+            )? {
+                txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::CommentSet {
+                        slot: slot as u32,
+                        prior,
+                    },
+                )?;
+            }
+        }
+        let mut old_definition = old.mutable_for(txn.txid);
+        let mut new_definition = new.mutable_for(txn.txid);
+        new_definition.kind = crate::storage::IndexKind::Ordinary;
+        new_definition.parent = old_definition.parent;
+        new_definition.clustered = old_definition.clustered;
+        new_definition.replica_identity = old_definition.replica_identity;
+        old_definition.kind = crate::storage::IndexKind::OrdinaryReady;
+        old_definition.immediate = true;
+        old_definition.parent = None;
+        old_definition.clustered = false;
+        old_definition.replica_identity = false;
+        stage_index_definition(storage, wal, txn, replacement.old_slot, old_definition)?;
+        stage_index_definition(storage, wal, txn, replacement.new_slot, new_definition)?;
+        let (target, current) = storage.select_table_definition(replacement.table, txn.txid);
+        let mut next = TableDefBuilder::from_definition(&current);
+        let mut changed = false;
+        if old.relation_kind() == crate::storage::IndexRelationKind::Toast {
+            if next
+                .toast_index_identity
+                .is_none_or(|identity| identity.created_at() != replacement.old_created_at)
+            {
+                return Err(sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "REINDEX TOAST anchor changed before swap"
+                ));
+            }
+            next.toast_index_identity =
+                crate::storage::RelationIdentity::parse(replacement.new_created_at);
+            changed = true;
+        }
+        for identity in next.implicit_index_identities_mut() {
+            if identity.is_some_and(|identity| identity.created_at() == replacement.old_created_at)
+            {
+                *identity = crate::storage::RelationIdentity::parse(replacement.new_created_at);
+                changed = true;
+            }
+        }
+        if changed {
+            stage_table_definition(storage, wal, txn, target, current, next)?;
+        }
+        storage.prepare_index_definition_enforcers(
+            replacement.old_slot,
+            txn.txid,
+            crate::storage::IndexBindingOperation::State,
+        )?;
+        storage.prepare_index_definition_enforcers(
+            replacement.new_slot,
+            txn.txid,
+            crate::storage::IndexBindingOperation::State,
+        )?;
+    }
+    Ok(())
+}
+
+/// Blocking REINDEX rebuilds disposable lookup caches. Concurrent REINDEX
+/// publishes replacement catalog lifetimes before switching their dependencies.
 pub struct ReindexCommand<'a> {
     pub target: crate::sql::ast::ReindexTarget,
     pub name: Option<QualName<'a>>,
@@ -56138,7 +56663,6 @@ pub fn reindex(
         Err(_) => return sql_fail(arena_full()),
     };
     let mut table_count = 0usize;
-    let mut selected_index = None;
     let mut selected_index_oid = None;
     match target {
         crate::sql::ast::ReindexTarget::Table => match resolve_dml_table(
@@ -56169,7 +56693,6 @@ pub fn reindex(
             };
             tables[0] = selected.table;
             selected_index_oid = Some(selected.oid);
-            selected_index = selected.explicit_slot;
         }
         crate::sql::ast::ReindexTarget::Schema => {
             let name = name.expect("SCHEMA target has a parsed name");
@@ -56246,25 +56769,29 @@ pub fn reindex(
     ) {
         table_count = 1;
     }
-    if options.tablespace.is_some()
-        && if selected_index_oid.is_some() {
-            selected_index.is_none()
-        } else {
-            tables[..table_count].iter().any(|&table| {
-                storage
-                    .table_def(table, txn.txid)
-                    .implicit_index_identities()
-                    .next()
-                    .is_some()
-            })
-        }
+    if matches!(
+        target,
+        crate::sql::ast::ReindexTarget::Index | crate::sql::ast::ReindexTarget::Table
+    ) && storage
+        .table_def(tables[0], txn.txid)
+        .partition
+        .is_partitioned()
     {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "REINDEX TABLESPACE for an implicit constraint index is not supported"
-        ));
+        let root = tables[0];
+        for table in 0..storage.table_count() {
+            if table != root
+                && storage.table_slot_visible_to(table, txn.txid)
+                && partition_depth_from(storage, table, root, txn.txid).is_some()
+            {
+                tables[table_count] = table;
+                table_count += 1;
+            }
+        }
     }
     for &table in &tables[..table_count] {
+        if options.build == crate::sql::ast::IndexBuildMode::Concurrent {
+            continue;
+        }
         if let Err(error) = require_table_privilege(
             storage,
             table,
@@ -56286,12 +56813,70 @@ pub fn reindex(
             return sql_fail(error);
         }
     }
+    if options.build == crate::sql::ast::IndexBuildMode::Concurrent {
+        if target == crate::sql::ast::ReindexTarget::System {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot reindex system catalogs concurrently"
+            ));
+        }
+        let selected_tablespace = match options
+            .tablespace
+            .map(|name| resolve_relation_tablespace(storage, Some(name), txn.txid))
+            .transpose()
+        {
+            Ok(selected) => selected,
+            Err(error) => return sql_fail(error),
+        };
+        let targets =
+            match arena.alloc_slice_with(table_count, |position| crate::storage::ReindexTable {
+                slot: tables[position],
+                created_at: storage.table(tables[position]).created_at(),
+            }) {
+                Ok(targets) => targets,
+                Err(_) => return sql_fail(arena_full()),
+            };
+        for (position, target) in targets.iter().enumerate() {
+            let replacements = match register_next_reindex_table(
+                storage,
+                wal,
+                txn,
+                target.slot,
+                selected_index_oid,
+                selected_tablespace,
+                arena,
+                responder,
+            )? {
+                Ok(replacements) => replacements,
+                Err(error) => return sql_fail(error),
+            };
+            if replacements.is_empty() {
+                continue;
+            }
+            match super::concurrent_index::Command::capture_reindex(
+                storage,
+                txn.txid,
+                replacements,
+                targets,
+                position + 1,
+                selected_index_oid,
+                selected_tablespace,
+            ) {
+                Ok(command) => txn.concurrent_index = Some(command),
+                Err(error) => return sql_fail(error),
+            }
+            return sql_ok();
+        }
+        txn.immediate_index_utility = Some(super::UtilityCommand::ReindexWithoutRestart);
+        responder.command_complete("REINDEX")?;
+        return sql_ok();
+    }
     if options.build == crate::sql::ast::IndexBuildMode::Blocking {
         for slot in 0..storage.index_count() {
             let Some(index) = storage.index_visible_to(slot, txn.txid) else {
                 continue;
             };
-            if (selected_index_oid.is_some() && selected_index != Some(slot))
+            if selected_index_oid.is_some_and(|oid| index.relation_oid() != oid)
                 || storage
                     .index_table_slot_to(slot, txn.txid)
                     .is_none_or(|table| !tables[..table_count].contains(&table))
@@ -56317,40 +56902,9 @@ pub fn reindex(
         }
     }
     for &table in &tables[..table_count] {
-        if let Err(error) = validate_index_rows(
-            storage,
-            table,
-            txn.txid,
-            IndexRowValidation::Reindex {
-                selected: selected_index_oid,
-            },
-            arena,
-        ) {
-            return sql_fail(error);
-        }
-        storage.mark_value_bindings_dirty(table);
-        if let Err(error) = storage.rebuild_value_caches(
-            table,
-            crate::storage::ValueCacheRebuild::Existing {
-                transaction: txn.txid,
-            },
-        ) {
-            return sql_fail(error);
-        }
-    }
-    for index_slot in 0..storage.index_count() {
-        let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
-            continue;
-        };
-        if index.method != crate::sql::ast::IndexAccessMethod::Brin
-            || (selected_index_oid.is_some() && selected_index != Some(index_slot))
-            || storage
-                .index_table_slot_to(index_slot, txn.txid)
-                .is_none_or(|table| !tables[..table_count].contains(&table))
+        if let Err(error) =
+            rebuild_reindex_table_cache(storage, txn, table, selected_index_oid, arena)
         {
-            continue;
-        }
-        if let Err(error) = storage.rebuild_brin_maintenance(index_slot, txn.txid) {
             return sql_fail(error);
         }
     }
@@ -56360,11 +56914,26 @@ pub fn reindex(
                 Ok(tablespace) => tablespace,
                 Err(error) => return sql_fail(error),
             };
+        let candidates = match crate::sql::catalog::reindex_candidates(
+            storage,
+            txn.txid,
+            &tables[..table_count],
+            selected_index_oid,
+            arena,
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) => return sql_fail(error),
+        };
+        for candidate in candidates {
+            if let Err(error) = materialize_reindex_original(storage, wal, txn, candidate) {
+                return sql_fail(error);
+            }
+        }
         for index_slot in 0..storage.index_count() {
             let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
                 continue;
             };
-            if selected_index_oid.is_some() && selected_index != Some(index_slot) {
+            if selected_index_oid.is_some_and(|oid| index.relation_oid() != oid) {
                 continue;
             }
             let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {
@@ -68604,6 +69173,7 @@ fn drop_named_constraint(def: &mut TableDefBuilder, name: &str) -> bool {
         && let Some(column) = def.columns().iter().position(|column| column.primary)
     {
         def.take_column_index_identity(column);
+        def.take_column_constraint_identity(column);
         def.columns[column].primary = false;
         def.columns[column].unique = false;
         return true;
@@ -68619,6 +69189,7 @@ fn drop_named_constraint(def: &mut TableDefBuilder, name: &str) -> bool {
             );
             if name == key.as_str() {
                 def.take_column_index_identity(i);
+                def.take_column_constraint_identity(i);
                 def.columns[i].unique = false;
                 return true;
             }
@@ -68673,19 +69244,28 @@ fn attached_constraint_index<Definition0: crate::storage::DefinitionBacking>(
     name: &str,
     txid: u32,
 ) -> Option<usize> {
-    let (columns, n_columns) = named_key_columns(definition, name)?;
-    let slot = storage.index_slot(definition.schema.as_str(), name, txid)?;
-    let index = storage.index_visible_to(slot, txid)?;
-    (storage
-        .index_table_slot_to(slot, txid)
-        .is_some_and(|table| {
-            let owner = storage.table_def(table, txid);
-            owner.schema == definition.schema && owner.name == definition.name
+    let identity = definition
+        .uniques()
+        .iter()
+        .find(|key| key.name.as_str() == name)
+        .and_then(|key| key.index_identity)
+        .or_else(|| {
+            definition
+                .exclusions()
+                .iter()
+                .find(|key| key.name.as_str() == name)
+                .and_then(|key| key.index_identity)
+        })?;
+    storage
+        .indexes_for(definition.schema.as_str(), definition.name.as_str(), txid)
+        .find(|index| index.created_at == identity.created_at())
+        .and_then(|index| {
+            storage.index_slot(
+                definition.schema.as_str(),
+                index.name_for(txid).as_str(),
+                txid,
+            )
         })
-        && index.n_cols == n_columns
-        && index.columns[..n_columns] == columns[..n_columns]
-        && index.expressions[..n_columns].iter().all(Option::is_none))
-    .then_some(slot)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74776,6 +75356,7 @@ fn materialize_flag_key_names(def: &mut TableDefBuilder) -> Result<(), SqlError>
             crate::sql::ast::ConstraintTiming::NotDeferrable,
         )?;
         def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(column);
+        def.uniques[def.n_uniques - 1].identity = def.take_column_constraint_identity(column);
         def.columns[column].primary = false;
         def.columns[column].unique = false;
     }
@@ -74829,6 +75410,7 @@ fn rename_flag_key(
                 crate::sql::ast::ConstraintTiming::NotDeferrable,
             )?;
             def.uniques[def.n_uniques - 1].index_identity = def.take_column_index_identity(i);
+            def.uniques[def.n_uniques - 1].identity = def.take_column_constraint_identity(i);
             return Ok(true);
         }
     }

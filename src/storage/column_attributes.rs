@@ -383,8 +383,8 @@ mod ownership_tests {
         use crate::mem::budget::Budget;
         use crate::mem::lease_pool::{LeasePool, Purpose};
         let bytes = 64 * 1024;
-        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 9));
-        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 9).unwrap();
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 10));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 10).unwrap();
         let mut draft = TableDefBuilder::empty();
         draft.name = SqlName::parse("actual_width").unwrap();
         draft.n_columns = 1;
@@ -406,6 +406,7 @@ mod ownership_tests {
             assert_eq!(saved.attributes.slots.len(), 2);
             assert_eq!(saved.not_null_identities.len(), 2);
             assert_eq!(saved.inline_index_identities.len(), 2);
+            assert_eq!(saved.inline_constraint_identities.len(), 2);
             assert_eq!(saved.uniques.len(), 1);
             assert_eq!(saved.checks.len(), 1);
             assert_eq!(saved.fkeys.len(), 1);
@@ -419,6 +420,7 @@ mod ownership_tests {
                 ));
                 assert_eq!(borrowed.columns.len(), 1);
                 assert_eq!(borrowed.not_null_identities.len(), 2);
+                assert_eq!(borrowed.inline_constraint_identities.len(), 2);
                 assert_eq!(borrowed.attribute_number(0), 2);
             }
             let pinned = saved.clone();

@@ -1544,6 +1544,11 @@ pub fn check_unique_indexes(
     check: UniqueIndexCheck,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if matches!(check, UniqueIndexCheck::Cache) && !index.mutable_for(txid).immediate {
+            // The constraint's own timing controls checks. A detached REINDEX
+            // replacement has no check trigger until the atomic link swap.
+            continue;
+        }
         if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(&index))
         {
             continue;

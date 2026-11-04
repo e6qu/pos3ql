@@ -218,7 +218,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v36";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v37";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -6003,6 +6003,14 @@ impl Checkpointer {
                             "implicit index outside table",
                         ));
                     };
+                    if storage.is_large_object_page_relation(
+                        definition.schema.as_str(),
+                        definition.name.as_str(),
+                    ) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "internal storage table has no SQL index identities",
+                        ));
+                    }
                     let position: usize = parse_field(words.next(), "implicit index position")?;
                     let created_at: u64 = parse_field(words.next(), "implicit index creation")?;
                     let identity = crate::storage::RelationIdentity::parse(created_at)
@@ -6016,7 +6024,7 @@ impl Checkpointer {
                         ));
                     }
                     let target = definition
-                        .implicit_index_identities_mut()
+                        .table_index_identities_mut()
                         .nth(position)
                         .ok_or(CheckpointSetupError::Corrupt(
                             "invalid implicit index position",
@@ -8724,6 +8732,29 @@ impl Checkpointer {
                     if created_at == 0 {
                         return Err(CheckpointSetupError::Corrupt("bad index catalog sequence"));
                     }
+                    let relation_tag: u8 = parse_field(words.next(), "idx relation source")?;
+                    let relation_slot: usize = parse_field(words.next(), "idx owner position")?;
+                    let relation_birth: u64 = parse_field(words.next(), "idx owner identity")?;
+                    let relation = match (relation_tag, relation_slot, relation_birth) {
+                        (0, 0, 0) => crate::storage::IndexRelationSource::Table,
+                        (1, slot, birth) if birth <= metadata.catalog_sequence => {
+                            crate::storage::IndexRelationSource::Toast(
+                                crate::storage::CatalogPosition::new(slot, birth).map_err(
+                                    |_| {
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid TOAST index owner identity",
+                                        )
+                                    },
+                                )?,
+                            )
+                        }
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid index relation source",
+                            ));
+                        }
+                    };
+                    let immediate = parse_bool_field(words.next(), "idx immediate uniqueness")?;
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
                     let n_cols: usize = parse_field(words.next(), "idx ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
@@ -9315,6 +9346,7 @@ impl Checkpointer {
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
+                                relation,
                                 database: crate::storage::DatabaseOid::POSTGRES,
                                 created_at,
                                 schema: sql_name(&schema)?,
@@ -9356,6 +9388,7 @@ impl Checkpointer {
                                     kind,
                                     clustered,
                                     replica_identity,
+                                    immediate,
                                 },
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
@@ -10984,20 +11017,20 @@ impl Checkpointer {
                 )?;
             }
 
-            for (position, identity) in definition.implicit_index_identities().enumerate() {
-                let identity = identity.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::DATA_EXCEPTION,
-                        "checkpoint implicit index has no creation identity"
-                    )
-                })?;
-                write_manifest(
-                    &mut self.manifest_output,
-                    format_args!("implicit_index {position} {}", identity.created_at()),
-                )?;
-            }
-
             if slot != storage.large_object_page_table() {
+                for (position, identity) in definition.table_index_identities().enumerate() {
+                    let identity = identity.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "checkpoint implicit index has no creation identity"
+                        )
+                    })?;
+                    write_manifest(
+                        &mut self.manifest_output,
+                        format_args!("implicit_index {position} {}", identity.created_at()),
+                    )?;
+                }
+
                 for (position, identity) in definition.constraint_identities().enumerate() {
                     let identity = identity.ok_or_else(|| {
                         sql_err!(
@@ -12936,8 +12969,21 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
+                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
                     index.created_at,
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(_) => 1,
+                    },
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(owner) => owner.slot(),
+                    },
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(owner) => owner.created_at(),
+                    },
+                    u8::from(mutable.immediate),
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -17887,6 +17933,7 @@ fn finish_pending(
                 || &definition.not_null_names[..definition.n_columns]
                     != expected.not_null_names.as_ref()
                 || definition.has_toast != expected.has_toast
+                || definition.toast_index_identity != expected.toast_index_identity
                 || definition
                     .columns()
                     .iter()
@@ -19966,6 +20013,101 @@ mod stored_dependency_tests {
     }
 
     #[test]
+    fn manifest_round_trip_preserves_independent_inline_and_named_key_identities() {
+        let (mut checkpoint, mut storage, inline, config) =
+            index_gc_fixture("constraint-identity-manifest", 16);
+        let mut definition = TableDefBuilder::empty();
+        definition.schema = SqlName::parse("public").unwrap();
+        definition.name = SqlName::parse("named_keys").unwrap();
+        definition.n_columns = 1;
+        definition.columns[0] = ColumnMeta {
+            name: SqlName::parse("id").unwrap(),
+            ctype: ColType::Text,
+            ..ColumnMeta::EMPTY
+        };
+        definition.n_uniques = 1;
+        definition.uniques[0].name = SqlName::parse("named_key").unwrap();
+        definition.uniques[0].columns[0] = 0;
+        definition.uniques[0].n_cols = 1;
+        let named = crate::mem::guard::forbid_alloc(|| storage.create_table(definition)).unwrap();
+        let owner = storage.table_position(named);
+        let anchor = storage.table_def(named, 0).toast_index_identity.unwrap();
+        let main_oid = crate::storage::RelationIdentity::parse(owner.created_at())
+            .unwrap()
+            .oid();
+        let toast_name = crate::stack_format!(64, "pg_toast_{main_oid}");
+        let toast_index_name = crate::stack_format!(64, "pg_toast_{main_oid}_index");
+        let mut toast = crate::storage::IndexDef {
+            relation: crate::storage::IndexRelationSource::Toast(owner),
+            created_at: anchor.created_at(),
+            schema: SqlName::parse("pg_toast").unwrap(),
+            table: SqlName::parse(toast_name.as_str()).unwrap(),
+            name: SqlName::parse(toast_index_name.as_str()).unwrap(),
+            n_cols: 2,
+            unique: true,
+            collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+            ..crate::storage::IndexDef::EMPTY
+        };
+        toast.columns[1] = 1;
+        toast.resolved_operator_classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
+            crate::sql::types::BtreeOperatorClass::Oid,
+        ));
+        toast.resolved_operator_classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
+            crate::sql::types::BtreeOperatorClass::Int4,
+        ));
+        let toast_slot = crate::mem::guard::forbid_alloc(|| {
+            let slot = storage.create_index(toast, 0).unwrap();
+            storage.commit_index_create(slot).unwrap();
+            slot
+        });
+        let toast_before = storage.index_visible_to(toast_slot, 0).unwrap();
+        let inline_before = TableDefBuilder::from_definition(&storage.table_def(inline, 0));
+        let named_before = TableDefBuilder::from_definition(&storage.table_def(named, 0));
+        checkpoint.prepare_manifest(&storage, 0).unwrap();
+        let manifest = String::from_utf8(checkpoint.manifest_output.readable().to_vec()).unwrap();
+        drop(storage);
+        let mut budget = Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config));
+        let mut restored = Storage::new(&config, &mut budget, 0).unwrap();
+        checkpoint
+            .load_manifest_text(&mut restored, &manifest)
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (slot, before) in [(inline, &inline_before), (named, &named_before)] {
+                let after = restored.table_def(slot, 0);
+                assert!(
+                    after
+                        .constraint_identities()
+                        .eq(before.constraint_identities())
+                );
+                assert!(
+                    after
+                        .table_index_identities()
+                        .eq(before.table_index_identities())
+                );
+                for position in 0..after.implicit_index_identities().count() {
+                    let constraint = after.implicit_constraint_identity(position).unwrap();
+                    assert_ne!(constraint.oid(), after.implicit_index_oid(position));
+                }
+            }
+            let toast_after = restored
+                .index_definition("pg_toast", toast_index_name.as_str(), 0)
+                .unwrap();
+            assert_eq!(toast_after.relation, toast_before.relation);
+            assert_eq!(toast_after.relation_oid(), toast_before.relation_oid());
+            assert_eq!(restored.indexes_for("public", "named_keys", 0).count(), 0);
+            restored
+                .validate_restored_relation_identities(restored.catalog_identity_sequence())
+                .unwrap();
+            restored
+                .validate_restored_constraint_identities(restored.catalog_identity_sequence())
+                .unwrap();
+        });
+        drop(restored);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
     fn checkpoint_reads_full_table_capture_and_large_row_output_resume_once() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -20667,7 +20809,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v36\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v37\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -21483,7 +21625,7 @@ mod stored_dependency_tests {
             );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
-            let manifest = b"pos3ql-manifest-v36\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let manifest = b"pos3ql-manifest-v37\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
             let body: &[u8] = match phase {
                 "rows" | "index" => &root_body,
                 "manifest" => manifest,
@@ -21614,7 +21756,7 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
-        let manifest = b"pos3ql-manifest-v36\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v37\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
         for index in 0..65 {
             checkpoint
                 .client
@@ -22223,7 +22365,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v36\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v37\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -22249,7 +22391,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v36\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v37\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -22258,7 +22400,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v36\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v37\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -22460,7 +22602,9 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v32",
                 "pos3ql-manifest-v33",
                 "pos3ql-manifest-v34",
-                "pos3ql-manifest-v36 trailing",
+                "pos3ql-manifest-v35",
+                "pos3ql-manifest-v36",
+                "pos3ql-manifest-v37 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -22542,11 +22686,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v36\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v37\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v36\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v37\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -22955,7 +23099,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v36\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v37\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

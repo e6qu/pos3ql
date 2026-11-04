@@ -839,7 +839,7 @@ pub(super) fn dependencies<'a>(
     };
     for values in constraints {
         let constraint_kind = super::view_rows::character(values[kind])?;
-        if !matches!(constraint_kind, b'c' | b'n' | b'p' | b'u' | b'f') {
+        if !matches!(constraint_kind, b'c' | b'n' | b'p' | b'u' | b'x' | b'f') {
             continue;
         }
         let oid = integer(values[oid])?;
@@ -888,7 +888,7 @@ pub(super) fn dependencies<'a>(
             }
         }
         let index = integer(values[index])?;
-        if matches!(constraint_kind, b'p' | b'u') {
+        if matches!(constraint_kind, b'p' | b'u' | b'x') {
             push(
                 super::PG_CLASS_OID,
                 index,
@@ -919,7 +919,7 @@ pub(super) fn dependencies<'a>(
         }
     }
     for index in indexes {
-        if index.is_constraint {
+        if index.constraint_identity.is_some() {
             continue;
         }
         let table = storage.table_def(index.table_slot, transaction);
@@ -970,6 +970,32 @@ pub(super) fn dependencies<'a>(
                     b'a',
                 )?;
             }
+        }
+    }
+    for table in 0..storage.table_count() {
+        if storage.table_slot_visible_to(table, transaction)
+            && storage.table_def(table, transaction).has_toast
+        {
+            push(
+                super::PG_CLASS_OID,
+                super::toast_relation_oid(storage, table),
+                super::PG_CLASS_OID,
+                super::user_table_oid(storage, table),
+                0,
+                b'i',
+            )?;
+        }
+    }
+    for index in super::collect_toast_indexes(storage, transaction, arena)? {
+        for column in [1, 2] {
+            push(
+                super::PG_CLASS_OID,
+                index.oid,
+                super::PG_CLASS_OID,
+                super::toast_relation_oid(storage, index.table),
+                column,
+                b'a',
+            )?;
         }
     }
     output.rows().map(|rows| &*rows)

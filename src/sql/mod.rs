@@ -1974,6 +1974,7 @@ pub(crate) enum UtilityCommand {
     AlterSubscriptionOptions,
     CreateIndexWithoutRestart,
     DropIndexWithoutRestart,
+    ReindexWithoutRestart,
 }
 
 impl UtilityCommand {
@@ -1988,6 +1989,7 @@ impl UtilityCommand {
             Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION SET",
             Self::CreateIndexWithoutRestart => "CREATE INDEX CONCURRENTLY",
             Self::DropIndexWithoutRestart => "DROP INDEX CONCURRENTLY",
+            Self::ReindexWithoutRestart => "REINDEX CONCURRENTLY",
         }
     }
 
@@ -2002,6 +2004,7 @@ impl UtilityCommand {
             Self::AlterSubscriptionOptions => "ALTER SUBSCRIPTION",
             Self::CreateIndexWithoutRestart => "CREATE INDEX",
             Self::DropIndexWithoutRestart => "DROP INDEX",
+            Self::ReindexWithoutRestart => "REINDEX",
         }
     }
 }
@@ -12180,6 +12183,9 @@ impl Engine {
                                 ) | (
                                     UtilityCommand::DropIndexWithoutRestart,
                                     Some(concurrent_index::Kind::Drop)
+                                ) | (
+                                    UtilityCommand::ReindexWithoutRestart,
+                                    Some(concurrent_index::Kind::Reindex)
                                 )
                             )
                         {
@@ -18479,16 +18485,7 @@ impl Engine {
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
-        let index_statement = matches!(
-            statement,
-            Stmt::CreateIndex {
-                build: ast::IndexBuildMode::Concurrent,
-                ..
-            } | Stmt::DropIndex {
-                build: ast::IndexBuildMode::Concurrent,
-                ..
-            }
-        );
+        let index_statement = concurrent_index::Kind::for_statement(statement).is_some();
         let mut result = loop {
             if let Some(command) = &txn.concurrent_index
                 && let Some(cursor) = command.replay
@@ -20391,6 +20388,13 @@ impl Engine {
                 },
                 responder,
             ),
+            Stmt::Reindex { .. } if txn.concurrent_index.is_some() => self
+                .execute_concurrent_index_phase(
+                    txn,
+                    concurrent_index::Kind::Reindex,
+                    arena,
+                    responder,
+                ),
             Stmt::Reindex {
                 target,
                 name,
@@ -21580,20 +21584,38 @@ impl Engine {
             arena,
             responder,
         } = execution;
-        let graphs = event_trigger::collect(
-            &self.storage,
-            txn.txid,
-            statement,
-            tag,
-            event_trigger::CollectChanges {
-                before: &event_before,
-                undo: &txn.ddl()[event_ddl_mark..],
-                undo_origins: &txn.ddl_origins()[event_ddl_mark..],
-                origin: event_ddl_origin,
-                in_extension: txn.in_extension_script(),
-            },
-            arena,
-        )?;
+        let completed_replacements = txn
+            .concurrent_index
+            .as_ref()
+            .filter(|command| {
+                command.kind == concurrent_index::Kind::Reindex
+                    && command.phase == concurrent_index::Phase::Complete
+            })
+            .and_then(concurrent_index::Command::reindex_replacements);
+        let graphs = match completed_replacements {
+            Some(replacements) => event_trigger::completed_reindex_graphs(
+                &self.storage,
+                txn.txid,
+                replacements,
+                tag,
+                txn.in_extension_script(),
+                arena,
+            )?,
+            None => event_trigger::collect(
+                &self.storage,
+                txn.txid,
+                statement,
+                tag,
+                event_trigger::CollectChanges {
+                    before: &event_before,
+                    undo: &txn.ddl()[event_ddl_mark..],
+                    undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                    origin: event_ddl_origin,
+                    in_extension: txn.in_extension_script(),
+                },
+                arena,
+            )?,
+        };
         if event_drop {
             let _scope = event_trigger::enter_dropped_objects(graphs.drops);
             self.fire_event_triggers(
@@ -27476,6 +27498,7 @@ fn apply_wal_op(
             schema,
             name,
             table,
+            relation,
             method,
             columns,
             include_columns,
@@ -27508,6 +27531,7 @@ fn apply_wal_op(
                     name: crate::storage::SqlName::parse(name)?,
                     pending_name: None,
                     table: crate::storage::SqlName::parse(table)?,
+                    relation,
                     table_binding: None,
                     pending_table: None,
                     method,

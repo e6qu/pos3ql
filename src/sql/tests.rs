@@ -12,6 +12,7 @@ mod builtin_argument_binding;
 mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
+mod constraint_index_identity;
 mod cursor_execution;
 mod foreign_parent_admission;
 mod geometric_casts;
@@ -7281,7 +7282,6 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
         assert!(
             crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
                 + crate::storage::MAX_INDEX_OID_GENERATION
-                + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
                 < first.oid() as u64
         );
         for trigger in ForeignKeyTrigger::ALL {

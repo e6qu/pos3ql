@@ -2,6 +2,55 @@
 
 use super::catalog_sources::{CatalogObjectIdentity, CatalogObjectSlot};
 use super::*;
+use crate::sql::types::BtreeOperatorClass;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexRelationKind {
+    Table,
+    Toast,
+}
+
+/// TOAST keys describe the virtual large-value relation, never its owner's columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexRelationSource {
+    Table,
+    Toast(CatalogPosition),
+}
+
+impl IndexRelationSource {
+    pub(crate) const ENCODED_BYTES: usize = 1 + CatalogPosition::ENCODED_BYTES;
+
+    pub(crate) fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        if let Self::Toast(owner) = self {
+            bytes[0] = 1;
+            bytes[1..].copy_from_slice(&owner.encode());
+        }
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_BYTES {
+            return None;
+        }
+        match bytes[0] {
+            0 if bytes[1..].iter().all(|byte| *byte == 0) => Some(Self::Table),
+            1 => {
+                let owner = CatalogPosition::decode(&bytes[1..])?;
+                RelationIdentity::parse(owner.created_at())?;
+                Some(Self::Toast(owner))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn kind(self) -> IndexRelationKind {
+        match self {
+            Self::Table => IndexRelationKind::Table,
+            Self::Toast(_) => IndexRelationKind::Toast,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IndexTableBinding {
@@ -17,6 +66,20 @@ pub(crate) struct PendingIndexTable {
 }
 
 impl IndexDef {
+    pub(crate) fn relation_kind(&self) -> IndexRelationKind {
+        self.relation.kind()
+    }
+
+    pub(crate) fn relation_oid(&self) -> i32 {
+        let first = match self.relation {
+            IndexRelationSource::Table => FIRST_EXPLICIT_INDEX_OID,
+            IndexRelationSource::Toast(_) => FIRST_TOAST_INDEX_OID,
+        };
+        RelationIdentity::parse(self.created_at)
+            .expect("admitted index has a durable identity")
+            .companion_oid(first)
+    }
+
     pub(super) fn pending_owner_other_than(&self, transaction: u32) -> Option<u32> {
         self.ddl_state
             .pending_txid()
@@ -69,7 +132,8 @@ impl Storage {
         transaction: u32,
     ) -> Result<(), IndexNamespaceConflict> {
         for (slot, index) in indexes.iter().enumerate().filter(|(_, index)| {
-            index.ddl_state != CatalogDdlState::Absent
+            matches!(index.relation, IndexRelationSource::Table)
+                && index.ddl_state != CatalogDdlState::Absent
                 && index
                     .table_binding
                     .is_some_and(|binding| binding.source == source)
@@ -165,7 +229,8 @@ impl Storage {
         transaction: u32,
     ) -> Result<(), SqlError> {
         for index in indexes.iter().filter(|index| {
-            index.visible_to(transaction)
+            matches!(index.relation, IndexRelationSource::Table)
+                && index.visible_to(transaction)
                 && index
                     .table_binding
                     .is_some_and(|binding| binding.source == source)
@@ -190,7 +255,8 @@ impl Storage {
         transaction: u32,
     ) {
         for index in indexes.iter_mut().filter(|index| {
-            index.visible_to(transaction)
+            matches!(index.relation, IndexRelationSource::Table)
+                && index.visible_to(transaction)
                 && index
                     .table_binding
                     .is_some_and(|binding| binding.source == source)
@@ -268,6 +334,117 @@ impl IndexTableBinding {
 }
 
 impl Storage {
+    pub(super) fn resolve_index_source_table(
+        &self,
+        index: IndexDef,
+        transaction: u32,
+    ) -> Result<usize, SqlError> {
+        match index.relation {
+            IndexRelationSource::Table => self
+                .find_visible(index.schema.as_str(), index.table.as_str(), transaction)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "relation \"{}\" does not exist",
+                        index.table.as_str()
+                    )
+                }),
+            IndexRelationSource::Toast(position) => {
+                let table = self.tables.get(position.slot()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "TOAST index owner position is invalid"
+                    )
+                })?;
+                let identity = table.identity();
+                let owner_oid = RelationIdentity::parse(position.created_at())
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "TOAST index owner identity is invalid"
+                        )
+                    })?
+                    .oid();
+                if index.created_at != 0 && index.created_at <= position.created_at() {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "TOAST index creation identity precedes its owner"
+                    ));
+                }
+                let name = crate::stack_format!(64, "pg_toast_{owner_oid}");
+                if identity.database != current_database()
+                    || identity.created_at != position.created_at()
+                    || !identity.existence.visible_to(transaction)
+                    || !self.table_def(position.slot(), transaction).has_toast
+                    || index.schema.as_str() != "pg_toast"
+                    || index.table.as_str() != name.as_str()
+                {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "TOAST index owner changed before installation"
+                    ));
+                }
+                if index.method != crate::sql::ast::IndexAccessMethod::Btree
+                    || !index.unique
+                    || !index.mutable.immediate
+                    || index.n_cols != 2
+                    || index.columns[..2] != [0, 1]
+                    || index.n_include_cols != 0
+                    || index.predicate.is_some()
+                    || index.expressions[..2].iter().any(Option::is_some)
+                    || index.collations[..2]
+                        .iter()
+                        .any(|collation| *collation != Collation::None)
+                    || index.resolved_operator_classes[..2]
+                        != [
+                            Some(IndexOperatorClass::Btree(BtreeOperatorClass::Oid)),
+                            Some(IndexOperatorClass::Btree(BtreeOperatorClass::Int4)),
+                        ]
+                    || index.mutable.kind.is_partitioned()
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "invalid object-native TOAST index definition"
+                    ));
+                }
+                Ok(position.slot())
+            }
+        }
+    }
+
+    /// A table drop retains its exact pending index drops for `sql_drop`.
+    pub(crate) fn dropped_table_index_for_event(
+        &self,
+        index_slot: usize,
+        table_slot: usize,
+        transaction: u32,
+    ) -> Option<IndexDef> {
+        let mut index = self.index_catalog().get(index_slot).copied()?;
+        if index.database != current_database()
+            || index.ddl_state.pending_drop_txid() != Some(transaction)
+        {
+            return None;
+        }
+        let source = index.table_binding?.source;
+        let table = self.tables.get(table_slot)?.identity();
+        if source.slot() != CatalogObjectSlot::Table(table_slot)
+            || !source.matches(self, table.database, table.created_at, table.existence)
+        {
+            return None;
+        }
+        index = index.definition_for(transaction);
+        if index.relation_kind() == IndexRelationKind::Table
+            && let Some(pending) = index
+                .pending_table
+                .filter(|pending| pending.transaction == transaction)
+        {
+            index.schema = pending.schema;
+            index.table = pending.table;
+        }
+        index.name = index.name_for(transaction);
+        Some(index)
+    }
+
     pub(super) fn index_binding_table(&self, index: IndexDef, transaction: u32) -> Option<usize> {
         let binding = index.table_binding?;
         let CatalogObjectSlot::Table(table) = binding.source.slot() else {
@@ -336,6 +513,22 @@ impl Storage {
             state.identity.existence,
         ) {
             return None;
+        }
+        if matches!(index.relation, IndexRelationSource::Toast(_)) {
+            if !state.committed().has_toast
+                && !state
+                    .pending
+                    .is_some_and(|head| head.transaction == transaction)
+            {
+                return None;
+            }
+            index.table_binding = Some(IndexTableBinding {
+                source: binding.source,
+                revision: self
+                    .pending_table_defs
+                    .selected_revision(state, transaction),
+            });
+            return Some(index);
         }
         let mut columns = [0; MAX_INDEX_COLS * 2];
         let mut count = 0;
@@ -413,6 +606,97 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::storage::tests::{make_def, test_budget, test_config};
+
+    #[test]
+    fn index_relation_source_codec_rejects_ambiguous_or_unbounded_owners() {
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = CatalogPosition::new(7, 42).unwrap();
+            for source in [
+                IndexRelationSource::Table,
+                IndexRelationSource::Toast(owner),
+            ] {
+                assert_eq!(IndexRelationSource::decode(&source.encode()), Some(source));
+            }
+            let mut malformed = IndexRelationSource::Toast(owner).encode();
+            malformed[0] = 0;
+            assert!(IndexRelationSource::decode(&malformed).is_none());
+            malformed[0] = 2;
+            assert!(IndexRelationSource::decode(&malformed).is_none());
+            malformed[0] = 1;
+            malformed[3..].copy_from_slice(&(MAX_INDEX_OID_GENERATION + 1).to_le_bytes());
+            assert!(IndexRelationSource::decode(&malformed).is_none());
+            malformed[3..].fill(0);
+            assert!(IndexRelationSource::decode(&malformed).is_none());
+        });
+    }
+
+    #[test]
+    fn registered_toast_indexes_keep_owner_identity_and_never_enter_main_table_keys() {
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_indexes = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let owner = storage
+                .create_table(make_def("toast_owner", &[("value", ColType::Text, false)]))
+                .unwrap();
+            let position = storage.table_position(owner);
+            let anchor = storage.table_def(owner, 0).toast_index_identity.unwrap();
+            let owner_oid = RelationIdentity::parse(position.created_at())
+                .unwrap()
+                .oid();
+            let table_name = crate::stack_format!(64, "pg_toast_{owner_oid}");
+            let index_name = crate::stack_format!(64, "pg_toast_{owner_oid}_index");
+            let mut definition = IndexDef {
+                relation: IndexRelationSource::Toast(position),
+                created_at: anchor.created_at(),
+                schema: SqlName::parse("pg_toast").unwrap(),
+                table: SqlName::parse(table_name.as_str()).unwrap(),
+                name: SqlName::parse(index_name.as_str()).unwrap(),
+                n_cols: 2,
+                unique: true,
+                collations: [Collation::None; MAX_INDEX_COLS],
+                ..IndexDef::EMPTY
+            };
+            definition.columns[1] = 1;
+            definition.resolved_operator_classes[0] =
+                Some(IndexOperatorClass::Btree(BtreeOperatorClass::Oid));
+            definition.resolved_operator_classes[1] =
+                Some(IndexOperatorClass::Btree(BtreeOperatorClass::Int4));
+            let slot = storage.create_index(definition, 0).unwrap();
+            storage.commit_index_create(slot).unwrap();
+            assert_eq!(storage.index_table_slot(slot), Some(owner));
+            assert_eq!(
+                storage.index_visible_to(slot, 0).unwrap().relation_oid(),
+                anchor.companion_oid(FIRST_TOAST_INDEX_OID)
+            );
+            assert_eq!(storage.indexes_for("public", "toast_owner", 0).count(), 0);
+            assert_eq!(
+                storage
+                    .unique_indexes_for("public", "toast_owner", 0)
+                    .count(),
+                0
+            );
+            storage
+                .rebuild_value_caches(owner, ValueCacheRebuild::Committed)
+                .unwrap();
+            storage
+                .validate_restored_relation_identities(storage.catalog_identity_sequence())
+                .unwrap();
+            let mut stale = definition;
+            stale.created_at = 0;
+            stale.name = SqlName::parse("stale_toast").unwrap();
+            stale.relation = IndexRelationSource::Toast(
+                CatalogPosition::new(owner, position.created_at() + 1).unwrap(),
+            );
+            assert_eq!(
+                storage.create_index(stale, 0).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(storage.indexes_for("public", "toast_owner", 0).count(), 0);
+        });
+    }
 
     fn index(name: &str, table: &str, column: u16, included: u16) -> IndexDef {
         let mut definition = IndexDef {

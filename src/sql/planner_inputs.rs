@@ -889,15 +889,18 @@ impl Engine {
                 .next_stmt()
                 .map_err(|error| super::parse_error_to_sql(&error))?
             {
+                let statement = arena
+                    .alloc(statement)
+                    .map_err(|_| query::arena_full_pub())?;
                 let statement = match relations {
                     Some(relations) => query::bind_materialized_statement(
-                        &statement,
+                        statement,
                         relations,
                         &self.storage,
                         transaction,
                         arena,
                     )?,
-                    None => &statement,
+                    None => statement,
                 };
                 let captured = capture_planner_inputs(
                     statement,

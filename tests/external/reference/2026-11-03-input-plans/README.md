@@ -27,6 +27,55 @@ and foreign key survive. The archive includes exact SQL, raw results, commands,
 binary hashes and provenance. Extract it and run
 `python3 verify-event-drop-reference.py .` to verify the evidence.
 
+[constraint-reference.zip](constraint-reference.zip), SHA256
+`bba01e9132f612f1dd77ff456b678e9f6e41fa4bf98170ecb1453451be3b8e08`,
+records concurrent reindexing of primary, unique, attached and partitioned keys.
+Constraint identifiers and comments survive while backing indexes change;
+exclusion indexes remain unchanged during a table-wide concurrent rebuild.
+The reference also checks dependency links and DROP reporting after another
+index was already dropped in the same transaction. Exact SQL, raw results,
+commands, binary hashes and provenance are included. Extract it and run
+`python3 verify-constraint-reference.py .` to verify the evidence.
+
+[reindex-reference.zip](reindex-reference.zip), SHA256
+`31690d72db894dd78d372ba37205c2dbd8590f889c123ab8121a3d6208a86fb3`,
+retains six PostgreSQL 18.6 probes covering rebuild eligibility, event callbacks,
+TOAST indexes and invalid-index repair. For example, a table-wide concurrent
+rebuild skips an invalid index with a warning; an explicit index rebuild repairs
+it after duplicate rows are removed. TOAST is PostgreSQL's separate storage for
+large values: its relation keeps its identity while its index changes. The
+archive preserves all 40 output rows, deliberate errors and warnings, exact SQL,
+commands and source/binary hashes. Extract it and run
+`python3 verify-reindex-reference.py .` to verify its 62 hashed files. Its recorded
+source revision is `5119b065`; the reference SQL is preserved separately.
+
+[toast-reference.zip](toast-reference.zip), SHA256
+`42ede35ea6e1b88c6747c98003e78e1e8dc422ccae58f4dedca1d35ec7276331`,
+records the exact `222_toast_index_identities.sql` fixture on the same PostgreSQL
+build. It verifies index flags, key types, dependency links and the replacement
+index's identity. The fixture was uncommitted at the recorded `5119b065` source
+revision; its exact executed hash is retained. Extract it and run
+`python3 verify-toast-reference.py .` to verify 10 hashes and 11 output rows.
+These archives establish PostgreSQL behavior; matching pos3ql tests must pass CI.
+
+[indexdef-reference.zip](indexdef-reference.zip), SHA256
+`d90312ba1dcbc445a17f2817ae3e718c79941b1cfdfc94cfa0bd409f4dbd5b38`,
+records the full TOAST index definition and individual key names before and after
+a concurrent table rebuild on the same PostgreSQL build. Its external probe was
+uncommitted at source revision `5119b065`; exact SQL, commands, results and hashes
+are preserved. Extract it and run `python3 verify-indexdef-reference.py .` to
+verify 10 hashes and both output rows.
+
+[deferrable-reference.zip](deferrable-reference.zip), SHA256
+`5a1df9e586f40046bf9714bbaad6cec211fd3c86dddd43b74506dd0009e8cec9`,
+records the exact `223_deferrable_index_identities.sql` fixture. A deferred unique
+constraint still allows duplicate values inside a transaction that is rolled
+back. Concurrent and ordinary rebuilds preserve deferred checking and constraint
+identity; the concurrent rebuild replaces the index identity. The fixture was
+uncommitted at recorded revision `5119b065`. Extract it and run
+`python3 verify-deferrable-reference.py .` to verify 10 hashes and four output
+rows. These are PostgreSQL observations; final pos3ql CI must still pass.
+
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the
 [original runner artifact](https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290).

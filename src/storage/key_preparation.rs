@@ -55,9 +55,10 @@ impl ValueKeyPreparation {
     }
 
     pub(super) fn matches_index_source(&self, index: &IndexDef) -> bool {
-        index
-            .table_binding
-            .is_some_and(|binding| binding.source == self.target.source)
+        matches!(index.relation, IndexRelationSource::Table)
+            && index
+                .table_binding
+                .is_some_and(|binding| binding.source == self.target.source)
     }
 
     pub(super) fn validate_definition(
@@ -94,6 +95,7 @@ impl ValueKeyPreparation {
             .iter()
             .find(|index| {
                 index.visible_to(self.target.transaction())
+                    && matches!(index.relation, IndexRelationSource::Table)
                     && index.created_at == created_at
                     && index.database == definition.identity.database
             })

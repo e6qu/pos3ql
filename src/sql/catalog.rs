@@ -11401,8 +11401,7 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
 }
 
 pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
-    assert!((1..=crate::storage::MAX_INDEX_OID_GENERATION).contains(&index.created_at));
-    crate::storage::FIRST_EXPLICIT_INDEX_OID + index.created_at as i32
+    index.relation_oid()
 }
 
 /// A sequence keeps its relation identity independently of its resident slot.
@@ -11473,7 +11472,7 @@ pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 =
 pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
     super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
 pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
-pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = crate::storage::FIRST_TOAST_INDEX_OID;
 
 pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
     crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
@@ -11481,10 +11480,105 @@ pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
         .companion_oid(FIRST_TOAST_RELATION_OID)
 }
 
-pub(crate) fn toast_index_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
-        .expect("admitted table has a durable identity")
+pub(crate) fn toast_index_oid(storage: &Storage, slot: usize, txid: u32) -> i32 {
+    storage
+        .table_def(slot, txid)
+        .toast_index_identity
+        .expect("admitted TOAST index has a durable identity")
         .companion_oid(FIRST_TOAST_INDEX_OID)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToastIndexInfo {
+    pub table: usize,
+    pub oid: i32,
+    pub name: StackStr<64>,
+    pub explicit_slot: Option<usize>,
+    pub definition: crate::storage::IndexMutableDefinition,
+    pub is_primary: bool,
+}
+
+fn visit_toast_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(ToastIndexInfo)) {
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let owner = storage.table_def(table, txid);
+        if !owner.has_toast {
+            continue;
+        }
+        let anchor = owner
+            .toast_index_identity
+            .expect("admitted TOAST index has an identity");
+        let source = crate::storage::IndexRelationSource::Toast(storage.table_position(table));
+        let mut registered_anchor = false;
+        for slot in 0..storage.index_count() {
+            let Some(index) = storage.index_visible_to(slot, txid) else {
+                continue;
+            };
+            if index.relation != source {
+                continue;
+            }
+            registered_anchor |= index.created_at == anchor.created_at();
+            visit(ToastIndexInfo {
+                table,
+                oid: index.relation_oid(),
+                name: StackStr::from_str(index.name_for(txid).as_str()),
+                explicit_slot: Some(slot),
+                definition: index.mutable_for(txid),
+                // PostgreSQL index.c creates copies without IS_PRIMARY;
+                // index_concurrently_swap transfers it to the selected index.
+                is_primary: index.created_at == anchor.created_at(),
+            });
+        }
+        if !registered_anchor {
+            visit(ToastIndexInfo {
+                table,
+                oid: anchor.companion_oid(FIRST_TOAST_INDEX_OID),
+                name: stack_format!(64, "pg_toast_{}_index", user_table_oid(storage, table)),
+                explicit_slot: None,
+                definition: crate::storage::IndexMutableDefinition {
+                    kind: crate::storage::IndexKind::Ordinary,
+                    tablespace: owner.tablespace,
+                    ..crate::storage::IndexMutableDefinition::DEFAULT
+                },
+                is_primary: true,
+            });
+        }
+    }
+}
+
+pub(crate) fn collect_toast_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [ToastIndexInfo], SqlError> {
+    let mut count = 0;
+    visit_toast_indexes(storage, txid, |_| count += 1);
+    let out = arena
+        .alloc_slice_with(count, |_| ToastIndexInfo {
+            table: 0,
+            oid: 0,
+            name: StackStr::new(),
+            explicit_slot: None,
+            definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            is_primary: false,
+        })
+        .map_err(|_| arena_full())?;
+    let mut next = 0;
+    let mut exhausted = false;
+    visit_toast_indexes(storage, txid, |index| {
+        if let Some(slot) = out.get_mut(next) {
+            *slot = index;
+            next += 1;
+        } else {
+            exhausted = true;
+        }
+    });
+    if exhausted {
+        return Err(catalog_capacity_exceeded("TOAST indexes"));
+    }
+    Ok(&out[..next])
 }
 
 const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bool) -> i32 {
@@ -11683,16 +11777,22 @@ struct IdxInfo {
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
-    is_constraint: bool,
+    constraint_identity: Option<crate::storage::ConstraintIdentity>,
     is_exclusion: bool,
     timing: crate::storage::ConstraintTiming,
-    constraint_parent_oid: i32,
+    constraint_parent: Option<crate::storage::ConstraintIdentity>,
+    index_parent_oid: Option<i32>,
     explicit_definition: Option<crate::storage::IndexMutableDefinition>,
 }
 
-fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index: &IdxInfo) -> i32 {
+fn parent_constraint(
+    storage: &Storage,
+    txid: u32,
+    child_slot: usize,
+    index: &IdxInfo,
+) -> Option<(crate::storage::ConstraintIdentity, i32)> {
     let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
-        return 0;
+        return None;
     };
     let parent_slot = usize::from(attachment.parent);
     let parent = storage.table_def(parent_slot, txid);
@@ -11707,8 +11807,12 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    parent
+                        .column_constraint_identity(column)
+                        .expect("admitted inline key has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         } else if metadata.unique {
@@ -11718,8 +11822,12 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    parent
+                        .column_constraint_identity(column)
+                        .expect("admitted inline key has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         }
@@ -11731,8 +11839,12 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             && unique.timing == index.timing
             && unique.columns() == columns
         {
-            return parent.implicit_index_oid(position)
-                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+            return Some((
+                unique
+                    .identity
+                    .expect("admitted unique key has a constraint identity"),
+                parent.implicit_index_oid(position),
+            ));
         }
         position += 1;
     }
@@ -11743,7 +11855,7 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             .iter()
             .find(|exclusion| exclusion.columns() == columns)
         else {
-            return 0;
+            return None;
         };
         for exclusion in parent.exclusions() {
             if exclusion.columns() == child_exclusion.columns()
@@ -11751,13 +11863,17 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         }
     }
-    0
+    None
 }
 
 /// Enumerates every index relation psql `\d` would show: a single-column PK or
@@ -11789,7 +11905,7 @@ fn visit_indexes(
                   nulls_not_distinct: bool,
                   is_primary: bool,
                   is_unique: bool,
-                  is_constraint: bool,
+                  constraint_identity: Option<crate::storage::ConstraintIdentity>,
                   is_exclusion: bool,
                   timing: crate::storage::ConstraintTiming,
                   name: StackStr<64>| {
@@ -11797,6 +11913,12 @@ fn visit_indexes(
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
+            let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+            for (position, &column) in columns.iter().enumerate() {
+                if !expression_keys[position] {
+                    collations[position] = def.columns()[usize::from(column)].collation;
+                }
+            }
             let mut info = IdxInfo {
                 oid,
                 table_oid: toid,
@@ -11804,11 +11926,15 @@ fn visit_indexes(
                 table_database: def.identity().database,
                 table_created_at: def.identity().created_at,
                 name,
-                method: crate::sql::ast::IndexAccessMethod::Btree,
+                method: if is_exclusion {
+                    crate::sql::ast::IndexAccessMethod::Gist
+                } else {
+                    crate::sql::ast::IndexAccessMethod::Btree
+                },
                 columns: c,
                 expression_keys,
                 include_columns: included,
-                collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+                collations,
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
                 resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
@@ -11822,14 +11948,18 @@ fn visit_indexes(
                 predicate,
                 is_primary,
                 is_unique,
-                is_constraint,
+                constraint_identity,
                 is_exclusion,
                 timing,
-                constraint_parent_oid: 0,
+                constraint_parent: None,
+                index_parent_oid: None,
                 explicit_definition: None,
             };
-            if is_constraint {
-                info.constraint_parent_oid = parent_constraint_oid(storage, txid, slot, &info);
+            if constraint_identity.is_some()
+                && let Some((parent, parent_index)) = parent_constraint(storage, txid, slot, &info)
+            {
+                info.constraint_parent = Some(parent);
+                info.index_parent_oid = Some(parent_index);
             }
             info
         };
@@ -11850,7 +11980,10 @@ fn visit_indexes(
                     false,
                     true,
                     true,
-                    true,
+                    Some(
+                        def.column_constraint_identity(ci)
+                            .expect("admitted inline key has a constraint identity"),
+                    ),
                     false,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
@@ -11872,7 +12005,10 @@ fn visit_indexes(
                     false,
                     false,
                     true,
-                    true,
+                    Some(
+                        def.column_constraint_identity(ci)
+                            .expect("admitted inline key has a constraint identity"),
+                    ),
                     false,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
@@ -11881,19 +12017,13 @@ fn visit_indexes(
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
-            // ALTER TABLE ... ADD CONSTRAINT ... USING INDEX transfers the
-            // index relation into the constraint. Do not synthesize a second
-            // catalog index: matching name plus typed key positions is the
-            // durable attachment proof.
+            // A transferred or rebuilt backing relation keeps the constraint's
+            // identity. Its relation identity prevents a duplicate index row.
             if storage
                 .indexes_for(def.schema.as_str(), table_name, txid)
                 .any(|index| {
-                    index.name_for(txid) == uk.name
-                        && index.n_cols == uk.n_cols
-                        && index.columns[..index.n_cols] == uk.columns[..uk.n_cols]
-                        && index.expressions[..index.n_cols]
-                            .iter()
-                            .all(Option::is_none)
+                    uk.index_identity
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
                 })
             {
                 continue;
@@ -11911,13 +12041,26 @@ fn visit_indexes(
                 uk.kind.nulls_not_distinct(),
                 uk.kind.is_primary(),
                 true,
-                true,
+                Some(
+                    uk.identity
+                        .expect("admitted unique key has a constraint identity"),
+                ),
                 false,
                 uk.timing,
                 stack_str_64(uk.name.as_str()),
             ));
         }
         for exclusion in def.exclusions() {
+            if storage
+                .indexes_for(def.schema.as_str(), table_name, txid)
+                .any(|index| {
+                    exclusion
+                        .index_identity
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
+                })
+            {
+                continue;
+            }
             visit(mk(
                 exclusion
                     .index_identity
@@ -11934,7 +12077,11 @@ fn visit_indexes(
                 false,
                 false,
                 false,
-                true,
+                Some(
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity"),
+                ),
                 true,
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
@@ -11943,13 +12090,24 @@ fn visit_indexes(
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
             let attached = def.uniques().iter().find(|key| {
-                key.name == index.name_for(txid)
-                    && key.n_cols == index.n_cols
-                    && key.columns[..key.n_cols] == index.columns[..index.n_cols]
-                    && index.expressions[..index.n_cols]
-                        .iter()
-                        .all(Option::is_none)
+                key.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
             });
+            let attached_exclusion = def.exclusions().iter().find(|key| {
+                key.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            });
+            let constraint_identity = attached
+                .map(|key| {
+                    key.identity
+                        .expect("admitted unique key has a constraint identity")
+                })
+                .or_else(|| {
+                    attached_exclusion.map(|key| {
+                        key.identity
+                            .expect("admitted exclusion has a constraint identity")
+                    })
+                });
             let mut info = mk(
                 explicit_index_oid(&index),
                 &index.columns[..index.n_cols],
@@ -11961,11 +12119,12 @@ fn visit_indexes(
                 index.nulls_not_distinct,
                 attached.is_some_and(|key| key.kind.is_primary()),
                 index.unique,
-                attached.is_some(),
-                false,
-                attached.map_or(crate::storage::ConstraintTiming::NotDeferrable, |key| {
-                    key.timing
-                }),
+                constraint_identity,
+                attached_exclusion.is_some(),
+                attached
+                    .map(|key| key.timing)
+                    .or_else(|| attached_exclusion.map(|key| key.timing))
+                    .unwrap_or(crate::storage::ConstraintTiming::NotDeferrable),
                 stack_str_64(index.name_for(txid).as_str()),
             );
             info.method = index.method;
@@ -11975,6 +12134,11 @@ fn visit_indexes(
             info.resolved_operator_classes = index.resolved_operator_classes;
             info.operator_class_options = index.operator_class_options;
             info.explicit_definition = Some(index.mutable_for(txid));
+            if let Some(parent) = index.mutable_for(txid).parent {
+                info.index_parent_oid = storage
+                    .index_visible_to(usize::from(parent), txid)
+                    .map(|parent| explicit_index_oid(&parent));
+            }
             visit(info);
         }
     }
@@ -12197,10 +12361,11 @@ fn empty_index() -> IdxInfo {
         predicate: None,
         is_primary: false,
         is_unique: false,
-        is_constraint: false,
+        constraint_identity: None,
         is_exclusion: false,
         timing: crate::storage::ConstraintTiming::NotDeferrable,
-        constraint_parent_oid: 0,
+        constraint_parent: None,
+        index_parent_oid: None,
         explicit_definition: None,
     }
 }
@@ -12248,6 +12413,15 @@ fn index_oid_by_name(
     schema: Option<&str>,
     name: &str,
 ) -> Option<i32> {
+    if schema == Some("pg_toast") {
+        let mut found = None;
+        visit_toast_indexes(storage, txid, |index| {
+            if index.name.as_str() == name {
+                found = Some(index.oid);
+            }
+        });
+        return found;
+    }
     let current_temporary_schema = storage.temporary_schema().ok();
     let mut found = None;
     visit_indexes(storage, txid, schema, |index| {
@@ -12274,6 +12448,7 @@ fn index_oid_by_name(
 fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
     let mut found = false;
     visit_indexes(storage, txid, None, |index| found |= index.oid == oid);
+    visit_toast_indexes(storage, txid, |index| found |= index.oid == oid);
     found
 }
 
@@ -12294,16 +12469,23 @@ pub(crate) fn index_identity_by_oid(
             ));
         }
     });
+    visit_toast_indexes(storage, txid, |index| {
+        if index.oid == oid {
+            found = Some((
+                SqlName::from_str("pg_toast"),
+                StackStr::from_str(index.name.as_str()),
+            ));
+        }
+    });
     found
 }
 
 pub(crate) struct IndexMaintenanceTarget {
     pub table: usize,
     pub oid: i32,
-    pub explicit_slot: Option<usize>,
 }
 
-/// Includes the implicit constraint indexes exposed by the relation catalog.
+/// Includes the implicit constraint and TOAST indexes exposed by the catalogs.
 pub(crate) fn index_maintenance_target(
     storage: &Storage,
     txid: u32,
@@ -12316,36 +12498,183 @@ pub(crate) fn index_maintenance_target(
     let mut found = None;
     visit_indexes(storage, txid, None, |index| {
         if index.oid == oid {
-            found = Some((
-                index.table_slot,
-                index.name,
-                index.explicit_definition.is_some(),
-            ));
+            found = Some(index.table_slot);
         }
     });
-    let Some((table, name, explicit)) = found else {
-        return Ok(None);
+    if found.is_none() {
+        visit_toast_indexes(storage, txid, |index| {
+            if index.oid == oid {
+                found = Some(index.table);
+            }
+        });
+    }
+    Ok(found.map(|table| IndexMaintenanceTarget { table, oid }))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReindexCandidate {
+    pub table: usize,
+    pub definition: crate::storage::IndexDef,
+    pub exclusion: bool,
+}
+
+/// Maintenance selects the same physical index lifetimes exposed by pg_index.
+pub(crate) fn reindex_candidates<'a>(
+    storage: &Storage,
+    txid: u32,
+    tables: &[usize],
+    selected: Option<i32>,
+    arena: &'a Arena,
+) -> Result<&'a [ReindexCandidate], SqlError> {
+    let matches = |index: &IdxInfo| {
+        tables.contains(&index.table_slot)
+            && selected.is_none_or(|oid| {
+                if oid == index.oid {
+                    return true;
+                }
+                let mut parent = index.index_parent_oid;
+                for _ in 0..storage.table_count() {
+                    let Some(current) = parent else {
+                        return false;
+                    };
+                    if current == oid {
+                        return true;
+                    }
+                    parent = None;
+                    visit_indexes(storage, txid, None, |candidate| {
+                        if candidate.oid == current {
+                            parent = candidate.index_parent_oid;
+                        }
+                    });
+                }
+                false
+            })
     };
-    let explicit_slot = if explicit {
-        let schema = storage.table_def(table, txid).schema;
-        Some(
-            storage
-                .index_slot(schema.as_str(), name.as_str(), txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "selected index changed before maintenance"
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    Ok(Some(IndexMaintenanceTarget {
-        table,
-        oid,
-        explicit_slot,
-    }))
+    let mut count = 0;
+    visit_indexes(storage, txid, None, |index| {
+        count += usize::from(matches(&index))
+    });
+    visit_toast_indexes(storage, txid, |index| {
+        count += usize::from(
+            tables.contains(&index.table) && selected.is_none_or(|oid| oid == index.oid),
+        );
+    });
+    let result = arena
+        .alloc_slice_with(count, |_| ReindexCandidate {
+            table: 0,
+            definition: crate::storage::IndexDef::EMPTY,
+            exclusion: false,
+        })
+        .map_err(|_| arena_full())?;
+    let mut next = 0;
+    visit_indexes(storage, txid, None, |index| {
+        if !matches(&index) {
+            return;
+        }
+        let table = storage.table_def(index.table_slot, txid);
+        let explicit = storage
+            .index_slot(table.schema.as_str(), index.name.as_str(), txid)
+            .and_then(|slot| storage.index_visible_to(slot, txid))
+            .filter(|definition| explicit_index_oid(definition) == index.oid);
+        let definition = explicit.unwrap_or_else(|| crate::storage::IndexDef {
+            database: storage.current_database_oid(),
+            created_at: table
+                .implicit_index_identities()
+                .flatten()
+                .find(|identity| identity.oid() == index.oid)
+                .expect("selected implicit index has a creation identity")
+                .created_at(),
+            schema: table.schema,
+            name: crate::storage::SqlName::from_str(index.name.as_str()),
+            table: table.name,
+            ownership: table.ownership,
+            method: index.method,
+            columns: index.columns,
+            include_columns: index.include_columns,
+            collations: index.collations,
+            explicit_collations: index.explicit_collations,
+            operator_classes: index.operator_classes,
+            resolved_operator_classes: index.resolved_operator_classes,
+            operator_class_options: index.operator_class_options,
+            descending: index.descending,
+            nulls_first: index.nulls_first,
+            n_cols: index.n_cols,
+            n_include_cols: index.n_include_cols,
+            nulls_not_distinct: index.nulls_not_distinct,
+            predicate: index.predicate,
+            unique: index.is_unique,
+            mutable: crate::storage::IndexMutableDefinition {
+                kind: if table.partition.is_partitioned() {
+                    crate::storage::IndexKind::Partitioned { valid: true }
+                } else {
+                    crate::storage::IndexKind::Ordinary
+                },
+                tablespace: table.tablespace,
+                immediate: !index.timing.is_deferrable(),
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            },
+            ..crate::storage::IndexDef::EMPTY
+        });
+        result[next] = ReindexCandidate {
+            table: index.table_slot,
+            definition,
+            exclusion: index.is_exclusion,
+        };
+        next += 1;
+    });
+    visit_toast_indexes(storage, txid, |index| {
+        if !tables.contains(&index.table) || selected.is_some_and(|oid| oid != index.oid) {
+            return;
+        }
+        let table = storage.table_def(index.table, txid);
+        let definition = index
+            .explicit_slot
+            .and_then(|slot| storage.index_visible_to(slot, txid))
+            .unwrap_or_else(|| {
+                let mut columns = [0; crate::storage::MAX_INDEX_COLS];
+                columns[1] = 1;
+                crate::storage::IndexDef {
+                    relation: crate::storage::IndexRelationSource::Toast(
+                        storage.table_position(index.table),
+                    ),
+                    database: storage.current_database_oid(),
+                    created_at: table
+                        .toast_index_identity
+                        .expect("admitted TOAST identity")
+                        .created_at(),
+                    schema: crate::storage::SqlName::from_str("pg_toast"),
+                    name: crate::storage::SqlName::from_str(index.name.as_str()),
+                    table: crate::storage::SqlName::from_str(
+                        stack_format!(64, "pg_toast_{}", user_table_oid(storage, index.table))
+                            .as_str(),
+                    ),
+                    ownership: table.ownership,
+                    columns,
+                    n_cols: 2,
+                    unique: true,
+                    collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+                    resolved_operator_classes: {
+                        let mut classes = [None; crate::storage::MAX_INDEX_COLS];
+                        classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
+                            crate::sql::types::BtreeOperatorClass::Oid,
+                        ));
+                        classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
+                            crate::sql::types::BtreeOperatorClass::Int4,
+                        ));
+                        classes
+                    },
+                    mutable: index.definition,
+                    ..crate::storage::IndexDef::EMPTY
+                }
+            });
+        result[next] = ReindexCandidate {
+            table: index.table,
+            definition,
+            exclusion: false,
+        };
+        next += 1;
+    });
+    Ok(&result[..next])
 }
 
 fn stack_str_64(s: &str) -> StackStr<64> {
@@ -12391,6 +12720,17 @@ pub fn relname_text<'a>(
     }
     if let Some((schema, name)) = storage.composite_relation_name(oid, txid) {
         return reference(schema.as_str(), name.as_str());
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && toast_relation_oid(storage, slot) == oid
+        {
+            return reference(
+                "pg_toast",
+                stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot)).as_str(),
+            );
+        }
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
@@ -12496,7 +12836,7 @@ pub(super) fn relation_oid_for_name(
                 }
                 continue;
             }
-            crate::storage::PathEntry::Toast => continue,
+            crate::storage::PathEntry::Toast => SqlName::from_str("pg_toast"),
             crate::storage::PathEntry::Schema(slot) => {
                 let definition = storage.schema_def_for(usize::from(*slot), txid);
                 if !definition.visible_to(txid) {
@@ -12518,6 +12858,18 @@ fn relation_oid_in_schema(
     schema: &str,
     relation: &str,
 ) -> Option<i32> {
+    if schema == "pg_toast" {
+        for slot in 0..storage.table_count() {
+            if storage.table_slot_visible_to(slot, txid)
+                && storage.table_def(slot, txid).has_toast
+                && relation
+                    == stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot)).as_str()
+            {
+                return Some(toast_relation_oid(storage, slot));
+            }
+        }
+        return index_oid_by_name(storage, txid, Some(schema), relation);
+    }
     if schema == "pg_catalog"
         && let Some(oid) = catalog_relation_oid(relation)
     {
@@ -12623,6 +12975,11 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
             storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid
         })
         || has_index_oid(storage, txid, oid)
+        || (0..storage.table_count()).any(|slot| {
+            storage.table_slot_visible_to(slot, txid)
+                && storage.table_def(slot, txid).has_toast
+                && toast_relation_oid(storage, slot) == oid
+        })
         || (0..storage.sequence_count()).any(|slot| {
             storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid
         })
@@ -12634,6 +12991,17 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     if let Some(name) = catalog_relation_name(oid) {
         return Some(relation_oid_for_name(storage, txid, None, name).matches_oid(oid));
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && toast_relation_oid(storage, slot) == oid
+        {
+            let name = stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot));
+            return Some(
+                relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid),
+            );
+        }
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid {
@@ -15313,6 +15681,9 @@ fn pg_shdescription<'a>(
 /// table or materialized-view backing table, a sequence, a plain view, or an
 /// index.
 fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Option<i32> {
+    if schema == "pg_toast" {
+        return relation_oid_in_schema(storage, txid, schema, name);
+    }
     if let Some(slot) = storage.find_visible(schema, name, txid) {
         return Some(user_table_oid(storage, slot));
     }
@@ -16102,8 +16473,8 @@ pub(crate) fn table_constraint_oid(
     }
     let mut index_constraint = None;
     visit_indexes(storage, txid, None, |index| {
-        if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
-            index_constraint = Some(index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET);
+        if index.table_slot == table_slot && index.name.as_str() == name {
+            index_constraint = index.constraint_identity.map(|identity| identity.oid());
         }
     });
     if index_constraint.is_some() {
@@ -16183,8 +16554,9 @@ pub(crate) fn table_constraint_identity_by_oid(
         let mut index_name = None;
         visit_indexes(storage, txid, None, |index| {
             if index.table_slot == table_slot
-                && index.is_constraint
-                && index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET == oid
+                && index
+                    .constraint_identity
+                    .is_some_and(|identity| identity.oid() == oid)
             {
                 index_name = Some(StackStr::from_str(index.name.as_str()));
             }
@@ -16472,7 +16844,10 @@ pub fn constraint_def_text<'a>(
     }
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
-        if oid != info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET || !info.is_constraint {
+        if !info
+            .constraint_identity
+            .is_some_and(|identity| identity.oid() == oid)
+        {
             continue;
         }
         let table = storage.table_def(info.table_slot, txid);
@@ -17082,6 +17457,40 @@ pub fn index_def_text<'a>(
                     .unwrap_or(""),
             )
         });
+    }
+    let mut toast = None;
+    visit_toast_indexes(storage, txid, |index| {
+        if index.oid == oid {
+            toast = Some(index);
+        }
+    });
+    if let Some(index) = toast {
+        if col != 0 {
+            return Ok(Some(match col {
+                1 => "chunk_id",
+                2 => "chunk_seq",
+                _ => "",
+            }));
+        }
+        let mut definition = StackStr::<640>::new();
+        let _ = definition.write_str("CREATE UNIQUE INDEX ");
+        write_identifier(&mut definition, index.name.as_str());
+        let _ = definition.write_str(" ON ");
+        let table_name = stack_format!(64, "pg_toast_{}", user_table_oid(storage, index.table));
+        if !pretty
+            || !relation_oid_for_name(storage, txid, None, table_name.as_str())
+                .matches_oid(toast_relation_oid(storage, index.table))
+        {
+            let _ = definition.write_str("pg_toast.");
+        }
+        write_identifier(&mut definition, table_name.as_str());
+        let _ = definition.write_str(" USING btree (chunk_id, chunk_seq)");
+        write_index_storage_options(&mut definition, Some(index.definition));
+        return Ok(Some(alloc_rendered(
+            &definition,
+            "index definition is too long",
+            arena,
+        )?));
     }
     let indices = collect_indexes(storage, txid, arena)?;
     for info in indices {
@@ -20028,7 +20437,7 @@ fn pg_inherits<'a>(
     let inherited_indexes = indexes
         .iter()
         .filter(|index| {
-            index.constraint_parent_oid != 0
+            index.index_parent_oid.is_some()
                 || index
                     .explicit_definition
                     .is_some_and(|definition| definition.parent.is_some())
@@ -20078,8 +20487,8 @@ fn pg_inherits<'a>(
         }
     }
     for index in indexes {
-        let parent_oid = if index.constraint_parent_oid != 0 {
-            index.constraint_parent_oid - crate::storage::INDEX_CONSTRAINT_OID_OFFSET
+        let parent_oid = if let Some(parent) = index.index_parent_oid {
+            parent
         } else if let Some(parent) = index
             .explicit_definition
             .and_then(|definition| definition.parent)
@@ -20199,6 +20608,7 @@ fn pg_class<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_class", false);
     let indexes = collect_indexes(storage, txid, arena)?;
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let visible_tables = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
@@ -20207,8 +20617,7 @@ fn pg_class<'a>(
         .filter(|slot| {
             storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
         })
-        .count()
-        * 2;
+        .count();
     let catalogs: &[crate::sql::catalog_metadata::CatalogRelation] = match purpose {
         Materialization::Query => crate::sql::catalog_metadata::RELATIONS,
         Materialization::History => &[],
@@ -20216,6 +20625,7 @@ fn pg_class<'a>(
     let out_capacity = catalogs.len()
         + visible_tables
         + toast_relations
+        + toast_indexes.len()
         + storage.composites_with_slots_visible_to(txid).count()
         + indexes.len()
         + (0..storage.sequence_count())
@@ -20409,12 +20819,11 @@ fn pg_class<'a>(
         if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
             continue;
         }
-        if n + 2 > out.len() {
+        if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
         let table_oid = user_table_oid(storage, slot);
         let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
-        let toast_index_name = crate::stack_format!(72, "{}_index", toast_name.as_str());
         let owner = storage.role_oid(storage.object_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Table,
@@ -20463,10 +20872,21 @@ fn pg_class<'a>(
             arena,
         )?;
         n += 1;
+    }
+    for info in toast_indexes {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        let owner = owner_oid(
+            storage,
+            crate::storage::AccessClass::Table,
+            info.table,
+            txid,
+        );
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(storage, slot)),
-                text(toast_index_name.as_str(), arena)?,
+                Datum::Int4(info.oid),
+                text(info.name.as_str(), arena)?,
                 Datum::Int4(PG_TOAST_NS_OID),
                 text("i", arena)?,
                 Datum::Int4(2),
@@ -20481,11 +20901,15 @@ fn pg_class<'a>(
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Int4(0),
+                Datum::Int4(catalog_tablespace_oid(
+                    storage,
+                    info.definition.tablespace,
+                    txid,
+                )),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 text(
-                    core::str::from_utf8(&[storage.table_def(slot, txid).persistence.code()])
+                    core::str::from_utf8(&[storage.table_def(info.table, txid).persistence.code()])
                         .unwrap_or("p"),
                     arena,
                 )?,
@@ -21147,7 +21571,8 @@ fn pg_constraint_values<'a>(
     let index_constraints = indexes
         .iter()
         .filter(|info| {
-            info.is_constraint && (info.is_exclusion || info.is_primary || info.is_unique)
+            info.constraint_identity.is_some()
+                && (info.is_exclusion || info.is_primary || info.is_unique)
         })
         .count();
     let trigger_constraints = storage
@@ -21203,9 +21628,9 @@ fn pg_constraint_values<'a>(
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
     for info in indexes {
-        if !info.is_constraint {
+        let Some(constraint) = info.constraint_identity else {
             continue;
-        }
+        };
         let contype = if info.is_exclusion {
             "x"
         } else if info.is_primary {
@@ -21220,12 +21645,12 @@ fn pg_constraint_values<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET),
+                Datum::Int4(constraint.oid()),
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(info.table_oid),
                 Datum::Int4(0),
                 text(contype, arena)?,
-                Datum::Int4(info.constraint_parent_oid),
+                Datum::Int4(info.constraint_parent.map_or(0, |identity| identity.oid())),
                 Datum::Int4(info.oid), // conindid -> the backing index
                 Datum::Int4(0),        // confrelid
                 Datum::Bool(info.timing.is_deferrable()),
@@ -21248,8 +21673,8 @@ fn pg_constraint_values<'a>(
                     txid,
                 )),
                 text(" ", arena)?,
-                Datum::Bool(info.constraint_parent_oid == 0),
-                Datum::Int4(i32::from(info.constraint_parent_oid != 0)),
+                Datum::Bool(info.constraint_parent.is_none()),
+                Datum::Int4(i32::from(info.constraint_parent.is_some())),
                 Datum::Bool(false),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
@@ -22964,13 +23389,11 @@ fn pg_index<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_index", false);
     let indexes = collect_indexes(storage, txid, arena)?;
-    let toast_indexes = (0..storage.table_count())
-        .filter(|slot| {
-            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
-        })
-        .count();
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let out = arena
-        .alloc_slice_with(indexes.len() + toast_indexes + 2, |_| &[] as &[Datum])
+        .alloc_slice_with(indexes.len() + toast_indexes.len() + 2, |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
@@ -23001,7 +23424,12 @@ fn pg_index<'a>(
                     info.explicit_definition
                         .is_none_or(|definition| definition.kind.valid()),
                 ),
-                Datum::Bool(!info.timing.is_deferrable()),
+                Datum::Bool(
+                    info.explicit_definition
+                        .map_or(!info.timing.is_deferrable(), |definition| {
+                            definition.immediate
+                        }),
+                ),
                 Datum::Bool(
                     info.explicit_definition
                         .is_some_and(|definition| definition.replica_identity),
@@ -23040,23 +23468,20 @@ fn pg_index<'a>(
         )?;
         n += 1;
     }
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
-            continue;
-        }
+    for info in toast_indexes {
         let keys = [0_u16, 1];
         let collations = [0_i32, 0];
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(storage, slot)),
-                Datum::Int4(toast_relation_oid(storage, slot)),
-                Datum::Bool(true),
+                Datum::Int4(info.oid),
+                Datum::Int4(toast_relation_oid(storage, info.table)),
+                Datum::Bool(info.is_primary),
                 Datum::Bool(true),
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(info.definition.kind.valid()),
+                Datum::Bool(info.definition.immediate),
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Int4(2),
@@ -23067,8 +23492,8 @@ fn pg_index<'a>(
                     raw: &[0; 4],
                 },
                 Datum::Null,
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(info.definition.kind.ready()),
+                Datum::Bool(info.definition.kind.live()),
                 Datum::Null,
                 oidvector(&collations, arena)?,
                 oidvector(&operator_classes, arena)?,
@@ -23349,6 +23774,7 @@ fn pg_attribute<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_attribute", false);
     let indexes = collect_indexes(storage, txid, arena)?;
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let composite_attributes = storage
         .composites_with_slots_visible_to(txid)
         .map(|(_, composite)| composite.fields().len())
@@ -23358,7 +23784,7 @@ fn pg_attribute<'a>(
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| {
             let table = storage.table_def(slot, txid);
-            usize::from(table.attributes.count) + if table.has_toast { 5 } else { 0 }
+            usize::from(table.attributes.count) + if table.has_toast { 3 } else { 0 }
         })
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
@@ -23386,6 +23812,7 @@ fn pg_attribute<'a>(
         .checked_add(table_attributes)
         .and_then(|count| count.checked_add(composite_attributes))
         .and_then(|count| count.checked_add(index_attributes))
+        .and_then(|count| count.checked_add(toast_indexes.len().checked_mul(2)?))
         .and_then(|count| count.checked_add(view_attributes))
         .and_then(|count| count.checked_add(9))
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
@@ -23500,54 +23927,54 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
-            continue;
-        }
-        let attributes = [
-            ("chunk_id", 26, 4),
-            ("chunk_seq", 23, 4),
-            ("chunk_data", 17, -1),
-        ];
-        for (relation_oid, count) in [
-            (toast_relation_oid(storage, slot), attributes.len()),
-            (toast_index_oid(storage, slot), 2),
-        ] {
-            for (attribute, (name, type_oid, type_length)) in attributes[..count].iter().enumerate()
-            {
-                if n == out.len() {
-                    return Err(catalog_capacity_exceeded("pg_attribute"));
-                }
-                out[n] = row(
-                    &[
-                        Datum::Int4(relation_oid),
-                        text(name, arena)?,
-                        Datum::Int4(*type_oid),
-                        Datum::Int4(attribute as i32 + 1),
-                        Datum::Bool(false),
-                        Datum::Int4(*type_length),
-                        Datum::Int4(-1),
-                        Datum::Bool(false),
-                        Datum::Int4(0),
-                        text("", arena)?,
-                        text("", arena)?,
-                        text("p", arena)?,
-                        text("", arena)?,
-                        Datum::Int4(-1),
-                        Datum::Bool(false),
-                        Datum::Int4(attribute as i32 + 1),
-                        text("i", arena)?,
-                        Datum::Bool(true),
-                        Datum::Null,
-                        Datum::Null,
-                        Datum::Bool(false),
-                        Datum::Null,
-                        Datum::Null,
-                    ],
-                    arena,
-                )?;
-                n += 1;
+    let toast_attributes = [
+        ("chunk_id", 26, 4),
+        ("chunk_seq", 23, 4),
+        ("chunk_data", 17, -1),
+    ];
+    let toast_relations = (0..storage.table_count())
+        .filter(|slot| {
+            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
+        })
+        .map(|slot| (toast_relation_oid(storage, slot), 3));
+    for (relation_oid, count) in
+        toast_relations.chain(toast_indexes.iter().map(|index| (index.oid, 2)))
+    {
+        for (attribute, (name, type_oid, type_length)) in
+            toast_attributes[..count].iter().enumerate()
+        {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
             }
+            out[n] = row(
+                &[
+                    Datum::Int4(relation_oid),
+                    text(name, arena)?,
+                    Datum::Int4(*type_oid),
+                    Datum::Int4(attribute as i32 + 1),
+                    Datum::Bool(false),
+                    Datum::Int4(*type_length),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text("p", arena)?,
+                    text("", arena)?,
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(attribute as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
         }
     }
     // Standalone composite fields belong to the generated `pg_class` relation

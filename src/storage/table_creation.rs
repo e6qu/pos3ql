@@ -179,7 +179,9 @@ pub(super) fn allocate(
                 for identity in def.constraint_identities_mut() {
                     *identity = None;
                 }
+                def.toast_index_identity = None;
                 def.inline_index_identities.fill(None);
+                def.inline_constraint_identities.fill(None);
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }

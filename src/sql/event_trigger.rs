@@ -20,6 +20,7 @@ pub(crate) struct BeforeDdl<'a> {
     altered_table: Option<(usize, crate::storage::TableDefinitionImages)>,
     // Keep the selected objects while their names and search-path entries exist.
     original_drops: &'a [ObjectRef],
+    indexes: &'a [(usize, crate::storage::RelationIdentity)],
     dependent_drops: &'a [(EventObjectRef, bool)],
 }
 
@@ -27,6 +28,7 @@ impl BeforeDdl<'_> {
     pub(crate) const EMPTY: Self = Self {
         altered_table: None,
         original_drops: &[],
+        indexes: &[],
         dependent_drops: &[],
     };
 }
@@ -39,6 +41,19 @@ pub(crate) fn capture_before<'a>(
 ) -> Result<BeforeDdl<'a>, SqlError> {
     let mut before = BeforeDdl::EMPTY;
     before.original_drops = capture_original_drops(storage, txid, statement, arena)?;
+    let mut indexes = ArenaList::new(arena);
+    for slot in 0..storage.index_count() {
+        if let Some(index) = storage.index_visible_to(slot, txid) {
+            indexes
+                .push((
+                    slot,
+                    crate::storage::RelationIdentity::parse(index.created_at)
+                        .expect("admitted index has a relation identity"),
+                ))
+                .map_err(|_| graph_full())?;
+        }
+    }
+    before.indexes = indexes.as_slice();
     let mut dependent_drops = ArenaList::new(arena);
     let alter_root = match statement {
         Stmt::AlterTable(alter)
@@ -441,7 +456,7 @@ impl EventObjectRef {
                 base_object(
                     catalog::PG_CLASS_OID,
                     if is_index {
-                        catalog::toast_index_oid(storage, slot)
+                        catalog::toast_index_oid(storage, slot, txid)
                     } else {
                         catalog::toast_relation_oid(storage, slot)
                     },
@@ -2402,6 +2417,12 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
                     .map_or(ObjectRef::Table(slot), ObjectRef::MaterializedView),
             ));
         }
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && catalog::toast_relation_oid(storage, slot) == object_id
+        {
+            return Some(EventObjectRef::ToastRelation(u16::try_from(slot).ok()?));
+        }
     }
     for slot in 0..storage.view_count() {
         if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(storage, slot) == object_id
@@ -3298,6 +3319,19 @@ fn push_alter_table_drops(
     };
     let slot = *slot;
     let old = definitions.definition(storage, slot, txid)?;
+    let index_reference = |oid: i32, name: &str| {
+        before
+            .indexes
+            .iter()
+            .find_map(|&(index_slot, identity)| {
+                (identity.oid() == oid
+                    && storage
+                        .dropped_table_index_for_event(index_slot, slot, txid)
+                        .is_some_and(|index| index.created_at == identity.created_at()))
+                .then_some(EventObjectRef::Primary(ObjectRef::Index(index_slot)))
+            })
+            .unwrap_or_else(|| detached_index(old, oid, name))
+    };
     let Stmt::AlterTable(alter) = statement else {
         return Ok(());
     };
@@ -3398,7 +3432,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            old.uniques()[index]
+                                .identity
+                                .expect("admitted unique key has a constraint identity")
+                                .oid(),
                             *name,
                         ),
                         true,
@@ -3407,7 +3444,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_index(old, index_oid, *name),
+                        index_reference(index_oid, name),
                         false,
                         false,
                     )?;
@@ -3423,7 +3460,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            old.exclusions()[index]
+                                .identity
+                                .expect("admitted exclusion has a constraint identity")
+                                .oid(),
                             *name,
                         ),
                         true,
@@ -3432,7 +3472,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_index(old, index_oid, *name),
+                        index_reference(index_oid, name),
                         false,
                         false,
                     )?;
@@ -3460,7 +3500,9 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                                        old.column_constraint_identity(column_index)
+                                            .expect("admitted inline key has a constraint identity")
+                                            .oid(),
                                         *name,
                                     ),
                                     true,
@@ -3469,7 +3511,7 @@ fn push_alter_table_drops(
                                 push_drop_once(
                                     output,
                                     count,
-                                    detached_index(old, index_oid, *name),
+                                    index_reference(index_oid, name),
                                     false,
                                     false,
                                 )?;
@@ -3557,7 +3599,9 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    old.column_constraint_identity(column_index)
+                        .expect("admitted inline key has a constraint identity")
+                        .oid(),
                     name.as_str(),
                 ),
                 false,
@@ -3566,7 +3610,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, name.as_str()),
+                index_reference(index_oid, name.as_str()),
                 false,
                 false,
             )?;
@@ -3584,7 +3628,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    unique
+                        .identity
+                        .expect("admitted unique key has a constraint identity")
+                        .oid(),
                     unique.name.as_str(),
                 ),
                 false,
@@ -3593,7 +3640,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, unique.name.as_str()),
+                index_reference(index_oid, unique.name.as_str()),
                 false,
                 false,
             )?;
@@ -3611,7 +3658,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity")
+                        .oid(),
                     exclusion.name.as_str(),
                 ),
                 false,
@@ -3620,7 +3670,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, exclusion.name.as_str()),
+                index_reference(index_oid, exclusion.name.as_str()),
                 false,
                 false,
             )?;
@@ -3697,11 +3747,29 @@ fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    indexes: &[(usize, crate::storage::RelationIdentity)],
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     let table = storage.table_def(slot, txid);
     let table_ref = u16::try_from(slot).map_err(|_| graph_full())?;
+    let index_reference =
+        |position: usize, name: StackStr<128>| -> Result<EventObjectRef, SqlError> {
+            let oid = table.implicit_index_oid(position);
+            for &(index_slot, identity) in indexes {
+                if let Some(index) = storage.dropped_table_index_for_event(index_slot, slot, txid)
+                    && index.created_at == identity.created_at()
+                    && catalog::explicit_index_oid(&index) == oid
+                {
+                    return Ok(EventObjectRef::Primary(ObjectRef::Index(index_slot)));
+                }
+            }
+            Ok(EventObjectRef::TableIndex {
+                table: table_ref,
+                position: u16::try_from(position).map_err(|_| graph_full())?,
+                name,
+            })
+        };
     push_drop(
         output,
         count,
@@ -3768,17 +3836,30 @@ fn push_table_drop_dependents(
             false,
             false,
         )?;
-        push_drop(
-            output,
-            count,
-            EventObjectRef::ToastIndex(table_ref),
-            false,
-            false,
-        )?;
+        let anchor = table
+            .toast_index_identity
+            .expect("admitted TOAST index has an identity");
+        let registered_anchor = indexes.iter().any(|&(index_slot, identity)| {
+            identity == anchor
+                && storage
+                    .dropped_table_index_for_event(index_slot, slot, txid)
+                    .is_some_and(|index| {
+                        index.relation_kind() == crate::storage::IndexRelationKind::Toast
+                    })
+        });
+        if !registered_anchor {
+            push_drop(
+                output,
+                count,
+                EventObjectRef::ToastIndex(table_ref),
+                false,
+                false,
+            )?;
+        }
     }
 
     let mut position = 0usize;
-    for column in table.columns() {
+    for (column_index, column) in table.columns().iter().enumerate() {
         let name = if column.primary {
             Some(inline_primary_name(&table))
         } else if column.unique {
@@ -3787,13 +3868,15 @@ fn push_table_drop_dependents(
             None
         };
         if let Some(name) = name {
-            let index_oid = table.implicit_index_oid(position);
             push_drop(
                 output,
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    oid: table
+                        .column_constraint_identity(column_index)
+                        .expect("admitted inline key has a constraint identity")
+                        .oid(),
                     name,
                 },
                 false,
@@ -3802,11 +3885,7 @@ fn push_table_drop_dependents(
             push_drop(
                 output,
                 count,
-                EventObjectRef::TableIndex {
-                    table: table_ref,
-                    position: u16::try_from(position).map_err(|_| graph_full())?,
-                    name,
-                },
+                index_reference(position, name)?,
                 false,
                 false,
             )?;
@@ -3814,13 +3893,15 @@ fn push_table_drop_dependents(
         }
     }
     for unique in table.uniques() {
-        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                oid: unique
+                    .identity
+                    .expect("admitted unique key has a constraint identity")
+                    .oid(),
                 name: StackStr::from_str(unique.name.as_str()),
             },
             false,
@@ -3829,24 +3910,22 @@ fn push_table_drop_dependents(
         push_drop(
             output,
             count,
-            EventObjectRef::TableIndex {
-                table: table_ref,
-                position: u16::try_from(position).map_err(|_| graph_full())?,
-                name: StackStr::from_str(unique.name.as_str()),
-            },
+            index_reference(position, StackStr::from_str(unique.name.as_str()))?,
             false,
             false,
         )?;
         position += 1;
     }
     for exclusion in table.exclusions() {
-        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                oid: exclusion
+                    .identity
+                    .expect("admitted exclusion has a constraint identity")
+                    .oid(),
                 name: StackStr::from_str(exclusion.name.as_str()),
             },
             false,
@@ -3855,15 +3934,24 @@ fn push_table_drop_dependents(
         push_drop(
             output,
             count,
-            EventObjectRef::TableIndex {
-                table: table_ref,
-                position: u16::try_from(position).map_err(|_| graph_full())?,
-                name: StackStr::from_str(exclusion.name.as_str()),
-            },
+            index_reference(position, StackStr::from_str(exclusion.name.as_str()))?,
             false,
             false,
         )?;
         position += 1;
+    }
+    for &(index_slot, identity) in indexes {
+        if let Some(index) = storage.dropped_table_index_for_event(index_slot, slot, txid)
+            && index.created_at == identity.created_at()
+        {
+            push_drop_once(
+                output,
+                count,
+                EventObjectRef::Primary(ObjectRef::Index(index_slot)),
+                false,
+                false,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3964,16 +4052,24 @@ fn push_type_drop_dependents(
 fn push_drop_dependents(
     storage: &Storage,
     txid: u32,
+    before: &BeforeDdl<'_>,
     reference: ObjectRef,
     parent_is_normal: bool,
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     match reference {
-        ObjectRef::Table(slot) => push_table_drop_dependents(storage, txid, slot, output, count),
-        ObjectRef::MaterializedView(slot) => {
-            push_table_drop_dependents(storage, txid, storage.matview_table(slot), output, count)
+        ObjectRef::Table(slot) => {
+            push_table_drop_dependents(storage, txid, slot, before.indexes, output, count)
         }
+        ObjectRef::MaterializedView(slot) => push_table_drop_dependents(
+            storage,
+            txid,
+            storage.matview_table(slot),
+            before.indexes,
+            output,
+            count,
+        ),
         ObjectRef::View(slot) => {
             push_view_drop_dependents(storage, slot, parent_is_normal, output, count)
         }
@@ -3995,6 +4091,48 @@ pub(crate) struct CollectChanges<'a, 'b> {
 pub(crate) struct EventGraphs<'a> {
     pub commands: &'a [DdlCommand],
     pub drops: &'a [DroppedObject],
+}
+
+/// Internal reindex commits have cleared their undo logs before end hooks run.
+pub(crate) fn completed_reindex_graphs<'a>(
+    storage: &Storage,
+    txid: u32,
+    replacements: &[crate::storage::IndexReplacement],
+    tag: &str,
+    in_extension: bool,
+    arena: &'a Arena,
+) -> Result<EventGraphs<'a>, SqlError> {
+    let mut commands = ArenaList::new(arena);
+    let mut count = 0;
+    for replacement in replacements {
+        let index = storage
+            .index_visible_to(replacement.new_slot, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "completed reindex replacement is no longer visible"
+                )
+            })?;
+        if index.created_at != replacement.new_created_at
+            || storage.index_table_slot_to(replacement.new_slot, txid) != Some(replacement.table)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "completed reindex replacement changed its selected lifetime"
+            ));
+        }
+        push_command(
+            &mut commands,
+            &mut count,
+            EventObjectRef::Primary(ObjectRef::Index(replacement.new_slot)),
+            tag,
+            in_extension,
+        )?;
+    }
+    Ok(EventGraphs {
+        commands: commands.as_slice(),
+        drops: &[],
+    })
 }
 
 pub(crate) fn collect<'a>(
@@ -4047,6 +4185,7 @@ pub(crate) fn collect<'a>(
             push_drop_dependents(
                 storage,
                 txid,
+                before,
                 reference,
                 !original,
                 &mut drops,

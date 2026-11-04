@@ -13,6 +13,9 @@ capacity limits and legitimate lock waits. Compare SQL values, effects, errors
 and client-message boundaries with actual PostgreSQL; compiler success alone
 does not establish runtime correctness. Recovery tests must exercise their
 declared durable tier before deleting caches.
+Concurrent-index verification must distinguish a cancelled command's committed
+catalog phases from its rolled-back current phase, and check constraint and
+index identities separately.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

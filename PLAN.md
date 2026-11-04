@@ -155,9 +155,13 @@ Concurrent reindexing must replace the index while preserving its owning
 constraint's identity. For example, an application's saved primary-key
 constraint identifier must still identify that constraint after its index is
 rebuilt. Store those identities separately, update the backing-index link, and
-preserve comments, dependencies and partition links. Verify the intermediate
-commits, failure cleanup and empty-cache recovery for ordinary and
-constraint-owned indexes.
+preserve comments, dependencies and partition links. The current implementation
+also gives the large-value index its own lifetime and preserves deferred
+uniqueness while its replacement is detached. Complete the runtime proofs for
+intermediate commit delays, earlier readers, cancellation and empty-cache
+recovery, including ordinary, constraint-owned and large-value indexes.
+Qualify all four workflows on the finished revision; a source check or a
+PostgreSQL reference probe alone does not establish those runtime guarantees.
 
 ### Share fixed memory and disk capacity according to demand
 

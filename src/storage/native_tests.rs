@@ -5397,6 +5397,7 @@ fn index_statistics_source_pins_survive_table_slot_reuse_without_cross_database_
             other_database,
             old_identity.created_at,
             old_index_identity.created_at(),
+            IndexRelationKind::Table,
         )
         .unwrap()
         .commit();

@@ -250,6 +250,7 @@ impl Storage {
         database: DatabaseOid,
         table_created_at: u64,
         index_created_at: u64,
+        relation_kind: super::IndexRelationKind,
     ) -> Result<IndexStatisticsAdmission<'_, 1>, SqlError> {
         let mut admission = IndexStatisticsAdmission {
             statistics: &self.cumulative_statistics,
@@ -270,7 +271,10 @@ impl Storage {
             ),
             owner: IndexStatisticsOwner::Explicit(table as u16),
             database,
-            oid: identity.oid(),
+            oid: identity.companion_oid(match relation_kind {
+                super::IndexRelationKind::Table => super::FIRST_EXPLICIT_INDEX_OID,
+                super::IndexRelationKind::Toast => super::FIRST_TOAST_INDEX_OID,
+            }),
         })?;
         Ok(admission)
     }

@@ -351,6 +351,25 @@ cache's transaction ownership. It does not turn a committed cache into a private
 one or replace another transaction's cache. Rebuilding from rows also avoids
 depending on the damaged saved index that the command is repairing.
 
+For example, `REINDEX TABLE CONCURRENTLY orders` creates replacement indexes
+while normal reads and writes continue. It first commits their catalog entries,
+waits for earlier writers, builds each index, then validates it against later
+writes and waits for earlier readers. It swaps names and constraint links,
+retires the old indexes, and commits their removal before reporting completion.
+The table's primary-key constraint keeps its identifier and comment; its
+backing index receives a new identifier. The virtual large-value index follows
+the same lifetime rules without introducing a separate PostgreSQL chunk heap.
+Schema and database rebuilds finish one table before moving to the next.
+
+These waits retain their source, selected table lifetime and bounded metadata
+leases across commits. Cancellation can leave a committed invalid replacement
+or a retired index, as in PostgreSQL; rollback cannot erase an earlier committed
+phase. Temporary indexes rebuild in place. Direct concurrent rebuilding of an
+exclusion index is rejected; a table rebuild warns and skips it. A table rebuild
+also warns and skips invalid indexes, which can be repaired by explicitly
+rebuilding the index. See the [compatibility guide](postgresql-18-compatibility.md)
+for supported boundaries and [durable formats](durable-format.md) for recovery.
+
 Application jobs, migration scheduling and backup schedules are operator work.
 There is no built-in SQL job scheduler or PostgreSQL background-worker ABI.
 See [operations](operations.md#scheduled-work-and-schema-migrations) for examples

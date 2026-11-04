@@ -83,6 +83,7 @@ mod index_statistics;
 use index_statistics::IndexCounterSlot;
 pub(crate) use index_statistics::IndexStatisticsCapture;
 mod key_preparation;
+pub(crate) use index_bindings::{IndexRelationKind, IndexRelationSource};
 use index_bindings::{IndexTableBinding, PendingIndexTable};
 mod log_positions;
 pub(crate) use log_positions::ReservedLogPosition;
@@ -1815,6 +1816,7 @@ impl UniqueKeyKind {
 /// Named, multi-column, deferred or NULLS NOT DISTINCT key constraint.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueKey {
+    pub(crate) identity: Option<ConstraintIdentity>,
     pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
@@ -1825,6 +1827,7 @@ pub struct UniqueKey {
 
 impl UniqueKey {
     pub const EMPTY: Self = UniqueKey {
+        identity: None,
         index_identity: None,
         name: SqlName::EMPTY,
         columns: [0u16; MAX_INDEX_COLS],
@@ -1874,6 +1877,7 @@ impl ExclusionOperator {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExclusionConstraint {
+    pub(crate) identity: Option<ConstraintIdentity>,
     pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
     pub columns: [u16; MAX_INDEX_COLS],
@@ -1885,6 +1889,7 @@ pub struct ExclusionConstraint {
 
 impl ExclusionConstraint {
     pub const EMPTY: Self = Self {
+        identity: None,
         index_identity: None,
         name: SqlName::EMPTY,
         columns: [0; MAX_INDEX_COLS],
@@ -2021,6 +2026,8 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub(crate) not_null_identities: B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
     pub(crate) attributes: column_attributes::ColumnAttributes<B>,
     pub(crate) inline_index_identities: B::Slice<Option<RelationIdentity>, MAX_RELATION_COLUMNS>,
+    pub(crate) inline_constraint_identities:
+        B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
     pub uniques: B::Slice<UniqueKey, MAX_UNIQUES>,
     pub n_uniques: usize,
     pub checks: B::Slice<CheckConstraint, MAX_CHECKS>,
@@ -2032,6 +2039,7 @@ pub struct TableDefinition<B: DefinitionBacking> {
     /// PostgreSQL retains a table's TOAST relation after the last toastable
     /// column is dropped. This catalog bit records that irreversible creation.
     pub has_toast: bool,
+    pub(crate) toast_index_identity: Option<RelationIdentity>,
     /// PostgreSQL leaves `relhasrules` set after the last rule is dropped.
     pub has_rules: bool,
     pub row_level_security: RowLevelSecurityState,
@@ -2435,6 +2443,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
             has_toast: self.has_toast,
+            toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
             row_level_security: self.row_level_security,
             replica_identity: self.replica_identity,
@@ -2446,6 +2455,8 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             not_null_identities: &self.not_null_identities.as_ref()
                 [..usize::from(self.attributes.count)],
             inline_index_identities: &self.inline_index_identities.as_ref()
+                [..usize::from(self.attributes.count)],
+            inline_constraint_identities: &self.inline_constraint_identities.as_ref()
                 [..usize::from(self.attributes.count)],
             uniques: &self.uniques.as_ref()[..self.n_uniques],
             checks: &self.checks.as_ref()[..self.n_checks],
@@ -2522,6 +2533,7 @@ impl TableDefBuilder {
         result.n_fkeys = source.n_fkeys;
         result.n_exclusions = source.n_exclusions;
         result.has_toast = source.has_toast;
+        result.toast_index_identity = source.toast_index_identity;
         result.has_rules = source.has_rules;
         result.row_level_security = source.row_level_security;
         result.replica_identity = source.replica_identity;
@@ -2536,6 +2548,8 @@ impl TableDefBuilder {
             .copy_from_slice(&source.not_null_identities.as_ref()[..attribute_count]);
         result.inline_index_identities[..attribute_count]
             .copy_from_slice(&source.inline_index_identities.as_ref()[..attribute_count]);
+        result.inline_constraint_identities[..attribute_count]
+            .copy_from_slice(&source.inline_constraint_identities.as_ref()[..attribute_count]);
         result.uniques[..source.n_uniques]
             .copy_from_slice(&source.uniques.as_ref()[..source.n_uniques]);
         result.checks[..source.n_checks]
@@ -2586,6 +2600,7 @@ impl TableDefBuilder {
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
             has_toast: self.has_toast,
+            toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
             row_level_security: self.row_level_security,
             replica_identity: self.replica_identity,
@@ -2603,6 +2618,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             inline_index_identities: pool
                 .copy_slice(&self.inline_index_identities[..attribute_count])
+                .map_err(exhausted)?,
+            inline_constraint_identities: pool
+                .copy_slice(&self.inline_constraint_identities[..attribute_count])
                 .map_err(exhausted)?,
             uniques: pool
                 .copy_slice(&self.uniques[..self.n_uniques])
@@ -2645,6 +2663,7 @@ impl TableDefBuilder {
             not_null_identities: [None; MAX_RELATION_COLUMNS],
             attributes: column_attributes::ColumnAttributes::<InlineDefinition>::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
+            inline_constraint_identities: [None; MAX_RELATION_COLUMNS],
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
             n_uniques: 0,
             checks: [CheckConstraint::EMPTY; MAX_CHECKS],
@@ -2654,6 +2673,7 @@ impl TableDefBuilder {
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
             has_toast: false,
+            toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
@@ -2684,6 +2704,7 @@ impl TableDef {
             not_null_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             attributes: column_attributes::ColumnAttributes::<StoredDefinition>::EMPTY,
             inline_index_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            inline_constraint_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             uniques: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_uniques: 0,
             checks: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -2693,6 +2714,7 @@ impl TableDef {
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_exclusions: 0,
             has_toast: false,
+            toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
@@ -2722,6 +2744,7 @@ impl TableDefView<'_> {
             not_null_identities: &[],
             attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
             inline_index_identities: &[],
+            inline_constraint_identities: &[],
             uniques: &[],
             n_uniques: 0,
             checks: &[],
@@ -2731,6 +2754,7 @@ impl TableDefView<'_> {
             exclusions: &[],
             n_exclusions: 0,
             has_toast: false,
+            toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
@@ -7156,9 +7180,8 @@ pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
 pub(crate) const MAX_VIEW_CATALOG_SLOTS: usize = 10_000;
 
 pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
-pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 =
-    (MAX_TABLE_CATALOG_SLOTS * MAX_VALUE_ENFORCERS) as i32;
 pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
 pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
 pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
@@ -11841,6 +11864,8 @@ pub struct IndexMutableDefinition {
     pub statistics: [i16; MAX_INDEX_COLS],
     pub parent: Option<u16>,
     pub kind: IndexKind,
+    /// Whether this index rejects duplicate keys immediately, independently of attachment.
+    pub immediate: bool,
     /// PostgreSQL's `pg_index.indisclustered`: at most one ordinary index on
     /// a relation is the selected CLUSTER ordering.
     pub clustered: bool,
@@ -11856,6 +11881,7 @@ impl IndexMutableDefinition {
         statistics: [-1; MAX_INDEX_COLS],
         parent: None,
         kind: IndexKind::Ordinary,
+        immediate: true,
         clustered: false,
         replica_identity: false,
     };
@@ -11873,6 +11899,7 @@ pub(crate) struct PendingIndexDefinition {
 /// A named executable index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
+    pub(crate) relation: IndexRelationSource,
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
     /// The schema of both the index and its table (an index always lives in
@@ -11914,6 +11941,7 @@ pub struct IndexDef {
 
 impl IndexDef {
     pub(crate) const EMPTY: Self = Self {
+        relation: IndexRelationSource::Table,
         database: DatabaseOid::POSTGRES,
         created_at: 0,
         schema: SqlName::EMPTY,
@@ -14564,6 +14592,21 @@ fn object_lock_capacity(config: &Config) -> usize {
 pub(crate) enum ObjectLockOwner {
     Transaction(u32),
     Session { connection: i32, acquisition: u64 },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReindexTable {
+    pub slot: usize,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IndexReplacement {
+    pub old_slot: usize,
+    pub old_created_at: u64,
+    pub new_slot: usize,
+    pub new_created_at: u64,
+    pub table: usize,
 }
 
 /// One command's hold on a specific table lifetime across internal commits.
@@ -23855,24 +23898,49 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.pending_table = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
-                let copied_table = self
-                    .tables
-                    .iter()
-                    .enumerate()
-                    .find_map(|(slot, table)| {
-                        let state = table.definition.read();
-                        (state.identity.database == target
-                            && state.identity.existence.visible_to(txid)
-                            && state.committed().schema == definition.schema
-                            && state.committed().name == definition.table)
+                let copied_table = match definition.relation {
+                    IndexRelationSource::Table => self
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, table)| {
+                            let state = table.definition.read();
+                            (state.identity.database == target
+                                && state.identity.existence.visible_to(txid)
+                                && state.committed().schema == definition.schema
+                                && state.committed().name == definition.table)
+                                .then_some(slot)
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template index table was not cloned"
+                            )
+                        })?,
+                    IndexRelationSource::Toast(position) => self
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, table)| {
+                            let identity = table.identity();
+                            (identity.database == target
+                                && identity.created_at == position.created_at()
+                                && identity.existence.visible_to(txid))
                             .then_some(slot)
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template index table was not cloned"
-                        )
-                    })?;
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template TOAST index owner was not cloned"
+                            )
+                        })?,
+                };
+                if matches!(definition.relation, IndexRelationSource::Toast(_)) {
+                    definition.relation = IndexRelationSource::Toast(CatalogPosition::new(
+                        copied_table,
+                        self.tables[copied_table].identity().created_at,
+                    )?);
+                }
                 definition.table_binding = Some(self.capture_index_binding(copied_table, txid));
                 for collation in definition.collations.iter_mut().take(definition.n_cols) {
                     if let Collation::Catalog(selected) = *collation {
@@ -23884,6 +23952,7 @@ impl Storage {
                     target,
                     self.tables[copied_table].identity().created_at,
                     definition.created_at,
+                    definition.relation_kind(),
                 )?;
                 maintenance.states[target_slot] = maintenance.states[source_slot];
                 let ranges_per_index = self.brin_unsummarized_ranges_per_index;
@@ -38636,6 +38705,10 @@ impl Storage {
                 ));
             }
         }
+        if matches!(index.relation, IndexRelationSource::Toast(_)) {
+            self.resolve_index_source_table(index, transaction)?;
+            return Ok(());
+        }
         if matches!(operation, IndexBindingOperation::State)
             && index.mutable.kind.ready() == index.mutable_for(transaction).kind.ready()
             && !self.tables[table]
@@ -38830,17 +38903,20 @@ impl Storage {
                 .any(|column| column.unique)
                 || definition.committed().n_uniques != 0;
             let has_indexes = indexes.iter().any(|index| {
-                txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
-                    index.visible_to(owner)
-                }) && index.table_binding.is_some_and(|binding| {
-                    binding.source.slot() == catalog_sources::CatalogObjectSlot::Table(table_index)
-                        && binding.source.matches_lifetime(
-                            self,
-                            definition.identity.database,
-                            definition.identity.created_at,
-                            definition.identity.existence,
-                        )
-                })
+                matches!(index.relation, IndexRelationSource::Table)
+                    && txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
+                        index.visible_to(owner)
+                    })
+                    && index.table_binding.is_some_and(|binding| {
+                        binding.source.slot()
+                            == catalog_sources::CatalogObjectSlot::Table(table_index)
+                            && binding.source.matches_lifetime(
+                                self,
+                                definition.identity.database,
+                                definition.identity.created_at,
+                                definition.identity.existence,
+                            )
+                    })
             });
             if !has_constraints && !has_indexes && change.is_none() {
                 publication.enforcers = SharedSlice::EMPTY;
@@ -48699,15 +48775,52 @@ impl Storage {
         Self::move_index_comments(&mut comments, before, indexes[slot], current.txid);
     }
 
-    /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
-    /// transaction; returns its slot. Errors on a duplicate visible name or
-    /// another transaction's uncommitted DDL on the name.
-    pub fn create_index(&self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+    /// Registers an uncommitted index owned by `txid` in the fixed catalog.
+    /// Duplicate names and another transaction's pending names are rejected.
+    pub fn create_index(&self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+        if matches!(def.relation, IndexRelationSource::Table) {
+            self.require_schema_create(def.schema.as_str(), txid)?;
+        } else if txid != 0 {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "TOAST index registration requires its selected REINDEX owner"
+            ));
+        }
+        self.install_index(def, txid)
+    }
+
+    /// REINDEX already holds MAINTAIN and a lock on this selected table. It
+    /// copies an existing definition without requiring CREATE on its schema.
+    pub(crate) fn create_reindex_index(
+        &self,
+        mut def: IndexDef,
+        source: TableDefinitionTarget,
+        relation_kind: IndexRelationKind,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        source.validate(self)?;
+        def.relation = match relation_kind {
+            IndexRelationKind::Table => IndexRelationSource::Table,
+            IndexRelationKind::Toast => {
+                IndexRelationSource::Toast(self.table_position(source.table()))
+            }
+        };
+        if source.transaction() != txid
+            || self.resolve_index_source_table(def, txid)? != source.table()
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "REINDEX table identity changed before index registration"
+            ));
+        }
+        self.install_index(def, txid)
+    }
+
+    fn install_index(&self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
         let created_at = (def.created_at != 0)
             .then(|| bounded_catalog_generation(def.created_at, MAX_INDEX_OID_GENERATION, "index"))
             .transpose()?;
         def.database = current_database();
-        self.require_schema_create(def.schema.as_str(), txid)?;
         match def.method {
             crate::sql::ast::IndexAccessMethod::Btree => {
                 if def.mutable.options.pages_per_range.is_some()
@@ -48928,15 +49041,7 @@ impl Storage {
             0
         };
         let ownership = self.initial_ownership(txid)?;
-        let table = self
-            .find_visible(def.schema.as_str(), def.table.as_str(), txid)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "relation \"{}\" does not exist",
-                    def.table.as_str()
-                )
-            })?;
+        let table = self.resolve_index_source_table(def, txid)?;
         let selected_binding = self.capture_index_binding(table, txid);
         let table_lifecycle = loop {
             match row_ownership::try_mutex(
@@ -48961,7 +49066,8 @@ impl Storage {
                 (head.schema, head.name)
             });
         if !state.identity.existence.visible_to(txid)
-            || selected_names != (def.schema, def.table)
+            || (matches!(def.relation, IndexRelationSource::Table)
+                && selected_names != (def.schema, def.table))
             || !selected_binding.matches_selected(self, &state, txid)
         {
             return Err(sql_err!(
@@ -49062,6 +49168,7 @@ impl Storage {
             def.database,
             self.tables[table].identity().created_at,
             created_at,
+            def.relation_kind(),
         )?;
         let mut maintenance = self.brin_maintenance();
         let (state, ranges) =
@@ -49419,7 +49526,9 @@ impl Storage {
     }
 
     fn install_index_create(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
-        let table = self.index_table_slot(slot);
+        let table = matches!(self.index(slot).relation, IndexRelationSource::Table)
+            .then(|| self.index_table_slot(slot))
+            .flatten();
         if let Some(table) = table {
             self.preview_index_generation(table, admitted)?;
             self.tables[table]
@@ -49451,7 +49560,9 @@ impl Storage {
 
     fn install_index_drop(&mut self, slot: usize, admitted: Option<u32>) -> Result<(), SqlError> {
         let index = self.index(slot);
-        let table = self.index_table_slot(slot);
+        let table = matches!(self.index(slot).relation, IndexRelationSource::Table)
+            .then(|| self.index_table_slot(slot))
+            .flatten();
         if let Some(table) = table {
             self.preview_index_generation(table, admitted)?;
         }
@@ -49479,6 +49590,7 @@ impl Storage {
         let mut catalog = self.index_catalog();
         let database = catalog[slot].database;
         let identity = RelationIdentity::parse(catalog[slot].created_at);
+        let oid = identity.map(|_| catalog[slot].relation_oid());
         if rollback_create {
             catalog[slot].ddl_state.rollback_create();
         } else {
@@ -49502,8 +49614,8 @@ impl Storage {
         });
         drop(maintenance);
         drop(catalog);
-        if !retained && let Some(identity) = identity {
-            self.retire_index_statistics(database, identity.oid());
+        if !retained && let Some(oid) = oid {
+            self.retire_index_statistics(database, oid);
         }
     }
 
@@ -49572,13 +49684,17 @@ impl Storage {
                 identity.created_at,
             )
         });
-        self.matching_indexes(move |x| x.database == current_database() && x.visible_to(txid))
-            .filter(move |(_, index)| {
-                index
-                    .table_binding
-                    .is_some_and(|binding| Some(binding.source) == selected)
-            })
-            .filter_map(move |(_, index)| self.project_index_binding(index, txid))
+        self.matching_indexes(move |x| {
+            x.database == current_database()
+                && x.visible_to(txid)
+                && matches!(x.relation, IndexRelationSource::Table)
+        })
+        .filter(move |(_, index)| {
+            index
+                .table_binding
+                .is_some_and(|binding| Some(binding.source) == selected)
+        })
+        .filter_map(move |(_, index)| self.project_index_binding(index, txid))
     }
 
     pub(crate) fn retain_index_command_source(
@@ -49587,6 +49703,29 @@ impl Storage {
     ) -> Result<SharedSlice<u8>, SqlError> {
         self.metadata_pool
             .copy_slice(text.as_bytes())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+    }
+
+    pub(crate) fn retain_index_replacements(
+        &self,
+        replacements: &[IndexReplacement],
+    ) -> Result<MutableSlice<IndexReplacement>, SqlError> {
+        let mut retained = self
+            .metadata_pool
+            .lease(replacements.len())
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        retained
+            .extend_from_slice(replacements)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))?;
+        Ok(retained)
+    }
+
+    pub(crate) fn retain_reindex_tables(
+        &self,
+        tables: &[ReindexTable],
+    ) -> Result<SharedSlice<ReindexTable>, SqlError> {
+        self.metadata_pool
+            .copy_slice(tables)
             .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
     }
 
@@ -49733,6 +49872,17 @@ impl Storage {
         index
             .filter(|index| index.database == current_database())
             .and_then(|index| self.project_index_binding(index, txid))
+            .map(|mut index| {
+                if index.relation_kind() == IndexRelationKind::Table
+                    && let Some(pending) = index
+                        .pending_table
+                        .filter(|pending| pending.transaction == txid)
+                {
+                    index.schema = pending.schema;
+                    index.table = pending.table;
+                }
+                index
+            })
     }
 
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {

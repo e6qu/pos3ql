@@ -58,6 +58,13 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
             .chain(self.exclusions().iter().map(|key| key.index_identity))
     }
 
+    pub(crate) fn table_index_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
+        self.implicit_index_identities()
+            .chain(self.has_toast.then_some(self.toast_index_identity))
+    }
+
     pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
         self.columns()
             .iter()
@@ -82,6 +89,19 @@ impl super::TableDefBuilder {
     pub(crate) fn implicit_index_identities_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+        self.index_identities_mut(false)
+    }
+
+    pub(crate) fn table_index_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+        self.index_identities_mut(true)
+    }
+
+    fn index_identities_mut(
+        &mut self,
+        include_toast: bool,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
         let columns = &self.columns;
         self.inline_index_identities[..usize::from(self.attributes.count)]
             .iter_mut()
@@ -105,6 +125,7 @@ impl super::TableDefBuilder {
                     .iter_mut()
                     .map(|key| &mut key.index_identity),
             )
+            .chain((include_toast && self.has_toast).then_some(&mut self.toast_index_identity))
     }
 }
 
@@ -114,6 +135,9 @@ impl Storage {
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
         self.reserve_constraint_identities(definition)?;
+        if !definition.has_toast {
+            definition.toast_index_identity = None;
+        }
         for (identity, slot) in definition
             .inline_index_identities
             .iter_mut()
@@ -130,7 +154,7 @@ impl Storage {
                 *identity = None;
             }
         }
-        for identity in definition.implicit_index_identities_mut() {
+        for identity in definition.table_index_identities_mut() {
             if identity.is_none() {
                 *identity = Some(
                     RelationIdentity::parse(
@@ -150,7 +174,7 @@ impl Storage {
         owner_birth: u64,
     ) -> Result<(), SqlError> {
         super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;
-        for (position, identity) in definition.implicit_index_identities().enumerate() {
+        for (position, identity) in definition.table_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
@@ -158,7 +182,7 @@ impl Storage {
                 )
             })?;
             if definition
-                .implicit_index_identities()
+                .table_index_identities()
                 .take(position)
                 .any(|earlier| earlier == Some(identity))
             {
@@ -168,7 +192,7 @@ impl Storage {
                 ));
             }
         }
-        for identity in definition.implicit_index_identities().flatten() {
+        for identity in definition.table_index_identities().flatten() {
             self.catalog_sequence.observe(identity.created_at());
         }
         for identity in definition.constraint_identities().flatten() {
@@ -232,6 +256,23 @@ impl Storage {
                     }
                     check(identity.created_at)?;
                     let definition = table.definition();
+                    if definition.has_toast {
+                        let toast = definition.toast_index_identity.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "restored TOAST index has no identity"
+                            )
+                        })?;
+                        let owner = super::CatalogPosition::new(slot, identity.created_at)?;
+                        if !indexes.iter().any(|index| {
+                            index.database == database.oid
+                                && index.ddl_state != super::CatalogDdlState::Absent
+                                && index.relation == super::IndexRelationSource::Toast(owner)
+                                && index.created_at == toast.created_at()
+                        }) {
+                            check(toast.created_at())?;
+                        }
+                    }
                     for (column, _) in definition
                         .columns()
                         .iter()

@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 24;
+pub(crate) const RECORD_VERSION: u8 = 25;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -257,7 +257,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 15;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 16;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1133,7 +1133,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     };
     n += 1;
     n += 3;
-    n += def.implicit_index_identities().count() * 8;
+    n += def.table_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
     n += 4 + def.type_inputs.as_ref().bytes().len();
     n
@@ -1287,7 +1287,7 @@ fn append_table_payload<B: DefinitionBacking>(
         u8::from(def.row_level_security.forced),
         def.replica_identity.code(),
     ]);
-    for identity in def.implicit_index_identities() {
+    for identity in def.table_index_identities() {
         ok &= identity.is_some()
             && buffer.append(
                 &identity
@@ -1704,6 +1704,7 @@ pub(crate) enum WalOp<'a> {
         confirmed_flush_lsn: u64,
     },
     CreateIndex {
+        relation: crate::storage::IndexRelationSource,
         created_at: u64,
         schema: &'a str,
         name: &'a str,
@@ -3748,7 +3749,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             operator_class_options,
             ..
         } => {
-            8 + 1
+            crate::storage::IndexRelationSource::ENCODED_BYTES
+                + 8
+                + 1
                 + name.len()
                 + 1
                 + table.len()
@@ -3798,12 +3801,13 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
+                + 1
                 + 8
                 + 6
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
         WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3 + 8 + 6
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 4 + 8 + 6
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -4695,6 +4699,7 @@ fn append_index_definition(
         kind,
         u8::from(definition.clustered),
         u8::from(definition.replica_identity),
+        u8::from(definition.immediate),
     ]);
     let autosummarize = match definition.options.autosummarize {
         None => 0,
@@ -5521,6 +5526,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             confirmed_flush_lsn,
         } => name_bytes(buffer, name) && buffer.append(&confirmed_flush_lsn.to_le_bytes()),
         WalOp::CreateIndex {
+            relation,
             created_at,
             schema,
             name,
@@ -5544,6 +5550,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             definition,
         } => {
             let mut ok = buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&relation.encode())
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, table)
                 && buffer.append(&[u8::from(*unique), *n_cols as u8]);
@@ -7326,58 +7333,59 @@ fn decode_index_definition(
         _ => return None,
     };
     *at += 1;
-    let mut pages_per_range = None;
-    let mut autosummarize = None;
-    if payload.get(*at) == Some(&0xab) {
-        *at += 1;
-        pages_per_range = match u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?) {
-            0 => None,
-            value @ 1..=131_072 => Some(value),
-            _ => return None,
-        };
-        *at += 4;
-        autosummarize = match *payload.get(*at)? {
-            0 => None,
-            1 => Some(false),
-            2 => Some(true),
-            _ => return None,
-        };
-        *at += 1;
+    let immediate = match *payload.get(*at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    *at += 1;
+    if payload.get(*at) != Some(&0xab) {
+        return None;
     }
-    let buffering = if payload.get(*at) == Some(&0xad) {
-        *at += 1;
-        let value = match *payload.get(*at)? {
+    *at += 1;
+    let pages_per_range = match u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?) {
+        0 => None,
+        value @ 1..=131_072 => Some(value),
+        _ => return None,
+    };
+    *at += 4;
+    let autosummarize = match *payload.get(*at)? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        _ => return None,
+    };
+    *at += 1;
+    if payload.get(*at) != Some(&0xad) {
+        return None;
+    }
+    *at += 1;
+    let buffering = match *payload.get(*at)? {
+        0 => None,
+        1 => Some(crate::sql::ast::GistBuffering::Auto),
+        2 => Some(crate::sql::ast::GistBuffering::On),
+        3 => Some(crate::sql::ast::GistBuffering::Off),
+        _ => return None,
+    };
+    *at += 1;
+    if payload.get(*at) != Some(&0xae) {
+        return None;
+    }
+    *at += 1;
+    let fastupdate = match *payload.get(*at)? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        _ => return None,
+    };
+    *at += 1;
+    let gin_pending_list_limit =
+        match u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?) {
             0 => None,
-            1 => Some(crate::sql::ast::GistBuffering::Auto),
-            2 => Some(crate::sql::ast::GistBuffering::On),
-            3 => Some(crate::sql::ast::GistBuffering::Off),
+            value @ 64..=2_147_483_647 => Some(value),
             _ => return None,
         };
-        *at += 1;
-        value
-    } else {
-        None
-    };
-    let (fastupdate, gin_pending_list_limit) = if payload.get(*at) == Some(&0xae) {
-        *at += 1;
-        let fastupdate = match *payload.get(*at)? {
-            0 => None,
-            1 => Some(false),
-            2 => Some(true),
-            _ => return None,
-        };
-        *at += 1;
-        let gin_pending_list_limit =
-            match u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?) {
-                0 => None,
-                value @ 64..=2_147_483_647 => Some(value),
-                _ => return None,
-            };
-        *at += 4;
-        (fastupdate, gin_pending_list_limit)
-    } else {
-        (None, None)
-    };
+    *at += 4;
     if (clustered || replica_identity) && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
@@ -7397,6 +7405,7 @@ fn decode_index_definition(
         kind,
         clustered,
         replica_identity,
+        immediate,
     })
 }
 
@@ -8376,7 +8385,7 @@ fn decode_op_inner<'a>(
             at += 1;
             // Stored names are authoritative during later column remapping.
             def.not_null_name_edits = crate::storage::ColumnSet::all(n_cols);
-            for identity in def.implicit_index_identities_mut() {
+            for identity in def.table_index_identities_mut() {
                 let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
                 *identity = Some(crate::storage::RelationIdentity::parse(created_at)?);
@@ -8394,9 +8403,9 @@ fn decode_op_inner<'a>(
                 identity.created_at(),
             )
             .ok()?;
-            for (position, identity) in def.implicit_index_identities().enumerate() {
+            for (position, identity) in def.table_index_identities().enumerate() {
                 if def
-                    .implicit_index_identities()
+                    .table_index_identities()
                     .take(position)
                     .any(|earlier| earlier == identity)
                 {
@@ -9647,6 +9656,10 @@ fn decode_op_inner<'a>(
         KIND_CREATE_INDEX => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
+            let relation = crate::storage::IndexRelationSource::decode(
+                payload.get(at..at + crate::storage::IndexRelationSource::ENCODED_BYTES)?,
+            )?;
+            at += crate::storage::IndexRelationSource::ENCODED_BYTES;
             let name = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let unique = stored_boolean(*payload.get(at)?)?;
@@ -9720,21 +9733,12 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             at += 1;
-            let mask = match *payload.get(at)? {
-                0xa5 => {
-                    at += 1;
-                    let mask = u32::from(*payload.get(at)?);
-                    at += 1;
-                    mask
-                }
-                0xb0 => {
-                    at += 1;
-                    let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-                    at += 4;
-                    mask
-                }
-                _ => return None,
-            };
+            if *payload.get(at)? != 0xb0 {
+                return None;
+            }
+            at += 1;
+            let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
             if n_cols < u32::BITS as usize && mask >> n_cols != 0 {
                 return None;
             }
@@ -9849,84 +9853,84 @@ fn decode_op_inner<'a>(
             }
             let mut operator_class_options =
                 [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
-            if payload.get(at) == Some(&0xac) {
+            if payload.get(at) != Some(&0xac) {
+                return None;
+            }
+            at += 1;
+            for options in operator_class_options.iter_mut().take(n_cols) {
+                let flags = *payload.get(at)?;
                 at += 1;
-                for options in operator_class_options.iter_mut().take(n_cols) {
-                    let flags = *payload.get(at)?;
-                    at += 1;
-                    if flags & !0b1111 != 0 {
+                if flags & !0b1111 != 0 {
+                    return None;
+                }
+                let values_per_range =
+                    u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                let n_distinct_per_range =
+                    i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                let rate_len = *payload.get(at)? as usize;
+                at += 1;
+                let rate = core::str::from_utf8(payload.get(at..at + rate_len)?).ok()?;
+                at += rate_len;
+                let siglen = if flags & 8 != 0 {
+                    let value = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    Some((1..=2024).contains(&value).then_some(value)?)
+                } else {
+                    None
+                };
+                let false_positive_rate = if flags & 4 != 0 {
+                    let parsed = rate.parse::<f64>().ok()?;
+                    if !parsed.is_finite() || !(0.000_1..=0.25).contains(&parsed) {
                         return None;
                     }
-                    let values_per_range =
-                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                    at += 2;
-                    let n_distinct_per_range =
-                        i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-                    at += 4;
-                    let rate_len = *payload.get(at)? as usize;
-                    at += 1;
-                    let rate = core::str::from_utf8(payload.get(at..at + rate_len)?).ok()?;
-                    at += rate_len;
-                    let siglen = if flags & 8 != 0 {
-                        let value = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-                        at += 2;
-                        Some((1..=2024).contains(&value).then_some(value)?)
-                    } else {
-                        None
-                    };
-                    let false_positive_rate = if flags & 4 != 0 {
-                        let parsed = rate.parse::<f64>().ok()?;
-                        if !parsed.is_finite() || !(0.000_1..=0.25).contains(&parsed) {
-                            return None;
-                        }
-                        let stored = crate::util::StackStr::from_str(rate);
-                        if stored.is_truncated() {
-                            return None;
-                        }
-                        Some(stored)
-                    } else if rate_len == 0 {
+                    let stored = crate::util::StackStr::from_str(rate);
+                    if stored.is_truncated() {
+                        return None;
+                    }
+                    Some(stored)
+                } else if rate_len == 0 {
+                    None
+                } else {
+                    return None;
+                };
+                *options = crate::storage::IndexOperatorClassOptions {
+                    values_per_range: if flags & 1 != 0 {
+                        Some(
+                            (8..=256)
+                                .contains(&values_per_range)
+                                .then_some(values_per_range)?,
+                        )
+                    } else if values_per_range == 0 {
                         None
                     } else {
                         return None;
-                    };
-                    *options = crate::storage::IndexOperatorClassOptions {
-                        values_per_range: if flags & 1 != 0 {
-                            Some(
-                                (8..=256)
-                                    .contains(&values_per_range)
-                                    .then_some(values_per_range)?,
-                            )
-                        } else if values_per_range == 0 {
-                            None
-                        } else {
-                            return None;
-                        },
-                        n_distinct_per_range: if flags & 2 != 0 {
-                            Some((n_distinct_per_range >= -1).then_some(n_distinct_per_range)?)
-                        } else if n_distinct_per_range == 0 {
-                            None
-                        } else {
-                            return None;
-                        },
-                        false_positive_rate,
-                        siglen,
-                    };
-                }
+                    },
+                    n_distinct_per_range: if flags & 2 != 0 {
+                        Some((n_distinct_per_range >= -1).then_some(n_distinct_per_range)?)
+                    } else if n_distinct_per_range == 0 {
+                        None
+                    } else {
+                        return None;
+                    },
+                    false_positive_rate,
+                    siglen,
+                };
             }
-            let method = if *payload.get(at)? == 0xaa {
-                at += 1;
-                let method = crate::sql::ast::IndexAccessMethod::from_code(*payload.get(at)?)?;
-                at += 1;
-                method
-            } else {
-                crate::sql::ast::IndexAccessMethod::Btree
-            };
+            if *payload.get(at)? != 0xaa {
+                return None;
+            }
+            at += 1;
+            let method = crate::sql::ast::IndexAccessMethod::from_code(*payload.get(at)?)?;
+            at += 1;
             if *payload.get(at)? != 0xa8 {
                 return None;
             }
             at += 1;
             let definition = decode_index_definition(payload, &mut at)?;
             (at == payload.len()).then_some(WalOp::CreateIndex {
+                relation,
                 created_at,
                 schema,
                 name,
@@ -15023,6 +15027,7 @@ mod tests {
             statistics_target: -1,
             statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
+        def.has_toast = true;
         // Exercise every durable constraint state in one table record.
         let mut uk = UniqueKey::EMPTY;
         uk.name = SqlName::parse("t_id_v_key").unwrap();
@@ -15061,7 +15066,7 @@ mod tests {
         def.n_exclusions = 1;
         def.attributes.initialize(def.n_columns).unwrap();
         crate::storage::constraint_names::table(&mut def).unwrap();
-        for (position, identity) in def.implicit_index_identities_mut().enumerate() {
+        for (position, identity) in def.table_index_identities_mut().enumerate() {
             *identity = crate::storage::RelationIdentity::parse(position as u64 + 100);
         }
         for (position, identity) in def.constraint_identities_mut().enumerate() {
@@ -15079,6 +15084,7 @@ mod tests {
             core::mem::size_of_val(&definition.not_null_names[..definition.n_columns]),
             core::mem::size_of_val(&definition.not_null_identities[..attributes]),
             core::mem::size_of_val(&definition.inline_index_identities[..attributes]),
+            core::mem::size_of_val(&definition.inline_constraint_identities[..attributes]),
             core::mem::size_of_val(definition.uniques()),
             core::mem::size_of_val(definition.checks()),
             core::mem::size_of_val(definition.fkeys()),
@@ -15090,13 +15096,13 @@ mod tests {
         .sum();
         let payload_bytes = table_payload_len(&definition);
         let mut budget = Budget::new(
-            crate::mem::lease_pool::LeasePool::budget_bytes(bytes, 9) + 2 * payload_bytes,
+            crate::mem::lease_pool::LeasePool::budget_bytes(bytes, 10) + 2 * payload_bytes,
         );
         let pool = crate::mem::lease_pool::LeasePool::new(
             &mut budget,
             crate::mem::lease_pool::Purpose::TABLE_METADATA,
             bytes,
-            9,
+            10,
         )
         .unwrap();
         let mut from_builder =
@@ -15123,9 +15129,28 @@ mod tests {
             let (position, decoded, _) = decode_table_payload(from_stored.readable()).unwrap();
             assert_eq!(position, identity);
             assert_eq!(decoded.columns(), definition.columns());
+            assert!(
+                decoded
+                    .constraint_identities()
+                    .eq(definition.constraint_identities())
+            );
+            assert!(
+                decoded
+                    .table_index_identities()
+                    .eq(definition.table_index_identities())
+            );
             assert_eq!(
-                decoded.constraint_identities().count(),
-                definition.constraint_identities().count()
+                decoded.inline_constraint_identities,
+                definition.inline_constraint_identities
+            );
+            assert_eq!(decoded.uniques[0].identity, definition.uniques[0].identity);
+            assert_eq!(
+                decoded.exclusions[0].identity,
+                definition.exclusions[0].identity
+            );
+            assert_eq!(
+                decoded.implicit_constraint_identity(0),
+                definition.column_constraint_identity(0)
             );
         });
         assert!(pool.lease::<u8>(bytes).is_ok());
@@ -16669,10 +16694,68 @@ mod tests {
     }
 
     #[test]
+    fn toast_index_journal_source_retains_exact_owner_and_rejects_ambiguous_tags() {
+        let owner = crate::storage::CatalogPosition::new(7, 39).unwrap();
+        let mut classes = [None; MAX_INDEX_COLS];
+        classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
+            BtreeOperatorClass::Oid,
+        ));
+        classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
+            BtreeOperatorClass::Int4,
+        ));
+        let mut columns = [0; MAX_INDEX_COLS];
+        columns[1] = 1;
+        let operation = WalOp::CreateIndex {
+            relation: crate::storage::IndexRelationSource::Toast(owner),
+            created_at: 42,
+            schema: "pg_toast",
+            name: "pg_toast_300000039_index",
+            table: "pg_toast_300000039",
+            method: crate::sql::ast::IndexAccessMethod::Btree,
+            columns,
+            expressions: [None; MAX_INDEX_COLS],
+            include_columns: [0; MAX_INDEX_COLS],
+            collations: [crate::sql::ast::Collation::None; MAX_INDEX_COLS],
+            explicit_collations: [false; MAX_INDEX_COLS],
+            operator_classes: [None; MAX_INDEX_COLS],
+            resolved_operator_classes: classes,
+            operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
+                MAX_INDEX_COLS],
+            descending: [false; MAX_INDEX_COLS],
+            nulls_first: [false; MAX_INDEX_COLS],
+            n_cols: 2,
+            n_include_cols: 0,
+            nulls_not_distinct: false,
+            predicate: None,
+            unique: true,
+            definition: crate::storage::IndexMutableDefinition::DEFAULT,
+        };
+        let length = encoded_payload_len(&operation);
+        let mut budget = Budget::new(length);
+        let mut payload =
+            FixedBuf::new(&mut budget, "TOAST index owner journal proof", length).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), length);
+            let Some(WalOp::CreateIndex { relation, .. }) =
+                decode_op(KIND_CREATE_INDEX, payload.readable())
+            else {
+                panic!("current TOAST source must decode");
+            };
+            assert_eq!(relation, crate::storage::IndexRelationSource::Toast(owner));
+            for invalid in [0, 2] {
+                payload.filled_mut()[8] = invalid;
+                assert!(decode_op(KIND_CREATE_INDEX, payload.readable()).is_none());
+            }
+        });
+    }
+
+    #[test]
     fn partial_index_payload_round_trips_without_name_length_limits() {
         let mut expressions = [None; MAX_INDEX_COLS];
         expressions[0] = Some("lower(value)");
         let operation = WalOp::CreateIndex {
+            relation: crate::storage::IndexRelationSource::Table,
             created_at: 42,
             schema: "public",
             name: "active_values",
@@ -16727,8 +16810,8 @@ mod tests {
         assert!(definition.clustered);
         assert_eq!(predicate, Some("active AND value IS NOT NULL"));
 
-        // The former eight-key format used tag 0xa5 followed by one mask
-        // byte. Recovery must keep accepting it after the mask widens.
+        // Current records require the wide mask, including when only one key
+        // is present; a legacy payload inside a current envelope is invalid.
         let current = payload.readable();
         let mut legacy = [0u8; 4096];
         {
@@ -16741,16 +16824,10 @@ mod tests {
             legacy[expression_mask_at + 1] = 1;
             legacy[expression_mask_at + 2..current.len() - 3]
                 .copy_from_slice(&current[expression_mask_at + 5..]);
-            let Some(WalOp::CreateIndex { expressions, .. }) =
-                decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 3])
-            else {
-                panic!("legacy expression-mask WAL payload must decode");
-            };
-            assert_eq!(expressions[0], Some("lower(value)"));
+            assert!(decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 3]).is_none());
         }
 
-        // WAL written before access methods became durable metadata has no
-        // 0xaa method field. Its only executable index method was btree.
+        // A missing method must not select btree implicitly.
         let method_at = current
             .windows(3)
             .rposition(|window| window == [0xaa, 0, 0xa8])
@@ -16758,12 +16835,28 @@ mod tests {
         legacy.fill(0);
         legacy[..method_at].copy_from_slice(&current[..method_at]);
         legacy[method_at..current.len() - 2].copy_from_slice(&current[method_at + 2..]);
-        let Some(WalOp::CreateIndex { method, .. }) =
-            decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 2])
-        else {
-            panic!("legacy btree index WAL payload must decode");
-        };
-        assert_eq!(method, crate::sql::ast::IndexAccessMethod::Btree);
+        assert!(decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 2]).is_none());
+
+        let options_at = current[..method_at]
+            .iter()
+            .rposition(|byte| *byte == 0xac)
+            .expect("encoded operator-class options marker");
+        let removed = method_at - options_at;
+        legacy[..options_at].copy_from_slice(&current[..options_at]);
+        legacy[options_at..current.len() - removed].copy_from_slice(&current[method_at..]);
+        assert!(decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - removed]).is_none());
+
+        crate::mem::guard::forbid_alloc(|| {
+            for (marker, width) in [(0xab, 6), (0xad, 2), (0xae, 6)] {
+                let start = current
+                    .iter()
+                    .rposition(|byte| *byte == marker)
+                    .expect("encoded mutable index option marker");
+                legacy[..start].copy_from_slice(&current[..start]);
+                legacy[start..current.len() - width].copy_from_slice(&current[start + width..]);
+                assert!(decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - width]).is_none());
+            }
+        });
     }
 
     #[test]
@@ -16771,6 +16864,7 @@ mod tests {
         let hash_class =
             crate::storage::IndexOperatorClass::Hash(crate::sql::types::HashOperatorClass::Int4);
         let operation = WalOp::CreateIndex {
+            relation: crate::storage::IndexRelationSource::Table,
             created_at: 43,
             schema: "public",
             name: "hash_values",
@@ -16819,6 +16913,7 @@ mod tests {
             [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
         operator_class_options[0].siglen = Some(64);
         let operation = WalOp::CreateIndex {
+            relation: crate::storage::IndexRelationSource::Table,
             created_at: 44,
             schema: "public",
             name: "gist_documents_search",
@@ -16897,6 +16992,7 @@ mod tests {
         ];
         for (method, class, options) in cases {
             let operation = WalOp::CreateIndex {
+                relation: crate::storage::IndexRelationSource::Table,
                 created_at: 45,
                 schema: "public",
                 name: "special_values",
@@ -17044,6 +17140,7 @@ mod tests {
             name: "clustered_rows",
             definition: crate::storage::IndexMutableDefinition {
                 clustered: true,
+                immediate: false,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
         };
@@ -17067,6 +17164,12 @@ mod tests {
         assert_eq!(schema, "public");
         assert_eq!(name, "clustered_rows");
         assert!(definition.clustered);
+        assert!(!definition.immediate);
+        let immediate_at = payload.len() - 15;
+        payload.filled_mut()[immediate_at] = 2;
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable()).is_none());
+        });
     }
 
     #[test]

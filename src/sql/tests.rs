@@ -86890,7 +86890,7 @@ fn distinct_aggregates() {
     // DISTINCT outside an aggregate is rejected loudly.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
-            .contains("42883")
+            .contains("42809")
     );
     assert_eq!(
         data_rows(&run_with(

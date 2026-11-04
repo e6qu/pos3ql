@@ -143,6 +143,11 @@ division by zero. A true constant `CASE` condition discards later branches.
 The type-only pass releases its arena and temporary record descriptions while
 preserving descriptions owned by the enclosing statement. SQL `EXECUTE` carries
 declared parameter types through planning and execution, even for NULL values.
+Metadata adapters carry declared sizes, collations and anonymous record shapes.
+For example, `(q).f1` remains usable when `q` comes from `ROW(7)` in a nested
+query. Expanded views retain their original schema and name while aliases
+control which names SQL can reference. `RETURNING` adds the target's old/new
+names without adding duplicate sources of unqualified columns.
 
 Protocol preparation distinguishes starting a command from executing a block of
 commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
@@ -364,7 +369,11 @@ waits for earlier writers, builds each index, then validates it against later
 writes and waits for earlier readers. It swaps names and constraint links,
 retires the old indexes, and commits their removal before reporting completion.
 The table's primary-key constraint keeps its identifier and comment; its
-backing index receives a new identifier. The virtual large-value index follows
+backing index receives a new identifier. Index registration leaves the table
+shape intact so an existing writer cannot block publication of the replacement.
+Inline keys are normalized when their backing index is swapped. Index comments
+move through the journal with the replacement and survive restart; reusing a
+retired name cannot move another index's comment. The virtual large-value index follows
 the same lifetime rules without introducing a separate PostgreSQL chunk heap.
 Schema and database rebuilds finish one table before moving to the next.
 Their end hooks run once after the complete command. If another connection

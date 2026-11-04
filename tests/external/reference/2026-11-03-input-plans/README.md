@@ -273,3 +273,17 @@ restores each original index once. These fixtures were uncommitted at revision
 check 12 file hashes, 25 result rows and the six expected error codes against
 the exact SQL, raw output, commands and binary provenance. This is reference
 behavior, not a passing pos3ql or performance result.
+
+[planner-metadata-reference.zip](planner-metadata-reference.zip), SHA256
+`daa7e45f1003d2e85a00535ce376491c97c4311f428910cdf484a204328a5c97`,
+records fixture `232_planner_record_metadata.sql` and the PostgreSQL 18.6
+B-tree/hash catalog inventory. Anonymous record fields, composite-domain array
+elements and `RETURNING` old/new aliases retain their types and values. Reusing
+an index name preserves each index's own comment. A constant true string
+comparison discards a later overflow; `length(DISTINCT 'x')` reports `42809`.
+The inventory contains 85 classes and 69 families, including `name_ops`' declared
+key type. Exact SQL, commands, binary hashes and raw results were captured with
+these repairs uncommitted at `fcd4f8cc`. Extract it and run
+`python3 verify-planner-metadata.py .` to verify file hashes, 175 result rows and
+seven expected error codes. These observations qualify the PostgreSQL reference;
+the final pos3ql CI run must establish matching behavior.

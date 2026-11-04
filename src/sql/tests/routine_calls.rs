@@ -3510,3 +3510,72 @@ fn foreign_row_inputs_preserve_the_request_sequence_context_without_allocating()
         ["4"]
     );
 }
+
+#[test]
+fn planner_metadata_preserves_record_shapes_target_names_and_index_comments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("planner-record-metadata-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/232_planner_record_metadata.sql");
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let state = if statement.contains("excluded.missing") {
+                Some("42703")
+            } else if statement.contains("length(DISTINCT") {
+                Some("42809")
+            } else if statement.contains(" AS hidden") {
+                Some("42P01")
+            } else {
+                None
+            };
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                state.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {statement}"
+            );
+            errors.extend(error_sqlstates(&output));
+            rows.extend(data_rows(&output));
+        }
+        assert_eq!(errors, ["42703", "42809", "42P01", "42P01"]);
+        assert_eq!(
+            rows,
+            [
+                "7|xy|integer|character varying",
+                "x|1",
+                "NULL|2",
+                "z|3",
+                "9",
+                "1|11|10|11",
+                "2|20|25",
+                "kept",
+                "planner_metadata_index|replacement index",
+                "planner_metadata_retired|original index",
+                "replacement index",
+                "1978|403|int4_ops|integer_ops|23|t|0",
+                "1979|403|int2_ops|integer_ops|21|t|0",
+                "1981|403|oid_ops|oid_ops|26|t|0",
+                "4217|403|text_pattern_ops|text_pattern_ops|25|f|0",
+                "10028|403|name_ops|text_ops|19|t|2275",
+                "10031|405|oid_ops|oid_ops|26|t|0",
+                "10044|403|varchar_ops|text_ops|25|f|0",
+                "10053|403|xid8_ops|xid8_ops|5069|t|0",
+                "85",
+                "0",
+            ],
+            "{mode:?}"
+        );
+    }
+}

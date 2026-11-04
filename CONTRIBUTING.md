@@ -150,6 +150,15 @@ using the original deadline; a mock server reporting a completed write does not
 guarantee that its client can read the bytes yet. Cleanup regressions should hold
 backup, manifest, roster, listing and deletion responses separately, check that
 cached SQL remains runnable, and verify retention before deleting any file.
+Verify metadata through client behavior: anonymous record fields, named
+composite-domain arrays, old/new `RETURNING` names and schema-qualified views
+must work through preparation and execution. Cross-reference index operator
+classes with `pg_opclass` and `pg_opfamily`, including virtual large-value
+indexes. Check index comments both before and after cold recovery and name
+reuse. For concurrent rebuilds, prove replacement publication precedes writer
+waits and cancellation preserves already committed catalog phases.
+Native crashes require thread backtraces; a retry or longer deadline is not a
+repair. Keep the failing selection, parallelism and original capacity limits.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.

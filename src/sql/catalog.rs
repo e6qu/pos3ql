@@ -4087,9 +4087,12 @@ pub(crate) fn builtin_routine_properties(
 }
 
 fn builtin_operator_exact(name: &str, left: Option<i32>, right: Option<i32>) -> Option<i32> {
-    // PostgreSQL tries an unknown literal as the other operand's type before
-    // ranking coercible overloads, which can otherwise tie mixed-width inputs.
+    // PostgreSQL resolves two unknown strings to text when that overload exists;
+    // one unknown first tries the known operand's type before overload ranking.
     let (left, right) = match (left.unwrap_or(0), right.unwrap_or(0)) {
+        (super::types::oid::UNKNOWN, super::types::oid::UNKNOWN) => {
+            (super::types::oid::TEXT, super::types::oid::TEXT)
+        }
         (super::types::oid::UNKNOWN, right) if right != 0 => (right, right),
         (left, super::types::oid::UNKNOWN) if left != 0 => (left, left),
         pair => pair,
@@ -13331,6 +13334,7 @@ pub(crate) fn operator_class_oid_visibility(
             | ACLITEM_HASH_OPERATOR_CLASS_OID
     );
     if builtin
+        || BUILTIN_TREE_HASH_CLASSES.iter().any(|class| class.0 == oid)
         || super::types::HashOperatorClass::from_oid(oid).is_some()
         || super::types::BrinOperatorClass::from_oid(oid).is_some()
         || super::types::GistOperatorClass::from_oid(oid).is_some()
@@ -13389,6 +13393,9 @@ pub(crate) fn operator_family_oid_visibility(
             | 4602..=4615
     );
     if builtin
+        || BUILTIN_TREE_HASH_FAMILIES
+            .iter()
+            .any(|family| family.0 == oid)
         || brin
         || super::gist_catalog::FAMILIES
             .iter()
@@ -25181,6 +25188,168 @@ fn pg_operator<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+// PostgreSQL 18.6 bootstrap metadata; reference query and hashes are retained
+// in tests/external/reference/2026-11-03-input-plans/planner-metadata-reference.zip.
+const BUILTIN_TREE_HASH_CLASSES: &[(i32, i32, &str, i32, i32, bool, i32)] = &[
+    (1978, 403, "int4_ops", 1976, 23, true, 0),
+    (1979, 403, "int2_ops", 1976, 21, true, 0),
+    (1981, 403, "oid_ops", 1989, 26, true, 0),
+    (3122, 403, "date_ops", 434, 1082, true, 0),
+    (3123, 403, "float8_ops", 1970, 701, true, 0),
+    (3124, 403, "int8_ops", 1976, 20, true, 0),
+    (3125, 403, "numeric_ops", 1988, 1700, true, 0),
+    (3126, 403, "text_ops", 1994, 25, true, 0),
+    (3127, 403, "timestamptz_ops", 434, 1184, true, 0),
+    (3128, 403, "timestamp_ops", 434, 1114, true, 0),
+    (4217, 403, "text_pattern_ops", 2095, 25, false, 0),
+    (4218, 403, "varchar_pattern_ops", 2095, 25, false, 0),
+    (4219, 403, "bpchar_pattern_ops", 2097, 1042, false, 0),
+    (10000, 403, "array_ops", 397, 2277, true, 0),
+    (10001, 405, "array_ops", 627, 2277, true, 0),
+    (10002, 403, "bit_ops", 423, 1560, true, 0),
+    (10003, 403, "bool_ops", 424, 16, true, 0),
+    (10004, 403, "bpchar_ops", 426, 1042, true, 0),
+    (10005, 405, "bpchar_ops", 427, 1042, true, 0),
+    (10006, 403, "bytea_ops", 428, 17, true, 0),
+    (10007, 403, "char_ops", 429, 18, true, 0),
+    (10008, 405, "char_ops", 431, 18, true, 0),
+    (10009, 403, "cidr_ops", 1974, 869, false, 0),
+    (10010, 405, "cidr_ops", 1975, 869, false, 0),
+    (10011, 405, "date_ops", 435, 1082, true, 0),
+    (10012, 403, "float4_ops", 1970, 700, true, 0),
+    (10013, 405, "float4_ops", 1971, 700, true, 0),
+    (10014, 405, "float8_ops", 1971, 701, true, 0),
+    (10015, 403, "inet_ops", 1974, 869, true, 0),
+    (10016, 405, "inet_ops", 1975, 869, true, 0),
+    (10019, 405, "int2_ops", 1977, 21, true, 0),
+    (10020, 405, "int4_ops", 1977, 23, true, 0),
+    (10021, 405, "int8_ops", 1977, 20, true, 0),
+    (10022, 403, "interval_ops", 1982, 1186, true, 0),
+    (10023, 405, "interval_ops", 1983, 1186, true, 0),
+    (10024, 403, "macaddr_ops", 1984, 829, true, 0),
+    (10025, 405, "macaddr_ops", 1985, 829, true, 0),
+    (10026, 403, "macaddr8_ops", 3371, 774, true, 0),
+    (10027, 405, "macaddr8_ops", 3372, 774, true, 0),
+    (10028, 403, "name_ops", 1994, 19, true, 2275),
+    (10029, 405, "name_ops", 1995, 19, true, 0),
+    (10030, 405, "numeric_ops", 1998, 1700, true, 0),
+    (10031, 405, "oid_ops", 1990, 26, true, 0),
+    (10032, 403, "oidvector_ops", 1991, 30, true, 0),
+    (10033, 405, "oidvector_ops", 1992, 30, true, 0),
+    (10034, 403, "record_ops", 2994, 2249, true, 0),
+    (10035, 405, "record_ops", 6194, 2249, true, 0),
+    (10036, 403, "record_image_ops", 3194, 2249, false, 0),
+    (10037, 405, "text_ops", 1995, 25, true, 0),
+    (10038, 403, "time_ops", 1996, 1083, true, 0),
+    (10039, 405, "time_ops", 1997, 1083, true, 0),
+    (10040, 405, "timestamptz_ops", 1999, 1184, true, 0),
+    (10041, 403, "timetz_ops", 2000, 1266, true, 0),
+    (10042, 405, "timetz_ops", 2001, 1266, true, 0),
+    (10043, 403, "varbit_ops", 2002, 1562, true, 0),
+    (10044, 403, "varchar_ops", 1994, 25, false, 0),
+    (10045, 405, "varchar_ops", 1995, 25, false, 0),
+    (10046, 405, "timestamp_ops", 2040, 1114, true, 0),
+    (10047, 403, "money_ops", 2099, 790, true, 0),
+    (10048, 405, "bool_ops", 2222, 16, true, 0),
+    (10049, 405, "bytea_ops", 2223, 17, true, 0),
+    (10050, 403, "tid_ops", 2789, 27, true, 0),
+    (10051, 405, "xid_ops", 2225, 28, true, 0),
+    (10052, 405, "xid8_ops", 5032, 5069, true, 0),
+    (10053, 403, "xid8_ops", 5067, 5069, true, 0),
+    (10054, 405, "cid_ops", 2226, 29, true, 0),
+    (10055, 405, "tid_ops", 2227, 27, true, 0),
+    (10056, 405, "text_pattern_ops", 2229, 25, false, 0),
+    (10057, 405, "varchar_pattern_ops", 2229, 25, false, 0),
+    (10058, 405, "bpchar_pattern_ops", 2231, 1042, false, 0),
+    (10059, 405, "aclitem_ops", 2235, 1033, true, 0),
+    (10065, 403, "uuid_ops", 2968, 2950, true, 0),
+    (10066, 405, "uuid_ops", 2969, 2950, true, 0),
+    (10067, 403, "pg_lsn_ops", 3253, 3220, true, 0),
+    (10068, 405, "pg_lsn_ops", 3254, 3220, true, 0),
+    (10069, 403, "enum_ops", 3522, 3500, true, 0),
+    (10070, 405, "enum_ops", 3523, 3500, true, 0),
+    (10071, 403, "tsvector_ops", 3626, 3614, true, 0),
+    (10074, 403, "tsquery_ops", 3683, 3615, true, 0),
+    (10076, 403, "range_ops", 3901, 3831, true, 0),
+    (10077, 405, "range_ops", 3903, 3831, true, 0),
+    (10080, 403, "multirange_ops", 4199, 4537, true, 0),
+    (10081, 405, "multirange_ops", 4225, 4537, true, 0),
+    (10088, 403, "jsonb_ops", 4033, 3802, true, 0),
+    (10089, 405, "jsonb_ops", 4034, 3802, true, 0),
+];
+
+const BUILTIN_TREE_HASH_FAMILIES: &[(i32, i32, &str)] = &[
+    (397, 403, "array_ops"),
+    (423, 403, "bit_ops"),
+    (424, 403, "bool_ops"),
+    (426, 403, "bpchar_ops"),
+    (427, 405, "bpchar_ops"),
+    (428, 403, "bytea_ops"),
+    (429, 403, "char_ops"),
+    (431, 405, "char_ops"),
+    (434, 403, "datetime_ops"),
+    (435, 405, "date_ops"),
+    (627, 405, "array_ops"),
+    (1970, 403, "float_ops"),
+    (1971, 405, "float_ops"),
+    (1974, 403, "network_ops"),
+    (1975, 405, "network_ops"),
+    (1976, 403, "integer_ops"),
+    (1977, 405, "integer_ops"),
+    (1982, 403, "interval_ops"),
+    (1983, 405, "interval_ops"),
+    (1984, 403, "macaddr_ops"),
+    (1985, 405, "macaddr_ops"),
+    (1988, 403, "numeric_ops"),
+    (1989, 403, "oid_ops"),
+    (1990, 405, "oid_ops"),
+    (1991, 403, "oidvector_ops"),
+    (1992, 405, "oidvector_ops"),
+    (1994, 403, "text_ops"),
+    (1995, 405, "text_ops"),
+    (1996, 403, "time_ops"),
+    (1997, 405, "time_ops"),
+    (1998, 405, "numeric_ops"),
+    (1999, 405, "timestamptz_ops"),
+    (2000, 403, "timetz_ops"),
+    (2001, 405, "timetz_ops"),
+    (2002, 403, "varbit_ops"),
+    (2040, 405, "timestamp_ops"),
+    (2095, 403, "text_pattern_ops"),
+    (2097, 403, "bpchar_pattern_ops"),
+    (2099, 403, "money_ops"),
+    (2222, 405, "bool_ops"),
+    (2223, 405, "bytea_ops"),
+    (2225, 405, "xid_ops"),
+    (2226, 405, "cid_ops"),
+    (2227, 405, "tid_ops"),
+    (2229, 405, "text_pattern_ops"),
+    (2231, 405, "bpchar_pattern_ops"),
+    (2235, 405, "aclitem_ops"),
+    (2789, 403, "tid_ops"),
+    (2968, 403, "uuid_ops"),
+    (2969, 405, "uuid_ops"),
+    (2994, 403, "record_ops"),
+    (3194, 403, "record_image_ops"),
+    (3253, 403, "pg_lsn_ops"),
+    (3254, 405, "pg_lsn_ops"),
+    (3371, 403, "macaddr8_ops"),
+    (3372, 405, "macaddr8_ops"),
+    (3522, 403, "enum_ops"),
+    (3523, 405, "enum_ops"),
+    (3626, 403, "tsvector_ops"),
+    (3683, 403, "tsquery_ops"),
+    (3901, 403, "range_ops"),
+    (3903, 405, "range_ops"),
+    (4033, 403, "jsonb_ops"),
+    (4034, 405, "jsonb_ops"),
+    (4199, 403, "multirange_ops"),
+    (4225, 405, "multirange_ops"),
+    (5032, 405, "xid8_ops"),
+    (5067, 403, "xid8_ops"),
+    (6194, 405, "record_ops"),
+];
+
 fn pg_opfamily<'a>(
     storage: &Storage,
     txid: u32,
@@ -25191,175 +25360,13 @@ fn pg_opfamily<'a>(
         arena,
         512 + storage.operator_families_visible_to(txid).count(),
     )?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(403),
-            text("xid8_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(403),
-            text("money_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    for (index, (oid, method, name)) in [
-        (TID_BTREE_OPERATOR_FAMILY_OID, 403, "tid_ops"),
-        (CID_HASH_OPERATOR_FAMILY_OID, 405, "cid_ops"),
-        (TID_HASH_OPERATOR_FAMILY_OID, 405, "tid_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 2] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (BIT_BTREE_OPERATOR_FAMILY_OID, 403, "bit_ops"),
-        (BYTEA_BTREE_OPERATOR_FAMILY_OID, 403, "bytea_ops"),
-        (VARBIT_BTREE_OPERATOR_FAMILY_OID, 403, "varbit_ops"),
-        (BYTEA_HASH_OPERATOR_FAMILY_OID, 405, "bytea_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 5] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (NETWORK_BTREE_OPERATOR_FAMILY_OID, 403, "network_ops"),
-        (NETWORK_HASH_OPERATOR_FAMILY_OID, 405, "network_ops"),
-        (MACADDR_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr_ops"),
-        (MACADDR_HASH_OPERATOR_FAMILY_OID, 405, "macaddr_ops"),
-        (MACADDR8_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr8_ops"),
-        (MACADDR8_HASH_OPERATOR_FAMILY_OID, 405, "macaddr8_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 9] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (RANGE_BTREE_OPERATOR_FAMILY_OID, 403, "range_ops"),
-        (RANGE_HASH_OPERATOR_FAMILY_OID, 405, "range_ops"),
-        (MULTIRANGE_BTREE_OPERATOR_FAMILY_OID, 403, "multirange_ops"),
-        (MULTIRANGE_HASH_OPERATOR_FAMILY_OID, 405, "multirange_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[15 + index] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method)) in [
-        (PG_LSN_BTREE_OPERATOR_FAMILY_OID, 403),
-        (PG_LSN_HASH_OPERATOR_FAMILY_OID, 405),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[19 + index] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text("pg_lsn_ops", arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    rows[21] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(405),
-            text("aclitem_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    let mut count = 22usize;
-    for (oid, name) in [
-        (427, "bpchar_ops"),
-        (431, "char_ops"),
-        (435, "date_ops"),
-        (627, "array_ops"),
-        (1971, "float_ops"),
-        (1977, "integer_ops"),
-        (1983, "interval_ops"),
-        (1990, "oid_ops"),
-        (1992, "oidvector_ops"),
-        (1995, "text_ops"),
-        (1997, "time_ops"),
-        (1998, "numeric_ops"),
-        (1999, "timestamptz_ops"),
-        (2001, "timetz_ops"),
-        (2040, "timestamp_ops"),
-        (2222, "bool_ops"),
-        (2225, "xid_ops"),
-        (2229, "text_pattern_ops"),
-        (2231, "bpchar_pattern_ops"),
-        (2969, "uuid_ops"),
-        (3523, "enum_ops"),
-        (4034, "jsonb_ops"),
-        (5032, "xid8_ops"),
-        (6194, "record_ops"),
-    ] {
+    let mut count = 0usize;
+    for &(oid, method, name) in BUILTIN_TREE_HASH_FAMILIES {
         rows[count] = row(
             &[
                 Datum::Int4(2753),
                 Datum::Int4(oid),
-                Datum::Int4(405),
+                Datum::Int4(method),
                 text(name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
@@ -25512,394 +25519,20 @@ fn pg_opclass<'a>(
         arena,
         512 + storage.operator_classes_visible_to(txid).count(),
     )?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(XID8_BTREE_OPERATOR_CLASS_OID),
-            Datum::Int4(403),
-            text("xid8_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(MONEY_BTREE_OPERATOR_CLASS_OID),
-            Datum::Int4(403),
-            text("money_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    for (index, (oid, method, name, family, input)) in [
-        (
-            TID_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "tid_ops",
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-        ),
-        (
-            CID_HASH_OPERATOR_CLASS_OID,
-            405,
-            "cid_ops",
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-        ),
-        (
-            TID_HASH_OPERATOR_CLASS_OID,
-            405,
-            "tid_ops",
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 2] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input)) in [
-        (
-            BIT_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "bit_ops",
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-        ),
-        (
-            BYTEA_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "bytea_ops",
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-        ),
-        (
-            VARBIT_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "varbit_ops",
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-        ),
-        (
-            BYTEA_HASH_OPERATOR_CLASS_OID,
-            405,
-            "bytea_ops",
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 5] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input, default)) in [
-        (
-            CIDR_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "cidr_ops",
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            false,
-        ),
-        (
-            CIDR_HASH_OPERATOR_CLASS_OID,
-            405,
-            "cidr_ops",
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            false,
-        ),
-        (
-            INET_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "inet_ops",
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            true,
-        ),
-        (
-            INET_HASH_OPERATOR_CLASS_OID,
-            405,
-            "inet_ops",
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            true,
-        ),
-        (
-            MACADDR_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "macaddr_ops",
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            true,
-        ),
-        (
-            MACADDR_HASH_OPERATOR_CLASS_OID,
-            405,
-            "macaddr_ops",
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            true,
-        ),
-        (
-            MACADDR8_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "macaddr8_ops",
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            true,
-        ),
-        (
-            MACADDR8_HASH_OPERATOR_CLASS_OID,
-            405,
-            "macaddr8_ops",
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            true,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 9] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(default),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input)) in [
-        (
-            RANGE_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "range_ops",
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-        ),
-        (
-            RANGE_HASH_OPERATOR_CLASS_OID,
-            405,
-            "range_ops",
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-        ),
-        (
-            MULTIRANGE_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "multirange_ops",
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-        ),
-        (
-            MULTIRANGE_HASH_OPERATOR_CLASS_OID,
-            405,
-            "multirange_ops",
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[17 + index] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, family)) in [
-        (
-            PG_LSN_BTREE_OPERATOR_CLASS_OID,
-            403,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-        ),
-        (
-            PG_LSN_HASH_OPERATOR_CLASS_OID,
-            405,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[21 + index] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text("pg_lsn_ops", arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    rows[23] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_CLASS_OID),
-            Datum::Int4(405),
-            text("aclitem_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    let mut count = 24usize;
-    for (oid, name, family, input, default) in [
-        (10001, "array_ops", 627, super::types::oid::ANYARRAY, true),
-        (10005, "bpchar_ops", 427, super::types::oid::BPCHAR, true),
-        (10008, "char_ops", 431, super::types::oid::CHAR, true),
-        (10011, "date_ops", 435, super::types::oid::DATE, true),
-        (10013, "float4_ops", 1971, super::types::oid::FLOAT4, true),
-        (10014, "float8_ops", 1971, super::types::oid::FLOAT8, true),
-        (10019, "int2_ops", 1977, super::types::oid::INT2, true),
-        (10020, "int4_ops", 1977, super::types::oid::INT4, true),
-        (10021, "int8_ops", 1977, super::types::oid::INT8, true),
-        (
-            10023,
-            "interval_ops",
-            1983,
-            super::types::oid::INTERVAL,
-            true,
-        ),
-        (10029, "name_ops", 1995, super::types::oid::NAME, true),
-        (10030, "numeric_ops", 1998, super::types::oid::NUMERIC, true),
-        (10031, "oid_ops", 1990, super::types::oid::OID, true),
-        (
-            10033,
-            "oidvector_ops",
-            1992,
-            super::types::oid::OIDVECTOR,
-            true,
-        ),
-        (10035, "record_ops", 6194, super::types::oid::RECORD, true),
-        (10037, "text_ops", 1995, super::types::oid::TEXT, true),
-        (10039, "time_ops", 1997, super::types::oid::TIME, true),
-        (
-            10040,
-            "timestamptz_ops",
-            1999,
-            super::types::oid::TIMESTAMPTZ,
-            true,
-        ),
-        (10042, "timetz_ops", 2001, super::types::oid::TIMETZ, true),
-        (10045, "varchar_ops", 1995, super::types::oid::TEXT, false),
-        (
-            10046,
-            "timestamp_ops",
-            2040,
-            super::types::oid::TIMESTAMP,
-            true,
-        ),
-        (10048, "bool_ops", 2222, super::types::oid::BOOL, true),
-        (10051, "xid_ops", 2225, super::types::oid::XID, true),
-        (10052, "xid8_ops", 5032, super::types::oid::XID8, true),
-        (
-            10056,
-            "text_pattern_ops",
-            2229,
-            super::types::oid::TEXT,
-            false,
-        ),
-        (
-            10057,
-            "varchar_pattern_ops",
-            2229,
-            super::types::oid::TEXT,
-            false,
-        ),
-        (
-            10058,
-            "bpchar_pattern_ops",
-            2231,
-            super::types::oid::BPCHAR,
-            false,
-        ),
-        (10066, "uuid_ops", 2969, super::types::oid::UUID, true),
-        (10070, "enum_ops", 3523, super::types::oid::ANYENUM, true),
-        (10089, "jsonb_ops", 4034, super::types::oid::JSONB, true),
-    ] {
+    let mut count = 0usize;
+    for &(oid, method, name, family, input, default, key) in BUILTIN_TREE_HASH_CLASSES {
         rows[count] = row(
             &[
                 Datum::Int4(2616),
                 Datum::Int4(oid),
-                Datum::Int4(405),
+                Datum::Int4(method),
                 text(name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
                 Datum::Int4(family),
                 Datum::Int4(input),
                 Datum::Bool(default),
-                Datum::Int4(0),
+                Datum::Int4(key),
             ],
             arena,
         )?;

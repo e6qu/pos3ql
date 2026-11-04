@@ -69,6 +69,10 @@ Check projections and types before folding constant values. An invalid
 `SELECT *` without a source must win over a later arithmetic error. Invalid `min(boolean)` must
 win over a later division by zero, and a true `CASE` condition must discard
 later conditions. Retain declared SQL `EXECUTE` parameter types, including NULLs.
+Verify that type checking preserves record fields, declared sizes and collations;
+`SELECT (q).f1 FROM (SELECT ROW(7) AS q) AS source` must still return `7`.
+Keep schema-qualified views resolvable and expose `old`/`new` only in the
+statement's `RETURNING` scope, including named aliases in `MERGE`.
 `DISCARD PLANS` must change future preparation without repeating checks in an
 already bound portal or cursor. Verify cache changes across
 schema edits, commit, rollback, search paths and roles against PostgreSQL;
@@ -170,7 +174,10 @@ Rebuilding a table must leave retired indexes untouched. Explicit user-index
 repair and replacement must preserve the distinct flags and ownership rules.
 The current implementation gives the large-value index its own lifetime and
 preserves deferred
-uniqueness while its replacement is detached. Complete the runtime proofs for
+uniqueness while its replacement is detached. Registration must publish replacement
+catalog entries before waiting for existing writers; table-shape normalization
+belongs with the later anchor swap. Comments must follow the selected index
+through name reuse, commit and cold recovery. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.
 Verify one final end hook reads current names and omits an earlier index dropped

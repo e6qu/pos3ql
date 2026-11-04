@@ -27,6 +27,12 @@ struct MetadataOnly<'s, 'v> {
 }
 
 impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.columns
+            .column_meta(qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
         self.row.whole_row_column(table, index)
     }
@@ -1453,7 +1459,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             }
             _ => unreachable!(),
         };
-        let scope = super::dependencies::dml_dependency_scope(
+        let mut scope = super::dependencies::dml_dependency_scope(
             self.storage,
             target,
             alias,
@@ -1578,9 +1584,34 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 .and_then(|conflict| conflict.update_where),
             _ => None,
         };
+        if matches!(statement, Stmt::Insert(_)) && filter.is_some() {
+            scope.set_target_aliases(&["excluded"], arena)?;
+        }
+        let schema = super::materialize::ScopeSchema(&scope);
+        let row = super::Chained {
+            inner: &schema,
+            outer,
+        };
+        let columns = RuntimeColumnTypes {
+            row: &row,
+            catalog: Some(&catalog),
+        };
         if let Some(expression) = filter {
             self.expression(expression, &columns, &row)?;
         }
+        if returning.is_empty() {
+            return Ok(());
+        }
+        scope.set_target_aliases(&[returning.old_name(), returning.new_name()], arena)?;
+        let schema = super::materialize::ScopeSchema(&scope);
+        let row = super::Chained {
+            inner: &schema,
+            outer,
+        };
+        let columns = RuntimeColumnTypes {
+            row: &row,
+            catalog: Some(&catalog),
+        };
         for item in returning.items {
             if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
                 self.expression(expression, &columns, &row)?;

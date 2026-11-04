@@ -2014,8 +2014,9 @@ pub trait ColTypeResolver {
     /// The registered shape handle of a record-typed *column* (a derived
     /// table's `type_mod` carries it), or None when the column is not a
     /// record or has no shape.
-    fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
-        None
+    fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let column = self.column_meta(qualifier, name)?;
+        (column.ctype == ColType::Record && column.type_mod >= 0).then_some(column.type_mod)
     }
 
     /// One field of a named composite already resolved to its catalog slot.
@@ -3603,7 +3604,10 @@ fn record_shape_metadata_dyn(
             let array_type = match &**array {
                 Expr::Column { qualifier, name } => Some(columns.resolve(*qualifier, name)?),
                 Expr::Field { base, field } => Some(record_field_type(base, field, columns)?),
-                _ => coltype_of_oid(infer_type_res(array, columns)?.0),
+                _ => crate::sql::eval::constructor_type_from_oid(
+                    infer_type_res(array, columns)?.0,
+                    &|oid| columns.domain_base_type(oid),
+                ),
             };
             let element = array_type.and_then(|ctype| match ctype {
                 ColType::Array(element) => Some(element.to_coltype()),
@@ -3981,6 +3985,11 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.column_meta(qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -4081,6 +4090,11 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.column_meta(qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,

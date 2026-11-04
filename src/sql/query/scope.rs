@@ -336,7 +336,7 @@ pub struct QueryScope<'d> {
     txid: u32,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
-    returning_aliases: &'d [&'d str],
+    target_aliases: &'d [&'d str],
     pub(crate) defs: QueryDefinitions<'d>,
     pub slots: &'d mut [usize],
     /// Per-source system fields encoded after the visible relation shape.
@@ -396,6 +396,10 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.0.column_type_mod(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -434,6 +438,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        super::ScopeSchema(self.0).column_type_mod(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -491,6 +499,14 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
+    pub(super) fn set_target_aliases(
+        &mut self,
+        names: &[&'d str],
+        arena: &'d Arena,
+    ) -> Result<(), SqlError> {
+        self.target_aliases = arena.alloc_slice_copy(names).map_err(|_| arena_full())?;
+        Ok(())
+    }
     /// Describe correlated RETURNING expressions without adding OLD and NEW
     /// as separate, ambiguous sources of unqualified columns.
     pub(crate) fn for_returning(
@@ -545,7 +561,7 @@ impl<'d> QueryScope<'d> {
         )?;
         scope.slots[0] = usize::MAX;
         scope.n = 1;
-        scope.returning_aliases = arena
+        scope.target_aliases = arena
             .alloc_slice_copy(output_aliases)
             .map_err(|_| arena_full())?;
         Ok(scope)
@@ -625,7 +641,7 @@ impl<'d> QueryScope<'d> {
             txid,
             type_sources: None,
             names,
-            returning_aliases: &[],
+            target_aliases: &[],
             defs: QueryDefinitions {
                 sources: defs,
                 images: storage.table_definition_images(),
@@ -885,7 +901,7 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
-        let definition = super::srf::describe_derived_definition(
+        let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
             exposed,
@@ -894,6 +910,11 @@ impl<'d> QueryScope<'d> {
             arena,
             tref.lateral.then_some(&*self),
         )?;
+        if let Some(slot) = tref.view_access {
+            let view = storage.view(usize::from(slot));
+            definition.schema = view.schema_for(txid);
+            definition.name = view.name_for(txid);
+        }
         self.defs.set_arena(self.n, definition);
         if tref.lateral {
             self.names[self.n] = exposed;
@@ -1081,7 +1102,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let definition = super::srf::describe_derived_definition(
+        let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
             exposed,
@@ -1090,6 +1111,11 @@ impl<'d> QueryScope<'d> {
             arena,
             tref.lateral.then_some(&*self),
         )?;
+        if let Some(slot) = tref.view_access {
+            let view = storage.view(usize::from(slot));
+            definition.schema = view.schema_for(txid);
+            definition.name = view.name_for(txid);
+        }
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, definition);
         self.authorization_roles[self.n] = tref.authorization_role;
@@ -1916,8 +1942,8 @@ impl<'d> QueryScope<'d> {
     /// the exposed name; a composed `schema.table` qualifier (a three-part
     /// reference) matches only an unaliased base table of that schema.
     fn entry_answers_to(&self, t: usize, q: &str) -> bool {
-        if self.n == 1 && self.returning_aliases.contains(&q) {
-            return true;
+        if self.target_aliases.contains(&q) {
+            return t == 0;
         }
         match q.split_once('.') {
             None => self.names[t] == q,

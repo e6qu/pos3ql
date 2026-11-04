@@ -457,6 +457,15 @@ struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
 }
 
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        describe::AliasedDefCols {
+            definition: self.def,
+            alias: self.alias,
+            output_aliases: &[],
+        }
+        .column_type_mod(qualifier, name)
+    }
+
     fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
         if crate::sql::eval::qualifier_answers_target(self.def, self.alias, table) {
             self.def.columns().get(index).copied()
@@ -636,6 +645,16 @@ impl<'v> ReturningLookup<'_, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        let aliases = [self.old_name, self.new_name];
+        describe::AliasedDefCols {
+            definition: self.definition,
+            alias: self.target_alias,
+            output_aliases: &aliases,
+        }
+        .column_type_mod(qualifier, name)
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (self.image(table).is_some()
             || crate::sql::eval::qualifier_answers_target(
@@ -56355,12 +56374,8 @@ fn materialize_reindex_original(
         }
         return Ok(slot);
     }
-    if original.relation_kind() == crate::storage::IndexRelationKind::Table {
-        let (target, current) = storage.select_table_definition(candidate.table, txn.txid);
-        let mut normalized = TableDefBuilder::from_definition(&current);
-        materialize_flag_key_names(&mut normalized)?;
-        stage_table_definition(storage, wal, txn, target, current, normalized)?;
-    }
+    // Registration must publish the replacement before waiting for writers.
+    // Normalize inline keys with the anchor swap, after those waits finish.
     register_reindex_definition(storage, wal, txn, candidate.table, original)
 }
 
@@ -56687,6 +56702,7 @@ pub(super) fn swap_reindex_definitions(
         stage_index_definition(storage, wal, txn, replacement.new_slot, new_definition)?;
         let (target, current) = storage.select_table_definition(replacement.table, txn.txid);
         let mut next = TableDefBuilder::from_definition(&current);
+        materialize_flag_key_names(&mut next)?;
         let mut changed = false;
         if old.relation_kind() == crate::storage::IndexRelationKind::Toast {
             if next
@@ -56714,22 +56730,18 @@ pub(super) fn swap_reindex_definitions(
         }
         stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
         for (name, text) in [(retired_name, None), (original_name, comment)] {
-            if let Some((slot, prior)) = storage.set_comment(
-                crate::storage::CommentClass::Relation,
-                old.schema,
-                name,
-                0,
-                text,
-                txn.txid,
-            )? {
-                txn.record_ddl(
-                    storage,
-                    super::txn::DdlUndo::CommentSet {
-                        slot: slot as u32,
-                        prior,
-                    },
-                )?;
-            }
+            stage_comment(
+                storage,
+                wal,
+                txn,
+                CommentIdentity {
+                    class: crate::storage::CommentClass::Relation,
+                    schema: old.schema,
+                    name,
+                    subid: 0,
+                },
+                text.as_ref().map(|text| text.as_str()),
+            )?;
         }
         storage.prepare_index_definition_enforcers(
             replacement.old_slot,

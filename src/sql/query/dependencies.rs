@@ -2284,6 +2284,11 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.column_meta(qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn lookup(&self, _: Option<&str>, _: &str) -> Result<crate::sql::types::Datum<'a>, SqlError> {
         Err(sql_err!(
             sqlstate::INTERNAL_ERROR,

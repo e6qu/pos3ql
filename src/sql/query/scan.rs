@@ -4182,6 +4182,9 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -4399,6 +4402,15 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.inner.col_type(qualifier, name).is_some() {
+            self.inner.column_type_mod(qualifier, name)
+        } else {
+            self.outer
+                .map_or(-1, |outer| outer.column_type_mod(qualifier, name))
+        }
+    }
+
     fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
         if self.inner.whole_row_type(table).is_some() {
             self.inner.whole_row_column(table, index)
@@ -4422,8 +4434,10 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                     .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
             {
                 match self.outer {
-                    Some(outer) => outer.resolve_column_type(qualifier, name),
-                    None => Err(error),
+                    Some(outer) if !outer.is_empty_scope() => {
+                        outer.resolve_column_type(qualifier, name)
+                    }
+                    _ => Err(error),
                 }
             }
             result => result,

@@ -19,6 +19,12 @@ struct MetadataColumns<'a> {
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for MetadataColumns<'_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.columns
+            .column_meta(qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn lookup(
         &self,
         _qualifier: Option<&str>,
@@ -265,16 +271,8 @@ fn builtin_constant(
                 txid,
                 Some("pg_catalog"),
                 if *case_insensitive { "~~*" } else { "~~" },
-                Some(if left == oid::UNKNOWN {
-                    oid::TEXT
-                } else {
-                    left
-                }),
-                Some(if right == oid::UNKNOWN {
-                    oid::TEXT
-                } else {
-                    right
-                }),
+                Some(left),
+                Some(right),
             )?;
             properties.known && properties.volatility == 0
         }

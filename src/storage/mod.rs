@@ -48890,7 +48890,7 @@ impl Storage {
         if let Some(table) = table {
             self.preview_index_generation(table, admitted)?;
         }
-        let (database, schema, old_name, new_name) = {
+        let (database, schema, new_name) = {
             let mut catalog = self.index_catalog();
             let index = &mut catalog[slot];
             let Some(pending) = index.pending_name else {
@@ -48899,30 +48899,24 @@ impl Storage {
             if pending.txid != txid {
                 return Ok(());
             }
-            let old_name = index.name;
             index.name = pending.name;
             index.pending_name = None;
-            (Some(index.database), index.schema, old_name, pending.name)
+            (Some(index.database), index.schema, pending.name)
         };
         for comment in self.comment_catalog().entries.iter_mut() {
             if comment.used
                 && comment.database == database
                 && comment.class == CommentClass::Relation
-                && (comment.schema == schema && comment.name == old_name
-                    || comment.pending_identity.is_some_and(|pending| {
-                        pending.txid == txid && pending.schema == schema && pending.name == new_name
-                    }))
+                && comment.pending_identity.is_some_and(|pending| {
+                    pending.txid == txid && pending.schema == schema && pending.name == new_name
+                })
             {
-                if let Some(pending) = comment
+                let pending = comment
                     .pending_identity
-                    .filter(|pending| pending.txid == txid)
-                {
-                    comment.schema = pending.schema;
-                    comment.name = pending.name;
-                    comment.pending_identity = None;
-                } else {
-                    comment.name = new_name;
-                }
+                    .take()
+                    .expect("selected comment move");
+                comment.schema = pending.schema;
+                comment.name = pending.name;
             }
         }
         if let Some(table) = table {

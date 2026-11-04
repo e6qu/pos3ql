@@ -329,6 +329,11 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Declared size/precision, or the registered shape of a record column.
+    fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
+        -1
+    }
+
     /// Resolves declared types and scope errors without reading a row value.
     fn resolve_column_type(
         &self,
@@ -747,7 +752,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         Some(crate::sql::exec::StaticTypeMeta {
             type_oid,
             ctype,
-            type_mod: -1,
+            type_mod: self.row.column_type_mod(qualifier, name),
             collation: self.row.collation(qualifier, name),
         })
     }
@@ -951,6 +956,9 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        (**self).column_type_mod(qualifier, name)
+    }
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,

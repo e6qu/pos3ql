@@ -36,6 +36,10 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -379,6 +383,11 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        crate::sql::exec::ColTypeResolver::column_meta(&super::ScopeCols(self.0), qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
     fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
         let entry = self.0.qualified_star_entry(table, index).ok()?;
         match entry {

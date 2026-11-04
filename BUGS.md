@@ -3,35 +3,14 @@
 No known defects are blocked by an external dependency or an intractable problem.
 
 Fix reproducible defects in the PR that finds them, including incidental defects.
-Record an entry here only with its reproducer, observed behavior and the exact
+Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.
 
-[CONTRIBUTING.md](CONTRIBUTING.md) defines the required comparisons, allocation
-checks and failure diagnostics. Repair causes while preserving the original
-capacity limits and legitimate lock waits. Compare SQL values, effects, errors
-and client-message boundaries with actual PostgreSQL; compiler success alone
-does not establish runtime correctness. Recovery tests must exercise their
-declared durable tier before deleting caches.
-Concurrent-index verification must distinguish a cancelled command's committed
-catalog phases from its rolled-back current phase, and check constraint and
-index identities separately. Include ownership and grants after losing local
-caches; a successful rebuild under a maintenance role must not change ownership.
-Name checks must distinguish another transaction's pending index from its pending
-CHECK constraint, matching PostgreSQL's different visibility rules.
-Check predecessor flags and live/dead counts after replacement; command completion
-alone cannot prove that an old index stayed retired.
-Check complete comparison metadata before journaling a constraint-created index.
-Native crashes require thread backtraces; a retry or a longer deadline is not a fix.
-Metadata cleanup must restore its enclosing state on success and error, without
-retaining a registry borrow while cleanup itself needs to update that registry.
-Projection errors must retain their order before constant evaluation, including
-invalid wildcards and missing columns.
-Table-drop undo must restore only indexes dropped by that operation. Verify
-`DROP INDEX; SAVEPOINT s; DROP TABLE; ROLLBACK TO s` and full rollback separately.
-Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
-not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
-and its [owning technical guides](docs/README.md).
+Pending CI, uncollected measurements and reproducible failures being repaired
+belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
+[CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
+current behavior belongs in the [owning guides](docs/README.md).
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

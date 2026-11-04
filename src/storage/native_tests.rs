@@ -5519,6 +5519,7 @@ fn relation_identity_recovery_accepts_only_matching_inline_backing_relations() {
         crate::sql::types::GistOperatorClass::for_type(definition.columns()[1].ctype)
             .map(IndexOperatorClass::Gist);
     let target = storage.table_definition_target(table, 0, &definition);
+    drop(definition);
     crate::mem::guard::forbid_alloc(|| {
         let index = storage
             .create_reindex_index(backing, target, IndexRelationKind::Table, 0)

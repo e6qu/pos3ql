@@ -36,6 +36,7 @@ fn catalog_scan(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } => {
                 constrained(left, column, table, unqualified)
                     || constrained(right, column, table, unqualified)
@@ -44,6 +45,7 @@ fn catalog_scan(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } => {
                 let matches = |key: &Expr<'_>, value: &Expr<'_>| {
                     let Expr::Column { qualifier, name } = key else {
@@ -95,6 +97,14 @@ fn validate_table_sample<'a>(
     let Some(sample) = table.sample else {
         return Ok(());
     };
+    let columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     for expression in [Some(sample.percentage), sample.repeatable]
         .into_iter()
         .flatten()
@@ -124,7 +134,7 @@ fn validate_table_sample<'a>(
             });
         }
         let mut aggregates = ArenaList::new(arena);
-        collect_aggs(expression, &mut aggregates, storage, txid)?;
+        collect_aggs(expression, &mut aggregates, storage, txid, &columns)?;
         if !aggregates.is_empty() {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -132,7 +142,7 @@ fn validate_table_sample<'a>(
             ));
         }
         let mut windows = ArenaList::new(arena);
-        collect_windows(expression, &mut windows, storage, txid)?;
+        collect_windows(expression, &mut windows, storage, txid, &columns)?;
         if !windows.is_empty() {
             return Err(sql_err!(
                 sqlstate::WINDOWING_ERROR,
@@ -326,7 +336,7 @@ pub struct QueryScope<'d> {
     txid: u32,
     type_sources: Option<crate::storage::StatementFileLease>,
     pub names: &'d mut [&'d str],
-    returning_aliases: &'d [&'d str],
+    target_aliases: &'d [&'d str],
     pub(crate) defs: QueryDefinitions<'d>,
     pub slots: &'d mut [usize],
     /// Per-source system fields encoded after the visible relation shape.
@@ -386,6 +396,22 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.0.column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.lookup(qualifier, name).map(|_| Datum::Null)
     }
@@ -405,9 +431,29 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.whole_row_type(table)
+    }
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        super::ScopeSchema(self.0).column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        super::ScopeSchema(self.0).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.0.find_column(qualifier, name)?;
         Ok(Datum::Null)
@@ -445,9 +491,22 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.func_scalar_type(table).is_some()
     }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.qualified_star_columns(table).ok()?;
+        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
+    }
 }
 
 impl<'d> QueryScope<'d> {
+    pub(super) fn set_target_aliases(
+        &mut self,
+        names: &[&'d str],
+        arena: &'d Arena,
+    ) -> Result<(), SqlError> {
+        self.target_aliases = arena.alloc_slice_copy(names).map_err(|_| arena_full())?;
+        Ok(())
+    }
     /// Describe correlated RETURNING expressions without adding OLD and NEW
     /// as separate, ambiguous sources of unqualified columns.
     pub(crate) fn for_returning(
@@ -474,6 +533,7 @@ impl<'d> QueryScope<'d> {
                     func_args: None,
                     func_argument_names: &[],
                     func_variadic: false,
+                    func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     rows_from: None,
                     col_alias: None,
                     inheritance: crate::sql::ast::RelationInheritance::Only,
@@ -501,7 +561,7 @@ impl<'d> QueryScope<'d> {
         )?;
         scope.slots[0] = usize::MAX;
         scope.n = 1;
-        scope.returning_aliases = arena
+        scope.target_aliases = arena
             .alloc_slice_copy(output_aliases)
             .map_err(|_| arena_full())?;
         Ok(scope)
@@ -513,7 +573,24 @@ impl<'d> QueryScope<'d> {
         arena: &'d Arena,
         from: &FromClause<'d>,
     ) -> Result<Self, SqlError> {
-        let table_count = from.joins.len() + 1;
+        Self::empty_sources(storage, txid, arena, from.joins.len() + 1, from.joins.len())
+    }
+
+    pub(super) fn singleton(
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+    ) -> Result<Self, SqlError> {
+        Self::empty_sources(storage, txid, arena, 0, 0)
+    }
+
+    fn empty_sources(
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+        table_count: usize,
+        join_count: usize,
+    ) -> Result<Self, SqlError> {
         let names = arena
             .alloc_slice_with(table_count, |_| "")
             .map_err(|_| arena_full())?;
@@ -555,16 +632,16 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(0, |_| ResolvedColumn::Table(0, 0))
             .map_err(|_| arena_full())?;
         let join_on = arena
-            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         let using_aliases = arena
-            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .alloc_slice_with(join_count.max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
             txid,
             type_sources: None,
             names,
-            returning_aliases: &[],
+            target_aliases: &[],
             defs: QueryDefinitions {
                 sources: defs,
                 images: storage.table_definition_images(),
@@ -806,7 +883,7 @@ impl<'d> QueryScope<'d> {
                 }
                 let source = self.n;
                 self.add(storage, tref, txid, arena)?;
-                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena)?;
+                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena, sequences)?;
                 self.derived[source] = Some(rows);
                 return Ok(());
             }
@@ -824,7 +901,7 @@ impl<'d> QueryScope<'d> {
         // (a body may project an outer column); a plain derived table is typed
         // on its own. Its rows are materialized per outer row by the scan, so
         // register an empty placeholder here rather than running it now.
-        let definition = super::srf::describe_derived_definition(
+        let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
             exposed,
@@ -833,6 +910,11 @@ impl<'d> QueryScope<'d> {
             arena,
             tref.lateral.then_some(&*self),
         )?;
+        if let Some(slot) = tref.view_access {
+            let view = storage.view(usize::from(slot));
+            definition.schema = view.schema_for(txid);
+            definition.name = view.name_for(txid);
+        }
         self.defs.set_arena(self.n, definition);
         if tref.lateral {
             self.names[self.n] = exposed;
@@ -1020,7 +1102,7 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let definition = super::srf::describe_derived_definition(
+        let mut definition = super::srf::describe_derived_definition(
             storage,
             sub,
             exposed,
@@ -1029,8 +1111,15 @@ impl<'d> QueryScope<'d> {
             arena,
             tref.lateral.then_some(&*self),
         )?;
+        if let Some(slot) = tref.view_access {
+            let view = storage.view(usize::from(slot));
+            definition.schema = view.schema_for(txid);
+            definition.name = view.name_for(txid);
+        }
         self.names[self.n] = exposed;
         self.defs.set_arena(self.n, definition);
+        self.authorization_roles[self.n] = tref.authorization_role;
+        self.view_accesses[self.n] = tref.view_access;
         // No rows: this scope is never scanned, only described. An empty row
         // set keeps a stray scan safe rather than reading a physical slot.
         self.derived[self.n] = Some(&[]);
@@ -1056,10 +1145,27 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        let namespace = storage
+            .path()
+            .catalog_namespace(tref.schema, tref.table)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "catalog relation \"{}\" has no selected namespace",
+                    tref.table
+                )
+            })?;
         let synth = if materialize {
-            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, scan, arena)?
+            crate::sql::catalog::synthesize(
+                storage,
+                Some(namespace),
+                tref.table,
+                txid,
+                scan,
+                arena,
+            )?
         } else {
-            crate::sql::catalog::synthesize_definition(tref.schema, tref.table, arena)?
+            crate::sql::catalog::synthesize_definition(Some(namespace), tref.table, arena)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
@@ -1285,7 +1391,11 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let subqueries = super::ProceduralSubqueries { storage, txid };
         let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            subquery_executor: Some(&subqueries),
             sequences,
             ..crate::sql::eval::NO_HOOKS
         };
@@ -1615,6 +1725,7 @@ impl<'d> QueryScope<'d> {
                         .map_err(|_| arena_full())?;
                     let eq = arena
                         .alloc(Expr::Binary {
+                            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                             operator: BinaryOp::Eq,
                             left: left_ref,
                             right: right_ref,
@@ -1624,6 +1735,7 @@ impl<'d> QueryScope<'d> {
                         None => eq,
                         Some(prev) => arena
                             .alloc(Expr::Binary {
+                                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                                 operator: BinaryOp::And,
                                 left: prev,
                                 right: eq,
@@ -1780,8 +1892,10 @@ impl<'d> QueryScope<'d> {
                 }
                 Ok(&*arena
                     .alloc(Expr::Call {
+                        kind: crate::sql::ast::CallKind::SqlSyntax,
                         bound_oid: None,
                         bound_strict: None,
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                         name: "coalesce",
                         args,
                         argument_names: &[],
@@ -1828,8 +1942,8 @@ impl<'d> QueryScope<'d> {
     /// the exposed name; a composed `schema.table` qualifier (a three-part
     /// reference) matches only an unaliased base table of that schema.
     fn entry_answers_to(&self, t: usize, q: &str) -> bool {
-        if self.n == 1 && self.returning_aliases.contains(&q) {
-            return true;
+        if self.target_aliases.contains(&q) {
+            return t == 0;
         }
         match q.split_once('.') {
             None => self.names[t] == q,
@@ -2185,6 +2299,7 @@ mod tests {
                     definition("pending", 1),
                     &[None; MAX_COLUMNS],
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             let pending = storage.table_definition_images();
@@ -2200,6 +2315,7 @@ mod tests {
                     definition("published", 1),
                     &[None; MAX_COLUMNS],
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             storage
@@ -2434,6 +2550,7 @@ mod tests {
                 definition("source", 2),
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         let mut arena_budget = Budget::new(1 << 17);

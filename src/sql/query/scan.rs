@@ -200,8 +200,22 @@ pub(crate) fn plan_row_security<'a>(
         match expression {
             Some(source) => {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
-                let expression = crate::sql::parser::parse_expr(source, arena)?;
                 let dependencies = storage.snapshot_policy_dependencies(slot, txid, arena)?;
+                let section = if matches!(expression_kind, RowSecurityExpression::Using)
+                    || policy_definition.with_check.is_none()
+                {
+                    crate::storage::StoredInputSection::PolicyUsing
+                } else {
+                    crate::storage::StoredInputSection::PolicyCheck
+                };
+                let expression = super::parse_stored_expression(
+                    source,
+                    section,
+                    storage,
+                    txid,
+                    dependencies.view(),
+                    arena,
+                )?;
                 predicates[count] = PolicyPredicate {
                     expression: super::cte::expand_stored_expression(
                         expression,
@@ -342,12 +356,12 @@ pub(crate) fn row_security_passes<'a>(
 }
 
 impl<'a> ColumnLookup<'a> for NoColumns {
-    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_COLUMN,
-            "column \"{}\" does not exist",
-            name
-        ))
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(crate::sql::eval::empty_scope_column_error(qualifier, name))
     }
 }
 
@@ -441,6 +455,120 @@ mod tests {
     use super::{PaxColumnDemand, PaxReadDemand, SampleIdentity, TableSamplePlan};
     use crate::sql::ast::{BinaryOp, TableSampleMethod};
     use crate::sql::types::GistOperatorClass;
+
+    #[test]
+    fn chained_scope_is_empty_only_when_every_source_is_proven_empty() {
+        use crate::sql::eval::{ColumnLookup, NoColumns, SqlError};
+        use crate::sql::types::Datum;
+        struct Unknown;
+        impl<'a> ColumnLookup<'a> for Unknown {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("scope classification must not read values");
+            }
+        }
+        let empty = NoColumns;
+        let unknown = Unknown;
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(
+                super::Chained {
+                    inner: &empty,
+                    outer: None
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                super::Chained {
+                    inner: &empty,
+                    outer: Some(&empty)
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                !super::Chained {
+                    inner: &empty,
+                    outer: Some(&unknown)
+                }
+                .is_empty_scope()
+            );
+            assert!(
+                !super::Chained {
+                    inner: &unknown,
+                    outer: Some(&empty)
+                }
+                .is_empty_scope()
+            );
+        });
+    }
+
+    #[test]
+    fn chained_qualified_columns_keep_the_innermost_alias_owner() {
+        use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
+        use crate::sql::types::{ColType, Datum};
+        struct Scope(bool);
+        impl<'a> ColumnLookup<'a> for Scope {
+            fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+                if self.col_type(qualifier, name).is_some() {
+                    Ok(Datum::Int4(7))
+                } else {
+                    Err(crate::sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column selected.value does not exist"
+                    ))
+                }
+            }
+            fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+                (self.0 && qualifier == Some("selected") && name == "value")
+                    .then_some(ColType::Int4)
+            }
+            fn whole_row_type(&self, table: &str) -> Option<ColType> {
+                (table == "selected").then_some(ColType::Record)
+            }
+        }
+        struct Hidden;
+        impl<'a> ColumnLookup<'a> for Hidden {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("column typing must not read values");
+            }
+            fn resolve_column_type(&self, _: Option<&str>, _: &str) -> Result<ColType, SqlError> {
+                Err(crate::sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"source\""
+                ))
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let inner = Scope(false);
+            let outer = Scope(true);
+            let row = super::Chained {
+                inner: &inner,
+                outer: Some(&outer),
+            };
+            assert!(row.col_type(Some("selected"), "value").is_none());
+            assert_eq!(
+                row.resolve_column_type(Some("selected"), "value")
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::UNDEFINED_COLUMN
+            );
+            assert_eq!(
+                row.lookup(Some("selected"), "value").unwrap_err().sqlstate,
+                sqlstate::UNDEFINED_COLUMN
+            );
+            let empty = crate::sql::eval::NoColumns;
+            let hidden = Hidden;
+            let row = super::Chained {
+                inner: &empty,
+                outer: Some(&hidden),
+            };
+            assert_eq!(
+                row.resolve_column_type(Some("reference_scope.source"), "value")
+                    .unwrap_err()
+                    .message
+                    .as_str(),
+                "invalid reference to FROM-clause entry for table \"source\""
+            );
+        });
+    }
 
     #[test]
     fn gist_operator_matrix_matches_postgresql_18_search_strategies() {
@@ -594,7 +722,7 @@ struct IndexKeyCandidate {
 
 pub(crate) struct IndexedCandidates<'a> {
     table: usize,
-    index_oid: i32,
+    statistics: crate::storage::IndexStatisticsCapture<'a>,
     scan_executed: bool,
     index_entries: usize,
     preserves_order: bool,
@@ -610,8 +738,8 @@ pub(crate) struct IndexedCandidates<'a> {
 }
 
 impl<'a> IndexedCandidates<'a> {
-    pub(crate) const fn index_oid(&self) -> i32 {
-        self.index_oid
+    pub(crate) fn statistics(&self) -> &crate::storage::IndexStatisticsCapture<'a> {
+        &self.statistics
     }
 
     pub(crate) const fn scan_executed(&self) -> bool {
@@ -1100,13 +1228,17 @@ impl IndexAccessPlan<'_> {
             let Some(constraint) = self.constraints[position] else {
                 continue;
             };
+            let column_statistics = definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute));
             if self.expression_mask & (1 << position) == 0
                 && statistics.valid
-                && statistics.columns[column].valid
+                && let Some(column_statistics) = column_statistics
             {
                 let distinct = crate::storage::column_distinct_estimate(
                     &definition.columns[column],
-                    statistics.columns[column],
+                    column_statistics,
                     statistics.rows,
                     false,
                 );
@@ -1400,6 +1532,7 @@ where
         operator: BinaryOp::TextSearchPhrase,
         left,
         right,
+        ..
     } = target
     else {
         return None;
@@ -1448,6 +1581,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = expression
     {
         collect_index_constraints(left, resolve_column, operand_is_invariant, constraints);
@@ -1458,6 +1592,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         operator,
         left,
         right,
+        ..
     } = expression
     else {
         return;
@@ -1529,10 +1664,12 @@ where
             Expr::Unary {
                 operator: left_op,
                 operand: left,
+                ..
             },
             Expr::Unary {
                 operator: right_op,
                 operand: right,
+                ..
             },
         ) => {
             left_op == right_op
@@ -1543,11 +1680,13 @@ where
                 operator: left_op,
                 left: left_lhs,
                 right: left_rhs,
+                ..
             },
             Expr::Binary {
                 operator: right_op,
                 left: right_lhs,
                 right: right_rhs,
+                ..
             },
         ) => {
             left_op == right_op
@@ -1600,6 +1739,7 @@ where
         }
         (
             Expr::Call {
+                kind: left_kind,
                 name: left_name,
                 bound_oid: left_bound_oid,
                 bound_strict: left_bound_strict,
@@ -1611,8 +1751,10 @@ where
                 order_by: left_order,
                 over: left_over,
                 filter: left_filter,
+                ..
             },
             Expr::Call {
+                kind: right_kind,
                 name: right_name,
                 bound_oid: right_bound_oid,
                 bound_strict: right_bound_strict,
@@ -1624,9 +1766,11 @@ where
                 order_by: right_order,
                 over: right_over,
                 filter: right_filter,
+                ..
             },
         ) => {
-            left_name.eq_ignore_ascii_case(right_name)
+            left_kind == right_kind
+                && left_name.eq_ignore_ascii_case(right_name)
                 && left_bound_oid == right_bound_oid
                 && left_bound_strict == right_bound_strict
                 && left_argument_names == right_argument_names
@@ -1671,6 +1815,7 @@ where
         operator: BinaryOp::Eq,
         left,
         right,
+        ..
     } = query
     {
         if matches!(**right, Expr::Bool(true))
@@ -1683,6 +1828,7 @@ where
         if let Expr::Unary {
             operator: crate::sql::ast::UnaryOp::Not,
             operand,
+            ..
         } = required
             && (matches!(**right, Expr::Bool(false))
                 && index_expression_matches(operand, left, definition, resolve_candidate)
@@ -1700,6 +1846,7 @@ where
             operator: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
             left,
             right,
+            ..
         } = query
     {
         return index_expression_matches(operand, left, definition, resolve_candidate)
@@ -1710,11 +1857,13 @@ where
             operator: required_op,
             left: required_lhs,
             right: required_rhs,
+            ..
         },
         Expr::Binary {
             operator: query_op,
             left: query_lhs,
             right: query_rhs,
+            ..
         },
     ) = (required, query)
     else {
@@ -1758,6 +1907,7 @@ where
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = query
     {
         any_conjunct_implies(left, required, definition, resolve_candidate)
@@ -1780,6 +1930,7 @@ where
         operator: BinaryOp::And,
         left,
         right,
+        ..
     } = required
     {
         return predicate_is_implied(left, queries, definition, resolve_candidate)
@@ -1928,6 +2079,9 @@ where
 {
     let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
     for index in storage.indexes_for(definition.schema.as_str(), definition.name.as_str(), txid) {
+        if !index.mutable_for(txid).kind.valid() {
+            continue;
+        }
         let Some(binding) = storage.value_binding_for_index(slot, index.created_at) else {
             continue;
         };
@@ -2716,6 +2870,7 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_) => true,
         Expr::Unary { operand, .. }
@@ -3043,10 +3198,11 @@ fn ranked_knn_candidates<'a>(
     if !storage.value_binding_durable_complete(slot, plan.binding) {
         return Ok(None);
     }
+    let statistics = storage.capture_index_statistics(txid, slot, ordered.index_oid)?;
     if window == 0 {
         return Ok(Some(IndexedCandidates {
             table,
-            index_oid: ordered.index_oid,
+            statistics,
             scan_executed: false,
             index_entries: 0,
             preserves_order: true,
@@ -3230,7 +3386,7 @@ fn ranked_knn_candidates<'a>(
     debug_assert_eq!(entry_at, entry_bytes);
     Ok(Some(IndexedCandidates {
         table,
-        index_oid: ordered.index_oid,
+        statistics,
         scan_executed: true,
         index_entries: scanned,
         preserves_order: true,
@@ -3262,6 +3418,7 @@ fn indexed_candidates_for_plan<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
+    let statistics = storage.capture_index_statistics(txid, slot, index_oid)?;
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
         && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
@@ -3312,7 +3469,7 @@ fn indexed_candidates_for_plan<'a>(
             if raw.is_null() {
                 return Ok(Some(IndexedCandidates {
                     table,
-                    index_oid,
+                    statistics,
                     scan_executed: false,
                     index_entries: 0,
                     preserves_order: ordered_plan.is_some(),
@@ -3858,7 +4015,7 @@ fn indexed_candidates_for_plan<'a>(
     }
     Ok(Some(IndexedCandidates {
         table,
-        index_oid,
+        statistics,
         scan_executed: true,
         index_entries: count,
         preserves_order: ordered_plan.is_some(),
@@ -4025,6 +4182,24 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        super::ScopeSchema(self.scope).whole_row_column(table, index)
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.scope.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         let one = |t: usize, c: usize| match self.table_values(t) {
             // Empty slice = LEFT-join null row.
@@ -4114,6 +4289,15 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.scope.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        self.scope.qualified_star_columns(table).ok()?;
+        Some(
+            self.scope
+                .func_scalar_type(table)
+                .unwrap_or(crate::sql::types::ColType::Record),
+        )
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -4221,6 +4405,52 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.inner.col_type(qualifier, name).is_some() {
+            self.inner.column_type_mod(qualifier, name)
+        } else {
+            self.outer
+                .map_or(-1, |outer| outer.column_type_mod(qualifier, name))
+        }
+    }
+
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        if self.inner.whole_row_type(table).is_some() {
+            self.inner.whole_row_column(table, index)
+        } else {
+            self.outer
+                .and_then(|outer| outer.whole_row_column(table, index))
+        }
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        match self.inner.resolve_column_type(qualifier, name) {
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !qualifier
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                match self.outer {
+                    Some(outer) if !outer.is_empty_scope() => {
+                        outer.resolve_column_type(qualifier, name)
+                    }
+                    _ => Err(error),
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.inner.is_empty_scope() && self.outer.is_none_or(|outer| outer.is_empty_scope())
+    }
+
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
         match self.inner.recursive_state(qualifier, index) {
             Ok(value) => Ok(value),
@@ -4272,6 +4502,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         match self.inner.lookup(q, name) {
             Ok(v) => Ok(v),
+            Err(e)
+                if !matches!(
+                    e.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) =>
+            {
+                Err(e)
+            }
+            Err(e) if q.is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) => {
+                Err(e)
+            }
             Err(e) => match self.outer {
                 Some(o) => o.lookup(q, name),
                 None => Err(e),
@@ -4279,29 +4520,44 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
     fn col_type(&self, q: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.inner
-            .col_type(q, name)
-            .or_else(|| self.outer.and_then(|o| o.col_type(q, name)))
+        self.resolve_column_type(q, name).ok()
     }
     fn column_user_type(
         &self,
         q: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if self.inner.col_type(q, name).is_some() {
-            self.inner.column_user_type(q, name)
-        } else {
-            self.outer.and_then(|outer| outer.column_user_type(q, name))
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.column_user_type(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer.and_then(|outer| outer.column_user_type(q, name))
+            }
+            Err(_) => None,
         }
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if self.inner.col_type(q, name).is_some() {
-            self.inner.collation(q, name)
-        } else {
-            self.outer
-                .map(|outer| outer.collation(q, name))
-                .unwrap_or(crate::sql::ast::Collation::None)
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.collation(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer
+                    .map_or(crate::sql::ast::Collation::None, |outer| {
+                        outer.collation(q, name)
+                    })
+            }
+            Err(_) => crate::sql::ast::Collation::None,
         }
     }
 
@@ -4324,6 +4580,12 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.inner.whole_row_is_scalar(table)
             || self.outer.is_some_and(|o| o.whole_row_is_scalar(table))
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<crate::sql::types::ColType> {
+        self.inner
+            .whole_row_type(table)
+            .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
     }
 }
 
@@ -4474,11 +4736,22 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             .expect("lateral function run has a block store");
     }
 
+    let qualified_name;
+    let written_name = if let Some(schema) = tref.schema {
+        qualified_name = crate::stack_format!(128, "{}.{}", schema, tref.table);
+        arena
+            .alloc_str(qualified_name.as_str())
+            .map_err(|_| arena_full())?
+    } else {
+        tref.table
+    };
     let call = arena
         .alloc(Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
             bound_oid: None,
             bound_strict: None,
-            name: tref.table,
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+            name: written_name,
             args: arguments,
             argument_names: tref.func_argument_names,
             variadic: tref.func_variadic,
@@ -4489,46 +4762,59 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             filter: None,
         })
         .map_err(|_| arena_full())?;
-    super::srf::with_bound_srf_inputs(call, arena, params, outer, &hooks, |bound, inputs| {
-        let count = super::srf::srf_count(bound, arena, inputs, outer, &hooks)?;
-        for index in 1..=count {
-            let mark = arena.mark();
-            let row_hooks = EvalHooks {
-                srf_index: Some(index),
-                ..hooks
-            };
-            let value = eval_full(bound, arena, inputs, outer, &row_hooks)?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            match (base_width, value) {
-                (1, value) => values[0] = value,
-                (_, Datum::Record(fields)) if fields.len() == base_width => {
-                    for (column, field) in fields.iter().enumerate() {
-                        values[column] = field.value;
+    super::srf::with_bound_srf_inputs(
+        &catalog,
+        call,
+        arena,
+        params,
+        outer,
+        &hooks,
+        |bound, inputs| {
+            let count = super::srf::srf_count(&catalog, bound, arena, inputs, outer, &hooks)?;
+            for index in 1..=count {
+                let mark = arena.mark();
+                let row_hooks = EvalHooks {
+                    srf_index: Some(index),
+                    ..hooks
+                };
+                let value = eval_full(bound, arena, inputs, outer, &row_hooks)?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                match (base_width, value) {
+                    (1, value) => values[0] = value,
+                    (_, Datum::Record(fields)) if fields.len() == base_width => {
+                        for (column, field) in fields.iter().enumerate() {
+                            values[column] = field.value;
+                        }
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "set-returning function row width does not match its definition"
+                        ));
                     }
                 }
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "set-returning function row width does not match its definition"
-                    ));
+                if tref.with_ordinality {
+                    values[base_width] = Datum::Int8(index as i64);
                 }
-            }
-            if tref.with_ordinality {
-                values[base_width] = Datum::Int8(index as i64);
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(
+                            blocks,
+                            width,
+                            |column| values[column],
+                            &mut compare,
+                        )
+                    })
+                    .expect("lateral function run has a block store")?;
+                // SAFETY: the evaluated SRF row was encoded into the immutable run;
+                // no datum allocated after this mark is retained.
+                unsafe { arena.rewind_to(mark) };
             }
             storage
-                .with_block_store(|blocks| {
-                    sorter.push_projected_by(blocks, width, |column| values[column], &mut compare)
-                })
-                .expect("lateral function run has a block store")?;
-            // SAFETY: the evaluated SRF row was encoded into the immutable run;
-            // no datum allocated after this mark is retained.
-            unsafe { arena.rewind_to(mark) };
-        }
-        storage
-            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
-            .expect("lateral function run has a block store")
-    })
+                .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+                .expect("lateral function run has a block store")
+        },
+    )
 }
 
 enum LateralRows<'a> {
@@ -4548,11 +4834,56 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     outer: &C,
     base_hooks: &EvalHooks<'_, 'a>,
 ) -> Result<LateralRows<'a>, SqlError> {
-    let external_function = tref.func_args.is_some()
-        && super::srf::is_srf_name(tref.table)
-        && !tref.table.eq_ignore_ascii_case("pg_options_to_table")
-        && !tref.table.eq_ignore_ascii_case("pg_get_sequence_data")
-        && !tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
+    let external_function = if tref.func_args.is_some() && !super::srf::sql_table_constructor(tref)
+    {
+        let (selection, _) = super::srf::select_table_func_routine(
+            tref,
+            storage,
+            txid,
+            arena,
+            outer,
+            Some(base_hooks),
+        )?;
+        match selection {
+            crate::storage::RoutineCallSelection::Builtin { schema, .. } => {
+                let qualified = crate::stack_format!(128, "{}.{}", schema, tref.table);
+                if qualified.is_truncated() {
+                    return Err(arena_full());
+                }
+                super::srf::is_srf_name(qualified.as_str())
+                    && !matches!(
+                        tref.table,
+                        "pg_options_to_table"
+                            | "pg_get_sequence_data"
+                            | "pg_get_publication_tables"
+                    )
+            }
+            crate::storage::RoutineCallSelection::Stored(_) => false,
+            crate::storage::RoutineCallSelection::Ambiguous => {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function {}(...) is not unique",
+                    tref.table
+                ));
+            }
+            crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is not a function",
+                    tref.table
+                ));
+            }
+            crate::storage::RoutineCallSelection::Absent => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}(...) does not exist",
+                    tref.table
+                ));
+            }
+        }
+    } else {
+        false
+    };
     if !storage.spill_attached() || (tref.subquery.is_none() && !external_function) {
         return Ok(LateralRows::Local(materialize_lateral(
             storage, txid, tref, arena, params, outer, base_hooks,
@@ -5007,6 +5338,7 @@ fn hash_join_keys<'a>(
             operator: BinaryOp::Eq,
             left,
             right,
+            ..
         } = c
         else {
             continue;
@@ -5512,6 +5844,7 @@ fn scan_source_mode<'a>(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } = expression
             {
                 collect(
@@ -5525,6 +5858,7 @@ fn scan_source_mode<'a>(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } = expression
             else {
                 return Ok(());
@@ -5535,7 +5869,7 @@ fn scan_source_mode<'a>(
                 let Expr::Column { qualifier, name } = column else {
                     return Ok(false);
                 };
-                if !constant.is_constant() || constant.contains_call() {
+                if !constant.is_constant(false) || constant.contains_call() {
                     return Ok(false);
                 }
                 let Ok(ResolvedColumn::Table(table, index)) = scope.find_column(*qualifier, name)
@@ -5552,6 +5886,7 @@ fn scan_source_mode<'a>(
                     storage,
                     txid,
                     arena,
+                    hooks.sequences,
                 )?;
                 known[index] = true;
                 Ok(true)
@@ -6750,7 +7085,7 @@ fn scan_source_mode<'a>(
                     storage.record_relation_scan(
                         txid,
                         slot,
-                        Some(access.index_oid),
+                        Some(access.statistics()),
                         access.index_entries,
                         crate::sql::datetime::now_micros(),
                     )?;
@@ -6763,7 +7098,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(index, BoundRow::Encoded(bytes), Some(rowid))
@@ -6891,7 +7226,7 @@ fn scan_source_mode<'a>(
                 storage.record_relation_scan(
                     txid,
                     slot,
-                    access.map(|access| access.index_oid),
+                    access.map(|access| access.statistics()),
                     access.map_or(0, |access| access.index_entries),
                     crate::sql::datetime::now_micros(),
                 )?;
@@ -6981,7 +7316,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         continue;
                     };
-                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    storage.record_relation_tuple_read(txid, slot, Some(access.statistics()))?;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                         let bytes = storage.row_bytes(slot, rowid, home, arena)?;
                         visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
@@ -7036,7 +7371,7 @@ fn scan_source_mode<'a>(
                 storage.record_relation_tuple_read(
                     txid,
                     slot,
-                    access.map(|access| access.index_oid),
+                    access.map(|access| access.statistics()),
                 )?;
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;

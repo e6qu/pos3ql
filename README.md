@@ -87,6 +87,9 @@ row_work_leases = 128
 definition_image_slots = 256
 table_metadata_bytes = 64MiB
 table_metadata_leases = 8192
+statistics_bytes = 1MiB
+statistics_leases = 1024
+index_statistics_slots = 4096
 ```
 
 These explicit settings bound resident rows, foreground row workspace, retained
@@ -95,6 +98,11 @@ schema identities and actual table/index metadata for the whole instance.
 its occupied ranges. Readers share immutable schema owners. A busy table can use
 available capacity; empty tables receive no private maximum-width schema or row
 allowance.
+`statistics_bytes` and `statistics_leases` bound shared analyzed-column images.
+`index_statistics_slots` bounds index activity counters, including counters
+still held by readers after an index is dropped. Empty tables have no private
+maximum-width statistics or sequence-counter arrays; SQL generators share the
+fixed sequence catalog.
 Large objects retain their separate `large_object_pages` reservation. The
 [architecture](docs/architecture.md#memory-and-physical-size) explains the
 remaining per-table costs and the limits of this work.

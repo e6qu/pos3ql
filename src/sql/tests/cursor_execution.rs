@@ -1,6 +1,279 @@
 use super::*;
 
 #[test]
+fn literal_values_cursors_defer_projections_and_preserve_source_positions() {
+    let config = test_config("literal-values-cursor-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE literal_effects START 10; \
+         CREATE FUNCTION literal_value(value integer) RETURNS bigint LANGUAGE sql VOLATILE \
+         SET search_path=public AS $$SELECT nextval('literal_effects')+$1$$; BEGIN; \
+         DECLARE literal_cursor NO SCROLL CURSOR FOR \
+         SELECT literal_value(id) FROM (VALUES(1),(2),(3)) source(id)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM literal_effects; FETCH 0 FROM literal_cursor; \
+         SELECT last_value,is_called FROM literal_effects",
+            true
+        )),
+        ["10|f", "10|f"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "FETCH 1 FROM literal_cursor; FETCH 1 FROM literal_cursor; FETCH ALL FROM literal_cursor; \
+         FETCH 1 FROM literal_cursor; SELECT last_value FROM literal_effects; \
+         CLOSE literal_cursor; COMMIT", true)), ["11", "13", "15", "12"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; DECLARE literal_held NO SCROLL CURSOR WITH HOLD FOR \
+         SELECT literal_value(id) FROM (VALUES(7),(8)) source(id); \
+         SELECT last_value FROM literal_effects; COMMIT; FETCH ALL FROM literal_held; \
+         SELECT last_value FROM literal_effects; CLOSE literal_held",
+            true
+        )),
+        ["12", "20", "22", "14"]
+    );
+    for (source, expected) in [
+        ("(VALUES(1))", "f"),
+        ("(VALUES(1),(2))", "t"),
+        ("(SELECT 1 UNION ALL SELECT 2)", "f"),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE literal_auto CURSOR FOR SELECT * FROM {source} source(id)"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='literal_auto'",
+                true
+            )),
+            [expected],
+            "{source}"
+        );
+        session.success(&mut engine, "CLOSE literal_auto; COMMIT", true);
+    }
+}
+
+#[test]
+fn literal_values_cursor_retries_keep_the_current_row_and_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("literal-values-cursor-wait-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut writer =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        reader.success(
+            &mut engine,
+            "CREATE SEQUENCE literal_wait_effects; CREATE TABLE literal_gate(value integer); \
+             INSERT INTO literal_gate VALUES(0); CREATE FUNCTION literal_wait(requested integer) \
+             RETURNS integer LANGUAGE plpgsql AS $$BEGIN PERFORM nextval('literal_wait_effects'); \
+             UPDATE literal_gate SET value=value+1; RETURN requested; END$$",
+            true,
+        );
+        writer.success(
+            &mut engine,
+            "BEGIN; UPDATE literal_gate SET value=value+1",
+            true,
+        );
+        reader.success(&mut engine, "BEGIN; DECLARE literal_wait_cursor NO SCROLL CURSOR FOR SELECT literal_wait(id) FROM (VALUES(4),(5)) source(id)", true);
+        let status = reader.execute_status(&mut engine, "FETCH 1 FROM literal_wait_cursor", true);
+        assert!(
+            matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::Lock,
+                    ..
+                }
+            ),
+            "{mode:?}: {status:?}: {}",
+            String::from_utf8_lossy(reader.send.readable())
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT last_value FROM literal_wait_effects",
+                true
+            )),
+            ["1"]
+        );
+        writer.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&reader.success(&mut engine, "FETCH 1 FROM literal_wait_cursor", true)),
+            ["4"]
+        );
+        assert_eq!(data_rows(&reader.success(&mut engine, "FETCH ALL FROM literal_wait_cursor; SELECT last_value FROM literal_wait_effects; CLOSE literal_wait_cursor; COMMIT", true)), ["5", "2"]);
+        drop((reader, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn singleton_cursor_wildcards_require_relations_and_preserve_zero_column_rows() {
+    let config = test_config("singleton-cursor-wildcards");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (query, expected) in [
+        ("SELECT *", sqlstate::SYNTAX_ERROR),
+        ("SELECT * LIMIT 0", sqlstate::SYNTAX_ERROR),
+        ("SELECT *,1/0 LIMIT 0", sqlstate::SYNTAX_ERROR),
+        ("SELECT true+1,*", sqlstate::UNDEFINED_FUNCTION),
+        ("SELECT *,true+1", sqlstate::SYNTAX_ERROR),
+        ("SELECT missing.*", sqlstate::UNDEFINED_TABLE),
+        ("SELECT missing.* LIMIT 0", sqlstate::UNDEFINED_TABLE),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [expected],
+            "{query}"
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                &format!("BEGIN; DECLARE invalid_singleton CURSOR FOR {query}"),
+                true
+            )),
+            [expected],
+            "DECLARE {query}"
+        );
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(&mut engine,
+        "CREATE TABLE zero_column_cursor_source(); INSERT INTO zero_column_cursor_source DEFAULT VALUES", true);
+    for projection in ["*", "source.*"] {
+        session.success(&mut engine,
+            &format!("BEGIN; DECLARE valid_empty_columns CURSOR FOR SELECT {projection} FROM zero_column_cursor_source source"), true);
+        let output = session.success(&mut engine, "FETCH NEXT FROM valid_empty_columns", true);
+        assert_eq!(command_tags(&output), ["FETCH 1"]);
+        assert_eq!(data_rows(&output), [""]);
+        session.success(&mut engine, "CLOSE valid_empty_columns; COMMIT", true);
+    }
+}
+
+#[test]
+fn singleton_cursors_defer_function_defaults_and_effects_until_fetch() {
+    let config = test_config("singleton-cursor-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE SEQUENCE singleton_effects START 10; \
+         CREATE FUNCTION singleton_value(value bigint DEFAULT nextval('singleton_effects')) \
+         RETURNS bigint LANGUAGE sql VOLATILE AS 'SELECT $1'; BEGIN; \
+         DECLARE singleton_cursor NO SCROLL CURSOR FOR SELECT singleton_value(),nextval('singleton_effects')", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM singleton_effects; FETCH 0 FROM singleton_cursor; \
+         SELECT last_value,is_called FROM singleton_effects",
+            true
+        )),
+        ["10|f", "10|f"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "FETCH 1 FROM singleton_cursor; SELECT last_value FROM singleton_effects; \
+         FETCH 1 FROM singleton_cursor; SELECT last_value FROM singleton_effects; \
+         CLOSE singleton_cursor; COMMIT",
+            true
+        )),
+        ["10|11", "11", "11"]
+    );
+    assert_eq!(data_rows(&session.success(&mut engine,
+        "BEGIN; DECLARE singleton_held NO SCROLL CURSOR WITH HOLD FOR SELECT singleton_value(); \
+         SELECT last_value FROM singleton_effects; COMMIT; FETCH ALL FROM singleton_held; \
+         SELECT last_value FROM singleton_effects; CLOSE singleton_held", true)), ["11", "12", "12"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE FUNCTION public.sum(value integer) RETURNS bigint LANGUAGE sql VOLATILE \
+         AS $$SELECT nextval('singleton_effects')+$1$$; \
+         BEGIN; DECLARE singleton_shadow NO SCROLL CURSOR FOR SELECT public.sum(7); \
+         SELECT last_value FROM singleton_effects; FETCH 1 FROM singleton_shadow; \
+         SELECT last_value FROM singleton_effects; CLOSE singleton_shadow; COMMIT",
+            true
+        )),
+        ["12", "20", "13"]
+    );
+}
+
+// PostgreSQL 18.6 opaque SQL-function phase oracle SQL SHA256:
+// 71df626e54f2dd353981387010aff2ce26bf2028bb44920a630526c8fc9a5993.
+// Backend cache reuse SQL SHA256:
+// 622bafc3e7ffb7f83fc3282fab8ecb0c941a1bb8f72fc87a1b382644c92b242b.
+#[test]
+fn cursor_function_plans_keep_their_owner_and_row_handoffs() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cursor-function-input-owner-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE cursor_checks; CREATE SEQUENCE cursor_rows START 10; \
+             CREATE TABLE cursor_values(id integer); INSERT INTO cursor_values VALUES(1),(2); \
+             CREATE FUNCTION cursor_allowed(value integer) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+              PERFORM nextval('cursor_checks'); RETURN true; END$$; \
+             CREATE DOMAIN cursor_checked AS integer CHECK(cursor_allowed(VALUE)); \
+             CREATE FUNCTION cursor_constant() RETURNS cursor_checked[] LANGUAGE sql SET search_path TO public \
+              AS 'SELECT ''{1}''::cursor_checked[]'; \
+             CREATE FUNCTION cursor_row(value integer) RETURNS integer LANGUAGE plpgsql AS $$BEGIN \
+              RETURN value+nextval('cursor_rows')::integer; END$$", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "BEGIN; DECLARE values_cursor NO SCROLL CURSOR FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; SELECT last_value FROM cursor_checks", true)), ["1"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks",
+                true
+            )),
+            ["{1}|11", "2"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "FETCH 1 FROM values_cursor; SELECT last_value FROM cursor_checks",
+                true
+            )),
+            ["{1}|13", "2"]
+        );
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "CLOSE values_cursor; DECLARE values_cursor NO SCROLL CURSOR FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; FETCH ALL FROM values_cursor; \
+             SELECT last_value FROM cursor_checks; CLOSE values_cursor; COMMIT", true)),
+            ["{1}|13", "{1}|15", "2"]);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "BEGIN; DECLARE held_values NO SCROLL CURSOR WITH HOLD FOR \
+             SELECT cursor_constant(),cursor_row(id) FROM cursor_values; COMMIT; \
+             FETCH ALL FROM held_values; SELECT last_value FROM cursor_checks; CLOSE held_values",
+                true
+            )),
+            ["{1}|15", "{1}|17", "2"]
+        );
+    }
+}
+
+#[test]
 fn cursor_builtin_hashes_preserve_types_lengths_seeds_and_argument_effects() {
     let config = test_config("cursor-builtin-hashes");
     let mut budget = test_engine_budget(&config, 1 << 29);
@@ -1244,6 +1517,22 @@ fn cursor_retained_default_mode_defers_reads_and_matches_plan_scrollability() {
         ["1"]
     );
     session.success(&mut engine, "CLOSE automatic; COMMIT", true);
+    for (option, expected) in [("", "f"), ("SCROLL", "t")] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE singleton_mode {option} CURSOR FOR SELECT 7 AS value"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_scrollable FROM pg_cursors WHERE name='singleton_mode'; \
+             FETCH NEXT FROM singleton_mode; CLOSE singleton_mode; COMMIT",
+                true
+            )),
+            [expected, "7"]
+        );
+    }
     for predicate in ["FALSE", "'f'", "NULL AND TRUE"] {
         session.success(&mut engine, &format!("BEGIN; DECLARE empty_cursor CURSOR FOR SELECT id FROM default_input WHERE {predicate}"), true);
         assert_eq!(
@@ -1587,7 +1876,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
             &mut session.transaction,
             &mut session.pool,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut Responder::new(&mut session.send),
             session.connection_id,
             false,
@@ -1595,7 +1884,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
     })
     .unwrap();
     assert_eq!(result, ExtendedExecutionStatus::Complete(true));
-    assert_eq!(session.transaction.mode, TxnMode::Implicit);
+    assert_eq!(session.transaction.mode, TxnMode::ImplicitBlock);
     session.send.clear();
     session.arena.reset();
     let result = crate::mem::guard::forbid_alloc(|| {
@@ -1605,6 +1894,7 @@ fn cursor_retained_hold_finishes_with_a_legacy_large_object_transaction() {
             true,
             &session.arena,
             &mut session.transaction,
+            &mut session.pool,
             &session.guc,
             &mut session.cursors,
             &mut Responder::new(&mut session.send),
@@ -2124,12 +2414,12 @@ fn cursor_typed_rows_use_exact_capacity_and_release_failed_declarations() {
     for _ in 0..2 {
         session.success(
             &mut engine,
-            "BEGIN; DECLARE fits CURSOR FOR SELECT; FETCH ALL FROM fits; COMMIT",
+            "BEGIN; DECLARE fits CURSOR FOR SELECT FROM (VALUES(1)) source(id) GROUP BY id; FETCH ALL FROM fits; COMMIT",
             true,
         );
         let failed = session.execute(
             &mut engine,
-            "BEGIN; DECLARE too_wide CURSOR FOR SELECT 1",
+            "BEGIN; DECLARE too_wide CURSOR FOR SELECT id FROM (VALUES(1)) source(id) GROUP BY id",
             true,
         );
         assert_eq!(error_sqlstates(&failed), ["54000"]);

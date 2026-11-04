@@ -9,7 +9,7 @@
 //!
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
-use crate::mem::arena::{Arena, ArenaHandle};
+use crate::mem::arena::{Arena, ArenaHandle, ArenaList, ArenaSliceHandle};
 use crate::sql::eval::{SequenceAccess, SequenceReference, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
@@ -38,38 +38,161 @@ struct SequenceEffect {
     next: Option<ArenaHandle<SequenceEffect>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementEffectKind {
+    StatisticsVoid,
+    Cursor,
+    RoutineInput,
+    PlanAllocation,
+}
+
+#[derive(Clone, Copy)]
+enum StatementEffectResult {
+    Values(ArenaSliceHandle<u8>),
+    Error(ArenaHandle<StatementEffectError>),
+}
+
+#[derive(Clone, Copy)]
+struct StatementEffectError {
+    state: super::eval::SqlState,
+    message: crate::util::StackStr<192>,
+    detail: Option<ArenaSliceHandle<u8>>,
+    hint: Option<ArenaSliceHandle<u8>>,
+}
+
+#[derive(Clone, Copy)]
+struct SequenceSessionValue {
+    slot: usize,
+    created_at: u64,
+    value: i64,
+}
+
+#[derive(Clone, Copy)]
+struct StatementEffect {
+    kind: StatementEffectKind,
+    key: ArenaSliceHandle<u8>,
+    result: Option<StatementEffectResult>,
+    replayable: bool,
+    children: StatementSequenceReplay,
+    after_lastval: Option<(usize, u64)>,
+    after_sequences: Option<ArenaSliceHandle<SequenceSessionValue>>,
+    next: Option<EffectHandle>,
+}
+
+#[derive(Clone, Copy)]
+struct ReadyInputEffect {
+    plan: super::type_input_plans::PlanId,
+    next: Option<EffectHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EffectHandle {
+    Full(ArenaHandle<StatementEffect>),
+    ReadyInput(ArenaHandle<ReadyInputEffect>),
+}
+
+impl EffectHandle {
+    fn next(self, arena: &Arena) -> Result<Option<Self>, SqlError> {
+        match self {
+            Self::Full(handle) => arena.retained(handle).map(|node| node.next),
+            Self::ReadyInput(handle) => arena.retained(handle).map(|node| node.next),
+        }
+        .ok_or_else(replay_changed)
+    }
+
+    fn set_next(self, arena: &Arena, next: Self) -> Result<(), SqlError> {
+        let replaced = match self {
+            Self::Full(handle) => {
+                let node = arena.retained(handle).ok_or_else(replay_changed)?;
+                arena.replace_retained(
+                    handle,
+                    StatementEffect {
+                        next: Some(next),
+                        ..node
+                    },
+                )
+            }
+            Self::ReadyInput(handle) => {
+                let node = arena.retained(handle).ok_or_else(replay_changed)?;
+                arena.replace_retained(
+                    handle,
+                    ReadyInputEffect {
+                        next: Some(next),
+                        ..node
+                    },
+                )
+            }
+        };
+        if replaced {
+            Ok(())
+        } else {
+            Err(replay_changed())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StatementEffectRetry {
+    Restart,
+    Continue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+// The persistent arena handle distinguishes statements even when the same
+// input site is admitted repeatedly or the arena later reuses an offset.
+pub(crate) struct StatementInputAttempt(ArenaHandle<u8>);
+
 #[derive(Clone, Copy)]
 pub(super) struct StatementSequenceReplay {
+    input_attempt: Option<StatementInputAttempt>,
+    journal: Option<EffectHandle>,
     head: Option<ArenaHandle<SequenceEffect>>,
     tail: Option<ArenaHandle<SequenceEffect>>,
     next: Option<ArenaHandle<SequenceEffect>>,
     initial_lastval: Option<(usize, u64)>,
+    effects_head: Option<EffectHandle>,
+    effects_tail: Option<EffectHandle>,
+    effects_next: Option<EffectHandle>,
+    nonreplayable: bool,
 }
 
 impl StatementSequenceReplay {
+    pub(super) fn is_retained(self) -> bool {
+        self.input_attempt.is_some() || self.head.is_some() || self.effects_head.is_some()
+    }
+
     pub(super) const EMPTY: Self = Self {
+        input_attempt: None,
+        journal: None,
         head: None,
         tail: None,
         next: None,
         initial_lastval: None,
+        effects_head: None,
+        effects_tail: None,
+        effects_next: None,
+        nonreplayable: false,
     };
 }
 
 thread_local! {
     static STATEMENT_ARENA: Cell<*const Arena> = const { Cell::new(core::ptr::null()) };
+    static STATEMENT_SESSION: Cell<*const SeqSession> = const { Cell::new(core::ptr::null()) };
 }
 
-pub(super) struct StatementSequenceScope<'arena> {
+pub(super) struct StatementSequenceScope<'arena, 'session> {
     previous: *const Arena,
-    arena: PhantomData<&'arena Arena>,
+    previous_session: *const SeqSession,
+    arena: PhantomData<(&'arena Arena, &'session SeqSession)>,
 }
 
-impl StatementSequenceScope<'_> {
+impl StatementSequenceScope<'_, '_> {
     pub(super) fn finish(&self, session: &SeqSession) -> Result<(), SqlError> {
         if !self.previous.is_null() {
             return Ok(());
         }
-        let complete = session.statement_replay.get().next.is_none();
+        let replay = session.statement_replay.get();
+        let complete = replay.next.is_none() && replay.effects_next.is_none();
         finish_statement(session);
         if complete {
             Ok(())
@@ -85,27 +208,29 @@ impl StatementSequenceScope<'_> {
     }
 }
 
-impl Drop for StatementSequenceScope<'_> {
+impl Drop for StatementSequenceScope<'_, '_> {
     fn drop(&mut self) {
         STATEMENT_ARENA.with(|active| active.set(self.previous));
+        STATEMENT_SESSION.with(|active| active.set(self.previous_session));
     }
 }
 
-pub(super) fn enter_statement<'arena>(
+pub(super) fn enter_statement<'arena, 'session>(
     arena: &'arena Arena,
-    session: &SeqSession,
+    session: &'session SeqSession,
     resumed: bool,
-) -> StatementSequenceScope<'arena> {
+) -> StatementSequenceScope<'arena, 'session> {
     let arena = arena.retention_owner();
     let previous = STATEMENT_ARENA.with(|active| active.get());
     if !previous.is_null() {
         return StatementSequenceScope {
             previous,
+            previous_session: STATEMENT_SESSION.with(Cell::get),
             arena: PhantomData,
         };
     }
     let retained = session.statement_replay.get();
-    let mut replay = if resumed && retained.head.is_some() {
+    let mut replay = if resumed && retained.is_retained() {
         session.restore_last_sequence(retained.initial_lastval);
         retained
     } else {
@@ -115,14 +240,16 @@ pub(super) fn enter_statement<'arena>(
         }
     };
     replay.next = replay.head;
+    replay.effects_next = replay.effects_head;
     session.statement_replay.set(replay);
     StatementSequenceScope {
         previous: STATEMENT_ARENA.with(|active| active.replace(arena)),
+        previous_session: STATEMENT_SESSION.with(|active| active.replace(session)),
         arena: PhantomData,
     }
 }
 
-pub(super) fn finish_statement(session: &SeqSession) {
+pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
 }
 
@@ -138,6 +265,12 @@ fn statement_call(
     call: SequenceCall,
     action: impl FnOnce() -> Result<i64, SqlError>,
 ) -> Result<i64, SqlError> {
+    if matches!(
+        call.operation,
+        SequenceOperation::Next | SequenceOperation::Set { .. }
+    ) {
+        super::query::protect_statement_effects();
+    }
     STATEMENT_ARENA.with(|active| {
         let pointer = active.get();
         if pointer.is_null() {
@@ -218,128 +351,775 @@ fn statement_call(
     })
 }
 
-/// Bounded effect log for an expression stream that may be physically retried
-/// while waiting for a mutable SQL routine. Sequence calls are replayed in
-/// logical call order, never advanced again by a retry.
-pub struct SequenceReplayState {
-    first: Cell<Option<ArenaHandle<SequenceReplayChunk>>>,
-    last: Cell<Option<ArenaHandle<SequenceReplayChunk>>>,
-    next: Cell<Option<SequenceReplayPosition>>,
+pub(crate) struct StatementEffectAttempt<'a> {
+    pub result: Result<&'a [super::types::Datum<'a>], SqlError>,
+    pub rewound_state: bool,
+}
+
+fn nonreplayable_effect() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "a cursor or routine input with transactional or session effects cannot resume after a statement wait"
+    )
+}
+
+pub(crate) fn ensure_statement_effects_replayable() -> Result<(), SqlError> {
+    with_statement_context(|context| {
+        if context.is_some_and(|(_, session)| session.statement_replay.get().nonreplayable) {
+            Err(nonreplayable_effect())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn effect_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "statement effect replay exceeds statement memory"
+    )
+}
+
+fn with_statement_context<R>(
+    execute: impl for<'scope> FnOnce(Option<(&'scope Arena, &'scope SeqSession)>) -> R,
+) -> R {
+    let arena = STATEMENT_ARENA.with(Cell::get);
+    let session = STATEMENT_SESSION.with(Cell::get);
+    if arena.is_null() || session.is_null() {
+        return execute(None);
+    }
+    // SAFETY: enter_statement keeps both owners borrowed on this thread. The
+    // higher-ranked closure cannot return a borrow into the active context.
+    execute(Some(unsafe { (&*arena, &*session) }))
+}
+
+pub(crate) fn input_attempt() -> Option<StatementInputAttempt> {
+    with_statement_context(|context| {
+        context.and_then(|(_, session)| session.statement_replay.get().input_attempt)
+    })
+}
+
+pub(crate) fn retains_input_attempt(attempt: StatementInputAttempt) -> bool {
+    with_statement_context(|context| {
+        context.is_some_and(|(arena, session)| {
+            session.statement_replay.get().input_attempt == Some(attempt)
+                && arena.retained(attempt.0).is_some()
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
-struct SequenceReplayPosition {
-    chunk: ArenaHandle<SequenceReplayChunk>,
-    index: usize,
+enum ReplayPosition<T: Copy> {
+    Start,
+    Before(ArenaHandle<T>),
+    After(ArenaHandle<T>),
 }
-
-const SEQUENCE_VALUES_PER_CHUNK: usize = 16;
 
 #[derive(Clone, Copy)]
-struct SequenceReplayChunk {
-    values: [i64; SEQUENCE_VALUES_PER_CHUNK],
-    len: usize,
-    next: Option<ArenaHandle<SequenceReplayChunk>>,
+enum EffectPosition {
+    Start,
+    Before(EffectHandle),
+    After(EffectHandle),
 }
 
-impl SequenceReplayChunk {
-    const EMPTY: Self = Self {
-        values: [0; SEQUENCE_VALUES_PER_CHUNK],
-        len: 0,
-        next: None,
-    };
-}
-
-impl SequenceReplayState {
-    pub const fn empty() -> Self {
-        Self {
-            first: Cell::new(None),
-            last: Cell::new(None),
-            next: Cell::new(None),
+impl EffectPosition {
+    fn capture(next: Option<EffectHandle>, tail: Option<EffectHandle>) -> Self {
+        match (next, tail) {
+            (Some(next), _) => Self::Before(next),
+            (None, Some(tail)) => Self::After(tail),
+            (None, None) => Self::Start,
         }
     }
+}
 
-    pub fn begin_attempt(&self) {
-        self.next.set(
-            self.first
-                .get()
-                .map(|chunk| SequenceReplayPosition { chunk, index: 0 }),
-        );
+impl<T: Copy> ReplayPosition<T> {
+    fn capture(next: Option<ArenaHandle<T>>, tail: Option<ArenaHandle<T>>) -> Self {
+        match (next, tail) {
+            (Some(next), _) => Self::Before(next),
+            (None, Some(tail)) => Self::After(tail),
+            (None, None) => Self::Start,
+        }
     }
+}
 
-    fn invoke(
-        &self,
-        arena: &Arena,
-        action: impl FnOnce() -> Result<i64, SqlError>,
-    ) -> Result<i64, SqlError> {
-        let stale = || {
-            sql_err!(
-                sqlstate::SERIALIZATION_FAILURE,
-                "volatile sequence replay state was reset or replaced"
+#[derive(Clone, Copy)]
+pub(crate) struct StatementReplayStart {
+    attempt: StatementInputAttempt,
+    journal: Option<EffectHandle>,
+    sequences: ReplayPosition<SequenceEffect>,
+    effects: EffectPosition,
+    lastval: Option<(usize, u64)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StatementReplayCursor(Option<StatementReplayEnd>);
+
+impl StatementReplayCursor {
+    pub(crate) const EMPTY: Self = Self(None);
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.0.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StatementReplayEnd {
+    boundary: StatementReplayStart,
+    values: Option<ArenaSliceHandle<SequenceSessionValue>>,
+}
+
+fn cursor_boundary(
+    session: &SeqSession,
+    replay: StatementSequenceReplay,
+) -> Result<StatementReplayStart, SqlError> {
+    Ok(StatementReplayStart {
+        attempt: replay.input_attempt.ok_or_else(replay_changed)?,
+        journal: replay.journal,
+        sequences: ReplayPosition::capture(replay.next, replay.tail),
+        effects: EffectPosition::capture(replay.effects_next, replay.effects_tail),
+        lastval: session.last_sequence(),
+    })
+}
+
+fn validate_cursor(
+    arena: &Arena,
+    replay: StatementSequenceReplay,
+    boundary: StatementReplayStart,
+) -> Result<(), SqlError> {
+    if replay.input_attempt != Some(boundary.attempt)
+        || replay.journal != boundary.journal
+        || arena.retained(boundary.attempt.0).is_none()
+    {
+        return Err(replay_changed());
+    }
+    Ok(())
+}
+
+fn sequence_position(
+    arena: &Arena,
+    replay: StatementSequenceReplay,
+    position: ReplayPosition<SequenceEffect>,
+) -> Result<Option<ArenaHandle<SequenceEffect>>, SqlError> {
+    match position {
+        ReplayPosition::Start => Ok(replay.head),
+        ReplayPosition::Before(handle) => arena
+            .retained(handle)
+            .map(|_| Some(handle))
+            .ok_or_else(replay_changed),
+        ReplayPosition::After(handle) => arena
+            .retained(handle)
+            .map(|effect| effect.next)
+            .ok_or_else(replay_changed),
+    }
+}
+
+fn effect_position(
+    arena: &Arena,
+    replay: StatementSequenceReplay,
+    position: EffectPosition,
+) -> Result<Option<EffectHandle>, SqlError> {
+    match position {
+        EffectPosition::Start => Ok(replay.effects_head),
+        EffectPosition::Before(handle) => handle.next(arena).map(|_| Some(handle)),
+        EffectPosition::After(handle) => handle.next(arena),
+    }
+}
+
+pub(crate) fn begin_replay_cursor() -> Result<Option<StatementReplayStart>, SqlError> {
+    with_statement_context(|context| {
+        let Some((arena, session)) = context else {
+            return Ok(None);
+        };
+        let mut replay = session.statement_replay.get();
+        if replay.input_attempt.is_none() {
+            replay.input_attempt = Some(StatementInputAttempt(
+                arena.retain(0u8).map_err(|_| effect_full())?,
+            ));
+            session.statement_replay.set(replay);
+        }
+        let boundary = cursor_boundary(session, replay)?;
+        validate_cursor(arena, replay, boundary)?;
+        Ok(Some(boundary))
+    })
+}
+
+pub(crate) fn finish_replay_cursor(
+    start: Option<StatementReplayStart>,
+    scratch: &Arena,
+) -> Result<StatementReplayCursor, SqlError> {
+    with_statement_context(|context| {
+        let (Some(start), Some((arena, session))) = (start, context) else {
+            return if start.is_none() && context.is_none() {
+                Ok(StatementReplayCursor(None))
+            } else {
+                Err(replay_changed())
+            };
+        };
+        let replay = session.statement_replay.get();
+        validate_cursor(arena, replay, start)?;
+        let boundary = cursor_boundary(session, replay)?;
+        let mut values = ArenaList::new(scratch);
+        {
+            let mut add = |slot, created_at| -> Result<(), SqlError> {
+                if !values
+                    .borrowed_slice()
+                    .iter()
+                    .any(|value: &SequenceSessionValue| {
+                        value.slot == slot && value.created_at == created_at
+                    })
+                    && let Some(value) = session.currval(slot, created_at)
+                {
+                    values
+                        .push(SequenceSessionValue {
+                            slot,
+                            created_at,
+                            value,
+                        })
+                        .map_err(|_| effect_full())?;
+                }
+                Ok(())
+            };
+            let stop = sequence_position(arena, replay, boundary.sequences)?;
+            let mut next = sequence_position(arena, replay, start.sequences)?;
+            while next != stop {
+                let effect = arena
+                    .retained(next.ok_or_else(replay_changed)?)
+                    .ok_or_else(replay_changed)?;
+                if matches!(
+                    effect.call.operation,
+                    SequenceOperation::Next
+                        | SequenceOperation::Set {
+                            is_called: true,
+                            ..
+                        }
+                ) && let Some(source) = effect.call.source
+                {
+                    let (slot, created_at) = source.session_identity();
+                    add(slot, created_at)?;
+                }
+                next = effect.next;
+            }
+            let stop = effect_position(arena, replay, boundary.effects)?;
+            let mut next = effect_position(arena, replay, start.effects)?;
+            while next != stop {
+                let handle = next.ok_or_else(replay_changed)?;
+                if let EffectHandle::Full(full) = handle {
+                    let effect = arena.retained(full).ok_or_else(replay_changed)?;
+                    if let Some(saved) = effect.after_sequences {
+                        let saved = arena
+                            .retained_slice_mut(saved)
+                            .map_err(|_| replay_changed())?;
+                        for value in saved.iter() {
+                            add(value.slot, value.created_at)?;
+                        }
+                    }
+                }
+                next = handle.next(arena)?;
+            }
+        }
+        let values = if values.is_empty() {
+            None
+        } else {
+            let values = values.as_slice();
+            Some(
+                arena
+                    .retain_slice_with(values.len(), |index| values[index])
+                    .map_err(|_| effect_full())?,
             )
         };
-        if let Some(position) = self.next.get() {
-            let recorded = arena.retained(position.chunk).ok_or_else(stale)?;
-            if position.index >= recorded.len {
-                return Err(stale());
-            }
-            let value = recorded.values[position.index];
-            self.next.set(if position.index + 1 < recorded.len {
-                Some(SequenceReplayPosition {
-                    index: position.index + 1,
-                    ..position
-                })
+        Ok(StatementReplayCursor(Some(StatementReplayEnd {
+            boundary,
+            values,
+        })))
+    })
+}
+
+pub(crate) fn rewind_replay_cursor(start: Option<StatementReplayStart>) -> Result<(), SqlError> {
+    with_statement_context(|context| {
+        let (Some(start), Some((arena, session))) = (start, context) else {
+            return if start.is_none() && context.is_none() {
+                Ok(())
             } else {
-                recorded
-                    .next
-                    .map(|chunk| SequenceReplayPosition { chunk, index: 0 })
-            });
-            return Ok(value);
-        }
-        let previous = self
-            .last
-            .get()
-            .map(|handle| {
-                let recorded = arena.retained(handle).ok_or_else(stale)?;
-                Ok::<_, SqlError>((handle, recorded))
-            })
-            .transpose()?;
-        // Fixed chunks keep values contiguous without copying a growing list.
-        // Reserve their space before issuing an irreversible sequence value.
-        let (handle, mut recorded, appended) = match previous {
-            Some((handle, recorded)) if recorded.len < SEQUENCE_VALUES_PER_CHUNK => {
-                (handle, recorded, false)
-            }
-            _ => {
-                let handle = arena.retain(SequenceReplayChunk::EMPTY).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "volatile sequence replay exceeds statement memory"
-                    )
-                })?;
-                (handle, SequenceReplayChunk::EMPTY, true)
-            }
+                Err(replay_changed())
+            };
         };
-        let value = action()?;
-        recorded.values[recorded.len] = value;
-        recorded.len += 1;
-        assert!(arena.replace_retained(handle, recorded));
-        if appended {
-            if let Some((last, recorded)) = previous {
-                assert!(arena.replace_retained(
-                    last,
-                    SequenceReplayChunk {
-                        next: Some(handle),
-                        ..recorded
-                    }
-                ));
+        let mut replay = session.statement_replay.get();
+        validate_cursor(arena, replay, start)?;
+        replay.next = sequence_position(arena, replay, start.sequences)?;
+        replay.effects_next = effect_position(arena, replay, start.effects)?;
+        session.restore_last_sequence(start.lastval);
+        session.statement_replay.set(replay);
+        Ok(())
+    })
+}
+
+pub(crate) fn restore_replay_cursor(cursor: StatementReplayCursor) -> Result<(), SqlError> {
+    with_statement_context(|context| {
+        let (Some(end), Some((arena, session))) = (cursor.0, context) else {
+            return if cursor.0.is_none() && context.is_none() {
+                Ok(())
             } else {
-                self.first.set(Some(handle));
+                Err(replay_changed())
+            };
+        };
+        let mut replay = session.statement_replay.get();
+        validate_cursor(arena, replay, end.boundary)?;
+        replay.next = sequence_position(arena, replay, end.boundary.sequences)?;
+        replay.effects_next = effect_position(arena, replay, end.boundary.effects)?;
+        if let Some(values) = end.values {
+            let values = arena
+                .retained_slice_mut(values)
+                .map_err(|_| replay_changed())?;
+            for value in values.iter() {
+                session.record_setval(value.slot, value.created_at, value.value, true);
             }
-            self.last.set(Some(handle));
         }
-        Ok(value)
+        session.restore_last_sequence(end.boundary.lastval);
+        session.statement_replay.set(replay);
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExpectedInput {
+    None,
+    Plan(super::type_input_plans::PlanId),
+    OtherEffect,
+}
+
+pub(crate) fn expected_input() -> Result<ExpectedInput, SqlError> {
+    with_statement_context(|context| {
+        let Some((arena, session)) = context else {
+            return Ok(ExpectedInput::None);
+        };
+        let Some(handle) = session.statement_replay.get().effects_next else {
+            return Ok(ExpectedInput::None);
+        };
+        let handle = match handle {
+            EffectHandle::ReadyInput(handle) => {
+                return arena
+                    .retained(handle)
+                    .map(|effect| ExpectedInput::Plan(effect.plan))
+                    .ok_or_else(replay_changed);
+            }
+            EffectHandle::Full(handle) => handle,
+        };
+        let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+        if effect.kind != StatementEffectKind::RoutineInput {
+            return Ok(ExpectedInput::OtherEffect);
+        }
+        let key = arena
+            .retained_slice_mut(effect.key)
+            .map_err(|_| replay_changed())?;
+        match super::exec::decode_projected_col_record(&key, 0, arena)? {
+            super::types::Datum::Bytea(bytes) => {
+                super::type_input_plans::PlanId::from_key_bytes(bytes).map(ExpectedInput::Plan)
+            }
+            _ => Err(replay_changed()),
+        }
+    })
+}
+
+pub(crate) fn replayed_input_plan() -> Result<Option<super::type_input_plans::PlanId>, SqlError> {
+    match expected_input()? {
+        ExpectedInput::None => Ok(None),
+        ExpectedInput::Plan(plan) => Ok(Some(plan)),
+        ExpectedInput::OtherEffect => Err(replay_changed()),
     }
+}
+
+fn retained_effect_bytes(
+    arena: &Arena,
+    values: &[super::types::Datum<'_>],
+) -> Result<ArenaSliceHandle<u8>, SqlError> {
+    let length = super::exec::projected_row_len(values)?;
+    let handle = arena
+        .retain_slice_with(length, |_| 0u8)
+        .map_err(|_| effect_full())?;
+    {
+        let mut bytes = arena
+            .retained_slice_mut(handle)
+            .map_err(|_| replay_changed())?;
+        super::exec::encode_projected_into(values, &mut bytes)?;
+    }
+    Ok(handle)
+}
+
+fn restore_effect_values<'a>(
+    arena: &Arena,
+    handle: ArenaSliceHandle<u8>,
+    output: &'a Arena,
+) -> Result<&'a [super::types::Datum<'a>], SqlError> {
+    let encoded = {
+        let bytes = arena
+            .retained_slice_mut(handle)
+            .map_err(|_| replay_changed())?;
+        output.alloc_slice_copy(&bytes).map_err(|_| effect_full())?
+    };
+    let count = super::exec::projected_row_width(encoded);
+    let values = output
+        .alloc_slice_with(count, |_| super::types::Datum::Null)
+        .map_err(|_| effect_full())?;
+    super::exec::decode_projected_row_into(encoded, output, values)?;
+    Ok(values)
+}
+
+#[inline(never)]
+fn retain_effect_error(
+    arena: &Arena,
+    error: &SqlError,
+) -> Result<ArenaHandle<StatementEffectError>, SqlError> {
+    let diagnostic = super::eval::take_diagnostic();
+    let copy = |value: &str| {
+        arena
+            .retain_slice_with(value.len(), |at| value.as_bytes()[at])
+            .map_err(|_| effect_full())
+    };
+    let (detail, hint) = match diagnostic {
+        Some(diagnostic) => (
+            diagnostic
+                .detail
+                .map(|detail| copy(detail.as_str()))
+                .transpose()?,
+            diagnostic
+                .hint
+                .map(|hint| copy(hint.as_str()))
+                .transpose()?,
+        ),
+        None => (None, None),
+    };
+    let saved = arena
+        .retain(StatementEffectError {
+            state: error.sqlstate,
+            message: error.message,
+            detail,
+            hint,
+        })
+        .map_err(|_| effect_full())?;
+    if let Some(diagnostic) = diagnostic {
+        super::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+    }
+    Ok(saved)
+}
+
+#[inline(never)]
+fn restore_effect_error(
+    arena: &Arena,
+    handle: ArenaHandle<StatementEffectError>,
+) -> Result<SqlError, SqlError> {
+    let saved = arena.retained(handle).ok_or_else(replay_changed)?;
+    let detail = if let Some(detail) = saved.detail {
+        let detail = arena
+            .retained_slice_mut(detail)
+            .map_err(|_| replay_changed())?;
+        Some(crate::util::StackStr::from_str(
+            core::str::from_utf8(&detail).map_err(|_| replay_changed())?,
+        ))
+    } else {
+        None
+    };
+    let hint = if let Some(hint) = saved.hint {
+        let hint = arena
+            .retained_slice_mut(hint)
+            .map_err(|_| replay_changed())?;
+        let text = crate::util::StackStr::from_str(
+            core::str::from_utf8(&hint).map_err(|_| replay_changed())?,
+        );
+        Some(text)
+    } else {
+        None
+    };
+    if detail.is_some() || hint.is_some() {
+        super::eval::stash_diagnostic(detail, hint);
+    }
+    Ok(SqlError {
+        sqlstate: saved.state,
+        message: saved.message,
+    })
+}
+
+// Capture only sources changed inside this subtree. Values are read after the
+// complete subtree, so nested effects and later sibling calls share the same
+// final session value without requiring a global sequence-sized snapshot.
+fn retain_sequence_session(
+    arena: &Arena,
+    scratch: &Arena,
+    session: &SeqSession,
+    replay: StatementSequenceReplay,
+) -> Result<Option<ArenaSliceHandle<SequenceSessionValue>>, SqlError> {
+    if replay.head.is_none() && replay.effects_head.is_none() {
+        return Ok(None);
+    }
+    let mut pending = ArenaList::new(scratch);
+    let mut values = ArenaList::new(scratch);
+    pending.push(replay).map_err(|_| effect_full())?;
+    let mut at = 0;
+    while at < pending.len() {
+        let current = pending.borrowed_slice()[at];
+        at += 1;
+        let mut sequence = current.head;
+        while let Some(handle) = sequence {
+            let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+            if matches!(
+                effect.call.operation,
+                SequenceOperation::Next
+                    | SequenceOperation::Set {
+                        is_called: true,
+                        ..
+                    }
+            ) && let Some(source) = effect.call.source
+            {
+                let (slot, created_at) = source.session_identity();
+                if let Some(value) = session.currval(slot, created_at) {
+                    values
+                        .push(SequenceSessionValue {
+                            slot,
+                            created_at,
+                            value,
+                        })
+                        .map_err(|_| effect_full())?;
+                }
+            }
+            sequence = effect.next;
+        }
+        let mut nested = current.effects_head;
+        while let Some(handle) = nested {
+            if let EffectHandle::Full(full) = handle {
+                let effect = arena.retained(full).ok_or_else(replay_changed)?;
+                pending.push(effect.children).map_err(|_| effect_full())?;
+            }
+            nested = handle.next(arena)?;
+        }
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let values = values.as_slice();
+    arena
+        .retain_slice_with(values.len(), |at| values[at])
+        .map(Some)
+        .map_err(|_| effect_full())
+}
+
+/// Ready images run no conversion or CHECK. Their compact receipts retain the
+/// exact generation; a replay may still encounter its original full admission.
+pub(crate) fn ready_routine_input(
+    plan: super::type_input_plans::PlanId,
+    output: &Arena,
+) -> Result<(), SqlError> {
+    with_statement_context(|context| {
+        let Some((arena, session)) = context else {
+            return Ok(());
+        };
+        let mut replay = session.statement_replay.get();
+        if let Some(handle) = replay.effects_next {
+            match handle {
+                EffectHandle::Full(_) => {
+                    let bytes = plan.key_bytes();
+                    return statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[super::types::Datum::Bytea(&bytes)],
+                        StatementEffectRetry::Restart,
+                        output,
+                        || StatementEffectAttempt {
+                            result: Err(replay_changed()),
+                            rewound_state: false,
+                        },
+                    )
+                    .map(|_| ());
+                }
+                EffectHandle::ReadyInput(handle) => {
+                    let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+                    if effect.plan != plan {
+                        return Err(replay_changed());
+                    }
+                    replay.effects_next = effect.next;
+                }
+            }
+        } else {
+            if replay.input_attempt.is_none() {
+                replay.input_attempt = Some(StatementInputAttempt(
+                    arena.retain(0u8).map_err(|_| effect_full())?,
+                ));
+            }
+            let handle = EffectHandle::ReadyInput(
+                arena
+                    .retain(ReadyInputEffect { plan, next: None })
+                    .map_err(|_| effect_full())?,
+            );
+            if let Some(tail) = replay.effects_tail {
+                tail.set_next(arena, handle)?;
+            } else {
+                replay.effects_head = Some(handle);
+            }
+            replay.effects_tail = Some(handle);
+        }
+        session.statement_replay.set(replay);
+        Ok(())
+    })
+}
+
+pub(crate) fn statement_effect<'a>(
+    kind: StatementEffectKind,
+    key: &[super::types::Datum<'_>],
+    retry: StatementEffectRetry,
+    output: &'a Arena,
+    execute: impl FnOnce() -> StatementEffectAttempt<'a>,
+) -> Result<&'a [super::types::Datum<'a>], SqlError> {
+    with_statement_context(|context| {
+        let Some((arena, session)) = context else {
+            return execute().result;
+        };
+        let key_length = super::exec::projected_row_len(key)?;
+        let encoded_key = output
+            .alloc_slice_with(key_length, |_| 0u8)
+            .map_err(|_| effect_full())?;
+        super::exec::encode_projected_into(key, encoded_key)?;
+        let mut parent = session.statement_replay.get();
+        if kind == StatementEffectKind::RoutineInput && parent.input_attempt.is_none() {
+            parent.input_attempt = Some(StatementInputAttempt(
+                arena.retain(0u8).map_err(|_| effect_full())?,
+            ));
+        }
+        let (handle, mut effect) = if let Some(handle) = parent.effects_next {
+            let EffectHandle::Full(handle) = handle else {
+                return Err(replay_changed());
+            };
+            let effect = arena.retained(handle).ok_or_else(replay_changed)?;
+            let same = {
+                let prior = arena
+                    .retained_slice_mut(effect.key)
+                    .map_err(|_| replay_changed())?;
+                effect.kind == kind && &*prior == encoded_key
+            };
+            if !same {
+                return Err(replay_changed());
+            }
+            parent.effects_next = effect.next;
+            (handle, effect)
+        } else {
+            let key = retained_effect_bytes(arena, key)?;
+            let effect = StatementEffect {
+                kind,
+                key,
+                result: None,
+                replayable: true,
+                children: StatementSequenceReplay {
+                    input_attempt: parent.input_attempt,
+                    initial_lastval: session.last_sequence(),
+                    ..StatementSequenceReplay::EMPTY
+                },
+                after_lastval: None,
+                after_sequences: None,
+                next: None,
+            };
+            let handle = arena.retain(effect).map_err(|_| effect_full())?;
+            if let Some(tail) = parent.effects_tail {
+                tail.set_next(arena, EffectHandle::Full(handle))?;
+            } else {
+                parent.effects_head = Some(EffectHandle::Full(handle));
+            }
+            parent.effects_tail = Some(EffectHandle::Full(handle));
+            (handle, effect)
+        };
+        if let Some(result) = effect.result {
+            if !effect.replayable {
+                return Err(nonreplayable_effect());
+            }
+            session.statement_replay.set(parent);
+            if let Some(values) = effect.after_sequences {
+                let values = arena
+                    .retained_slice_mut(values)
+                    .map_err(|_| replay_changed())?;
+                for saved in values.iter() {
+                    session.record_setval(saved.slot, saved.created_at, saved.value, true);
+                }
+            }
+            session.restore_last_sequence(effect.after_lastval);
+            return match result {
+                StatementEffectResult::Values(result) => {
+                    restore_effect_values(arena, result, output)
+                }
+                StatementEffectResult::Error(error) => Err(restore_effect_error(arena, error)?),
+            };
+        }
+        let mut child = effect.children;
+        child.journal = Some(EffectHandle::Full(handle));
+        match retry {
+            StatementEffectRetry::Restart => {
+                child.next = child.head;
+                child.effects_next = child.effects_head;
+                session.restore_last_sequence(child.initial_lastval);
+            }
+            StatementEffectRetry::Continue => {
+                child.next = None;
+                child.effects_next = None;
+            }
+        }
+        session.statement_replay.set(child);
+        super::query::protect_statement_effects();
+        let attempt = execute();
+        effect.children = session.statement_replay.get();
+        parent.input_attempt = parent.input_attempt.or(effect.children.input_attempt);
+        effect.after_lastval = session.last_sequence();
+        effect.replayable = !attempt.rewound_state && !effect.children.nonreplayable;
+        parent.nonreplayable |= !effect.replayable;
+        session.statement_replay.set(parent);
+        let result = match attempt.result {
+            Ok(_) if effect.children.next.is_some() || effect.children.effects_next.is_some() => {
+                Err(replay_changed())
+            }
+            Err(error)
+                if !effect.replayable
+                    && matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT
+                    ) =>
+            {
+                Err(nonreplayable_effect())
+            }
+            result => result,
+        };
+        let recorded = (|| {
+            match &result {
+                Ok(values) => {
+                    effect.after_sequences =
+                        retain_sequence_session(arena, output, session, effect.children)?;
+                    effect.result = Some(StatementEffectResult::Values(retained_effect_bytes(
+                        arena, values,
+                    )?));
+                }
+                Err(error)
+                    if matches!(
+                        kind,
+                        StatementEffectKind::Cursor | StatementEffectKind::RoutineInput
+                    ) && !matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::INTERNAL_IO_WAIT
+                            | sqlstate::INTERNAL_LOCK_WAIT
+                            | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    ) =>
+                {
+                    effect.after_sequences =
+                        retain_sequence_session(arena, output, session, effect.children)?;
+                    effect.result = Some(StatementEffectResult::Error(retain_effect_error(
+                        arena, error,
+                    )?));
+                }
+                Err(_) => {}
+            }
+            if !arena.replace_retained(handle, effect) {
+                return Err(replay_changed());
+            }
+            Ok(())
+        })();
+        if let Err(error) = recorded {
+            parent.nonreplayable = true;
+            session.statement_replay.set(parent);
+            return Err(error);
+        }
+        result
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -351,22 +1131,6 @@ pub struct SeqEval<'a> {
     /// generator or touches session state. Write validation uses it before
     /// executing changes; query materialization evaluates live values once.
     dry: bool,
-}
-
-pub struct ReplaySeqEval<'base, 'state, 'arena> {
-    base: SeqEval<'base>,
-    state: &'state SequenceReplayState,
-    arena: &'arena Arena,
-}
-
-impl<'base, 'state, 'arena> ReplaySeqEval<'base, 'state, 'arena> {
-    pub fn new(
-        base: SeqEval<'base>,
-        state: &'state SequenceReplayState,
-        arena: &'arena Arena,
-    ) -> Self {
-        Self { base, state, arena }
-    }
 }
 
 impl<'a> SeqEval<'a> {
@@ -626,31 +1390,698 @@ impl SequenceAccess for SeqEval<'_> {
     }
 }
 
-impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
-    fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
-        self.state.invoke(self.arena, || self.base.nextval(name))
-    }
-    fn currval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
-        self.state.invoke(self.arena, || self.base.currval(name))
-    }
-    fn lastval(&self) -> Result<i64, SqlError> {
-        self.state.invoke(self.arena, || self.base.lastval())
-    }
-    fn setval(
-        &self,
-        name: SequenceReference<'_>,
-        value: i64,
-        is_called: bool,
-    ) -> Result<i64, SqlError> {
-        self.state
-            .invoke(self.arena, || self.base.setval(name, value, is_called))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn compact_ready_inputs_mix_with_full_errors_waits_and_scoped_cursors() {
+        use crate::sql::{type_input_plans::PlanId, types::Datum};
+        fn plan(slot: u64, generation: u64) -> PlanId {
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&slot.to_le_bytes());
+            bytes[8..].copy_from_slice(&generation.to_le_bytes());
+            PlanId::from_key_bytes(&bytes).unwrap()
+        }
+        assert!(core::mem::size_of::<ReadyInputEffect>() <= 64);
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "compact ready input receipts", 64 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let source = crate::storage::SequenceReplaySource::test_source(0, 1);
+        let cold = plan(0, 1);
+        let rejected = plan(1, 1);
+        let waiting = plan(2, 1);
+        let changed = plan(0, 2);
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let ready_range;
+            {
+                let _scope = enter_statement(&arena, session, false);
+                let bytes = cold.key_bytes();
+                statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        let value = statement_call(
+                            session,
+                            SequenceCall {
+                                operation: SequenceOperation::Next,
+                                source: Some(source),
+                            },
+                            || {
+                                actions.set(actions.get() + 1);
+                                Ok(7)
+                            },
+                        )
+                        .unwrap();
+                        session.record_nextval(0, 1, value);
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                let before = begin_replay_cursor().unwrap();
+                for _ in 0..1100 {
+                    ready_routine_input(cold, &arena).unwrap();
+                }
+                ready_range = finish_replay_cursor(before, &arena).unwrap();
+                let bytes = rejected.key_bytes();
+                let error = statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        let value = statement_call(
+                            session,
+                            SequenceCall {
+                                operation: SequenceOperation::Next,
+                                source: Some(source),
+                            },
+                            || {
+                                actions.set(actions.get() + 1);
+                                Ok(8)
+                            },
+                        )
+                        .unwrap();
+                        session.record_nextval(0, 1, value);
+                        super::super::eval::stash_diagnostic(
+                            Some(crate::util::StackStr::from_str("caught literal detail")),
+                            None,
+                        );
+                        StatementEffectAttempt {
+                            result: Err(sql_err!(sqlstate::CHECK_VIOLATION, "caught literal")),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::CHECK_VIOLATION);
+                assert_eq!(
+                    super::super::eval::take_diagnostic()
+                        .unwrap()
+                        .detail
+                        .unwrap()
+                        .as_str(),
+                    "caught literal detail"
+                );
+                let bytes = waiting.key_bytes();
+                let error = statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || StatementEffectAttempt {
+                        result: Err(sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "row lock")),
+                        rewound_state: false,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+            }
+            {
+                let scope = enter_statement(&arena, session, true);
+                ready_routine_input(cold, &arena).unwrap();
+                assert_eq!(session.currval(0, 1), Some(7));
+                assert_eq!(replayed_input_plan().unwrap(), Some(cold));
+                assert!(ready_routine_input(changed, &arena).is_err());
+                restore_replay_cursor(ready_range).unwrap();
+                assert_eq!(replayed_input_plan().unwrap(), Some(rejected));
+                let bytes = rejected.key_bytes();
+                let error = statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || panic!("the caught input error must be restored"),
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::CHECK_VIOLATION);
+                assert_eq!(session.currval(0, 1), Some(8));
+                assert_eq!(
+                    super::super::eval::take_diagnostic()
+                        .unwrap()
+                        .detail
+                        .unwrap()
+                        .as_str(),
+                    "caught literal detail"
+                );
+                let bytes = waiting.key_bytes();
+                statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Bytea(&bytes)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || StatementEffectAttempt {
+                        result: Ok(&[]),
+                        rewound_state: false,
+                    },
+                )
+                .unwrap();
+                scope.finish(session).unwrap();
+            }
+            assert_eq!(actions.get(), 2);
+            {
+                let scope = enter_statement(&arena, session, false);
+                ready_routine_input(cold, &arena).unwrap();
+                scope.discard(session);
+            }
+            {
+                let _scope = enter_statement(&arena, session, false);
+                assert!(replayed_input_plan().unwrap().is_none());
+                assert!(restore_replay_cursor(ready_range).is_err());
+                ready_routine_input(changed, &arena).unwrap();
+            }
+            {
+                let scope = enter_statement(&arena, session, true);
+                assert_eq!(replayed_input_plan().unwrap(), Some(changed));
+                assert!(ready_routine_input(cold, &arena).is_err());
+                ready_routine_input(changed, &arena).unwrap();
+                scope.finish(session).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn cursor_only_statements_keep_exact_identity_across_waits_and_finish() {
+        let mut budget = Budget::new(8192);
+        let mut arena = Arena::new(&mut budget, "cursor-only statement", 8192).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        crate::mem::guard::forbid_alloc(|| {
+            let cursor;
+            {
+                let _statement = enter_statement(&arena, session, false);
+                cursor = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+                assert!(session.statement_replay.get().is_retained());
+            }
+            for _ in 0..3 {
+                let _statement = enter_statement(&arena, session, true);
+                restore_replay_cursor(cursor).unwrap();
+            }
+            {
+                let statement = enter_statement(&arena, session, true);
+                restore_replay_cursor(cursor).unwrap();
+                statement.finish(session).unwrap();
+                assert!(!session.statement_replay.get().is_retained());
+            }
+            {
+                let statement = enter_statement(&arena, session, false);
+                assert_eq!(
+                    restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+                restore_replay_cursor(fresh).unwrap();
+                statement.finish(session).unwrap();
+            }
+            arena.reset();
+            let statement = enter_statement(&arena, session, false);
+            let fresh = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+            assert_eq!(
+                restore_replay_cursor(cursor).unwrap_err().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            restore_replay_cursor(fresh).unwrap();
+            statement.finish(session).unwrap();
+        });
+    }
+
+    #[test]
+    fn cached_value_cursors_skip_exact_effect_ranges_and_restore_sparse_sessions() {
+        use crate::sql::types::Datum;
+        let mut budget = Budget::new(128 << 10);
+        let mut arena = Arena::new(&mut budget, "cached value replay cursors", 96 << 10).unwrap();
+        let wrong = Arena::new(&mut budget, "foreign cached value cursor", 32 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let source = crate::storage::SequenceReplaySource::test_source(0, 1);
+        let nested_source = crate::storage::SequenceReplaySource::test_source(1, 2);
+        let calls = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            let absent = finish_replay_cursor(begin_replay_cursor().unwrap(), &arena).unwrap();
+            restore_replay_cursor(absent).unwrap();
+            let first;
+            let second;
+            let start;
+            {
+                let scope = enter_statement(&arena, session, false);
+                assert!(restore_replay_cursor(absent).is_err());
+                start = begin_replay_cursor().unwrap();
+                let value = statement_call(
+                    session,
+                    SequenceCall {
+                        operation: SequenceOperation::Next,
+                        source: Some(source),
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok(10)
+                    },
+                )
+                .unwrap();
+                session.record_nextval(0, 1, value);
+                first = finish_replay_cursor(start, &arena).unwrap();
+                let before = begin_replay_cursor().unwrap();
+                let value = statement_call(
+                    session,
+                    SequenceCall {
+                        operation: SequenceOperation::Next,
+                        source: Some(source),
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok(11)
+                    },
+                )
+                .unwrap();
+                session.record_nextval(0, 1, value);
+                statement_effect(
+                    StatementEffectKind::Cursor,
+                    &[Datum::Text("nested")],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        assert!(restore_replay_cursor(first).is_err());
+                        let value = statement_call(
+                            session,
+                            SequenceCall {
+                                operation: SequenceOperation::Next,
+                                source: Some(nested_source),
+                            },
+                            || {
+                                calls.set(calls.get() + 1);
+                                Ok(21)
+                            },
+                        )
+                        .unwrap();
+                        session.record_nextval(1, 2, value);
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                second = finish_replay_cursor(before, &arena).unwrap();
+                assert_eq!(
+                    statement_call(
+                        session,
+                        SequenceCall {
+                            operation: SequenceOperation::Current,
+                            source: Some(source)
+                        },
+                        || session.currval(0, 1).ok_or_else(replay_changed)
+                    )
+                    .unwrap(),
+                    11
+                );
+                rewind_replay_cursor(start).unwrap();
+                restore_replay_cursor(first).unwrap();
+                assert_eq!(session.currval(0, 1), Some(10));
+                restore_replay_cursor(second).unwrap();
+                assert_eq!(session.currval(0, 1), Some(11));
+                assert_eq!(session.currval(1, 2), Some(21));
+                assert_eq!(session.last_sequence(), Some((1, 2)));
+                assert_eq!(
+                    statement_call(
+                        session,
+                        SequenceCall {
+                            operation: SequenceOperation::Current,
+                            source: Some(source)
+                        },
+                        || panic!("the later sequence call keeps its own receipt")
+                    )
+                    .unwrap(),
+                    11
+                );
+                scope.finish(session).unwrap();
+            }
+            assert_eq!(calls.get(), 3);
+            {
+                let scope = enter_statement(&wrong, session, false);
+                begin_replay_cursor().unwrap();
+                assert!(restore_replay_cursor(first).is_err());
+                scope.discard(session);
+            }
+            arena.reset();
+            {
+                let scope = enter_statement(&arena, session, false);
+                begin_replay_cursor().unwrap();
+                assert!(restore_replay_cursor(first).is_err());
+                scope.finish(session).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn nested_statement_effects_replay_values_and_children_without_repeating_actions() {
+        use crate::sql::types::Datum;
+        let mut budget = Budget::new(64 << 10);
+        let mut arena =
+            Arena::new(&mut budget, "hierarchical statement effects", 64 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let actions = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _scope = enter_statement(&arena, session, false);
+                let values = statement_effect(
+                    StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    StatementEffectRetry::Continue,
+                    &arena,
+                    || {
+                        actions.set(actions.get() + 1);
+                        let nested = statement_effect(
+                            StatementEffectKind::StatisticsVoid,
+                            &[Datum::Int4(2274)],
+                            StatementEffectRetry::Restart,
+                            &arena,
+                            || {
+                                actions.set(actions.get() + 1);
+                                StatementEffectAttempt {
+                                    result: Ok(&[]),
+                                    rewound_state: false,
+                                }
+                            },
+                        )
+                        .unwrap();
+                        assert!(nested.is_empty());
+                        let value = statement_call(
+                            session,
+                            SequenceCall {
+                                operation: SequenceOperation::Last,
+                                source: None,
+                            },
+                            || Ok(7),
+                        )
+                        .unwrap();
+                        session.record_nextval(0, 1, value);
+                        let values = arena
+                            .alloc_slice_copy(&[Datum::Text("cursor output"), Datum::Int8(value)])
+                            .unwrap();
+                        StatementEffectAttempt {
+                            result: Ok(values),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                assert!(matches!(
+                    values,
+                    [Datum::Text("cursor output"), Datum::Int8(7)]
+                ));
+                session.record_nextval(1, 2, 99);
+            }
+            arena.recycle_front();
+            {
+                let scope = enter_statement(&arena, session, true);
+                let values = statement_effect(
+                    StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    StatementEffectRetry::Continue,
+                    &arena,
+                    || panic!("completed cursor and reset must not repeat"),
+                )
+                .unwrap();
+                assert!(matches!(
+                    values,
+                    [Datum::Text("cursor output"), Datum::Int8(7)]
+                ));
+                assert_eq!(session.last_sequence(), Some((0, 1)));
+                scope.finish(session).unwrap();
+            }
+            assert_eq!(actions.get(), 2);
+            assert!(!session.statement_replay.get().is_retained());
+        });
+    }
+
+    #[test]
+    fn incomplete_statement_effects_restart_or_continue_their_own_child_journal() {
+        use crate::sql::types::Datum;
+        let mut budget = Budget::new(64 << 10);
+        let mut arena = Arena::new(&mut budget, "incomplete statement effects", 64 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let calls = Cell::new(0);
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            for retry in [
+                StatementEffectRetry::Restart,
+                StatementEffectRetry::Continue,
+            ] {
+                {
+                    let _scope = enter_statement(&arena, session, false);
+                    let error = statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[Datum::Int4(1)],
+                        retry,
+                        &arena,
+                        || {
+                            statement_call(session, call, || {
+                                calls.set(calls.get() + 1);
+                                Ok(1)
+                            })
+                            .unwrap();
+                            StatementEffectAttempt {
+                                result: Err(sql_err!(sqlstate::INTERNAL_LOCK_WAIT, "held lock")),
+                                rewound_state: false,
+                            }
+                        },
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+                }
+                arena.recycle_front();
+                {
+                    let scope = enter_statement(&arena, session, true);
+                    statement_effect(
+                        StatementEffectKind::RoutineInput,
+                        &[Datum::Int4(1)],
+                        retry,
+                        &arena,
+                        || {
+                            if matches!(retry, StatementEffectRetry::Restart) {
+                                assert_eq!(
+                                    statement_call(session, call, || panic!("child must replay"))
+                                        .unwrap(),
+                                    1
+                                );
+                            }
+                            StatementEffectAttempt {
+                                result: Ok(&[]),
+                                rewound_state: false,
+                            }
+                        },
+                    )
+                    .unwrap();
+                    scope.finish(session).unwrap();
+                }
+                arena.reset();
+            }
+            assert_eq!(calls.get(), 2);
+        });
+    }
+
+    #[test]
+    fn statement_effects_preserve_caught_errors_and_reject_rewound_state() {
+        use crate::sql::types::Datum;
+        let mut budget = Budget::new(32 << 10);
+        let mut arena = Arena::new(&mut budget, "session effect errors", 32 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _scope = enter_statement(&arena, session, false);
+                let error = statement_effect(
+                    StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    StatementEffectRetry::Continue,
+                    &arena,
+                    || {
+                        super::super::eval::stash_diagnostic(
+                            Some(crate::util::StackStr::from_str("one row required")),
+                            None,
+                        );
+                        StatementEffectAttempt {
+                            result: Err(sql_err!(
+                                sqlstate::CARDINALITY_VIOLATION,
+                                "too many cursor rows"
+                            )),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::CARDINALITY_VIOLATION);
+                assert_eq!(
+                    super::super::eval::take_diagnostic()
+                        .unwrap()
+                        .detail
+                        .unwrap()
+                        .as_str(),
+                    "one row required"
+                );
+            }
+            arena.recycle_front();
+            {
+                let scope = enter_statement(&arena, session, true);
+                let error = statement_effect(
+                    StatementEffectKind::Cursor,
+                    &[Datum::Text("fetch")],
+                    StatementEffectRetry::Continue,
+                    &arena,
+                    || panic!("caught fetch cannot advance again"),
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::CARDINALITY_VIOLATION);
+                assert_eq!(
+                    super::super::eval::take_diagnostic()
+                        .unwrap()
+                        .detail
+                        .unwrap()
+                        .as_str(),
+                    "one row required"
+                );
+                scope.finish(session).unwrap();
+            }
+            for detail in [None, Some("")] {
+                arena.reset();
+                {
+                    let _scope = enter_statement(&arena, session, false);
+                    statement_effect(
+                        StatementEffectKind::Cursor,
+                        &[Datum::Text("optional fields")],
+                        StatementEffectRetry::Continue,
+                        &arena,
+                        || {
+                            super::super::eval::stash_diagnostic(
+                                detail.map(crate::util::StackStr::from_str),
+                                Some(crate::util::StackStr::from_str("hint without detail")),
+                            );
+                            StatementEffectAttempt {
+                                result: Err(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "denied")),
+                                rewound_state: false,
+                            }
+                        },
+                    )
+                    .unwrap_err();
+                    let diagnostic = super::super::eval::take_diagnostic().unwrap();
+                    assert_eq!(diagnostic.detail.as_ref().map(|text| text.as_str()), detail);
+                }
+                {
+                    let scope = enter_statement(&arena, session, true);
+                    statement_effect(
+                        StatementEffectKind::Cursor,
+                        &[Datum::Text("optional fields")],
+                        StatementEffectRetry::Continue,
+                        &arena,
+                        || panic!("terminal diagnostic cannot execute twice"),
+                    )
+                    .unwrap_err();
+                    let diagnostic = super::super::eval::take_diagnostic().unwrap();
+                    assert_eq!(diagnostic.detail.as_ref().map(|text| text.as_str()), detail);
+                    assert_eq!(diagnostic.hint.unwrap().as_str(), "hint without detail");
+                    scope.finish(session).unwrap();
+                }
+            }
+            arena.reset();
+            {
+                let scope = enter_statement(&arena, session, false);
+                statement_effect(
+                    StatementEffectKind::RoutineInput,
+                    &[Datum::Int4(2)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || StatementEffectAttempt {
+                        result: Ok(&[]),
+                        rewound_state: true,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    ensure_statement_effects_replayable().unwrap_err().sqlstate,
+                    sqlstate::FEATURE_NOT_SUPPORTED
+                );
+                scope.discard(session);
+                assert!(ensure_statement_effects_replayable().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn statement_effects_reject_changed_identity_and_reserve_before_effects() {
+        use crate::sql::types::Datum;
+        let mut budget = Budget::new(4096);
+        let arena = Arena::new(&mut budget, "bounded session effects", 4096).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let calls = Cell::new(0);
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _scope = enter_statement(&arena, session, false);
+                statement_effect(
+                    StatementEffectKind::StatisticsVoid,
+                    &[Datum::Int4(2274)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || {
+                        calls.set(calls.get() + 1);
+                        StatementEffectAttempt {
+                            result: Ok(&[]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+            }
+            {
+                let scope = enter_statement(&arena, session, true);
+                let error = statement_effect(
+                    StatementEffectKind::StatisticsVoid,
+                    &[Datum::Int4(3775)],
+                    StatementEffectRetry::Restart,
+                    &arena,
+                    || panic!("changed reset target must not run"),
+                )
+                .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                scope.discard(session);
+            }
+            let scope = enter_statement(&arena, session, false);
+            let occupied = arena
+                .alloc_slice_with(arena.capacity() - arena.used(), |_| 0u8)
+                .unwrap();
+            let error = statement_effect(
+                StatementEffectKind::StatisticsVoid,
+                &[],
+                StatementEffectRetry::Restart,
+                &arena,
+                || {
+                    calls.set(calls.get() + 1);
+                    StatementEffectAttempt {
+                        result: Ok(&[]),
+                        rewound_state: false,
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(calls.get(), 1);
+            assert!(!occupied.is_empty());
+            scope.discard(session);
+        });
+    }
 
     #[test]
     fn cursor_owned_query_statement_sequence_effects_survive_row_regions_and_command_retries() {
@@ -847,151 +2278,107 @@ mod tests {
     }
 
     #[test]
-    fn replay_state_scales_with_the_statement_arena_and_replays_exactly() {
-        let mut budget = Budget::new(1 << 20);
-        let arena = Arena::new(&mut budget, "sequence replay", 1 << 16).unwrap();
-        let replay = SequenceReplayState::empty();
-        let row_mark = arena.mark();
-        let calls = Cell::new(0i64);
-        crate::mem::guard::forbid_alloc(|| {
-            for expected in 1..=1_100i64 {
-                let _row_scratch = arena.alloc_slice_with(16, |_| 0xa5u8).unwrap();
-                assert_eq!(
-                    replay
-                        .invoke(&arena, || {
-                            calls.set(calls.get() + 1);
-                            Ok(calls.get())
-                        })
-                        .unwrap(),
-                    expected
-                );
-                unsafe { arena.rewind_to(row_mark) };
-            }
-            replay.begin_attempt();
-            for expected in 1..=1_100i64 {
-                let _row_scratch = arena.alloc_slice_with(16, |_| 0x5au8).unwrap();
-                assert_eq!(
-                    replay
-                        .invoke(&arena, || panic!("a replayed call must not run again"))
-                        .unwrap(),
-                    expected
-                );
-                unsafe { arena.rewind_to(row_mark) };
-            }
-        });
-        assert_eq!(calls.get(), 1_100);
-    }
-
-    #[test]
-    fn replay_state_reports_statement_memory_exhaustion() {
-        let mut budget = Budget::new(1024);
-        let arena = Arena::new(&mut budget, "small sequence replay", 256).unwrap();
-        let replay = SequenceReplayState::empty();
-        let calls = Cell::new(0i64);
-        crate::mem::guard::forbid_alloc(|| {
-            loop {
-                let before = calls.get();
-                match replay.invoke(&arena, || {
-                    calls.set(before + 1);
-                    Ok(before)
-                }) {
-                    Ok(value) => assert_eq!(value, before),
-                    Err(error) => {
-                        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-                        assert!(error.message.as_str().contains("statement memory"));
-                        assert_eq!(calls.get(), before);
-                        break;
-                    }
-                }
-            }
-            assert!(calls.get() > 0);
-            replay.begin_attempt();
-            for expected in 0..calls.get() {
-                assert_eq!(
-                    replay
-                        .invoke(&arena, || panic!("replay must not issue another value"))
-                        .unwrap(),
-                    expected
-                );
-            }
-        });
-    }
-    #[test]
     fn cursor_owned_query_sequence_positions_survive_moves_and_retries() {
         let mut budget = Budget::new(32 << 10);
         let mut query = crate::sql::cursor::CursorQuery::new(&mut budget, 16 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
         let calls = Cell::new(0);
-        let prefix = SEQUENCE_VALUES_PER_CHUNK as i64 + 3;
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
+        let prefix = 19;
         crate::mem::guard::forbid_alloc(|| {
             query
-                .bind("SELECT $1", &[crate::sql::types::Datum::Null], &[])
+                .bind(
+                    "SELECT $1",
+                    &[crate::sql::types::Datum::Null],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Cursor(1),
+                    |_| Ok(()),
+                )
                 .unwrap();
             query
                 .with_query(|_, _, arena| {
+                    let _statement = enter_statement(arena, session, false);
                     for expected in 1..=prefix {
-                        let value = query
-                            .sequence_replay
-                            .invoke(arena, || {
+                        assert_eq!(
+                            statement_call(session, call, || {
                                 calls.set(calls.get() + 1);
                                 Ok(calls.get())
                             })
-                            .unwrap();
-                        assert_eq!(value, expected);
+                            .unwrap(),
+                            expected
+                        );
                     }
                 })
                 .unwrap();
         });
         let mut moved = query;
         crate::mem::guard::forbid_alloc(|| {
-            moved.sequence_replay.begin_attempt();
             moved
                 .with_query(|_, _, arena| {
+                    let _statement = enter_statement(arena, session, true);
                     for expected in 1..=prefix {
                         assert_eq!(
-                            moved
-                                .sequence_replay
-                                .invoke(arena, || panic!("issued value must not repeat"))
-                                .unwrap(),
+                            statement_call(session, call, || panic!(
+                                "issued value must not repeat"
+                            ))
+                            .unwrap(),
                             expected
                         );
                     }
                     assert_eq!(
-                        moved
-                            .sequence_replay
-                            .invoke(arena, || {
-                                calls.set(calls.get() + 1);
-                                Ok(calls.get())
-                            })
-                            .unwrap(),
+                        statement_call(session, call, || {
+                            calls.set(calls.get() + 1);
+                            Ok(calls.get())
+                        })
+                        .unwrap(),
                         prefix + 1
                     );
-                    moved.sequence_replay.begin_attempt();
+                })
+                .unwrap();
+            moved
+                .with_query(|_, _, arena| {
+                    let statement = enter_statement(arena, session, true);
                     for expected in 1..=prefix + 1 {
                         assert_eq!(
-                            moved
-                                .sequence_replay
-                                .invoke(arena, || panic!("resumed values must not repeat"))
-                                .unwrap(),
+                            statement_call(session, call, || panic!(
+                                "resumed values must not repeat"
+                            ))
+                            .unwrap(),
                             expected
                         );
                     }
+                    statement.finish(session).unwrap();
                 })
                 .unwrap();
             assert_eq!(calls.get(), prefix + 1);
             moved.clear();
-            moved.bind("SELECT 1", &[], &[]).unwrap();
+            moved
+                .bind(
+                    "SELECT 1",
+                    &[],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Cursor(1),
+                    |_| Ok(()),
+                )
+                .unwrap();
             moved
                 .with_query(|_, _, arena| {
+                    let statement = enter_statement(arena, session, false);
                     assert_eq!(
-                        moved
-                            .sequence_replay
-                            .invoke(arena, || {
-                                calls.set(calls.get() + 1);
-                                Ok(calls.get())
-                            })
-                            .unwrap(),
+                        statement_call(session, call, || {
+                            calls.set(calls.get() + 1);
+                            Ok(calls.get())
+                        })
+                        .unwrap(),
                         prefix + 2
                     );
+                    statement.finish(session).unwrap();
                 })
                 .unwrap();
         });
@@ -1002,27 +2389,38 @@ mod tests {
         let mut budget = Budget::new(8192);
         let arena = Arena::new(&mut budget, "sequence positions", 4096).unwrap();
         let other = Arena::new(&mut budget, "other sequence positions", 4096).unwrap();
-        let replay = SequenceReplayState::empty();
+        let guc = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let call = SequenceCall {
+            operation: SequenceOperation::Last,
+            source: None,
+        };
         crate::mem::guard::forbid_alloc(|| {
-            replay.invoke(&arena, || Ok(1)).unwrap();
-            replay.begin_attempt();
-            let error = replay
-                .invoke(&other, || panic!("wrong arena must be rejected"))
-                .unwrap_err();
-            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            {
+                let _statement = enter_statement(&arena, session, false);
+                statement_call(session, call, || Ok(1)).unwrap();
+            }
+            {
+                let _statement = enter_statement(&other, session, true);
+                let error =
+                    statement_call(session, call, || panic!("wrong arena must be rejected"))
+                        .unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            }
             let mut moved = arena;
-            assert_eq!(
-                replay
-                    .invoke(&moved, || panic!("a move keeps issued values"))
-                    .unwrap(),
-                1
-            );
-            replay.begin_attempt();
+            {
+                let _statement = enter_statement(&moved, session, true);
+                assert_eq!(
+                    statement_call(session, call, || panic!("a move keeps issued values")).unwrap(),
+                    1
+                );
+            }
             moved.reset();
-            let error = replay
-                .invoke(&moved, || panic!("reset must be rejected"))
-                .unwrap_err();
+            let statement = enter_statement(&moved, session, true);
+            let error =
+                statement_call(session, call, || panic!("reset must be rejected")).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            statement.discard(session);
         });
     }
 }

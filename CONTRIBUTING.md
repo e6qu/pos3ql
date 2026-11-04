@@ -86,6 +86,18 @@ the Rust code compiles and passes lint, with warnings treated as failures. Build
 matrices start only after both checks pass, so one compiler error does not
 launch dozens of copies of the same failing build.
 
+Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
+CI uses `gdb` to print every thread's stack if a native test crashes. It runs
+the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,
+the same test selection and ordinary test parallelism. A crash still fails
+the job; the debugger does not retry or resume it. GDB launches the executable
+directly: rebuilding thousands of test filters as one shell argument exceeds
+Linux's argument-size limit before the tests start.
+A historical crash reproduction records its source revision, compiler/coverage
+versions, original test partition, stack limit, ordinary test parallelism and
+process outcome. Its artifact describes that failed revision. Finish current-head
+validation separately and remove temporary historical CI jobs before merging.
+
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in
 `tests/external/requirements.lock`, with links to their PyPI release metadata.
@@ -142,6 +154,15 @@ using the original deadline; a mock server reporting a completed write does not
 guarantee that its client can read the bytes yet. Cleanup regressions should hold
 backup, manifest, roster, listing and deletion responses separately, check that
 cached SQL remains runnable, and verify retention before deleting any file.
+Verify metadata through client behavior: anonymous record fields, named
+composite-domain arrays, old/new `RETURNING` names and schema-qualified views
+must work through preparation and execution. Cross-reference index operator
+classes with `pg_opclass` and `pg_opfamily`, including virtual large-value
+indexes. Check index comments both before and after cold recovery and name
+reuse. For concurrent rebuilds, prove replacement publication precedes writer
+waits and cancellation preserves already committed catalog phases.
+Native crashes require thread backtraces; a retry or longer deadline is not a
+repair. Keep the failing selection, parallelism and original capacity limits.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
@@ -167,6 +188,10 @@ statement failed while removing whole notice/warning records and secondary
 DETAIL/HINT fields, including continuation lines. Diagnostic bytes outside UTF-8
 are escaped losslessly rather than replaced; primary error messages remain
 comparison inputs in exact-message mode.
+The Differential workflow keeps complete failed comparisons and server logs in
+`differential-failure-<shard>-<revision>` artifacts for seven days. Download those
+when its console preview ends before the mismatch you need. The other corpus
+harness prints the complete diff, including when coverage forces rows to disk.
 The port-based corpus harness requires an external reference at `127.0.0.1`;
 forward a remote reference explicitly instead of supplying a host it cannot use.
 Synchronize concurrent catalog changes before comparing current permission
@@ -233,6 +258,15 @@ smallest reproducer. Fix the slow work, deadlock, resource contention, or worklo
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
 
+Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
+test jobs run that build's library test executable with the full native filter
+lists; each build, test and lint job retains its 15-minute ceiling. The artifact
+helper checks the source revision, target, byte length and SHA256 before running
+the executable. Test workers also restore `RUST_MIN_STACK` from the checked-in
+Cargo configuration, which direct executable launches do not read. This keeps
+a slow cold build from consuming the tests' time
+budget without rebuilding or dropping cases.
+
 Regenerate built-in catalog metadata from the pinned PostgreSQL 18.6 reference
 with explicit container and output arguments:
 
@@ -244,6 +278,21 @@ The generator rejects other server versions and records the source version and
 container image. It includes the input/output routine identities reported by
 `pg_type`; user-defined domains, enums, arrays and row types derive those
 identities from their type definitions.
+
+Planner procedure attributes use the pinned upstream `REL_18_6` files
+[`pg_proc.dat`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat)
+and [`pg_proc.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.h):
+
+```sh
+python3 tools/generate-pg18-planner-properties.py \
+  --source /path/to/pg_proc.dat --header /path/to/pg_proc.h \
+  --type-io-source src/sql/catalog_builtin_properties.rs \
+  --output src/sql/catalog_planner_properties.rs
+```
+
+The generator verifies all three source checksums before writing. It supplements
+the callable declarations with internal type input/output facts; SQL functions
+keep their initialized catalog attributes. These facts do not add callable functions.
 
 The catalog comparison also checks built-in view SQL against the PostgreSQL
 service. To regenerate its static definitions from retained `catalog-metadata.json`

@@ -12,7 +12,7 @@ use core::fmt::Write;
 use crate::mem::arena::{ArenaList, ArenaString};
 use crate::sql::ast::Expr;
 use crate::sql::json;
-use crate::sql::types::Datum;
+use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
@@ -84,6 +84,8 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                             cast.function_oid,
                             &[value],
                             &[cast.source_type_oid],
+                            crate::sql::ast::Collation::None,
+                            crate::sql::eval::RoutineCallAccess::Caller,
                             self.arena,
                         )?
                         .ok_or_else(|| {
@@ -340,7 +342,7 @@ pub(crate) fn sql_json_cast<'a>(
                 hooks,
             );
         }
-        if let Some(value) = catalog.cast_user_type(type_name, value, arena)? {
+        if let Some(value) = catalog.cast_user_type(type_name, value, arena, hooks.sequences)? {
             return Ok(value);
         }
     }
@@ -550,7 +552,7 @@ pub(crate) fn populate_record_from_json<'a>(
         .type_name(declared_type_oid, arena)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
     catalog
-        .cast_user_type(type_name, result, arena)?
+        .cast_user_type(type_name, result, arena, hooks.sequences)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))
 }
 
@@ -693,7 +695,7 @@ pub(crate) fn json_value_to_type<'a>(
             )
         })?;
         catalog
-            .cast_user_type(type_name, input, arena)?
+            .cast_user_type(type_name, input, arena, hooks.sequences)?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     } else if let Some(ctype) = crate::sql::types::ColType::from_oid(type_oid) {
         super::super::cast_to(input, ctype, arena)?
@@ -706,7 +708,7 @@ pub(crate) fn json_value_to_type<'a>(
             )
         })?;
         catalog
-            .cast_user_type(type_name, input, arena)?
+            .cast_user_type(type_name, input, arena, hooks.sequences)?
             .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type does not exist"))?
     };
     if type_mod != -1
@@ -849,6 +851,7 @@ pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&'a Expr<'a>],
     star: bool,
+    variadic: bool,
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -1802,17 +1805,27 @@ pub(crate) fn dispatch<'a>(
                     jsonb: true,
                 })
             }
-            // `jsonb_strip_nulls` / `json_strip_nulls`: drop null-valued members.
+            // The selected declaration supplies the optional array flag.
             "jsonb_strip_nulls" | "json_strip_nulls" => {
-                arity(1)?;
-                let d = eval_full(args[0], arena, params, row, hooks)?;
-                if d.is_null() {
+                arity(2)?;
+                let Some(values) =
+                    super::super::args::strict_arguments::<2>(args, arena, params, row, hooks)?
+                else {
                     return Ok(Datum::Null);
-                }
+                };
+                let d = values[0];
+                let Datum::Bool(strip_arrays) =
+                    super::super::cast_to(values[1], ColType::Bool, arena)?
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "JSON strip flag lost its boolean input type"
+                    ));
+                };
                 check_json_family(name, &d)?;
                 let jsonb =
                     matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
-                let result = json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
+                let result = json::strip_nulls(json_tree_arg(d, arena)?, strip_arrays, arena)?;
                 // A json result re-serializes compactly, a jsonb one in the
                 // canonical spaced form — PostgreSQL's split exactly.
                 let text = if jsonb {
@@ -1844,7 +1857,19 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
-                if !args.len().is_multiple_of(2) {
+                let expanded = if variadic {
+                    let Some(values) = super::super::args::variadic_tail(
+                        name, args, 0, true, arena, params, row, hooks,
+                    )?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Some(values)
+                } else {
+                    None
+                };
+                let count = expanded.map_or(args.len(), <[Datum<'a>]>::len);
+                if !count.is_multiple_of(2) {
                     return Err(sql_err!(
                         sqlstate::INVALID_PARAMETER_VALUE,
                         "argument list must have even number of elements"
@@ -1854,8 +1879,11 @@ pub(crate) fn dispatch<'a>(
                 let colon = if jsonb { ": " } else { " : " };
                 let mut buf = ArenaString::new(arena);
                 buf.write_char('{').map_err(|_| arena_full())?;
-                for pair in args.chunks(2) {
-                    let key = eval_full(pair[0], arena, params, row, hooks)?;
+                for index in (0..count).step_by(2) {
+                    let key = match expanded {
+                        Some(values) => values[index],
+                        None => eval_full(args[index], arena, params, row, hooks)?,
+                    };
                     if key.is_null() {
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -1863,8 +1891,11 @@ pub(crate) fn dispatch<'a>(
                             1
                         ));
                     }
-                    let value = eval_full(pair[1], arena, params, row, hooks)?;
-                    if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {
+                    let value = match expanded {
+                        Some(values) => values[index + 1],
+                        None => eval_full(args[index + 1], arena, params, row, hooks)?,
+                    };
+                    if index != 0 {
                         buf.write_str(", ").map_err(|_| arena_full())?;
                     }
                     let mut key_text = ArenaString::new(arena);
@@ -1888,15 +1919,30 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
+                let expanded = if variadic {
+                    let Some(values) = super::super::args::variadic_tail(
+                        name, args, 0, true, arena, params, row, hooks,
+                    )?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Some(values)
+                } else {
+                    None
+                };
+                let count = expanded.map_or(args.len(), <[Datum<'a>]>::len);
                 let jsonb = name == "jsonb_build_array";
                 let colon = if jsonb { ": " } else { " : " };
                 let mut buf = ArenaString::new(arena);
                 buf.write_char('[').map_err(|_| arena_full())?;
-                for (i, a) in args.iter().enumerate() {
+                for i in 0..count {
                     if i > 0 {
                         buf.write_str(", ").map_err(|_| arena_full())?;
                     }
-                    let value = eval_full(a, arena, params, row, hooks)?;
+                    let value = match expanded {
+                        Some(values) => values[i],
+                        None => eval_full(args[i], arena, params, row, hooks)?,
+                    };
                     json::write_datum_json_styled(&value, colon, ", ", &mut buf)
                         .map_err(|_| arena_full())?;
                 }

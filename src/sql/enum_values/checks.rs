@@ -52,6 +52,19 @@ pub(crate) fn bind_default<const N: usize>(
         .map_err(|_| full::<N>())?;
     let rendered = resolve_expression(executable.as_str(), base, storage, txid, arena, true)?;
     let display = canonical_display(rendered, arena)?;
+    stored_default(
+        display,
+        executable
+            .as_str()
+            .strip_prefix(HEADER)
+            .expect("writer prefix"),
+    )
+}
+
+fn stored_default<const N: usize>(
+    display: &str,
+    executable: &str,
+) -> Result<StackStr<N>, SqlError> {
     let mut stored = StackStr::<N>::new();
     stored.write_str(HEADER).map_err(|_| full::<N>())?;
     stored.write_str("/*p3o:").map_err(|_| full::<N>())?;
@@ -63,15 +76,60 @@ pub(crate) fn bind_default<const N: usize>(
         }
     }
     stored.write_str("*/\n").map_err(|_| full::<N>())?;
-    stored
-        .write_str(
-            executable
-                .as_str()
-                .strip_prefix(HEADER)
-                .expect("writer prefix"),
-        )
-        .map_err(|_| full::<N>())?;
+    stored.write_str(executable).map_err(|_| full::<N>())?;
     Ok(stored)
+}
+
+pub(crate) fn rename_default_schema<const N: usize>(
+    source: &mut StackStr<N>,
+    spans: &mut [crate::storage::RuleTextSpan],
+    old: crate::storage::SqlName,
+    new: crate::storage::SqlName,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    let Some(body) = source.as_str().strip_prefix(HEADER) else {
+        return crate::storage::rename_schema_qualified_sql(
+            source,
+            spans,
+            old,
+            new,
+            crate::sql::parser::StoredSqlKind::Expression,
+            arena,
+        );
+    };
+    let (display, executable) = split_display(body)?;
+    let mut buffer = [0; crate::storage::DEFAULT_EXPR_MAX];
+    let display = decode_display(display.ok_or_else(corrupt)?, &mut buffer)?;
+    let mut display = StackStr::<N>::from_str(display);
+    let mut executable = StackStr::<N>::from_str(executable);
+    if display.is_truncated() || executable.is_truncated() {
+        return Err(full::<N>());
+    }
+    let adjusted = arena
+        .alloc_slice_copy(spans)
+        .map_err(|_| crate::sql::query::arena_full_pub())?;
+    let display_changed = crate::storage::rename_schema_qualified_sql(
+        &mut display,
+        adjusted,
+        old,
+        new,
+        crate::sql::parser::StoredSqlKind::Expression,
+        arena,
+    )?;
+    let executable_changed = crate::storage::rename_schema_qualified_sql(
+        &mut executable,
+        &mut [],
+        old,
+        new,
+        crate::sql::parser::StoredSqlKind::Expression,
+        arena,
+    )?;
+    if !display_changed && !executable_changed {
+        return Ok(false);
+    }
+    *source = stored_default(display.as_str(), executable.as_str())?;
+    spans.copy_from_slice(adjusted);
+    Ok(true)
 }
 
 fn bind_expression<const N: usize>(
@@ -426,8 +484,21 @@ fn resolve_expression<'a>(
             write!(output, "{}", SqlString(text))
                 .map_err(|_| crate::sql::query::arena_full_pub())?;
             if !explicit_cast {
-                write!(output, "::{}[]", name.as_str())
-                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+                if matches!(
+                    base,
+                    ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+                ) {
+                    // Preserve an admitted domain-array value through the
+                    // generated cast; lowering it to enum[] repeats its checks.
+                    let target =
+                        crate::sql::catalog::user_type_name_text(storage, txid, base.oid(), arena)?
+                            .ok_or_else(corrupt)?;
+                    write!(output, "::{target}")
+                        .map_err(|_| crate::sql::query::arena_full_pub())?;
+                } else {
+                    write!(output, "::{}[]", name.as_str())
+                        .map_err(|_| crate::sql::query::arena_full_pub())?;
+                }
             }
             output
                 .write_char(' ')
@@ -575,22 +646,30 @@ fn split_display(body: &str) -> Result<(Option<&str>, &str), SqlError> {
 /// PostgreSQL keeps typdefault's original display text independently from
 /// the executable expression, which resolves current enum labels and names.
 pub(crate) fn default_display<'a>(source: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    with_default_display(source, |display| {
+        arena
+            .alloc_str(display)
+            .map_err(|_| crate::sql::query::arena_full_pub())
+    })
+}
+
+/// The original SQL is also the coordinate system for its retained input map.
+pub(crate) fn with_default_display<R>(
+    source: &str,
+    use_display: impl FnOnce(&str) -> Result<R, SqlError>,
+) -> Result<R, SqlError> {
     if let Some(body) = source.strip_prefix(HEADER) {
         let (display, _) = split_display(body)?;
         let mut bytes = [0; crate::storage::DEFAULT_EXPR_MAX];
         let display = decode_display(display.ok_or_else(corrupt)?, &mut bytes)?;
-        arena
-            .alloc_str(display)
-            .map_err(|_| crate::sql::query::arena_full_pub())
+        use_display(display)
     } else if source.starts_with("pos3ql-enum-check-") {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "unsupported enum expression encoding"
         ))
     } else {
-        arena
-            .alloc_str(source)
-            .map_err(|_| crate::sql::query::arena_full_pub())
+        use_display(source)
     }
 }
 

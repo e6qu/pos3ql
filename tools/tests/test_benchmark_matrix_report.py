@@ -41,6 +41,9 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 "definition_image_slots": 256,
                 "table_metadata_bytes": 67108864,
                 "table_metadata_leases": 8192,
+                "statistics_bytes": 1048576,
+                "statistics_leases": 1024,
+                "index_statistics_slots": 4096,
                 "operations_per_client": 10,
                 "clients": 2,
                 "catalog_relations": 128 if mode == "full" else 0,
@@ -220,7 +223,8 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
         )
 
     def test_rejects_different_shared_capacities(self):
-        for field in ("row_work_bytes", "table_metadata_bytes", "table_metadata_leases"):
+        for field in ("row_work_bytes", "table_metadata_bytes", "table_metadata_leases",
+                      "statistics_bytes", "statistics_leases", "index_statistics_slots"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
                 directory = pathlib.Path(temporary)
                 for backend in ["fixture", "minio", "seaweedfs"]:
@@ -258,6 +262,42 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("unsupported environment version; expected 2", completed.stderr)
+
+    def test_rejects_unrecorded_statistics_capacities_even_when_all_profiles_match(self):
+        for field in ("statistics_bytes", "statistics_leases", "index_statistics_slots"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary)
+                for backend in ("fixture", "minio", "seaweedfs"):
+                    self.write_run(directory, backend)
+                    path = directory / backend / "environment.json"
+                    environment = json.loads(path.read_text())
+                    del environment["suite"][field]
+                    path.write_text(json.dumps(environment))
+                completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(f"missing suite {field}", completed.stderr)
+
+    def test_rejects_invalid_statistics_capacity_without_coercing_profiles(self):
+        for field, value in (
+            ("statistics_bytes", 65),
+            ("statistics_leases", 0),
+            ("index_statistics_slots", -1),
+            ("statistics_bytes", "1048576"),
+            ("statistics_leases", 1024.0),
+            ("index_statistics_slots", True),
+            ("statistics_bytes", None),
+        ):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temporary:
+                directory = pathlib.Path(temporary)
+                for backend in ("fixture", "minio", "seaweedfs"):
+                    self.write_run(directory, backend)
+                    path = directory / backend / "environment.json"
+                    environment = json.loads(path.read_text())
+                    environment["suite"][field] = value
+                    path.write_text(json.dumps(environment))
+                completed = subprocess.run(["python3", str(SCRIPT), str(directory)], text=True, capture_output=True)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(f"suite {field} must be", completed.stderr)
 
 
 if __name__ == "__main__":

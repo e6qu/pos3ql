@@ -53,6 +53,12 @@ pub(crate) struct MatviewQueryUndo {
     prior: Option<PendingMatviewQuery>,
 }
 
+impl MatviewQueryUndo {
+    pub(crate) fn slot(self) -> usize {
+        self.target.slot()
+    }
+}
+
 impl core::fmt::Debug for MatviewQueryUndo {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         output
@@ -171,6 +177,8 @@ impl Storage {
         transaction: u32,
         arena: &crate::mem::arena::Arena,
     ) -> Result<MatviewQueryUndo, SqlError> {
+        let mut dependencies =
+            self.snapshot_matview_dependencies(target.catalog.slot(), transaction, arena)?;
         let mut owners = self.catalog_dependency_owners(
             &self.matviews,
             type_contracts::CatalogPublicationInput::StoredQueryEdit,
@@ -228,23 +236,28 @@ impl Storage {
             crate::sql::parser::StoredSqlKind::Statements,
             arena,
         )?;
+        dependencies.rename_schema(old, new);
+        let inputs = self.relocate_stored_type_inputs(
+            dependencies.type_inputs(),
+            |section| {
+                (section == StoredInputSection::Query).then_some((
+                    selected.sql.as_str(),
+                    sql.as_str(),
+                    crate::sql::parser::StoredSqlKind::Statements,
+                ))
+            },
+            dependencies.view(),
+            arena,
+        )?;
+        dependencies.set_type_inputs(inputs);
         let version = self.catalog_sequence.next()?;
-        let dependency_slot = owners.allocate_preserved_query_image(
+        let dependency_slot = owners.allocate_query_image(
             self,
             StoredQueryDependencyOwner::MaterializedView(slot as u16),
             view.pending_query.map(|pending| pending.dependency_slot),
+            dependencies.view(),
             transaction,
         )?;
-        let count = owners.dependencies.pending[dependency_slot as usize].count;
-        rename_dependency_schema(
-            owners.dependencies.image_mut(
-                self.stored_query_dependency_pending_base + dependency_slot as usize,
-                count,
-                self.stored_query_dependencies_per_image,
-            ),
-            old,
-            new,
-        );
         owners.catalog[slot].pending_query = Some(PendingMatviewQuery {
             transaction,
             version,

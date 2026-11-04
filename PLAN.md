@@ -37,14 +37,97 @@ first result column and writes an audit row through a function in its second.
 It must produce three increments, three audit rows and three result rows,
 including when a function pauses. Completed columns must not run again.
 
-Supported single-table scalar statements retain their source, predicate and
-projection positions through mutable function handoffs, using the existing
-physical reader and startup arenas. Temporary call state belongs to active rows.
-Calls retain selected identities, original defaults and null handling; explicit
-variadic arrays remain distinct from expanded arguments.
+Simple table scans already preserve their source position and completed values
+when a function pauses. Extend that behavior to the remaining query shapes and
+statement bodies described below. Preserve declared types, selected objects,
+defaults, null handling and evaluation order. Reclaim temporary memory between
+calls and preserve enclosing row descriptions after both successful and failed
+metadata probes. Ordinary expressions without preparation-time checks must not reserve
+checked-input storage. The [architecture](docs/architecture.md#the-request-path)
+owns the current execution details and memory rules.
+Finish retaining values checked while SQL is prepared. For example, preparing
+`SELECT '{approved}'::checked_status[]` can run a user-defined constraint;
+describing or executing that prepared statement must reuse its checked value.
+Cover implicit column and function arguments, repeated lock waits, cancellation,
+stored definitions, renames and recovery. A SQL function checks its string body
+at creation and again on its first runtime call in a backend, retaining inputs
+for that routine definition and resolved call types. Accepted inlining instead
+keeps the planner's checked values with its caller; rejected attempts leave the
+runtime check separate. A cursor must preserve its own plan across opening
+waits, separate fetches and holdable commit, releasing it on close or rollback.
+A PL/pgSQL statement keeps its own plan across calls; dynamic `EXECUTE` makes
+a new plan each time.
+Unreached branches must not run constraints. Verify these differences against
+PostgreSQL, including function settings and `check_function_bodies=off`.
+Extended-protocol Bind must validate parameters before planning function inputs,
+retain decoded values through planning waits, and publish its portal only after
+preparation succeeds. Closing or cancelling one portal must release its plan
+without changing another portal's checked values.
+Keep parameterless generic plans shared and live while portals use them;
+parameterized planning must use the supplied values when pruning branches.
+Check projections and types before folding constant values. An invalid
+`SELECT *` without a source must win over a later arithmetic error. Invalid `min(boolean)` must
+win over a later division by zero, and a true `CASE` condition must discard
+later conditions. Retain declared SQL `EXECUTE` parameter types, including NULLs.
+Verify that type checking preserves record fields, declared sizes and collations;
+`SELECT (q).f1 FROM (SELECT ROW(7) AS q) AS source` must still return `7`.
+Keep schema-qualified views resolvable and expose `old`/`new` only in the
+statement's `RETURNING` scope, including named aliases in `MERGE`.
+`DISCARD PLANS` must change future preparation without repeating checks in an
+already bound portal or cursor. Verify cache changes across
+schema edits, commit, rollback, search paths and roles against PostgreSQL;
+unrelated table changes must not repeat a constraint.
+Compare procedural specialization, nested arguments, sized casts, selected
+operator/cast support functions and inherited ownership with PostgreSQL.
+Preserve the distinction between a constant argument and the element placeholder
+used when converting an existing array; their input-check timing can differ.
+Cover index, policy, rule and privilege changes, plus TRUNCATE commit, rollback
+and prepared transactions, including immediate delivery to other sessions
+before an ANALYZE commits. Retain the selected table identity through these
+boundaries. Match whether whole-relation catalog statistics changed; repeating
+unchanged statistics and renaming an index must not repeat a constraint.
+Keep completed inputs while rolling back and safely replaying the unfinished
+input within its original deadline. Caught input errors must retain their exact
+attempt and error through a later wait, without repeating the constraint.
+Cancellation must release unfinished
+metadata so a fresh statement can select a different schema and track its
+subsequent changes. Demonstrate the complete behavior in CI
+before closing this acceptance item. The original PostgreSQL probe inputs, raw
+results and verified provenance are retained under
+`tests/external/reference/2026-11-03-input-plans/`.
+Focused PostgreSQL 18.6 observations also cover cursor fetch timing, query-error
+order, checked defaults, prepared values and canonical foreign-object labels.
+Keep event reporting, object identification and address lookup consistent with
+the same object kind; an unchanged owner still produces the expected DDL event.
+Reassigning ownership must exclude the destination from the objects still to
+change. Repeated same-owner commands must finish without consuming catalog
+versions; foreign wrappers and servers must preserve ownership through rollback
+and recovery. Dropping a type with CASCADE must remove dependents only in its
+database, preserving routines and views copied into another database.
+Data-change trigger statements that need checked domain-array input currently
+raise `0A000` before running the constraint; event triggers have an engine-owned
+execution context. Finish a retained trigger continuation that preserves prior
+row changes, local variables, branch position and transition rows while input
+preparation waits. Verify that constraints see the preceding transaction and
+statement changes, run once, and do not fire in unreached branches. Do not route
+these checks through a retry that first undoes the rows they must observe.
+Trigger query preparation must see its invocation's transition rows without
+executing queries while discovering their types.
+Keep simple table, constant VALUES and one-row cursor expressions deferred until fetching,
+including scalar calls, then extend those positions to the remaining cursor
+plans that currently execute when opened. Ordinary PL statements without any
+checked or planner inputs must not consume checked-plan slots. Keep running
+images alive when `DISCARD PLANS` refreshes future query admissions.
 Keep sequence effects aligned with PostgreSQL through sorting, skipped rows
 and tied groups, including nested queries and disk-backed sorts. A zero-row
 limit must validate the query without evaluating its input.
+Procedural query handoffs must publish rows and local assignments at their proper
+boundary. A real caught RETURN QUERY error preserves its completed row prefix;
+a private retry must not publish that prefix twice. Compare static SELECT INTO's
+one/two-row consumption with dynamic EXECUTE INTO, which evaluates the query fully.
+Cold-recovery tests must explicitly enable object storage and synchronous journal
+publication before deleting local files; starting an HTTP fixture alone proves
+neither configuration nor durability.
 
 Extend those positions through function bodies and object-store waits, complex
 plans, named/custom casts, SQL cursors and results already sent to the client.
@@ -56,9 +139,74 @@ reads, nested calls and replaced objects. The
 Audit PostgreSQL 18 built-ins by signature and executable behavior, including
 `hashtextextended('order-42', 0)`. Catalog presence alone is not support.
 Keep values, declared types, nulls, errors and argument effects aligned with
-PostgreSQL. Run real SQLAlchemy, Alembic and psycopg2 inspection, migrations,
+PostgreSQL. Validate declared assignments before row processing: an empty input
+or typed NULL must not bypass an otherwise invalid conversion. Run real
+SQLAlchemy, Alembic and psycopg2 inspection, migrations,
 streaming and binary-client workflows against both servers; preserve native
 Linux amd64, Linux arm64 and macOS arm64 coverage.
+Keep protocol preparation separate from an executed implicit command block.
+Standalone prepared-transaction resolution must work through JDBC, while
+unsynchronized preceding executions and explicit blocks still reject it. Query
+analysis must pin snapshots at PostgreSQL's boundary; utility preparation must
+permit transaction settings, and protocol errors must preserve correct rollback
+and failed-block recovery. Aggregate support functions use the aggregate owner's
+permission to call them while their bodies retain ordinary invoker identity.
+Keep session plan ownership with its frontend while work moves into commit
+workers or prepared slots. A suspended command must retain its original arena
+and resume after a conflicting lock is released. Temporary argument tracking
+must fit the original bounded-memory proofs without enlarging their arenas.
+Match each standalone utility's publication boundary with PostgreSQL: creating a
+database publishes before protocol `Sync`, while concurrent index commands have
+intermediate committed catalog states and a final transaction. A common
+"commit every utility immediately" rule is incorrect.
+
+Concurrent reindexing must replace the index while preserving its owning
+constraint's identity. For example, an application's saved primary-key
+constraint identifier must still identify that constraint after its index is
+rebuilt. Store those identities separately, update the backing-index link, and
+preserve comments, dependencies and partition links. Map a partition child's
+physical columns to the parent's selected columns when reporting those links.
+Retain each key's selected comparison rules when a constraint-created index
+becomes a stored index. Reject incomplete journal records before changing their
+buffer. Verify that nested SQL queries cannot append an outer call's input
+frames inside a recycling row scan. Cover repeated `ts_rewrite` queries,
+invalid and empty result descriptions, errors and restored caller scopes.
+Diagnose native crashes with the failing threads' stacks, preserving
+the configured stack, test parallelism and job deadlines.
+Rebuilding a table must leave retired indexes untouched. Explicit user-index
+repair and replacement must preserve the distinct flags and ownership rules.
+The current implementation gives the large-value index its own lifetime and
+preserves deferred uniqueness while its replacement is detached. Registration must publish replacement
+catalog entries before waiting for existing writers; table-shape normalization
+belongs with the later anchor swap. Each backing index must appear once in
+catalogs and rebuild selection, including inline keys with stored physical
+metadata after a tablespace change. Recovery must recognize a materialized
+inline key's matching backing relation at each published cancellation point,
+while rejecting an identity reused for a different key. Partitioned indexes
+must retain their partitioned relation kind before and after materialization.
+Direct `ALTER INDEX` must resolve constraint indexes before any rebuild,
+preserving their identities, comments, permissions and rollback behavior.
+Retired indexes keep their own owner when their former table changes owner;
+catalog reports must reflect the selected index's ownership.
+An inline key may share its own backing index's name while being renamed;
+unrelated relations must still block the name. Rebuilding an already retired
+index must skip unchanged state transitions without requesting a pending
+binding that was never staged.
+Comments must follow the selected index
+through name reuse, commit and cold recovery. Complete the runtime proofs for
+intermediate commit delays, earlier readers, cancellation and empty-cache
+recovery, including ordinary, constraint-owned and large-value indexes.
+Verify one final end hook reads current names and omits an earlier index dropped
+while a later table waits, including reuse of the released catalog slot.
+Verify stored generated key names with legal long identifiers, schema collisions
+and pending transactions. Index names reserve space before commit; another
+transaction's pending CHECK name does not. Retain names through rename and
+recovery, including prepared changes that replace an earlier relation.
+Apply the same comparisons to multi-column keys, exclusion constraints, foreign
+keys and copied or partition indexes. Explicit names and copied CHECK names must
+retain PostgreSQL's distinct rules.
+Qualify all four workflows on the finished revision; a source check or a
+PostgreSQL reference probe alone does not establish those runtime guarantees.
 
 ### Share fixed memory and disk capacity according to demand
 
@@ -67,31 +215,19 @@ row lookup structure for each empty table. If most traffic touches `orders`, it 
 available shared slots. A long report keeps its selected versions until it
 finishes; those slots cannot be reassigned simply because demand changes.
 
-Ordinary row metadata, foreground row work, actual table definitions and index
-bindings now share explicit fixed pools. Readers keep their selected schema
-owners; a change reserves its replacement definitions, bindings and row keys
-before durability. [Architecture](docs/architecture.md#memory-and-physical-size)
+Ordinary row metadata, foreground row work, actual table definitions, index
+bindings and analyzed columns share explicit fixed pools. Index counters have
+an independent global limit, and SQL generators use the shared sequence catalog.
+Readers keep their selected owners; a change reserves replacements before
+durability. [Architecture](docs/architecture.md#memory-and-physical-size)
 owns the current limits and admission behavior.
 
-Complete the current CI and equal-capacity evidence before accepting this
-integration. Cover narrow/wide schemas, retained readers, overlapping replacements,
-savepoints, private catalog reconstruction after prepared recovery, cancellation
-and waits that preserve completed SQL effects. Keep joined and recursive input
-decoding proportional to the complete physical shape, including hidden fields;
-a successful small-arena regression does not establish an embedded minimum.
-Exercise prepared resolution with no spare metadata after admission, binding
-private stored queries only after their startup catalogs exist. Preserve old
-definitions on rollback. For example, if adding an `orders.note` column cannot
-reserve metadata, `orders` must keep its previous usable definition; waiting to
-commit must not run an audit trigger again.
-
-Next, share statistics storage using actual analyzed columns and explicit global
-byte and owner limits. Keep column identity stable through table changes, retain
-old images for readers and checkpoints, and reserve replacements before effects.
-Give index counters an independent global limit. Remove duplicate per-table
-sequence counters only after every SQL generator uses its catalog sequence,
-including copied tables and partition children. Compare the same global limits
-at 1/8/32/128 tables, with populated, replacement and exhausted-pool cases.
+Retain the ownership, exhaustion, prepared recovery and once-only SQL tests as
+shared resources change. Reserve replacements before effects and preserve old
+images on rollback. For example, if analyzing `orders` cannot reserve statistics
+space, its previous statistics must remain usable. A waiting commit must not
+run an audit trigger again. Joined and recursive row decoding must continue to
+include its complete physical shape, including hidden fields.
 
 Reduce other catalog reservations using measured component costs. Empty tables
 still have a cost; shared schema storage does not establish an embedded memory
@@ -103,7 +239,7 @@ Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa30
 [two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.
 Saved generations can exceed resident capacity; replaying their newer journal
 tail still needs resident slots and bytes. Extend the
-[measurement matrix](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) with realistic populated
+[measurement matrix](https://github.com/e6qu/pos3ql/blob/main/tools/measure-embedded-capacity.py) with realistic populated
 sessions and pinned-reader pressure before claiming an embedded minimum.
 
 Reserve forward progress for commit, rollback, required reads and maintenance.
@@ -123,8 +259,8 @@ in the [performance guide](docs/performance.md). Keep controller state within
 startup budgets and prove capacity conservation, no runtime heap growth and safe
 release after errors.
 Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
-repeat with independent statistics capacity and populated workloads before
-claiming a current embedded minimum.
+compare future measurements at identical explicit capacities. Add populated
+multi-session and pinned-reader measurements before claiming an embedded minimum.
 
 ### Adapt batching, admission and future layout to the workload
 
@@ -189,8 +325,8 @@ A waiting schema edit must never attach itself to a new object that reused a nam
   ownership, failed-fetch cleanup and scan statistics. Fetching, skipping and
   moving rows must keep their distinct PostgreSQL effects. Sequence values
   already issued remain owned by the command across retries and rollback.
-  Finishing or saving a result must release its input owners across all wire
-  command paths, including COPY and extended-protocol Sync.
+  Finishing or saving a result must release its input owners across embedded
+  calls and wire command paths, including COPY and extended-protocol Sync.
 
 Follow PostgreSQL's distinction between listing an old catalog row and resolving
 an object for current use. After `orders` becomes `sales`, an older report can

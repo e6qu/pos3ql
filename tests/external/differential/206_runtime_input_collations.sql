@@ -1,0 +1,104 @@
+-- Runtime SQL-body checks use declared argument types and input collation.
+-- PostgreSQL REL_18_6 src/backend/utils/cache/funccache.c:268-300.
+CREATE SEQUENCE body_collation_checks;
+CREATE TYPE body_collation_choice AS ENUM('a');
+CREATE DOMAIN body_collation_checked AS body_collation_choice
+  CHECK(nextval('body_collation_checks')>0);
+CREATE FUNCTION body_collation(input text) RETURNS body_collation_checked[]
+  LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]';
+CREATE FUNCTION body_collation_cast(input text) RETURNS integer
+  LANGUAGE sql SET search_path=public AS 'SELECT cardinality(''{a}''::body_collation_checked[])';
+CREATE CAST(text AS integer) WITH FUNCTION body_collation_cast(text) AS ASSIGNMENT;
+CREATE TABLE body_collation_numbers(value integer);
+CREATE TABLE body_collation_texts(value text COLLATE "C");
+INSERT INTO body_collation_texts VALUES('a');
+CREATE FUNCTION body_collation_default(input text DEFAULT ('a' COLLATE "C"))
+  RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public
+  AS 'SELECT ''{a}''::body_collation_checked[]';
+CREATE FUNCTION body_collation_pair(first_input text, second_input text DEFAULT ('a' COLLATE "POSIX"))
+  RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public
+  AS 'SELECT ''{a}''::body_collation_checked[]';
+CREATE FUNCTION body_collation_srf(input text DEFAULT ('a' COLLATE "C"))
+  RETURNS SETOF body_collation_checked[] LANGUAGE sql SET search_path=public
+  AS 'SELECT ''{a}''::body_collation_checked[]';
+CREATE PROCEDURE body_collation_procedure(input text DEFAULT ('a' COLLATE "C"))
+  LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]';
+CREATE FUNCTION body_collation_identity(input text) RETURNS text LANGUAGE sql AS 'SELECT input';
+CREATE FUNCTION body_collation_nested(input text DEFAULT body_collation_identity('a' COLLATE "C"))
+  RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public
+  AS 'SELECT ''{a}''::body_collation_checked[]';
+ALTER SEQUENCE body_collation_checks RESTART WITH 1;
+SELECT body_collation('first' COLLATE "C");
+SELECT 'first_c',last_value FROM body_collation_checks;
+SELECT body_collation('second'::varchar COLLATE "C");
+SELECT 'same_declared_type',last_value FROM body_collation_checks;
+SELECT body_collation('third' COLLATE "POSIX");
+SELECT 'posix',last_value FROM body_collation_checks;
+SELECT body_collation('fourth'::text);
+SELECT body_collation('fifth'::varchar);
+SELECT 'default_collation',last_value FROM body_collation_checks;
+SELECT body_collation(NULL::text COLLATE "C");
+SELECT 'null_reuses_c',last_value FROM body_collation_checks;
+SELECT ('42'::text COLLATE "C")::integer;
+SELECT ('43'::text COLLATE "C")::integer;
+SELECT 'cast_c',last_value FROM body_collation_checks;
+SELECT ('44'::text COLLATE "POSIX")::integer;
+SELECT 'cast_posix',last_value FROM body_collation_checks;
+SELECT ARRAY['45'::text COLLATE "C", '46'::text COLLATE "C"]::integer[];
+SELECT 'array_cast_reuses_c',last_value FROM body_collation_checks;
+INSERT INTO body_collation_numbers
+  SELECT '47'::text COLLATE "C" FROM generate_series(1,2);
+SELECT 'select_assignment_cast_c',last_value FROM body_collation_checks;
+INSERT INTO body_collation_numbers VALUES('48'::text COLLATE "POSIX");
+SELECT 'assignment_reuses',last_value FROM body_collation_checks;
+SELECT value FROM body_collation_numbers ORDER BY value;
+SELECT body_collation_default();
+SELECT 'default_without_written_arguments',last_value FROM body_collation_checks;
+SELECT body_collation_default('a' COLLATE "C");
+SELECT 'default_and_explicit_c_are_separate',last_value FROM body_collation_checks;
+SELECT body_collation_default('a'::text);
+SELECT 'default_is_separate',last_value FROM body_collation_checks;
+SELECT body_collation_pair(value) FROM body_collation_texts;
+SELECT 'pair_first_implicit_c',last_value FROM body_collation_checks;
+SELECT body_collation_pair('a' COLLATE "POSIX");
+SELECT 'defaults_do_not_set_call_collation',last_value FROM body_collation_checks;
+SELECT * FROM body_collation_srf();
+SELECT 'srf_without_written_arguments',last_value FROM body_collation_checks;
+SELECT * FROM body_collation_srf('a' COLLATE "C");
+SELECT 'srf_default_and_explicit_c_are_separate',last_value FROM body_collation_checks;
+SELECT * FROM body_collation_srf('a'::text);
+SELECT 'srf_default_is_separate',last_value FROM body_collation_checks;
+CALL body_collation_procedure();
+SELECT 'procedure_without_written_arguments',last_value FROM body_collation_checks;
+CALL body_collation_procedure('a' COLLATE "C");
+SELECT 'procedure_default_and_explicit_c_are_separate',last_value FROM body_collation_checks;
+CALL body_collation_procedure('a'::text);
+SELECT 'procedure_default_is_separate',last_value FROM body_collation_checks;
+SELECT body_collation_pair('a' COLLATE "C");
+SELECT 'omitted_default_collation_is_not_merged',last_value FROM body_collation_checks;
+SELECT body_collation_nested();
+SELECT 'nested_without_written_arguments',last_value FROM body_collation_checks;
+SELECT body_collation_nested('a' COLLATE "C");
+SELECT 'nested_default_and_explicit_c_are_separate',last_value FROM body_collation_checks;
+SELECT body_collation_nested('a'::text);
+SELECT 'nested_default_is_separate',last_value FROM body_collation_checks;
+DROP FUNCTION body_collation_pair(text,text);
+CREATE FUNCTION body_collation_echo(first_input text DEFAULT ('a' COLLATE "POSIX"),
+  second_input text DEFAULT ('b' COLLATE "POSIX")) RETURNS text
+  LANGUAGE sql SET search_path=public AS 'SELECT first_input';
+SELECT body_collation_echo(value) = ('a' COLLATE "C") FROM body_collation_texts;
+SELECT body_collation_echo(first_input=>value) = ('a' COLLATE "C") FROM body_collation_texts;
+SELECT body_collation_echo() = ('a' COLLATE "C") FROM body_collation_texts;
+SELECT body_collation_echo('a' COLLATE "C") = ('a' COLLATE "C") FROM body_collation_texts;
+DROP FUNCTION body_collation_echo(text,text);
+DROP FUNCTION body_collation_nested(text);
+DROP FUNCTION body_collation_identity(text);
+DROP PROCEDURE body_collation_procedure(text);
+DROP FUNCTION body_collation_default(text),body_collation_srf(text);
+DROP TABLE body_collation_texts;
+DROP TABLE body_collation_numbers;
+DROP CAST(text AS integer);
+DROP FUNCTION body_collation(text),body_collation_cast(text);
+DROP DOMAIN body_collation_checked;
+DROP TYPE body_collation_choice;
+DROP SEQUENCE body_collation_checks;

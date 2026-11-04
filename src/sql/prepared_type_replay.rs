@@ -21,13 +21,14 @@ pub(super) fn stage_type_record(
     let txid = transaction.txid;
     match operation {
         WalOp::RestoreDomain(payload) | WalOp::RestoreTypedDomain(payload) => {
-            let (slot, definition) =
-                crate::wal::decode_domain_payload(payload).ok_or_else(|| {
+            let (slot, mut definition, inputs) = crate::wal::decode_domain_payload(payload)
+                .ok_or_else(|| {
                     sql_err!(
                         sqlstate::DATA_EXCEPTION,
                         "prepared domain definition is corrupt"
                     )
                 })?;
+            definition.default_inputs = storage.decode_stored_type_inputs(inputs)?;
             stage_domain(storage, transaction, usize::from(slot), &definition)?;
         }
         WalOp::CreateDomain(slot, definition) => {
@@ -181,6 +182,7 @@ pub(super) fn stage_type_record(
             schema,
             name,
             table,
+            relation,
             method,
             columns,
             include_columns,
@@ -213,6 +215,7 @@ pub(super) fn stage_type_record(
                     name: SqlName::parse(name)?,
                     pending_name: None,
                     table: SqlName::parse(table)?,
+                    relation: *relation,
                     table_binding: None,
                     pending_table: None,
                     method: *method,
@@ -237,6 +240,7 @@ pub(super) fn stage_type_record(
                     mutable: *definition,
                     pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
+                    pending_parent_drop_txid: None,
                 },
                 txid,
             )?;
@@ -302,7 +306,14 @@ pub(super) fn stage_type_record(
             for (to, column) in mapping.iter_mut().zip(current.columns()) {
                 *to = Some(column.name);
             }
-            transaction.write_table_definition(storage, target, definition, &mapping, false)?;
+            transaction.write_table_definition(
+                storage,
+                target,
+                definition.clone(),
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
             super::exec::stage_inbound_foreign_key_moves(
                 storage,
                 transaction,
@@ -332,7 +343,14 @@ pub(super) fn stage_type_record(
             for (to, column) in mapping.iter_mut().zip(current.columns()) {
                 *to = Some(column.name);
             }
-            transaction.write_table_definition(storage, target, definition, &mapping, false)?;
+            transaction.write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
         }
         WalOp::CreateTable {
             identity,
@@ -342,7 +360,7 @@ pub(super) fn stage_type_record(
                 crate::wal::TableDefinitionSource::Stored(value) => {
                     TableDefBuilder::from_definition(value)
                 }
-                crate::wal::TableDefinitionSource::Builder(value) => **value,
+                crate::wal::TableDefinitionSource::Builder(value) => (*value).clone(),
             };
             let table = storage.restore_table(
                 *identity,
@@ -398,6 +416,7 @@ fn stage_domain(
                 not_null_name: definition.not_null_name,
                 not_null_identity: definition.not_null_identity,
                 default_expr: definition.default_expr,
+                default_inputs: definition.default_inputs.clone(),
                 checks: definition.checks,
                 n_checks: definition.n_checks,
             },

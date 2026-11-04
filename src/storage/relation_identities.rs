@@ -58,6 +58,13 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
             .chain(self.exclusions().iter().map(|key| key.index_identity))
     }
 
+    pub(crate) fn table_index_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<RelationIdentity>> + '_ {
+        self.implicit_index_identities()
+            .chain(self.has_toast.then_some(self.toast_index_identity))
+    }
+
     pub(crate) fn implicit_index_oid(&self, position: usize) -> i32 {
         self.columns()
             .iter()
@@ -82,6 +89,19 @@ impl super::TableDefBuilder {
     pub(crate) fn implicit_index_identities_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+        self.index_identities_mut(false)
+    }
+
+    pub(crate) fn table_index_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
+        self.index_identities_mut(true)
+    }
+
+    fn index_identities_mut(
+        &mut self,
+        include_toast: bool,
+    ) -> impl Iterator<Item = &mut Option<RelationIdentity>> {
         let columns = &self.columns;
         self.inline_index_identities[..usize::from(self.attributes.count)]
             .iter_mut()
@@ -105,6 +125,7 @@ impl super::TableDefBuilder {
                     .iter_mut()
                     .map(|key| &mut key.index_identity),
             )
+            .chain((include_toast && self.has_toast).then_some(&mut self.toast_index_identity))
     }
 }
 
@@ -113,7 +134,15 @@ impl Storage {
         &self,
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
+        Self::validate_inline_key_names(definition)?;
         self.reserve_constraint_identities(definition)?;
+        definition.has_toast |= definition
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
+        if !definition.has_toast {
+            definition.toast_index_identity = None;
+        }
         for (identity, slot) in definition
             .inline_index_identities
             .iter_mut()
@@ -130,7 +159,7 @@ impl Storage {
                 *identity = None;
             }
         }
-        for identity in definition.implicit_index_identities_mut() {
+        for identity in definition.table_index_identities_mut() {
             if identity.is_none() {
                 *identity = Some(
                     RelationIdentity::parse(
@@ -149,8 +178,9 @@ impl Storage {
         definition: &super::TableDefinition<B>,
         owner_birth: u64,
     ) -> Result<(), SqlError> {
+        Self::validate_inline_key_names(definition)?;
         super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;
-        for (position, identity) in definition.implicit_index_identities().enumerate() {
+        for (position, identity) in definition.table_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
                 sql_err!(
                     sqlstate::DATA_EXCEPTION,
@@ -158,7 +188,7 @@ impl Storage {
                 )
             })?;
             if definition
-                .implicit_index_identities()
+                .table_index_identities()
                 .take(position)
                 .any(|earlier| earlier == Some(identity))
             {
@@ -168,7 +198,7 @@ impl Storage {
                 ));
             }
         }
-        for identity in definition.implicit_index_identities().flatten() {
+        for identity in definition.table_index_identities().flatten() {
             self.catalog_sequence.observe(identity.created_at());
         }
         for identity in definition.constraint_identities().flatten() {
@@ -194,6 +224,12 @@ impl Storage {
             .expect("type catalog lock poisoned");
         let views = self.view_rule_catalog();
         let sequences = self.sequence_catalog();
+        self.validate_restored_key_names(super::RelationNameSources {
+            indexes: &indexes,
+            views: &views.views,
+            sequences: &sequences.definitions,
+            composites: &types.composites,
+        })?;
         for (_, database) in self.databases_visible_to(0) {
             // Inspect one range even when a corrupt manifest claims no reservations.
             let last = saved_sequence.clamp(1, MAX_RELATION_GENERATION);
@@ -232,23 +268,66 @@ impl Storage {
                     }
                     check(identity.created_at)?;
                     let definition = table.definition();
+                    if definition.has_toast {
+                        let toast = definition.toast_index_identity.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "restored TOAST index has no identity"
+                            )
+                        })?;
+                        let owner = super::CatalogPosition::new(slot, identity.created_at)?;
+                        if !indexes.iter().any(|index| {
+                            index.database == database.oid
+                                && index.ddl_state != super::CatalogDdlState::Absent
+                                && index.relation == super::IndexRelationSource::Toast(owner)
+                                && index.created_at == toast.created_at()
+                        }) {
+                            check(toast.created_at())?;
+                        }
+                    }
+                    // An implicit key and its materialized backing catalog
+                    // entry describe one relation only when their key agrees.
+                    let backing = |identity: RelationIdentity,
+                                   name: Option<super::SqlName>,
+                                   columns: &[u16],
+                                   unique: bool| {
+                        indexes.iter().any(|index| {
+                            index.database == database.oid
+                                && index.ddl_state != super::CatalogDdlState::Absent
+                                && index.relation == super::IndexRelationSource::Table
+                                && index.created_at == identity.created_at()
+                                && index.schema == definition.schema
+                                && index.table == definition.name
+                                && Some(index.name) == name
+                                && index.unique == unique
+                                && index.n_cols == columns.len()
+                                && index.columns[..index.n_cols] == *columns
+                                && index.expressions[..index.n_cols]
+                                    .iter()
+                                    .all(Option::is_none)
+                        })
+                    };
                     for (column, _) in definition
                         .columns()
                         .iter()
                         .enumerate()
                         .filter(|(_, column)| column.primary || column.unique)
                     {
-                        check(
-                            definition
-                                .column_index_identity(column)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "restored inline index has no identity"
-                                    )
-                                })?
-                                .created_at(),
-                        )?;
+                        let identity =
+                            definition.column_index_identity(column).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "restored inline index has no identity"
+                                )
+                            })?;
+                        if !backing(
+                            identity,
+                            definition.column_key_name(column),
+                            &[column as u16],
+                            true,
+                        ) {
+                            check(identity.created_at())?;
+                        }
                     }
                     for key in definition.uniques() {
                         let identity = key.index_identity.ok_or_else(|| {
@@ -257,36 +336,20 @@ impl Storage {
                                 "restored unique index has no identity"
                             )
                         })?;
-                        // USING INDEX represents one relation in both catalogs.
-                        let adopted = indexes.iter().any(|index| {
-                            index.database == database.oid
-                                && index.ddl_state != super::CatalogDdlState::Absent
-                                && index.created_at == identity.created_at()
-                                && index.schema == definition.schema
-                                && index.table == definition.name
-                                && index.name == key.name
-                                && index.unique
-                                && index.n_cols == key.n_cols
-                                && index.columns[..index.n_cols] == key.columns[..key.n_cols]
-                                && index.expressions[..index.n_cols]
-                                    .iter()
-                                    .all(Option::is_none)
-                        });
-                        if !adopted {
+                        if !backing(identity, Some(key.name), key.columns(), true) {
                             check(identity.created_at())?;
                         }
                     }
                     for key in definition.exclusions() {
-                        check(
-                            key.index_identity
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "restored exclusion index has no identity"
-                                    )
-                                })?
-                                .created_at(),
-                        )?;
+                        let identity = key.index_identity.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "restored exclusion index has no identity"
+                            )
+                        })?;
+                        if !backing(identity, Some(key.name), key.columns(), false) {
+                            check(identity.created_at())?;
+                        }
                     }
                 }
                 for index in indexes.iter().filter(|index| {

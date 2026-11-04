@@ -80,6 +80,7 @@ pub(crate) fn rename(
             not_null_name: definition.not_null_name,
             not_null_identity: definition.not_null_identity,
             default_expr: definition.default_expr,
+            default_inputs: definition.default_inputs.clone(),
             checks: definition.checks,
             n_checks: definition.n_checks,
         };
@@ -120,12 +121,19 @@ pub(crate) fn rename(
         }
         let (target, selected) = storage.select_table_definition(slot, txn.txid);
         let mut definition = crate::storage::TableDefBuilder::from_definition(&selected);
-        if source.rewrite_table(name, &mut definition, arena)? {
+        if source.rewrite_table(storage, name, &mut definition, arena)? {
             let mut mapping = [None; MAX_COLUMNS];
             for (entry, column) in mapping.iter_mut().zip(definition.columns()) {
                 *entry = Some(column.name);
             }
-            txn.write_table_definition(storage, target, definition, &mapping, false)?;
+            txn.write_table_definition(
+                storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
         }
     }
     for slot in 0..storage.index_count() {
@@ -231,7 +239,8 @@ pub(crate) fn rename(
             body: routine.body,
             creation_path: routine.creation_path,
         };
-        let dependencies = storage.snapshot_routine_dependencies_for(slot, txn.txid, arena)?;
+        let original_definition = definition;
+        let mut dependencies = storage.snapshot_routine_dependencies_for(slot, txn.txid, arena)?;
         let changed = source.rewrite_routine(name, &mut definition, arena)?;
         if changed
             || dependencies
@@ -239,10 +248,38 @@ pub(crate) fn rename(
                 .iter()
                 .any(|dependency| dependency.schema == old || dependency.referenced_schema == old)
         {
+            dependencies.rename_schema(old, name);
+            let inputs = storage.relocate_stored_type_inputs(
+                dependencies.type_inputs(),
+                |section| match section {
+                    crate::storage::StoredInputSection::RoutineBody => Some((
+                        original_definition.body.as_str(),
+                        definition.body.as_str(),
+                        definition.body_kind.bound_sql_kind().ok()?,
+                    )),
+                    crate::storage::StoredInputSection::ParameterDefault(index) => Some((
+                        original_definition
+                            .parameters
+                            .get(usize::from(index))?
+                            .mode
+                            .default_sql()?,
+                        definition
+                            .parameters
+                            .get(usize::from(index))?
+                            .mode
+                            .default_sql()?,
+                        super::super::parser::StoredSqlKind::Expression,
+                    )),
+                    _ => None,
+                },
+                dependencies.view(),
+                arena,
+            )?;
+            dependencies.set_type_inputs(inputs);
             let change = storage.replace_routine(
                 storage.prepare_routine_edit(slot, txn.txid)?,
                 definition,
-                crate::storage::RoutineDependencies::RenameSchema { old, new: name },
+                crate::storage::RoutineDependencies::Replace(dependencies.view()),
                 txn.txid,
             )?;
             txn.record_routine_change(storage, change)?;
@@ -278,6 +315,7 @@ pub(crate) fn rename(
             continue;
         }
         let mut definition = policy.definition_for(txn.txid);
+        let original_definition = definition;
         let mut changed = false;
         for expression in [&mut definition.using, &mut definition.with_check]
             .into_iter()
@@ -297,6 +335,30 @@ pub(crate) fn rename(
         if !changed {
             continue;
         }
+        let inputs = storage.relocate_stored_type_inputs(
+            dependencies.type_inputs(),
+            |section| {
+                let (old, new) = match section {
+                    crate::storage::StoredInputSection::PolicyUsing => (
+                        original_definition.using.as_ref()?,
+                        definition.using.as_ref()?,
+                    ),
+                    crate::storage::StoredInputSection::PolicyCheck => (
+                        original_definition.with_check.as_ref()?,
+                        definition.with_check.as_ref()?,
+                    ),
+                    _ => return None,
+                };
+                Some((
+                    old.as_str(),
+                    new.as_str(),
+                    super::super::parser::StoredSqlKind::Expression,
+                ))
+            },
+            dependencies.view(),
+            arena,
+        )?;
+        dependencies.set_type_inputs(inputs);
         let mut roles = ArenaList::new(arena);
         for role in storage.policy_roles(slot, txn.txid).iter() {
             roles.push(*role).map_err(|_| arena_full())?;

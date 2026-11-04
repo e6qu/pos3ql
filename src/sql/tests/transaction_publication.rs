@@ -201,9 +201,11 @@ fn transaction_admission_sql_retries_keep_one_command_and_do_not_repeat_effects(
         .begin_transaction_installation(writer.transaction.txid, engine.storage.visible_lsn())
         .unwrap();
     for _ in 0..2 {
-        let output = reader.execute(&mut engine, "SELECT nextval('admission_counter')", true);
+        let status =
+            reader.execute_status(&mut engine, "SELECT nextval('admission_counter')", true);
+        assert!(matches!(status, ExecutionStatus::Blocked { .. }));
         assert!(
-            output.is_empty(),
+            reader.send.is_empty(),
             "an unadmitted statement emitted a response"
         );
         assert_eq!(reader.transaction.command_id(), command + 1);
@@ -248,6 +250,7 @@ fn transaction_admission_fast_path_yields_before_effects_and_resumes_once() {
                 true,
                 &reader.arena,
                 &mut reader.transaction,
+                &mut reader.pool,
                 &reader.guc,
                 &mut reader.cursors,
                 &mut responder,
@@ -327,6 +330,7 @@ fn transaction_admission_fast_path_expired_wait_has_no_effects_and_can_roll_back
                 true,
                 &reader.arena,
                 &mut reader.transaction,
+                &mut reader.pool,
                 &reader.guc,
                 &mut reader.cursors,
                 &mut responder,
@@ -393,6 +397,7 @@ fn transaction_admission_fast_path_private_object_wait_resumes_once() {
                 true,
                 &reader.arena,
                 &mut reader.transaction,
+                &mut reader.pool,
                 &reader.guc,
                 &mut reader.cursors,
                 &mut responder,

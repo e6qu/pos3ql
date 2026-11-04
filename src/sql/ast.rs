@@ -1268,9 +1268,8 @@ pub enum Stmt<'a> {
     /// LOAD is intentionally not an application extension point: object-store
     /// durability cannot safely host a session-loaded native library.
     Load(&'a str),
-    /// ALTER <supported object> name OWNER TO role. Every catalog object is
-    /// owned by the one modeled role, but the target and requested role are
-    /// still validated exactly.
+    /// ALTER <supported object> name OWNER TO role, including a validated
+    /// command that leaves the current owner unchanged.
     AlterOwner {
         kind: AlterOwnerKind,
         name: QualName<'a>,
@@ -3099,11 +3098,19 @@ pub enum SetOp {
 pub enum SetTree<'a> {
     Select(&'a Select<'a>),
     Op {
+        /// VALUES and explicit UNION ALL differ in automatic cursor scrolling.
+        syntax: SetOperationSyntax,
         operator: SetOp,
         all: bool,
         left: &'a SetTree<'a>,
         right: &'a SetTree<'a>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperationSyntax {
+    Explicit,
+    Values,
 }
 
 /// A set-operation query plus the trailing ORDER BY / LIMIT / OFFSET that apply
@@ -3430,6 +3437,28 @@ pub struct TableSample<'a> {
     pub repeatable: Option<&'a Expr<'a>>,
 }
 
+/// Source provenance does not participate in SQL expression equality. Runtime
+/// plan keys must extract the actual offset, never compare this annotation.
+#[derive(Debug, Clone, Copy)]
+pub struct SourcePosition(Option<usize>);
+
+impl SourcePosition {
+    pub const UNKNOWN: Self = Self(None);
+    pub const fn new(offset: Option<usize>) -> Self {
+        Self(offset)
+    }
+    pub const fn get(self) -> Option<usize> {
+        self.0
+    }
+}
+
+impl PartialEq for SourcePosition {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SourcePosition {}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TableRef<'a> {
     /// Optional schema qualifier (pg_catalog / information_schema / public).
@@ -3447,6 +3476,8 @@ pub struct TableRef<'a> {
     pub func_argument_names: &'a [Option<&'a str>],
     /// The last function-source argument is an already-packed array.
     pub func_variadic: bool,
+    /// Actual function-name token offset in the owning SQL source.
+    pub func_source_position: SourcePosition,
     /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
     /// reference. The outer source owns the shared alias and ordinality, so a
     /// parsed table source is either one function or one non-empty function
@@ -4283,6 +4314,7 @@ pub struct AggregateIdentity<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateRoutine<'a> {
+    pub source_position: SourcePosition,
     pub name: QualName<'a>,
     pub or_replace: bool,
     pub arguments: &'a [RoutineArgument<'a>],
@@ -4809,6 +4841,7 @@ impl<'a> Returning<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Insert<'a> {
+    pub source_position: SourcePosition,
     pub table: QualName<'a>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
@@ -4862,6 +4895,7 @@ pub struct OnConflictTarget<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Update<'a> {
+    pub source_position: SourcePosition,
     pub table: QualName<'a>,
     pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
@@ -4884,6 +4918,7 @@ pub struct Delete<'a> {
 /// `MERGE INTO target [AS alias] USING source [AS alias] ON cond WHEN ...`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Merge<'a> {
+    pub source_position: SourcePosition,
     pub target: QualName<'a>,
     /// Whether target-row matching includes inheritance descendants. INSERT
     /// actions always name `target` itself, as PostgreSQL specifies.
@@ -5546,6 +5581,21 @@ pub enum CastBinding {
     Builtin,
 }
 
+/// Distinguishes SQL grammar constructs from ordinary namespace-resolved calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Routine,
+    SqlSyntax,
+}
+
+/// The producer determines which encoded value contract the executor checks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundLiteralValue<'a> {
+    CheckedArrayInput(&'a [u8]),
+    /// Encoded by the executor after materializing a catalog default.
+    CachedDefault(&'a [u8]),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5576,23 +5626,36 @@ pub enum Expr<'a> {
     },
     Param(u32),
     Unary {
+        source_position: SourcePosition,
         operator: UnaryOp,
         operand: &'a Expr<'a>,
     },
     Binary {
+        source_position: SourcePosition,
         operator: BinaryOp,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
     },
     Cast {
+        source_position: SourcePosition,
         operand: &'a Expr<'a>,
         type_name: &'a str,
         /// Encoded atttypmod for `::numeric(p,s)` / `::varchar(n)`, or -1.
         type_mod: i32,
         binding: CastBinding,
     },
+    /// Input checking or catalog-default materialization has already run.
+    /// Source syntax is retained for deparsers and dependency capture only.
+    BoundLiteral {
+        value: BoundLiteralValue<'a>,
+        type_oid: i32,
+        type_mod: i32,
+        collation: Option<Collation>,
+        source: &'a Expr<'a>,
+    },
     /// A planned routine default keeps its declared input type without an
-    /// extra conversion. Routine input preparation performs its one coercion.
+    /// extra conversion. Routine input preparation performs its one coercion;
+    /// inserted defaults do not contribute to the enclosing call's collation.
     BoundDefault {
         expression: &'a Expr<'a>,
         type_oid: i32,
@@ -5611,11 +5674,14 @@ pub enum Expr<'a> {
     /// `count(DISTINCT x)`; `order_by` carries an aggregate's `ORDER BY`
     /// (e.g. `string_agg(x, ',' ORDER BY y)`), empty otherwise.
     Call {
+        kind: CallKind,
         name: &'a str,
         /// Captured catalog identity for a stored call; SQL text carries names only.
         bound_oid: Option<i32>,
         /// Null-input behavior selected while preparing this query.
         bound_strict: Option<bool>,
+        /// Byte offset in the exact SQL source owned by this execution plan.
+        source_position: SourcePosition,
         args: &'a [&'a Expr<'a>],
         /// Empty for positional calls; otherwise parallel to `args` and
         /// populated only for named notation parsed after positional inputs.
@@ -5867,12 +5933,30 @@ fn is_nonimmutable_function(name: &str) -> bool {
 }
 
 impl Expr<'_> {
+    pub(crate) const fn source_position(&self) -> SourcePosition {
+        match self {
+            Self::Call {
+                source_position, ..
+            }
+            | Self::Cast {
+                source_position, ..
+            }
+            | Self::Binary {
+                source_position, ..
+            }
+            | Self::Unary {
+                source_position, ..
+            } => *source_position,
+            _ => SourcePosition::UNKNOWN,
+        }
+    }
+
     /// Whether this expression is an aggregate-function call.
     pub fn is_aggregate(&self) -> bool {
         matches!(
             self,
-            Expr::Call { name, .. }
-                if name.starts_with("__json_arrayagg_") || name.starts_with("__json_objectagg_") || matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "xmlagg" | "json_agg" | "json_agg_strict" | "jsonb_agg" | "jsonb_agg_strict" | "json_object_agg" | "json_object_agg_strict" | "json_object_agg_unique" | "json_object_agg_unique_strict" | "jsonb_object_agg" | "jsonb_object_agg_strict" | "jsonb_object_agg_unique" | "jsonb_object_agg_unique_strict" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy" | "range_agg" | "range_intersect_agg")
+            Expr::Call { kind, name, .. }
+                if (*kind == CallKind::SqlSyntax && (name.starts_with("__json_arrayagg_") || name.starts_with("__json_objectagg_"))) || matches!(name.strip_prefix("pg_catalog.").unwrap_or(name), "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "xmlagg" | "json_agg" | "json_agg_strict" | "jsonb_agg" | "jsonb_agg_strict" | "json_object_agg" | "json_object_agg_strict" | "json_object_agg_unique" | "json_object_agg_unique_strict" | "jsonb_object_agg" | "jsonb_object_agg_strict" | "jsonb_object_agg_unique" | "jsonb_object_agg_unique_strict" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy" | "range_agg" | "range_intersect_agg")
         )
     }
 
@@ -5884,11 +5968,9 @@ impl Expr<'_> {
         self.is_aggregate() && matches!(self, Expr::Call { over: None, .. })
     }
 
-    /// True when the expression is a compile-time constant: only literals
-    /// and pure operations over them, with no column/parameter/subquery/
-    /// aggregate reference. PostgreSQL evaluates these at plan time, so
-    /// their errors (division by zero, overflow) surface eagerly.
-    pub fn is_constant(&self) -> bool {
+    /// Whether syntax has only constant inputs. Catalog-aware callers still
+    /// classify function volatility and named-type checks before evaluation.
+    pub fn is_constant(&self, catalog_aware: bool) -> bool {
         /// Set-returning functions expand to multiple rows and are never a
         /// foldable constant.
         fn is_set_returning(name: &str) -> bool {
@@ -5901,7 +5983,8 @@ impl Expr<'_> {
             | Expr::Float(_)
             | Expr::NumericLit(_)
             | Expr::Str(_)
-            | Expr::BitLit(_) => true,
+            | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. } => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. }
             | Expr::RecursiveState { .. }
@@ -5914,10 +5997,11 @@ impl Expr<'_> {
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
             | Expr::DefaultMarker => false,
-            // User-defined casts retain runtime type/domain validation. Builtin
-            // catalog identifiers use the catalog-aware constant evaluator.
+            // A catalog-free probe cannot classify a named type's input or
+            // checks. Catalog-aware evaluation decides whether these can fold.
             Expr::Cast { type_name, .. }
-                if crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
+                if !catalog_aware
+                    && crate::sql::types::ColType::from_sql_name(type_name).is_none() =>
             {
                 false
             }
@@ -5928,28 +6012,42 @@ impl Expr<'_> {
                 ..
             }
             | Expr::Collate { operand, .. }
-            | Expr::IsNull { operand, .. } => operand.is_constant(),
-            Expr::Binary { left, right, .. } => left.is_constant() && right.is_constant(),
+            | Expr::IsNull { operand, .. } => operand.is_constant(catalog_aware),
+            Expr::Binary { left, right, .. } => {
+                left.is_constant(catalog_aware) && right.is_constant(catalog_aware)
+            }
             Expr::InList { operand, list, .. } => {
-                operand.is_constant() && list.iter().all(|e| e.is_constant())
+                operand.is_constant(catalog_aware)
+                    && list.iter().all(|e| e.is_constant(catalog_aware))
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.is_constant(catalog_aware)
+                    && pattern.is_constant(catalog_aware)
+                    && escape.is_none_or(|expression| expression.is_constant(catalog_aware))
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
-            } => operand.is_constant() && pattern.is_constant(),
+            } => operand.is_constant(catalog_aware) && pattern.is_constant(catalog_aware),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
             } => {
-                operand.map(|o| o.is_constant()).unwrap_or(true)
+                operand
+                    .map(|o| o.is_constant(catalog_aware))
+                    .unwrap_or(true)
                     && whens
                         .iter()
-                        .all(|(c, r)| c.is_constant() && r.is_constant())
-                    && otherwise.map(|e| e.is_constant()).unwrap_or(true)
+                        .all(|(c, r)| c.is_constant(catalog_aware) && r.is_constant(catalog_aware))
+                    && otherwise
+                        .map(|e| e.is_constant(catalog_aware))
+                        .unwrap_or(true)
             }
             // Aggregates, windows, set-returning functions, and non-immutable
             // calls are never constants. In particular, probing a volatile
@@ -5961,17 +6059,23 @@ impl Expr<'_> {
                     && !self.is_aggregate()
                     && !is_set_returning(name)
                     && !is_nonimmutable_function(name)
-                    && args.iter().all(|a| a.is_constant())
+                    && args.iter().all(|a| a.is_constant(catalog_aware))
             }
-            Expr::Array(items) => items.iter().all(|e| e.is_constant()),
-            Expr::Subscript { base, index } => base.is_constant() && index.is_constant(),
+            Expr::Array(items) => items.iter().all(|e| e.is_constant(catalog_aware)),
+            Expr::Subscript { base, index } => {
+                base.is_constant(catalog_aware) && index.is_constant(catalog_aware)
+            }
             Expr::Slice { base, lower, upper } => {
-                base.is_constant()
-                    && lower.is_none_or(|e| e.is_constant())
-                    && upper.is_none_or(|e| e.is_constant())
+                base.is_constant(catalog_aware)
+                    && lower.is_none_or(|e| e.is_constant(catalog_aware))
+                    && upper.is_none_or(|e| e.is_constant(catalog_aware))
             }
-            Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => base.is_constant(),
-            Expr::AnyAll { operand, array, .. } => operand.is_constant() && array.is_constant(),
+            Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
+                base.is_constant(catalog_aware)
+            }
+            Expr::AnyAll { operand, array, .. } => {
+                operand.is_constant(catalog_aware) && array.is_constant(catalog_aware)
+            }
         }
     }
 
@@ -5988,6 +6092,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6024,9 +6129,16 @@ impl Expr<'_> {
                 operand.contains_call() || list.iter().any(|e| e.contains_call())
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.contains_call()
+                    || pattern.contains_call()
+                    || escape.is_some_and(|expression| expression.contains_call())
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => operand.contains_call() || pattern.contains_call(),
             Expr::Case {
@@ -6070,6 +6182,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6107,9 +6220,16 @@ impl Expr<'_> {
                 operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.contains_subquery()
+                    || pattern.contains_subquery()
+                    || escape.is_some_and(|expression| expression.contains_subquery())
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => operand.contains_subquery() || pattern.contains_subquery(),
             Expr::Case {
@@ -6157,6 +6277,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::Column { .. }
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
@@ -6200,9 +6321,15 @@ impl Expr<'_> {
                 .find_function(matches)
                 .or_else(|| list.iter().find_map(|e| e.find_function(matches))),
             Expr::Like {
-                operand, pattern, ..
-            }
-            | Expr::Match {
+                operand,
+                pattern,
+                escape,
+                ..
+            } => operand
+                .find_function(matches)
+                .or_else(|| pattern.find_function(matches))
+                .or_else(|| escape.and_then(|expression| expression.find_function(matches))),
+            Expr::Match {
                 operand, pattern, ..
             } => operand
                 .find_function(matches)
@@ -6237,6 +6364,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
@@ -6286,9 +6414,18 @@ impl Expr<'_> {
                 list.iter().for_each(|e| e.for_each_column(f));
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.for_each_column(f);
+                pattern.for_each_column(f);
+                if let Some(expression) = escape {
+                    expression.for_each_column(f);
+                }
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => {
                 operand.for_each_column(f);
@@ -6327,6 +6464,7 @@ impl Expr<'_> {
             | Expr::NumericLit(_)
             | Expr::Str(_)
             | Expr::BitLit(_)
+            | Expr::BoundLiteral { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
@@ -6380,9 +6518,18 @@ impl Expr<'_> {
                     .for_each(|expression| expression.for_each_column_reference(f));
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.for_each_column_reference(f);
+                pattern.for_each_column_reference(f);
+                if let Some(expression) = escape {
+                    expression.for_each_column_reference(f);
+                }
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => {
                 operand.for_each_column_reference(f);

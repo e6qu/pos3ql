@@ -54,9 +54,10 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
             let first_change = storage
                 .write_table_def(
                     storage.select_table_definition(table, 7).0,
-                    definition,
+                    definition.clone(),
                     &mapping,
                     true,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             let pending = storage.index_visible_to(slot, 7).unwrap();
@@ -71,6 +72,7 @@ fn table_name_publication_remaps_index_keys_and_includes_before_rebinding() {
                     definition,
                     &mapping,
                     true,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             assert_eq!(
@@ -216,9 +218,10 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
         let first_change = storage
             .write_table_def(
                 storage.select_table_definition(created, 7).0,
-                updated,
+                updated.clone(),
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         updated.name = SqlName::parse("second_lookup").unwrap();
@@ -228,6 +231,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
                 updated,
                 &[None; MAX_COLUMNS],
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         assert_eq!(storage.find_visible("public", "private_lookup", 7), None);
@@ -281,6 +285,7 @@ fn table_name_lookup_tracks_create_rename_rollback_and_drop_visibility() {
                 committed,
                 &mapping,
                 false,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap();
         assert_eq!(

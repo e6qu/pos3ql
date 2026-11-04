@@ -152,7 +152,7 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
         c.cursor_bytes = 4096;
         pos3ql::sql::cursor::CursorPool::new(&c, budget).unwrap()
     };
-    let mut guc = pos3ql::sql::guc::GucState::new();
+    let guc = pos3ql::sql::guc::GucState::new();
     let mut resp = Responder::new(&mut buf);
     pos3ql::mem::guard::forbid_alloc(|| {
         engine.execute_simple(
@@ -161,7 +161,7 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
             &mut txn,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut resp,
             1,
         )

@@ -1,0 +1,89 @@
+name: Routine input oracle
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - '.github/workflows/routine-input-oracle.yml'
+      - 'tests/external/routine-input-oracle.sql'
+      - 'tests/external/routine-input-oracle.py'
+      - 'tests/external/differential/205_planner_checked_inputs.sql'
+      - 'tests/external/differential/206_runtime_input_collations.sql'
+      - 'tests/external/differential/207_plpgsql_input_instances.sql'
+      - 'tests/external/differential/208_routine_parameter_collations.sql'
+      - 'tests/external/differential/214_owner_role_inheritance.sql'
+      - 'tests/external/differential/215_relation_input_granularity.sql'
+      - 'tests/external/differential/216_support_function_plan_dependencies.sql'
+      - 'tests/external/differential/217_analyze_plan_invalidations.sql'
+      - 'tests/external/differential/213_cast_type_modifiers.sql'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: routine-input-oracle-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Focused source checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Type-check every target before linting
+        run: cargo check --locked --all-targets --jobs 1
+      - name: Lint all Rust targets while required native gates run separately
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo clippy --locked --all-targets --jobs 1 -- -Dwarnings
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: '--lc-collate=C --lc-ctype=C --encoding=UTF8 --set=max_prepared_transactions=4'
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Record PostgreSQL input planning behavior
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          mkdir oracle-evidence
+          git rev-parse HEAD > oracle-evidence/revision.txt
+          docker inspect "$POSTGRES_CONTAINER" --format '{{.Image}}' > oracle-evidence/image.txt
+          sha256sum tests/external/routine-input-oracle.sql tests/external/routine-input-oracle.py > oracle-evidence/inputs.sha256
+          docker exec "$POSTGRES_CONTAINER" postgres --version > oracle-evidence/version.txt
+          docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
+            < tests/external/routine-input-oracle.sql 2>&1 | tee oracle-evidence/postgres.log
+          python3 tests/external/routine-input-oracle.py "$POSTGRES_CONTAINER" oracle-evidence/sessions.jsonl
+          for fixture in tests/external/differential/205_planner_checked_inputs.sql tests/external/differential/206_runtime_input_collations.sql tests/external/differential/207_plpgsql_input_instances.sql tests/external/differential/208_routine_parameter_collations.sql tests/external/differential/213_cast_type_modifiers.sql tests/external/differential/214_owner_role_inheritance.sql tests/external/differential/215_relation_input_granularity.sql tests/external/differential/216_support_function_plan_dependencies.sql tests/external/differential/217_analyze_plan_invalidations.sql; do
+            sha256sum "$fixture" >> oracle-evidence/inputs.sha256
+            docker exec -i "$POSTGRES_CONTAINER" psql -U postgres -X -a -f - \
+              < "$fixture" 2>&1 | tee "oracle-evidence/$(basename "$fixture").log"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routine-input-oracle-${{ github.event.pull_request.head.sha }}
+          path: oracle-evidence
+          retention-days: 7

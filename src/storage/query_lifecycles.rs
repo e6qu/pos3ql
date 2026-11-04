@@ -83,7 +83,7 @@ impl RulePublication {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ViewAlterUndo {
     pub(super) target: CatalogEditTarget,
     pub(super) prior: Option<PendingViewDefinition>,
@@ -91,7 +91,7 @@ pub(crate) struct ViewAlterUndo {
 }
 
 impl ViewAlterUndo {
-    pub(crate) fn slot(self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         self.target.slot()
     }
 }
@@ -100,14 +100,14 @@ impl ViewAlterUndo {
     clippy::large_enum_variant,
     reason = "View undo stays inline in the startup-reserved transaction log"
 )]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum ViewPublication {
     Created(CatalogDdlUndo),
     Altered(ViewAlterUndo),
 }
 
 impl ViewPublication {
-    pub(crate) fn slot(self) -> usize {
+    pub(crate) fn slot(&self) -> usize {
         match self {
             Self::Created(undo) => undo.slot(),
             Self::Altered(undo) => undo.slot(),
@@ -297,6 +297,7 @@ impl Storage {
             persistence: definition.persistence,
             return_rule: rule_slot as u16,
             options: definition.options,
+            default_inputs: definition.default_inputs.clone(),
             columns: definition.columns,
             ownership: if replacing {
                 view.ownership
@@ -819,6 +820,7 @@ impl Storage {
             && let super::RuleTarget::View(view) = rule.definition.target
             && (owners.catalog.views[usize::from(view)]
                 .pending_definition
+                .as_ref()
                 .is_some_and(|pending| pending.txid == target.transaction)
                 || owners.catalog.views[usize::from(view)]
                     .ddl_state
@@ -889,7 +891,7 @@ impl Storage {
         publication: ViewPublication,
         transaction: u32,
     ) -> Result<(), SqlError> {
-        let (source, owner) = match publication {
+        let (source, owner) = match &publication {
             ViewPublication::Created(undo) => (undo.source, undo.transaction),
             ViewPublication::Altered(undo) => (undo.target.source, undo.target.transaction),
         };
@@ -1011,10 +1013,12 @@ impl Storage {
             if matches(0)
                 || view
                     .pending_definition
+                    .as_ref()
                     .is_some_and(|pending| matches(pending.txid))
             {
                 blocked = view
                     .pending_definition
+                    .as_ref()
                     .map(|pending| pending.txid)
                     .or_else(|| view.ddl_state.pending_txid())
                     .filter(|owner| *owner != transaction);
@@ -1401,6 +1405,12 @@ impl Storage {
         definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
+        self.validate_view_default_inputs(
+            &definition.columns,
+            &definition.default_inputs,
+            transaction,
+            owners.types.as_deref(),
+        )?;
         super::validate_stored_search_path(&definition.query.creation_path)?;
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
         let current = owners.catalog.views[slot].clone();
@@ -1444,6 +1454,7 @@ impl Storage {
             schema: current.schema_for(transaction),
             name: current.name_for(transaction),
             options: definition.options,
+            default_inputs: definition.default_inputs.clone(),
             columns: definition.columns,
         });
         Ok(ViewAlterUndo {
@@ -1477,13 +1488,14 @@ impl Storage {
         );
         let slot = self.validate_view_edit(&owners.catalog, target, transaction)?;
         let current = owners.catalog.views[slot].clone();
-        let prior = current.pending_definition;
-        let mut pending = prior.unwrap_or(PendingViewDefinition {
+        let prior = current.pending_definition.clone();
+        let mut pending = prior.clone().unwrap_or(PendingViewDefinition {
             txid: transaction,
             version: current.version,
             schema: current.schema,
             name: current.name,
             options: current.options,
+            default_inputs: current.default_inputs.clone(),
             columns: current.columns,
         });
         let before = (pending.schema, pending.name);
@@ -1505,12 +1517,10 @@ impl Storage {
             (pending.schema, pending.name),
             transaction,
         );
+        let version = pending.version;
         owners.catalog.views[slot].pending_definition = Some(pending);
         Ok(ViewAlterUndo {
-            target: CatalogEditTarget {
-                version: pending.version,
-                ..target
-            },
+            target: CatalogEditTarget { version, ..target },
             prior,
             return_rule: None,
         })
@@ -1550,10 +1560,44 @@ impl Storage {
         target: CatalogEditTarget,
         columns: super::ViewColumns,
         transaction: u32,
+        default_inputs: super::StoredTypeInputs,
     ) -> Result<ViewAlterUndo, SqlError> {
+        {
+            let catalog = self
+                .type_catalog
+                .lock()
+                .expect("type catalog lock poisoned");
+            self.validate_view_default_inputs(
+                &columns,
+                &default_inputs,
+                transaction,
+                Some(&catalog),
+            )?;
+        }
         self.stage_view_metadata(target, transaction, |definition| {
-            definition.columns = columns
+            definition.columns = columns;
+            definition.default_inputs = default_inputs;
         })
+    }
+
+    pub(super) fn validate_view_default_inputs(
+        &self,
+        columns: &super::ViewColumns,
+        inputs: &super::StoredTypeInputs,
+        transaction: u32,
+        catalog: Option<&super::TypeCatalog>,
+    ) -> Result<(), SqlError> {
+        self.validate_definition_type_inputs(
+            inputs,
+            |section| {
+                let super::StoredInputSection::ViewDefault(attribute) = section else {
+                    return None;
+                };
+                columns.default_sql(usize::from(attribute).checked_sub(1)?)
+            },
+            transaction,
+            catalog,
+        )
     }
 
     fn validate_view_comment_move(
@@ -1656,6 +1700,7 @@ impl Storage {
         current.name = pending.name;
         current.options = pending.options;
         current.columns = pending.columns;
+        current.default_inputs = pending.default_inputs;
         current.version = pending.version;
         current.pending_definition = None;
         for comment in owners
@@ -2012,10 +2057,10 @@ mod tests {
         let original = create(&storage, "original_view", 7);
         let selected = storage.prepare_view_edit(original.slot(), 7).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
+            storage.finish_view_publication(original.clone(), CatalogDdlDecision::Rollback);
             let replacement = create(&storage, "replacement_view", 9);
             assert_eq!(replacement.slot(), original.slot());
-            storage.finish_view_publication(original, CatalogDdlDecision::Commit);
+            storage.finish_view_publication(original.clone(), CatalogDdlDecision::Commit);
             storage.finish_view_publication(original, CatalogDdlDecision::Rollback);
             assert!(storage.find_view("public", "replacement_view", 9).is_some());
             assert!(storage.find_view("public", "replacement_view", 0).is_none());
@@ -2036,9 +2081,10 @@ mod tests {
     fn query_lifecycle_view_edits_and_undo_follow_one_revision() {
         let storage = fixture(1);
         let created = create(&storage, "original_view", 7);
+        let created_slot = created.slot();
         storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
-            let selected = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let selected = storage.prepare_view_edit(created_slot, 9).unwrap();
             let first = storage
                 .stage_view_rename(selected, name("first_view"), 9)
                 .unwrap();
@@ -2049,21 +2095,21 @@ mod tests {
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let current = storage.prepare_view_edit(created_slot, 9).unwrap();
             let second = storage
                 .stage_view_rename(current, name("second_view"), 9)
                 .unwrap();
-            storage.rollback_view_alter(first);
+            storage.rollback_view_alter(first.clone());
             assert!(storage.find_view("public", "second_view", 9).is_some());
-            storage.rollback_view_alter(second);
+            storage.rollback_view_alter(second.clone());
             assert!(storage.find_view("public", "first_view", 9).is_some());
             storage.rollback_view_alter(first);
             assert!(storage.find_view("public", "original_view", 9).is_some());
-            let current = storage.prepare_view_edit(created.slot(), 9).unwrap();
+            let current = storage.prepare_view_edit(created_slot, 9).unwrap();
             let third = storage
                 .stage_view_rename(current, name("third_view"), 9)
                 .unwrap();
-            storage.rollback_view_alter(second);
+            storage.rollback_view_alter(second.clone());
             storage.commit_view_alter(second);
             assert!(storage.find_view("public", "third_view", 9).is_some());
             storage.commit_view_alter(third);
@@ -2075,6 +2121,7 @@ mod tests {
     fn query_lifecycle_view_drop_undo_cannot_finalize_a_later_drop() {
         let mut storage = fixture(1);
         let created = create(&storage, "original_view", 7);
+        let created_slot = created.slot();
         storage.finish_view_publication(created, CatalogDdlDecision::Commit);
         crate::mem::guard::forbid_alloc(|| {
             let first = storage
@@ -2092,7 +2139,7 @@ mod tests {
             assert!(storage.find_view("public", "original_view", 9).is_none());
             storage.commit_view_drop(second);
             let replacement = create(&storage, "replacement_view", 11);
-            assert_eq!(replacement.slot(), created.slot());
+            assert_eq!(replacement.slot(), created_slot);
             storage.commit_view_drop(second);
             storage.rollback_view_drop(second);
             assert!(
@@ -2113,7 +2160,7 @@ mod tests {
         let mut second = fixture(1);
         let replacement = create(&second, "replacement_view", 11);
         crate::mem::guard::forbid_alloc(|| {
-            second.finish_view_publication(selected, CatalogDdlDecision::Commit);
+            second.finish_view_publication(selected.clone(), CatalogDdlDecision::Commit);
             second.finish_view_publication(selected, CatalogDdlDecision::Rollback);
             assert_eq!(
                 second
@@ -2137,10 +2184,11 @@ mod tests {
     fn query_lifecycle_rule_edits_and_finalizers_reject_replaced_sources() {
         let mut storage = fixture(2);
         let view = create(&storage, "rule_parent", 7);
+        let view_slot = view.slot();
         storage.finish_view_publication(view, CatalogDdlDecision::Commit);
         let definition = super::super::RuleDefinition {
             name: name("first_rule"),
-            target: super::super::RuleTarget::View(view.slot() as u16),
+            target: super::super::RuleTarget::View(view_slot as u16),
             event: super::super::RewriteEvent::Insert,
             ..super::super::RuleDefinition::EMPTY
         };

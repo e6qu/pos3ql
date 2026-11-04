@@ -93,6 +93,7 @@ mod tests {
                 definition,
                 &mapping,
                 rewrite,
+                crate::storage::ColumnSet::EMPTY,
             )
             .unwrap()
     }
@@ -461,7 +462,13 @@ mod tests {
                 let mut mapping = [None; crate::storage::MAX_COLUMNS];
                 mapping[0] = Some(definition.columns[0].name);
                 let change = storage
-                    .write_table_def(target, definition, &mapping, true)
+                    .write_table_def(
+                        target,
+                        definition,
+                        &mapping,
+                        true,
+                        crate::storage::ColumnSet::EMPTY,
+                    )
                     .unwrap();
                 let exhausted = if dependent_exhausted { other } else { table };
                 storage.tables[exhausted].publication().generation = u64::MAX;

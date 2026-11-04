@@ -452,7 +452,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
         CommentSet { .. } | CommentIdentityChanged { .. } => {
             &["pg_description", "pg_shdescription"]
         }
-        SequenceReset { .. } | SystemSettingChanged { .. } => &[],
+        SystemSettingChanged { .. } => &[],
     }
 }
 

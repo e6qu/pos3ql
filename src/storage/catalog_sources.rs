@@ -540,6 +540,10 @@ pub(super) struct CatalogObjectIdentity {
 }
 
 impl CatalogObjectIdentity {
+    pub(super) fn created_at(self) -> u64 {
+        self.created_at
+    }
+
     pub(super) fn slot(self) -> CatalogObjectSlot {
         self.slot
     }

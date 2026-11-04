@@ -109,32 +109,54 @@ pub(crate) fn dispatch<'a>(
     ) {
         return None;
     }
-    // These names are overloaded with text functions. Route them here only
-    // when the resolved input family is binary; the text dispatcher remains
-    // responsible for ordinary strings and unknown literals.
+    // Resolve the written expression through the selected catalog contract:
+    // qualified nested calls can produce binary values without a binary cast.
+    let input_type = if matches!(
+        name,
+        "substr"
+            | "substring"
+            | "overlay"
+            | "position"
+            | "btrim"
+            | "ltrim"
+            | "rtrim"
+            | "reverse"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "bytea"
+    ) {
+        match args
+            .first()
+            .map(|argument| super::super::expression_type_identity(argument, row, hooks))
+            .transpose()
+        {
+            Ok(Some(super::super::ExpressionTypeIdentity::Known(oid))) => ColType::from_oid(oid)
+                .or_else(|| {
+                    hooks
+                        .catalog
+                        .and_then(|catalog| catalog.domain_base_type(oid))
+                }),
+            Ok(_) => None,
+            Err(error) => return Some(Err(error)),
+        }
+    } else {
+        None
+    };
+    // Unknown literals remain the text dispatcher's responsibility.
     if matches!(
         name,
         "substr" | "substring" | "overlay" | "position" | "btrim" | "ltrim" | "rtrim" | "reverse"
-    ) && !matches!(
-        args.first()
-            .and_then(|argument| super::super::static_type_pub(argument, row)),
-        Some(ColType::Bytea | ColType::Bit { .. })
-    ) {
+    ) && !matches!(input_type, Some(ColType::Bytea | ColType::Bit { .. }))
+    {
         return None;
     }
-    if matches!(name, "int2" | "int4" | "int8")
-        && !matches!(
-            args.first()
-                .and_then(|argument| super::super::static_type_pub(argument, row)),
-            Some(ColType::Bytea)
-        )
-    {
+    if matches!(name, "int2" | "int4" | "int8") && !matches!(input_type, Some(ColType::Bytea)) {
         return None;
     }
     if name == "bytea"
         && !matches!(
-            args.first()
-                .and_then(|argument| super::super::static_type_pub(argument, row)),
+            input_type,
             Some(ColType::Int2 | ColType::Int4 | ColType::Int8)
         )
     {

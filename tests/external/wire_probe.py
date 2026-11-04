@@ -978,7 +978,9 @@ def test_named_portals_cannot_be_silently_rebound():
             break
     check(
         "named portal: duplicate Bind is 42P03",
-        has_sqlstate(duplicate, "42P03") and duplicate[-1] == (b"Z", b"T"),
+        has_sqlstate(duplicate, "42P03")
+        and any(b'Mcursor "duplicate_portal" already exists\x00' in payload for kind, payload in duplicate if kind == b"E")
+        and duplicate[-1] == (b"Z", b"E"),
         duplicate,
     )
     execute = frontend_message(b"E", b"duplicate_portal\x00\x00\x00\x00\x00")
@@ -990,10 +992,20 @@ def test_named_portals_cannot_be_silently_rebound():
         if item[0] == b"Z":
             break
     check(
-        "named portal: failed rebind retains the original portal",
-        first_text_row(original) == "7" and not any(kind == b"E" for kind, _ in original),
+        "named portal: duplicate Bind leaves an aborted transaction",
+        has_sqlstate(original, "25P02") and original[-1] == (b"Z", b"E"),
         original,
     )
+    rollback = simple_query(s, "ROLLBACK")
+    check("named portal: ROLLBACK recovers after duplicate Bind", rollback[-1] == (b"Z", b"I"), rollback)
+    s.sendall(execute + frontend_message(b"S"))
+    gone = []
+    while True:
+        item = read_message(s)
+        gone.append(item)
+        if item[0] == b"Z":
+            break
+    check("named portal: ROLLBACK releases the failed portal", has_sqlstate(gone, "34000") and gone[-1] == (b"Z", b"I"), gone)
     s.close()
 
 

@@ -52,4 +52,4 @@ jobs:
       - name: Check and lint all Rust targets before test matrices
         env:
           RUSTFLAGS: -Dwarnings
-        run: cargo clippy --locked --all-targets --jobs 1 -- -Dwarnings
+        run: cargo clippy --locked --all-targets --keep-going --jobs 1 -- -Dwarnings

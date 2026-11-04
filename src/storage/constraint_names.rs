@@ -6,7 +6,7 @@ use crate::sql_err;
 use crate::util::StackStr;
 use core::fmt::Write;
 
-fn generated(left: &str, right: Option<&str>, label: &str) -> Result<SqlName, SqlError> {
+pub(crate) fn generated(left: &str, right: Option<&str>, label: &str) -> Result<SqlName, SqlError> {
     let right = right.unwrap_or("");
     let overhead = label.len() + 1 + usize::from(!right.is_empty());
     let available = 63usize.checked_sub(overhead).ok_or_else(|| {
@@ -93,6 +93,10 @@ pub(crate) fn table(definition: &mut super::TableDefBuilder) -> Result<(), SqlEr
                 |name| {
                     definition.not_null_names[..definition.n_columns].contains(&Some(name))
                         || definition
+                            .inline_key_names()
+                            .iter()
+                            .any(|key| key.name == name)
+                        || definition
                             .checks()
                             .iter()
                             .any(|constraint| constraint.name == name)
@@ -117,9 +121,13 @@ pub(crate) fn table(definition: &mut super::TableDefBuilder) -> Result<(), SqlEr
             definition.not_null_names[position] = Some(name);
         } else if let Some(name) = definition.not_null_names[position]
             && (definition
-                .checks()
+                .inline_key_names()
                 .iter()
-                .any(|constraint| constraint.name == name)
+                .any(|key| key.name == name)
+                || definition
+                    .checks()
+                    .iter()
+                    .any(|constraint| constraint.name == name)
                 || definition
                     .uniques()
                     .iter()
@@ -177,6 +185,7 @@ pub(crate) fn remap_table<B: super::DefinitionBacking>(
         }
     }
     definition.not_null_names = names;
+    definition.retain_active_inline_key_names()?;
     table(definition)?;
     // Later admission may remap the same draft again; these names are canonical.
     definition.not_null_name_edits = super::ColumnSet::all(definition.n_columns);
@@ -243,7 +252,7 @@ mod tests {
         original.columns[1].not_null = NotNullOrigin::Local;
         table(&mut original).unwrap();
         let retained_name = original.not_null_names[1];
-        let mut replacement = original;
+        let mut replacement = original.clone();
         replacement.name = SqlName::parse("renamed").unwrap();
         replacement.columns[0] = original.columns[1];
         replacement.columns[1] = ColumnMeta {

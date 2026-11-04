@@ -65,6 +65,7 @@ CASES = [
 # binary just as reliably as comparing raw frames, while also exercising all
 # subtype codecs clients actually use.
 RESULT_CASES = [
+    "SELECT current_schemas(true), current_schemas(false), current_schemas(NULL), current_schemas('true')",
     "SELECT overlay('\\x001122'::bytea PLACING '\\xaabb'::bytea FROM 2)",
     "SELECT set_bit(B'1001'::varbit, 1, 1)",
     "SELECT string_agg(value, delimiter ORDER BY ordinal) FROM "

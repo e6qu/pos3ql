@@ -2,8 +2,8 @@
 
 use super::{
     AccessClass, AccessObject, CatalogDdlState, DependencyClass, Ownership,
-    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableDefBuilder, TableSerialState,
-    TableStatistics, current_database, table_definitions,
+    RelationCumulativeStatistics, SqlError, Storage, TableDef, TableDefBuilder, TableStatistics,
+    current_database, table_definitions,
 };
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -60,6 +60,18 @@ pub(super) fn allocate(
         {
             drop(names);
             return Err(storage.catalog_ddl_wait_error(txid, other, def.name.as_str()));
+        }
+        if matches!(allocation, super::CatalogAllocation::New) {
+            if storage.implicit_index_name_taken(def.schema, def.name, transaction, None)? {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    def.name.as_str()
+                ));
+            }
+            def.inline_key_names.fill(super::InlineKeyName::EMPTY);
+            def.n_inline_key_names = 0;
+            storage.prepare_inline_key_names(&mut def, transaction, None)?;
         }
         let (slot, lifecycle) = match allocation {
             super::CatalogAllocation::New => {
@@ -179,7 +191,9 @@ pub(super) fn allocate(
                 for identity in def.constraint_identities_mut() {
                     *identity = None;
                 }
+                def.toast_index_identity = None;
                 def.inline_index_identities.fill(None);
+                def.inline_constraint_identities.fill(None);
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }
@@ -192,7 +206,14 @@ pub(super) fn allocate(
         if matches!(allocation, super::CatalogAllocation::Restore(_)) {
             storage.catalog_sequence.observe(created_at);
         }
+        storage.validate_table_type_inputs(&def, transaction, Some(&source))?;
         let definition = def.freeze(&storage.metadata_pool)?;
+        let statistics_admission = storage.reserve_implicit_index_statistics(
+            slot,
+            current_database(),
+            created_at,
+            &definition,
+        )?;
         drop(state);
         // A reused slot must not keep the dropped table's value indexes.
         storage.release_enforcers(slot);
@@ -234,6 +255,7 @@ pub(super) fn allocate(
                 },
             },
         );
+        statistics_admission.commit();
         publication.row_layout = super::row_layout::RowLayout::initial();
         publication.generation = generation;
         publication.dirty = true;
@@ -243,12 +265,6 @@ pub(super) fn allocate(
         table
             .statistics
             .set_image(TableStatistics::EMPTY, Some(false), true);
-        // A reused slot must not inherit the dropped table's sequences or
-        // spilled rows.
-        *table
-            .serial
-            .lock()
-            .expect("table serial state lock poisoned") = TableSerialState::EMPTY;
         table.spill_generations.write().clear();
         let schema = {
             let definition = table.definition();

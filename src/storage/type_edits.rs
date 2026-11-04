@@ -123,6 +123,12 @@ impl TypeDdlUndo {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DomainDependency {
+    Inheritance,
+    Containment,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TypeDdlDecision {
     Commit,
@@ -499,6 +505,7 @@ impl super::Storage {
         &self,
         mut slot: usize,
         target: usize,
+        dependency: DomainDependency,
         transaction: u32,
     ) -> Result<bool, SqlError> {
         let catalog = self
@@ -512,11 +519,20 @@ impl super::Storage {
                 return Ok(true);
             }
             let definition = &catalog.domains[slot];
-            let parent = definition
+            let pending = definition
                 .pending_definition
                 .as_ref()
-                .filter(|pending| pending.txid == transaction)
-                .map_or(definition.base_domain, |pending| pending.spec.base_domain);
+                .filter(|pending| pending.txid == transaction);
+            let inherited =
+                pending.map_or(definition.base_domain, |pending| pending.spec.base_domain);
+            let parent = match dependency {
+                DomainDependency::Inheritance => inherited,
+                DomainDependency::Containment => inherited.or_else(|| {
+                    pending.map_or(definition.base_user_type, |pending| {
+                        pending.spec.base_user_type
+                    })
+                }),
+            };
             let Some(parent) = parent else {
                 return Ok(false);
             };
@@ -533,6 +549,9 @@ impl super::Storage {
                     )
                 })?;
             let NamedTypeSlot::Domain(parent) = parent.identity.slot() else {
+                if dependency == DomainDependency::Containment && inherited.is_none() {
+                    return Ok(false);
+                }
                 return Err(sql_err!(
                     sqlstate::WRONG_OBJECT_TYPE,
                     "domain parent source is not a domain"
@@ -749,6 +768,7 @@ impl super::Storage {
                 catalog.domains[slot].ddl_state = next;
                 if next == State::Absent {
                     catalog.domains[slot].pending_definition = None;
+                    catalog.domains[slot].default_inputs = super::StoredTypeInputs::EMPTY;
                 }
                 &mut catalog.domains[slot].ownership
             }
@@ -932,6 +952,7 @@ mod tests {
                         not_null_name: None,
                         not_null_identity: None,
                         default_expr: None,
+                        default_inputs: super::super::StoredTypeInputs::EMPTY,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
                     },

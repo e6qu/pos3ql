@@ -67,21 +67,23 @@ fn cast_properties(
     target: i32,
     binding: CastBinding,
     type_mod: i32,
-) -> ProcedureProperties {
+    context: crate::sql::eval::DefinedCastContext,
+) -> Result<ProcedureProperties, SqlError> {
     if source == target && type_mod < 0 && ColType::from_oid(target).is_some() {
-        return ProcedureProperties::BINARY;
+        return Ok(ProcedureProperties::BINARY);
     }
     let mut properties = if binding == CastBinding::Resolve
-        && let Some((_, cast)) = storage.cast_for_oids(source, target, txid)
-    {
-        match cast.method {
-            crate::storage::CastMethod::Function(function) => {
-                routine_properties(storage, txid, function)
-            }
-            crate::storage::CastMethod::Binary => ProcedureProperties::BINARY,
-            crate::storage::CastMethod::InOut => ProcedureProperties::from_builtin(
-                crate::sql::catalog::builtin_inout_cast_properties(source, target),
-            ),
+        && let Some(selected) = super::selected_cast(
+            storage,
+            txid,
+            source,
+            target,
+            context,
+            super::CastSelectionPhase::Analysis,
+        )? {
+        ProcedureProperties {
+            volatile: selected.volatility == RoutineVolatility::Volatile,
+            leakproof: selected.leakproof,
         }
     } else {
         ProcedureProperties::from_builtin(crate::sql::catalog::builtin_cast_properties(
@@ -95,7 +97,7 @@ fn cast_properties(
         properties.volatile |= modifier.volatile;
         properties.leakproof &= modifier.leakproof;
     }
-    properties
+    Ok(properties)
 }
 
 fn operator_properties(
@@ -122,8 +124,15 @@ fn operator_properties(
                 && let Some(expected) =
                     storage.routine_type_oid(expected.ctype, expected.user_type, txid)
             {
-                let conversion =
-                    cast_properties(storage, txid, actual, expected, CastBinding::Resolve, -1);
+                let conversion = cast_properties(
+                    storage,
+                    txid,
+                    actual,
+                    expected,
+                    CastBinding::Resolve,
+                    -1,
+                    crate::sql::eval::DefinedCastContext::Implicit,
+                )?;
                 result.volatile |= conversion.volatile;
                 result.leakproof &= conversion.leakproof;
             }
@@ -258,6 +267,7 @@ pub(super) fn expression_properties(
             operator,
             left,
             right,
+            ..
         } => Some(match operator.operator_name() {
             Some(name) => operator_properties(
                 storage,
@@ -269,7 +279,9 @@ pub(super) fn expression_properties(
             )?,
             None => ProcedureProperties::UNKNOWN,
         }),
-        Expr::Unary { operator, operand } => {
+        Expr::Unary {
+            operator, operand, ..
+        } => {
             let name = match operator {
                 UnaryOp::Neg => "-",
                 UnaryOp::BitNot => "~",
@@ -291,11 +303,13 @@ pub(super) fn expression_properties(
         // ROW is a structural constructor, not a procedure lookup. Its
         // effects are exactly those of its already-classified child nodes.
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             ..
         } if *name == "row" => None,
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -303,15 +317,13 @@ pub(super) fn expression_properties(
             star: false,
             variadic: false,
             ..
-        } if argument_names.is_empty()
-            && sql_value_expression(name)
-            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
-        {
+        } if argument_names.is_empty() && sql_value_expression(name) => {
             // SQL value expressions read transaction or session state; their
             // explicit precision expression was classified with the children.
             Some(ProcedureProperties::BINARY)
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -351,7 +363,8 @@ pub(super) fn expression_properties(
                             target,
                             CastBinding::Resolve,
                             -1,
-                        );
+                            crate::sql::eval::DefinedCastContext::Implicit,
+                        )?;
                         result.volatile |= conversion.volatile;
                         result.leaks_columns |=
                             !conversion.leakproof && contains_columns(argument)?;
@@ -374,6 +387,7 @@ pub(super) fn expression_properties(
             }
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
             name,
             bound_oid: None,
             args,
@@ -381,10 +395,7 @@ pub(super) fn expression_properties(
             star: false,
             variadic: false,
             ..
-        } if argument_names.is_empty()
-            && sql_constructor(name).is_some()
-            && !storage.has_function_routine_candidate(name, args.len(), txid) =>
-        {
+        } if argument_names.is_empty() && sql_constructor(name).is_some() => {
             // PostgreSQL's volatile-expression walk sees explicit children,
             // but not constructor-internal casts or output functions. Those
             // still execute at the original projection phase (PG 18.6).
@@ -394,6 +405,7 @@ pub(super) fn expression_properties(
             })
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
@@ -413,7 +425,10 @@ pub(super) fn expression_properties(
                 *slot = infer_routine_argument_oid(argument, columns)?;
             }
             let types = &types[..args.len()];
-            if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+            if let Some((schema, operator)) = (*kind == crate::sql::ast::CallKind::SqlSyntax)
+                .then(|| crate::sql::ast::catalog_operator_call(name))
+                .flatten()
+            {
                 let (left, right) = match types {
                     [right] => (None, Some(*right)),
                     [left, right] => (Some(*left), Some(*right)),
@@ -429,18 +444,58 @@ pub(super) fn expression_properties(
                     storage, txid, schema, operator, left, right,
                 )?)
             } else {
-                let routine = if let Some(oid) = bound_oid {
-                    storage.function_for_captured_call(*oid, argument_names, types, *variadic, txid)
-                } else if argument_names.is_empty() {
-                    storage.function_for_call_syntax_oids(name, types, *variadic, txid)
+                let (routine, builtin_oid) = if let Some(oid) = bound_oid {
+                    (
+                        storage.function_for_captured_call(
+                            *oid,
+                            argument_names,
+                            types,
+                            *variadic,
+                            txid,
+                        ),
+                        None,
+                    )
                 } else {
-                    storage.function_for_named_call_oids(
+                    match storage.select_routine_call(
                         name,
                         argument_names,
                         types,
                         *variadic,
                         txid,
-                    )
+                        crate::storage::RoutineCallKind::Function,
+                    ) {
+                        crate::storage::RoutineCallSelection::Stored(slot) => {
+                            let oid = crate::storage::routine_oid(&storage.routine_for(slot, txid));
+                            (
+                                storage.function_for_captured_call(
+                                    oid,
+                                    argument_names,
+                                    types,
+                                    *variadic,
+                                    txid,
+                                ),
+                                None,
+                            )
+                        }
+                        crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
+                            (None, Some(oid))
+                        }
+                        crate::storage::RoutineCallSelection::Ambiguous => {
+                            return Err(sql_err!(
+                                sqlstate::AMBIGUOUS_FUNCTION,
+                                "function {} is not unique",
+                                name
+                            ));
+                        }
+                        crate::storage::RoutineCallSelection::WrongKind { .. } => {
+                            return Err(sql_err!(
+                                sqlstate::WRONG_OBJECT_TYPE,
+                                "{} is not a function",
+                                name
+                            ));
+                        }
+                        crate::storage::RoutineCallSelection::Absent => (None, None),
+                    }
                 };
                 Some(match routine {
                     Some(routine) => {
@@ -498,7 +553,7 @@ pub(super) fn expression_properties(
                                 types[position],
                                 expected_oid,
                                 expected.ctype,
-                            );
+                            )?;
                             result.volatile |= conversion.volatile;
                             result.leaks_columns |=
                                 !conversion.leakproof && contains_columns(argument)?;
@@ -511,7 +566,11 @@ pub(super) fn expression_properties(
                         }
                     }
                     None => ProcedureProperties::from_builtin(
-                        crate::sql::catalog::builtin_routine_properties(name, *bound_oid, types),
+                        crate::sql::catalog::builtin_routine_properties(
+                            name,
+                            builtin_oid.or(*bound_oid),
+                            types,
+                        ),
                     ),
                 })
             }
@@ -521,6 +580,7 @@ pub(super) fn expression_properties(
             type_name,
             binding,
             type_mod,
+            ..
         } => {
             let target = columns.named_type_oid(type_name);
             // ARRAY constructors receive their element type from an explicit
@@ -539,9 +599,46 @@ pub(super) fn expression_properties(
             } else {
                 type_of(operand)?
             };
-            Some(target.map_or(ProcedureProperties::UNKNOWN, |target| {
-                cast_properties(storage, txid, source, target, *binding, *type_mod)
-            }))
+            let mut properties = match target {
+                Some(target) => cast_properties(
+                    storage,
+                    txid,
+                    source,
+                    target,
+                    *binding,
+                    *type_mod,
+                    crate::sql::eval::DefinedCastContext::Explicit,
+                )?,
+                None => ProcedureProperties::UNKNOWN,
+            };
+            if *binding == CastBinding::Resolve
+                && let Some(ColType::Array(element)) = target.and_then(|target| {
+                    crate::sql::eval::constructor_type_from_oid(target, &|oid| {
+                        columns.domain_base_type(oid)
+                    })
+                })
+            {
+                crate::sql::exec::visit_array_constructor_conversions(
+                    operand,
+                    element,
+                    columns,
+                    &mut |source, target| {
+                        let conversion = cast_properties(
+                            storage,
+                            txid,
+                            source,
+                            target,
+                            *binding,
+                            -1,
+                            crate::sql::eval::DefinedCastContext::Explicit,
+                        )?;
+                        properties.volatile |= conversion.volatile;
+                        properties.leakproof &= conversion.leakproof;
+                        Ok(())
+                    },
+                )?;
+            }
+            Some(properties)
         }
         Expr::Like {
             operand,
@@ -643,7 +740,7 @@ fn parameter_conversion_properties(
     source: i32,
     target: i32,
     ctype: ColType,
-) -> ProcedureProperties {
+) -> Result<ProcedureProperties, SqlError> {
     // Domain checks, including those in named arrays/composites, are executable
     // expressions. Equal outer OIDs do not establish a binary-only conversion.
     if matches!(
@@ -657,7 +754,15 @@ fn parameter_conversion_properties(
                     | crate::sql::types::ArrElem::Composite(_)
             )
     ) {
-        return ProcedureProperties::UNKNOWN;
+        return Ok(ProcedureProperties::UNKNOWN);
     }
-    cast_properties(storage, txid, source, target, CastBinding::Resolve, -1)
+    cast_properties(
+        storage,
+        txid,
+        source,
+        target,
+        CastBinding::Resolve,
+        -1,
+        crate::sql::eval::DefinedCastContext::Implicit,
+    )
 }

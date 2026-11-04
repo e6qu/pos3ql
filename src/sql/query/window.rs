@@ -109,15 +109,17 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
+    scope: Option<&QueryScope<'a>>,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
 ) -> Result<&'a Select<'a>, SqlError> {
     let mut agg_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-            collect_grouped_aggs(expression, &mut agg_nodes, storage, txid)?;
+            collect_grouped_aggs(expression, &mut agg_nodes, storage, txid, columns)?;
         }
     }
     for ob in statement.order_by {
-        collect_grouped_aggs(ob.expression, &mut agg_nodes, storage, txid)?;
+        collect_grouped_aggs(ob.expression, &mut agg_nodes, storage, txid, columns)?;
     }
     let agg_nodes = agg_nodes.as_slice();
     let n_aggs = agg_nodes.len();
@@ -178,16 +180,12 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         .alloc_slice_copy(&group_names[..n_keys])
         .map_err(|_| arena_full())?;
     let agg_names: &[&str] = agg_names;
-    let scope = statement
-        .from
-        .as_ref()
-        .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, None).ok());
     let context = GroupedRewrite {
         group_by: statement.group_by,
         group_names,
         aggs: agg_nodes,
         agg_names,
-        scope: scope.as_ref(),
+        scope,
     };
     let mut outer_items = [SelectItem::Wildcard; MAX_PROJ];
     for (i, item) in statement.items.iter().enumerate() {
@@ -228,6 +226,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: None,
             inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -783,6 +782,8 @@ fn compute_window<'a>(
     else {
         return Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function"));
     };
+    let builtin_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let name = &builtin_name;
     let n = rows.len();
     let out = arena
         .alloc_slice_with(n, |_| Datum::Null)

@@ -16,7 +16,7 @@ use crate::sql::eval::{
 use crate::sql::txn::TxnState;
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, Storage, ValidationRead, rowenc};
+use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, ValidationRead, rowenc};
 
 use super::{RowCtx, check_not_null};
 
@@ -115,11 +115,12 @@ pub(crate) fn coerce_domain_value<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let domain = storage
         .read_domain_definition(target, txid)?
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain type does not exist"))?;
-    coerce_selected_domain_value(storage, &domain, value, txid, arena, params)
+    coerce_selected_domain_value(storage, &domain, value, txid, arena, params, sequences)
 }
 
 fn coerce_selected_domain_value<'a>(
@@ -129,6 +130,7 @@ fn coerce_selected_domain_value<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let value = if let Some(parent_name) = domain.base_domain {
         let reference = crate::storage::TypeReference::from_bound_name(parent_name)?;
@@ -142,7 +144,7 @@ fn coerce_selected_domain_value<'a>(
                     parent_name.name.as_str()
                 )
             })?;
-        coerce_selected_domain_value(storage, &parent, value, txid, arena, params)?
+        coerce_selected_domain_value(storage, &parent, value, txid, arena, params, sequences)?
     } else {
         match domain.base {
             crate::sql::types::ColType::Enum(slot) => {
@@ -158,19 +160,22 @@ fn coerce_selected_domain_value<'a>(
                     storage,
                     txid,
                     arena,
+                    sequences,
                 )?,
-                value => super::coerce_composite_value(value, slot, storage, txid, arena)?,
+                value => {
+                    super::coerce_composite_value(value, slot, storage, txid, arena, sequences)?
+                }
             },
             crate::sql::types::ColType::Array(
                 element @ (crate::sql::types::ArrElem::Enum(_)
                 | crate::sql::types::ArrElem::Composite(_)
                 | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(value, element, storage, txid, arena)?,
+            ) => super::coerce_user_type_array(value, element, storage, txid, arena, sequences)?,
             base => crate::sql::eval::cast_to(value, base, arena)?,
         }
     };
     let value = super::apply_typmod(value, domain.base, domain.base_type_mod, arena)?;
-    validate_domain_value(storage, txid, domain, value, arena, params)?;
+    validate_domain_value(storage, txid, domain, value, arena, params, sequences)?;
     Ok(value)
 }
 
@@ -181,13 +186,13 @@ fn validate_domain_value(
     value: Datum,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     validate_domain_not_null(domain, value)?;
-    if value.is_null() {
-        return Ok(());
-    }
     for check in domain.checks() {
-        validate_domain_check(storage, txid, domain, check, value, arena, params)?;
+        validate_domain_check(
+            storage, txid, domain, check, value, arena, params, sequences,
+        )?;
     }
     Ok(())
 }
@@ -212,6 +217,10 @@ pub(crate) fn validate_domain_not_null(
 /// Enforces one named domain CHECK. This is deliberately separate from the
 /// full write-time domain coercion path: `VALIDATE CONSTRAINT` scans exactly
 /// the named constraint and does not validate unrelated `NOT VALID` checks.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "domain checks preserve the selected definition and explicit sequence context"
+)]
 pub(crate) fn validate_domain_check<'a>(
     storage: &Storage,
     txid: u32,
@@ -220,14 +229,13 @@ pub(crate) fn validate_domain_check<'a>(
     value: Datum<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
-    if value.is_null() {
-        return Ok(());
-    }
     let context = ValueLookup { value };
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
     let source = crate::sql::enum_values::checks::resolve(
@@ -290,6 +298,7 @@ pub(crate) fn check_domain_constraints(
     txid: u32,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
         let Some(slot) = column_domain_target(storage, col, txid)? else {
@@ -299,42 +308,17 @@ pub(crate) fn check_domain_constraints(
         // The column was already coerced to the base representation. Reusing
         // the catalog-aware path applies every inherited constraint as well as
         // the leaf domain's rules.
-        let _ = coerce_domain_value(storage, slot, value, txid, arena, params)?;
+        let _ = coerce_domain_value(storage, slot, value, txid, arena, params, sequences)?;
     }
     Ok(())
 }
 
-/// Names a uniqueness constraint for its 23505 message: a single-column flag
-/// synthesizes PostgreSQL's `<table>_pkey` / `<table>_<column>_key`, while a
-/// table-level key or index carries its stored name.
-pub(crate) enum ConstraintName<'a> {
-    PrimaryFlag,
-    UniqueFlag(&'a str),
-    Named(&'a str),
-}
-
-fn unique_violation(
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
-) -> SqlError {
-    match name {
-        ConstraintName::PrimaryFlag => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}_pkey\"",
-            def.name.as_str()
-        ),
-        ConstraintName::UniqueFlag(column) => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}_{}_key\"",
-            def.name.as_str(),
-            column
-        ),
-        ConstraintName::Named(constraint) => sql_err!(
-            sqlstate::UNIQUE_VIOLATION,
-            "duplicate key value violates unique constraint \"{}\"",
-            constraint
-        ),
-    }
+fn unique_violation(name: SqlName) -> SqlError {
+    sql_err!(
+        sqlstate::UNIQUE_VIOLATION,
+        "duplicate key value violates unique constraint \"{}\"",
+        name.as_str()
+    )
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -644,7 +628,7 @@ fn enforce_expression_index_uniqueness<'a>(
     collations: &[crate::sql::ast::Collation],
     operator_classes: &[crate::storage::IndexOperatorClass],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     predicate: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
@@ -695,7 +679,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -722,7 +706,7 @@ fn enforce_expression_index_uniqueness<'a>(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(def, name))
+        Err(unique_violation(name))
     })?;
     Ok(())
 }
@@ -746,7 +730,7 @@ fn enforce_key_uniqueness(
     txid: u32,
     columns: &[u16],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
@@ -864,7 +848,7 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(def, name)),
+                    Ok(true) => result = Err(unique_violation(name)),
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -920,7 +904,7 @@ fn committed_scan_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
+    name: SqlName,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -948,7 +932,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -971,7 +955,7 @@ fn pending_scan_uniqueness(
     self_rowid: Option<u64>,
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    name: &ConstraintName,
+    name: SqlName,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1004,7 +988,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(def, name));
+            return Err(unique_violation(name));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1027,7 +1011,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     txid: u32,
     columns: &[u16],
     nulls_not_distinct: bool,
-    name: &ConstraintName,
+    name: SqlName,
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -1071,7 +1055,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(def, name));
+                return Err(unique_violation(name));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1098,7 +1082,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(def, name))
+        Err(unique_violation(name))
     })?;
     Ok(())
 }
@@ -1152,11 +1136,12 @@ pub fn check_unique(
         if !column.unique {
             continue;
         }
-        let name = if column.primary {
-            ConstraintName::PrimaryFlag
-        } else {
-            ConstraintName::UniqueFlag(column.name.as_str())
-        };
+        let name = def.column_key_name(i).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "inline unique key has no admitted name"
+            )
+        })?;
         enforce_key_uniqueness(
             storage,
             table_index,
@@ -1167,7 +1152,7 @@ pub fn check_unique(
             txid,
             &[i as u16],
             false,
-            &name,
+            name,
             UniqueKeySource::Cache,
         )?;
     }
@@ -1326,6 +1311,9 @@ fn check_index_tuple_sizes_inner(
         })?;
     let index_source = storage.table_def(table_slot, txid);
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if !index.mutable_for(txid).kind.live() {
+            continue;
+        }
         let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut include_columns = [0u16; crate::storage::MAX_INDEX_COLS];
         for (target, source) in columns.iter_mut().zip(&index.columns[..index.n_cols]) {
@@ -1436,11 +1424,12 @@ pub(crate) fn check_reindex_constraints(
         {
             continue;
         }
-        let name = if metadata.primary {
-            ConstraintName::PrimaryFlag
-        } else {
-            ConstraintName::UniqueFlag(metadata.name.as_str())
-        };
+        let name = def.column_key_name(column).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "inline unique key has no admitted name"
+            )
+        })?;
         enforce_key_uniqueness(
             storage,
             table_index,
@@ -1451,7 +1440,7 @@ pub(crate) fn check_reindex_constraints(
             txid,
             &[column as u16],
             false,
-            &name,
+            name,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1472,7 +1461,7 @@ pub(crate) fn check_reindex_constraints(
             txid,
             key.columns(),
             key.kind.nulls_not_distinct(),
-            &ConstraintName::Named(key.name.as_str()),
+            key.name,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1535,13 +1524,18 @@ pub fn check_unique_indexes(
     check: UniqueIndexCheck,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if matches!(check, UniqueIndexCheck::Cache) && !index.mutable_for(txid).immediate {
+            // The constraint's own timing controls checks. A detached REINDEX
+            // replacement has no check trigger until the atomic link swap.
+            continue;
+        }
         if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(&index))
         {
             continue;
         }
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
-        let name = ConstraintName::Named(index_name.as_str());
+        let name = index_name;
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
             if let Some(source) = source {
@@ -1597,7 +1591,7 @@ pub fn check_unique_indexes(
                 &index.collations[..index.n_cols],
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
-                &name,
+                name,
                 predicate,
                 arena,
             )?;
@@ -1615,7 +1609,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 index.nulls_not_distinct,
-                &name,
+                name,
                 expression,
                 arena,
             )?;
@@ -1630,7 +1624,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 index.nulls_not_distinct,
-                &name,
+                name,
                 UniqueKeySource::Cache,
             )?;
         }
@@ -1681,25 +1675,58 @@ pub(crate) fn parse_defaults<'a>(
     txid: u32,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    let input_sections = def.type_inputs.as_ref().detached_sections(arena)?;
     for (i, c) in def.columns().iter().enumerate() {
-        if c.default.is_generated() {
+        if c.default.is_generated() || c.default.constant().is_some() {
             continue;
         }
         if let Some(text) = c.default.expression() {
-            let text = if c.default.constant().is_none() {
-                super::super::enum_values::checks::resolve_default(
-                    text.as_str(),
-                    c.ctype,
-                    storage,
-                    txid,
+            let original = crate::sql::enum_values::checks::default_display(text.as_str(), arena)?;
+            let text = super::super::enum_values::checks::resolve_default(
+                text.as_str(),
+                c.ctype,
+                storage,
+                txid,
+                arena,
+            )?;
+            let section = crate::storage::StoredInputSection::TableDefault(def.attribute_number(i));
+            let inputs = input_sections
+                .binary_search_by_key(&section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| input_sections[index].1);
+            let inputs = if original == text {
+                inputs
+            } else {
+                crate::sql::type_inputs::rebase(
+                    original,
+                    text,
+                    crate::sql::parser::StoredSqlKind::Expression,
+                    inputs,
+                    |name| Ok(crate::sql::type_inputs::target_oid(storage, txid, name)),
                     arena,
                 )?
-            } else {
-                arena
-                    .alloc_str(text.as_str())
-                    .map_err(|_| crate::sql::query::arena_full_pub())?
             };
-            out[i] = Some(crate::sql::parser::parse_expr(text, arena)?);
+            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+                text,
+                inputs,
+                arena,
+                |parser| {
+                    crate::sql::type_inputs::validate_restored_candidates(parser, |candidate| {
+                        Ok(inputs
+                            .iter()
+                            .find(|input| {
+                                (input.start, input.end, input.kind)
+                                    == (candidate.start, candidate.end, candidate.kind)
+                            })
+                            .map(|input| input.type_oid)
+                            .or_else(|| {
+                                crate::sql::type_inputs::candidate_target_oid(
+                                    storage, txid, candidate,
+                                )
+                            }))
+                    })
+                },
+            )?);
         }
     }
     Ok(out)
@@ -1711,15 +1738,43 @@ pub(crate) fn parse_defaults<'a>(
 pub(crate) fn parse_generated<'a>(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
+    let input_sections = def.type_inputs.as_ref().detached_sections(arena)?;
     for (i, c) in def.columns().iter().enumerate() {
         if c.default.is_generated() {
             let text = c.default.expression().expect("generated column has expr");
             let source = arena
                 .alloc_str(text.as_str())
                 .map_err(|_| crate::sql::eval::arena_full())?;
-            out[i] = Some(crate::sql::parser::parse_expr(source, arena)?);
+            let section = crate::storage::StoredInputSection::TableDefault(def.attribute_number(i));
+            let inputs = input_sections
+                .binary_search_by_key(&section, |(section, _)| *section)
+                .ok()
+                .map_or(&[][..], |index| input_sections[index].1);
+            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+                source,
+                inputs,
+                arena,
+                |parser| {
+                    crate::sql::type_inputs::validate_restored_candidates(parser, |candidate| {
+                        Ok(inputs
+                            .iter()
+                            .find(|input| {
+                                (input.start, input.end, input.kind)
+                                    == (candidate.start, candidate.end, candidate.kind)
+                            })
+                            .map(|input| input.type_oid)
+                            .or_else(|| {
+                                crate::sql::type_inputs::candidate_target_oid(
+                                    storage, txid, candidate,
+                                )
+                            }))
+                    })
+                },
+            )?);
         }
     }
     Ok(out)
@@ -1794,6 +1849,7 @@ pub(crate) fn enforce_row_constraints(
     checks: &ParsedChecks,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let self_rowid = row.excluded();
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
@@ -1877,8 +1933,8 @@ pub(crate) fn enforce_row_constraints(
         )?;
     }
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params)?;
-    check_domain_constraints(storage, def, values, txid, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_or_defer_fk_child(storage, constraint_table, def, values, row, txid, txn)?;
     Ok(())
 }
@@ -1899,12 +1955,13 @@ pub(crate) fn check_row_content(
     params: &[Datum],
     txid: u32,
     read: ValidationRead,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params)?;
-    check_domain_constraints(storage, def, values, txid, arena, params)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_fk_child(storage, def, values, txid, read)?;
     Ok(())
 }
@@ -1933,6 +1990,10 @@ fn check_detached_partition_bound(
 
 /// Evaluates each CHECK predicate against the candidate row. A predicate that
 /// is FALSE raises 23514; NULL and TRUE both pass, per SQL three-valued logic.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row checks preserve row and statement sequence contexts"
+)]
 fn check_row_checks(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -1941,6 +2002,7 @@ fn check_row_checks(
     txid: u32,
     arena: &Arena,
     params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let context = RowCtx {
         def: crate::storage::RelationDefinition::from_definition(def),
@@ -1950,6 +2012,7 @@ fn check_row_checks(
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
+        sequences,
         ..crate::sql::eval::NO_HOOKS
     };
     for (i, c) in def.checks().iter().enumerate() {
@@ -2029,7 +2092,7 @@ fn check_or_defer_unique_keys(
             txid,
             key.columns(),
             key.kind.nulls_not_distinct(),
-            &ConstraintName::Named(key.name.as_str()),
+            key.name,
             UniqueKeySource::Cache,
         )?;
     }
@@ -2337,7 +2400,7 @@ pub(crate) fn validate_constraint_obligation(
                     txid,
                     key.columns(),
                     key.kind.nulls_not_distinct(),
-                    &ConstraintName::Named(key.name.as_str()),
+                    key.name,
                     UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
@@ -2599,20 +2662,12 @@ fn named_constraint_timing(
     {
         return Some(crate::storage::ConstraintTiming::NotDeferrable);
     }
-    for column in definition.columns() {
-        let synthesized = if column.primary {
-            crate::stack_format!(128, "{}_pkey", definition.name.as_str())
-        } else if column.unique {
-            crate::stack_format!(
-                128,
-                "{}_{}_key",
-                definition.name.as_str(),
-                column.name.as_str()
-            )
-        } else {
-            continue;
-        };
-        if synthesized.as_str() == name {
+    for (column, metadata) in definition.columns().iter().enumerate() {
+        if (metadata.primary || metadata.unique)
+            && definition
+                .column_key_name(column)
+                .is_some_and(|stored| stored.as_str() == name)
+        {
             return Some(crate::storage::ConstraintTiming::NotDeferrable);
         }
     }
@@ -2825,6 +2880,7 @@ pub(crate) fn apply_fk_parent_actions(
     seq_session: &crate::sql::guc::SeqSession,
     depth: u32,
 ) -> Result<(), SqlError> {
+    let coercion_txid = txn.txid;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3071,6 +3127,11 @@ pub(crate) fn apply_fk_parent_actions(
                                     storage,
                                     txn.txid,
                                     arena,
+                                    Some(&crate::sql::sequence::SeqEval::new(
+                                        storage,
+                                        seq_session,
+                                        coercion_txid,
+                                    )),
                                 )?
                             }
                             crate::storage::ColumnDefault::Generated(_) => {
@@ -3100,6 +3161,11 @@ pub(crate) fn apply_fk_parent_actions(
                     &checks,
                     arena,
                     params,
+                    Some(&crate::sql::sequence::SeqEval::new(
+                        storage,
+                        seq_session,
+                        coercion_txid,
+                    )),
                 )?;
                 // The child's own referenced keys may have changed — recurse.
                 apply_fk_parent_actions(

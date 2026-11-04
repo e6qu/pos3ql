@@ -18,7 +18,7 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DISTINCT row exceeds the statement arena"
+            "projected row exceeds the statement arena"
         )
     })?;
     encode_projected_into(values, out)?;
@@ -42,6 +42,78 @@ pub(crate) fn encode_projected_persistent_pub<'a>(
         })?;
     encode_projected_into(values, out)?;
     Ok(&*out)
+}
+
+/// Transfer a row set across a scoped workspace without retaining its pointers.
+pub(crate) fn pack_projected_rows<'a>(
+    rows: &[&[u8]],
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine rows exceed statement memory"
+        )
+    };
+    let count = u64::try_from(rows.len()).map_err(|_| full())?;
+    let mut len = 8_usize;
+    for row in rows {
+        len = len
+            .checked_add(8)
+            .and_then(|len| len.checked_add(row.len()))
+            .ok_or_else(full)?;
+    }
+    let output = arena.alloc_slice_with(len, |_| 0_u8).map_err(|_| full())?;
+    output[..8].copy_from_slice(&count.to_le_bytes());
+    let mut at = 8;
+    for row in rows {
+        let size = u64::try_from(row.len()).map_err(|_| full())?;
+        output[at..at + 8].copy_from_slice(&size.to_le_bytes());
+        at += 8;
+        output[at..at + row.len()].copy_from_slice(row);
+        at += row.len();
+    }
+    Ok(output)
+}
+
+pub(crate) fn unpack_projected_rows<'a>(
+    encoded: &'a [u8],
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let invalid = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "routine row transfer has an invalid encoding"
+        )
+    };
+    let count = encoded.get(..8).ok_or_else(invalid)?;
+    let count = usize::try_from(u64::from_le_bytes(
+        count.try_into().expect("checked header"),
+    ))
+    .map_err(|_| invalid())?;
+    if count > (encoded.len() - 8) / 8 {
+        return Err(invalid());
+    }
+    let rows = arena.alloc_slice_with(count, |_| &[][..]).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine rows exceed statement memory"
+        )
+    })?;
+    let mut at = 8_usize;
+    for row in rows.iter_mut() {
+        let end = at.checked_add(8).ok_or_else(invalid)?;
+        let size = encoded.get(at..end).ok_or_else(invalid)?;
+        let size = usize::try_from(u64::from_le_bytes(size.try_into().expect("checked header")))
+            .map_err(|_| invalid())?;
+        let end = end.checked_add(size).ok_or_else(invalid)?;
+        *row = encoded.get(at + 8..end).ok_or_else(invalid)?;
+        at = end;
+    }
+    if at != encoded.len() {
+        return Err(invalid());
+    }
+    Ok(rows)
 }
 
 /// Exact byte length of a projected row whose values are read by index.
@@ -1340,6 +1412,40 @@ pub fn sort_dedup_projected(rows: &mut [&[u8]], width: usize) -> usize {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn row_sets_transfer_empty_and_typed_rows_without_child_references() {
+        let mut budget = Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "row set transfer", 64 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let encoded = arena
+                .with_remaining_bytes(|scratch| {
+                    let first = encode_projected_pub(&[Datum::Int4(7), Datum::Null], scratch)?;
+                    let second = encode_projected_pub(&[Datum::Text("typed result")], scratch)?;
+                    pack_projected_rows(&[first, second, &[]], scratch)
+                })
+                .unwrap()
+                .unwrap();
+            let rows = unpack_projected_rows(encoded, &arena).unwrap();
+            arena.alloc_slice_with(4096, |_| 0xcc_u8).unwrap();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(decode_projected_pub(rows[0], 0), Datum::Int4(7));
+            assert_eq!(decode_projected_pub(rows[0], 1), Datum::Null);
+            assert_eq!(
+                decode_projected_pub(rows[1], 0),
+                Datum::Text("typed result")
+            );
+            assert!(rows[2].is_empty());
+            let empty = pack_projected_rows(&[], &arena).unwrap();
+            assert!(unpack_projected_rows(empty, &arena).unwrap().is_empty());
+            for invalid in [&[][..], &[0][..], &[1, 0, 0, 0, 0, 0, 0, 0][..]] {
+                assert_eq!(
+                    unpack_projected_rows(invalid, &arena).unwrap_err().sqlstate,
+                    sqlstate::INTERNAL_ERROR
+                );
+            }
+        });
+    }
 
     #[test]
     fn projected_records_preserve_wide_nested_fields_and_following_columns() {

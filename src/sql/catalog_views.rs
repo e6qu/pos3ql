@@ -718,8 +718,9 @@ pub(super) fn rules<'a>(
         if rule[name] == Datum::Text("_RETURN") {
             continue;
         }
-        let definition = super::rule_def_text(storage, transaction, integer(rule[oid])?, arena)?
-            .map_or(Datum::Null, Datum::Text);
+        let definition =
+            super::rule_def_text(storage, transaction, integer(rule[oid])?, false, arena)?
+                .map_or(Datum::Null, Datum::Text);
         for class in classes.matching((integer(rule[relation])? as u32, 0)) {
             for names in namespaces.left(Some((integer(class[namespace])? as u32, 0))) {
                 output.push(&[

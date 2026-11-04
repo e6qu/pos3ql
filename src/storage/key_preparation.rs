@@ -55,9 +55,10 @@ impl ValueKeyPreparation {
     }
 
     pub(super) fn matches_index_source(&self, index: &IndexDef) -> bool {
-        index
-            .table_binding
-            .is_some_and(|binding| binding.source == self.target.source)
+        matches!(index.relation, IndexRelationSource::Table)
+            && index
+                .table_binding
+                .is_some_and(|binding| binding.source == self.target.source)
     }
 
     pub(super) fn validate_definition(
@@ -94,6 +95,7 @@ impl ValueKeyPreparation {
             .iter()
             .find(|index| {
                 index.visible_to(self.target.transaction())
+                    && matches!(index.relation, IndexRelationSource::Table)
                     && index.created_at == created_at
                     && index.database == definition.identity.database
             })
@@ -1174,7 +1176,13 @@ mod tests {
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
             let change = storage
-                .write_table_def(target, definition, &mapping, true)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    true,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             let rewritten = storage
                 .heap
@@ -1221,7 +1229,13 @@ mod tests {
             mapping[0] = Some(definition.columns[0].name);
             mapping[1] = Some(definition.columns[1].name);
             let change = storage
-                .write_table_def(target, definition, &mapping, false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             crate::storage::tests::publish_table_definition(&storage, change).unwrap();
             assert_eq!(selection.definition().name.as_str(), "key_orders");

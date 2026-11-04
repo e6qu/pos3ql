@@ -1161,7 +1161,8 @@ impl TypeCatalog {
 
 impl<B: super::DefinitionBacking> super::TableDefinition<B> {
     pub(super) fn requires_type_catalog(&self) -> bool {
-        self.type_membership != super::TableTypeMembership::None
+        !self.type_inputs.as_ref().bytes().is_empty()
+            || self.type_membership != super::TableTypeMembership::None
             || self.columns().iter().any(|column| {
                 RoutineResult {
                     ctype: column.ctype,
@@ -1221,6 +1222,7 @@ impl super::Storage {
         for entry in self.path().entries() {
             let slot = match entry {
                 super::PathEntry::Schema(slot) => slot,
+                super::PathEntry::InformationSchema | super::PathEntry::Toast => continue,
                 super::PathEntry::Catalog => {
                     if let Some(builtin) = ColType::from_sql_name(name.as_str()) {
                         return Err(sql_err!(

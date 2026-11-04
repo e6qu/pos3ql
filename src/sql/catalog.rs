@@ -25,6 +25,40 @@ use super::types::{ColType, Datum, TypeMod};
 #[path = "catalog_schema.rs"]
 mod schema;
 
+#[path = "catalog_planner_properties.rs"]
+mod planner_properties;
+
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinPlannerProcedure {
+    pub volatility: u8,
+    pub strict: bool,
+    pub cost: f64,
+    pub forbidden: bool,
+}
+
+pub(crate) fn builtin_planner_procedure(oid: i32) -> Option<BuiltinPlannerProcedure> {
+    // Callable attributes describe the initialized catalog, including SQL
+    // functions installed after bootstrap. Bootstrap facts also cover support
+    // procedures that are not exposed as SQL-callable routines.
+    if let Some(signature) = builtin_callable_by_oid(oid) {
+        return Some(BuiltinPlannerProcedure {
+            volatility: match signature.catalog.volatility {
+                "i" => 0,
+                "s" => 1,
+                "v" => 2,
+                _ => return None,
+            },
+            strict: signature.catalog.strict,
+            cost: signature.catalog.cost,
+            forbidden: signature.kind != b'f' || signature.returns_set,
+        });
+    }
+    let index = planner_properties::PROCEDURES
+        .binary_search_by_key(&oid, |(oid, _)| *oid)
+        .ok()?;
+    Some(planner_properties::PROCEDURES[index].1)
+}
+
 #[path = "catalog_rewrite.rs"]
 mod rewrite;
 #[path = "catalog_view_definitions.rs"]
@@ -97,6 +131,8 @@ pub(crate) const PG_STATISTIC_EXT_OID: i32 = 3381;
 pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6100;
+pub(crate) const PG_FOREIGN_SERVER_OID: i32 = 1417;
+pub(crate) const PG_FOREIGN_DATA_WRAPPER_OID: i32 = 2328;
 
 const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
     ("heap", 2, 3, "heap_tableam_handler", "t"),
@@ -193,6 +229,186 @@ macro_rules! intrinsic {
             volatility: $volatility,
         }
     };
+}
+
+#[path = "catalog_callable_signatures.rs"]
+mod callable_signatures;
+
+/// Catalog properties and executable input declarations share one PG snapshot.
+pub(crate) struct BuiltinCallableCatalog {
+    pub volatility: &'static str,
+    pub parallel: &'static str,
+    pub strict: bool,
+    pub leakproof: bool,
+    pub security_definer: bool,
+    pub language: i32,
+    pub source: &'static str,
+    pub cost: f64,
+    pub rows: f64,
+    pub support: i32,
+    pub support_name: &'static str,
+    pub all_arguments: &'static [i32],
+    pub modes: &'static [u8],
+    pub all_argument_names: &'static [&'static str],
+}
+
+/// Names and declared input types come from already modeled or executed families.
+pub(crate) struct BuiltinCallableSignature {
+    pub oid: i32,
+    pub schema: &'static str,
+    pub name: &'static str,
+    pub arguments: &'static [i32],
+    pub argument_names: &'static [&'static str],
+    pub required_arguments: usize,
+    pub defaults: Option<&'static str>,
+    pub variadic_element: Option<i32>,
+    pub kind: u8,
+    pub returns_set: bool,
+    pub result_oid: i32,
+    pub catalog: BuiltinCallableCatalog,
+}
+
+impl BuiltinCallableSignature {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "generated PostgreSQL callable declarations preserve independent catalog fields"
+    )]
+    const fn new(
+        oid: i32,
+        schema: &'static str,
+        name: &'static str,
+        arguments: &'static [i32],
+        argument_names: &'static [&'static str],
+        required_arguments: usize,
+        defaults: Option<&'static str>,
+        variadic_element: Option<i32>,
+        kind: u8,
+        returns_set: bool,
+        result_oid: i32,
+        catalog: BuiltinCallableCatalog,
+    ) -> Self {
+        Self {
+            oid,
+            schema,
+            name,
+            arguments,
+            argument_names,
+            required_arguments,
+            defaults,
+            variadic_element,
+            kind,
+            returns_set,
+            result_oid,
+            catalog,
+        }
+    }
+}
+
+pub(crate) fn builtin_callable_signatures(
+    name: &str,
+) -> impl Iterator<Item = &'static BuiltinCallableSignature> + '_ {
+    let first = callable_signatures::CALLABLES.partition_point(|candidate| candidate.name < name);
+    callable_signatures::CALLABLES[first..]
+        .iter()
+        .take_while(move |candidate| candidate.name == name)
+}
+
+pub(crate) fn builtin_callable_schema(name: &str) -> Option<&'static str> {
+    builtin_callable_signatures(name)
+        .next()
+        .map(|signature| signature.schema)
+}
+
+pub(crate) fn builtin_callable_by_oid(oid: i32) -> Option<&'static BuiltinCallableSignature> {
+    let index = callable_signatures::CALLABLE_OIDS
+        .binary_search_by_key(&oid, |(oid, _)| *oid)
+        .ok()?;
+    Some(&callable_signatures::CALLABLES[callable_signatures::CALLABLE_OIDS[index].1])
+}
+
+#[cfg(test)]
+mod callable_contract_tests {
+    use super::*;
+
+    #[test]
+    fn planner_procedures_cover_support_functions_without_exposing_new_callables() {
+        let numeric = builtin_planner_procedure(1701).unwrap();
+        assert_eq!(numeric.volatility, 0);
+        assert!(numeric.strict && !numeric.forbidden);
+        assert_eq!(numeric.cost, 1.0);
+        assert!(builtin_callable_by_oid(1701).is_none());
+        for oid in [1084, 1150, 750] {
+            assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
+        }
+        assert_eq!(planner_properties::PROCEDURES.len(), 3397);
+        assert!(
+            planner_properties::PROCEDURES
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        for oid in [67, 1258] {
+            let properties = builtin_planner_procedure(oid).unwrap();
+            assert_eq!(properties.volatility, 0);
+            assert!(properties.strict && !properties.forbidden);
+            assert!(builtin_callable_by_oid(oid).is_none());
+        }
+        for (oid, _) in planner_properties::PROCEDURES {
+            let Some(signature) = builtin_callable_by_oid(*oid) else {
+                continue;
+            };
+            let properties = builtin_planner_procedure(*oid).unwrap();
+            assert_eq!(
+                properties.volatility,
+                match signature.catalog.volatility {
+                    "i" => 0,
+                    "s" => 1,
+                    "v" => 2,
+                    _ => panic!("declared procedure volatility"),
+                },
+                "{}",
+                signature.name
+            );
+            assert_eq!(properties.strict, signature.catalog.strict);
+            assert_eq!(properties.cost, signature.catalog.cost);
+            assert_eq!(
+                properties.forbidden,
+                signature.kind != b'f' || signature.returns_set
+            );
+        }
+        for oid in [6183, 6184] {
+            assert_eq!(builtin_planner_procedure(oid).unwrap().cost, 100.0);
+        }
+        assert!(builtin_planner_procedure(13700).unwrap().forbidden);
+    }
+
+    #[test]
+    fn every_modeled_intrinsic_has_a_shared_callable_contract() {
+        for intrinsic in INTRINSIC_ROUTINES {
+            let signature = builtin_callable_by_oid(intrinsic.oid).unwrap_or_else(|| {
+                panic!(
+                    "modeled routine {} is missing its callable contract",
+                    intrinsic.oid
+                )
+            });
+            assert!(signature.arguments.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS);
+            assert!(signature.required_arguments <= signature.arguments.len());
+        }
+        for (oid, name, result, arguments, volatility) in [
+            (540000, "postgres_fdw_handler", 3115, &[][..], "v"),
+            (540001, "postgres_fdw_validator", 2278, &[1009, 26][..], "s"),
+        ] {
+            let declaration = builtin_callable_by_oid(oid).unwrap();
+            assert_eq!(declaration.name, name);
+            assert_eq!(declaration.result_oid, result);
+            assert_eq!(declaration.arguments, arguments);
+            assert_eq!(declaration.catalog.volatility, volatility);
+            assert_eq!(declaration.catalog.source, name);
+            assert!(declaration.catalog.strict);
+            assert_eq!(declaration.catalog.language, 12);
+            assert_eq!(declaration.catalog.parallel, "s");
+            assert!(declaration.defaults.is_none());
+        }
+    }
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
@@ -3870,12 +4086,34 @@ pub(crate) fn builtin_routine_properties(
     if mixed_family { None } else { family }
 }
 
+fn builtin_operator_exact(name: &str, left: Option<i32>, right: Option<i32>) -> Option<i32> {
+    // PostgreSQL resolves two unknown strings to text when that overload exists;
+    // one unknown first tries the known operand's type before overload ranking.
+    let (left, right) = match (left.unwrap_or(0), right.unwrap_or(0)) {
+        (super::types::oid::UNKNOWN, super::types::oid::UNKNOWN) => {
+            (super::types::oid::TEXT, super::types::oid::TEXT)
+        }
+        (super::types::oid::UNKNOWN, right) if right != 0 => (right, right),
+        (left, super::types::oid::UNKNOWN) if left != 0 => (left, left),
+        pair => pair,
+    };
+    builtin_properties::OPERATORS.iter().find_map(
+        |&(candidate, expected_left, expected_right, procedure)| {
+            (candidate == name && expected_left == left && expected_right == right)
+                .then_some(procedure)
+        },
+    )
+}
+
 pub(crate) fn builtin_operator_properties(
     name: &str,
     left: Option<i32>,
     right: Option<i32>,
 ) -> Option<(bool, bool)> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if let Some(procedure) = builtin_operator_exact(name, left, right) {
+        return builtin_procedure_properties(procedure);
+    }
     let mut best = None;
     let mut best_score = None;
     let mut ambiguous = false;
@@ -3910,6 +4148,60 @@ pub(crate) fn builtin_operator_properties(
         }
     }
     if ambiguous { None } else { best }
+}
+
+/// The selected procedure identity, rather than a merged volatility summary.
+pub(crate) fn builtin_operator_procedure(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> Option<i32> {
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if let Some(procedure) = builtin_operator_exact(name, left, right) {
+        return Some(procedure);
+    }
+    let mut best = None;
+    let mut best_score = None;
+    let mut ambiguous = false;
+    for &(candidate, expected_left, expected_right, procedure) in builtin_properties::OPERATORS {
+        if candidate != name {
+            continue;
+        }
+        let Some((left_rank, _, _)) = builtin_argument_properties(left.unwrap_or(0), expected_left)
+        else {
+            continue;
+        };
+        let Some((right_rank, _, _)) =
+            builtin_argument_properties(right.unwrap_or(0), expected_right)
+        else {
+            continue;
+        };
+        let score = left_rank + right_rank;
+        if best_score.is_none_or(|prior| score > prior) {
+            best_score = Some(score);
+            best = Some(procedure);
+            ambiguous = false;
+        } else if best_score == Some(score) && best != Some(procedure) {
+            ambiguous = true;
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
+/// Operator support procedures need not be exposed as SQL-callable routines.
+pub(crate) fn builtin_operator_input_oids(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> Option<(Option<i32>, Option<i32>)> {
+    let procedure = builtin_operator_procedure(name, left, right)?;
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    builtin_properties::OPERATORS
+        .iter()
+        .find_map(|&(candidate, left, right, selected)| {
+            (candidate == name && selected == procedure)
+                .then_some(((left != 0).then_some(left), (right != 0).then_some(right)))
+        })
 }
 
 /// NULLIF retains the first argument after equality overload coercion.
@@ -4008,6 +4300,167 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
     }
 }
 
+/// Resolve a user-defined conversion, including PostgreSQL's element-wise
+/// array coercion. Domains use their base conversion and retain their checks
+/// at the destination boundary; casts declared on a domain are ignored.
+pub(crate) fn defined_cast_path(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+) -> Option<(usize, crate::storage::CastDef)> {
+    let source_base = storage
+        .domain_base_type_for_oid(source, txid)
+        .map(ColType::oid);
+    let target_base = storage
+        .domain_base_type_for_oid(target, txid)
+        .map(ColType::oid);
+    if source_base.is_some() || target_base.is_some() {
+        return defined_cast_path(
+            storage,
+            txid,
+            source_base.unwrap_or(source),
+            target_base.unwrap_or(target),
+        );
+    }
+    if source == target {
+        return None;
+    }
+    if let Some(cast) = storage.cast_for_oids(source, target, txid) {
+        return Some(cast);
+    }
+    let ColType::Array(source) = storage.routine_result_for_oid(source, txid)?.ctype else {
+        return None;
+    };
+    let ColType::Array(target) = storage.routine_result_for_oid(target, txid)?.ctype else {
+        return None;
+    };
+    defined_cast_path(storage, txid, source.element_oid(), target.element_oid())
+}
+
+pub(crate) fn require_cast_context(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+    declared: crate::storage::CastContext,
+    requested: super::eval::DefinedCastContext,
+) -> Result<(), SqlError> {
+    let permitted = match requested {
+        super::eval::DefinedCastContext::Explicit => true,
+        super::eval::DefinedCastContext::Assignment => declared.permits_assignment(),
+        super::eval::DefinedCastContext::Implicit => declared.permits_implicit(),
+    };
+    if permitted {
+        return Ok(());
+    }
+    let type_name = |oid| {
+        user_type_name_fixed(storage, txid, oid)?
+            .or_else(|| super::exec::builtin_type_name_fixed(oid))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "cast type identity is unavailable"
+                )
+            })
+    };
+    Err(sql_err!(
+        if matches!(requested, super::eval::DefinedCastContext::Assignment) {
+            sqlstate::DATATYPE_MISMATCH
+        } else {
+            sqlstate::CANNOT_COERCE
+        },
+        "cannot cast type {} to {}",
+        type_name(source)?.as_str(),
+        type_name(target)?.as_str()
+    ))
+}
+
+/// UNKNOWN literals use the base type's input routine during SQL analysis.
+/// Domain constraints and registered conversion functions remain runtime work.
+pub(crate) fn validate_enum_input_literal(
+    storage: &Storage,
+    txid: u32,
+    text: &str,
+    target_oid: i32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let target = super::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    });
+    let (creation, array) = match target {
+        Some(ColType::Enum(creation)) => (creation, false),
+        Some(ColType::Array(element)) if matches!(element.to_coltype(), ColType::Enum(_)) => {
+            let ColType::Enum(creation) = element.to_coltype() else {
+                unreachable!()
+            };
+            (creation, true)
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "enum input type identity is unavailable"
+            ));
+        }
+    };
+    arena
+        .with_remaining_region(|scratch| {
+            if array {
+                super::exec::coerce_user_type_array(
+                    Datum::Text(text),
+                    super::types::ArrElem::Enum(creation),
+                    storage,
+                    txid,
+                    scratch,
+                    None,
+                )?;
+            } else {
+                super::exec::coerce_enum_value(
+                    Datum::Text(text),
+                    creation,
+                    storage,
+                    txid,
+                    scratch,
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+pub(crate) fn validate_explicit_cast(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target_oid: i32,
+    target: ColType,
+) -> Result<(), SqlError> {
+    if defined_cast_path(storage, txid, source, target_oid).is_some() {
+        return Ok(());
+    }
+    if let Some(contract) = storage.routine_result_for_oid(source, txid) {
+        super::eval::validate_geometry_type_cast(
+            contract.ctype,
+            target,
+            super::eval::DefinedCastContext::Explicit,
+        )?;
+    }
+    let source = storage
+        .domain_base_type_for_oid(source, txid)
+        .map_or(source, ColType::oid);
+    super::eval::validate_catalog_reference_cast(source, target)
+}
+
+pub(crate) fn builtin_cast_context(
+    source: i32,
+    target: i32,
+) -> Option<crate::storage::CastContext> {
+    builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+        .and_then(|cast| crate::storage::CastContext::from_code(cast.context))
+}
+
 pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
     if source == super::types::oid::UNKNOWN {
         let &(_, input, _) = builtin_properties::TYPE_IO
@@ -4037,6 +4490,58 @@ pub(crate) fn builtin_cast_properties(source: i32, target: i32) -> Option<(bool,
         return builtin_inout_cast_properties(source, target);
     }
     None
+}
+
+/// Visits the actual input/output or cast functions; binary paths visit none.
+pub(crate) fn builtin_cast_procedures(
+    source: i32,
+    target: i32,
+    mut visit: impl FnMut(i32),
+) -> Option<()> {
+    if source == super::types::oid::UNKNOWN {
+        let &(_, input, _) = builtin_properties::TYPE_IO
+            .iter()
+            .find(|entry| entry.0 == target)?;
+        visit(input);
+        return Some(());
+    }
+    if let Some(cast) = builtin_properties::CASTS
+        .iter()
+        .find(|cast| cast.source == source && cast.target == target)
+    {
+        match cast.method {
+            b'b' => return Some(()),
+            b'f' => {
+                visit(cast.procedure);
+                return Some(());
+            }
+            b'i' => {}
+            _ => unreachable!("PostgreSQL cast method"),
+        }
+    } else if source == target {
+        return Some(());
+    } else if ![source, target].into_iter().any(|oid| {
+        ColType::from_oid(oid).is_some_and(|ctype| super::types::type_category(ctype) == "S")
+    }) {
+        return None;
+    }
+    builtin_inout_cast_procedures(source, target, visit)
+}
+
+pub(crate) fn builtin_inout_cast_procedures(
+    source: i32,
+    target: i32,
+    mut visit: impl FnMut(i32),
+) -> Option<()> {
+    let &(_, input, _) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == target)?;
+    let &(_, _, output) = builtin_properties::TYPE_IO
+        .iter()
+        .find(|entry| entry.0 == source)?;
+    visit(output);
+    visit(input);
+    Some(())
 }
 
 pub(crate) fn builtin_inout_cast_properties(source: i32, target: i32) -> Option<(bool, bool)> {
@@ -4111,6 +4616,37 @@ fn builtin_argument_properties(actual: i32, expected: i32) -> Option<(usize, boo
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod builtin_property_tests {
     use super::*;
+
+    #[test]
+    fn unknown_operator_operands_try_the_known_types_exact_overload_first() {
+        use super::super::types::oid;
+        crate::mem::guard::forbid_alloc(|| {
+            for (known, procedure) in [(oid::INT4, 65), (oid::TEXT, 67)] {
+                for (left, right) in [(known, oid::UNKNOWN), (oid::UNKNOWN, known)] {
+                    assert_eq!(
+                        builtin_operator_procedure("=", Some(left), Some(right)),
+                        Some(procedure)
+                    );
+                    assert_eq!(
+                        builtin_operator_input_oids("=", Some(left), Some(right)),
+                        Some((Some(known), Some(known)))
+                    );
+                    assert_eq!(
+                        builtin_operator_properties("=", Some(left), Some(right)),
+                        builtin_procedure_properties(procedure)
+                    );
+                }
+            }
+            assert_eq!(
+                builtin_operator_procedure("=", Some(oid::UNKNOWN), Some(oid::UNKNOWN)),
+                Some(67)
+            );
+            assert_eq!(
+                builtin_operator_properties("=", Some(oid::UNKNOWN), Some(oid::UNKNOWN)),
+                builtin_procedure_properties(67)
+            );
+        });
+    }
 
     #[test]
     fn pg18_builtin_properties_distinguish_operators_casts_and_io() {
@@ -4312,110 +4848,6 @@ fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {
     }
 }
 
-fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
-    !matches!(
-        routine.oid,
-        376 | 394
-            | 1081
-            | 1271
-            | 1289
-            | 1290
-            | 1304
-            | 1305
-            | 1306
-            | 1307
-            | 1308
-            | 1309
-            | 1310
-            | 1311
-            | 1843
-            | 1844
-            | 2041
-            | 2042
-            | 2043
-            | 2044
-            | 2078
-            | 2106
-            | 2112
-            | 2113
-            | 2122
-            | 2123
-            | 2124
-            | 2125
-            | 2126
-            | 2127
-            | 2128
-            | 2137
-            | 2138
-            | 2139
-            | 2140
-            | 2141
-            | 2142
-            | 2143
-            | 2144
-            | 2230
-            | 2242
-            | 2243
-            | 2274
-            | 2307
-            | 2797
-            | 2798
-            | 2900
-            | 2901
-            | 3058
-            | 3059
-            | 3205
-            | 3209
-            | 3325
-            | 3434
-            | 3475
-            | 3491
-            | 3539
-            | 3540
-            | 3543
-            | 3544
-            | 3545
-            | 3549
-            | 3564
-            | 3565
-            | 3775
-            | 3840
-            | 3841
-            | 3844
-            | 3845
-            | 3933
-            | 3934
-            | 3937
-            | 3938
-            | 3941
-            | 3942
-            | 3945
-            | 3946
-            | 3960
-            | 3961
-            | 4189
-            | 4190
-            | 4299
-            | 4300
-            | 4301
-            | 4389
-            | 4450
-            | 6160
-            | 6161
-            | 6167
-            | 6170
-            | 6225
-            | 6226
-            | 6227
-            | 6232
-            | 6299
-            | 6326
-            | 6338
-            | 6395
-            | 6396
-    )
-}
-
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
@@ -4452,359 +4884,6 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 2511
             | 3035
     )
-}
-
-fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
-    match routine.oid {
-        715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
-        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
-        | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
-        1181
-        | 2137
-        | 2230
-        | 1598
-        | 1599
-        | 1641
-        | 2026
-        | 3035
-        | 3296
-        | 2511
-        | 2880..=2892
-        | 3089..=3096
-        | 3566
-        | 4568
-        | 6212
-        | 3952
-        | 3999
-        | 4014
-        | 6339
-        | 6340
-        | 6341 => "r",
-        _ => "s",
-    }
-}
-
-fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
-    match routine.oid {
-        1191 => "generate_subscripts",
-        1192 => "generate_subscripts_nodir",
-        1066 => "generate_series_step_int4",
-        1067 => "generate_series_int4",
-        1068 => "generate_series_step_int8",
-        1069 => "generate_series_int8",
-        3259 => "generate_series_step_numeric",
-        3260 => "generate_series_numeric",
-        938 => "generate_series_timestamp",
-        939 => "generate_series_timestamptz",
-        6274 => "generate_series_timestamptz_at_zone",
-        2026 => "pg_backend_pid",
-        2561 => "pg_blocking_pids",
-        2171 => "pg_cancel_backend",
-        2096 => "pg_terminate_backend",
-        2880 => "pg_advisory_lock_int8",
-        2881 => "pg_advisory_lock_shared_int8",
-        2882 => "pg_try_advisory_lock_int8",
-        2883 => "pg_try_advisory_lock_shared_int8",
-        2884 => "pg_advisory_unlock_int8",
-        2885 => "pg_advisory_unlock_shared_int8",
-        2886 => "pg_advisory_lock_int4",
-        2887 => "pg_advisory_lock_shared_int4",
-        2888 => "pg_try_advisory_lock_int4",
-        2889 => "pg_try_advisory_lock_shared_int4",
-        2890 => "pg_advisory_unlock_int4",
-        2891 => "pg_advisory_unlock_shared_int4",
-        2892 => "pg_advisory_unlock_all",
-        3089 => "pg_advisory_xact_lock_int8",
-        3090 => "pg_advisory_xact_lock_shared_int8",
-        3091 => "pg_try_advisory_xact_lock_int8",
-        3092 => "pg_try_advisory_xact_lock_shared_int8",
-        3093 => "pg_advisory_xact_lock_int4",
-        3094 => "pg_advisory_xact_lock_shared_int4",
-        3095 => "pg_try_advisory_xact_lock_int4",
-        3096 => "pg_try_advisory_xact_lock_shared_int4",
-        1062 => "aclitem_eq",
-        3000 => "has_foreign_data_wrapper_privilege_name_name",
-        3001 => "has_foreign_data_wrapper_privilege_name_id",
-        3002 => "has_foreign_data_wrapper_privilege_id_name",
-        3003 => "has_foreign_data_wrapper_privilege_id_id",
-        3004 => "has_foreign_data_wrapper_privilege_name",
-        3005 => "has_foreign_data_wrapper_privilege_id",
-        3006 => "has_server_privilege_name_name",
-        3007 => "has_server_privilege_name_id",
-        3008 => "has_server_privilege_id_name",
-        3009 => "has_server_privilege_id_id",
-        3010 => "has_server_privilege_name",
-        3011 => "has_server_privilege_id",
-        3943 => "acldefault_sql",
-        4189 | 4190 => "aggregate_dummy",
-        5023 => "",
-        6103 => "numeric_pg_lsn",
-        6348 => "has_largeobject_privilege_name_id",
-        6349 => "has_largeobject_privilege_id",
-        6350 => "has_largeobject_privilege_id_id",
-        89 => "pgsql_version",
-        376 => "text_to_array_null",
-        394 => "text_to_array",
-        720 | 2010 => "byteaoctetlen",
-        749 => "byteaoverlay",
-        752 => "byteaoverlay_no_len",
-        849 | 868 => "textpos",
-        877 | 936 => "text_substr",
-        879 | 880 | 1810 | 1811 | 1812 | 2074 => "",
-        881 => "ltrim1",
-        882 => "rtrim1",
-        883 | 937 => "text_substr_no_len",
-        885 => "btrim1",
-        1285 => "select pg_catalog.quote_literal($1::pg_catalog.text)",
-        1290 => "select pg_catalog.quote_nullable($1::pg_catalog.text)",
-        1317 | 1369 | 1381 => "textlen",
-        1318 | 1367 | 1372 => "bpcharlen",
-        1374 => "textoctetlen",
-        1375 => "bpcharoctetlen",
-        1404 => "textoverlay",
-        1405 => "textoverlay_no_len",
-        1530 => "lseg_length",
-        1531 => "path_length",
-        1680 => "bitsubstr",
-        1681 => "bitlength",
-        1682 => "bitoctetlength",
-        1698 => "bitposition",
-        1699 => "bitsubstr_no_len",
-        1845 => "to_ascii_default",
-        1846 => "to_ascii_enc",
-        1847 => "to_ascii_encname",
-        2012 => "bytea_substr",
-        2013 => "bytea_substr_no_len",
-        2014 => "byteapos",
-        2015 => "byteatrim",
-        2073 => "textregexsubstr",
-        1986 => "similar_to_escape_2",
-        1987 => "similar_to_escape_1",
-        2284 => "textregexreplace_noopt",
-        2285 => "textregexreplace",
-        2763 => "regexp_matches_no_flags",
-        2764 => "regexp_matches",
-        2765 => "regexp_split_to_table_no_flags",
-        2766 => "regexp_split_to_table",
-        2767 => "regexp_split_to_array_no_flags",
-        2768 => "regexp_split_to_array",
-        3396 => "regexp_match_no_flags",
-        3397 => "regexp_match",
-        6251 => "textregexreplace_extended",
-        6252 => "textregexreplace_extended_no_flags",
-        6253 => "textregexreplace_extended_no_n",
-        6254 => "regexp_count_no_start",
-        6255 => "regexp_count_no_flags",
-        6256 => "regexp_count",
-        6257 => "regexp_instr_no_start",
-        6258 => "regexp_instr_no_n",
-        6259 => "regexp_instr_no_endoption",
-        6260 => "regexp_instr_no_flags",
-        6261 => "regexp_instr_no_subexpr",
-        6262 => "regexp_instr",
-        6263 => "regexp_like_no_flags",
-        6264 => "regexp_like",
-        6265 => "regexp_substr_no_start",
-        6266 => "regexp_substr_no_n",
-        6267 => "regexp_substr_no_flags",
-        6268 => "regexp_substr_no_subexpr",
-        6269 => "regexp_substr",
-        2087 => "replace_text",
-        2085 => "bytea_substr",
-        2086 => "bytea_substr_no_len",
-        2089 => "to_hex32",
-        2090 => "to_hex64",
-        3030 => "bitoverlay",
-        3031 => "bitoverlay_no_len",
-        3058 => "text_concat",
-        3059 => "text_concat_ws",
-        3060 => "text_left",
-        3061 => "text_right",
-        3062 => "text_reverse",
-        3539 => "text_format",
-        3540 => "text_format_nv",
-        3696 => "text_starts_with",
-        3711 => "tsvector_length",
-        3848 => "range_lower",
-        3849 => "range_upper",
-        4235 => "multirange_lower",
-        4236 => "multirange_upper",
-        4350 => "unicode_normalize_func",
-        4351 => "unicode_is_normalized",
-        6160 => "text_to_table",
-        6161 => "text_to_table_null",
-        6195 => "bytealtrim",
-        6196 => "byteartrim",
-        6330 => "to_bin32",
-        6331 => "to_bin64",
-        6332 => "to_oct32",
-        6333 => "to_oct64",
-        6382 => "bytea_reverse",
-        320 => "width_bucket_float8",
-        3281 => "numeric_scale",
-        4112 => "macaddr8_trunc",
-        5042 => "numeric_min_scale",
-        5043 => "numeric_trim_scale",
-        5044 => "int4gcd",
-        5045 => "int8gcd",
-        5046 => "int4lcm",
-        5047 => "int8lcm",
-        5048 => "numeric_gcd",
-        5049 => "numeric_lcm",
-        6212 => "drandom_normal",
-        6219 => "derf",
-        6220 => "derfc",
-        6339 => "int4random",
-        6340 => "int8random",
-        6341 => "numeric_random",
-        6383 => "dgamma",
-        6384 => "dlgamma",
-        6428 => "gen_random_uuid",
-        6430 => "uuidv7_interval",
-        753 => "macaddr_trunc",
-        940 => "int2mod",
-        941 => "int4mod",
-        947 => "int8mod",
-        1194 | 1340 => "dlog10",
-        1341 => "dlog1",
-        1342 => "dround",
-        1343 => "dtrunc",
-        1344 => "dsqrt",
-        1345 => "dcbrt",
-        1346 | 1368 => "dpow",
-        1347 => "dexp",
-        1376 => "numeric_fac",
-        1394 => "float4abs",
-        1395 => "float8abs",
-        1396 => "int8abs",
-        1397 => "int4abs",
-        1398 => "int2abs",
-        1481 | 1708 | 1710 | 1741 => "",
-        1598 => "drandom",
-        1600 => "dasin",
-        1601 => "dacos",
-        1602 => "datan",
-        1603 => "datan2",
-        1604 => "dsin",
-        1605 => "dcos",
-        1606 => "dtan",
-        1607 => "dcot",
-        1610 => "dpi",
-        1705 => "numeric_abs",
-        1706 => "numeric_sign",
-        1707 => "numeric_round",
-        1709 => "numeric_trunc",
-        1711 => "numeric_ceil",
-        1712 => "numeric_floor",
-        1728 => "numeric_mod",
-        1730 => "numeric_sqrt",
-        1732 => "numeric_exp",
-        1734 => "numeric_ln",
-        1736 => "numeric_log",
-        1738 | 2169 => "numeric_power",
-        1973 => "numeric_div_trunc",
-        2167 => "numeric_ceil",
-        2170 => "width_bucket_numeric",
-        2308 | 2320 => "dceil",
-        2309 => "dfloor",
-        2310 => "dsign",
-        2462 => "dsinh",
-        2463 => "dcosh",
-        2464 => "dtanh",
-        2465 => "dasinh",
-        2466 => "dacosh",
-        2467 => "datanh",
-        2731 => "dasind",
-        2732 => "dacosd",
-        2733 => "datand",
-        2734 => "datan2d",
-        2735 => "dsind",
-        2736 => "dcosd",
-        2737 => "dtand",
-        2738 => "dcotd",
-        3218 => "width_bucket_array",
-        1026 => "timestamptz_izone",
-        1152 => "timestamp_eq",
-        1153 => "timestamp_ne",
-        1154 => "timestamp_lt",
-        1155 => "timestamp_le",
-        1156 => "timestamp_ge",
-        1157 => "timestamp_gt",
-        1159 => "timestamptz_zone",
-        1171 => "timestamptz_part",
-        1172 => "interval_part",
-        1174 => "date_timestamptz",
-        1175 => "interval_justify_hours",
-        1178 => "timestamptz_date",
-        1188 => "timestamp_mi",
-        1195 => "timestamp_smaller",
-        1196 => "timestamp_larger",
-        1199 => "timestamptz_age",
-        1200 => "interval_scale",
-        1217 => "timestamptz_trunc",
-        1218 => "interval_trunc",
-        1271 => "overlaps_timetz",
-        1272 => "datetime_timestamp",
-        1273 => "timetz_part",
-        1284 => "timestamptz_trunc_zone",
-        1295 => "interval_justify_days",
-        1176 | 1296 | 1298 | 1305 | 1306 | 1307 | 1309 | 1310 | 1311 | 1384 | 1386 | 1848
-        | 2042 | 2043 | 2044 | 2059 | 2546 | 2547 | 2548 | 2549 | 2550 => "",
-        1297 => "datetimetz_timestamptz",
-        1304 | 2041 => "overlaps_timestamp",
-        1308 => "overlaps_time",
-        1314 => "timestamp_cmp",
-        1316 => "timestamp_time",
-        1370 => "time_interval",
-        1373 => "date_finite",
-        1385 => "time_part",
-        1388 => "timestamptz_timetz",
-        1389 => "timestamp_finite",
-        1390 => "interval_finite",
-        1419 => "interval_time",
-        1961 => "timestamp_scale",
-        1967 => "timestamptz_scale",
-        1968 => "time_scale",
-        1969 => "timetz_scale",
-        2019 => "timestamptz_time",
-        2020 => "timestamp_trunc",
-        2021 => "timestamp_part",
-        2024 => "date_timestamp",
-        2025 => "datetime_timestamp",
-        2027 => "timestamptz_timestamp",
-        2028 => "timestamp_timestamptz",
-        2029 => "timestamp_date",
-        2037 => "timetz_zone",
-        2038 => "timetz_izone",
-        2046 => "timetz_time",
-        2047 => "time_timetz",
-        2048 => "timestamp_finite",
-        1359 => "datetimetz_timestamptz",
-        2058 => "timestamp_age",
-        2069 => "timestamp_zone",
-        2070 => "timestamp_izone",
-        2647 => "now",
-        2711 => "interval_justify_interval",
-        3463 => "make_timestamptz_at_timezone",
-        6177 => "timestamp_bin",
-        6178 => "timestamptz_bin",
-        6199 => "extract_date",
-        6200 => "extract_time",
-        6201 => "extract_timetz",
-        6202 => "extract_timestamp",
-        6203 => "extract_timestamptz",
-        6204 => "extract_interval",
-        6221 => "timestamptz_pl_interval",
-        6222 => "timestamptz_pl_interval_at_zone",
-        6223 => "timestamptz_mi_interval",
-        6273 => "timestamptz_mi_interval_at_zone",
-        6334 => "timestamptz_at_local",
-        6335 => "timestamp_at_local",
-        6336 => "timetz_at_local",
-        2106 | 2113 | 2122 | 2123 | 2124 | 2126 | 2127 | 2128 | 2138 | 2139 | 2140 | 2142
-        | 2143 | 2144 => "aggregate_dummy",
-        _ => routine.name,
-    }
 }
 
 const DDL_COMMAND_OUTPUT_OIDS: &[i32] = &[26, 26, 23, 25, 25, 25, 25, 16, 32];
@@ -4856,47 +4935,6 @@ const IDENTIFY_ADDRESS_OUTPUT_OIDS: &[i32] = &[25, 1009, 1009];
 const IDENTIFY_ADDRESS_OUTPUT_NAMES: &[&str] = &["type", "object_names", "object_args"];
 const OBJECT_ADDRESS_OUTPUT_OIDS: &[i32] = &[26, 26, 23];
 const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
-
-fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
-    match oid {
-        2289 => Some(&["options_array"]),
-        2307 | 3775 => Some(&["target"]),
-        2096 => Some(&["pid", "timeout"]),
-        2171 => Some(&["pid"]),
-        6119 => Some(&["pubname"]),
-        3382 | 3839 => Some(&["classid", "objid", "objsubid"]),
-        3954 => Some(&["type", "object_names", "object_args"]),
-        2284 => Some(&["string", "pattern", "replacement"]),
-        2285 => Some(&["string", "pattern", "replacement", "flags"]),
-        2763 | 2765 | 2767 | 3396 | 6254 | 6257 | 6263 | 6265 => Some(&["string", "pattern"]),
-        2764 | 2766 | 2768 | 3397 | 6264 => Some(&["string", "pattern", "flags"]),
-        6251 => Some(&["string", "pattern", "replacement", "start", "N", "flags"]),
-        6252 => Some(&["string", "pattern", "replacement", "start", "N"]),
-        6253 => Some(&["string", "pattern", "replacement", "start"]),
-        6255 | 6258 | 6266 => Some(&["string", "pattern", "start"]),
-        6256 => Some(&["string", "pattern", "start", "flags"]),
-        6259 | 6267 => Some(&["string", "pattern", "start", "N"]),
-        6260 => Some(&["string", "pattern", "start", "N", "endoption"]),
-        6261 => Some(&["string", "pattern", "start", "N", "endoption", "flags"]),
-        6262 => Some(&[
-            "string",
-            "pattern",
-            "start",
-            "N",
-            "endoption",
-            "flags",
-            "subexpr",
-        ]),
-        6268 => Some(&["string", "pattern", "start", "N", "flags"]),
-        6269 => Some(&["string", "pattern", "start", "N", "flags", "subexpr"]),
-        3461 | 3462 => Some(&["year", "month", "mday", "hour", "min", "sec"]),
-        3463 => Some(&["year", "month", "mday", "hour", "min", "sec", "timezone"]),
-        3464 => Some(&["years", "months", "weeks", "days", "hours", "mins", "secs"]),
-        3846 => Some(&["year", "month", "day"]),
-        3847 => Some(&["hour", "min", "sec"]),
-        _ => None,
-    }
-}
 
 fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
@@ -11370,8 +11408,7 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
 }
 
 pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
-    assert!((1..=crate::storage::MAX_INDEX_OID_GENERATION).contains(&index.created_at));
-    crate::storage::FIRST_EXPLICIT_INDEX_OID + index.created_at as i32
+    index.relation_oid()
 }
 
 /// A sequence keeps its relation identity independently of its resident slot.
@@ -11442,7 +11479,7 @@ pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 =
 pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
     super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
 pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 320_000_000;
-pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = crate::storage::FIRST_TOAST_INDEX_OID;
 
 pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
     crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
@@ -11450,10 +11487,109 @@ pub(crate) fn toast_relation_oid(storage: &Storage, slot: usize) -> i32 {
         .companion_oid(FIRST_TOAST_RELATION_OID)
 }
 
-pub(crate) fn toast_index_oid(storage: &Storage, slot: usize) -> i32 {
-    crate::storage::RelationIdentity::parse(storage.table(slot).created_at())
-        .expect("admitted table has a durable identity")
+pub(crate) fn toast_index_oid(storage: &Storage, slot: usize, txid: u32) -> i32 {
+    storage
+        .table_def(slot, txid)
+        .toast_index_identity
+        .expect("admitted TOAST index has a durable identity")
         .companion_oid(FIRST_TOAST_INDEX_OID)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ToastIndexInfo {
+    pub table: usize,
+    pub oid: i32,
+    pub name: StackStr<64>,
+    pub explicit_slot: Option<usize>,
+    pub definition: crate::storage::IndexMutableDefinition,
+    pub is_primary: bool,
+    owner: u16,
+}
+
+fn visit_toast_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(ToastIndexInfo)) {
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let owner = storage.table_def(table, txid);
+        if !owner.has_toast {
+            continue;
+        }
+        let anchor = owner
+            .toast_index_identity
+            .expect("admitted TOAST index has an identity");
+        let source = crate::storage::IndexRelationSource::Toast(storage.table_position(table));
+        let mut registered_anchor = false;
+        for slot in 0..storage.index_count() {
+            let Some(index) = storage.index_visible_to(slot, txid) else {
+                continue;
+            };
+            if index.relation != source {
+                continue;
+            }
+            registered_anchor |= index.created_at == anchor.created_at();
+            visit(ToastIndexInfo {
+                table,
+                oid: index.relation_oid(),
+                name: StackStr::from_str(index.name_for(txid).as_str()),
+                explicit_slot: Some(slot),
+                definition: index.mutable_for(txid),
+                // PostgreSQL index.c creates copies without IS_PRIMARY;
+                // index_concurrently_swap transfers it to the selected index.
+                is_primary: index.created_at == anchor.created_at(),
+                owner: index.ownership.owner_to(txid),
+            });
+        }
+        if !registered_anchor {
+            visit(ToastIndexInfo {
+                table,
+                oid: anchor.companion_oid(FIRST_TOAST_INDEX_OID),
+                name: stack_format!(64, "pg_toast_{}_index", user_table_oid(storage, table)),
+                explicit_slot: None,
+                definition: crate::storage::IndexMutableDefinition {
+                    kind: crate::storage::IndexKind::Ordinary,
+                    tablespace: owner.tablespace,
+                    ..crate::storage::IndexMutableDefinition::DEFAULT
+                },
+                is_primary: true,
+                owner: storage.table(table).ownership().owner_to(txid),
+            });
+        }
+    }
+}
+
+pub(crate) fn collect_toast_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [ToastIndexInfo], SqlError> {
+    let mut count = 0;
+    visit_toast_indexes(storage, txid, |_| count += 1);
+    let out = arena
+        .alloc_slice_with(count, |_| ToastIndexInfo {
+            table: 0,
+            oid: 0,
+            name: StackStr::new(),
+            explicit_slot: None,
+            definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            is_primary: false,
+            owner: 0,
+        })
+        .map_err(|_| arena_full())?;
+    let mut next = 0;
+    let mut exhausted = false;
+    visit_toast_indexes(storage, txid, |index| {
+        if let Some(slot) = out.get_mut(next) {
+            *slot = index;
+            next += 1;
+        } else {
+            exhausted = true;
+        }
+    });
+    if exhausted {
+        return Err(catalog_capacity_exceeded("TOAST indexes"));
+    }
+    Ok(&out[..next])
 }
 
 const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bool) -> i32 {
@@ -11630,7 +11766,11 @@ struct IdxInfo {
     oid: i32,
     table_oid: i32,
     table_slot: usize,
+    table_database: crate::storage::DatabaseOid,
+    table_created_at: u64,
     name: StackStr<64>,
+    kind: crate::storage::IndexKind,
+    owner: u16,
     method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
@@ -11650,20 +11790,31 @@ struct IdxInfo {
     predicate: Option<StackStr<{ crate::storage::INDEX_PREDICATE_MAX }>>,
     is_primary: bool,
     is_unique: bool,
-    is_constraint: bool,
+    constraint_identity: Option<crate::storage::ConstraintIdentity>,
     is_exclusion: bool,
     timing: crate::storage::ConstraintTiming,
-    constraint_parent_oid: i32,
+    constraint_parent: Option<crate::storage::ConstraintIdentity>,
+    index_parent_oid: Option<i32>,
     explicit_definition: Option<crate::storage::IndexMutableDefinition>,
 }
 
-fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index: &IdxInfo) -> i32 {
-    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
-        return 0;
-    };
+fn parent_constraint<Definition: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
+    child: &crate::storage::TableDefinition<Definition>,
+    index: &IdxInfo,
+) -> Option<(crate::storage::ConstraintIdentity, i32)> {
+    let attachment = child.partition.attachment?;
     let parent_slot = usize::from(attachment.parent);
     let parent = storage.table_def(parent_slot, txid);
-    let columns = &index.columns[..index.n_cols];
+    let child_columns = &index.columns[..index.n_cols];
+    // Attached partitions can store the same named columns in a different order.
+    let mut parent_columns = [0u16; crate::storage::MAX_INDEX_COLS];
+    for (target, &column) in parent_columns.iter_mut().zip(child_columns) {
+        let name = child.columns()[usize::from(column)].name;
+        *target = parent.column_index(name.as_str())? as u16;
+    }
+    let columns = &parent_columns[..index.n_cols];
     let is_primary = index.is_primary;
     let is_exclusion = index.is_exclusion;
     let mut position = 0usize;
@@ -11674,8 +11825,12 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    parent
+                        .column_constraint_identity(column)
+                        .expect("admitted inline key has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         } else if metadata.unique {
@@ -11685,8 +11840,12 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
                 && index.timing == crate::storage::ConstraintTiming::NotDeferrable
                 && columns == [column as u16]
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    parent
+                        .column_constraint_identity(column)
+                        .expect("admitted inline key has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         }
@@ -11698,33 +11857,37 @@ fn parent_constraint_oid(storage: &Storage, txid: u32, child_slot: usize, index:
             && unique.timing == index.timing
             && unique.columns() == columns
         {
-            return parent.implicit_index_oid(position)
-                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+            return Some((
+                unique
+                    .identity
+                    .expect("admitted unique key has a constraint identity"),
+                parent.implicit_index_oid(position),
+            ));
         }
         position += 1;
     }
     if is_exclusion {
-        let child = storage.table_def(child_slot, txid);
-        let Some(child_exclusion) = child
+        let child_exclusion = child
             .exclusions()
             .iter()
-            .find(|exclusion| exclusion.columns() == columns)
-        else {
-            return 0;
-        };
+            .find(|exclusion| exclusion.columns() == child_columns)?;
         for exclusion in parent.exclusions() {
-            if exclusion.columns() == child_exclusion.columns()
+            if exclusion.columns() == columns
                 && exclusion.operators[..exclusion.n_cols]
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return parent.implicit_index_oid(position)
-                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
+                return Some((
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity"),
+                    parent.implicit_index_oid(position),
+                ));
             }
             position += 1;
         }
     }
-    0
+    None
 }
 
 /// Enumerates every index relation psql `\d` would show: a single-column PK or
@@ -11756,7 +11919,7 @@ fn visit_indexes(
                   nulls_not_distinct: bool,
                   is_primary: bool,
                   is_unique: bool,
-                  is_constraint: bool,
+                  constraint_identity: Option<crate::storage::ConstraintIdentity>,
                   is_exclusion: bool,
                   timing: crate::storage::ConstraintTiming,
                   name: StackStr<64>| {
@@ -11764,19 +11927,46 @@ fn visit_indexes(
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
             included[..include_columns.len()].copy_from_slice(include_columns);
+            let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
+            let mut resolved_operator_classes = [None; crate::storage::MAX_INDEX_COLS];
+            for (position, &column) in columns.iter().enumerate() {
+                if !expression_keys[position] {
+                    let column = &def.columns()[usize::from(column)];
+                    collations[position] = column.collation;
+                    resolved_operator_classes[position] = if is_exclusion {
+                        crate::sql::types::GistOperatorClass::for_type(column.ctype)
+                            .map(crate::storage::IndexOperatorClass::Gist)
+                    } else {
+                        crate::sql::types::BtreeOperatorClass::for_type(column.ctype)
+                            .map(crate::storage::IndexOperatorClass::Btree)
+                    };
+                }
+            }
             let mut info = IdxInfo {
                 oid,
                 table_oid: toid,
                 table_slot: slot,
+                table_database: def.identity().database,
+                table_created_at: def.identity().created_at,
                 name,
-                method: crate::sql::ast::IndexAccessMethod::Btree,
+                owner: storage.table(slot).ownership().owner_to(txid),
+                kind: if def.partition.is_partitioned() {
+                    crate::storage::IndexKind::Partitioned { valid: true }
+                } else {
+                    crate::storage::IndexKind::Ordinary
+                },
+                method: if is_exclusion {
+                    crate::sql::ast::IndexAccessMethod::Gist
+                } else {
+                    crate::sql::ast::IndexAccessMethod::Btree
+                },
                 columns: c,
                 expression_keys,
                 include_columns: included,
-                collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+                collations,
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-                resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+                resolved_operator_classes,
                 operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                     crate::storage::MAX_INDEX_COLS],
                 descending,
@@ -11787,21 +11977,39 @@ fn visit_indexes(
                 predicate,
                 is_primary,
                 is_unique,
-                is_constraint,
+                constraint_identity,
                 is_exclusion,
                 timing,
-                constraint_parent_oid: 0,
+                constraint_parent: None,
+                index_parent_oid: None,
                 explicit_definition: None,
             };
-            if is_constraint {
-                info.constraint_parent_oid = parent_constraint_oid(storage, txid, slot, &info);
+            if constraint_identity.is_some()
+                && let Some((parent, parent_index)) = parent_constraint(storage, txid, &def, &info)
+            {
+                info.constraint_parent = Some(parent);
+                info.index_parent_oid = Some(parent_index);
             }
             info
         };
         // Single-column PK / UNIQUE carried as column flags.
         for (ci, col) in def.columns().iter().enumerate() {
+            if (col.primary || col.unique)
+                && storage
+                    .indexes_for(def.schema.as_str(), table_name, txid)
+                    .any(|index| {
+                        def.column_index_identity(ci)
+                            .is_some_and(|identity| identity.created_at() == index.created_at)
+                    })
+            {
+                continue;
+            }
             if col.primary {
-                let name = stack_str_64(stack_format!(64, "{}_pkey", table_name).as_str());
+                let name = stack_str_64(
+                    def.column_key_name(ci)
+                        .expect("admitted inline key has a name")
+                        .as_str(),
+                );
                 visit(mk(
                     def.column_index_identity(ci)
                         .expect("admitted inline index has an identity")
@@ -11815,14 +12023,19 @@ fn visit_indexes(
                     false,
                     true,
                     true,
-                    true,
+                    Some(
+                        def.column_constraint_identity(ci)
+                            .expect("admitted inline key has a constraint identity"),
+                    ),
                     false,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
             } else if col.unique {
                 let name = stack_str_64(
-                    stack_format!(64, "{}_{}_key", table_name, col.name.as_str()).as_str(),
+                    def.column_key_name(ci)
+                        .expect("admitted inline key has a name")
+                        .as_str(),
                 );
                 visit(mk(
                     def.column_index_identity(ci)
@@ -11837,7 +12050,10 @@ fn visit_indexes(
                     false,
                     false,
                     true,
-                    true,
+                    Some(
+                        def.column_constraint_identity(ci)
+                            .expect("admitted inline key has a constraint identity"),
+                    ),
                     false,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
@@ -11846,19 +12062,13 @@ fn visit_indexes(
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
-            // ALTER TABLE ... ADD CONSTRAINT ... USING INDEX transfers the
-            // index relation into the constraint. Do not synthesize a second
-            // catalog index: matching name plus typed key positions is the
-            // durable attachment proof.
+            // A transferred or rebuilt backing relation keeps the constraint's
+            // identity. Its relation identity prevents a duplicate index row.
             if storage
                 .indexes_for(def.schema.as_str(), table_name, txid)
                 .any(|index| {
-                    index.name_for(txid) == uk.name
-                        && index.n_cols == uk.n_cols
-                        && index.columns[..index.n_cols] == uk.columns[..uk.n_cols]
-                        && index.expressions[..index.n_cols]
-                            .iter()
-                            .all(Option::is_none)
+                    uk.index_identity
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
                 })
             {
                 continue;
@@ -11876,13 +12086,26 @@ fn visit_indexes(
                 uk.kind.nulls_not_distinct(),
                 uk.kind.is_primary(),
                 true,
-                true,
+                Some(
+                    uk.identity
+                        .expect("admitted unique key has a constraint identity"),
+                ),
                 false,
                 uk.timing,
                 stack_str_64(uk.name.as_str()),
             ));
         }
         for exclusion in def.exclusions() {
+            if storage
+                .indexes_for(def.schema.as_str(), table_name, txid)
+                .any(|index| {
+                    exclusion
+                        .index_identity
+                        .is_some_and(|identity| identity.created_at() == index.created_at)
+                })
+            {
+                continue;
+            }
             visit(mk(
                 exclusion
                     .index_identity
@@ -11899,7 +12122,11 @@ fn visit_indexes(
                 false,
                 false,
                 false,
-                true,
+                Some(
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity"),
+                ),
                 true,
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
@@ -11907,14 +12134,42 @@ fn visit_indexes(
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+            let inline = def
+                .columns()
+                .iter()
+                .enumerate()
+                .find_map(|(column, metadata)| {
+                    ((metadata.primary || metadata.unique)
+                        && def
+                            .column_index_identity(column)
+                            .is_some_and(|identity| identity.created_at() == index.created_at))
+                    .then_some(column)
+                });
             let attached = def.uniques().iter().find(|key| {
-                key.name == index.name_for(txid)
-                    && key.n_cols == index.n_cols
-                    && key.columns[..key.n_cols] == index.columns[..index.n_cols]
-                    && index.expressions[..index.n_cols]
-                        .iter()
-                        .all(Option::is_none)
+                key.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
             });
+            let attached_exclusion = def.exclusions().iter().find(|key| {
+                key.index_identity
+                    .is_some_and(|identity| identity.created_at() == index.created_at)
+            });
+            let constraint_identity = attached
+                .map(|key| {
+                    key.identity
+                        .expect("admitted unique key has a constraint identity")
+                })
+                .or_else(|| {
+                    attached_exclusion.map(|key| {
+                        key.identity
+                            .expect("admitted exclusion has a constraint identity")
+                    })
+                })
+                .or_else(|| {
+                    inline.map(|column| {
+                        def.column_constraint_identity(column)
+                            .expect("admitted inline key has a constraint identity")
+                    })
+                });
             let mut info = mk(
                 explicit_index_oid(&index),
                 &index.columns[..index.n_cols],
@@ -11924,13 +12179,15 @@ fn visit_indexes(
                 index.nulls_first,
                 index.predicate,
                 index.nulls_not_distinct,
-                attached.is_some_and(|key| key.kind.is_primary()),
+                attached.is_some_and(|key| key.kind.is_primary())
+                    || inline.is_some_and(|column| def.columns()[column].primary),
                 index.unique,
-                attached.is_some(),
-                false,
-                attached.map_or(crate::storage::ConstraintTiming::NotDeferrable, |key| {
-                    key.timing
-                }),
+                constraint_identity,
+                attached_exclusion.is_some(),
+                attached
+                    .map(|key| key.timing)
+                    .or_else(|| attached_exclusion.map(|key| key.timing))
+                    .unwrap_or(crate::storage::ConstraintTiming::NotDeferrable),
                 stack_str_64(index.name_for(txid).as_str()),
             );
             info.method = index.method;
@@ -11940,27 +12197,39 @@ fn visit_indexes(
             info.resolved_operator_classes = index.resolved_operator_classes;
             info.operator_class_options = index.operator_class_options;
             info.explicit_definition = Some(index.mutable_for(txid));
+            info.kind = index.mutable_for(txid).kind;
+            info.owner = index.ownership.owner_to(txid);
+            if let Some(parent) = index.mutable_for(txid).parent {
+                info.index_parent_oid = storage
+                    .index_visible_to(usize::from(parent), txid)
+                    .map(|parent| explicit_index_oid(&parent));
+            }
             visit(info);
         }
     }
 }
 
 /// Counters belong to the index's table, which may be a scanned child partition.
-pub(crate) fn index_statistics_owner(
+pub(crate) fn index_statistics_source(
     storage: &Storage,
     transaction: u32,
     oid: i32,
-) -> Option<crate::storage::IndexStatisticsOwner> {
+) -> Option<(
+    crate::storage::IndexStatisticsOwner,
+    crate::storage::DatabaseOid,
+    u64,
+)> {
     let mut owner = None;
     visit_indexes(storage, transaction, None, |index| {
         if index.oid == oid {
             let table =
                 u16::try_from(index.table_slot).expect("startup table capacity is representable");
-            owner = Some(if index.explicit_definition.is_some() {
+            let selected = if index.explicit_definition.is_some() {
                 crate::storage::IndexStatisticsOwner::Explicit(table)
             } else {
                 crate::storage::IndexStatisticsOwner::Implicit(table)
-            });
+            };
+            owner = Some((selected, index.table_database, index.table_created_at));
         }
     });
     owner
@@ -12136,7 +12405,11 @@ fn empty_index() -> IdxInfo {
         oid: 0,
         table_oid: 0,
         table_slot: 0,
+        table_database: crate::storage::DatabaseOid::POSTGRES,
+        table_created_at: 0,
         name: StackStr::new(),
+        kind: crate::storage::IndexKind::Ordinary,
+        owner: 0,
         method: crate::sql::ast::IndexAccessMethod::Btree,
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expression_keys: [false; crate::storage::MAX_INDEX_COLS],
@@ -12155,10 +12428,11 @@ fn empty_index() -> IdxInfo {
         predicate: None,
         is_primary: false,
         is_unique: false,
-        is_constraint: false,
+        constraint_identity: None,
         is_exclusion: false,
         timing: crate::storage::ConstraintTiming::NotDeferrable,
-        constraint_parent_oid: 0,
+        constraint_parent: None,
+        index_parent_oid: None,
         explicit_definition: None,
     }
 }
@@ -12206,6 +12480,15 @@ fn index_oid_by_name(
     schema: Option<&str>,
     name: &str,
 ) -> Option<i32> {
+    if schema == Some("pg_toast") {
+        let mut found = None;
+        visit_toast_indexes(storage, txid, |index| {
+            if index.name.as_str() == name {
+                found = Some(index.oid);
+            }
+        });
+        return found;
+    }
     let current_temporary_schema = storage.temporary_schema().ok();
     let mut found = None;
     visit_indexes(storage, txid, schema, |index| {
@@ -12232,6 +12515,7 @@ fn index_oid_by_name(
 fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
     let mut found = false;
     visit_indexes(storage, txid, None, |index| found |= index.oid == oid);
+    visit_toast_indexes(storage, txid, |index| found |= index.oid == oid);
     found
 }
 
@@ -12252,58 +12536,238 @@ pub(crate) fn index_identity_by_oid(
             ));
         }
     });
+    visit_toast_indexes(storage, txid, |index| {
+        if index.oid == oid {
+            found = Some((
+                SqlName::parse("pg_toast").expect("fixed catalog namespace fits"),
+                StackStr::from_str(index.name.as_str()),
+            ));
+        }
+    });
     found
 }
 
 pub(crate) struct IndexMaintenanceTarget {
     pub table: usize,
     pub oid: i32,
-    pub explicit_slot: Option<usize>,
 }
 
-/// Includes the implicit constraint indexes exposed by the relation catalog.
+/// Includes the implicit constraint and TOAST indexes exposed by the catalogs.
 pub(crate) fn index_maintenance_target(
     storage: &Storage,
     txid: u32,
     schema: Option<&str>,
     name: &str,
 ) -> Result<Option<IndexMaintenanceTarget>, SqlError> {
-    let Some(oid) = relation_oid_for_name(storage, txid, schema, name) else {
+    let Some(oid) = relation_oid_for_name(storage, txid, schema, name).require_supported()? else {
         return Ok(None);
     };
     let mut found = None;
     visit_indexes(storage, txid, None, |index| {
         if index.oid == oid {
-            found = Some((
-                index.table_slot,
-                index.name,
-                index.explicit_definition.is_some(),
-            ));
+            found = Some(index.table_slot);
         }
     });
-    let Some((table, name, explicit)) = found else {
-        return Ok(None);
+    if found.is_none() {
+        visit_toast_indexes(storage, txid, |index| {
+            if index.oid == oid {
+                found = Some(index.table);
+            }
+        });
+    }
+    Ok(found.map(|table| IndexMaintenanceTarget { table, oid }))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReindexCandidate {
+    pub table: usize,
+    pub definition: crate::storage::IndexDef,
+    pub exclusion: bool,
+}
+
+/// Table maintenance follows PostgreSQL's live-index list; a direct INDEX
+/// request still selects its exact lifetime, including an invalid index.
+pub(crate) fn reindex_candidates<'a>(
+    storage: &Storage,
+    txid: u32,
+    tables: &[usize],
+    selected: Option<i32>,
+    arena: &'a Arena,
+) -> Result<&'a [ReindexCandidate], SqlError> {
+    let matches = |index: &IdxInfo| {
+        tables.contains(&index.table_slot)
+            && (selected.is_some()
+                || index
+                    .explicit_definition
+                    .is_none_or(|definition| definition.kind.live()))
+            && selected.is_none_or(|oid| {
+                if oid == index.oid {
+                    return true;
+                }
+                let mut parent = index.index_parent_oid;
+                for _ in 0..storage.table_count() {
+                    let Some(current) = parent else {
+                        return false;
+                    };
+                    if current == oid {
+                        return true;
+                    }
+                    parent = None;
+                    visit_indexes(storage, txid, None, |candidate| {
+                        if candidate.oid == current {
+                            parent = candidate.index_parent_oid;
+                        }
+                    });
+                }
+                false
+            })
     };
-    let explicit_slot = if explicit {
-        let schema = storage.table_def(table, txid).schema;
-        Some(
-            storage
-                .index_slot(schema.as_str(), name.as_str(), txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::SERIALIZATION_FAILURE,
-                        "selected index changed before maintenance"
+    let mut count = 0;
+    visit_indexes(storage, txid, None, |index| {
+        count += usize::from(matches(&index))
+    });
+    visit_toast_indexes(storage, txid, |index| {
+        count += usize::from(
+            tables.contains(&index.table)
+                && selected.is_none_or(|oid| oid == index.oid)
+                && (selected.is_some() || index.definition.kind.live()),
+        );
+    });
+    let result = arena
+        .alloc_slice_with(count, |_| ReindexCandidate {
+            table: 0,
+            definition: crate::storage::IndexDef::EMPTY,
+            exclusion: false,
+        })
+        .map_err(|_| arena_full())?;
+    let mut next = 0;
+    let mut failure = None;
+    visit_indexes(storage, txid, None, |index| {
+        if failure.is_some() || !matches(&index) {
+            return;
+        }
+        let name = match crate::storage::SqlName::parse(index.name.as_str()) {
+            Ok(name) => name,
+            Err(error) => {
+                failure = Some(error);
+                return;
+            }
+        };
+        let table = storage.table_def(index.table_slot, txid);
+        let explicit = storage
+            .index_slot(table.schema.as_str(), index.name.as_str(), txid)
+            .and_then(|slot| storage.index_visible_to(slot, txid))
+            .filter(|definition| explicit_index_oid(definition) == index.oid);
+        let definition = explicit.unwrap_or_else(|| crate::storage::IndexDef {
+            database: storage.current_database_oid(),
+            created_at: table
+                .implicit_index_identities()
+                .flatten()
+                .find(|identity| identity.oid() == index.oid)
+                .expect("selected implicit index has a creation identity")
+                .created_at(),
+            schema: table.schema,
+            name,
+            table: table.name,
+            ownership: crate::storage::Ownership {
+                owner: storage.table(index.table_slot).ownership().owner_to(txid),
+                pending: None,
+            },
+            method: index.method,
+            columns: index.columns,
+            include_columns: index.include_columns,
+            collations: index.collations,
+            explicit_collations: index.explicit_collations,
+            operator_classes: index.operator_classes,
+            resolved_operator_classes: index.resolved_operator_classes,
+            operator_class_options: index.operator_class_options,
+            descending: index.descending,
+            nulls_first: index.nulls_first,
+            n_cols: index.n_cols,
+            n_include_cols: index.n_include_cols,
+            nulls_not_distinct: index.nulls_not_distinct,
+            predicate: index.predicate,
+            unique: index.is_unique,
+            mutable: crate::storage::IndexMutableDefinition {
+                kind: index.kind,
+                tablespace: table.tablespace,
+                immediate: !index.timing.is_deferrable(),
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            },
+            ..crate::storage::IndexDef::EMPTY
+        });
+        result[next] = ReindexCandidate {
+            table: index.table_slot,
+            definition,
+            exclusion: index.is_exclusion,
+        };
+        next += 1;
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    visit_toast_indexes(storage, txid, |index| {
+        if !tables.contains(&index.table)
+            || selected.is_some_and(|oid| oid != index.oid)
+            || (selected.is_none() && !index.definition.kind.live())
+        {
+            return;
+        }
+        let table = storage.table_def(index.table, txid);
+        let definition = index
+            .explicit_slot
+            .and_then(|slot| storage.index_visible_to(slot, txid))
+            .unwrap_or_else(|| {
+                let mut columns = [0; crate::storage::MAX_INDEX_COLS];
+                columns[1] = 1;
+                crate::storage::IndexDef {
+                    relation: crate::storage::IndexRelationSource::Toast(
+                        storage.table_position(index.table),
+                    ),
+                    database: storage.current_database_oid(),
+                    created_at: table
+                        .toast_index_identity
+                        .expect("admitted TOAST identity")
+                        .created_at(),
+                    schema: crate::storage::SqlName::parse("pg_toast")
+                        .expect("fixed catalog namespace fits"),
+                    name: crate::storage::SqlName::parse(index.name.as_str())
+                        .expect("admitted TOAST index name fits"),
+                    table: crate::storage::SqlName::parse(
+                        stack_format!(64, "pg_toast_{}", user_table_oid(storage, index.table))
+                            .as_str(),
                     )
-                })?,
-        )
-    } else {
-        None
-    };
-    Ok(Some(IndexMaintenanceTarget {
-        table,
-        oid,
-        explicit_slot,
-    }))
+                    .expect("generated TOAST relation name fits"),
+                    ownership: crate::storage::Ownership {
+                        owner: storage.table(index.table).ownership().owner_to(txid),
+                        pending: None,
+                    },
+                    columns,
+                    n_cols: 2,
+                    unique: true,
+                    collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+                    resolved_operator_classes: {
+                        let mut classes = [None; crate::storage::MAX_INDEX_COLS];
+                        classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
+                            crate::sql::types::BtreeOperatorClass::Oid,
+                        ));
+                        classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
+                            crate::sql::types::BtreeOperatorClass::Int4,
+                        ));
+                        classes
+                    },
+                    mutable: index.definition,
+                    ..crate::storage::IndexDef::EMPTY
+                }
+            });
+        result[next] = ReindexCandidate {
+            table: index.table,
+            definition,
+            exclusion: false,
+        };
+        next += 1;
+    });
+    Ok(&result[..next])
 }
 
 fn stack_str_64(s: &str) -> StackStr<64> {
@@ -12323,7 +12787,7 @@ pub fn relname_text<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     let reference = |schema: &str, name: &str| {
         let mut output = StackStr::<260>::new();
-        if relation_oid_for_name(storage, txid, None, name) != Some(oid) {
+        if !relation_oid_for_name(storage, txid, None, name).matches_oid(oid) {
             write_identifier(&mut output, schema);
             let _ = output.write_char('.');
         }
@@ -12349,6 +12813,17 @@ pub fn relname_text<'a>(
     }
     if let Some((schema, name)) = storage.composite_relation_name(oid, txid) {
         return reference(schema.as_str(), name.as_str());
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && toast_relation_oid(storage, slot) == oid
+        {
+            return reference(
+                "pg_toast",
+                stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot)).as_str(),
+            );
+        }
     }
     // Other relation families were resolved above. Index names are copied
     // directly, without constructing catalog rows.
@@ -12381,12 +12856,37 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Result<Option
             {
                 storage.require_schema_usage(schema.as_str(), txid)?;
             }
-            Ok(relation_oid_for_name(
+            relation_oid_for_name(
                 storage,
                 txid,
                 parsed.schema.as_ref().map(SqlName::as_str),
                 parsed.name.as_str(),
-            ))
+            )
+            .require_supported()
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RelationOidLookup {
+    Found(i32),
+    Missing,
+    UnsupportedInformationSchema,
+}
+
+impl RelationOidLookup {
+    fn matches_oid(self, oid: i32) -> bool {
+        matches!(self, Self::Found(selected) if selected == oid)
+    }
+
+    pub(super) fn require_supported(self) -> Result<Option<i32>, SqlError> {
+        match self {
+            Self::Found(oid) => Ok(Some(oid)),
+            Self::Missing => Ok(None),
+            Self::UnsupportedInformationSchema => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "relation OIDs for information_schema views are not supported"
+            )),
         }
     }
 }
@@ -12396,30 +12896,41 @@ pub(super) fn relation_oid_for_name(
     txid: u32,
     schema: Option<&str>,
     name: &str,
-) -> Option<i32> {
+) -> RelationOidLookup {
+    let ordinary =
+        |oid: Option<i32>| oid.map_or(RelationOidLookup::Missing, RelationOidLookup::Found);
     if let Some(schema) = schema {
+        if schema == "information_schema" && is_catalog_relation(Some(schema), name) {
+            return RelationOidLookup::UnsupportedInformationSchema;
+        }
         if schema == "pg_temp" {
-            return relation_oid_in_schema(
-                storage,
-                txid,
-                storage.temporary_schema().ok()?.as_str(),
-                name,
-            );
+            return ordinary(storage.temporary_schema().ok().and_then(|temporary| {
+                relation_oid_in_schema(storage, txid, temporary.as_str(), name)
+            }));
         }
         if schema.starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema) {
-            return None;
+            return RelationOidLookup::Missing;
         }
-        return relation_oid_in_schema(storage, txid, schema, name);
+        return ordinary(relation_oid_in_schema(storage, txid, schema, name));
     }
     if let Ok(temporary) = storage.temporary_schema()
         && let Some(oid) = relation_oid_in_schema(storage, txid, temporary.as_str(), name)
     {
-        return Some(oid);
+        return RelationOidLookup::Found(oid);
     }
     for entry in storage.path().entries() {
         let schema = match entry {
             crate::storage::PathEntry::Catalog => {
                 SqlName::parse("pg_catalog").expect("catalog name fits")
+            }
+            crate::storage::PathEntry::InformationSchema => {
+                if is_catalog_relation(Some("information_schema"), name) {
+                    return RelationOidLookup::UnsupportedInformationSchema;
+                }
+                continue;
+            }
+            crate::storage::PathEntry::Toast => {
+                SqlName::parse("pg_toast").expect("fixed catalog namespace fits")
             }
             crate::storage::PathEntry::Schema(slot) => {
                 let definition = storage.schema_def_for(usize::from(*slot), txid);
@@ -12430,10 +12941,10 @@ pub(super) fn relation_oid_for_name(
             }
         };
         if let Some(oid) = relation_oid_in_schema(storage, txid, schema.as_str(), name) {
-            return Some(oid);
+            return RelationOidLookup::Found(oid);
         }
     }
-    None
+    RelationOidLookup::Missing
 }
 
 fn relation_oid_in_schema(
@@ -12442,6 +12953,18 @@ fn relation_oid_in_schema(
     schema: &str,
     relation: &str,
 ) -> Option<i32> {
+    if schema == "pg_toast" {
+        for slot in 0..storage.table_count() {
+            if storage.table_slot_visible_to(slot, txid)
+                && storage.table_def(slot, txid).has_toast
+                && relation
+                    == stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot)).as_str()
+            {
+                return Some(toast_relation_oid(storage, slot));
+            }
+        }
+        return index_oid_by_name(storage, txid, Some(schema), relation);
+    }
     if schema == "pg_catalog"
         && let Some(oid) = catalog_relation_oid(relation)
     {
@@ -12465,41 +12988,29 @@ fn relation_oid_in_schema(
         .map(|slot| named_composite_relation_oid(storage, slot))
 }
 
-fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
-    let (written_schema, written_table) = split_qualified_name(written)?;
-    let in_schema = |schema: &str| {
-        (0..storage.table_count()).find(|slot| {
-            storage.table_slot_visible_to(*slot, txid)
-                && storage.table_def(*slot, txid).schema.as_str() == schema
-                && identifier_spelling_matches(
-                    written_table,
-                    storage.table_def(*slot, txid).name.as_str(),
-                )
-        })
-    };
-    if let Some(written_schema) = written_schema {
-        let schema = (0..storage.schema_count()).find_map(|slot| {
-            let definition = storage.schema_def_for(slot, txid);
-            (definition.visible_to(txid)
-                && identifier_spelling_matches(written_schema, definition.name.as_str()))
-            .then_some(definition.name)
-        })?;
-        return in_schema(schema.as_str());
-    }
-    if let Ok(schema) = storage.temporary_schema()
-        && let Some(slot) = in_schema(schema.as_str())
+fn table_slot_by_written_name(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<Option<usize>, SqlError> {
+    let parsed = crate::sql::identifiers::QualifiedObjectName::parse(written)?;
+    if parsed
+        .database
+        .is_some_and(|database| database != storage.current_database_name(txid))
     {
-        return Some(slot);
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cross-database relation references are not supported"
+        ));
     }
-    for entry in storage.path().entries() {
-        if let crate::storage::PathEntry::Schema(schema) = entry
-            && let Some(slot) =
-                in_schema(storage.schema_def_for(*schema as usize, txid).name.as_str())
-        {
-            return Some(slot);
-        }
-    }
-    None
+    let oid = relation_oid_for_name(
+        storage,
+        txid,
+        parsed.schema.as_ref().map(SqlName::as_str),
+        parsed.name.as_str(),
+    )
+    .require_supported()?;
+    Ok(oid.and_then(|oid| table_slot_by_oid(storage, txid, oid)))
 }
 
 pub(crate) fn serial_sequence_name<'a>(
@@ -12509,7 +13020,7 @@ pub(crate) fn serial_sequence_name<'a>(
     column: &str,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let table_slot = table_slot_by_written_name(storage, txid, table).ok_or_else(|| {
+    let table_slot = table_slot_by_written_name(storage, txid, table)?.ok_or_else(|| {
         sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "relation \"{}\" does not exist",
@@ -12559,6 +13070,11 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
             storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid
         })
         || has_index_oid(storage, txid, oid)
+        || (0..storage.table_count()).any(|slot| {
+            storage.table_slot_visible_to(slot, txid)
+                && storage.table_def(slot, txid).has_toast
+                && toast_relation_oid(storage, slot) == oid
+        })
         || (0..storage.sequence_count()).any(|slot| {
             storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid
         })
@@ -12569,32 +13085,43 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
 
 pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
     if let Some(name) = catalog_relation_name(oid) {
-        return Some(relation_oid_for_name(storage, txid, None, name) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name).matches_oid(oid));
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && toast_relation_oid(storage, slot) == oid
+        {
+            let name = stack_format!(64, "pg_toast_{}", user_table_oid(storage, slot));
+            return Some(
+                relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid),
+            );
+        }
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid) && user_table_oid(storage, slot) == oid {
             let table = storage.table_def(slot, txid);
             return Some(
-                relation_oid_for_name(storage, txid, None, table.name.as_str()) == Some(oid),
+                relation_oid_for_name(storage, txid, None, table.name.as_str()).matches_oid(oid),
             );
         }
     }
     if let Some((_, name)) = index_identity_by_oid(storage, txid, oid) {
-        return Some(index_oid_by_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     for slot in 0..storage.sequence_count() {
         if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid {
             let sequence = storage.sequence_for(slot, txid);
             return Some(
-                relation_oid_for_name(storage, txid, None, sequence.name.as_str()) == Some(oid),
+                relation_oid_for_name(storage, txid, None, sequence.name.as_str()).matches_oid(oid),
             );
         }
     }
     if let Some((_, name)) = storage.view_relation_name(oid, txid) {
-        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     if let Some((_, name)) = storage.composite_relation_name(oid, txid) {
-        return Some(relation_oid_for_name(storage, txid, None, name.as_str()) == Some(oid));
+        return Some(relation_oid_for_name(storage, txid, None, name.as_str()).matches_oid(oid));
     }
     None
 }
@@ -12651,7 +13178,7 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
         {
             return Some(
                 relation_oid_for_name(storage, txid, None, table.name.as_str())
-                    == Some(user_table_oid(storage, slot)),
+                    .matches_oid(user_table_oid(storage, slot)),
             );
         }
     }
@@ -12668,7 +13195,8 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
                     txid,
                     None,
                     storage.view(slot).name_for(txid).as_str(),
-                ) == Some(view_oid(storage, slot)),
+                )
+                .matches_oid(view_oid(storage, slot)),
             );
         }
     }
@@ -12721,7 +13249,7 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
 }
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
-    INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+    builtin_callable_by_oid(oid).is_some()
 }
 
 pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
@@ -12731,38 +13259,63 @@ pub(crate) fn intrinsic_routine_public_execute(oid: i32) -> Option<bool> {
     ))
 }
 
-fn intrinsic_routine_defaults(oid: i32) -> Option<(usize, &'static str)> {
-    Some(match oid {
-        2096 => (1, "0"),
-        3577 | 3578 | 3960 | 3961 => (1, "false"),
-        3786 => (3, "false, false, false"),
-        1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
-            (2, "'{}'::jsonb, false")
-        }
-        6212 => (2, "0, 1"),
-        1268 => (1, "true"),
-        4350 | 4351 => (1, "'NFC'::text"),
-        3464 => (7, "0, 0, 0, 0, 0, 0, 0.0"),
-        _ => return None,
-    })
-}
-
 pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
-    if function_oid_is_visible(oid) {
-        return Some(true);
+    let mut argument_oids = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    let (schema, name, arguments) = if let Some(declaration) = builtin_callable_by_oid(oid) {
+        (
+            SqlName::parse(declaration.schema).expect("built-in schema fits its name bound"),
+            SqlName::parse(declaration.name).expect("built-in routine fits its name bound"),
+            declaration.arguments,
+        )
+    } else {
+        let slot = storage.routine_slot_by_oid(oid, txid)?;
+        let routine = storage.routine_for(slot, txid);
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            argument_oids[index] =
+                storage.routine_type_oid(argument.ctype, argument.user_type, txid)?;
+        }
+        (
+            routine.schema_for(txid),
+            routine.name_for(txid),
+            &argument_oids[..routine.argument_count],
+        )
+    };
+    let Some(rank) = storage.path_namespace_rank(schema.as_str(), txid) else {
+        return Some(false);
+    };
+    if builtin_callable_signatures(name.as_str()).any(|candidate| {
+        candidate.arguments == arguments
+            && storage
+                .path_namespace_rank(candidate.schema, txid)
+                .is_some_and(|other| other < rank)
+    }) {
+        return Some(false);
     }
-    let slot = storage.routine_slot_by_oid(oid, txid)?;
-    let routine = storage.routine_for(slot, txid);
-    let mut arguments = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-    for (index, argument) in routine.arguments().iter().enumerate() {
-        arguments[index] = storage.routine_type_oid(argument.ctype, argument.user_type, txid)?;
+    for slot in 0..storage.routine_count() {
+        if !storage.routine_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let routine = storage.routine_for(slot, txid);
+        if routine.name_for(txid) != name
+            || routine.arguments().len() != arguments.len()
+            || !storage
+                .path_namespace_rank(routine.schema_for(txid).as_str(), txid)
+                .is_some_and(|other| other < rank)
+        {
+            continue;
+        }
+        if routine
+            .arguments()
+            .iter()
+            .zip(arguments)
+            .all(|(argument, oid)| {
+                storage.routine_type_oid(argument.ctype, argument.user_type, txid) == Some(*oid)
+            })
+        {
+            return Some(false);
+        }
     }
-    let visible = storage.routine_slot_for_function_call_oids(
-        routine.name_for(txid).as_str(),
-        &arguments[..routine.argument_count],
-        txid,
-    ) == Some(slot);
-    Some(visible)
+    Some(true)
 }
 
 pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -12825,6 +13378,7 @@ pub(crate) fn operator_class_oid_visibility(
             | ACLITEM_HASH_OPERATOR_CLASS_OID
     );
     if builtin
+        || BUILTIN_TREE_HASH_CLASSES.iter().any(|class| class.0 == oid)
         || super::types::HashOperatorClass::from_oid(oid).is_some()
         || super::types::BrinOperatorClass::from_oid(oid).is_some()
         || super::types::GistOperatorClass::from_oid(oid).is_some()
@@ -12883,6 +13437,9 @@ pub(crate) fn operator_family_oid_visibility(
             | 4602..=4615
     );
     if builtin
+        || BUILTIN_TREE_HASH_FAMILIES
+            .iter()
+            .any(|family| family.0 == oid)
         || brin
         || super::gist_catalog::FAMILIES
             .iter()
@@ -13228,29 +13785,38 @@ fn routine_builtin_type(written: &str) -> Option<ColType> {
     routine_builtin_type(base.as_str())
 }
 
-fn intrinsic_argument_matches(
-    routine: IntrinsicRoutine,
+fn builtin_argument_matches(
+    routine: &BuiltinCallableSignature,
     arguments: &[crate::storage::RoutineArgumentDef],
 ) -> bool {
-    if routine.argument_count != arguments.len() as i32 {
+    if routine.arguments.len() != arguments.len() {
         return false;
     }
     routine
-        .argument_types
-        .split_ascii_whitespace()
+        .arguments
+        .iter()
         .zip(arguments)
         .all(|(oid, argument)| {
-            argument.user_type.is_none() && oid.parse::<i32>().ok() == Some(argument.ctype.oid())
+            argument.polymorphic_type().map_or_else(
+                || argument.user_type.is_none() && *oid == argument.ctype.oid(),
+                |kind| *oid == kind.oid(),
+            )
         })
 }
 
 fn routine_signature<'a>(
+    schema: Option<&str>,
     name: &str,
-    arguments: impl Iterator<Item = ColType>,
+    arguments: impl Iterator<Item = i32>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
+    if let Some(schema) = schema {
+        write_identifier(&mut text, schema);
+        text.write_char('.')
+            .map_err(|_| super::eval::arena_full())?;
+    }
     write_identifier(&mut text, name);
     text.write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -13258,7 +13824,15 @@ fn routine_signature<'a>(
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
         }
-        write!(text, "{}", argument.name()).map_err(|_| super::eval::arena_full())?;
+        let name = intrinsic_type_name(argument).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "built-in routine argument type {} has no name",
+                argument
+            )
+        })?;
+        text.write_str(name)
+            .map_err(|_| super::eval::arena_full())?;
     }
     write!(text, ")").map_err(|_| super::eval::arena_full())?;
     arena
@@ -13275,7 +13849,7 @@ fn routine_declared_signature<'a>(
     use core::fmt::Write;
     let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     let schema = routine.schema_for(txid);
-    if !storage.schema_is_on_path(schema, txid) {
+    if function_oid_visibility(storage, txid, crate::storage::routine_oid(&routine)) != Some(true) {
         write_identifier(&mut text, schema.as_str());
         text.write_char('.')
             .map_err(|_| super::eval::arena_full())?;
@@ -13367,8 +13941,19 @@ pub(crate) fn routine_oid_by_name(
     } else {
         (written.trim(), 0)
     };
+    let unqualified = split_qualified_name(name).is_some_and(|(schema, _)| schema.is_none());
     let mut found = None;
-    let mut consider = |oid| -> Result<(), SqlError> {
+    let mut found_rank = usize::MAX;
+    let mut consider = |oid, rank| -> Result<(), SqlError> {
+        if found == Some(oid) {
+            return Ok(());
+        }
+        if signature && rank > found_rank {
+            return Ok(());
+        }
+        if signature && rank < found_rank {
+            found = None;
+        }
         if found.replace(oid).is_some() {
             return Err(sql_err!(
                 sqlstate::AMBIGUOUS_FUNCTION,
@@ -13376,15 +13961,27 @@ pub(crate) fn routine_oid_by_name(
                 written
             ));
         }
+        found_rank = rank;
         Ok(())
     };
-    for routine in INTRINSIC_ROUTINES {
-        if !routine_name_matches(name, "pg_catalog", routine.name)
-            || (signature && !intrinsic_argument_matches(*routine, &arguments[..argument_count]))
+    for routine in callable_signatures::CALLABLES {
+        if !routine_name_matches(name, routine.schema, routine.name)
+            || (signature && !builtin_argument_matches(routine, &arguments[..argument_count]))
         {
             continue;
         }
-        consider(routine.oid)?;
+        let rank = if unqualified {
+            let Some(rank) = storage.path_namespace_rank(routine.schema, txid) else {
+                continue;
+            };
+            if !signature && function_oid_visibility(storage, txid, routine.oid) != Some(true) {
+                continue;
+            }
+            rank
+        } else {
+            0
+        };
+        consider(routine.oid, rank)?;
     }
     for slot in 0..storage.routine_count() {
         let Some(identity) = storage.routine_identity_for(slot, txid) else {
@@ -13397,7 +13994,18 @@ pub(crate) fn routine_oid_by_name(
         {
             continue;
         }
-        consider(identity.oid)?;
+        let rank = if unqualified {
+            let Some(rank) = storage.path_namespace_rank(identity.schema.as_str(), txid) else {
+                continue;
+            };
+            if !signature && function_oid_visibility(storage, txid, identity.oid) != Some(true) {
+                continue;
+            }
+            rank
+        } else {
+            0
+        };
+        consider(identity.oid, rank)?;
     }
     Ok(found)
 }
@@ -13409,8 +14017,18 @@ pub(crate) fn routine_name_by_oid<'a>(
     signature: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+    if let Some(routine) = builtin_callable_by_oid(oid) {
+        let schema =
+            (function_oid_visibility(storage, txid, oid) != Some(true)).then_some(routine.schema);
         if !signature {
+            if let Some(schema) = schema {
+                let mut qualified = StackStr::<260>::new();
+                write_identifier(&mut qualified, schema);
+                core::fmt::Write::write_char(&mut qualified, '.').map_err(|_| arena_full())?;
+                write_identifier(&mut qualified, routine.name);
+                return alloc_rendered(&qualified, "qualified routine name is too long", arena)
+                    .map(Some);
+            }
             return if ident_needs_quotes(routine.name) {
                 super::eval::quote_ident_str(routine.name, arena).map(Some)
             } else {
@@ -13420,12 +14038,13 @@ pub(crate) fn routine_name_by_oid<'a>(
                     .map_err(|_| super::eval::arena_full())
             };
         }
-        let arguments = routine
-            .argument_types
-            .split_ascii_whitespace()
-            .filter_map(|oid| oid.parse::<i32>().ok())
-            .filter_map(ColType::from_oid);
-        return routine_signature(routine.name, arguments, arena).map(Some);
+        return routine_signature(
+            schema,
+            routine.name,
+            routine.arguments.iter().copied(),
+            arena,
+        )
+        .map(Some);
     }
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
@@ -13434,7 +14053,7 @@ pub(crate) fn routine_name_by_oid<'a>(
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
-        if !storage.schema_is_on_path(routine.schema_for(txid), txid) {
+        if function_oid_visibility(storage, txid, oid) != Some(true) {
             let mut qualified = StackStr::<256>::new();
             write_identifier(&mut qualified, routine.schema_for(txid).as_str());
             use core::fmt::Write;
@@ -13614,6 +14233,7 @@ pub(crate) fn operator_oid_by_name(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin()?,
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -13629,6 +14249,21 @@ pub(crate) fn operator_oid_by_name(
 }
 
 /// Exact operator contracts used by executable catalog declarations.
+pub(crate) fn builtin_operator_function(
+    function_oid: i32,
+) -> Option<(crate::sql::ast::BinaryOp, ColType, ColType)> {
+    CATALOG_OPERATORS.iter().find_map(|operator| {
+        if operator.procedure_oid != function_oid {
+            return None;
+        }
+        Some((
+            crate::sql::ast::BinaryOp::from_operator_name(operator.name)?,
+            operator.left?,
+            operator.right?,
+        ))
+    })
+}
+
 pub(crate) fn builtin_operator_contract(
     oid: i32,
 ) -> Option<(crate::storage::OperatorSignature, ColType)> {
@@ -13720,6 +14355,7 @@ pub(crate) fn operator_oid_for_signature(
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -14267,8 +14903,14 @@ pub fn trigger_def_text<'a>(
         .write_str("EXECUTE FUNCTION ")
         .map_err(|_| super::eval::arena_full())?;
     let routine = storage.routine_for(usize::from(trigger.function), txid);
-    if storage.trigger_slot_for_call(routine.name.as_str(), txid)
-        != Some(usize::from(trigger.function))
+    if storage.select_routine_call(
+        routine.name.as_str(),
+        &[],
+        &[],
+        false,
+        txid,
+        crate::storage::RoutineCallKind::Trigger,
+    ) != crate::storage::RoutineCallSelection::Stored(usize::from(trigger.function))
     {
         write_identifier(&mut output, routine.schema.as_str());
         output
@@ -14592,6 +15234,7 @@ pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str)
     for entry in storage.path().entries() {
         let found = match entry {
             crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::InformationSchema | crate::storage::PathEntry::Toast => None,
             crate::storage::PathEntry::Schema(slot) => user(
                 storage
                     .schema_def_for(usize::from(*slot), txid)
@@ -14686,9 +15329,10 @@ pub fn rule_def_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    rewrite::rule_definition(storage, txid, oid, arena)
+    rewrite::rule_definition(storage, txid, oid, pretty, arena)
 }
 
 /// The bytes occupied by a relation's visible encoded row images. Plain views
@@ -15136,6 +15780,9 @@ fn pg_shdescription<'a>(
 /// table or materialized-view backing table, a sequence, a plain view, or an
 /// index.
 fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Option<i32> {
+    if schema == "pg_toast" {
+        return relation_oid_in_schema(storage, txid, schema, name);
+    }
     if let Some(slot) = storage.find_visible(schema, name, txid) {
         return Some(user_table_oid(storage, slot));
     }
@@ -15229,25 +15876,80 @@ fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option
     None
 }
 
-/// Search-path-aware SQL spelling of a user-defined type OID. `format_type`
-/// uses this for domains/enums and their automatically-created array types;
-/// built-in types deliberately return `None` and stay on the static path.
+/// Search-path-aware spelling of named types and table/view row types,
+/// including their arrays. Builtin types stay on the static naming path.
 pub fn user_type_name_text<'a>(
     storage: &Storage,
     txid: u32,
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) else {
-        return Ok(None);
-    };
-    let Some(source) = storage.routine_result_for_oid(oid, txid) else {
-        return Ok(None);
-    };
-    let Some(identity) = source.user_type else {
-        return Ok(None);
-    };
-    let (schema, name) = (identity.schema, identity.name);
+    user_type_name_fixed(storage, txid, oid)?
+        .map(|rendered| alloc_rendered(&rendered, "formatted type name is too long", arena))
+        .transpose()
+}
+
+pub(crate) fn user_type_name_fixed(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<StackStr<260>>, SqlError> {
+    let (schema, name, array) =
+        if let Some((_, _, array)) = crate::storage::NamedTypeKind::from_oid(oid) {
+            let Some(identity) = storage
+                .routine_result_for_oid(oid, txid)
+                .and_then(|source| source.user_type)
+            else {
+                return Ok(None);
+            };
+            (identity.schema, identity.name, array)
+        } else {
+            let Some((view_type, array)) = [
+                (FIRST_TABLE_COMPOSITE_TYPE_OID, false, false),
+                (FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID, false, true),
+                (FIRST_VIEW_COMPOSITE_TYPE_OID, true, false),
+                (FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID, true, true),
+            ]
+            .into_iter()
+            .find_map(|(first, view, array)| {
+                oid.checked_sub(first)
+                    .and_then(|created| u64::try_from(created).ok())
+                    .and_then(crate::storage::RelationIdentity::parse)
+                    .map(|_| (view, array))
+            }) else {
+                return Ok(None);
+            };
+            let mut relation_type = None;
+            let table_count = if view_type { 0 } else { storage.table_count() };
+            for slot in 0..table_count {
+                if !storage.table_slot_visible_to(slot, txid) {
+                    continue;
+                }
+                if table_row_type_oid(storage, slot, array) != oid {
+                    continue;
+                }
+                let definition = storage.table_def(slot, txid);
+                relation_type = Some((definition.schema, definition.name, array));
+                break;
+            }
+            if view_type {
+                for slot in 0..storage.view_count() {
+                    if !storage.view_slot_visible_to(slot, txid) {
+                        continue;
+                    }
+                    if view_row_type_oid(storage, slot, array) != oid {
+                        continue;
+                    }
+                    let view = storage.view(slot);
+                    relation_type = Some((view.schema_for(txid), view.name_for(txid), array));
+                    break;
+                }
+            }
+            let Some(relation_type) = relation_type else {
+                return Ok(None);
+            };
+            relation_type
+        };
     let written = stack_format!(160, "{}{}", name.as_str(), if array { "[]" } else { "" });
     let unqualified_visible = user_type_oid(storage, txid, written.as_str()) == Some(oid);
     let mut rendered = StackStr::<260>::new();
@@ -15260,11 +15962,13 @@ pub fn user_type_name_text<'a>(
     if array {
         let _ = rendered.write_str("[]");
     }
-    Ok(Some(alloc_rendered(
-        &rendered,
-        "formatted type name is too long",
-        arena,
-    )?))
+    if rendered.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "formatted type name is too long"
+        ));
+    }
+    Ok(Some(rendered))
 }
 
 /// The comment text `txid` sees on the object with this OID (and column
@@ -15868,8 +16572,8 @@ pub(crate) fn table_constraint_oid(
     }
     let mut index_constraint = None;
     visit_indexes(storage, txid, None, |index| {
-        if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
-            index_constraint = Some(index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET);
+        if index.table_slot == table_slot && index.name.as_str() == name {
+            index_constraint = index.constraint_identity.map(|identity| identity.oid());
         }
     });
     if index_constraint.is_some() {
@@ -15949,8 +16653,9 @@ pub(crate) fn table_constraint_identity_by_oid(
         let mut index_name = None;
         visit_indexes(storage, txid, None, |index| {
             if index.table_slot == table_slot
-                && index.is_constraint
-                && index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET == oid
+                && index
+                    .constraint_identity
+                    .is_some_and(|identity| identity.oid() == oid)
             {
                 index_name = Some(StackStr::from_str(index.name.as_str()));
             }
@@ -16238,7 +16943,10 @@ pub fn constraint_def_text<'a>(
     }
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
-        if oid != info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET || !info.is_constraint {
+        if !info
+            .constraint_identity
+            .is_some_and(|identity| identity.oid() == oid)
+        {
             continue;
         }
         let table = storage.table_def(info.table_slot, txid);
@@ -16725,10 +17433,7 @@ fn write_index_target<Definition0: crate::storage::DefinitionBacking>(
     qualify: bool,
 ) {
     let _ = out.write_str(" ON ");
-    if info
-        .explicit_definition
-        .is_some_and(|definition| definition.kind.is_partitioned())
-    {
+    if info.kind.is_partitioned() {
         let _ = out.write_str("ONLY ");
     }
     if qualify {
@@ -16828,7 +17533,8 @@ pub fn index_def_text<'a>(
     if let Some((definition, columns, (relation, name))) = builtin {
         return Ok(if col == 0 {
             Some(
-                if pretty && relation_oid_for_name(storage, txid, None, name) == Some(relation) {
+                if pretty && relation_oid_for_name(storage, txid, None, name).matches_oid(relation)
+                {
                     let (before, after) = definition
                         .split_once("pg_catalog.")
                         .expect("builtin definition names its schema");
@@ -16847,6 +17553,40 @@ pub fn index_def_text<'a>(
                     .unwrap_or(""),
             )
         });
+    }
+    let mut toast = None;
+    visit_toast_indexes(storage, txid, |index| {
+        if index.oid == oid {
+            toast = Some(index);
+        }
+    });
+    if let Some(index) = toast {
+        if col != 0 {
+            return Ok(Some(match col {
+                1 => "chunk_id",
+                2 => "chunk_seq",
+                _ => "",
+            }));
+        }
+        let mut definition = StackStr::<640>::new();
+        let _ = definition.write_str("CREATE UNIQUE INDEX ");
+        write_identifier(&mut definition, index.name.as_str());
+        let _ = definition.write_str(" ON ");
+        let table_name = stack_format!(64, "pg_toast_{}", user_table_oid(storage, index.table));
+        if !pretty
+            || !relation_oid_for_name(storage, txid, None, table_name.as_str())
+                .matches_oid(toast_relation_oid(storage, index.table))
+        {
+            let _ = definition.write_str("pg_toast.");
+        }
+        write_identifier(&mut definition, table_name.as_str());
+        let _ = definition.write_str(" USING btree (chunk_id, chunk_seq)");
+        write_index_storage_options(&mut definition, Some(index.definition));
+        return Ok(Some(alloc_rendered(
+            &definition,
+            "index definition is too long",
+            arena,
+        )?));
     }
     let indices = collect_indexes(storage, txid, arena)?;
     for info in indices {
@@ -17301,6 +18041,7 @@ pub(crate) fn describe_view<'a>(
         .map_err(|_| arena_full())?;
     let count = super::query::describe_stored_query(
         source,
+        query.input_source.unwrap_or(source),
         storage,
         txid,
         path,
@@ -17346,11 +18087,7 @@ fn pg_stats<'a>(
         .map(|slot| {
             let statistics = storage.table_statistics(slot, txid);
             if statistics.valid {
-                statistics
-                    .columns
-                    .iter()
-                    .filter(|column| column.valid)
-                    .count()
+                statistics.columns.len()
             } else {
                 0
             }
@@ -17368,10 +18105,13 @@ fn pg_stats<'a>(
         }
         let table_definition = storage.table_def(slot, txid);
         for (column, metadata) in table_definition.columns().iter().enumerate() {
-            let column_statistics = statistics.columns[column];
-            if !column_statistics.valid {
+            let Some(column_statistics) = table_definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute))
+            else {
                 continue;
-            }
+            };
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -19793,7 +20533,7 @@ fn pg_inherits<'a>(
     let inherited_indexes = indexes
         .iter()
         .filter(|index| {
-            index.constraint_parent_oid != 0
+            index.index_parent_oid.is_some()
                 || index
                     .explicit_definition
                     .is_some_and(|definition| definition.parent.is_some())
@@ -19843,8 +20583,8 @@ fn pg_inherits<'a>(
         }
     }
     for index in indexes {
-        let parent_oid = if index.constraint_parent_oid != 0 {
-            index.constraint_parent_oid - crate::storage::INDEX_CONSTRAINT_OID_OFFSET
+        let parent_oid = if let Some(parent) = index.index_parent_oid {
+            parent
         } else if let Some(parent) = index
             .explicit_definition
             .and_then(|definition| definition.parent)
@@ -19964,6 +20704,7 @@ fn pg_class<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_class", false);
     let indexes = collect_indexes(storage, txid, arena)?;
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let visible_tables = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
@@ -19972,8 +20713,7 @@ fn pg_class<'a>(
         .filter(|slot| {
             storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
         })
-        .count()
-        * 2;
+        .count();
     let catalogs: &[crate::sql::catalog_metadata::CatalogRelation] = match purpose {
         Materialization::Query => crate::sql::catalog_metadata::RELATIONS,
         Materialization::History => &[],
@@ -19981,6 +20721,7 @@ fn pg_class<'a>(
     let out_capacity = catalogs.len()
         + visible_tables
         + toast_relations
+        + toast_indexes.len()
         + storage.composites_with_slots_visible_to(txid).count()
         + indexes.len()
         + (0..storage.sequence_count())
@@ -20058,20 +20799,8 @@ fn pg_class<'a>(
         let has_rules = storage.table_has_rules(slot, txid);
         let n_checks = table_def.n_checks as i32;
         let statistics = storage.table_statistics(slot, txid);
-        let reltuples = if statistics.valid {
-            statistics.rows as f64
-        } else {
-            -1.0
-        };
-        let relpages = if statistics.valid {
-            statistics
-                .rows
-                .saturating_mul(u64::from(statistics.average_row_width))
-                .div_ceil(8_192)
-                .min(i32::MAX as u64) as i32
-        } else {
-            0
-        };
+        let reltuples = statistics.relation_tuples();
+        let relpages = statistics.relation_pages();
         let materialized = storage
             .matviews_visible_to(txid)
             .find(|(_, view)| usize::from(view.backing_table) == slot);
@@ -20186,12 +20915,11 @@ fn pg_class<'a>(
         if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
             continue;
         }
-        if n + 2 > out.len() {
+        if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
         let table_oid = user_table_oid(storage, slot);
         let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
-        let toast_index_name = crate::stack_format!(72, "{}_index", toast_name.as_str());
         let owner = storage.role_oid(storage.object_owner(
             crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Table,
@@ -20240,10 +20968,16 @@ fn pg_class<'a>(
             arena,
         )?;
         n += 1;
+    }
+    for info in toast_indexes {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        let owner = storage.role_oid(usize::from(info.owner));
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(storage, slot)),
-                text(toast_index_name.as_str(), arena)?,
+                Datum::Int4(info.oid),
+                text(info.name.as_str(), arena)?,
                 Datum::Int4(PG_TOAST_NS_OID),
                 text("i", arena)?,
                 Datum::Int4(2),
@@ -20258,11 +20992,15 @@ fn pg_class<'a>(
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Int4(0),
+                Datum::Int4(catalog_tablespace_oid(
+                    storage,
+                    info.definition.tablespace,
+                    txid,
+                )),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 text(
-                    core::str::from_utf8(&[storage.table_def(slot, txid).persistence.code()])
+                    core::str::from_utf8(&[storage.table_def(info.table, txid).persistence.code()])
                         .unwrap_or("p"),
                     arena,
                 )?,
@@ -20348,17 +21086,7 @@ fn pg_class<'a>(
                     storage.table_def(info.table_slot, txid).schema.as_str(),
                     txid,
                 )),
-                text(
-                    if info
-                        .explicit_definition
-                        .is_some_and(|definition| definition.kind.is_partitioned())
-                    {
-                        "I"
-                    } else {
-                        "i"
-                    },
-                    arena,
-                )?,
+                text(if info.kind.is_partitioned() { "I" } else { "i" }, arena)?,
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages
@@ -20371,12 +21099,7 @@ fn pg_class<'a>(
                     crate::sql::ast::IndexAccessMethod::Btree if info.is_exclusion => 783,
                     crate::sql::ast::IndexAccessMethod::Btree => 403,
                 }),
-                Datum::Int4(owner_oid(
-                    storage,
-                    crate::storage::AccessClass::Table,
-                    info.table_slot,
-                    txid,
-                )),
+                Datum::Int4(storage.role_oid(usize::from(info.owner))),
                 Datum::Int4(0), // relchecks
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -20924,7 +21647,8 @@ fn pg_constraint_values<'a>(
     let index_constraints = indexes
         .iter()
         .filter(|info| {
-            info.is_constraint && (info.is_exclusion || info.is_primary || info.is_unique)
+            info.constraint_identity.is_some()
+                && (info.is_exclusion || info.is_primary || info.is_unique)
         })
         .count();
     let trigger_constraints = storage
@@ -20980,9 +21704,9 @@ fn pg_constraint_values<'a>(
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
     for info in indexes {
-        if !info.is_constraint {
+        let Some(constraint) = info.constraint_identity else {
             continue;
-        }
+        };
         let contype = if info.is_exclusion {
             "x"
         } else if info.is_primary {
@@ -20997,12 +21721,12 @@ fn pg_constraint_values<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET),
+                Datum::Int4(constraint.oid()),
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(info.table_oid),
                 Datum::Int4(0),
                 text(contype, arena)?,
-                Datum::Int4(info.constraint_parent_oid),
+                Datum::Int4(info.constraint_parent.map_or(0, |identity| identity.oid())),
                 Datum::Int4(info.oid), // conindid -> the backing index
                 Datum::Int4(0),        // confrelid
                 Datum::Bool(info.timing.is_deferrable()),
@@ -21025,8 +21749,8 @@ fn pg_constraint_values<'a>(
                     txid,
                 )),
                 text(" ", arena)?,
-                Datum::Bool(info.constraint_parent_oid == 0),
-                Datum::Int4(i32::from(info.constraint_parent_oid != 0)),
+                Datum::Bool(info.constraint_parent.is_none()),
+                Datum::Int4(i32::from(info.constraint_parent.is_some())),
                 Datum::Bool(false),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
@@ -21800,6 +22524,35 @@ fn pg_depend<'a>(
                 && storage.sequence_for(*slot, txid).owner.is_some()
         })
         .count();
+    let mut default_sequence_dependencies = 0;
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for (column_index, column) in definition.columns().iter().enumerate() {
+            let mark = arena.mark();
+            let dependencies = super::exec::column_default_dependencies(
+                storage,
+                txid,
+                column,
+                definition.type_inputs.as_ref(),
+                definition.attribute_number(column_index),
+                arena,
+            );
+            let count = dependencies.map(|dependencies| {
+                dependencies
+                    .entries()
+                    .iter()
+                    .filter(|dependency| {
+                        dependency.class == crate::storage::DependencyClass::Sequence
+                    })
+                    .count()
+            });
+            unsafe { arena.rewind_to(mark) };
+            default_sequence_dependencies += count?;
+        }
+    }
     let domain_dependencies = (0..storage.domain_count())
         .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
         .count();
@@ -21866,6 +22619,7 @@ fn pg_depend<'a>(
     let out = catalog_rows(
         arena,
         sequence_dependencies
+            + default_sequence_dependencies
             + constraint_dependencies.len()
             + domain_dependencies
             + cast_dependencies
@@ -21944,6 +22698,49 @@ fn pg_depend<'a>(
                 "a"
             },
         )?;
+    }
+
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txid);
+        for (column_index, column) in definition.columns().iter().enumerate() {
+            let mark = arena.mark();
+            let dependencies = super::exec::column_default_dependencies(
+                storage,
+                txid,
+                column,
+                definition.type_inputs.as_ref(),
+                definition.attribute_number(column_index),
+                arena,
+            );
+            let mut sequences = [0usize; crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
+            let count = dependencies.map(|dependencies| {
+                let mut count = 0;
+                for dependency in dependencies.entries() {
+                    if dependency.class == crate::storage::DependencyClass::Sequence {
+                        sequences[count] = usize::from(dependency.slot);
+                        count += 1;
+                    }
+                }
+                count
+            });
+            unsafe { arena.rewind_to(mark) };
+            for sequence in &sequences[..count?] {
+                push(
+                    2604,
+                    400_000_000
+                        + table as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
+                        + i32::from(definition.attribute_number(column_index))
+                        - 1,
+                    PG_CLASS_OID,
+                    sequence_oid(storage, *sequence),
+                    0,
+                    "n",
+                )?;
+            }
+        }
     }
 
     // A domain is ordered after its parent domain or direct user-defined base
@@ -22668,13 +23465,11 @@ fn pg_index<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_index", false);
     let indexes = collect_indexes(storage, txid, arena)?;
-    let toast_indexes = (0..storage.table_count())
-        .filter(|slot| {
-            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
-        })
-        .count();
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let out = arena
-        .alloc_slice_with(indexes.len() + toast_indexes + 2, |_| &[] as &[Datum])
+        .alloc_slice_with(indexes.len() + toast_indexes.len() + 2, |_| {
+            &[] as &[Datum]
+        })
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
@@ -22705,7 +23500,12 @@ fn pg_index<'a>(
                     info.explicit_definition
                         .is_none_or(|definition| definition.kind.valid()),
                 ),
-                Datum::Bool(!info.timing.is_deferrable()),
+                Datum::Bool(
+                    info.explicit_definition
+                        .map_or(!info.timing.is_deferrable(), |definition| {
+                            definition.immediate
+                        }),
+                ),
                 Datum::Bool(
                     info.explicit_definition
                         .is_some_and(|definition| definition.replica_identity),
@@ -22723,8 +23523,14 @@ fn pg_index<'a>(
                     Some(predicate) => text(predicate.as_str(), arena)?,
                     None => Datum::Null,
                 },
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_none_or(|definition| definition.kind.ready()),
+                ),
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_none_or(|definition| definition.kind.live()),
+                ),
                 match (0..info.n_cols)
                     .find_map(|position| index_expression_source(storage, info, position, txid))
                 {
@@ -22738,23 +23544,20 @@ fn pg_index<'a>(
         )?;
         n += 1;
     }
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
-            continue;
-        }
+    for info in toast_indexes {
         let keys = [0_u16, 1];
         let collations = [0_i32, 0];
         let operator_classes = [1981_i32, 1978];
         out[n] = row(
             &[
-                Datum::Int4(toast_index_oid(storage, slot)),
-                Datum::Int4(toast_relation_oid(storage, slot)),
-                Datum::Bool(true),
+                Datum::Int4(info.oid),
+                Datum::Int4(toast_relation_oid(storage, info.table)),
+                Datum::Bool(info.is_primary),
                 Datum::Bool(true),
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(info.definition.kind.valid()),
+                Datum::Bool(info.definition.immediate),
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Int4(2),
@@ -22765,8 +23568,8 @@ fn pg_index<'a>(
                     raw: &[0; 4],
                 },
                 Datum::Null,
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(info.definition.kind.ready()),
+                Datum::Bool(info.definition.kind.live()),
                 Datum::Null,
                 oidvector(&collations, arena)?,
                 oidvector(&operator_classes, arena)?,
@@ -23047,6 +23850,7 @@ fn pg_attribute<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_attribute", false);
     let indexes = collect_indexes(storage, txid, arena)?;
+    let toast_indexes = collect_toast_indexes(storage, txid, arena)?;
     let composite_attributes = storage
         .composites_with_slots_visible_to(txid)
         .map(|(_, composite)| composite.fields().len())
@@ -23056,7 +23860,7 @@ fn pg_attribute<'a>(
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| {
             let table = storage.table_def(slot, txid);
-            usize::from(table.attributes.count) + if table.has_toast { 5 } else { 0 }
+            usize::from(table.attributes.count) + if table.has_toast { 3 } else { 0 }
         })
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
@@ -23084,6 +23888,7 @@ fn pg_attribute<'a>(
         .checked_add(table_attributes)
         .and_then(|count| count.checked_add(composite_attributes))
         .and_then(|count| count.checked_add(index_attributes))
+        .and_then(|count| count.checked_add(toast_indexes.len().checked_mul(2)?))
         .and_then(|count| count.checked_add(view_attributes))
         .and_then(|count| count.checked_add(9))
         .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
@@ -23198,54 +24003,54 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
-            continue;
-        }
-        let attributes = [
-            ("chunk_id", 26, 4),
-            ("chunk_seq", 23, 4),
-            ("chunk_data", 17, -1),
-        ];
-        for (relation_oid, count) in [
-            (toast_relation_oid(storage, slot), attributes.len()),
-            (toast_index_oid(storage, slot), 2),
-        ] {
-            for (attribute, (name, type_oid, type_length)) in attributes[..count].iter().enumerate()
-            {
-                if n == out.len() {
-                    return Err(catalog_capacity_exceeded("pg_attribute"));
-                }
-                out[n] = row(
-                    &[
-                        Datum::Int4(relation_oid),
-                        text(name, arena)?,
-                        Datum::Int4(*type_oid),
-                        Datum::Int4(attribute as i32 + 1),
-                        Datum::Bool(false),
-                        Datum::Int4(*type_length),
-                        Datum::Int4(-1),
-                        Datum::Bool(false),
-                        Datum::Int4(0),
-                        text("", arena)?,
-                        text("", arena)?,
-                        text("p", arena)?,
-                        text("", arena)?,
-                        Datum::Int4(-1),
-                        Datum::Bool(false),
-                        Datum::Int4(attribute as i32 + 1),
-                        text("i", arena)?,
-                        Datum::Bool(true),
-                        Datum::Null,
-                        Datum::Null,
-                        Datum::Bool(false),
-                        Datum::Null,
-                        Datum::Null,
-                    ],
-                    arena,
-                )?;
-                n += 1;
+    let toast_attributes = [
+        ("chunk_id", 26, 4),
+        ("chunk_seq", 23, 4),
+        ("chunk_data", 17, -1),
+    ];
+    let toast_relations = (0..storage.table_count())
+        .filter(|slot| {
+            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
+        })
+        .map(|slot| (toast_relation_oid(storage, slot), 3));
+    for (relation_oid, count) in
+        toast_relations.chain(toast_indexes.iter().map(|index| (index.oid, 2)))
+    {
+        for (attribute, (name, type_oid, type_length)) in
+            toast_attributes[..count].iter().enumerate()
+        {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
             }
+            out[n] = row(
+                &[
+                    Datum::Int4(relation_oid),
+                    text(name, arena)?,
+                    Datum::Int4(*type_oid),
+                    Datum::Int4(attribute as i32 + 1),
+                    Datum::Bool(false),
+                    Datum::Int4(*type_length),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text("p", arena)?,
+                    text("", arena)?,
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(attribute as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
         }
     }
     // Standalone composite fields belong to the generated `pg_class` relation
@@ -23270,7 +24075,6 @@ fn pg_attribute<'a>(
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
-                auto_increment_step: 1,
                 user_type: field.user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -24187,7 +24991,9 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     ];
     let rows = catalog_rows(
         arena,
-        builtin.len() + storage.casts_visible_to(txid).count(),
+        builtin.len()
+            + crate::sql::geometry::CAST_IDENTITIES.len()
+            + storage.casts_visible_to(txid).count(),
     )?;
     for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
     {
@@ -24205,6 +25011,40 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
     }
     let mut count = builtin.len();
+    for &(oid, source, target) in crate::sql::geometry::CAST_IDENTITIES {
+        let cast = builtin_properties::CASTS
+            .iter()
+            .find(|cast| cast.source == source.oid() && cast.target == target.oid())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "geometric catalog cast has no shared declaration"
+                )
+            })?;
+        rows[count] = row(
+            &[
+                Datum::Int4(2605),
+                Datum::Int4(oid),
+                Datum::Int4(cast.source),
+                Datum::Int4(cast.target),
+                Datum::Int4(cast.procedure),
+                Datum::Bpchar(match cast.context {
+                    b'e' => "e",
+                    b'a' => "a",
+                    b'i' => "i",
+                    _ => unreachable!("catalog cast context"),
+                }),
+                Datum::Bpchar(match cast.method {
+                    b'f' => "f",
+                    b'b' => "b",
+                    b'i' => "i",
+                    _ => unreachable!("catalog cast method"),
+                }),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (_, cast) in storage.casts_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_cast"));
@@ -24369,6 +25209,168 @@ fn pg_operator<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+// PostgreSQL 18.6 bootstrap metadata; reference query and hashes are retained
+// in tests/external/reference/2026-11-03-input-plans/planner-metadata-reference.zip.
+const BUILTIN_TREE_HASH_CLASSES: &[(i32, i32, &str, i32, i32, bool, i32)] = &[
+    (1978, 403, "int4_ops", 1976, 23, true, 0),
+    (1979, 403, "int2_ops", 1976, 21, true, 0),
+    (1981, 403, "oid_ops", 1989, 26, true, 0),
+    (3122, 403, "date_ops", 434, 1082, true, 0),
+    (3123, 403, "float8_ops", 1970, 701, true, 0),
+    (3124, 403, "int8_ops", 1976, 20, true, 0),
+    (3125, 403, "numeric_ops", 1988, 1700, true, 0),
+    (3126, 403, "text_ops", 1994, 25, true, 0),
+    (3127, 403, "timestamptz_ops", 434, 1184, true, 0),
+    (3128, 403, "timestamp_ops", 434, 1114, true, 0),
+    (4217, 403, "text_pattern_ops", 2095, 25, false, 0),
+    (4218, 403, "varchar_pattern_ops", 2095, 25, false, 0),
+    (4219, 403, "bpchar_pattern_ops", 2097, 1042, false, 0),
+    (10000, 403, "array_ops", 397, 2277, true, 0),
+    (10001, 405, "array_ops", 627, 2277, true, 0),
+    (10002, 403, "bit_ops", 423, 1560, true, 0),
+    (10003, 403, "bool_ops", 424, 16, true, 0),
+    (10004, 403, "bpchar_ops", 426, 1042, true, 0),
+    (10005, 405, "bpchar_ops", 427, 1042, true, 0),
+    (10006, 403, "bytea_ops", 428, 17, true, 0),
+    (10007, 403, "char_ops", 429, 18, true, 0),
+    (10008, 405, "char_ops", 431, 18, true, 0),
+    (10009, 403, "cidr_ops", 1974, 869, false, 0),
+    (10010, 405, "cidr_ops", 1975, 869, false, 0),
+    (10011, 405, "date_ops", 435, 1082, true, 0),
+    (10012, 403, "float4_ops", 1970, 700, true, 0),
+    (10013, 405, "float4_ops", 1971, 700, true, 0),
+    (10014, 405, "float8_ops", 1971, 701, true, 0),
+    (10015, 403, "inet_ops", 1974, 869, true, 0),
+    (10016, 405, "inet_ops", 1975, 869, true, 0),
+    (10019, 405, "int2_ops", 1977, 21, true, 0),
+    (10020, 405, "int4_ops", 1977, 23, true, 0),
+    (10021, 405, "int8_ops", 1977, 20, true, 0),
+    (10022, 403, "interval_ops", 1982, 1186, true, 0),
+    (10023, 405, "interval_ops", 1983, 1186, true, 0),
+    (10024, 403, "macaddr_ops", 1984, 829, true, 0),
+    (10025, 405, "macaddr_ops", 1985, 829, true, 0),
+    (10026, 403, "macaddr8_ops", 3371, 774, true, 0),
+    (10027, 405, "macaddr8_ops", 3372, 774, true, 0),
+    (10028, 403, "name_ops", 1994, 19, true, 2275),
+    (10029, 405, "name_ops", 1995, 19, true, 0),
+    (10030, 405, "numeric_ops", 1998, 1700, true, 0),
+    (10031, 405, "oid_ops", 1990, 26, true, 0),
+    (10032, 403, "oidvector_ops", 1991, 30, true, 0),
+    (10033, 405, "oidvector_ops", 1992, 30, true, 0),
+    (10034, 403, "record_ops", 2994, 2249, true, 0),
+    (10035, 405, "record_ops", 6194, 2249, true, 0),
+    (10036, 403, "record_image_ops", 3194, 2249, false, 0),
+    (10037, 405, "text_ops", 1995, 25, true, 0),
+    (10038, 403, "time_ops", 1996, 1083, true, 0),
+    (10039, 405, "time_ops", 1997, 1083, true, 0),
+    (10040, 405, "timestamptz_ops", 1999, 1184, true, 0),
+    (10041, 403, "timetz_ops", 2000, 1266, true, 0),
+    (10042, 405, "timetz_ops", 2001, 1266, true, 0),
+    (10043, 403, "varbit_ops", 2002, 1562, true, 0),
+    (10044, 403, "varchar_ops", 1994, 25, false, 0),
+    (10045, 405, "varchar_ops", 1995, 25, false, 0),
+    (10046, 405, "timestamp_ops", 2040, 1114, true, 0),
+    (10047, 403, "money_ops", 2099, 790, true, 0),
+    (10048, 405, "bool_ops", 2222, 16, true, 0),
+    (10049, 405, "bytea_ops", 2223, 17, true, 0),
+    (10050, 403, "tid_ops", 2789, 27, true, 0),
+    (10051, 405, "xid_ops", 2225, 28, true, 0),
+    (10052, 405, "xid8_ops", 5032, 5069, true, 0),
+    (10053, 403, "xid8_ops", 5067, 5069, true, 0),
+    (10054, 405, "cid_ops", 2226, 29, true, 0),
+    (10055, 405, "tid_ops", 2227, 27, true, 0),
+    (10056, 405, "text_pattern_ops", 2229, 25, false, 0),
+    (10057, 405, "varchar_pattern_ops", 2229, 25, false, 0),
+    (10058, 405, "bpchar_pattern_ops", 2231, 1042, false, 0),
+    (10059, 405, "aclitem_ops", 2235, 1033, true, 0),
+    (10065, 403, "uuid_ops", 2968, 2950, true, 0),
+    (10066, 405, "uuid_ops", 2969, 2950, true, 0),
+    (10067, 403, "pg_lsn_ops", 3253, 3220, true, 0),
+    (10068, 405, "pg_lsn_ops", 3254, 3220, true, 0),
+    (10069, 403, "enum_ops", 3522, 3500, true, 0),
+    (10070, 405, "enum_ops", 3523, 3500, true, 0),
+    (10071, 403, "tsvector_ops", 3626, 3614, true, 0),
+    (10074, 403, "tsquery_ops", 3683, 3615, true, 0),
+    (10076, 403, "range_ops", 3901, 3831, true, 0),
+    (10077, 405, "range_ops", 3903, 3831, true, 0),
+    (10080, 403, "multirange_ops", 4199, 4537, true, 0),
+    (10081, 405, "multirange_ops", 4225, 4537, true, 0),
+    (10088, 403, "jsonb_ops", 4033, 3802, true, 0),
+    (10089, 405, "jsonb_ops", 4034, 3802, true, 0),
+];
+
+const BUILTIN_TREE_HASH_FAMILIES: &[(i32, i32, &str)] = &[
+    (397, 403, "array_ops"),
+    (423, 403, "bit_ops"),
+    (424, 403, "bool_ops"),
+    (426, 403, "bpchar_ops"),
+    (427, 405, "bpchar_ops"),
+    (428, 403, "bytea_ops"),
+    (429, 403, "char_ops"),
+    (431, 405, "char_ops"),
+    (434, 403, "datetime_ops"),
+    (435, 405, "date_ops"),
+    (627, 405, "array_ops"),
+    (1970, 403, "float_ops"),
+    (1971, 405, "float_ops"),
+    (1974, 403, "network_ops"),
+    (1975, 405, "network_ops"),
+    (1976, 403, "integer_ops"),
+    (1977, 405, "integer_ops"),
+    (1982, 403, "interval_ops"),
+    (1983, 405, "interval_ops"),
+    (1984, 403, "macaddr_ops"),
+    (1985, 405, "macaddr_ops"),
+    (1988, 403, "numeric_ops"),
+    (1989, 403, "oid_ops"),
+    (1990, 405, "oid_ops"),
+    (1991, 403, "oidvector_ops"),
+    (1992, 405, "oidvector_ops"),
+    (1994, 403, "text_ops"),
+    (1995, 405, "text_ops"),
+    (1996, 403, "time_ops"),
+    (1997, 405, "time_ops"),
+    (1998, 405, "numeric_ops"),
+    (1999, 405, "timestamptz_ops"),
+    (2000, 403, "timetz_ops"),
+    (2001, 405, "timetz_ops"),
+    (2002, 403, "varbit_ops"),
+    (2040, 405, "timestamp_ops"),
+    (2095, 403, "text_pattern_ops"),
+    (2097, 403, "bpchar_pattern_ops"),
+    (2099, 403, "money_ops"),
+    (2222, 405, "bool_ops"),
+    (2223, 405, "bytea_ops"),
+    (2225, 405, "xid_ops"),
+    (2226, 405, "cid_ops"),
+    (2227, 405, "tid_ops"),
+    (2229, 405, "text_pattern_ops"),
+    (2231, 405, "bpchar_pattern_ops"),
+    (2235, 405, "aclitem_ops"),
+    (2789, 403, "tid_ops"),
+    (2968, 403, "uuid_ops"),
+    (2969, 405, "uuid_ops"),
+    (2994, 403, "record_ops"),
+    (3194, 403, "record_image_ops"),
+    (3253, 403, "pg_lsn_ops"),
+    (3254, 405, "pg_lsn_ops"),
+    (3371, 403, "macaddr8_ops"),
+    (3372, 405, "macaddr8_ops"),
+    (3522, 403, "enum_ops"),
+    (3523, 405, "enum_ops"),
+    (3626, 403, "tsvector_ops"),
+    (3683, 403, "tsquery_ops"),
+    (3901, 403, "range_ops"),
+    (3903, 405, "range_ops"),
+    (4033, 403, "jsonb_ops"),
+    (4034, 405, "jsonb_ops"),
+    (4199, 403, "multirange_ops"),
+    (4225, 405, "multirange_ops"),
+    (5032, 405, "xid8_ops"),
+    (5067, 403, "xid8_ops"),
+    (6194, 405, "record_ops"),
+];
+
 fn pg_opfamily<'a>(
     storage: &Storage,
     txid: u32,
@@ -24379,175 +25381,13 @@ fn pg_opfamily<'a>(
         arena,
         512 + storage.operator_families_visible_to(txid).count(),
     )?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(403),
-            text("xid8_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(403),
-            text("money_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    for (index, (oid, method, name)) in [
-        (TID_BTREE_OPERATOR_FAMILY_OID, 403, "tid_ops"),
-        (CID_HASH_OPERATOR_FAMILY_OID, 405, "cid_ops"),
-        (TID_HASH_OPERATOR_FAMILY_OID, 405, "tid_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 2] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (BIT_BTREE_OPERATOR_FAMILY_OID, 403, "bit_ops"),
-        (BYTEA_BTREE_OPERATOR_FAMILY_OID, 403, "bytea_ops"),
-        (VARBIT_BTREE_OPERATOR_FAMILY_OID, 403, "varbit_ops"),
-        (BYTEA_HASH_OPERATOR_FAMILY_OID, 405, "bytea_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 5] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (NETWORK_BTREE_OPERATOR_FAMILY_OID, 403, "network_ops"),
-        (NETWORK_HASH_OPERATOR_FAMILY_OID, 405, "network_ops"),
-        (MACADDR_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr_ops"),
-        (MACADDR_HASH_OPERATOR_FAMILY_OID, 405, "macaddr_ops"),
-        (MACADDR8_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr8_ops"),
-        (MACADDR8_HASH_OPERATOR_FAMILY_OID, 405, "macaddr8_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 9] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name)) in [
-        (RANGE_BTREE_OPERATOR_FAMILY_OID, 403, "range_ops"),
-        (RANGE_HASH_OPERATOR_FAMILY_OID, 405, "range_ops"),
-        (MULTIRANGE_BTREE_OPERATOR_FAMILY_OID, 403, "multirange_ops"),
-        (MULTIRANGE_HASH_OPERATOR_FAMILY_OID, 405, "multirange_ops"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[15 + index] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method)) in [
-        (PG_LSN_BTREE_OPERATOR_FAMILY_OID, 403),
-        (PG_LSN_HASH_OPERATOR_FAMILY_OID, 405),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[19 + index] = row(
-            &[
-                Datum::Int4(2753),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text("pg_lsn_ops", arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-            ],
-            arena,
-        )?;
-    }
-    rows[21] = row(
-        &[
-            Datum::Int4(2753),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(405),
-            text("aclitem_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-        ],
-        arena,
-    )?;
-    let mut count = 22usize;
-    for (oid, name) in [
-        (427, "bpchar_ops"),
-        (431, "char_ops"),
-        (435, "date_ops"),
-        (627, "array_ops"),
-        (1971, "float_ops"),
-        (1977, "integer_ops"),
-        (1983, "interval_ops"),
-        (1990, "oid_ops"),
-        (1992, "oidvector_ops"),
-        (1995, "text_ops"),
-        (1997, "time_ops"),
-        (1998, "numeric_ops"),
-        (1999, "timestamptz_ops"),
-        (2001, "timetz_ops"),
-        (2040, "timestamp_ops"),
-        (2222, "bool_ops"),
-        (2225, "xid_ops"),
-        (2229, "text_pattern_ops"),
-        (2231, "bpchar_pattern_ops"),
-        (2969, "uuid_ops"),
-        (3523, "enum_ops"),
-        (4034, "jsonb_ops"),
-        (5032, "xid8_ops"),
-        (6194, "record_ops"),
-    ] {
+    let mut count = 0usize;
+    for &(oid, method, name) in BUILTIN_TREE_HASH_FAMILIES {
         rows[count] = row(
             &[
                 Datum::Int4(2753),
                 Datum::Int4(oid),
-                Datum::Int4(405),
+                Datum::Int4(method),
                 text(name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
@@ -24700,394 +25540,20 @@ fn pg_opclass<'a>(
         arena,
         512 + storage.operator_classes_visible_to(txid).count(),
     )?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(XID8_BTREE_OPERATOR_CLASS_OID),
-            Datum::Int4(403),
-            text("xid8_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(MONEY_BTREE_OPERATOR_CLASS_OID),
-            Datum::Int4(403),
-            text("money_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    for (index, (oid, method, name, family, input)) in [
-        (
-            TID_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "tid_ops",
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-        ),
-        (
-            CID_HASH_OPERATOR_CLASS_OID,
-            405,
-            "cid_ops",
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-        ),
-        (
-            TID_HASH_OPERATOR_CLASS_OID,
-            405,
-            "tid_ops",
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 2] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input)) in [
-        (
-            BIT_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "bit_ops",
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-        ),
-        (
-            BYTEA_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "bytea_ops",
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-        ),
-        (
-            VARBIT_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "varbit_ops",
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-        ),
-        (
-            BYTEA_HASH_OPERATOR_CLASS_OID,
-            405,
-            "bytea_ops",
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 5] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input, default)) in [
-        (
-            CIDR_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "cidr_ops",
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            false,
-        ),
-        (
-            CIDR_HASH_OPERATOR_CLASS_OID,
-            405,
-            "cidr_ops",
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            false,
-        ),
-        (
-            INET_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "inet_ops",
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            true,
-        ),
-        (
-            INET_HASH_OPERATOR_CLASS_OID,
-            405,
-            "inet_ops",
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            true,
-        ),
-        (
-            MACADDR_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "macaddr_ops",
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            true,
-        ),
-        (
-            MACADDR_HASH_OPERATOR_CLASS_OID,
-            405,
-            "macaddr_ops",
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            true,
-        ),
-        (
-            MACADDR8_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "macaddr8_ops",
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            true,
-        ),
-        (
-            MACADDR8_HASH_OPERATOR_CLASS_OID,
-            405,
-            "macaddr8_ops",
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            true,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 9] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(default),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, name, family, input)) in [
-        (
-            RANGE_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "range_ops",
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-        ),
-        (
-            RANGE_HASH_OPERATOR_CLASS_OID,
-            405,
-            "range_ops",
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-        ),
-        (
-            MULTIRANGE_BTREE_OPERATOR_CLASS_OID,
-            403,
-            "multirange_ops",
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-        ),
-        (
-            MULTIRANGE_HASH_OPERATOR_CLASS_OID,
-            405,
-            "multirange_ops",
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[17 + index] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text(name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, method, family)) in [
-        (
-            PG_LSN_BTREE_OPERATOR_CLASS_OID,
-            403,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-        ),
-        (
-            PG_LSN_HASH_OPERATOR_CLASS_OID,
-            405,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[21 + index] = row(
-            &[
-                Datum::Int4(2616),
-                Datum::Int4(oid),
-                Datum::Int4(method),
-                text("pg_lsn_ops", arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Bool(true),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-    }
-    rows[23] = row(
-        &[
-            Datum::Int4(2616),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_CLASS_OID),
-            Datum::Int4(405),
-            text("aclitem_ops", arena)?,
-            Datum::Int4(PG_CATALOG_NS_OID),
-            Datum::Int4(10),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Bool(true),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    let mut count = 24usize;
-    for (oid, name, family, input, default) in [
-        (10001, "array_ops", 627, super::types::oid::ANYARRAY, true),
-        (10005, "bpchar_ops", 427, super::types::oid::BPCHAR, true),
-        (10008, "char_ops", 431, super::types::oid::CHAR, true),
-        (10011, "date_ops", 435, super::types::oid::DATE, true),
-        (10013, "float4_ops", 1971, super::types::oid::FLOAT4, true),
-        (10014, "float8_ops", 1971, super::types::oid::FLOAT8, true),
-        (10019, "int2_ops", 1977, super::types::oid::INT2, true),
-        (10020, "int4_ops", 1977, super::types::oid::INT4, true),
-        (10021, "int8_ops", 1977, super::types::oid::INT8, true),
-        (
-            10023,
-            "interval_ops",
-            1983,
-            super::types::oid::INTERVAL,
-            true,
-        ),
-        (10029, "name_ops", 1995, super::types::oid::NAME, true),
-        (10030, "numeric_ops", 1998, super::types::oid::NUMERIC, true),
-        (10031, "oid_ops", 1990, super::types::oid::OID, true),
-        (
-            10033,
-            "oidvector_ops",
-            1992,
-            super::types::oid::OIDVECTOR,
-            true,
-        ),
-        (10035, "record_ops", 6194, super::types::oid::RECORD, true),
-        (10037, "text_ops", 1995, super::types::oid::TEXT, true),
-        (10039, "time_ops", 1997, super::types::oid::TIME, true),
-        (
-            10040,
-            "timestamptz_ops",
-            1999,
-            super::types::oid::TIMESTAMPTZ,
-            true,
-        ),
-        (10042, "timetz_ops", 2001, super::types::oid::TIMETZ, true),
-        (10045, "varchar_ops", 1995, super::types::oid::TEXT, false),
-        (
-            10046,
-            "timestamp_ops",
-            2040,
-            super::types::oid::TIMESTAMP,
-            true,
-        ),
-        (10048, "bool_ops", 2222, super::types::oid::BOOL, true),
-        (10051, "xid_ops", 2225, super::types::oid::XID, true),
-        (10052, "xid8_ops", 5032, super::types::oid::XID8, true),
-        (
-            10056,
-            "text_pattern_ops",
-            2229,
-            super::types::oid::TEXT,
-            false,
-        ),
-        (
-            10057,
-            "varchar_pattern_ops",
-            2229,
-            super::types::oid::TEXT,
-            false,
-        ),
-        (
-            10058,
-            "bpchar_pattern_ops",
-            2231,
-            super::types::oid::BPCHAR,
-            false,
-        ),
-        (10066, "uuid_ops", 2969, super::types::oid::UUID, true),
-        (10070, "enum_ops", 3523, super::types::oid::ANYENUM, true),
-        (10089, "jsonb_ops", 4034, super::types::oid::JSONB, true),
-    ] {
+    let mut count = 0usize;
+    for &(oid, method, name, family, input, default, key) in BUILTIN_TREE_HASH_CLASSES {
         rows[count] = row(
             &[
                 Datum::Int4(2616),
                 Datum::Int4(oid),
-                Datum::Int4(405),
+                Datum::Int4(method),
                 text(name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
                 Datum::Int4(family),
                 Datum::Int4(input),
                 Datum::Bool(default),
-                Datum::Int4(0),
+                Datum::Int4(key),
             ],
             arena,
         )?;
@@ -27137,219 +27603,122 @@ fn pg_language<'a>(
     finish(definition, &[internal, c, sql, plpgsql], arena)
 }
 
+fn builtin_proc_row<'a>(
+    signature: &BuiltinCallableSignature,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let metadata = &signature.catalog;
+    let namespace = schema_oid_by_name(storage, txid, signature.schema).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "builtin callable namespace is unavailable"
+        )
+    })?;
+    let all_types = if metadata.all_arguments.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.all_arguments.len(), |index| {
+                Datum::Oid(metadata.all_arguments[index] as u32)
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Oid,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    let modes = if metadata.modes.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.modes.len(), |index| {
+                Datum::Char(metadata.modes[index])
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Char,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    let names = if metadata.all_argument_names.is_empty() {
+        Datum::Null
+    } else {
+        let values = arena
+            .alloc_slice_with(metadata.all_argument_names.len(), |index| {
+                Datum::Text(metadata.all_argument_names[index])
+            })
+            .map_err(|_| arena_full())?;
+        Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(values, arena)?,
+        }
+    };
+    row(
+        &[
+            Datum::Int4(1255),
+            Datum::Int4(signature.oid),
+            Datum::Text(signature.name),
+            Datum::Int4(namespace),
+            Datum::Int4(signature.arguments.len() as i32),
+            Datum::Int4(signature.result_oid),
+            Datum::Bool(signature.returns_set),
+            Datum::Char(signature.kind),
+            oidvector(signature.arguments, arena)?,
+            Datum::Bpchar(metadata.volatility),
+            Datum::Bpchar(metadata.parallel),
+            Datum::Int4(10),
+            Datum::Bool(metadata.security_definer),
+            if intrinsic_routine_public_execute(signature.oid) == Some(false) {
+                builtin_acl(&["postgres=X/postgres"], arena)?
+            } else {
+                Datum::Null
+            },
+            Datum::Int4(metadata.language),
+            Datum::Text(metadata.source),
+            Datum::Null,
+            Datum::Bool(metadata.strict),
+            Datum::Bool(metadata.leakproof),
+            Datum::Null,
+            Datum::Float8(metadata.cost),
+            Datum::Float8(metadata.rows),
+            Datum::Null,
+            Datum::RegObject {
+                type_oid: super::types::oid::REGPROC,
+                referenced_oid: metadata.support,
+                name: metadata.support_name,
+            },
+            Datum::Int4((signature.arguments.len() - signature.required_arguments) as i32),
+            Datum::Int4(signature.variadic_element.unwrap_or(0)),
+            all_types,
+            modes,
+            names,
+            signature.defaults.map_or(Datum::Null, Datum::Text),
+            Datum::Null,
+        ],
+        arena,
+    )
+}
+
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_proc", false);
-    // The routine inventory is fixed at startup, so size the synthesized row
-    // index from that same bound instead of coupling it to the built-in count.
-    let row_capacity = INTRINSIC_ROUTINES
+    let row_capacity = callable_signatures::CALLABLES
         .len()
         .checked_add(storage.routine_count())
         .ok_or_else(|| catalog_capacity_exceeded("pg_proc"))?;
     let rows = arena
         .alloc_slice_with(row_capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
-        let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut argument_count = 0usize;
-        for written in routine.argument_types.split_ascii_whitespace() {
-            if argument_count == argument_oids.len() {
-                return Err(catalog_capacity_exceeded("pg_proc.proargtypes"));
-            }
-            argument_oids[argument_count] = written.parse().map_err(|_| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "intrinsic routine has an invalid argument OID"
-                )
-            })?;
-            argument_count += 1;
+    let mut count = 0;
+    for signature in callable_signatures::CALLABLES {
+        // A retained stored definition is the executable owner of its OID.
+        if storage.routine_slot_by_oid(signature.oid, txid).is_some() {
+            continue;
         }
-        if argument_count != routine.argument_count as usize {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "intrinsic routine argument count does not match its OID vector"
-            ));
-        }
-        let record_outputs = intrinsic_record_outputs(*routine);
-        let mut all_types = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let mut modes = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let mut names = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
-        let intrinsic_names = intrinsic_routine_argument_names(routine.oid);
-        if let Some(argument_names) = intrinsic_names {
-            for (index, name) in argument_names.iter().enumerate() {
-                names[index] = Datum::Text(name);
-            }
-        }
-        let record_input_count = if record_outputs.is_some() {
-            argument_count
-        } else {
-            0
-        };
-        for input in 0..record_input_count {
-            all_types[input] = Datum::Oid(argument_oids[input] as u32);
-            modes[input] = Datum::Char(if routine.oid == 6119 { b'v' } else { b'i' });
-        }
-        if let Some((output_oids, output_names)) = record_outputs {
-            for output in 0..output_oids.len() {
-                let index = record_input_count + output;
-                all_types[index] = Datum::Oid(output_oids[output] as u32);
-                modes[index] = Datum::Char(b'o');
-                names[index] = Datum::Text(output_names[output]);
-            }
-        }
-        rows[index] = row(
-            &[
-                Datum::Int4(1255),
-                Datum::Int4(routine.oid),
-                text(routine.name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(routine.argument_count),
-                Datum::Int4(routine.result_oid),
-                Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar(intrinsic_routine_kind(*routine)),
-                oidvector(&argument_oids[..argument_count], arena)?,
-                Datum::Bpchar(routine.volatility),
-                Datum::Bpchar(intrinsic_routine_parallel(*routine)),
-                Datum::Int4(10),
-                Datum::Bool(false),
-                if intrinsic_routine_public_execute(routine.oid) == Some(false) {
-                    builtin_acl(&["postgres=X/postgres"], arena)?
-                } else {
-                    Datum::Null
-                },
-                Datum::Int4(
-                    if matches!(
-                        routine.oid,
-                        879 | 880
-                            | 1285
-                            | 1290
-                            | 1481
-                            | 1708
-                            | 1710
-                            | 1741
-                            | 1810
-                            | 1811
-                            | 1812
-                            | 2074
-                    ) {
-                        14
-                    } else {
-                        12
-                    },
-                ),
-                text(intrinsic_routine_source(*routine), arena)?,
-                Datum::Null,
-                Datum::Bool(intrinsic_routine_is_strict(*routine)),
-                Datum::Bool(builtin_procedure_is_leakproof(routine.oid)),
-                Datum::Null,
-                Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
-                Datum::Float8(match routine.oid {
-                    2289 => 3.0,
-                    2763 => 1.0,
-                    2764 => 10.0,
-                    2765 | 2766 => 1000.0,
-                    2947 | 5064 => 50.0,
-                    6119 => 1000.0,
-                    _ => 0.0,
-                }),
-                Datum::Null,
-                match routine.oid {
-                    79 | 1254 => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 1364,
-                        name: "textregexeq_support",
-                    },
-                    1238 | 1240 => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 1024,
-                        name: "texticregexeq_support",
-                    },
-                    _ => Datum::RegObject {
-                        type_oid: super::types::oid::REGPROC,
-                        referenced_oid: 0,
-                        name: "-",
-                    },
-                },
-                Datum::Int4(
-                    intrinsic_routine_defaults(routine.oid).map_or(0, |(count, _)| count as i32),
-                ),
-                Datum::Int4(match routine.oid {
-                    6119 => super::types::oid::TEXT,
-                    3058 | 3059 | 3539 => 2276,
-                    4282 => 3904,
-                    4285 => 3906,
-                    4288 => 3908,
-                    4291 => 3910,
-                    4294 => 3912,
-                    4297 => 3926,
-                    _ => 0,
-                }),
-                match record_outputs {
-                    Some((output_oids, _)) => Datum::Array {
-                        element: super::types::ArrElem::Oid,
-                        raw: super::array::build(
-                            &all_types[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    None => Datum::Null,
-                },
-                match record_outputs {
-                    Some((output_oids, _)) => Datum::Array {
-                        element: super::types::ArrElem::Char,
-                        raw: super::array::build(
-                            &modes[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    None => Datum::Null,
-                },
-                match (routine.oid, record_outputs) {
-                    (6430, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&[Datum::Text("shift")], arena)?,
-                    },
-                    (6212, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &[Datum::Text("mean"), Datum::Text("stddev")],
-                            arena,
-                        )?,
-                    },
-                    (6339..=6341, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&[Datum::Text("min"), Datum::Text("max")], arena)?,
-                    },
-                    (1268, _) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &[Datum::Text("str"), Datum::Text("strict")],
-                            arena,
-                        )?,
-                    },
-                    (_, Some((output_oids, _))) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &names[..record_input_count + output_oids.len()],
-                            arena,
-                        )?,
-                    },
-                    (_, _) if intrinsic_names.is_some() => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &names[..intrinsic_names.expect("checked").len()],
-                            arena,
-                        )?,
-                    },
-                    (_, None) => Datum::Null,
-                },
-                intrinsic_routine_defaults(routine.oid)
-                    .map_or(Datum::Null, |(_, source)| Datum::Text(source)),
-                Datum::Null,
-            ],
-            arena,
-        )?;
+        rows[count] = builtin_proc_row(signature, storage, txid, arena)?;
+        count += 1;
     }
-    let mut count = INTRINSIC_ROUTINES.len();
     for slot in 0..storage.routine_count() {
         if !storage.routine_slot_visible_to(slot, txid) {
             continue;
@@ -27637,14 +28006,15 @@ fn pg_aggregate<'a>(
             "xmlconcat2"
         } else if oid == 2901 {
             "xmlagg"
-        } else if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        } else if let Some(routine) = builtin_callable_by_oid(oid) {
             if matches!(oid, 4301 | 4389 | 4450 | 6227) {
                 match oid {
                     4301 | 6227 => "pg_catalog.range_agg",
                     _ => "pg_catalog.range_intersect_agg",
                 }
             } else {
-                routine.name
+                routine_name_by_oid(storage, txid, routine.oid, false, arena)?
+                    .expect("selected built-in declaration retains its identity")
             }
         } else {
             let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
@@ -32216,7 +32586,6 @@ fn info_column_type_usage<'a>(
                 default: crate::storage::ColumnDefault::NONE,
                 is_identity: false,
                 identity_always: false,
-                auto_increment_step: 1,
                 user_type,
                 statistics_target: -1,
                 statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,

@@ -1884,13 +1884,10 @@ impl Server {
                 {
                     continue;
                 }
-                self.engine
-                    .restore_execution_identity(self.slots[index].conn.execution_identity());
-                {
-                    let slot = &mut self.slots[index];
-                    self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
-                }
-                if self.slots[index].conn.terminate_by_administrator() {
+                if terminate_connection_by_administrator(
+                    &mut self.engine,
+                    &mut self.slots[index].conn,
+                ) {
                     self.sync_write_interest(index);
                 } else {
                     self.release(index);
@@ -1927,20 +1924,21 @@ impl Server {
             else {
                 continue;
             };
-            self.engine
-                .restore_execution_identity(self.slots[index].conn.execution_identity());
             if terminate {
-                {
-                    let slot = &mut self.slots[index];
-                    self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
-                }
-                if self.slots[index].conn.terminate_by_administrator() {
+                if terminate_connection_by_administrator(
+                    &mut self.engine,
+                    &mut self.slots[index].conn,
+                ) {
                     self.sync_write_interest(index);
                 } else {
                     self.release(index);
                 }
-            } else if self.slots[index].conn.cancel_parked(&mut self.engine) {
-                self.sync_write_interest(index);
+            } else {
+                self.engine
+                    .restore_execution_identity(self.slots[index].conn.execution_identity());
+                if self.slots[index].conn.cancel_parked(&mut self.engine) {
+                    self.sync_write_interest(index);
+                }
             }
         }
     }
@@ -3853,6 +3851,15 @@ fn parse_operations_request(
     }
 }
 
+/// Queue the terminal response while an irreversible publication keeps its owner.
+fn terminate_connection_by_administrator(engine: &mut Engine, connection: &mut Conn) -> bool {
+    engine.restore_execution_identity(connection.execution_identity());
+    if connection.txn.staged_commit().is_none() {
+        engine.rollback_txn(&mut connection.txn, &connection.guc);
+    }
+    connection.terminate_by_administrator()
+}
+
 /// Binds a TCP listener whose address can immediately be reused after an
 /// ungraceful server exit. This is required for crash recovery: the previous
 /// process may leave completed connections in TCP's closing states.
@@ -4064,6 +4071,218 @@ mod tests {
         Server, SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork,
         bind_listener, parse_operations_request,
     };
+
+    #[test]
+    fn administrator_termination_keeps_staged_publication_and_rolls_back_active_work() {
+        use crate::config::{Config, TransactionMode};
+        use crate::pg::{conn::Conn, respond::Responder};
+        use crate::sql::{Engine, ExecutionIdentity, ExecutionStatus, StatementWait};
+        use crate::storage::DatabaseOid;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        fn execute(engine: &mut Engine, connection: &mut Conn, sql: &str) -> ExecutionStatus {
+            connection.arena.reset();
+            connection.send.clear();
+            let id = connection.id();
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    0,
+                    &connection.arena,
+                    &mut connection.txn,
+                    &mut connection.sqlprep,
+                    &mut connection.cursors,
+                    &connection.guc,
+                    &mut Responder::new(&mut connection.send),
+                    id,
+                    false,
+                )
+            })
+            .unwrap();
+            assert!(
+                !connection
+                    .send
+                    .readable()
+                    .windows(6)
+                    .any(|bytes| bytes == b"ERROR\0"),
+                "{sql}: {}",
+                String::from_utf8_lossy(connection.send.readable())
+            );
+            status
+        }
+
+        for mode in [TransactionMode::Mvcc, TransactionMode::Locking] {
+            let mode_name = match mode {
+                TransactionMode::Mvcc => "mvcc",
+                TransactionMode::Locking => "locking",
+            };
+            let namespace = format!(
+                "admin-staged-publication-{mode_name}-{}",
+                std::process::id()
+            );
+            let mut config = Config::default_dev();
+            config.transaction_mode = mode;
+            config.data_dir = std::env::temp_dir()
+                .join(&namespace)
+                .to_string_lossy()
+                .into_owned();
+            if std::path::Path::new(&config.data_dir).exists() {
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+            }
+            config.remove_test_data_dir_on_drop();
+            config.max_tables = 4;
+            config.max_connections = 3;
+            config.memtable_bytes = 1 << 20;
+            config.block_cache_bytes = 1 << 20;
+            config.work_arena_bytes = 8 << 20;
+            config.sql_arena_bytes = 1 << 20;
+            config.catalog_history_bytes = 1 << 20;
+            config.txn_rows = 64;
+            config.max_ddl_per_transaction = 16;
+            config.routine_input_slots = 8;
+            config.row_overlay_slots = 64;
+            config.wal_bytes = 1 << 20;
+            config.wal_buffer_bytes = 1 << 16;
+            config.wal_upload_buffer_bytes = 1 << 16;
+            config.object_store_on = true;
+            config.object_store_sim = false;
+            config.object_store_bucket = namespace;
+            config.wal_upload = true;
+            config.wal_upload_sync = true;
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+            let object_server = crate::sql::HttpObjectServer::start(&mut config);
+            let mut budget = crate::sql::test_engine_budget(&config, 64 << 20);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut target = Conn::new(&config, &mut budget).unwrap();
+            let mut observer = Conn::new(&config, &mut budget).unwrap();
+            let mut verifier = Conn::new(&config, &mut budget).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            target.open(stream, 71);
+            let observer_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            observer.open(stream, 72);
+            let verifier_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            verifier.open(stream, 73);
+            assert_eq!(
+                execute(
+                    &mut engine,
+                    &mut target,
+                    "CREATE TABLE administrator_publication_rows(id integer)"
+                ),
+                ExecutionStatus::Complete
+            );
+            engine.commit_wal().unwrap();
+            engine.enable_async_durability();
+            assert!(matches!(
+                execute(
+                    &mut engine,
+                    &mut target,
+                    "INSERT INTO administrator_publication_rows VALUES(1)"
+                ),
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::ObjectIo,
+                    ..
+                }
+            ));
+            let staged = target.txn.staged_commit().expect("publication is pending");
+            engine.restore_execution_identity(ExecutionIdentity::new(72, DatabaseOid::POSTGRES));
+            assert!(crate::mem::guard::forbid_alloc(|| {
+                super::terminate_connection_by_administrator(&mut engine, &mut target)
+            }));
+            assert_eq!(engine.execution_identity(), target.execution_identity());
+            assert!(target.is_terminating());
+            assert!(target.txn.staged_commit().is_some_and(
+                |current| current.lsn == staged.lsn && current.target == staged.target
+            ));
+            assert!(engine.fatal_commit_failure().is_none());
+            assert_eq!(
+                crate::mem::guard::forbid_alloc(|| target.on_writable()),
+                crate::pg::conn::After::Continue
+            );
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).unwrap();
+            assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
+            assert!(response.windows(5).any(|bytes| bytes == b"57P01"));
+            assert!(
+                target.txn.staged_commit().is_some(),
+                "flushing Fatal cannot discard the receipt"
+            );
+            engine.commit_wal().unwrap();
+            crate::mem::guard::forbid_alloc(|| {
+                engine.finish_pending_transaction(&mut target.txn, &target.guc)
+            })
+            .unwrap();
+            assert!(target.txn.staged_commit().is_none());
+            assert!(engine.fatal_commit_failure().is_none());
+            assert_eq!(
+                execute(
+                    &mut engine,
+                    &mut verifier,
+                    "SELECT count(*) FROM administrator_publication_rows"
+                ),
+                ExecutionStatus::Complete
+            );
+            let one = b"D\0\0\0\x0b\0\x01\0\0\0\x011";
+            assert!(
+                verifier
+                    .send
+                    .readable()
+                    .windows(one.len())
+                    .any(|bytes| bytes == one)
+            );
+            assert_eq!(
+                execute(
+                    &mut engine,
+                    &mut observer,
+                    "BEGIN; INSERT INTO administrator_publication_rows VALUES(2)"
+                ),
+                ExecutionStatus::Complete
+            );
+            assert!(observer.txn.is_active());
+            assert!(observer.txn.staged_commit().is_none());
+            assert!(crate::mem::guard::forbid_alloc(|| {
+                super::terminate_connection_by_administrator(&mut engine, &mut observer)
+            }));
+            assert!(!observer.txn.is_active());
+            assert!(engine.fatal_commit_failure().is_none());
+            assert_eq!(
+                execute(
+                    &mut engine,
+                    &mut verifier,
+                    "SELECT count(*) FROM administrator_publication_rows"
+                ),
+                ExecutionStatus::Complete
+            );
+            assert!(
+                verifier
+                    .send
+                    .readable()
+                    .windows(one.len())
+                    .any(|bytes| bytes == one)
+            );
+            drop((
+                observer_client,
+                verifier_client,
+                client,
+                target,
+                observer,
+                verifier,
+                engine,
+            ));
+            drop(object_server);
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
 
     #[test]
     fn extreme_server_resource_budgets_propagate_exhaustion_without_allocation() {

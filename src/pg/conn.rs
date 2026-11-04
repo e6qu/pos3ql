@@ -160,7 +160,11 @@ struct Prepared {
     /// share the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     query_len: usize,
+    oid_bytes: usize,
     n_params: u16,
+    plan: u64,
+    planner_ready: bool,
+    kind: crate::sql::ProtocolStatement,
 }
 
 impl Prepared {
@@ -170,7 +174,11 @@ impl Prepared {
     }
 
     fn parameter_oid_bytes(&self) -> &[u8] {
-        &self.data.readable()[self.query_len..]
+        &self.data.readable()[self.query_len..self.query_len + self.oid_bytes]
+    }
+
+    fn type_inputs(&self) -> &[u8] {
+        &self.data.readable()[self.query_len + self.oid_bytes..]
     }
 }
 
@@ -185,7 +193,8 @@ struct Portal {
     active: bool,
     name: SqlName,
     statement: usize,
-    /// Validated Bind format codes, lengths, and values in wire order.
+    plan: crate::sql::type_input_plans::Owner,
+    /// Resolved parameter OIDs followed by one encoded, already checked row.
     params: FixedBuf,
     n_params: u16,
     /// Per-column result format requested by Bind.
@@ -432,6 +441,8 @@ pub struct Conn {
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     prepared: Vec<Prepared>,
     portals: Vec<Portal>,
+    /// Unpublished portal whose decoded parameters survive a planning wait.
+    pending_bind: Option<usize>,
     phase: Phase,
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
@@ -460,7 +471,36 @@ pub struct Conn {
 }
 
 impl Conn {
+    fn abandon_pending_bind(&mut self) {
+        let Some(slot) = self.pending_bind.take() else {
+            return;
+        };
+        let portal = &mut self.portals[slot];
+        if matches!(
+            portal.plan,
+            crate::sql::type_input_plans::Owner::ProtocolPortal(_)
+        ) || !self.prepared[portal.statement].planner_ready
+        {
+            self.sqlprep.routine_inputs.retire(portal.plan);
+        }
+        portal.active = false;
+        portal.plan = crate::sql::type_input_plans::Owner::Unlocated;
+        portal.params.clear();
+    }
+
+    fn release_closed_statement_plans(&mut self) {
+        self.sqlprep.routine_inputs.retire_invalid_protocol_owners(|owner| {
+            (matches!(owner, crate::sql::type_input_plans::Owner::ProtocolPrepared(plan)
+                if self.prepared.iter().any(|statement| statement.active && statement.plan == plan)))
+                || self.portals.iter().enumerate().any(|(slot, portal)|
+                    (portal.active || self.pending_bind == Some(slot)) && portal.plan == owner)
+        });
+    }
+
     fn clear_protocol_state(&mut self) {
+        self.pending_bind = None;
+        self.sqlprep.clear_request_type_inputs();
+        self.sqlprep.routine_inputs.clear();
         for prepared in &mut self.prepared {
             prepared.active = false;
         }
@@ -474,11 +514,26 @@ impl Conn {
     fn apply_protocol_reset(&mut self, engine: &mut Engine) {
         match engine.take_protocol_reset() {
             crate::sql::ProtocolReset::None => {}
+            crate::sql::ProtocolReset::Plans { first, count } => {
+                assert_eq!(
+                    count,
+                    self.prepared.len(),
+                    "protocol and SQL prepared namespaces share startup capacity"
+                );
+                for (index, prepared) in self.prepared.iter_mut().enumerate() {
+                    if prepared.active {
+                        prepared.plan = first + index as u64;
+                        prepared.planner_ready = false;
+                    }
+                }
+                self.release_closed_statement_plans();
+            }
             crate::sql::ProtocolReset::Statements => {
                 // Bound portals retain their original statement bytes until closed.
                 for statement in &mut self.prepared {
                     statement.active = false;
                 }
+                self.release_closed_statement_plans();
             }
             crate::sql::ProtocolReset::All => self.clear_protocol_state(),
         }
@@ -493,7 +548,11 @@ impl Conn {
                 name: empty,
                 data: FixedBuf::new(budget, "prepared_data", config.prepared_bytes)?,
                 query_len: 0,
+                oid_bytes: 0,
                 n_params: 0,
+                plan: 0,
+                planner_ready: false,
+                kind: crate::sql::ProtocolStatement::Utility,
             });
         }
         let mut portals = Vec::with_capacity(config.max_portals);
@@ -502,6 +561,7 @@ impl Conn {
                 active: false,
                 name: empty,
                 statement: 0,
+                plan: crate::sql::type_input_plans::Owner::Unlocated,
                 params: FixedBuf::new(budget, "portal_params", config.portal_bytes)?,
                 n_params: 0,
                 result_formats: ResultFmt::ALL_TEXT,
@@ -553,6 +613,7 @@ impl Conn {
             )?,
             prepared,
             portals,
+            pending_bind: None,
             phase: Phase::Startup,
             minor: 0,
             id: 0,
@@ -726,7 +787,11 @@ impl Conn {
     }
 
     pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
-        if !self.parked || self.txn.staged_commit().is_some() {
+        if !self.parked {
+            return false;
+        }
+        if self.txn.staged_commit().is_some() {
+            self.txn.defer_concurrent_index_cancel();
             return false;
         }
         let extended = self.copy.as_ref().map_or_else(
@@ -753,7 +818,10 @@ impl Conn {
             .filter(|length| *length <= self.recv.len())
             .unwrap_or(self.recv.len());
         self.recv.consume(message_bytes);
+        self.abandon_pending_bind();
         self.finish_lock_wait();
+        self.sqlprep.clear_request_type_inputs();
+        crate::sql::sequence::finish_statement(self.guc.seq_session());
         engine.cancel_backend_wait(self.id);
         if self.copy.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
@@ -768,6 +836,9 @@ impl Conn {
         if !self.txn.is_active() {
             self.cursors.on_rollback();
         }
+        self.sqlprep
+            .routine_inputs
+            .retire_invalid_cursors(|generation| self.cursors.contains_plan_owner(generation));
         engine.finish_backend_statement(&self.txn, self.id);
         let mut synchronized = extended && parked_sync;
         while extended && !synchronized && self.recv.len() >= 5 {
@@ -1541,7 +1612,7 @@ impl Conn {
                 &mut self.txn,
                 &mut self.sqlprep,
                 &mut self.cursors,
-                &mut self.guc,
+                &self.guc,
                 &self.arena,
                 &mut responder,
             )
@@ -1888,6 +1959,7 @@ impl Conn {
                         portal.active = false;
                     }
                 }
+                self.release_closed_statement_plans();
                 let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
                 if responder.ready_for_query(status).is_err() {
@@ -1902,7 +1974,7 @@ impl Conn {
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
                 let lock_timeout_expired = self.lock_timeout_expired();
-                let result = if self.txn.mode == crate::sql::txn::TxnMode::Implicit {
+                let result = if self.txn.is_implicit() {
                     engine
                         .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
                         .and_then(|()| {
@@ -1910,7 +1982,12 @@ impl Conn {
                             engine.commit_txn_with_triggers(
                                 &mut self.txn,
                                 &self.guc,
-                                Some(&mut self.cursors),
+                                crate::sql::txn::CommitTarget::Ordinary,
+                                Some(crate::sql::CursorCommitContext {
+                                    cursors: &mut self.cursors,
+                                    plans: &mut self.sqlprep,
+                                    arena: &self.arena,
+                                }),
                                 &self.arena,
                                 &mut responder,
                             )
@@ -1949,6 +2026,7 @@ impl Conn {
                         portal.active = false;
                     }
                 }
+                self.release_closed_statement_plans();
                 let status = self.txn.status_byte();
                 match Responder::new(&mut self.send).ready_for_query(status) {
                     Ok(()) => Step::Continue,
@@ -1956,7 +2034,7 @@ impl Conn {
                 }
             }
             wire::FMSG_FLUSH => Step::Continue,
-            wire::FMSG_PARSE => self.handle_parse(total),
+            wire::FMSG_PARSE => self.handle_parse(engine, total),
             wire::FMSG_BIND => self.handle_bind(engine, total),
             wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
             wire::FMSG_EXECUTE => self.handle_execute(engine, total),
@@ -1973,6 +2051,34 @@ impl Conn {
         };
         if !matches!(step, Step::Close | Step::Parked) && msg_type != wire::FMSG_QUERY {
             self.recv.consume(total);
+        }
+        if msg_type == wire::FMSG_BIND && !matches!(step, Step::Parked) {
+            crate::sql::query::disarm_timeout();
+            self.abandon_pending_bind();
+            self.finish_lock_wait();
+        }
+        if matches!(step, Step::Continue)
+            && self.phase == Phase::SkipToSync
+            && matches!(
+                msg_type,
+                wire::FMSG_PARSE
+                    | wire::FMSG_BIND
+                    | wire::FMSG_DESCRIBE
+                    | wire::FMSG_EXECUTE
+                    | wire::FMSG_CLOSE
+            )
+        {
+            crate::sql::query::disarm_timeout();
+            crate::sql::sequence::finish_statement(self.guc.seq_session());
+            self.sqlprep.clear_request_type_inputs();
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else if self.txn.is_active() && self.txn.staged_commit().is_none() {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+                self.cursors.on_rollback();
+            }
+            self.finish_lock_wait();
+            engine.finish_backend_statement(&self.txn, self.id);
         }
         step
     }
@@ -2119,6 +2225,7 @@ impl Conn {
                     bytes,
                     &self.arena,
                     self.txn.txid,
+                    Some(self.guc.seq_session()),
                 )
             } else {
                 engine.decode_text_parameter(
@@ -2126,6 +2233,7 @@ impl Conn {
                     bytes,
                     &self.arena,
                     self.txn.txid,
+                    Some(self.guc.seq_session()),
                 )
             };
             match decoded {
@@ -2147,6 +2255,7 @@ impl Conn {
                 result_format == 1,
                 &self.arena,
                 &mut self.txn,
+                &mut self.sqlprep,
                 &self.guc,
                 &mut self.cursors,
                 &mut responder,
@@ -2765,7 +2874,11 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
-                        Some(&mut self.cursors),
+                        Some(crate::sql::CursorCommitContext {
+                            cursors: &mut self.cursors,
+                            plans: &mut self.sqlprep,
+                            arena: &self.arena,
+                        }),
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {
@@ -2840,7 +2953,7 @@ impl Conn {
         }
     }
 
-    fn handle_parse(&mut self, total: usize) -> Step {
+    fn handle_parse(&mut self, engine: &mut Engine, total: usize) -> Step {
         let payload = &self.recv.readable()[5..total];
         let parse = || -> Result<(&str, &str, usize, &[u8]), wire::Malformed> {
             let mut m = MsgIn::new(payload);
@@ -2863,8 +2976,14 @@ impl Conn {
         };
 
         // Validate now so Parse errors surface at Parse, like PostgreSQL.
-        self.arena.reset();
-        let n_params = {
+        if self.sqlprep.request_input_waiting()
+            || self.guc.seq_session().retains_statement_effects()
+        {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
+        let (n_params, statement_kind) = {
             let mut parser = match Parser::new(query, &self.arena) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2876,8 +2995,11 @@ impl Conn {
                     );
                 }
             };
-            match parser.next_stmt() {
-                Ok(_first) => {}
+            let statement_kind = match parser.next_stmt() {
+                Ok(first) => first.as_ref().map_or(
+                    crate::sql::ProtocolStatement::Utility,
+                    crate::sql::ProtocolStatement::for_statement,
+                ),
                 Err(e) => {
                     return ext_err(
                         &mut self.send,
@@ -2886,7 +3008,7 @@ impl Conn {
                         e.message.as_str(),
                     );
                 }
-            }
+            };
             match parser.next_stmt() {
                 Ok(None) => {}
                 Ok(Some(_)) => {
@@ -2906,7 +3028,7 @@ impl Conn {
                     );
                 }
             }
-            parser.max_param()
+            (parser.max_param(), statement_kind)
         };
         if n_params as usize > MAX_BIND_PARAMS {
             return ext_err(
@@ -2923,6 +3045,22 @@ impl Conn {
                 &mut self.phase,
                 sqlstate::PROTOCOL_VIOLATION,
                 "Parse message supplies more parameter types than the statement uses",
+            );
+        }
+        if let Err(error) =
+            engine.begin_extended_parse(&mut self.txn, &self.guc, self.id, statement_kind)
+        {
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+                self.cursors.on_rollback();
+            }
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                error.sqlstate,
+                error.message.as_str(),
             );
         }
 
@@ -2975,10 +3113,85 @@ impl Conn {
                 "statement name too long",
             );
         };
+        let plan = match self.sqlprep.reserve_plan_ids(1) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
+        let lock_timeout_expired = self.lock_timeout_expired();
+        let bound_inputs = {
+            let mut responder = Responder::new(&mut self.send);
+            engine.admit_type_input_source(
+                crate::sql::type_inputs::Source::RootCommand { statement: 0 },
+                query,
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &self.guc,
+                &mut responder,
+                self.id,
+                lock_timeout_expired,
+            )
+        };
+        let bound_inputs = match bound_inputs {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error))
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
+            {
+                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                    crate::sql::StatementWait::ObjectIo
+                } else {
+                    crate::sql::StatementWait::Lock
+                };
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                return Step::Parked;
+            }
+            Ok(Err(error)) => {
+                self.sqlprep.clear_request_type_inputs();
+                if self.txn.is_explicit() {
+                    self.txn.failed = true;
+                } else {
+                    engine.rollback_txn(&mut self.txn, &self.guc);
+                    self.cursors.on_rollback();
+                }
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+            Err(WireFull) => return Step::Close,
+        };
         let entry = &mut self.prepared[slot];
+        self.sqlprep
+            .routine_inputs
+            .retire(crate::sql::type_input_plans::Owner::ProtocolPrepared(
+                entry.plan,
+            ));
         entry.data.clear();
-        if query.len().saturating_add(param_oid_bytes.len()) > entry.data.capacity() {
+        if query
+            .len()
+            .saturating_add(param_oid_bytes.len())
+            .saturating_add(bound_inputs.len())
+            > entry.data.capacity()
+        {
             entry.active = false;
+            self.sqlprep.clear_request_type_inputs();
+            if self.txn.is_explicit() {
+                self.txn.failed = true;
+            } else {
+                engine.rollback_txn(&mut self.txn, &self.guc);
+                self.cursors.on_rollback();
+            }
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -2991,16 +3204,24 @@ impl Conn {
             "capacity checked above"
         );
         assert!(entry.data.append(param_oid_bytes), "capacity checked above");
+        assert!(entry.data.append(bound_inputs), "capacity checked above");
         entry.active = true;
         entry.name = sql_name;
         entry.query_len = query.len();
+        entry.oid_bytes = param_oid_bytes.len();
         entry.n_params = n_params as u16;
+        entry.plan = plan;
+        entry.planner_ready = false;
+        entry.kind = statement_kind;
+        self.sqlprep.clear_request_type_inputs();
         if name.is_empty()
             && let Some(prior) = unnamed
             && prior != slot
         {
             self.prepared[prior].active = false;
         }
+        self.release_closed_statement_plans();
+        self.finish_lock_wait();
 
         let mut responder = Responder::new(&mut self.send);
         match responder.parse_complete() {
@@ -3119,23 +3340,68 @@ impl Conn {
                 "bind parameter count differs from the statement",
             );
         }
+        if self.pending_bind.is_some() || self.guc.seq_session().retains_statement_effects() {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
+        let timeout = self.lock_timeout_expired();
+        let resumed = self.parked;
+        let mut snapshot = match engine.begin_extended_bind(
+            &mut self.txn,
+            &self.guc,
+            self.id,
+            timeout,
+            self.prepared[stmt_slot].kind,
+            n_params != 0,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
         if !result_formats.matches_column_count(1) || result_formats.any_binary() {
             // A per-column result-format list needs the query's described
             // shape. Probe that same typed boundary before a portal exists,
             // discard its provisional response, and retain only a valid
             // format state for execution.
-            self.arena.reset();
             let text = self.prepared[stmt_slot].query();
+            let param_oids = match engine.infer_param_types(
+                text,
+                &self.arena,
+                &self.txn,
+                n_params,
+                self.prepared[stmt_slot].parameter_oid_bytes(),
+                self.prepared[stmt_slot].type_inputs(),
+            ) {
+                Ok(oids) => oids,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
             let mark = self.send.mark();
             let described = {
                 let mut responder = Responder::for_describe(&mut self.send, result_formats);
-                engine.describe(
-                    text,
-                    &self.arena,
-                    &self.txn,
-                    Some(&self.cursors),
-                    &mut responder,
-                )
+                crate::sql::exec::with_bound_parameter_types(param_oids, || {
+                    engine.describe(
+                        text,
+                        &self.arena,
+                        &self.txn,
+                        Some(&self.cursors),
+                        &mut responder,
+                        self.prepared[stmt_slot].type_inputs(),
+                    )
+                })
             };
             match described {
                 Ok(true) => {}
@@ -3181,48 +3447,6 @@ impl Conn {
                 );
             }
         }
-        // PostgreSQL validates text parameters at Bind after resolving the
-        // statement. Walk the compact metadata a second time so malformed
-        // text cannot enter a portal without retaining one span per value.
-        let mut parameter_message = MsgIn::new(parameter_data);
-        let n_formats = usize::from(
-            parameter_message
-                .u16()
-                .expect("validated Bind format count"),
-        );
-        let format_bytes = parameter_message
-            .take(n_formats * 2)
-            .expect("validated Bind format codes");
-        let stored_count = usize::from(
-            parameter_message
-                .u16()
-                .expect("validated Bind parameter count"),
-        );
-        debug_assert_eq!(stored_count, n_params);
-        for index in 0..n_params {
-            let len = parameter_message
-                .i32()
-                .expect("validated Bind parameter length");
-            if len < 0 {
-                continue;
-            }
-            let value = parameter_message
-                .take(len as usize)
-                .expect("validated Bind parameter value");
-            let binary = match n_formats {
-                0 => false,
-                1 => format_bytes == [0, 1],
-                _ => format_bytes[index * 2..index * 2 + 2] == [0, 1],
-            };
-            if !binary && core::str::from_utf8(value).is_err() {
-                return ext_err(
-                    &mut self.send,
-                    &mut self.phase,
-                    "22021",
-                    "invalid UTF-8 in parameter value",
-                );
-            }
-        }
         let existing = self
             .portals
             .iter()
@@ -3232,10 +3456,13 @@ impl Conn {
                 &mut self.send,
                 &mut self.phase,
                 sqlstate::DUPLICATE_CURSOR,
-                crate::stack_format!(96, "portal \"{portal_name}\" already exists").as_str(),
+                crate::stack_format!(96, "cursor \"{portal_name}\" already exists").as_str(),
             );
         }
-        let slot = existing.or_else(|| self.portals.iter().position(|portal| !portal.active));
+        let slot = self
+            .pending_bind
+            .or(existing)
+            .or_else(|| self.portals.iter().position(|portal| !portal.active));
         let Some(slot) = slot else {
             return ext_err(&mut self.send, &mut self.phase, "54000", "too many portals");
         };
@@ -3247,18 +3474,125 @@ impl Conn {
                 "portal name too long",
             );
         };
-        // Retain the validated wire-order metadata and values. Execute walks
-        // this compact representation directly within `portal_bytes`.
-        let portal = &mut self.portals[slot];
-        portal.params.clear();
-        if !portal.params.append(parameter_data) {
-            return ext_err(
-                &mut self.send,
-                &mut self.phase,
-                "54000",
-                "parameters exceed portal_bytes",
-            );
+        if self.pending_bind.is_none() {
+            let encoded = match decode_bind_parameters(
+                engine,
+                &self.prepared[stmt_slot],
+                parameter_data,
+                &self.arena,
+                &self.txn,
+                self.guc.seq_session(),
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
+            let portal = &mut self.portals[slot];
+            let plan = if n_params == 0 {
+                crate::sql::type_input_plans::Owner::ProtocolPrepared(self.prepared[stmt_slot].plan)
+            } else {
+                match self.sqlprep.reserve_plan_ids(1) {
+                    Ok(plan) => crate::sql::type_input_plans::Owner::ProtocolPortal(plan),
+                    Err(error) => {
+                        return ext_err(
+                            &mut self.send,
+                            &mut self.phase,
+                            error.sqlstate,
+                            error.message.as_str(),
+                        );
+                    }
+                }
+            };
+            if matches!(
+                portal.plan,
+                crate::sql::type_input_plans::Owner::ProtocolPortal(_)
+            ) {
+                self.sqlprep.routine_inputs.retire(portal.plan);
+            }
+            portal.plan = plan;
+            portal.active = false;
+            portal.params.clear();
+            if !portal.params.append(encoded) {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    "54000",
+                    "parameters exceed portal_bytes",
+                );
+            }
+            portal.n_params = n_params as u16;
+            portal.statement = stmt_slot;
+            self.pending_bind = Some(slot);
         }
+        let (params, param_oids) = match restore_portal_parameters(
+            self.portals[slot].params.readable(),
+            n_params,
+            &self.arena,
+        ) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
+        let prepared = &self.prepared[stmt_slot];
+        let planned = crate::sql::type_input_plans::with_owner(self.portals[slot].plan, || {
+            let mut responder = Responder::new(&mut self.send);
+            engine.admit_extended_plan(
+                prepared.query(),
+                params,
+                param_oids,
+                prepared.type_inputs(),
+                &self.arena,
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &self.guc,
+                &mut responder,
+                &mut snapshot,
+                resumed,
+            )
+        });
+        match planned {
+            Ok(Ok(())) => {}
+            Ok(Err(error))
+                if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
+            {
+                let wait = if error.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                    crate::sql::StatementWait::ObjectIo
+                } else {
+                    crate::sql::StatementWait::Lock
+                };
+                self.park(wait, engine.statement_wait_generation(wait, self.id));
+                engine.park_backend_statement(self.id, wait);
+                return Step::Parked;
+            }
+            Ok(Err(error)) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+            Err(WireFull) => return Step::Close,
+        }
+        self.pending_bind = None;
+        if n_params == 0 {
+            self.prepared[stmt_slot].planner_ready = true;
+        }
+        let portal = &mut self.portals[slot];
         portal.active = true;
         portal.name = sql_name;
         portal.statement = stmt_slot;
@@ -3344,6 +3678,7 @@ impl Conn {
             &self.txn,
             usize::from(n_params),
             self.prepared[slot].parameter_oid_bytes(),
+            self.prepared[slot].type_inputs(),
         ) {
             Ok(oids) => oids,
             Err(error) => {
@@ -3366,6 +3701,7 @@ impl Conn {
                 &self.txn,
                 Some(&self.cursors),
                 &mut responder,
+                self.prepared[slot].type_inputs(),
             ) {
                 Ok(true) => Step::Continue,
                 Ok(false) => {
@@ -3431,7 +3767,11 @@ impl Conn {
             max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
 
         if need_run {
-            self.arena.reset();
+            if self.guc.seq_session().retains_statement_effects() {
+                self.arena.recycle_front();
+            } else {
+                self.arena.reset();
+            }
             let lock_timeout_expired = self.lock_timeout_expired();
             let portal = &mut self.portals[portal_slot];
             let prepared = &self.prepared[portal.statement];
@@ -3443,33 +3783,12 @@ impl Conn {
                 paged = false;
                 self.arena.reset();
             }
-            let parameter_count = usize::from(portal.n_params);
-            let params = match self
-                .arena
-                .alloc_slice_with(parameter_count, |_| Datum::Null)
-            {
-                Ok(params) => params,
-                Err(_) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "bound parameters exceed the statement arena",
-                    );
-                }
-            };
-            let raw = portal.params.readable();
-            // Resolve every parameter the client left untyped (OID 0) from
-            // its use in the query before decoding either wire format. Text
-            // Bind values are values of the inferred type, not SQL literals.
-            let param_oids = match engine.infer_param_types(
-                text,
+            let (params, param_oids) = match restore_portal_parameters(
+                portal.params.readable(),
+                usize::from(portal.n_params),
                 &self.arena,
-                &self.txn,
-                parameter_count,
-                prepared.parameter_oid_bytes(),
             ) {
-                Ok(oids) => oids,
+                Ok(parameters) => parameters,
                 Err(error) => {
                     return ext_err(
                         &mut self.send,
@@ -3479,112 +3798,62 @@ impl Conn {
                     );
                 }
             };
-            let mut message = MsgIn::new(raw);
-            let n_formats = usize::from(message.u16().expect("validated Bind format count"));
-            let format_bytes = message
-                .take(n_formats * 2)
-                .expect("validated Bind format codes");
-            let stored_count = usize::from(message.u16().expect("validated Bind parameter count"));
-            debug_assert_eq!(stored_count, parameter_count);
-            for i in 0..parameter_count {
-                let len = message.i32().expect("validated Bind parameter length");
-                if len == -1 {
-                    match engine.coerce_parameter_null(param_oids[i], &self.arena, self.txn.txid) {
-                        Ok(value) => params[i] = value,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                let bytes = message
-                    .take(len as usize)
-                    .expect("validated Bind parameter value");
-                let binary = match n_formats {
-                    0 => false,
-                    1 => format_bytes == [0, 1],
-                    _ => format_bytes[i * 2..i * 2 + 2] == [0, 1],
-                };
-                if binary {
-                    match engine.decode_binary_parameter(
-                        param_oids[i],
-                        bytes,
-                        &self.arena,
-                        self.txn.txid,
-                    ) {
-                        Ok(v) => params[i] = v,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                } else {
-                    match engine.decode_text_parameter(
-                        param_oids[i],
-                        bytes,
-                        &self.arena,
-                        self.txn.txid,
-                    ) {
-                        Ok(value) => params[i] = value,
-                        Err(error) => {
-                            return ext_err(
-                                &mut self.send,
-                                &mut self.phase,
-                                error.sqlstate,
-                                error.message.as_str(),
-                            );
-                        }
-                    }
-                }
-            }
 
             // Paged execution goes through the portal's result buffer so
             // later Execute messages can continue draining it.
             let rfmt = portal.result_formats;
             let send_mark = self.send.mark();
-            let result = if paged {
-                portal.result.clear();
-                let mut responder = Responder::for_execute(&mut portal.result, rfmt);
-                engine.execute_extended_selected(
-                    text,
-                    &self.arena,
-                    params,
-                    param_oids,
-                    &mut self.txn,
-                    &mut self.sqlprep,
-                    &mut self.cursors,
-                    &mut self.guc,
-                    &mut responder,
-                    self.id,
-                    lock_timeout_expired,
-                )
-            } else {
-                let mut responder = Responder::for_execute(&mut self.send, rfmt);
-                engine.execute_extended_selected(
-                    text,
-                    &self.arena,
-                    params,
-                    param_oids,
-                    &mut self.txn,
-                    &mut self.sqlprep,
-                    &mut self.cursors,
-                    &mut self.guc,
-                    &mut responder,
-                    self.id,
-                    lock_timeout_expired,
-                )
-            };
+            let result = crate::sql::type_input_plans::with_owner(portal.plan, || {
+                if paged {
+                    portal.result.clear();
+                    let mut responder = Responder::for_execute(&mut portal.result, rfmt);
+                    engine.execute_extended_selected(
+                        text,
+                        &self.arena,
+                        params,
+                        param_oids,
+                        &mut self.txn,
+                        &mut self.sqlprep,
+                        &mut self.cursors,
+                        &self.guc,
+                        &mut responder,
+                        self.id,
+                        lock_timeout_expired,
+                        prepared.type_inputs(),
+                    )
+                } else {
+                    let mut responder = Responder::for_execute(&mut self.send, rfmt);
+                    engine.execute_extended_selected(
+                        text,
+                        &self.arena,
+                        params,
+                        param_oids,
+                        &mut self.txn,
+                        &mut self.sqlprep,
+                        &mut self.cursors,
+                        &self.guc,
+                        &mut responder,
+                        self.id,
+                        lock_timeout_expired,
+                        prepared.type_inputs(),
+                    )
+                }
+            });
             let pending_copy = engine.take_pending_copy();
-            self.arena.reset();
+            if !matches!(
+                result,
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked { .. })
+            ) {
+                self.sqlprep.clear_request_type_inputs();
+            }
+            if matches!(
+                result,
+                Ok(crate::sql::ExtendedExecutionStatus::Blocked { .. })
+            ) {
+                self.arena.recycle_front();
+            } else {
+                self.arena.reset();
+            }
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
                     self.finish_lock_wait();
@@ -3764,6 +4033,7 @@ impl Conn {
                 );
             }
         }
+        self.release_closed_statement_plans();
         let mut responder = Responder::new(&mut self.send);
         match responder.close_complete() {
             Ok(()) => Step::Continue,
@@ -3787,7 +4057,13 @@ impl Conn {
         if is_replication_command(self.replication, text) {
             return self.handle_replication_query(engine, identify_system, total);
         }
-        self.arena.reset();
+        if self.sqlprep.request_input_waiting()
+            || self.guc.seq_session().retains_statement_effects()
+        {
+            self.arena.recycle_front();
+        } else {
+            self.arena.reset();
+        }
         let mark = self.send.mark();
         // Stream large results: put the socket in blocking mode so the
         // Responder can drain a full send buffer straight to the client and
@@ -3815,7 +4091,7 @@ impl Conn {
                 &mut self.txn,
                 &mut self.sqlprep,
                 &mut self.cursors,
-                &mut self.guc,
+                &self.guc,
                 &mut responder,
                 self.id,
                 lock_timeout_expired,
@@ -3827,6 +4103,7 @@ impl Conn {
         let status = self.txn.status_byte();
         let step = match result {
             Ok(crate::sql::ExecutionStatus::Complete) => {
+                self.sqlprep.clear_request_type_inputs();
                 self.finish_lock_wait();
                 self.resume_statement = 0;
                 // A COPY FROM STDIN holds its query cycle open: the
@@ -3868,10 +4145,11 @@ impl Conn {
                 self.resume_statement = completed_statements;
                 self.park(wait, engine.statement_wait_generation(wait, self.id));
                 engine.park_backend_statement(self.id, wait);
-                self.arena.reset();
+                self.arena.recycle_front();
                 return Step::Parked;
             }
             Err(WireFull) => {
+                self.sqlprep.clear_request_type_inputs();
                 if engine.take_pending_copy().is_some() {
                     engine.copy_abort(&mut self.txn, &self.guc);
                     self.copy_transition_scratch.clear();
@@ -3886,6 +4164,14 @@ impl Conn {
                 }
             }
         };
+        if matches!(result, Ok(crate::sql::ExecutionStatus::Complete))
+            && self.txn.mode == crate::sql::txn::TxnMode::Idle
+        {
+            for portal in &mut self.portals {
+                portal.active = false;
+            }
+            self.release_closed_statement_plans();
+        }
         self.apply_protocol_reset(engine);
         self.arena.reset();
         self.recv.consume(total);
@@ -5047,6 +5333,123 @@ fn parse_publication_names_impl(
     }
 }
 
+fn decode_bind_parameters<'a>(
+    engine: &Engine,
+    prepared: &Prepared,
+    raw: &'a [u8],
+    arena: &'a Arena,
+    txn: &TxnState,
+    sequence_session: &crate::sql::guc::SeqSession,
+) -> Result<&'a [u8], SqlError> {
+    let count = usize::from(prepared.n_params);
+    let oids = engine.infer_param_types(
+        prepared.query(),
+        arena,
+        txn,
+        count,
+        prepared.parameter_oid_bytes(),
+        prepared.type_inputs(),
+    )?;
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut message = MsgIn::new(raw);
+    let formats = usize::from(message.u16().expect("validated Bind format count"));
+    let codes = message.take(formats * 2).expect("validated Bind formats");
+    assert_eq!(
+        usize::from(message.u16().expect("validated Bind parameter count")),
+        count
+    );
+    for (index, value) in values.iter_mut().enumerate() {
+        let length = message.i32().expect("validated Bind parameter length");
+        if length == -1 {
+            *value = engine.coerce_parameter_null(
+                oids[index],
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?;
+            continue;
+        }
+        let bytes = message
+            .take(length as usize)
+            .expect("validated Bind parameter value");
+        let binary = match formats {
+            0 => false,
+            1 => codes == [0, 1],
+            _ => codes[index * 2..index * 2 + 2] == [0, 1],
+        };
+        *value = if binary {
+            engine.decode_binary_parameter(
+                oids[index],
+                bytes,
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?
+        } else {
+            engine.decode_text_parameter(
+                oids[index],
+                bytes,
+                arena,
+                txn.txid,
+                Some(sequence_session),
+            )?
+        };
+    }
+    let row = crate::sql::exec::encode_projected_pub(values, arena)?;
+    let type_bytes = count
+        .checked_mul(4)
+        .ok_or_else(crate::sql::eval::arena_full)?;
+    let length = type_bytes
+        .checked_add(row.len())
+        .ok_or_else(crate::sql::eval::arena_full)?;
+    let image = arena
+        .alloc_slice_with(length, |_| 0u8)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (bytes, oid) in image[..type_bytes]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(oids)
+    {
+        *bytes = oid.to_be_bytes();
+    }
+    image[type_bytes..].copy_from_slice(row);
+    Ok(image)
+}
+
+type PortalParameters<'a> = (&'a [Datum<'a>], &'a [i32]);
+
+fn restore_portal_parameters<'a>(
+    raw: &'a [u8],
+    count: usize,
+    arena: &'a Arena,
+) -> Result<PortalParameters<'a>, SqlError> {
+    let (types, row) = raw.split_at(count * 4);
+    let oids = arena
+        .alloc_slice_with(count, |index| {
+            i32::from_be_bytes(
+                types[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("stored parameter OID"),
+            )
+        })
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let width = crate::sql::exec::decode_projected_row_into(row, arena, values)?;
+    if width != count {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored portal parameter count changed"
+        ));
+    }
+    Ok((values, oids))
+}
+
+#[derive(Debug)]
 enum Step {
     Continue,
     NeedMoreData,
@@ -5493,6 +5896,10 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+#[path = "conn/bind_inputs_tests.rs"]
+mod bind_inputs_tests;
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
 
@@ -5516,6 +5923,637 @@ mod tests {
             bytes = &bytes[1 + length as usize..];
         }
         false
+    }
+
+    #[test]
+    fn serialized_domain_input_waits_retain_prefix_and_replay_only_active_effects() {
+        fn request(conn: &mut Conn, engine: &mut Engine, text: &str) -> Vec<u8> {
+            conn.send.clear();
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+            conn.send.readable().to_vec()
+        }
+        fn contains_value(bytes: &[u8], value: &[u8]) -> bool {
+            bytes.windows(value.len()).any(|found| found == value)
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-input-waits-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 8;
+            config.row_overlay_slots = 128;
+            config.max_connections = 3;
+            config.prepared_bytes = 32 << 10;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = Conn::new(&config, &mut budget).unwrap();
+            let mut holder = Conn::new(&config, &mut budget).unwrap();
+            let mut observer = Conn::new(&config, &mut budget).unwrap();
+            writer.id = 1;
+            holder.id = 2;
+            observer.id = 3;
+            writer.phase = Phase::Ready;
+            holder.phase = Phase::Ready;
+            observer.phase = Phase::Ready;
+            request(
+                &mut writer,
+                &mut engine,
+                "CREATE SEQUENCE input_wait_checks; \
+                 CREATE TABLE input_wait_audit(value text, draw double precision); \
+                 CREATE TABLE input_wait_gate(id integer PRIMARY KEY, hits integer); \
+                 CREATE TABLE input_wait_second_gate(id integer PRIMARY KEY, hits integer); \
+                 INSERT INTO input_wait_gate VALUES(1,0); INSERT INTO input_wait_second_gate VALUES(2,0); \
+                 CREATE TYPE input_wait_choice AS ENUM('a','b'); \
+                 CREATE FUNCTION input_wait_allowed(value input_wait_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                 DECLARE draw double precision; BEGIN \
+                   PERFORM nextval('input_wait_checks'); \
+                   PERFORM set_config('application_name',current_setting('application_name')||value::text,false); \
+                   draw := random(); \
+                   INSERT INTO input_wait_audit VALUES(value::text,draw); \
+                   IF value='a' THEN UPDATE input_wait_gate SET hits=hits+1 WHERE id=1; \
+                   ELSE UPDATE input_wait_second_gate SET hits=hits+1 WHERE id=2; END IF; \
+                   RETURN true; END$$; \
+                 CREATE DOMAIN input_wait_domain AS input_wait_choice CHECK(input_wait_allowed(VALUE))",
+            );
+            for parse in [false, true] {
+                for (cancel, timeout) in [(false, false), (true, false), (false, true)] {
+                    request(
+                        &mut writer,
+                        &mut engine,
+                        "TRUNCATE input_wait_audit; UPDATE input_wait_gate SET hits=0; UPDATE input_wait_second_gate SET hits=0; \
+                         SELECT setval('input_wait_checks',1,false); SET application_name=''; SET lock_timeout='10s'; SELECT setseed(0.5)",
+                    );
+                    // Separate tables let Locking mode finish the first input
+                    // before the second input reaches its conflicting write.
+                    request(
+                        &mut holder,
+                        &mut engine,
+                        "BEGIN; UPDATE input_wait_second_gate SET hits=hits WHERE id=2",
+                    );
+                    writer.send.clear();
+                    let sql = "SELECT '{a}'::input_wait_domain[], '{b}'::input_wait_domain[]";
+                    let mut payload = Vec::new();
+                    if parse {
+                        payload.extend_from_slice(b"wait_input\0");
+                    }
+                    payload.extend_from_slice(sql.as_bytes());
+                    payload.push(0);
+                    if parse {
+                        payload.extend_from_slice(&0u16.to_be_bytes());
+                    }
+                    assert!(writer.recv.append(&frontend(
+                        if parse {
+                            wire::FMSG_PARSE
+                        } else {
+                            wire::FMSG_QUERY
+                        },
+                        &payload
+                    )));
+                    let mut original_deadline = None;
+                    for attempt in 0..3 {
+                        assert!(matches!(
+                            crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                            Step::Parked
+                        ));
+                        assert!(writer.send.is_empty());
+                        assert!(writer.sqlprep.request_input_waiting());
+                        if attempt == 0 {
+                            original_deadline = writer.parked_deadline;
+                            assert!(original_deadline.is_some());
+                        } else {
+                            assert_eq!(writer.parked_deadline, original_deadline);
+                        }
+                    }
+                    let state = request(
+                        &mut observer,
+                        &mut engine,
+                        "SELECT last_value::text||':'||is_called::text FROM input_wait_checks",
+                    );
+                    assert!(
+                        contains_value(&state, b"2:true"),
+                        "mode {mode:?}, Parse {parse}, cancel {cancel}, timeout {timeout}: {}",
+                        String::from_utf8_lossy(&state)
+                    );
+                    if cancel || timeout {
+                        if cancel {
+                            assert!(crate::mem::guard::forbid_alloc(
+                                || writer.cancel_parked(&mut engine)
+                            ));
+                        } else {
+                            writer.parked_deadline = Some(Instant::now());
+                            assert!(matches!(
+                                crate::mem::guard::forbid_alloc(
+                                    || writer.process_message(&mut engine)
+                                ),
+                                Step::Continue
+                            ));
+                        }
+                        assert!(contains_value(
+                            writer.send.readable(),
+                            if cancel { b"57014" } else { b"55P03" }
+                        ));
+                        if parse {
+                            writer.send.clear();
+                            assert!(writer.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                        }
+                    }
+                    request(&mut holder, &mut engine, "COMMIT");
+                    if !cancel && !timeout {
+                        assert!(matches!(
+                            crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                            Step::Continue
+                        ));
+                        assert!(!has_backend_message(
+                            writer.send.readable(),
+                            wire::MSG_ERROR_RESPONSE
+                        ));
+                        if parse {
+                            assert!(has_backend_message(
+                                writer.send.readable(),
+                                wire::MSG_PARSE_COMPLETE
+                            ));
+                            writer.send.clear();
+                            assert!(writer.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                            writer.send.clear();
+                            assert!(
+                                writer
+                                    .recv
+                                    .append(&frontend(wire::FMSG_CLOSE, b"Swait_input\0"))
+                            );
+                            assert!(matches!(
+                                writer.process_message(&mut engine),
+                                Step::Continue
+                            ));
+                        }
+                    }
+                    let state = request(
+                        &mut writer,
+                        &mut engine,
+                        "SELECT currval('input_wait_checks')::text||':'||count(*)::text||':'||current_setting('application_name') FROM input_wait_audit",
+                    );
+                    assert!(contains_value(
+                        &state,
+                        if cancel || timeout {
+                            b"2:0:"
+                        } else {
+                            b"2:2:ab"
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_inputs_keep_completed_cursor_and_statistics_effects_through_lock_retries() {
+        fn request(conn: &mut Conn, engine: &mut Engine, text: &str) {
+            conn.send.clear();
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            assert!(conn.recv.append(&frontend(wire::FMSG_QUERY, &payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            for cancel in [false, true] {
+                let mut config = Config::default_dev();
+                config.data_dir = std::env::temp_dir()
+                    .join(format!(
+                        "pos3ql-cursor-receipts-{}-{mode:?}-{cancel}",
+                        std::process::id()
+                    ))
+                    .to_string_lossy()
+                    .into_owned();
+                config.remove_test_data_dir_on_drop();
+                config.transaction_mode = mode;
+                config.max_tables = 8;
+                config.row_overlay_slots = 128;
+                config.max_connections = 3;
+                config.prepared_bytes = 32 << 10;
+                let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut writer = Conn::new(&config, &mut budget).unwrap();
+                let mut holder = Conn::new(&config, &mut budget).unwrap();
+                let mut observer = Conn::new(&config, &mut budget).unwrap();
+                writer.id = 1;
+                holder.id = 2;
+                observer.id = 3;
+                writer.phase = Phase::Ready;
+                holder.phase = Phase::Ready;
+                observer.phase = Phase::Ready;
+                request(
+                    &mut writer,
+                    &mut engine,
+                    "CREATE SEQUENCE receipt_checks CACHE 1; \
+                     CREATE TABLE receipt_probe(id integer); INSERT INTO receipt_probe VALUES(1); \
+                     CREATE TABLE receipt_gate(id integer PRIMARY KEY,hits integer); INSERT INTO receipt_gate VALUES(1,0); \
+                     CREATE TYPE receipt_choice AS ENUM('a'); \
+                     CREATE FUNCTION receipt_allowed(value receipt_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
+                     DECLARE handle refcursor; fetched bigint; observed bigint; issued bigint; BEGIN \
+                       OPEN handle NO SCROLL FOR SELECT nextval('receipt_checks'); \
+                       FETCH NEXT FROM handle INTO fetched; CLOSE handle; \
+                       observed:=currval('receipt_checks'); issued:=nextval('receipt_checks'); \
+                       PERFORM pg_stat_reset_single_table_counters('receipt_probe'::regclass); \
+                       UPDATE receipt_gate SET hits=hits+1 WHERE id=1; \
+                       RETURN fetched=1 AND observed=1 AND issued=2; END$$; \
+                     CREATE DOMAIN receipt_checked AS receipt_choice CHECK(receipt_allowed(VALUE))",
+                );
+                let probe = engine
+                    .publication_storage_for_tests()
+                    .find_visible("public", "receipt_probe", 0)
+                    .unwrap();
+                let sequence = engine
+                    .publication_storage_for_tests()
+                    .sequence_slot("public", "receipt_checks", 0)
+                    .unwrap();
+                request(
+                    &mut holder,
+                    &mut engine,
+                    "BEGIN; UPDATE receipt_gate SET hits=hits WHERE id=1",
+                );
+                writer.send.clear();
+                assert!(writer.recv.append(&frontend(
+                    wire::FMSG_QUERY,
+                    b"SELECT '{a}'::receipt_checked[]\0"
+                )));
+                assert!(
+                    matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Parked
+                    ),
+                    "mode {mode:?}, cancel {cancel}: {}, fatal {:?}",
+                    String::from_utf8_lossy(writer.send.readable()),
+                    engine.fatal_commit_failure()
+                );
+                assert!(writer.send.is_empty());
+                assert_eq!(
+                    writer.cursors.len(),
+                    0,
+                    "completed CLOSE remains applied while admission waits"
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .relation_cumulative_statistics(probe)
+                        .n_tup_ins,
+                    0
+                );
+                request(
+                    &mut observer,
+                    &mut engine,
+                    "INSERT INTO receipt_probe VALUES(2)",
+                );
+                for _ in 0..2 {
+                    assert!(matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Parked
+                    ));
+                    assert!(writer.send.is_empty());
+                    assert_eq!(writer.cursors.len(), 0);
+                    assert_eq!(
+                        engine
+                            .publication_storage_for_tests()
+                            .sequence_value_for(sequence, 0)
+                            .0,
+                        2
+                    );
+                    assert_eq!(
+                        engine
+                            .publication_storage_for_tests()
+                            .relation_cumulative_statistics(probe)
+                            .n_tup_ins,
+                        1,
+                        "completed statistics reset must not run again"
+                    );
+                }
+                if cancel {
+                    assert!(crate::mem::guard::forbid_alloc(
+                        || writer.cancel_parked(&mut engine)
+                    ));
+                    assert!(
+                        writer
+                            .send
+                            .readable()
+                            .windows(5)
+                            .any(|state| state == b"57014")
+                    );
+                }
+                request(&mut holder, &mut engine, "COMMIT");
+                if !cancel {
+                    assert!(matches!(
+                        crate::mem::guard::forbid_alloc(|| writer.process_message(&mut engine)),
+                        Step::Continue
+                    ));
+                    assert!(
+                        !has_backend_message(writer.send.readable(), wire::MSG_ERROR_RESPONSE),
+                        "{}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                    assert!(has_backend_message(
+                        writer.send.readable(),
+                        wire::MSG_DATA_ROW
+                    ));
+                }
+                assert!(!writer.guc.seq_session().retains_statement_effects());
+                assert_eq!(writer.cursors.len(), 0);
+                assert_eq!(
+                    writer.cursors.unnamed_name().unwrap().as_str(),
+                    "<unnamed portal 2>",
+                    "OPEN must allocate its name only once"
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .relation_cumulative_statistics(probe)
+                        .n_tup_ins,
+                    1
+                );
+                assert_eq!(
+                    engine
+                        .publication_storage_for_tests()
+                        .sequence_value_for(sequence, 0)
+                        .0,
+                    2
+                );
+                request(&mut writer, &mut engine, "SELECT hits FROM receipt_gate");
+                let expected = if cancel { b'0' } else { b'1' };
+                let frame = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, expected];
+                assert!(
+                    writer
+                        .send
+                        .readable()
+                        .windows(frame.len())
+                        .any(|value| value == frame)
+                );
+            }
+        }
+    }
+
+    #[test]
+    // PostgreSQL 18.6 PREPARE/EXECUTE reference SQL SHA256:
+    // 79d26366490991a38ea78b54b9a2c055f6de593702a37f58307054a5e22f20b0.
+    fn serialized_domain_inputs_are_bound_once_per_prepared_source() {
+        fn message(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            kind: u8,
+            payload: &[u8],
+            error: bool,
+        ) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let response = conn.send.readable().to_vec();
+            assert_eq!(
+                has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                error,
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            response
+        }
+        fn query(conn: &mut Conn, engine: &mut Engine, text: &str) -> Vec<u8> {
+            let mut payload = text.as_bytes().to_vec();
+            payload.push(0);
+            message(conn, engine, wire::FMSG_QUERY, &payload, false)
+        }
+        fn parse(
+            conn: &mut Conn,
+            engine: &mut Engine,
+            name: &str,
+            text: &str,
+            error: bool,
+        ) -> Vec<u8> {
+            let mut payload = name.as_bytes().to_vec();
+            payload.push(0);
+            payload.extend_from_slice(text.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&0u16.to_be_bytes());
+            message(conn, engine, wire::FMSG_PARSE, &payload, error)
+        }
+        fn first_row(mut bytes: &[u8]) -> String {
+            while bytes.len() >= 5 {
+                let length = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize + 1;
+                if bytes[0] == wire::MSG_DATA_ROW {
+                    let count = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+                    let mut at = 7;
+                    let mut row = String::new();
+                    for column in 0..count {
+                        if column != 0 {
+                            row.push('|');
+                        }
+                        let length = i32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        if length < 0 {
+                            row.push_str("NULL");
+                        } else {
+                            row.push_str(
+                                core::str::from_utf8(&bytes[at..at + length as usize]).unwrap(),
+                            );
+                            at += length as usize;
+                        }
+                    }
+                    return row;
+                }
+                bytes = &bytes[length..];
+            }
+            panic!("missing result row")
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-bound-domain-input-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 8;
+            config.row_overlay_slots = 128;
+            config.max_connections = 1;
+            config.max_prepared = 2;
+            config.max_portals = 2;
+            config.prepared_bytes = 16 << 10;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            conn.phase = Phase::Ready;
+            query(
+                &mut conn,
+                &mut engine,
+                "CREATE SEQUENCE input_checks; CREATE TABLE input_audit(value text); \
+                 CREATE TYPE input_choice AS ENUM('a','b'); \
+                 CREATE FUNCTION input_allowed(value input_choice) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN \
+                   PERFORM nextval('input_checks'); INSERT INTO input_audit VALUES(value::text); RETURN value='a'; END$$; \
+                 CREATE DOMAIN checked_choice AS input_choice CHECK(input_allowed(VALUE))",
+            );
+            assert!(has_backend_message(
+                &parse(
+                    &mut conn,
+                    &mut engine,
+                    "bound",
+                    "SELECT '{a}'::checked_choice[]",
+                    false
+                ),
+                wire::MSG_PARSE_COMPLETE
+            ));
+            for _ in 0..2 {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_DESCRIBE,
+                    b"Sbound\0",
+                    false,
+                );
+            }
+            for portal in ["first", "second"] {
+                let mut bind = portal.as_bytes().to_vec();
+                bind.extend_from_slice(b"\0bound\0");
+                bind.extend_from_slice(&[0; 6]);
+                message(&mut conn, &mut engine, wire::FMSG_BIND, &bind, false);
+            }
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+            parse(&mut conn, &mut engine, "bound", "SELECT 99", false);
+            for portal in ["first", "second"] {
+                let mut describe = vec![b'P'];
+                describe.extend_from_slice(portal.as_bytes());
+                describe.push(0);
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_DESCRIBE,
+                    &describe,
+                    false,
+                );
+                let mut execute = portal.as_bytes().to_vec();
+                execute.push(0);
+                execute.extend_from_slice(&0u32.to_be_bytes());
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        &execute,
+                        false
+                    )),
+                    "{a}"
+                );
+            }
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "1|1"
+            );
+            parse(
+                &mut conn,
+                &mut engine,
+                "runtime",
+                "SELECT ARRAY['a']::checked_choice[]",
+                false,
+            );
+            for portal in ["first", "second"] {
+                let mut bind = portal.as_bytes().to_vec();
+                bind.extend_from_slice(b"\0runtime\0");
+                bind.extend_from_slice(&[0; 6]);
+                message(&mut conn, &mut engine, wire::FMSG_BIND, &bind, false);
+                let mut execute = portal.as_bytes().to_vec();
+                execute.push(0);
+                execute.extend_from_slice(&0u32.to_be_bytes());
+                assert_eq!(
+                    first_row(&message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_EXECUTE,
+                        &execute,
+                        false
+                    )),
+                    "{a}"
+                );
+            }
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            query(
+                &mut conn,
+                &mut engine,
+                "PREPARE sql_bound AS SELECT '{a}'::checked_choice[]; EXECUTE sql_bound; EXECUTE sql_bound",
+            );
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "4|4"
+            );
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Sbound\0", false);
+            let error = parse(
+                &mut conn,
+                &mut engine,
+                "bad",
+                "SELECT '{b}'::checked_choice[]",
+                true,
+            );
+            assert!(error.windows(5).any(|bytes| bytes == b"23514"));
+            assert!(!has_backend_message(&error, wire::MSG_PARSE_COMPLETE));
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], false);
+            assert_eq!(
+                first_row(&query(
+                    &mut conn,
+                    &mut engine,
+                    "SELECT currval('input_checks'),count(*) FROM input_audit"
+                )),
+                "5|4"
+            );
+        }
     }
 
     #[test]
@@ -7216,6 +8254,96 @@ mod tests {
             drop(writer);
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn binary_bind_shape_uses_declared_polymorphic_parameter_types() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) -> Vec<u8> {
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, payload)));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            let response = conn.send.readable().to_vec();
+            assert!(
+                !has_backend_message(&response, wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            response
+        }
+        let mut config = Config::default_dev();
+        config.data_dir = std::env::temp_dir()
+            .join(format!(
+                "pos3ql-polymorphic-binary-bind-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        config.max_tables = 8;
+        config.row_overlay_slots = 128;
+        config.remove_test_data_dir_on_drop();
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.phase = Phase::Ready;
+        message(&mut conn, &mut engine, wire::FMSG_QUERY,
+            b"CREATE FUNCTION bind_first_state(anyelement,anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT coalesce($1,$2)'; CREATE AGGREGATE bind_first(anyelement)(SFUNC=bind_first_state,STYPE=anyelement)\0");
+        for (name, oid, input) in [
+            (
+                "integer",
+                crate::sql::types::oid::INT4,
+                9i32.to_be_bytes().to_vec(),
+            ),
+            ("text", crate::sql::types::oid::TEXT, b"typed".to_vec()),
+        ] {
+            let mut parse = Vec::new();
+            parse.extend_from_slice(name.as_bytes());
+            parse.push(0);
+            parse.extend_from_slice(b"SELECT bind_first($1)\0");
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&oid.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_PARSE, &parse);
+            assert!(has_backend_message(&response, wire::MSG_PARSE_COMPLETE));
+            let mut bind = Vec::new();
+            bind.extend_from_slice(name.as_bytes());
+            bind.push(0);
+            bind.extend_from_slice(name.as_bytes());
+            bind.push(0);
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&(input.len() as i32).to_be_bytes());
+            bind.extend_from_slice(&input);
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            bind.extend_from_slice(&1i16.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_BIND, &bind);
+            assert!(has_backend_message(&response, wire::MSG_BIND_COMPLETE));
+            let mut describe = vec![b'P'];
+            describe.extend_from_slice(name.as_bytes());
+            describe.push(0);
+            let response = message(&mut conn, &mut engine, wire::FMSG_DESCRIBE, &describe);
+            assert_eq!(response[0], wire::MSG_ROW_DESCRIPTION);
+            let start = 7 + response[7..].iter().position(|byte| *byte == 0).unwrap() + 1;
+            assert_eq!(
+                i32::from_be_bytes(response[start + 6..start + 10].try_into().unwrap()),
+                oid
+            );
+            assert_eq!(&response[start + 16..start + 18], &1i16.to_be_bytes());
+            let mut execute = Vec::new();
+            execute.extend_from_slice(name.as_bytes());
+            execute.push(0);
+            execute.extend_from_slice(&0i32.to_be_bytes());
+            let response = message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &execute);
+            let mut expected = vec![wire::MSG_DATA_ROW];
+            expected.extend_from_slice(&((input.len() + 10) as i32).to_be_bytes());
+            expected.extend_from_slice(&1i16.to_be_bytes());
+            expected.extend_from_slice(&(input.len() as i32).to_be_bytes());
+            expected.extend_from_slice(&input);
+            assert!(response.starts_with(&expected));
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
         }
     }
 

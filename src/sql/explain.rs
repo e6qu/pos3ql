@@ -201,16 +201,23 @@ fn projected_shape<'a>(
     Ok((width, output))
 }
 
-fn has_aggregate(statement: &Select<'_>) -> bool {
-    !statement.group_by.is_empty()
-        || statement.having.is_some()
-        || statement.items.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Expr { expression, .. }
-                    if query::expr_has_aggregate(expression)
-            )
-        })
+fn has_aggregate(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn crate::sql::exec::ColTypeResolver,
+) -> Result<bool, SqlError> {
+    if !statement.group_by.is_empty() || statement.having.is_some() {
+        return Ok(true);
+    }
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
+            && query::expr_has_aggregate(expression, storage, txid, columns)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn has_window(statement: &Select<'_>) -> bool {
@@ -279,11 +286,13 @@ fn predicate_column(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => predicate_column(left, scope).or_else(|| predicate_column(right, scope)),
         Expr::Binary {
             operator,
             left,
             right,
+            ..
         } if matches!(
             operator,
             BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
@@ -300,7 +309,7 @@ fn predicate_column(
                 let Expr::Column { qualifier, name } = column else {
                     return None;
                 };
-                if !constant.is_constant() || constant.contains_call() {
+                if !constant.is_constant(false) || constant.contains_call() {
                     return None;
                 }
                 match scope.find_column(*qualifier, name).ok()? {
@@ -326,12 +335,18 @@ fn column_selectivity(
         return default;
     }
     let statistics = storage.table_statistics(scope.slots[table], txid);
-    let column_statistics = statistics.columns[column];
-    if !statistics.valid || !column_statistics.valid || statistics.rows == 0 {
+    let definition = storage.table_def(scope.slots[table], txid);
+    let Some(column_statistics) = definition
+        .attributes
+        .number(column)
+        .and_then(|attribute| statistics.column(attribute))
+    else {
+        return default;
+    };
+    if !statistics.valid || statistics.rows == 0 {
         return default;
     }
     let non_null = 1.0 - f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
-    let definition = storage.table_def(scope.slots[table], txid);
     let distinct = crate::storage::column_distinct_estimate(
         &definition.columns()[column],
         column_statistics,
@@ -353,13 +368,14 @@ fn expression_statistics_selectivity(
         operator: BinaryOp::Eq,
         left,
         right,
+        ..
     } = expression
     else {
         return None;
     };
-    let candidate = if right.is_constant() && !right.contains_call() {
+    let candidate = if right.is_constant(false) && !right.contains_call() {
         *left
-    } else if left.is_constant() && !left.contains_call() {
+    } else if left.is_constant(false) && !left.contains_call() {
         *right
     } else {
         return None;
@@ -416,7 +432,7 @@ fn extended_statistics_selectivity<'a>(
             let Expr::Column { qualifier, name } = candidate else {
                 return None;
             };
-            if !other.is_constant() || other.contains_call() {
+            if !other.is_constant(false) || other.contains_call() {
                 return None;
             }
             match scope.find_column(*qualifier, name).ok()? {
@@ -431,6 +447,7 @@ fn extended_statistics_selectivity<'a>(
                 operator: BinaryOp::And,
                 left,
                 right,
+                ..
             } => {
                 collect(left, scope, table, arena, columns, values, count)
                     && collect(right, scope, table, arena, columns, values, count)
@@ -439,6 +456,7 @@ fn extended_statistics_selectivity<'a>(
                 operator: BinaryOp::Eq,
                 left,
                 right,
+                ..
             } => {
                 let Some((column, constant)) = column_constant(left, right, scope, table)
                     .or_else(|| column_constant(right, left, scope, table))
@@ -577,6 +595,7 @@ fn predicate_selectivity<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             if let Some(selectivity) =
                 extended_statistics_selectivity(storage, scope, table, expression, txid, arena)
@@ -591,6 +610,7 @@ fn predicate_selectivity<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             let left = predicate_selectivity(storage, scope, table, left, txid, arena);
             let right = predicate_selectivity(storage, scope, table, right, txid, arena);
@@ -635,10 +655,14 @@ fn predicate_selectivity<'a>(
                 return 1.0;
             }
             let statistics = storage.table_statistics(scope.slots[table], txid);
-            let column_statistics = statistics.columns[column];
-            if !statistics.valid || !column_statistics.valid {
+            let definition = storage.table_def(scope.slots[table], txid);
+            let column_statistics = definition
+                .attributes
+                .number(column)
+                .and_then(|attribute| statistics.column(attribute));
+            let Some(column_statistics) = column_statistics.filter(|_| statistics.valid) else {
                 return if *negated { 0.995 } else { 0.005 };
-            }
+            };
             let fraction = f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
             if *negated { 1.0 - fraction } else { fraction }
         }
@@ -646,7 +670,7 @@ fn predicate_selectivity<'a>(
             operand,
             list,
             negated: false,
-        } if list.iter().all(|item| item.is_constant()) => {
+        } if list.iter().all(|item| item.is_constant(false)) => {
             let Expr::Column { qualifier, name } = **operand else {
                 return 1.0;
             };
@@ -864,10 +888,30 @@ pub(super) fn plan_select<'a>(
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 2 + MAX_EXPLAIN_STAGES);
     let mut plan = Plan::new(arena, capacity)?;
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
+        scope,
+        outer_scope: None,
+        storage,
+        txid,
+        arena,
+    });
+    let empty_columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
+        &empty_columns as &dyn crate::sql::exec::ColTypeResolver,
+        |columns| columns,
+    );
+    let aggregate = has_aggregate(statement, storage, txid, columns)?;
     let ordered_index = if !statement.distinct
         && statement.distinct_on.is_empty()
         && !statement.order_by.is_empty()
-        && !has_aggregate(statement)
+        && !aggregate
         && !has_window(statement)
         && scope.as_ref().is_some_and(|scope| scope.n == 1)
         && statement
@@ -1046,7 +1090,6 @@ pub(super) fn plan_select<'a>(
         )?;
     }
 
-    let aggregate = has_aggregate(statement);
     if aggregate {
         estimated_rows = if statement.group_by.is_empty() {
             1
@@ -1288,6 +1331,7 @@ fn push_set_tree(
             all,
             left,
             right,
+            ..
         } => {
             let at = plan.count;
             plan.push(PlanNode::EMPTY)?;
@@ -1849,8 +1893,15 @@ pub(super) fn plan_statement<'a>(
             plan_select(storage, txid, select, arena)
         }
         Stmt::SetQuery(set_query) => {
-            let body =
-                query::expand_set_tree(set_query.with, set_query.body, storage, txid, arena)?;
+            let body = query::expand_set_tree(
+                set_query.with,
+                set_query.body,
+                storage,
+                txid,
+                None,
+                None,
+                arena,
+            )?;
             let planned = SetQuery {
                 with: &[],
                 body,

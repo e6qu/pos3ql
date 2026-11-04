@@ -1,5 +1,8 @@
 //! Statistics visibility and saved-image acknowledgements have separate ownership.
 
+mod columns;
+pub(crate) use columns::AnalyzedColumn;
+
 use core::mem::size_of;
 use core::num::NonZeroU64;
 use {
@@ -17,10 +20,80 @@ use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-#[derive(Clone, Copy)]
+impl TableStatistics {
+    pub(crate) fn relation_tuples(&self) -> f64 {
+        if self.valid { self.rows as f64 } else { -1.0 }
+    }
+
+    pub(crate) fn relation_pages(&self) -> i32 {
+        if self.valid {
+            self.rows
+                .saturating_mul(u64::from(self.average_row_width))
+                .div_ceil(8_192)
+                .min(i32::MAX as u64) as i32
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn relation_estimates_changed(&self, previous: &Self) -> bool {
+        self.relation_tuples() != previous.relation_tuples()
+            || self.relation_pages() != previous.relation_pages()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct PendingStatisticsHead {
     transaction: u32,
     tail: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum StatisticsOrigin {
+    Analyze = 0,
+    Definition = 1,
+    RelationCounts = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatisticsVersionOwner {
+    Analyze,
+    Definition(u64),
+}
+
+pub(super) struct PreparedDefinitionStatistics<'a> {
+    state: RwLockWriteGuard<'a, StatisticsState>,
+    versions: RwLockWriteGuard<'a, FixedVec<PendingTableStatisticsSlot>>,
+    columns: super::SharedSlice<AnalyzedColumn>,
+    slot: usize,
+    depth: u32,
+    transaction: u32,
+}
+
+impl PreparedDefinitionStatistics<'_> {
+    pub(super) fn publish(mut self, revision: u64) {
+        let previous = self.state.pending.map(|head| head.tail);
+        let entry = PendingTableStatisticsSlot {
+            used: true,
+            previous,
+            depth: self.depth,
+            columns: core::mem::replace(&mut self.columns, super::SharedSlice::EMPTY),
+            owner: StatisticsVersionOwner::Definition(revision),
+        };
+        if self.slot == self.versions.len() {
+            self.versions
+                .push(entry)
+                .expect("definition statistics control was admitted");
+        } else {
+            self.versions[self.slot] = entry;
+        }
+        self.state.pending = Some(PendingStatisticsHead {
+            transaction: self.transaction,
+            tail: self.slot,
+        });
+        self.state.dirty = true;
+    }
 }
 
 struct StatisticsState {
@@ -140,7 +213,7 @@ pub(crate) struct CheckpointStatistics {
 
 impl CheckpointStatistics {
     pub(crate) fn image(&self) -> TableStatistics {
-        self.image
+        self.image.clone()
     }
 
     pub(crate) fn has_index(&self) -> bool {
@@ -177,8 +250,10 @@ pub(super) struct StatisticsVersions {
 
 impl StatisticsVersions {
     pub(super) fn budget_bytes(config: &Config) -> usize {
-        size_of::<Self>()
-            + pending_table_statistics_capacity(config) * size_of::<PendingTableStatisticsSlot>()
+        size_of::<Self>().saturating_add(
+            pending_table_statistics_capacity(config)
+                .saturating_mul(size_of::<PendingTableStatisticsSlot>()),
+        )
     }
 
     pub(super) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -222,6 +297,7 @@ pub(crate) struct StatisticsWalImage {
     pub(crate) name: SqlName,
     pub(crate) persistence: RelationPersistence,
     pub(crate) statistics: TableStatistics,
+    pub(crate) origin: StatisticsOrigin,
     receipt: RelationStatisticsReceipt,
 }
 
@@ -348,11 +424,52 @@ fn clear_pending(state: &mut StatisticsState, versions: &mut FixedVec<PendingTab
     while let Some(slot) = tail {
         let entry = &mut versions[slot];
         tail = entry.previous;
+        entry.columns = super::SharedSlice::EMPTY;
         entry.used = false;
     }
 }
 
 impl Storage {
+    pub(crate) fn statistics_pool(&self) -> &Arc<crate::mem::lease_pool::LeasePool> {
+        &self.statistics_pool
+    }
+
+    pub(crate) fn reserve_statistics_columns(
+        &self,
+        count: usize,
+    ) -> Result<crate::mem::lease_pool::MutableSlice<AnalyzedColumn>, SqlError> {
+        if count > super::MAX_RELATION_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statistics column count exceeds the relation attribute limit"
+            ));
+        }
+        self.statistics_pool
+            .lease(count)
+            .map_err(|error| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "{}", error))
+    }
+
+    fn validate_table_statistics(
+        &self,
+        table: usize,
+        transaction: u32,
+        statistics: &TableStatistics,
+    ) -> Result<(), SqlError> {
+        let definition = self.table_def(table, transaction);
+        let mut previous = 0;
+        for column in statistics.columns.iter() {
+            let attribute = column.attribute();
+            if attribute <= previous || definition.attributes.column(attribute).is_none() {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "column statistics do not match the table's live attributes"
+                ));
+            }
+            previous = attribute;
+        }
+        Ok(())
+    }
+
     pub(super) fn relation_catalog_tuple_is_private(&self, table: usize, transaction: u32) -> bool {
         if transaction == 0 {
             return false;
@@ -401,14 +518,15 @@ impl Storage {
 
     pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
         let state = self.tables[table_slot].statistics.read();
-        let mut image = state.committed;
+        let mut image = state.committed.clone();
         if let Some(head) = state.pending.filter(|head| head.transaction == txid) {
             image.columns = self
                 .pending_table_statistics
                 .state
                 .read()
                 .expect("statistics versions lock poisoned")[head.tail]
-                .columns;
+                .columns
+                .clone();
         }
         image
     }
@@ -418,7 +536,7 @@ impl Storage {
         &self,
         table_slot: usize,
         txid: u32,
-    ) -> Option<[super::ColumnStatistics; super::MAX_COLUMNS]> {
+    ) -> Option<super::SharedSlice<AnalyzedColumn>> {
         let state = self.tables[table_slot].statistics.read();
         state
             .pending
@@ -429,6 +547,7 @@ impl Storage {
                     .read()
                     .expect("statistics versions lock poisoned")[head.tail]
                     .columns
+                    .clone()
             })
     }
 
@@ -448,14 +567,15 @@ impl Storage {
         if pending.is_none() && !state.wal_dirty {
             return None;
         }
-        let mut statistics = state.committed;
+        let mut statistics = state.committed.clone();
         if let Some(head) = pending {
             statistics.columns = self
                 .pending_table_statistics
                 .state
                 .read()
                 .expect("statistics versions lock poisoned")[head.tail]
-                .columns;
+                .columns
+                .clone();
         }
         Some(StatisticsWalImage {
             position: CatalogPosition::new(table_slot, definition.identity().created_at)
@@ -467,6 +587,17 @@ impl Storage {
             name: definition.name,
             persistence: definition.persistence,
             statistics,
+            origin: pending.map_or(StatisticsOrigin::RelationCounts, |head| {
+                let versions = self
+                    .pending_table_statistics
+                    .state
+                    .read()
+                    .expect("statistics versions lock poisoned");
+                match versions[head.tail].owner {
+                    StatisticsVersionOwner::Analyze => StatisticsOrigin::Analyze,
+                    StatisticsVersionOwner::Definition(_) => StatisticsOrigin::Definition,
+                }
+            }),
             receipt: RelationStatisticsReceipt {
                 state: Arc::clone(&self.tables[table_slot].statistics.state),
                 revision: state.relation_revision,
@@ -481,6 +612,7 @@ impl Storage {
         txid: u32,
         statistics: TableStatistics,
     ) -> Result<(), SqlError> {
+        self.validate_table_statistics(table_slot, txid, &statistics)?;
         let name = self.tables[table_slot].definition().name;
         let mut state = self.tables[table_slot].statistics.write();
         if state.pending.is_some_and(|head| head.transaction != txid) {
@@ -516,6 +648,7 @@ impl Storage {
             used: true,
             previous,
             depth,
+            owner: StatisticsVersionOwner::Analyze,
             columns: statistics.columns,
         };
         let slot = if let Some(slot) = versions.iter().position(|entry| !entry.used) {
@@ -553,9 +686,10 @@ impl Storage {
         transaction: u32,
         mut statistics: TableStatistics,
         replay_relation_counts: bool,
+        origin: StatisticsOrigin,
     ) -> Result<bool, SqlError> {
         let current = self.table_statistics(table_slot, 0);
-        if statistics.columns == current.columns {
+        if origin == StatisticsOrigin::RelationCounts {
             if replay_relation_counts {
                 self.write_relation_counts(table_slot, statistics, false)?;
             }
@@ -567,8 +701,65 @@ impl Storage {
             statistics.average_row_width = current.average_row_width;
             statistics.analyzed_generation = current.analyzed_generation;
         }
+        let revision = if origin == StatisticsOrigin::Definition {
+            let definition = self.tables[table_slot].definition.read();
+            let revision = self
+                .pending_table_defs
+                .selected_revision(&definition, transaction);
+            if revision == 0 {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "prepared definition statistics have no private table definition"
+                ));
+            }
+            Some(revision)
+        } else {
+            None
+        };
+        if let Some(revision) = revision {
+            self.validate_table_statistics(table_slot, transaction, &statistics)?;
+            let mut state = self.tables[table_slot].statistics.write();
+            let mut versions = self
+                .pending_table_statistics
+                .state
+                .write()
+                .expect("statistics versions lock poisoned");
+            if let Some(head) = state.pending.filter(|head| head.transaction == transaction)
+                && versions[head.tail].owner == StatisticsVersionOwner::Definition(revision)
+            {
+                let next = state.relation_revision.checked_add(1).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table statistics relation revision is exhausted"
+                    )
+                })?;
+                versions[head.tail].columns = statistics.columns;
+                state.committed.valid = statistics.valid;
+                state.committed.rows = statistics.rows;
+                state.committed.average_row_width = statistics.average_row_width;
+                state.committed.analyzed_generation = statistics.analyzed_generation;
+                state.relation_revision = next;
+                state.dirty = true;
+                state.wal_dirty = true;
+                return Ok(false);
+            }
+        }
         self.write_table_statistics(table_slot, transaction, statistics)?;
-        Ok(true)
+        if let Some(revision) = revision {
+            let state = self.tables[table_slot].statistics.read();
+            let tail = state
+                .pending
+                .expect("restored statistics has a private owner")
+                .tail;
+            self.pending_table_statistics
+                .state
+                .write()
+                .expect("statistics versions lock poisoned")[tail]
+                .owner = StatisticsVersionOwner::Definition(revision);
+            Ok(false)
+        } else {
+            Ok(true)
+        }
     }
 
     /// Relation estimates change in place; column statistics keep their owner.
@@ -595,9 +786,14 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn rollback_table_statistics(&self, table_slot: usize, txid: u32) {
-        let mut state = self.tables[table_slot].statistics.write();
-        let Some(head) = state.pending.filter(|head| head.transaction == txid) else {
+    fn rollback_statistics_version(
+        &self,
+        table: usize,
+        transaction: u32,
+        owner: StatisticsVersionOwner,
+    ) {
+        let mut state = self.tables[table].statistics.write();
+        let Some(head) = state.pending.filter(|head| head.transaction == transaction) else {
             return;
         };
         let mut versions = self
@@ -605,12 +801,133 @@ impl Storage {
             .state
             .write()
             .expect("statistics versions lock poisoned");
-        let previous = versions[head.tail].previous;
-        versions[head.tail].used = false;
-        state.pending = previous.map(|tail| PendingStatisticsHead {
-            transaction: txid,
-            tail,
+        let mut current = Some(head.tail);
+        let mut newer: Option<usize> = None;
+        while let Some(slot) = current {
+            let previous = versions[slot].previous;
+            if versions[slot].owner == owner {
+                if let Some(newer) = newer {
+                    versions[newer].previous = previous;
+                } else {
+                    state.pending =
+                        previous.map(|tail| PendingStatisticsHead { transaction, tail });
+                }
+                versions[slot].columns = super::SharedSlice::EMPTY;
+                versions[slot].used = false;
+                let mut remaining = state.pending.map(|head| head.tail);
+                let mut depth = remaining.map_or(0, |tail| versions[tail].depth);
+                if newer.is_some() {
+                    depth -= 1;
+                }
+                while let Some(slot) = remaining {
+                    versions[slot].depth = depth;
+                    depth = depth.saturating_sub(1);
+                    remaining = versions[slot].previous;
+                }
+                return;
+            }
+            newer = Some(slot);
+            current = previous;
+        }
+    }
+
+    pub(crate) fn rollback_table_statistics(&self, table: usize, transaction: u32) {
+        self.rollback_statistics_version(table, transaction, StatisticsVersionOwner::Analyze);
+    }
+
+    pub(super) fn rollback_definition_statistics(
+        &self,
+        table: usize,
+        transaction: u32,
+        revision: u64,
+    ) {
+        self.rollback_statistics_version(
+            table,
+            transaction,
+            StatisticsVersionOwner::Definition(revision),
+        );
+    }
+
+    pub(super) fn prepare_definition_statistics<'a>(
+        &'a self,
+        table: usize,
+        transaction: u32,
+        before: &super::TableDef,
+        after: &super::TableDefBuilder,
+        invalidated: super::ColumnSet,
+    ) -> Result<Option<PreparedDefinitionStatistics<'a>>, SqlError> {
+        let state = self.tables[table].statistics.write();
+        if state
+            .pending
+            .is_some_and(|head| head.transaction != transaction)
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "table statistics belongs to another transaction"
+            ));
+        }
+        let versions = self
+            .pending_table_statistics
+            .state
+            .write()
+            .expect("statistics versions lock poisoned");
+        let source = state.pending.map_or(&state.committed.columns, |head| {
+            &versions[head.tail].columns
         });
+        let retain = |record: &&AnalyzedColumn| {
+            let attribute = record.attribute();
+            let (Some(old), Some(new)) = (
+                before.attributes.column(attribute),
+                after.attributes.column(attribute),
+            ) else {
+                return false;
+            };
+            let old = &before.columns[old];
+            let new = &after.columns[new];
+            !invalidated.contains(usize::from(attribute - 1))
+                && old.ctype == new.ctype
+                && old.user_type == new.user_type
+                && old.type_mod == new.type_mod
+                && old.collation == new.collation
+        };
+        let count = source.iter().filter(retain).count();
+        if count == source.len() {
+            return Ok(None);
+        }
+        let previous = state.pending.map(|head| head.tail);
+        if previous.is_some_and(|slot| versions[slot].depth >= self.max_catalog_versions_per_object)
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table statistics exceeds max_catalog_versions_per_object ({})",
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let depth = previous.map_or(1, |slot| versions[slot].depth + 1);
+        let slot = versions
+            .iter()
+            .position(|entry| !entry.used)
+            .unwrap_or(versions.len());
+        if slot == versions.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending table-statistics pool is exhausted"
+            ));
+        }
+        let mut columns = self.reserve_statistics_columns(count)?;
+        for &record in source.iter().filter(retain) {
+            columns
+                .push_reserved(record)
+                .expect("filtered statistics count was reserved");
+        }
+        Ok(Some(PreparedDefinitionStatistics {
+            state,
+            versions,
+            columns: columns.freeze(),
+            slot,
+            depth,
+            transaction,
+        }))
     }
 
     pub(super) fn clear_pending_table_statistics(&self, table_slot: usize) {
@@ -633,7 +950,8 @@ impl Storage {
             .state
             .write()
             .expect("statistics versions lock poisoned");
-        state.committed.columns = versions[head.tail].columns;
+        state.committed.columns =
+            core::mem::replace(&mut versions[head.tail].columns, super::SharedSlice::EMPTY);
         state.dirty = true;
         clear_pending(&mut state, &mut versions);
     }
@@ -666,7 +984,7 @@ impl Storage {
             table: table_slot,
             created_at: definition.identity.created_at,
             state: Arc::clone(&table.statistics.state),
-            image: state.committed,
+            image: state.committed.clone(),
             revision: state.relation_revision,
             has_index_at: state.has_index_at,
         }
@@ -796,12 +1114,24 @@ impl Storage {
         state.wal_dirty = false;
     }
 
-    pub(crate) fn install_table_statistics(&self, table_slot: usize, statistics: TableStatistics) {
+    pub(crate) fn install_table_statistics(
+        &self,
+        table_slot: usize,
+        statistics: TableStatistics,
+    ) -> Result<(), SqlError> {
+        self.validate_table_statistics(table_slot, 0, &statistics)?;
         self.replace_table_statistics(table_slot, statistics, false);
+        Ok(())
     }
 
-    pub(crate) fn replay_table_statistics(&self, table_slot: usize, statistics: TableStatistics) {
+    pub(crate) fn replay_table_statistics(
+        &self,
+        table_slot: usize,
+        statistics: TableStatistics,
+    ) -> Result<(), SqlError> {
+        self.validate_table_statistics(table_slot, 0, &statistics)?;
         self.replace_table_statistics(table_slot, statistics, true);
+        Ok(())
     }
 }
 
@@ -884,18 +1214,28 @@ mod tests {
         });
     }
 
-    fn image(rows: u64) -> TableStatistics {
-        let mut image = TableStatistics::EMPTY;
-        image.valid = true;
-        image.rows = rows;
-        image.average_row_width = (rows * 2) as u32;
-        image.analyzed_generation = rows * 3;
-        image.columns[0] = ColumnStatistics {
+    fn image(storage: &Storage, rows: u64) -> TableStatistics {
+        let mut columns = storage.reserve_statistics_columns(1).unwrap();
+        columns
+            .push_reserved(
+                AnalyzedColumn::new(
+                    1,
+                    ColumnStatistics {
+                        valid: true,
+                        distinct_values: rows * 5,
+                        ..ColumnStatistics::EMPTY
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        TableStatistics {
             valid: true,
-            distinct_values: rows * 5,
-            ..ColumnStatistics::EMPTY
-        };
-        image
+            rows,
+            average_row_width: (rows * 2) as u32,
+            analyzed_generation: rows * 3,
+            columns: columns.freeze(),
+        }
     }
 
     fn fixture() -> (Storage, Budget, usize) {
@@ -917,19 +1257,33 @@ mod tests {
             for commit in [false, true] {
                 let (storage, _budget, table) = fixture();
                 crate::mem::guard::forbid_alloc(|| {
-                    storage.write_table_statistics(table, 7, image(1)).unwrap();
+                    storage
+                        .write_table_statistics(table, 7, image(&storage, 1))
+                        .unwrap();
                     storage.commit_table_statistics(table, 7);
                     storage
-                        .write_relation_counts(table, image(99), false)
+                        .write_relation_counts(table, image(&storage, 99), false)
                         .unwrap();
                     assert!(
                         storage
-                            .restore_prepared_table_statistics(table, 9, image(2), replay_counts)
+                            .restore_prepared_table_statistics(
+                                table,
+                                9,
+                                image(&storage, 2),
+                                replay_counts,
+                                StatisticsOrigin::Analyze
+                            )
                             .unwrap()
                     );
                     let rows = if replay_counts { 2 } else { 99 };
-                    assert_eq!(storage.table_statistics(table, 0).columns, image(1).columns);
-                    assert_eq!(storage.table_statistics(table, 9).columns, image(2).columns);
+                    assert_eq!(
+                        storage.table_statistics(table, 0).columns,
+                        image(&storage, 1).columns
+                    );
+                    assert_eq!(
+                        storage.table_statistics(table, 9).columns,
+                        image(&storage, 2).columns
+                    );
                     assert_eq!(storage.table_statistics(table, 0).rows, rows);
                     assert_eq!(storage.table_statistics(table, 9).rows, rows);
                     if commit {
@@ -939,13 +1293,19 @@ mod tests {
                     }
                     assert_eq!(
                         storage.table_statistics(table, 0).columns,
-                        image(if commit { 2 } else { 1 }).columns
+                        image(&storage, if commit { 2 } else { 1 }).columns
                     );
                     assert_eq!(storage.table_statistics(table, 0).rows, rows);
                     let current = storage.table_statistics(table, 0);
                     assert!(
                         !storage
-                            .restore_prepared_table_statistics(table, 11, current, replay_counts)
+                            .restore_prepared_table_statistics(
+                                table,
+                                11,
+                                current,
+                                replay_counts,
+                                StatisticsOrigin::RelationCounts
+                            )
                             .unwrap()
                     );
                     assert!(storage.pending_table_statistics(table, 11).is_none());
@@ -960,14 +1320,18 @@ mod tests {
         let config = super::super::tests::test_config();
         let pool = StatisticsReceiptPool::new(&config, &mut budget).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
             let captured = storage.capture_statistics_for_wal(table, 7).unwrap();
             let receipt = pool.retain().unwrap();
             receipt.retain_image(&captured).unwrap();
-            storage.write_table_statistics(table, 7, image(2)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 2))
+                .unwrap();
             receipt.acknowledge();
             assert!(storage.statistics_wal_dirty(table));
-            assert_eq!(storage.table_statistics(table, 7), image(2));
+            assert_eq!(storage.table_statistics(table, 7), image(&storage, 2));
             let latest = storage.capture_statistics_for_wal(table, 7).unwrap();
             receipt.retain_image(&latest).unwrap();
             receipt.acknowledge();
@@ -982,11 +1346,13 @@ mod tests {
                 ))
                 .unwrap();
             assert_eq!(replacement, table);
-            storage.write_table_statistics(table, 8, image(3)).unwrap();
+            storage
+                .write_table_statistics(table, 8, image(&storage, 3))
+                .unwrap();
             receipt.retain_image(&latest).unwrap();
             receipt.acknowledge();
             assert!(storage.statistics_wal_dirty(table));
-            assert_eq!(storage.table_statistics(table, 8), image(3));
+            assert_eq!(storage.table_statistics(table, 8), image(&storage, 3));
         });
     }
 
@@ -1003,7 +1369,7 @@ mod tests {
                 crate::mem::guard::forbid_alloc(|| {
                     for rows in 1..=100 {
                         storage_ref
-                            .write_table_statistics(table, 7, image(rows))
+                            .write_table_statistics(table, 7, image(storage_ref, rows))
                             .unwrap();
                         storage_ref.commit_table_statistics(table, 7);
                     }
@@ -1017,13 +1383,14 @@ mod tests {
                     for _ in 0..500 {
                         let own = storage_ref.table_statistics(table, 7);
                         if own.valid {
-                            assert_eq!(own, image(own.rows));
+                            assert_eq!(own, image(storage_ref, own.rows));
                         }
                         let other = storage_ref.table_statistics(table, 0);
                         if other.valid {
                             assert_eq!(other.average_row_width as u64, other.rows * 2);
                             assert_eq!(other.analyzed_generation, other.rows * 3);
-                            let prior_columns = other.columns[0].distinct_values / 5;
+                            let prior_columns =
+                                other.column(1).map_or(0, |column| column.distinct_values) / 5;
                             assert!(prior_columns == other.rows || prior_columns + 1 == other.rows);
                         }
                     }
@@ -1039,7 +1406,7 @@ mod tests {
             writer.join().unwrap();
             reader.join().unwrap();
         });
-        assert_eq!(storage.table_statistics(table, 0), image(100));
+        assert_eq!(storage.table_statistics(table, 0), image(&storage, 100));
     }
 
     #[test]
@@ -1055,51 +1422,57 @@ mod tests {
             ))
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
-            storage.write_table_statistics(table, 7, image(2)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 2))
+                .unwrap();
             assert_eq!(
                 storage
-                    .write_table_statistics(table, 7, image(3))
+                    .write_table_statistics(table, 7, image(&storage, 3))
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
             assert_eq!(
                 storage
-                    .write_table_statistics(table, 8, image(3))
+                    .write_table_statistics(table, 8, image(&storage, 3))
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
-            assert_eq!(storage.table_statistics(table, 7), image(2));
+            assert_eq!(storage.table_statistics(table, 7), image(&storage, 2));
             storage.rollback_table_statistics(table, 7);
             let restored = storage.table_statistics(table, 7);
             assert_eq!(restored.rows, 2);
             assert_eq!(restored.average_row_width, 4);
             assert_eq!(restored.analyzed_generation, 6);
-            assert_eq!(restored.columns, image(1).columns);
+            assert_eq!(restored.columns, image(&storage, 1).columns);
             storage.rollback_table_statistics(table, 7);
             let committed = storage.table_statistics(table, 0);
             assert_eq!(committed.rows, 2);
-            assert!(!committed.columns[0].valid);
+            assert!(committed.column(1).is_none());
             assert!(storage.statistics_wal_dirty(table));
             let slots = storage.pending_table_statistics.state.read().unwrap().len();
-            storage.write_table_statistics(table, 8, image(4)).unwrap();
+            storage
+                .write_table_statistics(table, 8, image(&storage, 4))
+                .unwrap();
             storage.commit_table_statistics(table, 8);
             assert_eq!(
                 storage.pending_table_statistics.state.read().unwrap().len(),
                 slots
             );
-            assert_eq!(storage.table_statistics(table, 0), image(4));
+            assert_eq!(storage.table_statistics(table, 0), image(&storage, 4));
             storage.tables[table].statistics.write().relation_revision = u64::MAX;
             assert_eq!(
                 storage
-                    .write_table_statistics(table, 9, image(5))
+                    .write_table_statistics(table, 9, image(&storage, 5))
                     .unwrap_err()
                     .sqlstate,
                 sqlstate::PROGRAM_LIMIT_EXCEEDED
             );
-            assert_eq!(storage.table_statistics(table, 0), image(4));
+            assert_eq!(storage.table_statistics(table, 0), image(&storage, 4));
             assert!(storage.pending_table_statistics(table, 9).is_none());
         });
     }
@@ -1114,7 +1487,9 @@ mod tests {
         let pool = StatisticsReceiptPool::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
             let captured = storage.capture_statistics_for_wal(table, 7).unwrap();
             let first = pool.retain_at(0).unwrap();
             let second = pool.retain_at(1).unwrap();
@@ -1155,7 +1530,9 @@ mod tests {
         let config = super::super::tests::test_config();
         let pool = StatisticsReceiptPool::new(&config, &mut budget).unwrap();
         let saved = crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
             let captured = storage.capture_statistics_for_wal(table, 7).unwrap();
             let saved = pool.retain().unwrap();
             saved.retain_image(&captured).unwrap();
@@ -1164,15 +1541,16 @@ mod tests {
         });
         let (replacement, _, replacement_table) = fixture();
         crate::mem::guard::forbid_alloc(|| {
+            let replacement_image = image(&replacement, 99);
             replacement
-                .write_table_statistics(replacement_table, 7, image(99))
+                .write_table_statistics(replacement_table, 7, replacement_image.clone())
                 .unwrap();
             drop(pool);
             saved.acknowledge();
             assert!(replacement.statistics_wal_dirty(replacement_table));
             assert_eq!(
                 replacement.table_statistics(replacement_table, 7),
-                image(99)
+                replacement_image
             );
             drop(saved);
         });
@@ -1184,7 +1562,9 @@ mod tests {
         let foreign = DatabaseOid::parse(16_385).unwrap();
         storage.tables[table].identity_mut().database = foreign;
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
             storage.rollback_table_statistics(table, 7);
             assert!(storage.capture_statistics_for_wal(table, 8).is_none());
             assert!(storage.statistics_wal_dirty(table));
@@ -1201,19 +1581,29 @@ mod tests {
     fn parallel_physical_manifest_statistics_ack_preserves_later_and_pending_analysis() {
         let (storage, _budget, table) = fixture();
         crate::mem::guard::forbid_alloc(|| {
-            storage.write_table_statistics(table, 7, image(1)).unwrap();
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
             storage.commit_table_statistics(table, 7);
             let old = storage.capture_checkpoint_statistics(table);
-            storage.write_table_statistics(table, 9, image(2)).unwrap();
+            storage
+                .write_table_statistics(table, 9, image(&storage, 2))
+                .unwrap();
             old.acknowledge(&storage);
             assert!(storage.statistics_dirty());
             assert!(storage.statistics_wal_dirty(table));
             storage.commit_table_statistics(table, 9);
 
-            let mut same_counts = image(2);
-            same_counts.columns[0].distinct_values = 999;
+            let mut same_counts = image(&storage, 2);
+            let mut column = same_counts.column(1).unwrap();
+            column.distinct_values = 999;
+            let mut columns = storage.reserve_statistics_columns(1).unwrap();
+            columns
+                .push_reserved(AnalyzedColumn::new(1, column).unwrap())
+                .unwrap();
+            same_counts.columns = columns.freeze();
             storage
-                .write_table_statistics(table, 11, same_counts)
+                .write_table_statistics(table, 11, same_counts.clone())
                 .unwrap();
             let pending = storage.capture_checkpoint_statistics(table);
             pending.acknowledge(&storage);
@@ -1229,6 +1619,262 @@ mod tests {
             current.acknowledge(&storage);
             assert!(!storage.statistics_dirty());
             assert!(!storage.statistics_wal_dirty(table));
+        });
+    }
+    #[test]
+    fn shared_statistics_pins_exhaustion_and_publication_use_only_reserved_backing() {
+        let mut config = super::super::tests::test_config();
+        config.statistics_bytes = 128;
+        config.statistics_leases = 2;
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(super::super::tests::make_def(
+                "statistics_pins",
+                &[("id", ColType::Int4, true)],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            storage
+                .write_table_statistics(table, 7, image(&storage, 1))
+                .unwrap();
+            storage.commit_table_statistics(table, 7);
+            let pinned = storage.table_statistics(table, 0);
+            storage
+                .write_table_statistics(table, 8, image(&storage, 2))
+                .unwrap();
+            let error = storage.reserve_statistics_columns(1).unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(error.message.as_str().contains("statistics_leases"));
+            storage.commit_table_statistics(table, 8);
+            assert_eq!(pinned.column(1).unwrap().distinct_values, 5);
+            assert_eq!(
+                storage
+                    .table_statistics(table, 0)
+                    .column(1)
+                    .unwrap()
+                    .distinct_values,
+                10
+            );
+            assert!(storage.reserve_statistics_columns(1).is_err());
+            drop(pinned);
+            storage
+                .write_table_statistics(table, 9, image(&storage, 3))
+                .unwrap();
+            storage.rollback_table_statistics(table, 9);
+            assert_eq!(
+                storage
+                    .table_statistics(table, 0)
+                    .column(1)
+                    .unwrap()
+                    .distinct_values,
+                10
+            );
+            let recovered = storage.reserve_statistics_columns(1).unwrap();
+            drop(recovered);
+        });
+    }
+
+    #[test]
+    fn shared_statistics_definition_admission_precedes_shape_changes_and_undo_preserves_analyze() {
+        let mut config = super::super::tests::test_config();
+        config.statistics_bytes = 192;
+        config.statistics_leases = 3;
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(super::super::tests::make_def(
+                "statistics_definition",
+                &[
+                    ("id", ColType::Int4, true),
+                    ("payload", ColType::Int4, true),
+                ],
+            ))
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let record = |attribute, distinct_values| {
+                AnalyzedColumn::new(
+                    attribute,
+                    ColumnStatistics {
+                        valid: true,
+                        distinct_values,
+                        ..ColumnStatistics::EMPTY
+                    },
+                )
+                .unwrap()
+            };
+            let mut initial = image(&storage, 1);
+            initial.columns = storage
+                .statistics_pool
+                .copy_slice(&[record(1, 5), record(2, 7)])
+                .unwrap();
+            storage.write_table_statistics(table, 7, initial).unwrap();
+            storage.commit_table_statistics(table, 7);
+            let old = storage.table_statistics(table, 0);
+            let (target, before) = storage.select_table_definition(table, 9);
+            let mut changed = super::super::TableDefBuilder::from_definition(&before);
+            changed.columns[1].ctype = ColType::Int8;
+            let mut mapping = [None; super::super::MAX_COLUMNS];
+            mapping[0] = Some(changed.columns[0].name);
+            mapping[1] = Some(changed.columns[1].name);
+            let mut blockers = storage.statistics_pool.lease::<u64>(1).unwrap();
+            blockers.push_reserved(0).unwrap();
+            let other = storage.statistics_pool.lease::<u64>(1).unwrap();
+            let error = storage
+                .write_table_def(
+                    target,
+                    changed,
+                    &mapping,
+                    true,
+                    super::super::ColumnSet::EMPTY,
+                )
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert_eq!(storage.table_def(table, 9).columns[1].ctype, ColType::Int4);
+            assert_eq!(storage.table_statistics(table, 9), old);
+            drop(other);
+            drop(blockers);
+            let mut changed = super::super::TableDefBuilder::from_definition(&before);
+            changed.columns[1].ctype = ColType::Int8;
+            let change = storage
+                .write_table_def(
+                    target,
+                    changed,
+                    &mapping,
+                    true,
+                    super::super::ColumnSet::EMPTY,
+                )
+                .unwrap();
+            assert!(storage.table_statistics(table, 9).column(2).is_none());
+            assert_eq!(
+                storage
+                    .table_statistics(table, 0)
+                    .column(2)
+                    .unwrap()
+                    .distinct_values,
+                7
+            );
+            storage
+                .write_table_statistics(table, 9, image(&storage, 4))
+                .unwrap();
+            storage.rollback_table_def(change);
+            assert_eq!(
+                storage
+                    .table_statistics(table, 9)
+                    .column(1)
+                    .unwrap()
+                    .distinct_values,
+                20
+            );
+            storage.rollback_table_statistics(table, 9);
+            assert_eq!(storage.table_statistics(table, 9).columns, old.columns);
+            assert_eq!(storage.table_def(table, 9).columns[1].ctype, ColType::Int4);
+        });
+    }
+
+    #[test]
+    fn shared_statistics_definition_depth_exhaustion_precedes_payload_reservation() {
+        let mut config = super::super::tests::test_config();
+        config.statistics_bytes = 128;
+        config.statistics_leases = 2;
+        let mut budget = super::super::tests::test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(super::super::tests::make_def(
+                "statistics_depth",
+                &[
+                    ("id", ColType::Int4, true),
+                    ("payload", ColType::Int4, true),
+                ],
+            ))
+            .unwrap();
+        storage.max_catalog_versions_per_object = u32::MAX;
+        crate::mem::guard::forbid_alloc(|| {
+            let mut columns = storage.reserve_statistics_columns(2).unwrap();
+            for attribute in [1, 2] {
+                columns
+                    .push_reserved(
+                        AnalyzedColumn::new(
+                            attribute,
+                            ColumnStatistics {
+                                valid: true,
+                                distinct_values: 1,
+                                ..ColumnStatistics::EMPTY
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let mut statistics = TableStatistics::EMPTY;
+            statistics.valid = true;
+            statistics.columns = columns.freeze();
+            storage
+                .write_table_statistics(table, 7, statistics)
+                .unwrap();
+            let tail = storage.tables[table]
+                .statistics
+                .read()
+                .pending
+                .unwrap()
+                .tail;
+            storage.pending_table_statistics.state.write().unwrap()[tail].depth = u32::MAX;
+            let (_, before) = storage.select_table_definition(table, 7);
+            let mut after = super::super::TableDefBuilder::from_definition(&before);
+            after.columns[0].ctype = ColType::Int8;
+            let occupied = storage.statistics_pool.lease::<u8>(64).unwrap();
+            let error = storage
+                .prepare_definition_statistics(
+                    table,
+                    7,
+                    &before,
+                    &after,
+                    super::super::ColumnSet::EMPTY,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("max_catalog_versions_per_object")
+            );
+            assert_eq!(storage.table_def(table, 7).columns[0].ctype, ColType::Int4);
+            assert_eq!(storage.table_statistics(table, 7).columns.len(), 2);
+            assert_eq!(
+                storage.pending_table_statistics.state.read().unwrap()[tail].depth,
+                u32::MAX
+            );
+            storage.rollback_table_statistics(table, 7);
+            assert!(storage.pending_table_statistics(table, 7).is_none());
+            assert!(storage.reserve_statistics_columns(1).is_ok());
+            drop(occupied);
+        });
+    }
+
+    #[test]
+    fn relation_estimate_changes_follow_advertised_counts_and_pages() {
+        crate::mem::guard::forbid_alloc(|| {
+            let empty = TableStatistics::EMPTY;
+            let mut first = empty.clone();
+            first.valid = true;
+            first.rows = 1;
+            first.average_row_width = 8;
+            assert!(first.relation_estimates_changed(&empty));
+            assert_eq!((first.relation_tuples(), first.relation_pages()), (1.0, 1));
+            let mut samples_only = first.clone();
+            samples_only.analyzed_generation = 99;
+            samples_only.average_row_width = 16;
+            assert!(!samples_only.relation_estimates_changed(&first));
+            let mut pages_changed = first.clone();
+            pages_changed.average_row_width = 8_193;
+            assert!(pages_changed.relation_estimates_changed(&first));
+            assert_eq!(pages_changed.relation_pages(), 2);
+            let mut rows_changed = first.clone();
+            rows_changed.rows = 2;
+            assert!(rows_changed.relation_estimates_changed(&first));
+            assert!(!first.relation_estimates_changed(&first));
         });
     }
 }

@@ -1,0 +1,46 @@
+-- Replacing a selected support function invalidates the containing cached plan.
+CREATE SEQUENCE support_checks;
+CREATE TYPE support_choice AS ENUM('a');
+CREATE DOMAIN support_checked AS support_choice CHECK(nextval('support_checks')>0);
+CREATE FUNCTION support_operator(integer,integer) RETURNS integer LANGUAGE sql AS $$SELECT $1+$2$$;
+CREATE OPERATOR public.##(LEFTARG=integer,RIGHTARG=integer,FUNCTION=support_operator);
+CREATE FUNCTION support_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'x'::varchar$$;
+CREATE CAST(integer AS varchar) WITH FUNCTION support_cast(integer,integer,boolean) AS IMPLICIT;
+CREATE FUNCTION support_unrelated() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;
+SET check_function_bodies=off;
+CREATE FUNCTION support_sql() RETURNS integer LANGUAGE sql SET search_path=public AS
+  $$SELECT cardinality('{a}'::support_checked[])+(1 OPERATOR(public.##) 2)+length(7::varchar(5))$$;
+CREATE FUNCTION support_pl() RETURNS integer LANGUAGE plpgsql AS
+  $$BEGIN RETURN cardinality('{a}'::support_checked[])+(1 OPERATOR(public.##) 2)+length(7::varchar(5)); END$$;
+SET check_function_bodies=on;
+ALTER SEQUENCE support_checks RESTART WITH 1;
+SELECT support_sql();
+SELECT support_sql();
+SELECT 'sql_reuse',last_value FROM support_checks;
+CREATE OR REPLACE FUNCTION support_unrelated() RETURNS integer LANGUAGE sql AS $$SELECT 2$$;
+SELECT support_sql();
+SELECT 'unrelated',last_value FROM support_checks;
+CREATE OR REPLACE FUNCTION support_operator(integer,integer) RETURNS integer LANGUAGE sql AS $$SELECT $1-$2$$;
+SELECT support_sql();
+SELECT 'operator_replaced',last_value FROM support_checks;
+CREATE OR REPLACE FUNCTION support_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'yy'::varchar$$;
+SELECT support_sql();
+SELECT 'cast_replaced',last_value FROM support_checks;
+DISCARD PLANS;
+ALTER SEQUENCE support_checks RESTART WITH 1;
+SELECT support_pl();
+SELECT support_pl();
+SELECT 'pl_reuse',last_value FROM support_checks;
+CREATE OR REPLACE FUNCTION support_operator(integer,integer) RETURNS integer LANGUAGE sql AS $$SELECT $1+$2$$;
+SELECT support_pl();
+SELECT 'pl_operator_replaced',last_value FROM support_checks;
+CREATE OR REPLACE FUNCTION support_cast(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS $$SELECT 'z'::varchar$$;
+SELECT support_pl();
+SELECT 'pl_cast_replaced',last_value FROM support_checks;
+DROP FUNCTION support_sql(),support_pl(),support_unrelated();
+DROP OPERATOR public.##(integer,integer);
+DROP CAST(integer AS varchar);
+DROP FUNCTION support_operator(integer,integer),support_cast(integer,integer,boolean);
+DROP DOMAIN support_checked;
+DROP TYPE support_choice;
+DROP SEQUENCE support_checks;

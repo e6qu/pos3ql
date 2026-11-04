@@ -11,12 +11,15 @@ pub(crate) enum IndexGenerationChange {
     Created(usize),
     Dropped(usize),
     Renamed(usize),
+    State(usize),
 }
 
 impl IndexGenerationChange {
     fn slot(self) -> usize {
         match self {
-            Self::Created(slot) | Self::Dropped(slot) | Self::Renamed(slot) => slot,
+            Self::Created(slot) | Self::Dropped(slot) | Self::Renamed(slot) | Self::State(slot) => {
+                slot
+            }
         }
     }
 }
@@ -193,7 +196,18 @@ impl TablePublication {
 
 impl Storage {
     fn generation_index_table(&self, change: IndexGenerationChange) -> Option<usize> {
-        match self.index(change.slot()).table_binding?.source.slot() {
+        let index = self.index(change.slot());
+        if matches!(index.relation, super::IndexRelationSource::Toast(_)) {
+            return None;
+        }
+        if matches!(change, IndexGenerationChange::State(_))
+            && index
+                .pending_definition
+                .is_none_or(|pending| pending.definition.kind.ready() == index.mutable.kind.ready())
+        {
+            return None;
+        }
+        match index.table_binding?.source.slot() {
             super::catalog_sources::CatalogObjectSlot::Table(table) => Some(table),
             _ => None,
         }
@@ -324,6 +338,15 @@ impl Storage {
                         )
                     })?;
                 for (position, change) in indexes.clone().enumerate() {
+                    if self.generation_index_table(change) != Some(table) {
+                        continue;
+                    }
+                    if matches!(change, IndexGenerationChange::State(_))
+                        && indexes.clone().take(position).any(|prior|
+                            matches!(prior, IndexGenerationChange::State(slot) if slot == change.slot()))
+                    {
+                        continue;
+                    }
                     if matches!(change, IndexGenerationChange::Renamed(_))
                         && indexes.clone().take(position).any(|prior| matches!(prior, IndexGenerationChange::Renamed(slot) if slot == change.slot()))
                     { continue }
@@ -425,7 +448,13 @@ mod tests {
             let mut mapping = [None; MAX_COLUMNS];
             mapping[0] = Some(SqlName::parse("id").unwrap());
             let change = storage
-                .write_table_def(target, definition, &mapping, false)
+                .write_table_def(
+                    target,
+                    definition,
+                    &mapping,
+                    false,
+                    crate::storage::ColumnSet::EMPTY,
+                )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {
                 storage

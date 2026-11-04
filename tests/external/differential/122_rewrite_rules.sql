@@ -43,4 +43,9 @@ DROP RULE keep_delete ON rewrite_source;
 DROP RULE z_update ON rewrite_source;
 SELECT relhasrules FROM pg_class WHERE relname = 'rewrite_source';
 
+CREATE RULE invalid_old_input AS ON INSERT TO rewrite_source DO ALSO
+  INSERT INTO rewrite_log VALUES ('invalid', OLD.id, NULL, NEW.value);
+CREATE RULE invalid_new_input AS ON DELETE TO rewrite_source DO ALSO
+  INSERT INTO rewrite_log VALUES ('invalid', NEW.id, OLD.value, NULL);
+
 DROP TABLE rewrite_source, rewrite_log;

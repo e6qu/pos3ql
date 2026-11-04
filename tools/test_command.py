@@ -24,7 +24,9 @@ def run(command):
             if match is None:
                 continue
             binary = Path(match[1])
-            if binary.parent.name != "deps" or re.fullmatch(r"pos3ql-[0-9a-f]+", binary.name) is None:
+            cargo_binary = (binary.parent.name == "deps"
+                and re.fullmatch(r"pos3ql-[0-9a-f]+", binary.name) is not None)
+            if not cargo_binary and binary.name != "pos3ql-native-tests":
                 continue
             addresses = frames.setdefault(binary, [])
             if match[2] not in addresses and len(addresses) < 64:

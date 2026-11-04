@@ -62,7 +62,7 @@ fn foreground_write_leases_release_on_success_sql_error_and_wire_exhaustion() {
             &mut session.transaction,
             &mut session.pool,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut responder,
             session.connection_id,
         )

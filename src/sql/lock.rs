@@ -447,6 +447,15 @@ struct AdvisoryReplayAction {
     result: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdvisoryStatementMark {
+    connection_id: i32,
+    replay_cursor: Option<usize>,
+    replay_actions: usize,
+    transaction_locks: usize,
+    latest_transaction_acquisition: u64,
+}
+
 #[derive(Clone, Copy)]
 struct AdvisoryReplayState {
     connection_id: i32,
@@ -554,6 +563,33 @@ impl AdvisoryLockManager {
             })
     }
 
+    pub(crate) fn statement_mark(&self, connection_id: i32) -> AdvisoryStatementMark {
+        let mut mark = AdvisoryStatementMark {
+            connection_id,
+            replay_cursor: self
+                .replay_states
+                .iter()
+                .find(|state| state.connection_id == connection_id)
+                .map(|state| state.cursor),
+            replay_actions: self
+                .replay_actions
+                .iter()
+                .filter(|action| action.connection_id == connection_id)
+                .count(),
+            transaction_locks: 0,
+            latest_transaction_acquisition: 0,
+        };
+        let owner = connection_wait_owner(connection_id);
+        for lock in self.locks.iter().filter(|lock| {
+            lock.wait_owner == owner && matches!(lock.owner, AdvisoryOwner::Transaction(_))
+        }) {
+            mark.transaction_locks += 1;
+            mark.latest_transaction_acquisition =
+                mark.latest_transaction_acquisition.max(lock.acquired_at);
+        }
+        mark
+    }
+
     pub(crate) fn preserve_statement(&mut self, connection_id: i32) {
         if let Some(state) = self
             .replay_states
@@ -632,8 +668,8 @@ impl AdvisoryLockManager {
             })
             .map(|lock| lock.wait_owner)
         {
-            self.clear_wait(wait_owner);
             if try_only {
+                self.clear_wait(wait_owner);
                 wait_graph.clear_wait(wait_owner);
                 if let AdvisoryOwner::Session(connection_id) = owner {
                     self.record_replay(connection_id, replay_operation, false)?;
@@ -1196,6 +1232,74 @@ mod tests {
             .unwrap_err();
         assert_eq!(deadlock.sqlstate, sqlstate::DEADLOCK_DETECTED);
         assert_eq!(advisory.blocker_pid_count(22), 0);
+    }
+
+    #[test]
+    fn advisory_effect_marks_track_connection_calls_and_replayed_positions() {
+        let mut budget = Budget::new(32 << 10);
+        let mut graph = LockManager::new(&mut budget, 4, 4).unwrap();
+        let mut advisory = AdvisoryLockManager::new(&mut budget, 16, 4).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            advisory.begin_statement(11).unwrap();
+            advisory.begin_statement(22).unwrap();
+            let first = advisory.statement_mark(11);
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(2),
+                    AdvisoryOwner::Session(22),
+                    connection_wait_owner(22),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    1,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_eq!(advisory.statement_mark(11), first);
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(1),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    2,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_ne!(advisory.statement_mark(11), first);
+            advisory.preserve_statement(11);
+            advisory.begin_statement(11).unwrap();
+            let replay = advisory.statement_mark(11);
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(1),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    3,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_ne!(
+                advisory.statement_mark(11),
+                replay,
+                "consuming an existing receipt is also a child effect"
+            );
+            let transaction = advisory.statement_mark(11);
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(3),
+                    AdvisoryOwner::Transaction(7),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    4,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_ne!(advisory.statement_mark(11), transaction);
+        });
     }
 
     #[test]

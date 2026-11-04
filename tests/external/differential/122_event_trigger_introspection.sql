@@ -4,6 +4,10 @@ DROP TABLE IF EXISTS introspection_target, introspection_ddl_log,
   introspection_drop_log CASCADE;
 DROP FUNCTION IF EXISTS introspection_capture_ddl() CASCADE;
 DROP FUNCTION IF EXISTS introspection_capture_drop() CASCADE;
+DROP SERVER IF EXISTS introspection_server;
+DROP FOREIGN DATA WRAPPER IF EXISTS introspection_wrapper;
+CREATE FOREIGN DATA WRAPPER introspection_wrapper;
+CREATE SERVER introspection_server FOREIGN DATA WRAPPER introspection_wrapper;
 
 CREATE TABLE introspection_ddl_log
   (position serial, classid oid, objid oid, objsubid integer,
@@ -48,6 +52,18 @@ ALTER TABLE introspection_target ALTER COLUMN value DROP NOT NULL;
 COMMENT ON TABLE introspection_target IS 'table';
 COMMENT ON COLUMN introspection_target.id IS 'column';
 ALTER TABLE introspection_target OWNER TO postgres;
+ALTER SERVER introspection_server OWNER TO postgres;
+ALTER FOREIGN DATA WRAPPER introspection_wrapper OWNER TO postgres;
+COMMENT ON SERVER introspection_server IS 'server';
+COMMENT ON FOREIGN DATA WRAPPER introspection_wrapper IS 'wrapper';
+SELECT type, identity FROM pg_identify_object('pg_foreign_server'::regclass,
+  (SELECT oid FROM pg_foreign_server WHERE srvname='introspection_server'), 0);
+SELECT type, identity FROM pg_identify_object('pg_foreign_data_wrapper'::regclass,
+  (SELECT oid FROM pg_foreign_data_wrapper WHERE fdwname='introspection_wrapper'), 0);
+SELECT classid='pg_foreign_server'::regclass FROM pg_get_object_address(
+  'server', ARRAY['introspection_server'], ARRAY[]::text[]);
+SELECT classid='pg_foreign_data_wrapper'::regclass FROM pg_get_object_address(
+  'foreign-data wrapper', ARRAY['introspection_wrapper'], ARRAY[]::text[]);
 GRANT SELECT ON introspection_target TO PUBLIC;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC;
 DROP TABLE introspection_target;
@@ -68,3 +84,5 @@ DROP EVENT TRIGGER introspection_ddl;
 DROP EVENT TRIGGER introspection_drop;
 DROP TABLE introspection_ddl_log, introspection_drop_log;
 DROP FUNCTION introspection_capture_ddl(), introspection_capture_drop();
+DROP SERVER introspection_server;
+DROP FOREIGN DATA WRAPPER introspection_wrapper;

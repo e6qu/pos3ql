@@ -263,6 +263,7 @@ mod tests {
                     not_null_name: None,
                     not_null_identity: None,
                     default_expr: None,
+                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
                 },

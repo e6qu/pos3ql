@@ -144,11 +144,40 @@ lib:*)
     echo "=== in-process tests, partition $partition ==="
     # Keep compilation visible while capturing only the harness's test names.
     # Buffered build/test output otherwise vanishes at the CI job deadline.
-    if ! cargo test --locked --lib --release -- --list > "$TMP/lib.list"; then
-        tail -80 "$TMP/lib.list"
-        echo "FAIL: in-process tests could not be enumerated"
+    case "${COVERAGE_NATIVE_DEBUGGER-}" in
+    gdb)
+        command -v gdb >/dev/null || { echo "FAIL: COVERAGE_NATIVE_DEBUGGER=gdb requires gdb"; exit 1; }
+        if ! cargo test --locked --lib --release --no-run \
+            --message-format=json-render-diagnostics > "$TMP/lib-build.jsonl"; then
+            echo "FAIL: in-process tests could not be built"
+            exit 1
+        fi
+        native_test_binary=$(python3 tools/native-test-artifact.py executable "$TMP/lib-build.jsonl")
+        RUST_MIN_STACK=$(python3 - <<'PY'
+from pathlib import Path
+import tomllib
+
+stack = tomllib.loads(Path(".cargo/config.toml").read_text())["env"]["RUST_MIN_STACK"]["value"]
+if not isinstance(stack, str) or not stack.isdecimal() or int(stack) <= 0:
+    raise SystemExit("RUST_MIN_STACK must be an explicit positive byte count")
+print(stack)
+PY
+        )
+        export RUST_MIN_STACK
+        "$native_test_binary" --list > "$TMP/lib.list"
+        ;;
+    none)
+        if ! cargo test --locked --lib --release -- --list > "$TMP/lib.list"; then
+            tail -80 "$TMP/lib.list"
+            echo "FAIL: in-process tests could not be enumerated"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "FAIL: library coverage requires COVERAGE_NATIVE_DEBUGGER=gdb or none"
         exit 1
-    fi
+        ;;
+    esac
     set -- --exact
     ordinal=0
     selected=0
@@ -170,7 +199,16 @@ lib:*)
         exit 1
     fi
     echo "=== executing $selected of $ordinal tests, partition $partition ==="
-    if ! python3 tools/test_command.py cargo test --locked --lib --release -- "$@"; then
+    if [ "$COVERAGE_NATIVE_DEBUGGER" = gdb ]; then
+        set -- gdb --batch --return-child-result \
+            -ex 'set pagination off' -ex 'set print thread-events off' \
+            -ex 'set startup-with-shell off' \
+            -ex 'handle SIGPIPE nostop noprint pass' \
+            -ex run -ex 'thread apply all bt 40' --args "$native_test_binary" "$@"
+    else
+        set -- cargo test --locked --lib --release -- "$@"
+    fi
+    if ! python3 tools/test_command.py "$@"; then
         echo "FAIL: in-process test partition $partition did not pass"
         exit 1
     fi

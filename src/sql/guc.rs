@@ -20,7 +20,7 @@ use super::eval::SqlError;
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct PrngState {
     s0: u64,
     s1: u64,
@@ -488,6 +488,10 @@ impl SequenceCache {
 }
 
 impl SeqSession {
+    pub(crate) fn retains_statement_effects(&self) -> bool {
+        self.statement_replay.get().is_retained()
+    }
+
     const fn new() -> Self {
         SeqSession {
             statement_replay: Cell::new(super::sequence::StatementSequenceReplay::EMPTY),
@@ -676,9 +680,7 @@ struct GucValues {
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
     xml_document: bool,
-    /// Whether function bodies are checked at definition time. Function DDL is
-    /// rejected before this matters, but the session value is still observable
-    /// and is emitted by pg_dump.
+    /// Whether stored function bodies are checked when their definitions are created.
     check_function_bodies: bool,
     default_transaction_isolation: TransactionIsolation,
     default_transaction_read_only: bool,
@@ -752,6 +754,38 @@ pub(crate) enum PasswordEncryption {
 }
 
 impl GucValues {
+    fn same_settings(&self, other: &Self) -> bool {
+        // The stored time-zone name determines its private parsed cache.
+        macro_rules! equal { ($($field:ident),+ $(,)?) => { true $(&& self.$field == other.$field)+ }; }
+        equal!(
+            current_role,
+            session_authorization,
+            datestyle,
+            intervalstyle,
+            lc_monetary,
+            timezone,
+            client_encoding,
+            application_name,
+            search_path,
+            default_tablespace,
+            default_text_search_config,
+            client_min_messages,
+            extra_float_digits,
+            lock_timeout,
+            statement_timeout,
+            row_security,
+            event_triggers,
+            bytea_escape,
+            xml_document,
+            check_function_bodies,
+            default_transaction_isolation,
+            default_transaction_read_only,
+            default_transaction_deferrable,
+            password_encryption,
+            track_functions
+        )
+    }
+
     fn new() -> Self {
         let mut values = Self {
             current_role: crate::storage::SessionIdentity::bootstrap(),
@@ -974,6 +1008,11 @@ struct GucSavepoint {
     session_overrides: u32,
 }
 
+pub(crate) struct StatementSettings {
+    values: GucSavepoint,
+    random: PrngState,
+}
+
 struct GucTransaction {
     active: bool,
     start: GucValues,
@@ -1011,7 +1050,7 @@ pub struct GucState {
     /// Immutable authenticated identity from the startup packet. PostgreSQL
     /// uses this identity—not a later SET ROLE or SET SESSION
     /// AUTHORIZATION—as the authority for changing session authorization.
-    authenticated_user: crate::storage::SessionIdentity,
+    authenticated_user: Cell<crate::storage::SessionIdentity>,
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
     random: Cell<PrngState>,
@@ -1097,6 +1136,44 @@ impl Default for GucState {
 }
 
 impl GucState {
+    pub(crate) fn statement_settings(&self) -> StatementSettings {
+        let state = self.store.borrow();
+        StatementSettings {
+            values: GucSavepoint {
+                current: state.current,
+                session: state.transaction.session,
+                current_overrides: state.session_overrides,
+                session_overrides: state.transaction.session_overrides,
+            },
+            random: self.random.get(),
+        }
+    }
+
+    pub(crate) fn restore_statement_settings(&self, mark: StatementSettings) {
+        {
+            let mut state = self.store.borrow_mut();
+            state.current = mark.values.current;
+            state.transaction.session = mark.values.session;
+            state.session_overrides = mark.values.current_overrides;
+            state.transaction.session_overrides = mark.values.session_overrides;
+        }
+        self.random.set(mark.random);
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
+        crate::sql::timezone::set_session(self.timezone());
+    }
+
+    pub(crate) fn matches_statement_settings(&self, mark: &StatementSettings) -> bool {
+        let state = self.store.borrow();
+        state.current.same_settings(&mark.values.current)
+            && state
+                .transaction
+                .session
+                .same_settings(&mark.values.session)
+            && state.session_overrides == mark.values.current_overrides
+            && state.transaction.session_overrides == mark.values.session_overrides
+            && self.random.get() == mark.random
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_sequence_capacity(
         budget: &mut Budget,
@@ -1161,7 +1238,7 @@ impl GucState {
             .clone_from_slice(&source.transaction.savepoints[..count]);
         destination.transaction.savepoint_count = count;
         target.transaction_mode = self.transaction_mode;
-        target.authenticated_user = self.authenticated_user;
+        target.authenticated_user.set(self.authenticated_user.get());
         target.random.set(self.random.get());
         target.seq_session.discard();
         for (source, destination) in self
@@ -1294,7 +1371,7 @@ impl GucState {
                     savepoint_count: 0,
                 },
             }),
-            authenticated_user: crate::storage::SessionIdentity::bootstrap(),
+            authenticated_user: Cell::new(crate::storage::SessionIdentity::bootstrap()),
             seq_session: SeqSession::new(),
             random: Cell::new(PrngState::UNINITIALIZED),
         }
@@ -1401,8 +1478,8 @@ impl GucState {
         self.store.borrow().current.session_authorization.name()
     }
 
-    pub fn authenticated_user(&self) -> &str {
-        self.authenticated_user.as_str()
+    pub fn authenticated_user(&self) -> StackStr<64> {
+        self.authenticated_user.get().name()
     }
 
     pub fn set_session_user(&mut self, user: &str) {
@@ -1410,7 +1487,7 @@ impl GucState {
     }
 
     pub(crate) fn bind_session_user(&mut self, role: crate::storage::SessionIdentity) {
-        self.authenticated_user = role;
+        self.authenticated_user.set(role);
         let mut store = self.store.borrow_mut();
         store.current.current_role = role;
         store.current.session_authorization = role;
@@ -1454,7 +1531,7 @@ impl GucState {
     }
 
     pub fn reset_session_authorization(&self, local: bool) {
-        let authenticated_user = self.authenticated_user;
+        let authenticated_user = self.authenticated_user.get();
         self.set_session_authorization(authenticated_user, local);
     }
 
@@ -1467,15 +1544,12 @@ impl GucState {
     }
 
     pub(crate) fn authenticated_identity(&self) -> crate::storage::SessionIdentity {
-        self.authenticated_user
+        self.authenticated_user.get()
     }
 
-    pub(crate) fn refresh_identities(
-        &mut self,
-        storage: &crate::storage::Storage,
-        transaction: u32,
-    ) {
-        self.authenticated_user = self.authenticated_user.refresh(storage, transaction);
+    pub(crate) fn refresh_identities(&self, storage: &crate::storage::Storage, transaction: u32) {
+        self.authenticated_user
+            .set(self.authenticated_user.get().refresh(storage, transaction));
         let mut store = self.store.borrow_mut();
         store.current.current_role = store.current.current_role.refresh(storage, transaction);
         store.current.session_authorization = store
@@ -1923,6 +1997,10 @@ impl GucState {
                 name
             )
         })
+    }
+
+    pub(crate) fn check_function_bodies(&self) -> bool {
+        self.store.borrow().current.check_function_bodies
     }
 
     pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
@@ -3073,6 +3151,38 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn statement_retry_restores_settings_and_the_random_stream() {
+        let state = GucState::new();
+        state.begin_transaction();
+        state
+            .set_config("application_name", Some("before"), false)
+            .unwrap();
+        state.set_random_seed(0.5).unwrap();
+        let expected = state.random().unwrap();
+        state.set_random_seed(0.5).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..3 {
+                let mark = state.statement_settings();
+                assert_eq!(state.random().unwrap(), expected);
+                state
+                    .set_config("application_name", Some("during"), false)
+                    .unwrap();
+                state.restore_statement_settings(mark);
+                assert_eq!(
+                    state.get_owned("application_name").unwrap().as_str(),
+                    "before"
+                );
+            }
+            assert_eq!(state.random().unwrap(), expected);
+            state.commit_transaction();
+            assert_eq!(
+                state.get_owned("application_name").unwrap().as_str(),
+                "before"
+            );
+        });
+    }
 
     #[test]
     fn configured_guc_capacities_saturate_and_valid_reservations_remain_exact() {

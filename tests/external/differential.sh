@@ -362,7 +362,7 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
       ok "differential: $name"
     else
       bad "differential: $name"
-      head -30 "$WORK/$name.diff"
+      cat "$WORK/$name.diff"
       printf '%s\n' 'PostgreSQL diagnostics:'
       cat "$WORK/$name.pg.stderr"
       printf '%s\n' 'pos3ql diagnostics:'
@@ -407,7 +407,7 @@ for f in $EXT/differential_exact/*.sql; do
     ok "exact errors: $name"
   else
     bad "exact errors: $name"
-    head -30 "$WORK/$name.diff"
+    cat "$WORK/$name.diff"
     printf '%s\n' 'PostgreSQL diagnostics:'
     cat "$WORK/$name.pg.stderr"
     printf '%s\n' 'pos3ql diagnostics:'

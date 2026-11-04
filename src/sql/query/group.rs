@@ -618,9 +618,19 @@ pub(super) fn groups_for_mask<'a>(
         let agg_vals: &mut [Datum] = arena
             .alloc_slice_with(n_aggs, |_| Datum::Null)
             .map_err(|_| arena_full())?;
+        let direct_hooks = EvalHooks {
+            group: Some((statement.group_by, &key_vals[..n_keys], mask)),
+            ..*hooks
+        };
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
             let state = &mut states[g * n_aggs.max(1) + i];
-            state.initialize_custom_direct(node, arena, params, &ScopeSchema(scope), hooks)?;
+            state.initialize_direct_inputs(
+                node,
+                arena,
+                params,
+                &ScopeSchema(scope),
+                &direct_hooks,
+            )?;
             agg_vals[i] = state.finish(arena, hooks.catalog)?;
         }
         let merged_subs;
@@ -759,13 +769,12 @@ pub(super) fn grouped_rows<'a>(
                 "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
             ));
         };
-        if let Some(column) = ungrouped_column(expression, statement.group_by, scope, storage, txid)
-        {
+        if let Some(column) = ungrouped_column(expression, statement.group_by, scope, agg_nodes) {
             return Err(ungrouped_error(column, scope));
         }
     }
     if let Some(h) = statement.having
-        && let Some(column) = ungrouped_column(h, statement.group_by, scope, storage, txid)
+        && let Some(column) = ungrouped_column(h, statement.group_by, scope, agg_nodes)
     {
         return Err(ungrouped_error(column, scope));
     }
@@ -878,7 +887,7 @@ pub(super) fn grouped_rows<'a>(
         // The sort key evaluates against the group, so it faces the same
         // grouping rule as a select item (42803, not a missing-column error).
         if let Some(column) =
-            ungrouped_column(target.expression, statement.group_by, scope, storage, txid)
+            ungrouped_column(target.expression, statement.group_by, scope, agg_nodes)
         {
             return Err(ungrouped_error(column, scope));
         }
@@ -1299,27 +1308,21 @@ fn ungrouped_column<'e, 'a>(
     expression: &'e Expr<'a>,
     group_by: &[&Expr<'a>],
     scope: &QueryScope<'a>,
-    storage: &Storage,
-    txid: u32,
+    agg_nodes: &[(*const Expr<'a>, &Expr<'a>)],
 ) -> Option<&'e Expr<'a>> {
-    let catalog_aggregate = matches!(
-        expression,
-        Expr::Call { name, args, order_by, .. }
-            if storage.has_aggregate_candidate(name, args.len(), txid)
-                || storage.has_aggregate_candidate(name, args.len() + order_by.len(), txid)
-    );
     if group_by
         .iter()
         .any(|g| **g == *expression || same_scope_column(scope, g, expression))
-        || expression.is_aggregate()
-        || catalog_aggregate
+        || agg_nodes
+            .iter()
+            .any(|(pointer, _)| core::ptr::eq(*pointer, expression))
     {
         return None;
     }
     let first = |parts: &[&'e Expr<'a>]| {
         parts
             .iter()
-            .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
+            .find_map(|e| ungrouped_column(e, group_by, scope, agg_nodes))
     };
     match expression {
         Expr::Column { .. }
@@ -1335,6 +1338,7 @@ fn ungrouped_column<'e, 'a>(
         | Expr::Float(_)
         | Expr::NumericLit(_)
         | Expr::Str(_)
+        | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
@@ -1352,18 +1356,17 @@ fn ungrouped_column<'e, 'a>(
         | Expr::IsNull { operand, .. }
         | Expr::InSubquery { operand, .. }
         | Expr::QuantifiedSubquery { operand, .. } => {
-            ungrouped_column(operand, group_by, scope, storage, txid)
+            ungrouped_column(operand, group_by, scope, agg_nodes)
         }
         Expr::Binary { left, right, .. } => first(&[left, right]),
         Expr::Call { args, .. } => args
             .iter()
-            .find_map(|a| ungrouped_column(a, group_by, scope, storage, txid)),
-        Expr::InList { operand, list, .. } => {
-            ungrouped_column(operand, group_by, scope, storage, txid).or_else(|| {
+            .find_map(|a| ungrouped_column(a, group_by, scope, agg_nodes)),
+        Expr::InList { operand, list, .. } => ungrouped_column(operand, group_by, scope, agg_nodes)
+            .or_else(|| {
                 list.iter()
-                    .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
-            })
-        }
+                    .find_map(|e| ungrouped_column(e, group_by, scope, agg_nodes))
+            }),
         Expr::Like {
             operand, pattern, ..
         }
@@ -1376,22 +1379,18 @@ fn ungrouped_column<'e, 'a>(
             otherwise,
             ..
         } => operand
-            .and_then(|o| ungrouped_column(o, group_by, scope, storage, txid))
+            .and_then(|o| ungrouped_column(o, group_by, scope, agg_nodes))
             .or_else(|| whens.iter().find_map(|(c, r)| first(&[c, r])))
-            .or_else(|| {
-                otherwise.and_then(|o| ungrouped_column(o, group_by, scope, storage, txid))
-            }),
+            .or_else(|| otherwise.and_then(|o| ungrouped_column(o, group_by, scope, agg_nodes))),
         Expr::Array(items) => items
             .iter()
-            .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid)),
+            .find_map(|e| ungrouped_column(e, group_by, scope, agg_nodes)),
         Expr::Subscript { base, index } => first(&[base, index]),
-        Expr::Slice { base, lower, upper } => {
-            ungrouped_column(base, group_by, scope, storage, txid)
-                .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
-                .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
-        }
+        Expr::Slice { base, lower, upper } => ungrouped_column(base, group_by, scope, agg_nodes)
+            .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope, agg_nodes)))
+            .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope, agg_nodes))),
         Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
-            ungrouped_column(base, group_by, scope, storage, txid)
+            ungrouped_column(base, group_by, scope, agg_nodes)
         }
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }

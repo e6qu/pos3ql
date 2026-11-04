@@ -367,6 +367,7 @@ fn set_tree_requires_equality(tree: &SetTree<'_>) -> bool {
             all,
             left,
             right,
+            ..
         } => {
             !(*operator == SetOp::Union && *all)
                 || set_tree_requires_equality(left)
@@ -497,6 +498,7 @@ fn external_set_tree<'a>(
         all,
         left,
         right,
+        ..
     } = tree
     else {
         let SetTree::Select(select) = tree else {
@@ -1124,7 +1126,7 @@ fn merge_set_collations(
         (Explicit, Explicit) if left.value != right.value => {
             return Err(sql_err!(
                 sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
+                "collation mismatch between explicit collations \"{}\" and \"{}\"",
                 left.value.name(),
                 right.value.name()
             ));
@@ -1184,6 +1186,7 @@ fn describe_set_collations(
             all,
             left,
             right,
+            ..
         } => {
             let left = describe_set_collations(
                 left,
@@ -1389,6 +1392,7 @@ fn eval_set_tree<'a>(
             all,
             left,
             right,
+            ..
         } => {
             let l = eval_set_tree(
                 left, storage, txid, arena, params, sequences, target, collations,

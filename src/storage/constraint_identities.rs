@@ -115,6 +115,11 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
             .oid()
     }
 
+    pub(crate) fn column_constraint_identity(&self, column: usize) -> Option<ConstraintIdentity> {
+        let attribute = usize::from(self.attributes.number(column)? - 1);
+        self.inline_constraint_identities.as_ref()[attribute]
+    }
+
     pub(crate) fn constraint_identities(
         &self,
     ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
@@ -144,10 +149,35 @@ impl<B: super::DefinitionBacking> super::TableDefinition<B> {
                     .iter()
                     .map(|check| check.identity),
             )
+            .chain(self.uniques().iter().map(|key| key.identity))
+            .chain(self.exclusions().iter().map(|key| key.identity))
+            .chain(
+                self.inline_constraint_identities
+                    .as_ref()
+                    .iter()
+                    .zip(self.attributes.slots.as_ref())
+                    .filter_map(|(identity, slot)| match *slot {
+                        super::column_attributes::AttributeSlot::Live(column)
+                            if self.columns.as_ref()[usize::from(column)].primary
+                                || self.columns.as_ref()[usize::from(column)].unique =>
+                        {
+                            Some(*identity)
+                        }
+                        _ => None,
+                    }),
+            )
     }
 }
 
 impl super::TableDefBuilder {
+    pub(crate) fn take_column_constraint_identity(
+        &mut self,
+        column: usize,
+    ) -> Option<ConstraintIdentity> {
+        let attribute = usize::from(self.attributes.number(column)? - 1);
+        self.inline_constraint_identities[attribute].take()
+    }
+
     pub(crate) fn constraint_identities_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
@@ -178,6 +208,30 @@ impl super::TableDefBuilder {
                     .detached_bound
                     .iter_mut()
                     .map(|check| &mut check.identity),
+            )
+            .chain(
+                self.uniques[..self.n_uniques]
+                    .iter_mut()
+                    .map(|key| &mut key.identity),
+            )
+            .chain(
+                self.exclusions[..self.n_exclusions]
+                    .iter_mut()
+                    .map(|key| &mut key.identity),
+            )
+            .chain(
+                self.inline_constraint_identities
+                    .iter_mut()
+                    .zip(&self.attributes.slots)
+                    .filter_map(move |(identity, slot)| match *slot {
+                        super::column_attributes::AttributeSlot::Live(column)
+                            if columns[usize::from(column)].primary
+                                || columns[usize::from(column)].unique =>
+                        {
+                            Some(identity)
+                        }
+                        _ => None,
+                    }),
             )
     }
 }
@@ -285,6 +339,22 @@ impl Storage {
                     [usize::from(column)]
                 .not_null
                 .is_required(),
+                _ => false,
+            };
+            if !active {
+                *identity = None;
+            }
+        }
+        for (identity, slot) in definition
+            .inline_constraint_identities
+            .iter_mut()
+            .zip(&definition.attributes.slots)
+        {
+            let active = match *slot {
+                super::column_attributes::AttributeSlot::Live(column) => {
+                    let column = &definition.columns[usize::from(column)];
+                    column.primary || column.unique
+                }
                 _ => false,
             };
             if !active {
@@ -407,7 +477,7 @@ impl Storage {
                         &seen,
                         &mut owned,
                     )?;
-                    if let Some(pending) = domain.pending_definition {
+                    if let Some(pending) = &domain.pending_definition {
                         validate_window(
                             pending.spec.constraint_identities(),
                             domain.created_at,
@@ -443,6 +513,119 @@ mod tests {
     }
 
     #[test]
+    fn key_constraints_keep_independent_identities_through_index_replacement_and_restore() {
+        let mut config = test_config();
+        config.max_tables = 2;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let mut restored_budget = test_budget(&config);
+        let mut restored = Storage::new(&config, &mut restored_budget, 0).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut definition = make_def(
+                "key_owner",
+                &[("id", ColType::Int4, true), ("value", ColType::Int4, false)],
+            );
+            definition.columns[0].primary = true;
+            definition.columns[0].unique = true;
+            definition.columns[1].unique = true;
+            definition.n_uniques = 1;
+            definition.uniques[0].name = SqlName::parse("pair_key").unwrap();
+            definition.uniques[0].columns[..2].copy_from_slice(&[0, 1]);
+            definition.uniques[0].n_cols = 2;
+            definition.n_exclusions = 1;
+            definition.exclusions[0].name = SqlName::parse("value_exclusion").unwrap();
+            definition.exclusions[0].columns[0] = 1;
+            definition.exclusions[0].n_cols = 1;
+            let slot = storage.create_table(definition).unwrap();
+            let position = CatalogPosition::new(slot, storage.table(slot).created_at()).unwrap();
+            let mut replacement =
+                super::super::TableDefBuilder::from_definition(&storage.table_def(slot, 0));
+            let primary = replacement.column_constraint_identity(0).unwrap();
+            assert_ne!(
+                primary.oid(),
+                replacement.column_index_identity(0).unwrap().oid()
+            );
+            assert_ne!(replacement.uniques[0].identity, Some(primary));
+            assert_eq!(replacement.constraint_identities().count(), 5);
+
+            let mut named = super::super::UniqueKey::EMPTY;
+            named.name = replacement.take_column_key_name(0).unwrap();
+            named.kind = super::super::UniqueKeyKind::Primary;
+            named.columns[0] = 0;
+            named.n_cols = 1;
+            named.identity = replacement.take_column_constraint_identity(0);
+            named.index_identity = replacement.take_column_index_identity(0);
+            replacement.columns[0].primary = false;
+            replacement.columns[0].unique = false;
+            replacement.uniques[1] = named;
+            replacement.n_uniques = 2;
+            let constraints: [Option<ConstraintIdentity>; 5] = core::array::from_fn(|position| {
+                replacement.constraint_identities().nth(position).unwrap()
+            });
+            let indexes: [Option<super::super::RelationIdentity>; 4] =
+                core::array::from_fn(|position| {
+                    replacement
+                        .implicit_index_identities()
+                        .nth(position)
+                        .unwrap()
+                });
+            for identity in replacement.implicit_index_identities_mut() {
+                *identity = None;
+            }
+            storage
+                .reserve_table_catalog_identities(&mut replacement)
+                .unwrap();
+            assert!(replacement.constraint_identities().eq(constraints));
+            assert!(
+                replacement
+                    .implicit_index_identities()
+                    .zip(indexes)
+                    .all(|(new, old)| new != old)
+            );
+            assert_eq!(replacement.uniques[1].identity, Some(primary));
+            assert_eq!(replacement.inline_constraint_identities[0], None);
+
+            restored
+                .restore_table(position, replacement.clone(), TableCreation::Committed)
+                .unwrap();
+            {
+                let recovered = restored.table_def(slot, 0);
+                assert!(
+                    recovered
+                        .constraint_identities()
+                        .eq(replacement.constraint_identities())
+                );
+                assert!(
+                    recovered
+                        .implicit_index_identities()
+                        .eq(replacement.implicit_index_identities())
+                );
+            }
+            restored
+                .validate_restored_constraint_identities(restored.catalog_identity_sequence())
+                .unwrap();
+
+            let mut invalid = replacement.clone();
+            invalid.uniques[0].identity = invalid.exclusions[0].identity;
+            assert_eq!(
+                validate_constraint_identities(invalid.constraint_identities())
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::DATA_EXCEPTION
+            );
+            replacement.name = SqlName::parse("copied_key_owner").unwrap();
+            let copied = storage.create_table(replacement).unwrap();
+            let copied = storage.table_def(copied, 0);
+            assert!(
+                copied
+                    .constraint_identities()
+                    .flatten()
+                    .all(|identity| !constraints.contains(&Some(identity)))
+            );
+        });
+    }
+
+    #[test]
     fn constraint_identity_restore_rejects_bad_definitions_without_catalog_or_counter_changes() {
         let mut config = test_config();
         config.max_tables = 2;
@@ -457,7 +640,7 @@ mod tests {
             let before = storage.catalog_identity_sequence();
             let position = CatalogPosition::new(1, before + 10).unwrap();
             for rejected_kind in 0..3 {
-                let mut rejected = original;
+                let mut rejected = original.clone();
                 rejected.name = SqlName::parse("rejected_restore").unwrap();
                 match rejected_kind {
                     0 => rejected.checks[0].identity = None,

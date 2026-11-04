@@ -281,7 +281,7 @@ fn create<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let (slot, oid) =
         storage.create_large_object(crate::storage::CatalogCreation::New, requested, txn.txid)?;
-    if let Err(error) = txn.record_ddl(DdlUndo::LargeObjectCreated(slot as u32)) {
+    if let Err(error) = txn.record_ddl(storage, DdlUndo::LargeObjectCreated(slot as u32)) {
         storage.rollback_large_object_create(slot);
         return Err(error);
     }
@@ -500,7 +500,7 @@ fn unlink(
         .drop_large_object(oid, txn.txid)?
         .ok_or_else(|| missing(oid))?;
     debug_assert_eq!(dropped, slot);
-    if let Err(error) = txn.record_ddl(DdlUndo::LargeObjectDropped(dropped as u32)) {
+    if let Err(error) = txn.record_ddl(storage, DdlUndo::LargeObjectDropped(dropped as u32)) {
         storage.rollback_large_object_drop(dropped, txn.txid);
         return Err(error);
     }

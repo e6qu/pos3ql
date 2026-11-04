@@ -11,12 +11,23 @@ use super::ast::{BinaryOp, CastBinding, Collation, Expr, GroupingSet, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ArrElem, ColType, Datum, RecordField};
 
+/// The selected callable identity, or the reason no unique callable was selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineCallSelection {
+    Stored(usize),
+    Builtin { oid: i32, schema: &'static str },
+    Absent,
+    Ambiguous,
+    WrongKind { is_procedure: bool },
+}
+
 mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
     cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
-    validate_bits, validate_catalog_reference_cast,
+    validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
+    validate_geometry_type_cast,
 };
 
 mod args;
@@ -47,7 +58,7 @@ pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 
 #[derive(Clone, Copy)]
 pub struct Diagnostic {
-    pub detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
+    pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     pub hint: Option<StackStr<128>>,
 }
 
@@ -57,7 +68,7 @@ std::thread_local! {
 }
 
 pub fn stash_diagnostic(
-    detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
+    detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     hint: Option<StackStr<128>>,
 ) {
     PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
@@ -275,6 +286,7 @@ pub mod sqlstate {
     /// Evaluation yielded a scalar routine which must run after the caller
     /// releases its immutable storage borrow.
     pub(crate) const INTERNAL_ROUTINE_INVOCATION: &str = "PZ003";
+    pub(crate) const INTERNAL_QUERY_CONSUMER_COMPLETE: &str = "PZ004";
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
@@ -317,6 +329,51 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Declared size/precision, or the registered shape of a record column.
+    fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
+        -1
+    }
+
+    /// Resolves declared types and scope errors without reading a row value.
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.col_type(qualifier, name)
+            .or_else(|| {
+                qualifier
+                    .is_none()
+                    .then(|| self.whole_row_type(name))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                if let Some(qualifier) = qualifier
+                    && self.whole_row_type(qualifier).is_some()
+                {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    )
+                } else if self.is_empty_scope() {
+                    empty_scope_column_error(qualifier, name)
+                } else {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                }
+            })
+    }
+
+    /// True only when this lookup has no relation scope, including outer scopes.
+    fn is_empty_scope(&self) -> bool {
+        false
+    }
+
     fn recursive_state(&self, qualifier: &str, _index: usize) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -347,6 +404,11 @@ pub trait ColumnLookup<'a> {
             "whole-row reference to \"{}\" is not supported in this context",
             table
         ))
+    }
+
+    /// Declared fields by position, without reading or evaluating row values.
+    fn whole_row_column(&self, _table: &str, _index: usize) -> Option<crate::storage::ColumnMeta> {
+        None
     }
 
     /// Fields used by `(row).*` and `ROW(row.*, ...)`. Unlike a whole-row
@@ -407,6 +469,11 @@ pub trait ColumnLookup<'a> {
     fn whole_row_is_scalar(&self, _table: &str) -> bool {
         false
     }
+
+    /// Declared whole-row identity, without looking up or constructing values.
+    fn whole_row_type(&self, _table: &str) -> Option<ColType> {
+        None
+    }
 }
 
 /// Static type identity retained until a context decides how PostgreSQL
@@ -442,7 +509,7 @@ pub(crate) fn expression_type_identity<'a>(
     row: &dyn ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<ExpressionTypeIdentity, SqlError> {
-    if let Expr::BoundDefault { type_oid, .. } = expression {
+    if let Expr::BoundDefault { type_oid, .. } | Expr::BoundLiteral { type_oid, .. } = expression {
         return Ok(ExpressionTypeIdentity::Known(*type_oid));
     }
     if let Expr::Collate { operand, .. } = expression {
@@ -480,7 +547,12 @@ pub(crate) fn expression_type_identity<'a>(
             });
     }
     if let Expr::Field { base, field } = expression
-        && let Expr::Call { name, args, .. } = &**base
+        && let Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } = &**base
         && name.eq_ignore_ascii_case("row")
         && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
             .iter()
@@ -549,7 +621,11 @@ pub(crate) fn expression_type_identity<'a>(
     // ROW() determines the anonymous record identity from its constructor,
     // including `record.*` arguments whose individual expressions are not
     // scalar values. Do not recursively type those expansion sentinels.
-    if let Expr::Call { name, .. } = expression
+    if let Expr::Call {
+        kind: super::ast::CallKind::SqlSyntax,
+        name,
+        ..
+    } = expression
         && name.eq_ignore_ascii_case("row")
     {
         return Ok(ExpressionTypeIdentity::Known(super::types::oid::RECORD));
@@ -567,6 +643,7 @@ pub(crate) fn expression_type_identity<'a>(
         return expression_type_identity(base, row, hooks);
     }
     if let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -588,6 +665,7 @@ pub(crate) fn expression_type_identity<'a>(
         if resolved
             && let Some(result_oid) = catalog.routine_result_oid(
                 name,
+                *kind,
                 *bound_oid,
                 argument_names,
                 *variadic,
@@ -626,6 +704,41 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
 }
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "enum input validation requires a catalog"
+                )
+            })?
+            .validate_enum_input_literal(text, target_oid)
+    }
+
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        match self.catalog {
+            Some(catalog) => catalog.validate_explicit_cast(source, target_oid, target),
+            None => validate_catalog_reference_cast(source, target),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+
+    fn type_name_fixed(&self, type_oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
+        let named = match self.catalog {
+            Some(catalog) => catalog.type_name_fixed(type_oid)?,
+            None => None,
+        };
+        Ok(named.or_else(|| super::exec::builtin_type_name_fixed(type_oid)))
+    }
+
     fn column_meta(
         &self,
         qualifier: Option<&str>,
@@ -639,7 +752,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         Some(crate::sql::exec::StaticTypeMeta {
             type_oid,
             ctype,
-            type_mod: -1,
+            type_mod: self.row.column_type_mod(qualifier, name),
             collation: self.row.collation(qualifier, name),
         })
     }
@@ -649,13 +762,40 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.row.col_type(qualifier, name).ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
-            )
-        })
+        self.row.resolve_column_type(qualifier, name)
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        self.row.whole_row_type(name).is_some()
+    }
+
+    fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
+        self.row
+            .whole_row_type(name)
+            .filter(|ctype| *ctype != ColType::Record)
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let column = self.row.whole_row_column(name, index)?;
+        let type_oid = match column.user_type {
+            Some(identity) => self
+                .catalog?
+                .declared_user_type_oid(column.ctype, identity)?,
+            None => column.ctype.oid(),
+        };
+        Some((
+            StackStr::from_str(column.name.as_str()),
+            crate::sql::exec::StaticTypeMeta {
+                type_oid,
+                ctype: column.ctype,
+                type_mod: column.type_mod,
+                collation: column.collation,
+            },
+        ))
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -705,9 +845,29 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         }
     }
 
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: super::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<RoutineCallSelection> {
+        self.catalog?.routine_call_selection(
+            name,
+            kind,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+        )
+    }
+
     fn routine_result(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -715,6 +875,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         let type_oid = self.catalog?.routine_result_oid(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -741,12 +902,20 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             super::ast::CATALOG_OPERATOR_CALL_PREFIX,
             name
         );
-        self.routine_result(encoded.as_str(), None, &[], false, &[left, right])
+        self.routine_result(
+            encoded.as_str(),
+            super::ast::CallKind::SqlSyntax,
+            None,
+            &[],
+            false,
+            &[left, right],
+        )
     }
 
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -755,6 +924,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         self.catalog?.routine_record_field(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -786,6 +956,21 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        (**self).column_type_mod(qualifier, name)
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        (**self).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        (**self).is_empty_scope()
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         (**self).lookup(qualifier, name)
     }
@@ -796,6 +981,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         (**self).whole_row_present(table)
+    }
+
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        (**self).whole_row_column(table, index)
     }
 
     fn whole_row_fields(
@@ -824,6 +1013,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         (**self).whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        (**self).whole_row_type(table)
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
@@ -863,13 +1056,28 @@ pub fn qualifier_answers_target(
 
 pub struct NoColumns;
 
-impl<'a> ColumnLookup<'a> for NoColumns {
-    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        Err(sql_err!(
+pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> SqlError {
+    match qualifier {
+        Some(table) => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            table
+        ),
+        None => sql_err!(
             sqlstate::UNDEFINED_COLUMN,
             "column \"{}\" does not exist",
             name
-        ))
+        ),
+    }
+}
+
+impl<'a> ColumnLookup<'a> for NoColumns {
+    fn is_empty_scope(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(empty_scope_column_error(qualifier, name))
     }
 }
 
@@ -965,10 +1173,124 @@ pub enum DescriptionTarget<'a> {
     },
 }
 
+/// Parser-created SQL expressions are syntax, not namespace-resolved routines.
+pub(crate) fn is_sql_syntax_call(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            ..
+        }
+    )
+}
+
+pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
+    matches!(
+        name,
+        "coalesce"
+            | "greatest"
+            | "least"
+            | "nullif"
+            | "row"
+            | "grouping"
+            | "json_scalar"
+            | "xmlconcat"
+            | "merge_action"
+            | "current_date"
+            | "current_timestamp"
+            | "current_time"
+            | "localtimestamp"
+            | "localtime"
+            | "current_user"
+            | "current_role"
+            | "session_user"
+            | "user"
+            | "current_catalog"
+            | "current_schema"
+            | "similar to"
+            | "overlaps periods"
+            | "__is_json_scalar"
+            | "__is_json_array"
+            | "__is_json_object"
+            | "__is_json_value"
+            | "__is_json_scalar_unique"
+            | "__is_json_array_unique"
+            | "__is_json_object_unique"
+            | "__is_json_value_unique"
+            | "__xmlparse_document"
+            | "__xmlparse_content"
+            | "__xmlserialize"
+            | "__xmlelement"
+            | "__xmlforest"
+            | "__xmlpi"
+            | "__xmlroot"
+            | "__xmlexists"
+            | "__json_unique"
+            | "__json"
+            | "__json_format"
+            | "__json_array_absent_json"
+            | "__json_array_absent_jsonb"
+            | "__json_array_absent_text"
+            | "__json_array_absent_bytea"
+            | "__json_array_null_json"
+            | "__json_array_null_jsonb"
+            | "__json_array_null_text"
+            | "__json_array_null_bytea"
+            | "__json_object_unique_json"
+            | "__json_object_unique_jsonb"
+            | "__json_object_unique_text"
+            | "__json_object_unique_bytea"
+            | "__json_object_json"
+            | "__json_object_jsonb"
+            | "__json_object_text"
+            | "__json_object_bytea"
+            | "__json_serialize_bytea"
+            | "__json_serialize_text"
+            | "__json_exists_true"
+            | "__json_exists_unknown"
+            | "__json_exists_error"
+            | "__json_exists_false"
+            | "__json_value"
+            | "__json_query_json"
+            | "__json_query_jsonb"
+            | "__json_query_text"
+            | "__json_query_bytea"
+            | "__json_arrayagg_absent_json"
+            | "__json_arrayagg_null_json"
+            | "__json_arrayagg_absent_jsonb"
+            | "__json_arrayagg_null_jsonb"
+            | "__json_objectagg_null_json"
+            | "__json_objectagg_absent_json"
+            | "__json_objectagg_null_unique_json"
+            | "__json_objectagg_absent_unique_json"
+            | "__json_objectagg_null_jsonb"
+            | "__json_objectagg_absent_jsonb"
+            | "__json_objectagg_null_unique_jsonb"
+            | "__json_objectagg_absent_unique_jsonb"
+            | "__json_table_passing"
+            | "__xml_namespaces"
+            | "__xml_table_ordinality"
+            | "__xml_table_column"
+            | "__xml_table_columns"
+            | "__json_record_column"
+            | "__json_record_columns"
+            | "__json_table_columns"
+            | "__json_table_nested"
+            | "__json_table_ordinality"
+            | "__json_table_exists"
+            | "__json_table_value"
+            | "__jsonb_subscript_set"
+    )
+}
+
 /// A callee chosen before evaluating its inputs. Stored functions keep their
 /// catalog identity and named/variadic input mapping through argument effects.
 #[derive(Clone, Copy)]
 pub enum RoutineCallTarget<'name> {
+    Builtin {
+        oid: i32,
+        schema: &'static str,
+    },
     Stored {
         oid: i32,
         argument_mapping: [u8; crate::storage::MAX_ROUTINE_ARGUMENTS],
@@ -982,7 +1304,31 @@ pub enum RoutineCallTarget<'name> {
     },
 }
 
+/// Component privileges belong to the aggregate owner; its function body still
+/// executes with the query caller's identity unless SECURITY DEFINER applies.
+#[derive(Clone, Copy)]
+pub enum RoutineCallAccess {
+    Caller,
+    Aggregate(i32),
+}
+
 pub trait CatalogAccess {
+    fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input validation requires a catalog"
+        ))
+    }
+
+    fn validate_explicit_cast(
+        &self,
+        source: i32,
+        _target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        validate_catalog_reference_cast(source, target)
+    }
+
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1231,9 +1577,14 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "record fields require the explicit bound call contract and field index"
+    )]
     fn routine_record_field(
         &self,
         _name: &str,
+        _kind: crate::sql::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1311,6 +1662,7 @@ pub trait CatalogAccess {
     fn resolve_routine_call<'name>(
         &self,
         _name: &'name str,
+        _kind: super::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1322,6 +1674,7 @@ pub trait CatalogAccess {
     fn routine_evaluation(
         &self,
         _name: &str,
+        _kind: super::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1344,6 +1697,7 @@ pub trait CatalogAccess {
         _target: RoutineCallTarget<'_>,
         _arguments: &[&'a Expr<'a>],
         _argument_type_oids: &[i32],
+        _argument_collation: &dyn Fn(&'a Expr<'a>) -> Result<Option<DerivedCollation>, SqlError>,
         _evaluate: &mut dyn FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -1360,6 +1714,8 @@ pub trait CatalogAccess {
         _oid: i32,
         _arguments: &[Datum<'a>],
         _argument_type_oids: &[i32],
+        _input_collation: super::ast::Collation,
+        _access: RoutineCallAccess,
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
@@ -1381,15 +1737,46 @@ pub trait CatalogAccess {
     ) -> Result<Option<ExpressionEvaluation>, SqlError> {
         Ok(None)
     }
-    /// Applies a catalog-defined cast in the context that selected it.
-    /// `None` means no visible cast has this exact source/target identity.
+    /// Selects a registered cast or array-element conversion before effects.
+    /// `None` means no applicable registered conversion exists in this context.
+    fn bind_defined_cast(
+        &self,
+        _source_oid: i32,
+        _target_oid: i32,
+        _context: DefinedCastContext,
+    ) -> Result<Option<BoundCast>, SqlError> {
+        Ok(None)
+    }
+
+    fn execute_bound_cast<'a>(
+        &self,
+        _cast: &BoundCast,
+        _value: Datum<'a>,
+        _target_type_mod: i32,
+        _input_collation: super::ast::Collation,
+        _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "selected cast execution is unavailable"
+        ))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cast execution preserves target type modifier and input collation"
+    )]
     fn cast_defined<'a>(
         &self,
         _source_oid: i32,
         _target_oid: i32,
+        _target_type_mod: i32,
         _value: Datum<'a>,
         _context: DefinedCastContext,
+        _input_collation: super::ast::Collation,
         _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -1409,11 +1796,17 @@ pub trait CatalogAccess {
     /// Executes a search-path-resolved user-defined binary operator. `None`
     /// means the catalog has no matching definition and builtin resolution
     /// continues.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "operator keeps selected and per-argument collations"
+    )]
     fn call_operator<'a>(
         &self,
         _name: &str,
         _arguments: [Datum<'a>; 2],
         _argument_type_oids: [i32; 2],
+        _input_collation: super::ast::Collation,
+        _argument_collations: [super::ast::Collation; 2],
         _nulls: OperatorNulls,
         _arena: &'a Arena,
     ) -> Result<Option<OperatorEvaluation<'a>>, SqlError> {
@@ -1429,9 +1822,22 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    fn routine_call_selection(
+        &self,
+        _name: &str,
+        _kind: super::ast::CallKind,
+        _bound_oid: Option<i32>,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _arguments: &[i32],
+    ) -> Option<RoutineCallSelection> {
+        None
+    }
+
     fn routine_result_oid(
         &self,
         _name: &str,
+        _kind: crate::sql::ast::CallKind,
         _bound_oid: Option<i32>,
         _argument_names: &[Option<&str>],
         _variadic: bool,
@@ -1783,6 +2189,11 @@ pub trait CatalogAccess {
         oid: u32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
+    /// SQL spelling of a user-defined type OID without statement allocation.
+    fn type_name_fixed(&self, _oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
+        Ok(None)
+    }
+
     /// SQL spelling of a user-defined type OID for `format_type`.
     fn type_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
@@ -1791,7 +2202,12 @@ pub trait CatalogAccess {
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
-    fn rule_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+    fn rule_def<'a>(
+        &self,
+        _oid: i32,
+        _pretty: bool,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// Bytes occupied by the relation's stored row images. Relations without
@@ -1852,6 +2268,7 @@ pub trait CatalogAccess {
         _type_name: &str,
         _value: Datum<'a>,
         _arena: &'a Arena,
+        _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
@@ -1908,6 +2325,21 @@ pub enum DefinedCastContext {
     Explicit,
     Assignment,
     Implicit,
+}
+
+/// A selected conversion retains its catalog definition while an array source
+/// or an earlier element runs. Execution must not resolve its name again.
+#[derive(Clone, Copy)]
+pub struct BoundCast {
+    pub(crate) source_oid: i32,
+    pub(crate) target_oid: i32,
+    pub(crate) leaf_source_oid: i32,
+    pub(crate) leaf_target_oid: i32,
+    pub(crate) definition: crate::storage::CastDef,
+    pub(crate) context: DefinedCastContext,
+    pub(crate) strict: bool,
+    pub(crate) volatility: crate::storage::RoutineVolatility,
+    pub(crate) leakproof: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2047,6 +2479,7 @@ fn catalog_evaluation(
 ) -> Result<Option<ExpressionEvaluation>, SqlError> {
     let mut found = None;
     if let Expr::Call {
+        kind,
         name,
         bound_oid,
         args,
@@ -2070,7 +2503,9 @@ fn catalog_evaluation(
                     expression_type_identity(argument, &NoColumns, &hooks)?.routine_argument_oid();
             }
             let types = &types[..args.len()];
-            if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+            if *kind == super::ast::CallKind::SqlSyntax
+                && let Some((schema, operator)) = super::ast::catalog_operator_call(name)
+            {
                 found = catalog.operator_evaluation(schema, operator, types)?;
             } else {
                 found = super::catalog::intrinsic_routine_evaluation(name, types, |from, to| {
@@ -2084,6 +2519,7 @@ fn catalog_evaluation(
                 if found != Some(ExpressionEvaluation::Runtime)
                     && let Some(evaluation) = catalog.routine_evaluation(
                         name,
+                        *kind,
                         *bound_oid,
                         argument_names,
                         *variadic,
@@ -2099,6 +2535,7 @@ fn catalog_evaluation(
         operator,
         left,
         right,
+        ..
     } = expression
         && let Some(name) = operator.operator_name()
         && catalog.has_operator_candidate(name)
@@ -2154,6 +2591,57 @@ fn catalog_evaluation(
             } else {
                 None
             };
+            if found.is_none()
+                && let Some((kind, _, _)) = crate::storage::NamedTypeKind::from_oid(target)
+            {
+                // UNKNOWN labels have already passed effect-free type input.
+                // Typed text uses stable enum input at runtime; domain and
+                // composite conversions can execute checks.
+                found = Some(
+                    if kind == crate::storage::NamedTypeKind::Enum
+                        && (source == super::types::oid::UNKNOWN || source == target)
+                    {
+                        ExpressionEvaluation::Immutable
+                    } else {
+                        ExpressionEvaluation::Runtime
+                    },
+                );
+            }
+            if *binding == CastBinding::Resolve
+                && let Some(ColType::Array(element)) =
+                    constructor_type_from_oid(target, &|oid| catalog.domain_base_type(oid))
+            {
+                let columns = RuntimeColumnTypes {
+                    row: &NoColumns,
+                    catalog: Some(catalog),
+                };
+                super::exec::visit_array_constructor_conversions(
+                    operand,
+                    element,
+                    &columns,
+                    &mut |source, target| {
+                        if found != Some(ExpressionEvaluation::Runtime) {
+                            if let Some(evaluation) = catalog.cast_evaluation(source, target)? {
+                                found = Some(evaluation);
+                            } else if let Some((kind, _, _)) =
+                                crate::storage::NamedTypeKind::from_oid(target)
+                            {
+                                found = Some(
+                                    if kind == crate::storage::NamedTypeKind::Enum
+                                        && (source == super::types::oid::UNKNOWN
+                                            || source == target)
+                                    {
+                                        ExpressionEvaluation::Immutable
+                                    } else {
+                                        ExpressionEvaluation::Runtime
+                                    },
+                                );
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
         }
     }
     super::query::walk_children(expression, &mut |child| {
@@ -2171,7 +2659,7 @@ pub(super) fn constant_evaluation(
     expression: &Expr<'_>,
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<Option<ExpressionEvaluation>, SqlError> {
-    if !expression.is_constant() {
+    if !expression.is_constant(catalog.is_some()) {
         return Ok(Some(ExpressionEvaluation::Runtime));
     }
     match catalog {
@@ -2230,6 +2718,7 @@ fn fold_check<'a>(
         | Expr::NumericLit(_)
         | Expr::Str(_)
         | Expr::BitLit(_)
+        | Expr::BoundLiteral { .. }
         | Expr::Column { .. }
         | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
@@ -2244,6 +2733,7 @@ fn fold_check<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             // FALSE settles AND; otherwise the result is known only when both
             // sides fold to TRUE (`TRUE AND TRUE` = TRUE).
@@ -2264,6 +2754,7 @@ fn fold_check<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             // TRUE settles OR; otherwise the result is known only when both
             // sides fold to FALSE (`FALSE OR FALSE` = FALSE) — so a constant
@@ -2287,7 +2778,41 @@ fn fold_check<'a>(
         Expr::Unary {
             operator: super::ast::UnaryOp::Not,
             operand,
+            ..
         } => Ok(fold_check(operand, arena, catalog)?.map(|b| !b)),
+        Expr::Cast {
+            operand: Expr::Array(items),
+            type_name,
+            ..
+        } if ColType::from_sql_name(type_name)
+            .or_else(|| {
+                let catalog = catalog?;
+                constructor_type_from_oid(catalog.user_type_oid(type_name)?, &|oid| {
+                    catalog.domain_base_type(oid)
+                })
+            })
+            .is_some_and(|target| matches!(target, ColType::Array(_))) =>
+        {
+            fn inputs<'a>(
+                items: &[&Expr<'a>],
+                arena: &'a Arena,
+                catalog: Option<&dyn CatalogAccess>,
+            ) -> Result<(), SqlError> {
+                for item in items {
+                    match item {
+                        Expr::Array(children) => inputs(children, arena, catalog)?,
+                        _ => {
+                            fold_check(item, arena, catalog)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // The cast owns the element context, including nested ARRAY[].
+            // Check source expressions without executing runtime conversions.
+            inputs(items, arena, catalog)?;
+            Ok(None)
+        }
         Expr::Unary { operand, .. }
         | Expr::Cast { operand, .. }
         | Expr::BoundDefault {
@@ -2312,9 +2837,19 @@ fn fold_check<'a>(
             Ok(None)
         }
         Expr::Like {
-            operand, pattern, ..
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            fold_check(operand, arena, catalog)?;
+            fold_check(pattern, arena, catalog)?;
+            if let Some(escape) = escape {
+                fold_check(escape, arena, catalog)?;
+            }
+            Ok(None)
         }
-        | Expr::Match {
+        Expr::Match {
             operand, pattern, ..
         } => {
             fold_check(operand, arena, catalog)?;
@@ -2541,9 +3076,18 @@ fn eval_binary_values<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) =
-            catalog.call_operator(name, [l, r], [left_oid, right_oid], nulls, arena)?
-        {
+        if let Some(value) = catalog.call_operator(
+            name,
+            [l, r],
+            [left_oid, right_oid],
+            routine_input_collation(&[left, right], row, hooks.catalog)?,
+            [
+                coercion_input_collation(left, row, hooks.catalog)?,
+                coercion_input_collation(right, row, hooks.catalog)?,
+            ],
+            nulls,
+            arena,
+        )? {
             return Ok(value);
         }
     }
@@ -2758,12 +3302,14 @@ pub(crate) fn routine_input_handoff(
 ) -> bool {
     match expression {
         Expr::Call {
+            kind,
             name,
             bound_oid,
             args,
             ..
         } => {
-            let builtin_operator = bound_oid.is_none()
+            let builtin_operator = *kind == super::ast::CallKind::SqlSyntax
+                && bound_oid.is_none()
                 && super::ast::catalog_operator_call(name).is_some_and(|(schema, symbol)| {
                     schema == Some("pg_catalog")
                         && catalog.is_none_or(|catalog| !catalog.has_operator_candidate(symbol))
@@ -2821,11 +3367,38 @@ pub fn eval_full<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let evaluate = || {
+        // Grouped/window results belong to the original plan node. Consume
+        // them before a scalar continuation can rebind or execute that call.
+        if let Expr::Call { over, .. } = expression {
+            let selected = over
+                .as_ref()
+                .and(hooks.windows)
+                .and_then(|(nodes, values)| {
+                    nodes.iter().zip(values).find_map(|(node, value)| {
+                        core::ptr::eq(*node, expression as *const _).then_some(*value)
+                    })
+                })
+                .or_else(|| {
+                    hooks.aggs.and_then(|(nodes, values)| {
+                        nodes.iter().zip(values).find_map(|(node, value)| {
+                            core::ptr::eq(*node, expression as *const _).then_some(*value)
+                        })
+                    })
+                });
+            if let Some(value) = selected {
+                return materialize_enum_values(
+                    materialize_acl_value(value, hooks, arena)?,
+                    hooks.catalog,
+                    arena,
+                );
+            }
+        }
         let position = super::query::input_progress::enter_expression(expression)?;
         let bound;
         let expression = if let (
             Some(oid),
             Expr::Call {
+                kind,
                 name,
                 args,
                 argument_names,
@@ -2836,14 +3409,17 @@ pub fn eval_full<'a>(
                 over,
                 filter,
                 bound_strict,
+                source_position,
                 ..
             },
         ) = (position.target, *expression)
         {
             bound = Expr::Call {
+                kind,
                 name,
                 bound_oid: Some(oid),
                 bound_strict,
+                source_position,
                 args,
                 argument_names,
                 variadic,
@@ -2896,6 +3472,23 @@ pub fn eval_full<'a>(
         arena,
         evaluate,
     )
+}
+
+pub(crate) fn bound_literal_value<'a>(
+    value: crate::sql::ast::BoundLiteralValue<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        crate::sql::ast::BoundLiteralValue::CheckedArrayInput(encoded) => {
+            super::type_inputs::value(encoded, arena)
+        }
+        crate::sql::ast::BoundLiteralValue::CachedDefault(encoded) => {
+            let mut values = [Datum::Null];
+            let width = super::exec::decode_projected_row_into(encoded, arena, &mut values)?;
+            debug_assert_eq!(width, 1, "cached default contains one encoded value");
+            Ok(values[0])
+        }
+    }
 }
 
 fn eval_full_inner<'a>(
@@ -3015,6 +3608,7 @@ fn eval_full_inner<'a>(
         }
     }
     match *expression {
+        Expr::BoundLiteral { value, .. } => bound_literal_value(value, arena),
         Expr::BoundDefault { expression, .. } => eval_full(expression, arena, params, row, hooks),
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null
@@ -3089,6 +3683,9 @@ fn eval_full_inner<'a>(
             table,
             name,
         } => {
+            if row.is_empty_scope() {
+                return Err(empty_scope_column_error(Some(table), name));
+            }
             // A three-part reference resolves through a composed
             // `schema.table` qualifier: only an unaliased FROM entry whose
             // base table really lives in that schema answers to it, exactly
@@ -3097,7 +3694,8 @@ fn eval_full_inner<'a>(
             let composed = arena
                 .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
                 .map_err(|_| arena_full())?;
-            materialize_named_composite(row.lookup(Some(composed), name)?, hooks, arena)
+            let value = row.lookup(Some(composed), name)?;
+            materialize_named_composite(value, hooks, arena)
         }
         Expr::RecursiveState {
             qualifier, index, ..
@@ -3109,7 +3707,9 @@ fn eval_full_inner<'a>(
                 n
             )
         }),
-        Expr::Unary { operator, operand } => {
+        Expr::Unary {
+            operator, operand, ..
+        } => {
             // The prefix arithmetic operators compute exactly what their
             // functions do, so they run the same code rather than a second copy.
             if let Some(function) = operator.arithmetic_function() {
@@ -3130,6 +3730,7 @@ fn eval_full_inner<'a>(
             operator: BinaryOp::And,
             left,
             right,
+            ..
         } => {
             // PostgreSQL simplifies `x AND FALSE` to FALSE and short-circuits a
             // scan qual in a cost order that is not fixed, so a FALSE operand
@@ -3144,6 +3745,7 @@ fn eval_full_inner<'a>(
             operator: BinaryOp::Or,
             left,
             right,
+            ..
         } => {
             // Dual of AND: a definite TRUE on either side yields TRUE and
             // absorbs the sibling's runtime error (PostgreSQL's `x OR TRUE`).
@@ -3153,6 +3755,7 @@ fn eval_full_inner<'a>(
             operator,
             left,
             right,
+            ..
         } => eval_binary_expression(
             BinaryExpression {
                 operator,
@@ -3171,6 +3774,7 @@ fn eval_full_inner<'a>(
             type_name,
             type_mod,
             binding,
+            ..
         } => {
             let array_target = ColType::from_sql_name(type_name).or_else(|| {
                 let catalog = hooks.catalog?;
@@ -3184,7 +3788,16 @@ fn eval_full_inner<'a>(
             };
             let mut v = if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
             {
-                eval_array_constructor(items, Some(element), arena, params, row, hooks)?
+                eval_array_constructor(
+                    items,
+                    Some(element),
+                    type_mod,
+                    binding,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                )?
             } else {
                 eval_full(operand, arena, params, row, hooks)?
             };
@@ -3223,9 +3836,12 @@ fn eval_full_inner<'a>(
                     && let Some(value) = catalog.cast_defined(
                         source_oid,
                         target_oid,
+                        type_mod,
                         v,
                         DefinedCastContext::Explicit,
+                        coercion_input_collation(operand, row, hooks.catalog)?,
                         arena,
+                        hooks.sequences,
                     )?
                 {
                     if type_mod != -1
@@ -3307,7 +3923,7 @@ fn eval_full_inner<'a>(
             // resolve and validate there.
             if ColType::from_sql_name(type_name).is_none()
                 && let Some(cat) = hooks.catalog
-                && let Some(value) = cat.cast_user_type(type_name, v, arena)?
+                && let Some(value) = cat.cast_user_type(type_name, v, arena, hooks.sequences)?
             {
                 return Ok(value);
             }
@@ -3391,6 +4007,7 @@ fn eval_full_inner<'a>(
             Ok(Datum::Bool(v.is_null() != negated))
         }
         Expr::Call {
+            kind,
             name,
             bound_oid,
             bound_strict,
@@ -3399,14 +4016,11 @@ fn eval_full_inner<'a>(
             variadic,
             star,
             distinct,
-            over,
             ..
         } => {
-            let qualified_candidate = !star
-                && name.starts_with("pg_catalog.")
-                && hooks
-                    .catalog
-                    .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()));
+            let mut selected_builtin = None;
+            let qualified_candidate =
+                !star && !is_sql_syntax_call(expression) && hooks.catalog.is_some();
             if bound_oid.is_some() || qualified_candidate {
                 let catalog = hooks.catalog.ok_or_else(|| {
                     sql_err!(
@@ -3428,6 +4042,7 @@ fn eval_full_inner<'a>(
                 let types = &types[..args.len()];
                 if let Some(mut target) = catalog.resolve_routine_call(
                     name,
+                    kind,
                     bound_oid,
                     argument_names,
                     variadic,
@@ -3440,15 +4055,22 @@ fn eval_full_inner<'a>(
                     {
                         *selected = bound_strict;
                     }
-                    return catalog.call_routine(
-                        target,
-                        args,
-                        types,
-                        &mut |argument| eval_full(argument, arena, params, row, hooks),
-                        arena,
-                    );
+                    if let RoutineCallTarget::Builtin { oid, schema } = target {
+                        selected_builtin = Some((oid, schema));
+                    } else {
+                        return catalog.call_routine(
+                            target,
+                            args,
+                            types,
+                            &|argument| routine_argument_collation(argument, row, hooks.catalog),
+                            &mut |argument| eval_full(argument, arena, params, row, hooks),
+                            arena,
+                        );
+                    }
                 }
-                if let Some(oid) = bound_oid {
+                if let Some(oid) = bound_oid
+                    && selected_builtin.is_none()
+                {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
                         "captured function with OID {} does not exist",
@@ -3457,7 +4079,8 @@ fn eval_full_inner<'a>(
                 }
             }
 
-            if let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
+            if kind == super::ast::CallKind::SqlSyntax
+                && let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
                 && schema.eq_ignore_ascii_case("pg_catalog")
             {
                 if args.len() != 2 || star || !argument_names.is_empty() || variadic {
@@ -3487,23 +4110,6 @@ fn eval_full_inner<'a>(
                     hooks,
                 );
             }
-            // A window-function call resolves to this row's precomputed value.
-            if over.is_some()
-                && let Some((nodes, values)) = hooks.windows
-            {
-                for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expression as *const _) {
-                        return Ok(*v);
-                    }
-                }
-            }
-            if let Some((nodes, values)) = hooks.aggs {
-                for (node, v) in nodes.iter().zip(values) {
-                    if core::ptr::eq(*node, expression as *const _) {
-                        return Ok(*v);
-                    }
-                }
-            }
             if distinct {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
@@ -3517,6 +4123,8 @@ fn eval_full_inner<'a>(
                     argument_names,
                     variadic,
                     star,
+                    builtin: selected_builtin,
+                    kind,
                 },
                 arena,
                 params,
@@ -3939,7 +4547,16 @@ fn eval_full_inner<'a>(
                 "EXISTS is not allowed in this context"
             ))
         }
-        Expr::Array(items) => eval_array_constructor(items, None, arena, params, row, hooks),
+        Expr::Array(items) => eval_array_constructor(
+            items,
+            None,
+            -1,
+            CastBinding::Resolve,
+            arena,
+            params,
+            row,
+            hooks,
+        ),
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
@@ -4178,7 +4795,12 @@ fn eval_full_inner<'a>(
             // A direct ROW(...) resolves its f1..fn — unless the selected
             // field is a bare unknown literal, which PostgreSQL cannot
             // coerce (XX000). A typed sibling of an unknown field is fine.
-            if let Expr::Call { name, args, .. } = base
+            if let Expr::Call {
+                kind: super::ast::CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } = base
                 && name.eq_ignore_ascii_case("row")
                 && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
@@ -4204,8 +4826,9 @@ fn eval_full_inner<'a>(
                 }
             }
             let anonymous_source = match base {
-                Expr::Call { name, .. } => {
-                    !(name.eq_ignore_ascii_case("row")
+                Expr::Call { kind, name, .. } => {
+                    !((*kind == super::ast::CallKind::SqlSyntax
+                        && name.eq_ignore_ascii_case("row"))
                         || name.eq_ignore_ascii_case("json_each")
                         || name.eq_ignore_ascii_case("jsonb_each")
                         || name.eq_ignore_ascii_case("json_each_text")
@@ -4380,7 +5003,12 @@ fn effective_quantified_collations<'a>(
         .alloc_slice_with(right.len(), |_| Collation::None)
         .map_err(|_| arena_full())?;
     let row_args = match operand {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(*args),
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if name.eq_ignore_ascii_case("row") => Some(*args),
         _ => None,
     };
     let whole_fields = match operand {
@@ -4609,7 +5237,7 @@ fn required_comparison_collation(
 
 /// PostgreSQL's collation-combination rule, shared by every expression that
 /// produces a collatable result.
-fn merge_derived_collations(
+pub(crate) fn merge_derived_collations(
     left: Option<DerivedCollation>,
     right: Option<DerivedCollation>,
 ) -> Result<Option<DerivedCollation>, SqlError> {
@@ -4619,22 +5247,15 @@ fn merge_derived_collations(
         {
             Err(sql_err!(
                 sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
+                "collation mismatch between explicit collations \"{}\" and \"{}\"",
                 left.value.name(),
                 right.value.name()
             ))
         }
         (Some(left), Some(_right)) if left.explicit => Ok(Some(left)),
         (Some(_left), Some(right)) if right.explicit => Ok(Some(right)),
-        (Some(left), Some(right)) if left.indeterminate && right.indeterminate => {
-            Ok(Some(DerivedCollation {
-                value: crate::sql::ast::Collation::None,
-                explicit: false,
-                indeterminate: true,
-            }))
-        }
-        (Some(left), Some(right)) if left.indeterminate => Ok(Some(right)),
-        (Some(left), Some(right)) if right.indeterminate => Ok(Some(left)),
+        (Some(left), Some(_right)) if left.indeterminate => Ok(Some(left)),
+        (Some(_left), Some(right)) if right.indeterminate => Ok(Some(right)),
         (Some(left), Some(right))
             if left.value != crate::sql::ast::Collation::Default
                 && right.value != crate::sql::ast::Collation::Default
@@ -4658,11 +5279,41 @@ fn merge_derived_collations(
     }
 }
 
+/// A collation choice retains explicit, implicit, and unresolved derivation.
 #[derive(Clone, Copy)]
-struct DerivedCollation {
+pub struct DerivedCollation {
     value: crate::sql::ast::Collation,
     explicit: bool,
     indeterminate: bool,
+}
+
+impl DerivedCollation {
+    fn implicit(value: Collation, collatable: bool) -> Option<Self> {
+        (value != Collation::None || collatable).then_some(Self {
+            value,
+            explicit: false,
+            indeterminate: value == Collation::None && collatable,
+        })
+    }
+    pub(crate) fn input_collation(self) -> Collation {
+        if self.indeterminate {
+            Collation::None
+        } else {
+            self.value
+        }
+    }
+
+    pub(crate) fn for_input_type(source: Option<Self>, target: ColType) -> Option<Self> {
+        if target.is_collatable() {
+            Some(source.unwrap_or(Self {
+                value: Collation::Default,
+                explicit: false,
+                indeterminate: false,
+            }))
+        } else {
+            None
+        }
+    }
 }
 
 fn expression_collation<'a>(
@@ -4700,7 +5351,55 @@ fn expression_collation<'a>(
                 indeterminate: false,
             }))
         }
+        Expr::BoundLiteral { collation, .. } => Ok(collation.map(|value| DerivedCollation {
+            value,
+            explicit: false,
+            indeterminate: false,
+        })),
         Expr::BoundDefault { expression, .. } => expression_collation(expression, row, catalog),
+        Expr::Param(index) => Ok(super::exec::routine_parameter_collation(*index).and_then(
+            |value| {
+                DerivedCollation::implicit(
+                    value,
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                )
+            },
+        )),
+        Expr::RoutineParam {
+            qualifier,
+            name,
+            index,
+            source,
+        } => match row.resolve_column_type(*qualifier, name) {
+            Ok(_) if *source == super::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
+                sqlstate::AMBIGUOUS_COLUMN,
+                "column reference \"{}{}{}\" is ambiguous",
+                qualifier.unwrap_or(""),
+                if qualifier.is_some() { "." } else { "" },
+                name,
+            )),
+            Ok(ctype) => Ok(DerivedCollation::implicit(
+                row.collation(*qualifier, name),
+                ctype.is_collatable(),
+            )),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    || error.sqlstate == sqlstate::UNDEFINED_TABLE =>
+            {
+                Ok(match source {
+                    super::ast::ParameterSource::SqlRoutine => {
+                        super::exec::routine_parameter_collation(*index).and_then(|value| {
+                            DerivedCollation::implicit(
+                                value,
+                                static_type(expression, row).is_some_and(ColType::is_collatable),
+                            )
+                        })
+                    }
+                    super::ast::ParameterSource::PlpgsqlCursor => None,
+                })
+            }
+            Err(error) => Err(error),
+        },
         Expr::Cast {
             operand, type_name, ..
         } => match ColType::from_sql_name(type_name) {
@@ -4710,14 +5409,11 @@ fn expression_collation<'a>(
         },
         Expr::Column { qualifier, name } => {
             let value = row.collation(*qualifier, name);
-            Ok(Some(DerivedCollation {
+            Ok(DerivedCollation::implicit(
                 value,
-                explicit: false,
-                indeterminate: value == crate::sql::ast::Collation::None
-                    && row
-                        .col_type(*qualifier, name)
-                        .is_some_and(ColType::is_collatable),
-            }))
+                row.col_type(*qualifier, name)
+                    .is_some_and(ColType::is_collatable),
+            ))
         }
         Expr::SchemaColumn {
             schema,
@@ -4726,17 +5422,19 @@ fn expression_collation<'a>(
         } => {
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             let value = row.collation(Some(qualifier.as_str()), name);
-            Ok(Some(DerivedCollation {
+            Ok(DerivedCollation::implicit(
                 value,
-                explicit: false,
-                indeterminate: value == crate::sql::ast::Collation::None
-                    && row
-                        .col_type(Some(qualifier.as_str()), name)
-                        .is_some_and(ColType::is_collatable),
-            }))
+                row.col_type(Some(qualifier.as_str()), name)
+                    .is_some_and(ColType::is_collatable),
+            ))
         }
         Expr::Field { base, field } => match &**base {
-            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+            Expr::Call {
+                kind: super::ast::CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("row") => {
                 let position = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(field));
@@ -4747,27 +5445,24 @@ fn expression_collation<'a>(
             }
             Expr::WholeRow(table) => {
                 let value = row.collation(Some(table), field);
-                Ok(Some(DerivedCollation {
+                Ok(DerivedCollation::implicit(
                     value,
-                    explicit: false,
-                    indeterminate: value == crate::sql::ast::Collation::None
-                        && static_type(expression, row).is_some_and(ColType::is_collatable),
-                }))
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                ))
             }
             _ => {
                 let value = row.record_field_collation(base, field);
-                Ok(Some(DerivedCollation {
+                Ok(DerivedCollation::implicit(
                     value,
-                    explicit: false,
-                    indeterminate: value == crate::sql::ast::Collation::None
-                        && static_type(expression, row).is_some_and(ColType::is_collatable),
-                }))
+                    static_type(expression, row).is_some_and(ColType::is_collatable),
+                ))
             }
         },
         Expr::Binary {
             operator: BinaryOp::Concat,
             left,
             right,
+            ..
         } => merge_derived_collations(
             expression_collation(left, row, catalog)?,
             expression_collation(right, row, catalog)?,
@@ -4786,12 +5481,13 @@ fn expression_collation<'a>(
             }
             Ok(derived)
         }
-        Expr::Call { name, args, .. }
-            if name.eq_ignore_ascii_case("coalesce")
-                || name.eq_ignore_ascii_case("greatest")
-                || name.eq_ignore_ascii_case("least")
-                || collation_preserving_call(name) =>
-        {
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("nullif") => {
+            match args.first() {
+                Some(argument) => expression_collation(argument, row, catalog),
+                None => Ok(None),
+            }
+        }
+        Expr::Array(args) => {
             let mut derived = None;
             for argument in *args {
                 derived = merge_derived_collations(
@@ -4801,8 +5497,104 @@ fn expression_collation<'a>(
             }
             Ok(derived)
         }
+        Expr::Call { name, args, .. }
+            if name.eq_ignore_ascii_case("coalesce")
+                || name.eq_ignore_ascii_case("greatest")
+                || name.eq_ignore_ascii_case("least")
+                || collation_preserving_call(name) =>
+        {
+            let mut derived = None;
+            for argument in *args {
+                if matches!(argument, Expr::BoundDefault { .. }) {
+                    continue;
+                }
+                derived = merge_derived_collations(
+                    derived,
+                    expression_collation(argument, row, catalog)?,
+                )?;
+            }
+            Ok(derived)
+        }
+        Expr::Call { args, .. } if catalog.is_some() => {
+            let hooks = EvalHooks {
+                catalog,
+                ..NO_HOOKS
+            };
+            let result = expression_type_identity(expression, row, &hooks)?.routine_argument_oid();
+            let ctype = constructor_type_from_oid(result, &|oid| {
+                catalog.and_then(|catalog| catalog.domain_base_type(oid))
+            });
+            if !ctype.is_some_and(ColType::is_collatable) {
+                return Ok(None);
+            }
+            let mut derived = None;
+            for argument in *args {
+                if matches!(argument, Expr::BoundDefault { .. }) {
+                    continue;
+                }
+                derived = merge_derived_collations(
+                    derived,
+                    routine_argument_collation(argument, row, catalog)?,
+                )?;
+            }
+            Ok(DerivedCollation::for_input_type(
+                derived,
+                ctype.expect("collatable result was resolved"),
+            ))
+        }
         _ => Ok(None),
     }
+}
+
+/// Merge function argument collations, retaining InvalidOid when implicit
+/// collations conflict. An explicit COLLATE clause takes precedence.
+pub(crate) fn routine_input_collation<'a>(
+    arguments: &[&Expr<'a>],
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<super::ast::Collation, SqlError> {
+    let mut derived = None;
+    for argument in arguments {
+        let value = routine_argument_collation(argument, row, catalog)?;
+        derived = merge_derived_collations(derived, value)?;
+    }
+    Ok(derived.map_or(Collation::None, DerivedCollation::input_collation))
+}
+
+/// Keep derivation strength until supplied argument collations combine.
+pub(crate) fn routine_argument_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Option<DerivedCollation>, SqlError> {
+    Ok(expression_collation(expression, row, catalog)?.or_else(|| {
+        static_type(expression, row)
+            .is_some_and(ColType::is_collatable)
+            .then_some(DerivedCollation {
+                value: Collation::Default,
+                explicit: false,
+                indeterminate: false,
+            })
+    }))
+}
+
+/// PostgreSQL moves a top-level COLLATE outside a coercion. The conversion
+/// function sees the underlying source; projected column collations stay intact.
+pub(crate) fn coercion_source<'source, 'a>(mut expression: &'source Expr<'a>) -> &'source Expr<'a> {
+    while let Expr::Collate { operand, .. } = expression {
+        expression = operand;
+    }
+    expression
+}
+
+pub(crate) fn coercion_input_collation<'a>(
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Result<Collation, SqlError> {
+    // Name/type validation precedes moving the parsed COLLATE decoration.
+    let _ = routine_input_collation(&[expression], row, catalog)?;
+    routine_input_collation(&[coercion_source(expression)], row, catalog)
 }
 
 /// Returns the collation required by an operation that compares or orders an
@@ -4904,15 +5696,44 @@ pub(crate) fn unify_arr_elem(
     super::types::common_array_element(a, b).map_err(|error| common_type_error(error, "ARRAY"))
 }
 
-fn eval_array_constructor<'a>(
-    items: &[&Expr<'a>],
+#[derive(Clone, Copy)]
+struct ArrayConstructorInput<'a> {
+    expression: &'a Expr<'a>,
+    nested: Option<&'a ArrayConstructorPlan<'a>>,
+    cast: Option<&'a BoundCast>,
+    site: Option<super::query::InvocationSite>,
+    named_conversion: bool,
+}
+
+struct ArrayConstructorSites {
+    position: Option<usize>,
+    next: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ArrayConstructorPlan<'a> {
+    element: ArrElem,
+    multidimensional: bool,
+    inputs: &'a [ArrayConstructorInput<'a>],
+    named_type: Option<&'a str>,
+    target_type_mod: i32,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "array conversion selection retains each lexical leaf and its explicit target type"
+)]
+fn prepare_array_constructor<'a>(
+    items: &[&'a Expr<'a>],
     expected: Option<ArrElem>,
+    target_type_mod: i32,
+    binding: CastBinding,
+    sites: &mut ArrayConstructorSites,
     arena: &'a Arena,
-    params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
-) -> Result<Datum<'a>, SqlError> {
-    let plan = array_constructor_type(
+) -> Result<ArrayConstructorPlan<'a>, SqlError> {
+    let types = array_constructor_type(
         items,
         expected,
         &|item| Ok(expression_type_identity(item, row, hooks)?.record_field_oid()),
@@ -4922,13 +5743,207 @@ fn eval_array_constructor<'a>(
                 .and_then(|catalog| catalog.domain_base_type(oid))
         },
     )?;
-    let element = plan.element;
-    let vals = super::array::alloc_items(arena, items.len())?;
-    for (target, expression) in vals.iter_mut().zip(items) {
-        *target = if let Expr::Array(children) = expression {
-            eval_array_constructor(children, expected, arena, params, row, hooks)?
+    let target_oid = if types.multidimensional {
+        types.element.array_oid()
+    } else {
+        types.element.element_oid()
+    };
+    let context = if expected.is_some() {
+        DefinedCastContext::Explicit
+    } else {
+        DefinedCastContext::Implicit
+    };
+    let mut named_type = None;
+    let inputs = arena
+        .alloc_slice_with(items.len(), |_| ArrayConstructorInput {
+            expression: &Expr::Null,
+            nested: None,
+            cast: None,
+            site: None,
+            named_conversion: false,
+        })
+        .map_err(|_| arena_full())?;
+    // Select every leaf conversion before the first source expression runs.
+    // Each leaf then evaluates and converts before the following leaf.
+    for (input, expression) in inputs.iter_mut().zip(items) {
+        let nested = if let Expr::Array(children) = expression {
+            let child = prepare_array_constructor(
+                children,
+                expected,
+                target_type_mod,
+                binding,
+                sites,
+                arena,
+                row,
+                hooks,
+            )?;
+            Some(&*arena.alloc(child).map_err(|_| arena_full())?)
         } else {
-            eval_full(expression, arena, params, row, hooks)?
+            None
+        };
+        let site = if nested.is_none() {
+            let element = sites.next;
+            sites.next = sites.next.checked_add(1).ok_or_else(arena_full)?;
+            sites
+                .position
+                .map(|position| super::query::InvocationSite::ArrayElement { position, element })
+        } else {
+            None
+        };
+        let source_oid = match nested {
+            Some(child) => child.element.array_oid(),
+            None => expression_type_identity(expression, row, hooks)?.record_field_oid(),
+        };
+        let cast = if binding == CastBinding::Resolve && source_oid != target_oid {
+            match hooks.catalog {
+                Some(catalog) => catalog
+                    .bind_defined_cast(source_oid, target_oid, context)?
+                    .map(|cast| {
+                        arena
+                            .alloc(cast)
+                            .map(|cast| &*cast)
+                            .map_err(|_| arena_full())
+                    })
+                    .transpose()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let named_conversion =
+            types.element.is_named() && source_oid != target_oid && cast.is_none();
+        if named_conversion && named_type.is_none() {
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "array constructor named type catalog access is unavailable"
+                )
+            })?;
+            named_type = Some(catalog.type_name(target_oid, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "array element has no declared type name"
+                )
+            })?);
+        }
+        *input = ArrayConstructorInput {
+            expression,
+            nested,
+            cast,
+            site,
+            named_conversion,
+        };
+    }
+    Ok(ArrayConstructorPlan {
+        element: types.element,
+        multidimensional: types.multidimensional,
+        inputs,
+        named_type,
+        target_type_mod,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "array execution preserves explicit element type modifier and evaluation context"
+)]
+fn eval_array_constructor<'a>(
+    items: &[&'a Expr<'a>],
+    expected: Option<ArrElem>,
+    target_type_mod: i32,
+    binding: CastBinding,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let mut sites = ArrayConstructorSites {
+        position: match (expected, super::query::input_progress::invocation_site()) {
+            (Some(_), Some(super::query::InvocationSite::Expression(position))) => Some(position),
+            _ => None,
+        },
+        next: 0,
+    };
+    let plan = prepare_array_constructor(
+        items,
+        expected,
+        target_type_mod,
+        binding,
+        &mut sites,
+        arena,
+        row,
+        hooks,
+    )?;
+    execute_array_constructor(&plan, arena, params, row, hooks)
+}
+
+fn execute_array_constructor<'a>(
+    plan: &ArrayConstructorPlan<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let element = plan.element;
+    let vals = super::array::alloc_items(arena, plan.inputs.len())?;
+    for (target, input) in vals.iter_mut().zip(plan.inputs) {
+        let value = match input.nested {
+            Some(nested) => execute_array_constructor(nested, arena, params, row, hooks)?,
+            None => eval_full(input.expression, arena, params, row, hooks)?,
+        };
+        let value = match input.cast {
+            Some(cast) => {
+                let _site = input
+                    .site
+                    .map(super::query::input_progress::enter_array_element);
+                hooks
+                    .catalog
+                    .expect("selected cast has a catalog")
+                    .execute_bound_cast(
+                        cast,
+                        value,
+                        plan.target_type_mod,
+                        coercion_input_collation(input.expression, row, hooks.catalog)?,
+                        arena,
+                        hooks.sequences,
+                    )?
+            }
+            None => value,
+        };
+        *target = if plan.multidimensional {
+            if input.cast.is_some() {
+                value
+            } else if input.named_conversion {
+                hooks
+                    .catalog
+                    .expect("named array conversion has a catalog")
+                    .cast_user_type(
+                        plan.named_type
+                            .expect("named array conversion has its declared name"),
+                        value,
+                        arena,
+                        hooks.sequences,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "array type has no catalog conversion"
+                        )
+                    })?
+            } else if element.is_catalog_reference() {
+                reg_array_cast(value, element, hooks.catalog, arena)?
+            } else {
+                cast_to(value, ColType::Array(element), arena)?
+            }
+        } else {
+            coerce_array_constructor_element(
+                value,
+                input.named_conversion,
+                element,
+                plan.named_type,
+                arena,
+                hooks,
+            )?
         };
     }
     if plan.multidimensional {
@@ -4975,7 +5990,7 @@ fn eval_array_constructor<'a>(
                 super::array::MAX_DIMENSIONS
             ));
         }
-        let shape = child.with_first(items.len(), 1)?;
+        let shape = child.with_first(plan.inputs.len(), 1)?;
         let flattened = super::array::alloc_items(arena, shape.element_count())?;
         let mut count = 0;
         for value in vals.iter() {
@@ -4993,72 +6008,61 @@ fn eval_array_constructor<'a>(
             raw: super::array::build_shaped(flattened, shape, arena)?,
         });
     }
-    // Coerce each element to the unified type.
+    Ok(Datum::Array {
+        element,
+        raw: super::array::build(vals, arena)?,
+    })
+}
+
+fn coerce_array_constructor_element<'a>(
+    mut value: Datum<'a>,
+    named_conversion: bool,
+    element: ArrElem,
+    named_type: Option<&str>,
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
     let ct = element.to_coltype();
-    let mut named_type = None;
-    for (v, expression) in vals.iter_mut().zip(items) {
-        if element.is_named()
-            && expression_type_identity(expression, row, hooks)?.record_field_oid()
-                != element.element_oid()
-        {
-            let catalog = hooks.catalog.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "array constructor named type catalog access is unavailable"
-                )
-            })?;
-            let name = match named_type {
-                Some(name) => name,
-                None => {
-                    let name = catalog
-                        .type_name(element.element_oid(), arena)?
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "array element has no declared type name"
-                            )
-                        })?;
-                    named_type = Some(name);
-                    name
-                }
-            };
-            *v = catalog.cast_user_type(name, *v, arena)?.ok_or_else(|| {
+    if named_conversion {
+        value = hooks
+            .catalog
+            .expect("named conversion has a catalog")
+            .cast_user_type(
+                named_type.expect("prepared named conversion"),
+                value,
+                arena,
+                hooks.sequences,
+            )?
+            .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "array element type has no catalog conversion"
                 )
             })?;
-        } else if element.is_catalog_reference() {
-            *v = if ct == ColType::Regtype {
-                regtype_cast(*v, hooks.catalog, arena)?
-            } else {
-                regobject_cast(*v, ct, hooks.catalog, arena)?
-            };
-            continue;
-        }
-        if !v.is_null() {
-            *v = match *v {
-                // A bpchar element keeps its padding in the array
-                // value, as PostgreSQL's array_out shows it.
-                Datum::Bpchar(s) if ct == ColType::Bpchar => Datum::Text(s),
-                Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields: 0,
-                        text: arena.alloc_str_display(*v).map_err(|_| arena_full())?,
-                    }
-                }
-                value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
-                    value
-                }
-                other => cast_to(other, ct, arena)?,
-            };
-        }
+    } else if element.is_catalog_reference() {
+        return if ct == ColType::Regtype {
+            regtype_cast(value, hooks.catalog, arena)
+        } else {
+            regobject_cast(value, ct, hooks.catalog, arena)
+        };
     }
-    Ok(Datum::Array {
-        element,
-        raw: super::array::build(&vals[..items.len()], arena)?,
-    })
+    if value.is_null() {
+        return Ok(value);
+    }
+    match value {
+        Datum::Bpchar(text) if ct == ColType::Bpchar => Ok(Datum::Text(text)),
+        Datum::Composite { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            Ok(Datum::CompositeText {
+                slot,
+                physical_fields: 0,
+                text: arena.alloc_str_display(value).map_err(|_| arena_full())?,
+            })
+        }
+        value @ Datum::CompositeText { slot, .. } if matches!(ct, ColType::Composite(expected) if expected == Some(slot)) => {
+            Ok(value)
+        }
+        other => cast_to(other, ct, arena),
+    }
 }
 
 fn array_constructor_shape_error() -> SqlError {
@@ -5236,65 +6240,332 @@ pub(crate) fn array_constructor_type<'a>(
 pub(crate) fn undefined_function<'a, T>(
     name: &str,
     args: &[&Expr<'a>],
-    arena: &'a Arena,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<T, SqlError> {
-    use core::fmt::Write as _;
-    let mut message = StackStr::<192>::new();
-    let _ = write!(message, "function {}(", name);
     let columns = RuntimeColumnTypes {
         row,
         catalog: hooks.catalog,
     };
-    for (i, argument) in args.iter().enumerate() {
-        if i > 0 {
-            let _ = message.write_str(", ");
-        }
-        let type_oid = super::exec::infer_routine_argument_oid(argument, &columns)?;
-        let named = if type_oid == super::types::oid::UNKNOWN {
-            "unknown"
-        } else if crate::storage::NamedTypeKind::from_oid(type_oid).is_some() {
-            hooks
-                .catalog
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type catalog is unavailable"
-                    )
-                })?
-                .type_name(type_oid, arena)?
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type with OID {} is unavailable",
-                        type_oid
-                    )
-                })?
-        } else {
-            ColType::from_oid(type_oid)
-                .map(ColType::name)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "function argument type with OID {} is unavailable",
-                        type_oid
-                    )
-                })?
-        };
-        let _ = message.write_str(named);
-    }
-    let _ = message.write_str(") does not exist");
-    // Fixed strings record truncation instead of returning a formatting error.
-    if message.is_truncated() {
+    let mut types = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if args.len() > types.len() {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "function diagnostic exceeds SQL error message capacity (192 bytes)"
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "function has too many arguments"
         ));
     }
-    Err(SqlError {
-        sqlstate: SqlState::known(sqlstate::UNDEFINED_FUNCTION),
-        message,
+    for (output, argument) in types.iter_mut().zip(args) {
+        *output = super::exec::infer_routine_argument_oid(argument, &columns)?;
+    }
+    Err(super::exec::function_lookup_error(
+        name,
+        &types[..args.len()],
+        &[],
+        super::exec::FunctionLookupFailure::Missing,
+        &columns,
+    ))
+}
+
+/// Normalize only a catalog-selected builtin. Written arguments stay as AST
+/// nodes so each implementation retains its strictness and short-circuit rules.
+pub(crate) fn bind_builtin_arguments<'a, 'b>(
+    oid: i32,
+    args: &'b [&'a Expr<'a>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arena: &'a Arena,
+) -> Result<&'b [&'a Expr<'a>], SqlError>
+where
+    'a: 'b,
+{
+    let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected builtin function {} has no declaration",
+            oid
+        )
+    })?;
+    let mapping =
+        crate::storage::Storage::builtin_call_mapping(oid, argument_names, args.len(), variadic)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected builtin function {} has an invalid argument mapping",
+                    oid
+                )
+            })?;
+    let count = if declaration.variadic_element.is_some() && !variadic {
+        declaration.arguments.len().max(args.len())
+    } else {
+        declaration.arguments.len()
+    };
+    if count == args.len() && argument_names.iter().all(Option::is_none) {
+        return Ok(args);
+    }
+    let mut ordered = [None; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let tail = declaration.arguments.len().checked_sub(1);
+    let mut expanded = 0;
+    for (argument, declared) in args.iter().zip(mapping) {
+        let mut position = usize::from(declared);
+        if declaration.variadic_element.is_some() && !variadic && Some(position) == tail {
+            position += expanded;
+            expanded += 1;
+        }
+        ordered[position] = Some(*argument);
+    }
+    if ordered[..count].iter().any(Option::is_none) {
+        let source = declaration.defaults.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "builtin function {} has no declared defaults",
+                oid
+            )
+        })?;
+        let defaults = super::parser::parse_expression_list(source, arena)?;
+        if defaults.len() != declaration.arguments.len() - declaration.required_arguments {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "builtin function {} has inconsistent defaults",
+                oid
+            ));
+        }
+        for (position, output) in ordered.iter_mut().enumerate().take(count) {
+            if output.is_some() {
+                continue;
+            }
+            let expression = defaults
+                .get(
+                    position
+                        .checked_sub(declaration.required_arguments)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "builtin function {} is missing a required input",
+                                oid
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "builtin function {} is missing an input default",
+                        oid
+                    )
+                })?;
+            let expression = bind_builtin_default(expression, arena)?;
+            *output = Some(
+                &*arena
+                    .alloc(Expr::BoundDefault {
+                        expression,
+                        type_oid: declaration.arguments[position],
+                    })
+                    .map_err(|_| arena_full())?,
+            );
+        }
+    }
+    arena
+        .alloc_slice_with(count, |index| {
+            ordered[index].expect("all selected builtin inputs are bound")
+        })
+        .map(|arguments| &*arguments)
+        .map_err(|_| arena_full())
+}
+
+fn bind_builtin_default<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    match *expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::BoundLiteral { .. } => Ok(expression),
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+            ..
+        } => {
+            if ColType::from_sql_name(type_name).is_none() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "builtin input default uses an unknown type"
+                ));
+            }
+            let operand = bind_builtin_default(operand, arena)?;
+            arena
+                .alloc(Expr::Cast {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operand,
+                    type_name,
+                    type_mod,
+                    binding: super::ast::CastBinding::Builtin,
+                })
+                .map(|expression| &*expression)
+                .map_err(|_| arena_full())
+        }
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "builtin input default is not a catalog literal"
+        )),
+    }
+}
+
+pub(crate) fn builtin_operator_function<'a>(
+    oid: i32,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Option<Result<Datum<'a>, SqlError>> {
+    let (operator, left_type, right_type) = super::catalog::builtin_operator_function(oid)?;
+    let strict = super::catalog::builtin_callable_by_oid(oid)?.catalog.strict;
+    Some((|| {
+        let [left, right] = args else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "bound operator function argument contract changed"
+            ));
+        };
+        let comparison_collation = if operators::Comparison::from_binary(operator).is_some() {
+            Some(resolve_comparison_collation(
+                left,
+                right,
+                row,
+                hooks.catalog,
+            )?)
+        } else {
+            None
+        };
+        let convert = |expression, target: ColType| {
+            let value = eval_full(expression, arena, params, row, hooks)?;
+            let source = expression_type_identity(expression, row, hooks)?.routine_argument_oid();
+            let value = if source == target.oid() {
+                value
+            } else if let Some(catalog) = hooks.catalog
+                && let Some(value) = catalog.cast_defined(
+                    source,
+                    target.oid(),
+                    -1,
+                    value,
+                    DefinedCastContext::Implicit,
+                    coercion_input_collation(expression, row, hooks.catalog)?,
+                    arena,
+                    hooks.sequences,
+                )?
+            {
+                value
+            } else {
+                cast_to(value, target, arena)?
+            };
+            match (target, value) {
+                (ColType::AclItem, Datum::Text(text)) => {
+                    let catalog = hooks.catalog.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "aclitem role catalog access is unavailable"
+                        )
+                    })?;
+                    crate::sql::acl::from_text(text, catalog, arena).map(Datum::AclItem)
+                }
+                (ColType::Array(ArrElem::AclItem), value) => {
+                    materialize_acl_value(value, hooks, arena)
+                }
+                (_, value) => Ok(value),
+            }
+        };
+        let mut values = [Datum::Null; 2];
+        let mut constants = [false; 2];
+        let targets = [left_type, right_type];
+        for (index, expression) in args.iter().enumerate() {
+            constants[index] = constant_evaluation(expression, hooks.catalog)?
+                != Some(ExpressionEvaluation::Runtime);
+            if constants[index] {
+                values[index] = convert(*expression, targets[index])?;
+            }
+        }
+        if strict
+            && constants
+                .iter()
+                .zip(values)
+                .any(|(constant, value)| *constant && value.is_null())
+        {
+            return Ok(Datum::Null);
+        }
+        for (index, expression) in args.iter().enumerate() {
+            if !constants[index] {
+                values[index] = convert(*expression, targets[index])?;
+            }
+        }
+        if strict && values.iter().any(|value| value.is_null()) {
+            return Ok(Datum::Null);
+        }
+        Ok(eval_binary_values(
+            BinaryExpression {
+                operator,
+                left,
+                right,
+                search_catalog: false,
+                nulls: OperatorNulls::RoutineStrictness,
+            },
+            values[0],
+            values[1],
+            comparison_collation,
+            arena,
+            row,
+            hooks,
+        )?
+        .value)
+    })())
+}
+
+/// Execute an already selected builtin without another namespace lookup.
+pub(crate) fn call_builtin_oid<'a>(
+    oid: i32,
+    values: &[Datum<'a>],
+    types: &[i32],
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let declaration = super::catalog::builtin_callable_by_oid(oid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "bound builtin function with OID {} does not exist",
+            oid
+        )
+    })?;
+    if values.len() != types.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "bound builtin argument type count changed"
+        ));
+    }
+    let nodes: &'a [Expr<'a>] = arena
+        .alloc_slice_with(values.len(), |index| Expr::Param(index as u32 + 1))
+        .map_err(|_| arena_full())?;
+    let arguments = arena
+        .alloc_slice_with(values.len(), |index| &nodes[index])
+        .map_err(|_| arena_full())?;
+    super::exec::with_bound_parameter_types(types, || {
+        call(
+            declaration.name,
+            arguments,
+            CallSyntax {
+                argument_names: &[],
+                variadic: false,
+                star: false,
+                builtin: Some((oid, declaration.schema)),
+                kind: super::ast::CallKind::Routine,
+            },
+            arena,
+            values,
+            &NoColumns,
+            hooks,
+        )
     })
 }
 
@@ -5303,6 +6574,8 @@ struct CallSyntax<'slice, 'text> {
     argument_names: &'slice [Option<&'text str>],
     variadic: bool,
     star: bool,
+    builtin: Option<(i32, &'static str)>,
+    kind: super::ast::CallKind,
 }
 
 impl CallSyntax<'static, 'static> {
@@ -5311,6 +6584,8 @@ impl CallSyntax<'static, 'static> {
             argument_names: &[],
             variadic: false,
             star: false,
+            builtin: None,
+            kind: super::ast::CallKind::Routine,
         }
     }
 }
@@ -5328,67 +6603,86 @@ fn call<'a>(
         argument_names,
         variadic,
         star,
+        builtin,
+        kind,
     } = syntax;
-    let regex_srf_name = match written_name.split_once('.') {
-        Some(("pg_catalog", name))
-            if matches!(name, "regexp_matches" | "regexp_split_to_table") =>
-        {
-            Some(name)
-        }
-        None if matches!(written_name, "regexp_matches" | "regexp_split_to_table") => {
-            Some(written_name)
-        }
-        _ => None,
-    };
-    let mut reordered = [&Expr::Null; 3];
-    let args = if let Some(name) = regex_srf_name
-        && argument_names.iter().any(Option::is_some)
-    {
-        let parameters: &[&str] = match args.len() {
-            2 => &["string", "pattern"],
-            3 => &["string", "pattern", "flags"],
-            _ => return Err(arity_err(name, args.len())),
-        };
-        reorder_required_arguments(
-            name,
-            args,
-            argument_names,
-            parameters,
-            &mut reordered[..args.len()],
-        )?;
-        &reordered[..args.len()]
+    let args = if let Some((oid, _)) = builtin {
+        bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
     } else {
         args
     };
-    let name = written_name
-        .strip_prefix("pg_catalog.")
-        .unwrap_or(written_name);
+    // Only a declared variadic handler unpacks the selected final input.
+    let variadic = variadic
+        && builtin.is_none_or(|(oid, _)| {
+            super::catalog::builtin_callable_by_oid(oid)
+                .expect("selected builtin declaration")
+                .variadic_element
+                .is_some()
+        });
+    let argument_names = if builtin.is_some() {
+        &[][..]
+    } else {
+        argument_names
+    };
+    if written_name.starts_with("pg_catalog.")
+        && matches!(
+            written_name.strip_prefix("pg_catalog."),
+            Some(
+                "coalesce"
+                    | "greatest"
+                    | "least"
+                    | "nullif"
+                    | "row"
+                    | "trim"
+                    | "current_date"
+                    | "current_time"
+                    | "current_timestamp"
+                    | "localtime"
+                    | "localtimestamp"
+                    | "current_role"
+                    | "user"
+                    | "current_catalog"
+            )
+        )
+    {
+        return undefined_function(written_name, args, row, hooks);
+    }
+    if kind == super::ast::CallKind::Routine
+        && builtin.is_none()
+        && sql_syntax_call_name(written_name)
+        && super::catalog::builtin_callable_schema(written_name).is_none()
+    {
+        return undefined_function(written_name, args, row, hooks);
+    }
+    if (written_name == "_pg_expandarray" || written_name == "pg_catalog._pg_expandarray")
+        && super::query::builtin_set_routine_name(written_name).is_none()
+    {
+        return undefined_function(written_name, args, row, hooks);
+    }
+    let name = if let Some((oid, _)) = builtin {
+        super::catalog::builtin_callable_by_oid(oid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected builtin function {} has no declaration",
+                    oid
+                )
+            })?
+            .name
+    } else {
+        super::query::builtin_set_routine_name(written_name).unwrap_or_else(|| {
+            written_name
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(written_name)
+        })
+    };
     if super::ast::is_volatile_function(name) {
         super::query::protect_statement_effects();
     }
-    if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
-        if args.len() != 2 || star || variadic {
-            return undefined_function(written_name, args, arena, row, hooks);
-        }
-        let mut parse_ident_args = [&Expr::Null; 2];
-        reorder_required_arguments(
-            name,
-            args,
-            argument_names,
-            &["string", "strict"],
-            &mut parse_ident_args[..args.len()],
-        )?;
-        return funcs::string::dispatch(
-            name,
-            &parse_ident_args[..args.len()],
-            false,
-            false,
-            arena,
-            params,
-            row,
-            hooks,
-        )
-        .expect("parse_ident is a string builtin");
+    if let Some((oid, _)) = builtin
+        && let Some(result) = builtin_operator_function(oid, args, arena, params, row, hooks)
+    {
+        return result;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
@@ -5473,7 +6767,8 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
-        && let Some(result) = funcs::json::dispatch(name, args, star, arena, params, row, hooks)
+        && let Some(result) =
+            funcs::json::dispatch(name, args, star, variadic, arena, params, row, hooks)
     {
         return result;
     }
@@ -5542,9 +6837,12 @@ fn call<'a>(
         });
     }
     if !star
+        && builtin.is_none()
         && let Some(catalog) = hooks.catalog
-        && (catalog.has_routine_candidate(written_name, args.len())
-            || crate::sql::ast::catalog_operator_call(written_name).is_some())
+        && ((kind == super::ast::CallKind::Routine
+            && catalog.has_routine_candidate(written_name, args.len()))
+            || (kind == super::ast::CallKind::SqlSyntax
+                && crate::sql::ast::catalog_operator_call(written_name).is_some()))
     {
         let argument_type_oids = arena
             .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
@@ -5568,15 +6866,20 @@ fn call<'a>(
         }
         if let Some(target) = catalog.resolve_routine_call(
             written_name,
+            kind,
             None,
             argument_names,
             variadic,
             argument_type_oids,
         )? {
+            if matches!(target, RoutineCallTarget::Builtin { .. }) {
+                return undefined_function(written_name, args, row, hooks);
+            }
             return catalog.call_routine(
                 target,
                 args,
                 argument_type_oids,
+                &|argument| routine_argument_collation(argument, row, hooks.catalog),
                 &mut |argument| eval_full(argument, arena, params, row, hooks),
                 arena,
             );
@@ -6366,7 +7669,7 @@ fn call<'a>(
                 .map_err(|_| arena_full())?;
             Ok(Datum::Record(fields))
         }
-        _ => undefined_function(written_name, args, arena, row, hooks),
+        _ => undefined_function(written_name, args, row, hooks),
     }
 }
 
@@ -6423,7 +7726,12 @@ pub(crate) fn static_type_pub<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> 
 }
 
 fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType> {
-    if let Expr::Call { name, args, .. } = e
+    if let Expr::Call {
+        kind: super::ast::CallKind::SqlSyntax,
+        name,
+        args,
+        ..
+    } = e
         && let Some((Some("pg_catalog"), operator)) = super::ast::catalog_operator_call(name)
         && let [left, right] = *args
     {
@@ -6464,7 +7772,9 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
             row.col_type(Some(qualifier.as_str()), name)
         }
-        Expr::BoundDefault { type_oid, .. } => ColType::from_oid(*type_oid),
+        Expr::BoundDefault { type_oid, .. } | Expr::BoundLiteral { type_oid, .. } => {
+            ColType::from_oid(*type_oid)
+        }
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
         Expr::Collate { operand, .. } => static_type(operand, row),
         Expr::Array(items) => {
@@ -6491,10 +7801,12 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Unary {
             operator: UnaryOp::Neg,
             operand,
+            ..
         } => static_type(operand, row),
         Expr::Unary {
             operator: UnaryOp::BitNot,
             operand,
+            ..
         } => static_type(operand, row).map(|ctype| {
             if matches!(ctype, ColType::Inet | ColType::Cidr) {
                 ColType::Inet
@@ -6514,6 +7826,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             operator,
             left,
             right,
+            ..
         } => super::exec::builtin_binary_type(
             operator,
             static_type(left, row)?.oid(),
@@ -7971,7 +9284,7 @@ pub(crate) fn input_error<'a>(
                 .and_then(|value| super::exec::apply_typmod(value, target, type_mod, arena)),
         )
     } else if let Some(catalog) = hooks.catalog {
-        match catalog.cast_user_type(base_name, Datum::Text(input), arena) {
+        match catalog.cast_user_type(base_name, Datum::Text(input), arena, hooks.sequences) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
             Err(error) => {
@@ -8895,6 +10208,375 @@ mod tests {
     }
 
     #[test]
+    fn routine_input_collation_preserves_explicit_and_indeterminate_arguments() {
+        use crate::sql::ast::Collation;
+        with_arena(|arena| {
+            crate::mem::guard::forbid_alloc(|| {
+                for (source, expected) in [
+                    ("'a'", Collation::Default),
+                    ("42", Collation::None),
+                    ("'a' COLLATE \"C\"", Collation::C),
+                    ("'a' COLLATE \"POSIX\"", Collation::Posix),
+                ] {
+                    let expression = crate::sql::parser::parse_expression(source, arena).unwrap();
+                    assert_eq!(
+                        routine_input_collation(&[expression], &NoColumns, None).unwrap(),
+                        expected
+                    );
+                }
+                struct Columns;
+                impl<'a> ColumnLookup<'a> for Columns {
+                    fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                        panic!("collation inference must not evaluate an argument")
+                    }
+                    fn col_type(&self, _: Option<&str>, _: &str) -> Option<ColType> {
+                        Some(ColType::Text)
+                    }
+                    fn collation(&self, _: Option<&str>, name: &str) -> Collation {
+                        if name == "c" {
+                            Collation::C
+                        } else {
+                            Collation::Posix
+                        }
+                    }
+                }
+                let c = Expr::Column {
+                    qualifier: None,
+                    name: "c",
+                };
+                let posix = Expr::Column {
+                    qualifier: None,
+                    name: "posix",
+                };
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix], &Columns, None).unwrap(),
+                    Collation::None
+                );
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix, &c], &Columns, None).unwrap(),
+                    Collation::None
+                );
+                let explicit =
+                    crate::sql::parser::parse_expression("'a' COLLATE \"C\"", arena).unwrap();
+                assert_eq!(
+                    routine_input_collation(&[&c, &posix, explicit], &Columns, None).unwrap(),
+                    Collation::C
+                );
+                let derived = routine_argument_collation(explicit, &Columns, None).unwrap();
+                assert!(DerivedCollation::for_input_type(derived, ColType::Int4).is_none());
+                assert_eq!(
+                    DerivedCollation::for_input_type(None, ColType::Text)
+                        .unwrap()
+                        .input_collation(),
+                    Collation::Default
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn formal_parameter_collations_restore_and_yield_to_columns_without_reading_values() {
+        use crate::sql::ast::{Collation, ParameterSource};
+        let formal = [crate::storage::RoutineArgumentDef {
+            name: crate::storage::SqlName::parse("input").unwrap(),
+            ctype: ColType::Text,
+            user_type: None,
+        }];
+        struct Columns;
+        impl<'a> ColumnLookup<'a> for Columns {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("collation inference must not read row values")
+            }
+            fn col_type(&self, _: Option<&str>, name: &str) -> Option<ColType> {
+                Some(if name == "integer" {
+                    ColType::Int4
+                } else {
+                    ColType::Text
+                })
+            }
+            fn collation(&self, _: Option<&str>, name: &str) -> Collation {
+                if name == "integer" {
+                    Collation::None
+                } else {
+                    Collation::Posix
+                }
+            }
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let _outer =
+                super::super::exec::enter_routine_parameter_types(&formal, None, Collation::C)
+                    .unwrap();
+            let positional = Expr::Param(1);
+            let named = Expr::RoutineParam {
+                qualifier: None,
+                name: "input",
+                index: 1,
+                source: ParameterSource::SqlRoutine,
+            };
+            assert_eq!(
+                routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            assert_eq!(
+                routine_input_collation(&[&named], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            assert_eq!(
+                routine_input_collation(&[&named], &Columns, None).unwrap(),
+                Collation::Posix
+            );
+            let cursor = Expr::RoutineParam {
+                qualifier: None,
+                name: "input",
+                index: 1,
+                source: ParameterSource::PlpgsqlCursor,
+            };
+            assert_eq!(
+                routine_input_collation(&[&cursor], &Columns, None)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::AMBIGUOUS_COLUMN
+            );
+            {
+                let _inner = super::super::exec::enter_routine_parameter_types(
+                    &formal,
+                    None,
+                    Collation::None,
+                )
+                .unwrap();
+                assert_eq!(
+                    routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                    Collation::Default
+                );
+            }
+            assert_eq!(
+                routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                Collation::C
+            );
+            super::super::exec::with_bound_parameter_types(
+                &[super::super::types::oid::TEXT],
+                || {
+                    assert_eq!(
+                        routine_input_collation(&[&positional], &NoColumns, None).unwrap(),
+                        Collation::Default
+                    );
+                },
+            );
+            let integer = Expr::Column {
+                qualifier: None,
+                name: "integer",
+            };
+            assert_eq!(
+                routine_input_collation(&[&integer, &Expr::Str("text")], &Columns, None).unwrap(),
+                Collation::Default
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_operator_receives_argument_collation_without_evaluating_twice() {
+        use crate::sql::ast::Collation;
+        struct Operator(core::cell::Cell<Collation>, core::cell::Cell<usize>);
+        impl CatalogAccess for Operator {
+            fn relation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected relation lookup in conversion metadata test")
+            }
+            fn type_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected type visibility lookup in conversion metadata test")
+            }
+            fn function_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected function visibility lookup in conversion metadata test")
+            }
+            fn collation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected collation visibility lookup in conversion metadata test")
+            }
+            fn relation_is_publishable(&self, _: i32) -> Option<bool> {
+                panic!("unexpected publication lookup in conversion metadata test")
+            }
+            fn index_def<'a>(
+                &self,
+                _: i32,
+                _: i32,
+                _: bool,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected index lookup in conversion metadata test")
+            }
+            fn constraint_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected constraint lookup in conversion metadata test")
+            }
+            fn partition_key_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected partition lookup in conversion metadata test")
+            }
+            fn relname<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected relation name lookup in conversion metadata test")
+            }
+            fn reloid(&self, _: &str) -> Result<Option<i32>, SqlError> {
+                panic!("unexpected relation identity lookup in conversion metadata test")
+            }
+            fn comment<'a>(
+                &self,
+                _: DescriptionTarget<'_>,
+                _: u32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected comment lookup in conversion metadata test")
+            }
+
+            fn has_operator_candidate(&self, name: &str) -> bool {
+                name == "="
+            }
+            fn call_operator<'a>(
+                &self,
+                _: &str,
+                arguments: [Datum<'a>; 2],
+                _: [i32; 2],
+                collation: Collation,
+                _: [Collation; 2],
+                _: OperatorNulls,
+                _: &'a Arena,
+            ) -> Result<Option<OperatorEvaluation<'a>>, SqlError> {
+                self.0.set(collation);
+                self.1.set(self.1.get() + 1);
+                Ok(Some(OperatorEvaluation {
+                    value: Datum::Bool(true),
+                    first_argument: arguments[0],
+                }))
+            }
+        }
+        with_arena(|arena| {
+            let catalog = Operator(
+                core::cell::Cell::new(Collation::None),
+                core::cell::Cell::new(0),
+            );
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..NO_HOOKS
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                let expression =
+                    crate::sql::parser::parse_expression("('a' COLLATE \"C\") = 'b'", arena)
+                        .unwrap();
+                assert_eq!(
+                    eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks).unwrap(),
+                    Datum::Bool(true)
+                );
+                assert_eq!(catalog.0.get(), Collation::C);
+                assert_eq!(catalog.1.get(), 1);
+            });
+        });
+    }
+
+    #[test]
+    fn explicit_function_cast_moves_top_level_collation_outside_conversion() {
+        use crate::sql::ast::Collation;
+        struct Cast(core::cell::Cell<Collation>);
+        impl CatalogAccess for Cast {
+            fn relation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected relation lookup in conversion metadata test")
+            }
+            fn type_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected type visibility lookup in conversion metadata test")
+            }
+            fn function_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected function visibility lookup in conversion metadata test")
+            }
+            fn collation_is_visible(&self, _: i32) -> Option<bool> {
+                panic!("unexpected collation visibility lookup in conversion metadata test")
+            }
+            fn relation_is_publishable(&self, _: i32) -> Option<bool> {
+                panic!("unexpected publication lookup in conversion metadata test")
+            }
+            fn index_def<'a>(
+                &self,
+                _: i32,
+                _: i32,
+                _: bool,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected index lookup in conversion metadata test")
+            }
+            fn constraint_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected constraint lookup in conversion metadata test")
+            }
+            fn partition_key_def<'a>(
+                &self,
+                _: i32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected partition lookup in conversion metadata test")
+            }
+            fn relname<'a>(&self, _: i32, _: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected relation name lookup in conversion metadata test")
+            }
+            fn reloid(&self, _: &str) -> Result<Option<i32>, SqlError> {
+                panic!("unexpected relation identity lookup in conversion metadata test")
+            }
+            fn comment<'a>(
+                &self,
+                _: DescriptionTarget<'_>,
+                _: u32,
+                _: &'a Arena,
+            ) -> Result<Option<&'a str>, SqlError> {
+                panic!("unexpected comment lookup in conversion metadata test")
+            }
+
+            fn cast_defined<'a>(
+                &self,
+                source: i32,
+                target: i32,
+                target_type_mod: i32,
+                _: Datum<'a>,
+                context: DefinedCastContext,
+                collation: Collation,
+                _: &'a Arena,
+                _sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+            ) -> Result<Option<Datum<'a>>, SqlError> {
+                if target == crate::sql::types::oid::TEXT {
+                    return Ok(None);
+                }
+                assert_eq!(source, crate::sql::types::oid::TEXT);
+                assert_eq!(target, crate::sql::types::oid::INT4);
+                assert_eq!(context, DefinedCastContext::Explicit);
+                assert_eq!(target_type_mod, -1);
+                self.0.set(collation);
+                Ok(Some(Datum::Int4(42)))
+            }
+        }
+        with_arena(|arena| {
+            let catalog = Cast(core::cell::Cell::new(Collation::None));
+            let hooks = EvalHooks {
+                catalog: Some(&catalog),
+                ..NO_HOOKS
+            };
+            crate::mem::guard::forbid_alloc(|| {
+                let expression = crate::sql::parser::parse_expression(
+                    "('42'::text COLLATE \"C\")::integer",
+                    arena,
+                )
+                .unwrap();
+                assert_eq!(
+                    eval_full(expression, arena, NO_PARAMS, &NoColumns, &hooks).unwrap(),
+                    Datum::Int4(42)
+                );
+                assert_eq!(catalog.0.get(), Collation::Default);
+            });
+        });
+    }
+
+    #[test]
     fn builtin_dispatch_accepts_only_catalog_qualification() {
         with_arena(|arena| {
             for (name, expected) in [("pg_catalog.lower", "hello"), ("pg_catalog.upper", "HELLO")] {
@@ -9198,5 +10880,134 @@ mod tests {
         for invalid in ["", "2201", "220123", "22p02", "22-02"] {
             assert!(SqlState::parse(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn whole_row_argument_types_do_not_read_values() {
+        struct SchemaOnly;
+        impl<'a> ColumnLookup<'a> for SchemaOnly {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                panic!("type inference must not read a row");
+            }
+
+            fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+                (qualifier == Some("rt") && name == "a").then_some(ColType::Int4)
+            }
+
+            fn whole_row_type(&self, table: &str) -> Option<ColType> {
+                (table == "rt").then_some(ColType::Record)
+            }
+        }
+        let base = Expr::Column {
+            qualifier: None,
+            name: "rt",
+        };
+        let field = Expr::Field {
+            base: &base,
+            field: "a",
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                crate::sql::exec::infer_type_res(
+                    &field,
+                    &RuntimeColumnTypes {
+                        row: &SchemaOnly,
+                        catalog: None
+                    }
+                )
+                .unwrap(),
+                (crate::sql::types::oid::INT4, 4)
+            );
+            assert_eq!(
+                crate::sql::exec::infer_type_res(
+                    &base,
+                    &RuntimeColumnTypes {
+                        row: &SchemaOnly,
+                        catalog: None
+                    }
+                )
+                .unwrap(),
+                (crate::sql::types::oid::RECORD, -1)
+            );
+        });
+    }
+
+    #[test]
+    fn empty_scope_qualified_references_report_missing_from_entries() {
+        use crate::sql::exec::ColTypeResolver as _;
+        struct Hidden;
+        impl crate::sql::exec::ColTypeResolver for Hidden {
+            fn resolve(&self, _: Option<&str>, _: &str) -> Result<ColType, SqlError> {
+                Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"pg_class\""
+                ))
+            }
+        }
+        impl<'a> ColumnLookup<'a> for Hidden {
+            fn lookup(&self, _: Option<&str>, _: &str) -> Result<Datum<'a>, SqlError> {
+                Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"pg_class\""
+                ))
+            }
+        }
+        with_arena(|arena| {
+            crate::mem::guard::forbid_alloc(|| {
+                for (qualifier, state, message) in [
+                    (
+                        None,
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"value\" does not exist",
+                    ),
+                    (
+                        Some("missing"),
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"missing\"",
+                    ),
+                    (
+                        Some("a.b"),
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"a.b\"",
+                    ),
+                ] {
+                    let described = crate::sql::exec::NoCols
+                        .resolve(qualifier, "value")
+                        .unwrap_err();
+                    let evaluated = NoColumns.lookup(qualifier, "value").unwrap_err();
+                    assert_eq!(described.sqlstate, state);
+                    assert_eq!(evaluated.sqlstate, state);
+                    assert_eq!(described.message.as_str(), message);
+                    assert_eq!(evaluated.message.as_str(), message);
+                }
+                let reference = Expr::SchemaColumn {
+                    schema: "pg_catalog",
+                    table: "pg_class",
+                    name: "relname",
+                };
+                let described =
+                    crate::sql::exec::infer_type_res(&reference, &crate::sql::exec::NoCols)
+                        .unwrap_err();
+                let evaluated =
+                    eval_full(&reference, arena, NO_PARAMS, &NoColumns, &NO_HOOKS).unwrap_err();
+                for error in [described, evaluated] {
+                    assert_eq!(error.sqlstate, sqlstate::UNDEFINED_TABLE);
+                    assert_eq!(
+                        error.message.as_str(),
+                        "missing FROM-clause entry for table \"pg_class\""
+                    );
+                }
+                let described = crate::sql::exec::infer_type_res(&reference, &Hidden).unwrap_err();
+                let evaluated =
+                    eval_full(&reference, arena, NO_PARAMS, &Hidden, &NO_HOOKS).unwrap_err();
+                for error in [described, evaluated] {
+                    assert_eq!(error.sqlstate, sqlstate::UNDEFINED_TABLE);
+                    assert_eq!(
+                        error.message.as_str(),
+                        "invalid reference to FROM-clause entry for table \"pg_class\""
+                    );
+                }
+            })
+        });
     }
 }

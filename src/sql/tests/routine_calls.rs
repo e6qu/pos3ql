@@ -1,6 +1,201 @@
 use super::*;
 
 #[test]
+fn plpgsql_input_plans_specialize_collation_and_polymorphism_without_eager_checks() {
+    // PG18.6 run41661367458, oracle SQL SHA256:
+    // 3df4b20befdb50122161465bd83cc7a870e63ccc78bd6b9cb8e8c0bafc444e38.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("plpgsql-input-instances-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE specialization_checks; CREATE TYPE specialization_choice AS ENUM('a'); \
+             CREATE DOMAIN specialization_checked AS specialization_choice CHECK(nextval('specialization_checks')>0); \
+             CREATE FUNCTION pl_collated(input text DEFAULT ('a' COLLATE \"C\")) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::specialization_checked[]; END$$; \
+             CREATE FUNCTION pl_polymorphic(input anyelement) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN RETURN '{a}'::specialization_checked[]; END$$; \
+             CREATE FUNCTION pl_unreached(input anyelement,choose boolean) RETURNS specialization_checked[] \
+               LANGUAGE plpgsql AS $$BEGIN IF choose THEN RETURN '{a}'::specialization_checked[]; END IF; RETURN NULL; END$$", true);
+        for (query, expected) in [
+            ("SELECT pl_collated()", "1"),
+            ("SELECT pl_collated('a' COLLATE \"C\")", "2"),
+            ("SELECT pl_collated('a' COLLATE \"POSIX\")", "3"),
+            ("SELECT pl_collated()", "3"),
+            ("SELECT pl_polymorphic(1)", "4"),
+            ("SELECT pl_polymorphic(2)", "4"),
+            ("SELECT pl_polymorphic('a'::text)", "5"),
+            ("SELECT pl_polymorphic(3)", "5"),
+            ("SELECT pl_unreached(1,false)", "5"),
+            ("SELECT pl_unreached('a'::text,false)", "5"),
+            ("SELECT pl_unreached(1,true)", "6"),
+            ("SELECT pl_unreached('a'::text,true)", "7"),
+            ("SELECT pl_unreached(2,true)", "7"),
+        ] {
+            session.success(&mut engine, query, true);
+            let output = session.success(
+                &mut engine,
+                "SELECT last_value FROM specialization_checks",
+                true,
+            );
+            assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
+        }
+    }
+}
+
+#[test]
+fn sql_runtime_body_inputs_share_declared_types_and_separate_input_collations() {
+    // PostgreSQL REL_18_6 funccache.c:268-300 keys by input collation and
+    // declared argument OIDs, resolving only polymorphic/RECORD declarations.
+    // PG18.6 run41661367458 fixture SHA256:
+    // 43c3f393296f801672182516141a08e3ba69f50a56f706bf9292691054fb23c0.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("runtime-body-collation-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE body_collation_checks; \
+             CREATE TYPE body_collation_choice AS ENUM('a'); \
+             CREATE DOMAIN body_collation_checked AS body_collation_choice \
+               CHECK(nextval('body_collation_checks')>0); \
+             CREATE FUNCTION body_collation(input text) RETURNS body_collation_checked[] \
+               LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_cast(input text) RETURNS integer \
+               LANGUAGE sql SET search_path=public AS 'SELECT cardinality(''{a}''::body_collation_checked[])'; \
+             CREATE CAST(text AS integer) WITH FUNCTION body_collation_cast(text) AS ASSIGNMENT; \
+             CREATE TABLE body_collation_numbers(value integer); \
+             CREATE TABLE body_collation_texts(value text COLLATE \"C\"); \
+             INSERT INTO body_collation_texts VALUES('a'); \
+             CREATE FUNCTION body_collation_default(input text DEFAULT ('a' COLLATE \"C\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_pair(first_input text, second_input text DEFAULT ('a' COLLATE \"POSIX\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_srf(input text DEFAULT ('a' COLLATE \"C\")) \
+               RETURNS SETOF body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE PROCEDURE body_collation_procedure(input text DEFAULT ('a' COLLATE \"C\")) \
+               LANGUAGE sql SET search_path=public AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             CREATE FUNCTION body_collation_identity(input text) RETURNS text LANGUAGE sql AS 'SELECT input'; \
+             CREATE FUNCTION body_collation_nested(input text DEFAULT body_collation_identity('a' COLLATE \"C\")) \
+               RETURNS body_collation_checked[] LANGUAGE sql SET search_path=public \
+               AS 'SELECT ''{a}''::body_collation_checked[]'; \
+             ALTER SEQUENCE body_collation_checks RESTART WITH 1", true);
+        for (query, expected) in [
+            ("SELECT body_collation('first' COLLATE \"C\")", "1"),
+            (
+                "SELECT body_collation('second'::varchar COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT body_collation('third' COLLATE \"POSIX\")", "2"),
+            ("SELECT body_collation('fourth'::text)", "3"),
+            ("SELECT body_collation('fifth'::varchar)", "3"),
+            ("SELECT body_collation(NULL::text COLLATE \"C\")", "3"),
+            ("SELECT ('42'::text COLLATE \"C\")::integer", "4"),
+            ("SELECT ('43'::text COLLATE \"C\")::integer", "4"),
+            ("SELECT ('44'::text COLLATE \"POSIX\")::integer", "4"),
+            (
+                "SELECT ARRAY['45'::text COLLATE \"C\", '46'::text COLLATE \"C\"]::integer[]",
+                "4",
+            ),
+            (
+                "INSERT INTO body_collation_numbers SELECT '47'::text COLLATE \"C\" FROM generate_series(1,2)",
+                "5",
+            ),
+            (
+                "INSERT INTO body_collation_numbers VALUES('48'::text COLLATE \"POSIX\")",
+                "5",
+            ),
+            ("SELECT body_collation_default()", "6"),
+            ("SELECT body_collation_default('a' COLLATE \"C\")", "7"),
+            ("SELECT body_collation_default('a'::text)", "8"),
+            (
+                "SELECT body_collation_pair(value) FROM body_collation_texts",
+                "9",
+            ),
+            ("SELECT body_collation_pair('a' COLLATE \"POSIX\")", "10"),
+            ("SELECT * FROM body_collation_srf()", "11"),
+            ("SELECT * FROM body_collation_srf('a' COLLATE \"C\")", "12"),
+            ("SELECT * FROM body_collation_srf('a'::text)", "13"),
+            ("CALL body_collation_procedure()", "14"),
+            ("CALL body_collation_procedure('a' COLLATE \"C\")", "15"),
+            ("CALL body_collation_procedure('a'::text)", "16"),
+            ("SELECT body_collation_nested()", "17"),
+            ("SELECT body_collation_nested('a' COLLATE \"C\")", "18"),
+            ("SELECT body_collation_nested('a'::text)", "19"),
+        ] {
+            session.success(&mut engine, query, true);
+            let output = session.success(
+                &mut engine,
+                "SELECT last_value FROM body_collation_checks",
+                true,
+            );
+            assert_eq!(data_rows(&output), [expected], "{query}, {mode:?}");
+        }
+        session.success(
+            &mut engine,
+            "SELECT body_collation_pair('a' COLLATE \"C\")",
+            true,
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT body_collation_pair('a' COLLATE \"C\", 'a' COLLATE \"POSIX\")",
+                true
+            )),
+            [sqlstate::COLLATION_MISMATCH]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM body_collation_checks",
+                true
+            )),
+            ["19"]
+        );
+        session.success(
+            &mut engine,
+            "DROP FUNCTION body_collation_pair(text,text)",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION body_collation_echo(first_input text DEFAULT ('a' COLLATE \"POSIX\"), \
+               second_input text DEFAULT ('b' COLLATE \"POSIX\")) RETURNS text \
+               LANGUAGE sql SET search_path=public AS 'SELECT first_input'",
+            true,
+        );
+        for expression in [
+            "body_collation_echo(value)",
+            "body_collation_echo(first_input=>value)",
+            "body_collation_echo()",
+            "body_collation_echo('a' COLLATE \"C\")",
+        ] {
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    &format!("SELECT {expression} = ('a' COLLATE \"C\") FROM body_collation_texts"),
+                    true
+                )),
+                ["t"],
+                "{expression}, {mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn sorted_and_paged_projection_effects_follow_postgresql_in_memory() {
     sorted_and_paged_projection_effects(false);
 }
@@ -173,9 +368,10 @@ fn sorted_and_paged_projection_effects(external: bool) {
     );
     let waiting_query = "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
             FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected";
-    let blocked = other.execute(&mut engine, waiting_query, true);
+    let status = other.execute_status(&mut engine, waiting_query, true);
+    assert!(matches!(status, ExecutionStatus::Blocked { .. }));
     assert!(
-        blocked.is_empty(),
+        other.send.is_empty(),
         "nested lock wait emitted a partial result: external={external}"
     );
     session.success(&mut engine, "ROLLBACK", true);
@@ -187,7 +383,7 @@ fn sorted_and_paged_projection_effects(external: bool) {
             &mut other.transaction,
             &mut other.pool,
             &mut other.cursors,
-            &mut other.guc,
+            &other.guc,
             &mut Responder::new(&mut other.send),
             2,
             false,
@@ -861,7 +1057,7 @@ fn retained_query_errors_rollback_completed_writes_and_session_changes() {
 
 #[test]
 fn retained_query_call_state_is_reused_between_rows() {
-    const ROWS: usize = 1024;
+    const ROWS: usize = 1100;
     let config = test_config("retained-query-bounded-rows");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -908,7 +1104,7 @@ fn retained_query_call_state_is_reused_between_rows() {
              SELECT count(*),count(DISTINCT value),sum(value) FROM query_bounded_audit",
             true,
         )),
-        ["1024", "1024|1024|524800"]
+        ["1100", "1100|1100|605550"]
     );
 }
 
@@ -2552,4 +2748,898 @@ fn timezone_numeric_offsets_and_intervals_use_postgresql_bounds() {
             assert_eq!(guc.get_owned("timezone").unwrap().as_str(), prior.as_str());
         }
     });
+}
+
+#[test]
+fn qualified_catalog_calls_keep_their_namespace_and_sql_syntax_boundaries() {
+    let config = test_config("qualified-catalog-call-boundaries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let fixture =
+        include_str!("../../../tests/external/differential_exact/60_qualified_routine_calls.sql");
+    let mut requests = fixture.split("-- next request");
+    let valid = session.success(&mut engine, requests.next().unwrap(), true);
+    assert_eq!(
+        data_rows(&valid),
+        [
+            "999|999|shadow",
+            "1|2|3|3|t|t",
+            "3",
+            "103|3|3|2|2",
+            "1|1|1",
+            "2|2|2",
+            "2|0|0|t|t",
+            "t|t|t|x",
+            "7|8|1.25",
+            "qualified_call_values",
+            "17",
+        ]
+    );
+    for request in requests {
+        let output = session.execute(&mut engine, request, true);
+        if request.contains("SELECT pg_catalog.nextval('qualified_error_values')") {
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            assert_eq!(data_rows(&output), ["1"]);
+            continue;
+        }
+        let expected = if request.contains("'x':1") {
+            "42601"
+        } else if request.contains("pg_catalog.array[")
+            || request.contains("pg_catalog.current_date;")
+            || request.contains("AS hidden")
+        {
+            "42P01"
+        } else {
+            "42883"
+        };
+        assert_eq!(
+            error_sqlstates(&output),
+            [expected],
+            "{}: {}",
+            request,
+            String::from_utf8_lossy(&output)
+        );
+        if request.contains("pg_catalog.json_object('x':1)") {
+            assert!(String::from_utf8_lossy(&output).contains("syntax error at or near \":\""));
+        }
+    }
+    session.success(
+        &mut engine,
+        "CREATE SCHEMA reference_scope; CREATE TABLE reference_scope.source(value integer); \
+         INSERT INTO reference_scope.source VALUES(7)",
+        true,
+    );
+    for query in [
+        "SELECT reference_scope.source.value FROM reference_scope.source",
+        "SELECT selected.value FROM reference_scope.source AS selected",
+        "SELECT (SELECT selected.value) FROM reference_scope.source AS selected",
+        "SELECT (SELECT reference_scope.source.value) FROM reference_scope.source",
+        "SELECT (SELECT selected.value FROM (VALUES(8)) AS inner_row(other)) FROM reference_scope.source AS selected",
+    ] {
+        assert_eq!(
+            data_rows(&session.success(&mut engine, query, true)),
+            ["7"],
+            "{query}"
+        );
+    }
+    for (query, state) in [
+        ("SELECT missing.value", "42P01"),
+        ("SELECT pg_catalog.pg_class.relname", "42P01"),
+        ("SELECT \"a.b\".value", "42P01"),
+        ("SELECT value", "42703"),
+        (
+            "SELECT source.value FROM reference_scope.source AS selected",
+            "42P01",
+        ),
+        (
+            "SELECT selected.missing FROM reference_scope.source AS selected",
+            "42703",
+        ),
+        (
+            "SELECT (SELECT selected.missing) FROM reference_scope.source AS selected",
+            "42703",
+        ),
+        (
+            "SELECT (SELECT selected.value FROM (VALUES(8)) AS selected(other)) FROM reference_scope.source AS selected",
+            "42703",
+        ),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, query, true)),
+            [state],
+            "{query}"
+        );
+    }
+    let missing = session.execute(
+        &mut engine,
+        "SELECT (SELECT selected.missing) FROM reference_scope.source AS selected",
+        true,
+    );
+    assert_eq!(error_sqlstates(&missing), ["42703"]);
+    assert!(String::from_utf8_lossy(&missing).contains("column selected.missing does not exist"));
+    for query in [
+        "SELECT reference_scope.source.value FROM reference_scope.source AS selected",
+        "SELECT (SELECT reference_scope.source.value) FROM reference_scope.source AS selected",
+    ] {
+        let hidden = session.execute(&mut engine, query, true);
+        assert_eq!(error_sqlstates(&hidden), ["42P01"], "{query}");
+        assert!(
+            String::from_utf8_lossy(&hidden)
+                .contains("invalid reference to FROM-clause entry for table \"source\""),
+            "{query}"
+        );
+    }
+    for (query, table) in [
+        ("SELECT (SELECT pg_catalog.pg_class.relname)", "pg_class"),
+        ("SELECT (SELECT \"a.b\".value)", "a.b"),
+    ] {
+        let output = session.execute(&mut engine, query, true);
+        assert_eq!(error_sqlstates(&output), ["42P01"], "{query}");
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains(&format!("missing FROM-clause entry for table \"{table}\"")),
+            "{query}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "DROP TABLE reference_scope.source; DROP SCHEMA reference_scope",
+        true,
+    );
+}
+
+#[test]
+fn qualified_set_routines_preserve_namespaces_records_and_argument_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("qualified-set-routine-records");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential_exact/61_qualified_set_routines.sql"
+        );
+        let requests = fixture.split("-- next request").collect::<Vec<_>>();
+        let output = session.success(&mut engine, requests[0], true);
+        assert_eq!(
+            data_rows(&output),
+            [
+                "10|1",
+                "NULL|2",
+                "30|3",
+                "x|1",
+                "NULL|2",
+                "z|3",
+                "0",
+                "0",
+                "1|1",
+                "2|2",
+                "3|3",
+                "4|4",
+                "40|1",
+                "50|2",
+                "2",
+                "3",
+                "4",
+                "5",
+                "host|localhost",
+                "port|5432",
+                "a",
+                "a",
+                "1|1",
+                "2|2",
+            ]
+        );
+        for request in &requests[1..4] {
+            let output = session.execute(&mut engine, request, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                ["42883"],
+                "{}: {}",
+                request,
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, requests[4], true)),
+            [
+                "1",
+                "8|1",
+                "9|2",
+                "102|3|103|104|(5)",
+                "1|3",
+                "2|4",
+                "99",
+                "1",
+                "2"
+            ]
+        );
+        for request in &requests[5..] {
+            assert_eq!(
+                error_sqlstates(&session.execute(&mut engine, request, true)),
+                ["42601"],
+                "{}",
+                request
+            );
+        }
+        let output = session.success(
+            &mut engine,
+            "SELECT (information_schema._pg_expandarray(ARRAY['typed'])).*",
+            true,
+        );
+        assert_eq!(row_description_type_oids(&output), [25, 23]);
+        assert_eq!(data_rows(&output), ["typed|1"]);
+    }
+}
+
+#[test]
+fn bound_builtin_support_functions_convert_inputs_without_name_resolution() {
+    use crate::sql::eval::CatalogAccess as _;
+    let config = test_config("bound-builtin-support-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let arena = Arena::new(&mut budget, "bound builtin arguments", 64 << 10).unwrap();
+    let catalog = query::storage_catalog(&engine.storage, &arena, 0);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    177,
+                    &[Datum::Int2(1), Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
+                    eval::RoutineCallAccess::Caller,
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Int4(3))
+        );
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    141,
+                    &[Datum::Int2(3), Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT2, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
+                    eval::RoutineCallAccess::Caller,
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Int4(6))
+        );
+        assert_eq!(
+            catalog
+                .call_routine_oid(
+                    177,
+                    &[Datum::Null, Datum::Int4(2)],
+                    &[crate::sql::types::oid::INT4, crate::sql::types::oid::INT4],
+                    ast::Collation::None,
+                    eval::RoutineCallAccess::Caller,
+                    &arena
+                )
+                .unwrap(),
+            Some(Datum::Null)
+        );
+    });
+}
+
+#[test]
+fn builtin_aggregate_support_identities_survive_catalog_publication() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("builtin-aggregate-catalog-identity");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE AGGREGATE public.sum(integer) (SFUNC=pg_catalog.int4pl,STYPE=integer,INITCOND='100'); \
+             SET search_path=public,pg_catalog", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT sum(value),pg_catalog.sum(value) FROM (VALUES(1),(2)) AS input(value); \
+             SELECT aggtransfn::oid FROM pg_aggregate WHERE aggfnoid='public.sum(integer)'::regprocedure; \
+             SELECT 177::regproc,177::regprocedure, \
+                    to_regproc('pg_catalog.int4pl')::oid, \
+                    to_regprocedure('pg_catalog.int4pl(integer,integer)')::oid; \
+             SELECT to_regprocedure('pg_catalog.array_append(anycompatiblearray,anycompatible)')::oid", true)),
+            ["103|3", "177", "int4pl|int4pl(integer,integer)|177|177", "378"]);
+        session.success(&mut engine, "DROP AGGREGATE public.sum(integer)", true);
+        session.success(&mut engine,
+            "CREATE FUNCTION public.int4pl(integer,integer) RETURNS integer LANGUAGE sql AS 'SELECT 999'", true);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            "SELECT 177::regproc,177::regprocedure,pg_function_is_visible(177), \
+                    to_regproc('int4pl')='public.int4pl(integer,integer)'::regprocedure, \
+                    to_regprocedure('int4pl(integer,integer)')='public.int4pl(integer,integer)'::regprocedure, \
+                    to_regproc('_pg_expandarray') IS NULL", true)),
+            ["pg_catalog.int4pl|pg_catalog.int4pl(integer,integer)|f|t|t|t"]);
+        session.success(
+            &mut engine,
+            "CREATE PROCEDURE public.visible_proc(integer) LANGUAGE sql AS 'SELECT 1'; \
+             CREATE SCHEMA z_first; CREATE SCHEMA z_second; \
+             CREATE FUNCTION z_first.echo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+             CREATE FUNCTION z_second.echo(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+             SET search_path=z_first,z_second,public,pg_catalog",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT pg_function_is_visible('public.visible_proc(integer)'::regprocedure), \
+                    to_regproc('visible_proc')='public.visible_proc(integer)'::regprocedure; \
+             SELECT 'z_second.echo(integer)'::regprocedure,to_regproc('z_second.echo'), \
+                    pg_function_is_visible('z_first.echo(integer)'::regprocedure), \
+                    pg_function_is_visible('z_second.echo(integer)'::regprocedure), \
+                    to_regprocedure('echo(integer)')='z_first.echo(integer)'::regprocedure",
+                true
+            )),
+            ["t|t", "z_second.echo(integer)|z_second.echo|t|f|t"]
+        );
+    }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// 9ceddc11f76f05b4af9d2234b0d8b08d8c02646f891affbfb07354d41294ddc6.
+#[test]
+fn conflict_condition_types_preserve_qualified_scope_errors() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("conflict-qualified-scope");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SCHEMA reference_scope; \
+             CREATE TABLE reference_scope.source(id integer PRIMARY KEY,value integer); \
+             INSERT INTO reference_scope.source VALUES(1,7)",
+            true,
+        );
+        for (condition, state, message) in [
+            (
+                "abs(ghost.missing)>0",
+                "42P01",
+                "missing FROM-clause entry for table \"ghost\"",
+            ),
+            (
+                "abs(excluded.missing)>0",
+                "42703",
+                "column excluded.missing does not exist",
+            ),
+            (
+                "excluded.missing>0",
+                "42703",
+                "column excluded.missing does not exist",
+            ),
+        ] {
+            let sql = format!(
+                "INSERT INTO reference_scope.source VALUES(1,9) \
+                 ON CONFLICT(id) DO UPDATE SET value=excluded.value WHERE {condition}"
+            );
+            let output = session.execute(&mut engine, &sql, true);
+            assert_eq!(error_sqlstates(&output), [state], "{mode:?}: {sql}");
+            assert!(
+                String::from_utf8_lossy(&output).contains(&format!("M{message}\0")),
+                "{mode:?}: {sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value FROM reference_scope.source",
+                true,
+            )),
+            ["7"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "INSERT INTO reference_scope.source VALUES(1,9) ON CONFLICT(id) \
+                 DO UPDATE SET value=excluded.value WHERE abs(excluded.value)>0 \
+                 RETURNING value",
+                true,
+            )),
+            ["9"]
+        );
+    }
+}
+
+// PostgreSQL 18.6 reference SQL SHA256:
+// 2baf7a415c2246607b549a3e1a2cef33191f7e0ca15a8bd311dbfe9dec3b9a89.
+#[test]
+fn auto_updatable_views_map_public_columns_under_target_aliases() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config("view-target-alias-columns");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE alias_view_base(id integer,value text,secret text); \
+             INSERT INTO alias_view_base VALUES(1,'a','private'),(2,'b','private'),(3,'c','private'); \
+             CREATE VIEW alias_view(visible_id,visible_value) AS \
+               SELECT id,value FROM alias_view_base WHERE id<=2",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "UPDATE alias_view AS exposed SET visible_value=upper(exposed.visible_value) \
+                 WHERE exposed.visible_id=1 RETURNING exposed.*; \
+                 DELETE FROM alias_view AS exposed WHERE exposed.visible_id=2 RETURNING exposed.*",
+                true,
+            )),
+            ["1|A", "2|b"]
+        );
+        let hidden = session.execute(
+            &mut engine,
+            "UPDATE alias_view AS exposed SET secret='leak' WHERE exposed.visible_id=1",
+            true,
+        );
+        assert_eq!(error_sqlstates(&hidden), ["42703"]);
+        assert!(
+            String::from_utf8_lossy(&hidden)
+                .contains("Mcolumn \"secret\" of relation \"alias_view\" does not exist\0"),
+            "{}",
+            String::from_utf8_lossy(&hidden)
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "UPDATE alias_view AS exposed SET visible_value='hidden' WHERE alias_view.visible_id=1",
+                true,
+            )),
+            ["42P01"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT id,value,secret FROM alias_view_base ORDER BY id",
+                true,
+            )),
+            ["1|A|private", "3|c|private"]
+        );
+    }
+}
+
+#[test]
+fn function_casts_receive_target_type_modifiers_and_conversion_context() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("cast-type-modifiers-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE FUNCTION target_varchar(integer,integer,boolean) RETURNS varchar LANGUAGE sql AS \
+               $$SELECT (CASE WHEN $2=9 THEN CASE WHEN $3 THEN 'e9' ELSE 'a9' END ELSE 'none' END)::varchar$$; \
+             CREATE CAST(integer AS varchar) WITH FUNCTION target_varchar(integer,integer,boolean) AS ASSIGNMENT; \
+             CREATE DOMAIN target_short AS varchar(5); \
+             CREATE TABLE target_modifiers(value varchar(5),items varchar(5)[],domain_value target_short)", true);
+        for (statement, expected) in [
+            ("SELECT 7::varchar(5)", "e9"),
+            ("SELECT 7::varchar", "none"),
+            ("SELECT ARRAY[7,8]::varchar(5)[]", "{e9,e9}"),
+            ("SELECT (ARRAY[7,8]::integer[])::varchar(5)[]", "{e9,e9}"),
+            (
+                "SELECT ARRAY[ARRAY[7],ARRAY[8]]::varchar(5)[]",
+                "{{e9},{e9}}",
+            ),
+            ("SELECT 7::target_short", "e9"),
+            ("SELECT ARRAY[7,8]::target_short[]", "{e9,e9}"),
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, statement, true)),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+        session.success(
+            &mut engine,
+            "INSERT INTO target_modifiers VALUES(7,ARRAY[7,8],7)",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT value,items,domain_value FROM target_modifiers",
+                true
+            )),
+            ["a9|{a9,a9}|a9"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn sql_and_plpgsql_formals_preserve_observed_postgresql_input_collations() {
+    // PostgreSQL 18.6 oracle at 233fb021, fixture SHA256:
+    // b903aff00968acddaa4815009a1836ee74c4630016800d904c5588402ae11b79.
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("formal-input-collations-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/208_routine_parameter_collations.sql"
+        );
+        let (definitions, _) = fixture
+            .split_once("ALTER SEQUENCE parameter_checks RESTART WITH 1;")
+            .unwrap();
+        session.success(&mut engine, definitions, true);
+        for (statement, expected) in [
+            (
+                "ALTER SEQUENCE parameter_checks RESTART WITH 1; SELECT parameter_sql('a' COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT parameter_sql('a' COLLATE \"POSIX\")", "2"),
+            ("SELECT parameter_sql('a' COLLATE \"C\")", "2"),
+            (
+                "DISCARD PLANS; ALTER SEQUENCE parameter_checks RESTART WITH 1; SELECT parameter_pl('a' COLLATE \"C\")",
+                "1",
+            ),
+            ("SELECT parameter_pl('a' COLLATE \"POSIX\")", "2"),
+            ("SELECT parameter_pl('a' COLLATE \"C\")", "2"),
+            (
+                "SELECT * FROM parameter_pl_table('a' COLLATE \"C\"); SELECT * FROM parameter_pl_table('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "SELECT parameter_local('a' COLLATE \"C\"); SELECT parameter_local('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "CALL parameter_sql_procedure('a' COLLATE \"C\"); CALL parameter_sql_procedure('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "CALL parameter_pl_procedure('a' COLLATE \"C\"); CALL parameter_pl_procedure('a' COLLATE \"POSIX\")",
+                "2",
+            ),
+            (
+                "PREPARE parameter_statement(text) AS SELECT parameter_sql($1 COLLATE \"C\"); EXECUTE parameter_statement('a'); EXECUTE parameter_statement('b')",
+                "2",
+            ),
+        ] {
+            session.success(&mut engine, statement, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM parameter_checks",
+                    true
+                )),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn domain_checks_keep_sequence_context_through_casts_arrays_and_assignments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("domain-check-sequences-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE direct_domain_checks; \
+             CREATE DOMAIN direct_checked AS integer CHECK(nextval('direct_domain_checks')>0); \
+             CREATE TABLE direct_values(value direct_checked,items direct_checked[])",
+            true,
+        );
+        for (statement, expected) in [
+            ("SELECT 7::direct_checked", "1"),
+            ("SELECT ARRAY[8,9]::direct_checked[]", "3"),
+            ("SELECT '{8,9}'::direct_checked[]", "5"),
+            ("INSERT INTO direct_values VALUES(1,ARRAY[2,3])", "8"),
+            ("SELECT NULL::direct_checked", "9"),
+            ("SELECT ARRAY[NULL]::direct_checked[]", "10"),
+        ] {
+            session.success(&mut engine, statement, true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM direct_domain_checks",
+                    true
+                )),
+                [expected],
+                "{statement}, {mode:?}"
+            );
+        }
+        session.success(&mut engine,
+            "CREATE FUNCTION direct_body() RETURNS direct_checked[] LANGUAGE sql SET search_path=public \
+               AS $$SELECT '{11,12}'::direct_checked[]$$", true);
+        let created = session.success(
+            &mut engine,
+            "SELECT last_value FROM direct_domain_checks",
+            true,
+        );
+        assert_eq!(data_rows(&created), ["12"]);
+        for expected in ["14", "14"] {
+            session.success(&mut engine, "SELECT direct_body()", true);
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT last_value FROM direct_domain_checks",
+                    true
+                )),
+                [expected]
+            );
+        }
+        let input_arena = Arena::new(&mut budget, "domain parameter inputs", 256 << 10).unwrap();
+        let oid = crate::sql::catalog::user_type_oid(&engine.storage, 0, "direct_checked").unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                engine
+                    .decode_text_parameter(
+                        oid,
+                        b"15",
+                        &input_arena,
+                        0,
+                        Some(session.guc.seq_session())
+                    )
+                    .unwrap(),
+                Datum::Int4(15)
+            );
+            assert_eq!(
+                engine
+                    .decode_binary_parameter(
+                        oid,
+                        &16_i32.to_be_bytes(),
+                        &input_arena,
+                        0,
+                        Some(session.guc.seq_session())
+                    )
+                    .unwrap(),
+                Datum::Int4(16)
+            );
+            assert_eq!(
+                engine
+                    .coerce_parameter_null(oid, &input_arena, 0, Some(session.guc.seq_session()))
+                    .unwrap(),
+                Datum::Null
+            );
+        });
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM direct_domain_checks",
+                true
+            )),
+            ["17"]
+        );
+    }
+}
+
+#[test]
+fn foreign_row_inputs_preserve_the_request_sequence_context_without_allocating() {
+    let config = test_config("foreign-domain-sequence-inputs");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE foreign_domain_checks; \
+         CREATE DOMAIN foreign_checked AS integer CHECK(nextval('foreign_domain_checks')>0); \
+         CREATE TABLE foreign_layout(value foreign_checked,items foreign_checked[])",
+        true,
+    );
+    let slot = engine
+        .storage
+        .find_visible("public", "foreign_layout", 0)
+        .unwrap();
+    let table = (*engine.storage.table_def(slot, 0)).clone();
+    let arena = Arena::new(&mut budget, "foreign value conversion", 256 << 10).unwrap();
+    let sequences =
+        crate::sql::sequence::SeqEval::new(&engine.storage, session.guc.seq_session(), 0);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            crate::sql::foreign::decode_foreign_field(
+                &engine.storage,
+                &table,
+                0,
+                Some(b"7"),
+                0,
+                &arena,
+                Some(&sequences)
+            )
+            .unwrap(),
+            Datum::Int4(7)
+        );
+        let array = crate::sql::foreign::decode_foreign_field(
+            &engine.storage,
+            &table,
+            1,
+            Some(b"{8,9}"),
+            0,
+            &arena,
+            Some(&sequences),
+        )
+        .unwrap();
+        assert!(matches!(array, Datum::Array { .. }));
+        assert_eq!(
+            crate::sql::foreign::decode_foreign_field(
+                &engine.storage,
+                &table,
+                0,
+                None,
+                0,
+                &arena,
+                Some(&sequences)
+            )
+            .unwrap(),
+            Datum::Null
+        );
+    });
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value FROM foreign_domain_checks",
+            true
+        )),
+        ["4"]
+    );
+}
+
+#[test]
+fn planner_metadata_preserves_record_shapes_target_names_and_index_comments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("planner-record-metadata-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/232_planner_record_metadata.sql");
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let state = if statement.contains("excluded.missing") {
+                Some("42703")
+            } else if statement.contains("length(DISTINCT") {
+                Some("42809")
+            } else if statement.contains(" AS hidden") {
+                Some("42P01")
+            } else {
+                None
+            };
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                state.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {statement}"
+            );
+            errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+            rows.extend(data_rows(&output));
+        }
+        assert_eq!(errors, ["42703", "42809", "42P01", "42P01"]);
+        assert_eq!(
+            rows,
+            [
+                "7|xy|integer|character varying",
+                "x|1",
+                "NULL|2",
+                "z|3",
+                "9",
+                "1|11|10|11",
+                "2|20|25",
+                "kept",
+                "planner_metadata_index|replacement index",
+                "planner_metadata_retired|original index",
+                "replacement index",
+                "1978|403|int4_ops|integer_ops|23|t|0",
+                "1979|403|int2_ops|integer_ops|21|t|0",
+                "1981|403|oid_ops|oid_ops|26|t|0",
+                "4217|403|text_pattern_ops|text_pattern_ops|25|f|0",
+                "10028|403|name_ops|text_ops|19|t|2275",
+                "10031|405|oid_ops|oid_ops|26|t|0",
+                "10044|403|varchar_ops|text_ops|25|f|0",
+                "10053|403|xid8_ops|xid8_ops|5069|t|0",
+                "85",
+                "0",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn nested_query_inputs_preserve_caller_scratch_record_shapes_and_index_metadata() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-query-inputs-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/234_nested_query_and_index_metadata.sql"
+        );
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let expected = if statement.contains("'SELECT target FROM nested_input_rules")
+                || statement.contains("'SELECT 1,2'")
+            {
+                Some("22023")
+            } else if statement.contains("\"a.b\".value") {
+                Some("42P01")
+            } else if statement.starts_with("SELECT substring(") {
+                Some("22011")
+            } else if statement.starts_with("SELECT 1/0,") {
+                Some("22012")
+            } else {
+                None
+            };
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {statement}"
+            );
+            rows.extend(data_rows(&output));
+        }
+        assert_eq!(
+            rows,
+            [
+                "'c' & 'd'",
+                "64|'c' & 'd'",
+                "'a'",
+                "'c' & 'd'",
+                "kept",
+                "1|one|character varying",
+                "2|two|character varying",
+                "1|one",
+                "2|two",
+                "t|t|key comment|index comment",
+                "t|t|key comment|index comment",
+                "t|t|key comment|index comment",
+                "1|2",
+                "1|2",
+            ],
+            "{mode:?}"
+        );
+    }
 }

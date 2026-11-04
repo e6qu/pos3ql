@@ -621,6 +621,141 @@ fn box_parts(
     }
 }
 
+fn polygon_from_circle<'a>(
+    text: &str,
+    count: usize,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if count < 2 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "polygon must have at least 2 points"
+        ));
+    }
+    let (circle, _, _) = points_parts(GeometryKind::Circle, text, arena)?;
+    if circle[2].abs() <= EPSILON {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot convert circle with radius zero to polygon"
+        ));
+    }
+    let components = count.checked_mul(2).ok_or_else(super::super::arena_full)?;
+    let values = arena
+        .alloc_slice_with(components, |_| 0.0)
+        .map_err(|_| super::super::arena_full())?;
+    let step = core::f64::consts::TAU / count as f64;
+    for (index, point) in values.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let angle = step * index as f64;
+        point[0] = circle[0] - circle[2] * angle.cos();
+        point[1] = circle[1] + circle[2] * angle.sin();
+    }
+    Ok(Datum::Geometry {
+        kind: GeometryKind::Polygon,
+        text: geometry::render(GeometryKind::Polygon, values, true, arena)?,
+    })
+}
+
+/// Unary geometric functions and SQL casts execute the same conversion.
+/// Admission follows pg_cast; callers still select the requested SQL context.
+pub(crate) fn convert_geometry<'a>(
+    value: Datum<'a>,
+    target: GeometryKind,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Datum::Geometry { kind: source, text } = value else {
+        return Err(type_error(target.name()));
+    };
+    if source == target {
+        return Ok(value);
+    }
+    super::super::validate_geometry_cast(
+        source.oid(),
+        crate::sql::types::ColType::Geometry(target),
+        super::super::DefinedCastContext::Explicit,
+    )?;
+    let render = |values: &[f64], closed| {
+        geometry::render(target, values, closed, arena)
+            .map(|text| Datum::Geometry { kind: target, text })
+    };
+    match target {
+        GeometryKind::Point => {
+            let (x, y) = center_of(source, text, arena)?;
+            render(&[x, y], false)
+        }
+        GeometryKind::Box | GeometryKind::Lseg => {
+            let (high_x, high_y, low_x, low_y) = box_parts(source, text, arena)?;
+            render(&[high_x, high_y, low_x, low_y], false)
+        }
+        GeometryKind::Path => {
+            let (values, count, _) = points_parts(source, text, arena)?;
+            render(&values[..count], true)
+        }
+        GeometryKind::Polygon => match source {
+            GeometryKind::Path => {
+                let (values, count, closed) = points_parts(source, text, arena)?;
+                if !closed {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "open path cannot be converted to polygon"
+                    ));
+                }
+                render(&values[..count], true)
+            }
+            GeometryKind::Box => {
+                let (high_x, high_y, low_x, low_y) = box_parts(source, text, arena)?;
+                render(
+                    &[low_x, low_y, low_x, high_y, high_x, high_y, high_x, low_y],
+                    true,
+                )
+            }
+            GeometryKind::Circle => polygon_from_circle(text, 12, arena),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "admitted geometric polygon conversion has no implementation"
+            )),
+        },
+        GeometryKind::Circle => {
+            let (x, y, radius) = match source {
+                GeometryKind::Box => {
+                    let (high_x, high_y, low_x, low_y) = box_parts(source, text, arena)?;
+                    (
+                        (high_x + low_x) / 2.0,
+                        (high_y + low_y) / 2.0,
+                        (high_x - low_x).hypot(high_y - low_y) / 2.0,
+                    )
+                }
+                GeometryKind::Polygon => {
+                    let (values, count, _) = points_parts(source, text, arena)?;
+                    let points = count / 2;
+                    let (mut x, mut y) = (0.0, 0.0);
+                    for point in values[..count].as_chunks::<2>().0 {
+                        x += point[0];
+                        y += point[1];
+                    }
+                    x /= points as f64;
+                    y /= points as f64;
+                    let mut radius = 0.0;
+                    for point in values[..count].as_chunks::<2>().0 {
+                        radius += (point[0] - x).hypot(point[1] - y);
+                    }
+                    (x, y, radius / points as f64)
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "admitted geometric circle conversion has no implementation"
+                    ));
+                }
+            };
+            render(&[x, y, radius], false)
+        }
+        GeometryKind::Line => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "admitted geometric line conversion has no implementation"
+        )),
+    }
+}
+
 /// Handles the constructor/accessor subset shared by normal SQL expression,
 /// prepared-statement and routine evaluation paths.
 #[allow(clippy::too_many_arguments)]
@@ -758,28 +893,11 @@ pub(crate) fn dispatch<'a>(
             }
             "point" => {
                 if args.len() == 1 && !star {
-                    return match arg(0)? {
+                    let value = arg(0)?;
+                    return match value {
                         Datum::Null => Ok(Datum::Null),
                         Datum::Text(text) => built(GeometryKind::Point, text),
-                        Datum::Geometry {
-                            kind: GeometryKind::Point,
-                            text,
-                        } => built(GeometryKind::Point, text),
-                        Datum::Geometry { kind, text }
-                            if matches!(
-                                kind,
-                                GeometryKind::Box
-                                    | GeometryKind::Circle
-                                    | GeometryKind::Lseg
-                                    | GeometryKind::Polygon
-                            ) =>
-                        {
-                            let (x, y) = center_of(kind, text, arena)?;
-                            let mut out = StackStr::<2048>::new();
-                            write_point(&mut out, x, y);
-                            built(GeometryKind::Point, out.as_str())
-                        }
-                        _ => Err(type_error(name)),
+                        _ => convert_geometry(value, GeometryKind::Point, arena),
                     };
                 }
                 want(2)?;
@@ -794,39 +912,11 @@ pub(crate) fn dispatch<'a>(
                     if value.is_null() {
                         return Ok(Datum::Null);
                     }
-                    return match (name, value) {
-                        (
-                            "lseg",
-                            Datum::Geometry {
-                                kind: GeometryKind::Box,
-                                text,
-                            },
-                        ) => {
-                            let (high_x, high_y, low_x, low_y) =
-                                box_parts(GeometryKind::Box, text, arena)?;
-                            let mut out = StackStr::<2048>::new();
-                            let _ = out.write_str("[");
-                            write_point(&mut out, high_x, high_y);
-                            let _ = out.write_str(",");
-                            write_point(&mut out, low_x, low_y);
-                            let _ = out.write_str("]");
-                            built(GeometryKind::Lseg, out.as_str())
-                        }
-                        ("box", Datum::Geometry { kind, text })
-                            if matches!(
-                                kind,
-                                GeometryKind::Point | GeometryKind::Circle | GeometryKind::Polygon
-                            ) =>
-                        {
-                            let (high_x, high_y, low_x, low_y) = box_parts(kind, text, arena)?;
-                            let mut out = StackStr::<2048>::new();
-                            write_point(&mut out, high_x, high_y);
-                            let _ = out.write_str(",");
-                            write_point(&mut out, low_x, low_y);
-                            built(GeometryKind::Box, out.as_str())
-                        }
-                        _ => Err(type_error(name)),
-                    };
+                    return convert_geometry(
+                        value,
+                        GeometryKind::from_name(name).expect("geometric constructor"),
+                        arena,
+                    );
                 }
                 want(2)?;
                 let (left, right) = (arg(0)?, arg(1)?);
@@ -866,42 +956,7 @@ pub(crate) fn dispatch<'a>(
                     if value.is_null() {
                         return Ok(Datum::Null);
                     }
-                    return match value {
-                        Datum::Geometry {
-                            kind: GeometryKind::Box,
-                            text,
-                        } => {
-                            let (high_x, high_y, low_x, low_y) =
-                                box_parts(GeometryKind::Box, text, arena)?;
-                            let x = (high_x + low_x) / 2.0;
-                            let y = (high_y + low_y) / 2.0;
-                            let radius = (high_x - low_x).hypot(high_y - low_y) / 2.0;
-                            let mut out = StackStr::<2048>::new();
-                            let _ = out.write_str("<");
-                            write_point(&mut out, x, y);
-                            let _ = write!(out, ",{}>", PgFloat8(radius));
-                            built(GeometryKind::Circle, out.as_str())
-                        }
-                        Datum::Geometry {
-                            kind: GeometryKind::Polygon,
-                            text,
-                        } => {
-                            let (values, count, _) =
-                                points_parts(GeometryKind::Polygon, text, arena)?;
-                            let (x, y) = center_of(GeometryKind::Polygon, text, arena)?;
-                            let mut radius = 0.0;
-                            for point in values[..count].as_chunks::<2>().0 {
-                                radius += (point[0] - x).hypot(point[1] - y);
-                            }
-                            radius /= (count / 2) as f64;
-                            let mut out = StackStr::<2048>::new();
-                            let _ = out.write_str("<");
-                            write_point(&mut out, x, y);
-                            let _ = write!(out, ",{}>", PgFloat8(radius));
-                            built(GeometryKind::Circle, out.as_str())
-                        }
-                        _ => Err(type_error(name)),
-                    };
+                    return convert_geometry(value, GeometryKind::Circle, arena);
                 }
                 want(2)?;
                 let (center, radius) = (arg(0)?, arg(1)?);
@@ -922,140 +977,43 @@ pub(crate) fn dispatch<'a>(
             }
             "path" => {
                 want(1)?;
-                match arg(0)? {
-                    Datum::Null => Ok(Datum::Null),
-                    Datum::Geometry {
-                        kind: GeometryKind::Path,
-                        text,
-                    } => built(GeometryKind::Path, text),
-                    Datum::Geometry {
-                        kind: GeometryKind::Polygon,
-                        text,
-                    } => built(GeometryKind::Path, text),
-                    _ => Err(type_error(name)),
+                let value = arg(0)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
                 }
+                convert_geometry(value, GeometryKind::Path, arena)
             }
             "polygon" => {
                 if args.len() == 2 && !star {
-                    let count = match arg(0)? {
+                    let Some(values) =
+                        super::super::args::strict_arguments::<2>(args, arena, params, row, hooks)?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    let count = match values[0] {
                         Datum::Int2(value) => i64::from(value),
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
-                        Datum::Null => return Ok(Datum::Null),
                         _ => return Err(type_error(name)),
                     };
-                    let circle = arg(1)?;
-                    if circle.is_null() {
-                        return Ok(Datum::Null);
-                    }
-                    let count = usize::try_from(count)
-                        .ok()
-                        .filter(|count| *count >= 2)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                "polygon must have at least 2 points"
-                            )
-                        })?;
-                    let (values, _, _) = points_parts(
-                        GeometryKind::Circle,
-                        geometry(circle, GeometryKind::Circle, name)?,
+                    let count = usize::try_from(count).map_err(|_| {
+                        sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "polygon must have at least 2 points"
+                        )
+                    })?;
+                    return polygon_from_circle(
+                        geometry(values[1], GeometryKind::Circle, name)?,
+                        count,
                         arena,
-                    )?;
-                    if values[2].abs() <= EPSILON {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "cannot convert circle with radius zero to polygon"
-                        ));
-                    }
-                    let component_count =
-                        count.checked_mul(2).ok_or_else(super::super::arena_full)?;
-                    let output = arena
-                        .alloc_slice_with(component_count, |_| 0.0)
-                        .map_err(|_| super::super::arena_full())?;
-                    let angle_step = core::f64::consts::TAU / count as f64;
-                    for index in 0..count {
-                        let angle = angle_step * index as f64;
-                        output[index * 2] = values[0] - values[2] * angle.cos();
-                        output[index * 2 + 1] = values[1] + values[2] * angle.sin();
-                    }
-                    let text = geometry::render(GeometryKind::Polygon, output, true, arena)?;
-                    return Ok(Datum::Geometry {
-                        kind: GeometryKind::Polygon,
-                        text,
-                    });
+                    );
                 }
                 want(1)?;
-                match arg(0)? {
-                    Datum::Null => Ok(Datum::Null),
-                    Datum::Geometry {
-                        kind: GeometryKind::Polygon,
-                        text,
-                    } => built(GeometryKind::Polygon, text),
-                    Datum::Geometry {
-                        kind: GeometryKind::Path,
-                        text,
-                    } => {
-                        let (values, count, _) = points_parts(GeometryKind::Path, text, arena)?;
-                        geometry::render(GeometryKind::Polygon, &values[..count], true, arena).map(
-                            |text| Datum::Geometry {
-                                kind: GeometryKind::Polygon,
-                                text,
-                            },
-                        )
-                    }
-                    Datum::Geometry {
-                        kind: GeometryKind::Box,
-                        text,
-                    } => {
-                        let (high_x, high_y, low_x, low_y) =
-                            box_parts(GeometryKind::Box, text, arena)?;
-                        let mut out = StackStr::<2048>::new();
-                        let _ = out.write_str("(");
-                        write_point(&mut out, low_x, low_y);
-                        let _ = out.write_str(",");
-                        write_point(&mut out, low_x, high_y);
-                        let _ = out.write_str(",");
-                        write_point(&mut out, high_x, high_y);
-                        let _ = out.write_str(",");
-                        write_point(&mut out, high_x, low_y);
-                        let _ = out.write_str(")");
-                        built(GeometryKind::Polygon, out.as_str())
-                    }
-                    circle @ Datum::Geometry {
-                        kind: GeometryKind::Circle,
-                        ..
-                    } => {
-                        let literal = match circle {
-                            Datum::Geometry { text, .. } => text,
-                            _ => unreachable!(),
-                        };
-                        let (values, _, _) = points_parts(GeometryKind::Circle, literal, arena)?;
-                        if values[2].abs() <= EPSILON {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "cannot convert circle with radius zero to polygon"
-                            ));
-                        }
-                        let mut out = StackStr::<2048>::new();
-                        let _ = out.write_str("(");
-                        let angle_step = core::f64::consts::TAU / 12.0;
-                        for index in 0..12 {
-                            if index != 0 {
-                                let _ = out.write_str(",");
-                            }
-                            let angle = angle_step * index as f64;
-                            write_point(
-                                &mut out,
-                                values[0] - values[2] * angle.cos(),
-                                values[1] + values[2] * angle.sin(),
-                            );
-                        }
-                        let _ = out.write_str(")");
-                        built(GeometryKind::Polygon, out.as_str())
-                    }
-                    _ => Err(type_error(name)),
+                let value = arg(0)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
                 }
+                convert_geometry(value, GeometryKind::Polygon, arena)
             }
             "x" | "y" => {
                 want(1)?;

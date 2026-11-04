@@ -394,7 +394,14 @@ impl SubscriptionApply {
     fn commit(&mut self, engine: &mut crate::sql::Engine) -> Result<(), SqlError> {
         self.trigger_response.clear();
         let mut responder = Responder::new(&mut self.trigger_response);
-        engine.commit_txn_with_triggers(&mut self.txn, &self.guc, None, &self.arena, &mut responder)
+        engine.commit_txn_with_triggers(
+            &mut self.txn,
+            &self.guc,
+            crate::sql::txn::CommitTarget::Ordinary,
+            None,
+            &self.arena,
+            &mut responder,
+        )
     }
 
     pub(crate) fn awaiting_durability(&self) -> bool {

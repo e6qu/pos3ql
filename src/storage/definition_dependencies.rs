@@ -54,6 +54,16 @@ impl Storage {
                 transaction,
             )?;
         }
+        definition.type_inputs.visit(|_, input| {
+            let result = Self::routine_result_for_oid_in(catalog, input.type_oid, transaction)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "stored SQL input type source is unavailable"
+                    )
+                })?;
+            self.require_type_dependency_access(catalog, result, transaction)
+        })?;
         if let TableTypeMembership::Composite(reference) = definition.type_membership {
             let source = catalog
                 .resolve_source_reference(reference, current_database(), transaction)?

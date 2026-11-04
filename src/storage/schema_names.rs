@@ -73,7 +73,7 @@ pub(super) fn validate_schema_name(name: SqlName) -> Result<(), SqlError> {
 }
 
 impl super::RoutineBodyKind {
-    pub(super) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
+    pub(crate) fn bound_sql_kind(self) -> Result<crate::sql::parser::StoredSqlKind, SqlError> {
         match self {
             Self::Return => Ok(crate::sql::parser::StoredSqlKind::Expression),
             Self::Atomic => Ok(crate::sql::parser::StoredSqlKind::Statements),
@@ -132,6 +132,7 @@ impl SchemaNameTarget {
 
     pub(crate) fn rewrite_table(
         self,
+        storage: &super::Storage,
         name: SqlName,
         definition: &mut super::TableDefBuilder,
         arena: &crate::mem::arena::Arena,
@@ -143,7 +144,13 @@ impl SchemaNameTarget {
         for key in definition.fkeys.iter_mut().take(definition.n_fkeys) {
             changed |= super::rename_schema_name(&mut key.parent_schema, self.name, name);
         }
-        changed |= super::rename_table_sql_identity(definition, self.name, name, arena)?;
+        changed |= super::rename_table_sql_identity(
+            definition,
+            self.name,
+            name,
+            arena,
+            &storage.metadata_pool,
+        )?;
         Ok(changed)
     }
 
@@ -390,6 +397,7 @@ impl Storage {
         }
         indexes[slot].pending_definition = Some(super::PendingIndexDefinition {
             txid: transaction,
+            revision: self.catalog_sequence.next()?,
             definition: definition.mutable_for(transaction),
             expressions: definition.expressions,
             predicate: definition.predicate,

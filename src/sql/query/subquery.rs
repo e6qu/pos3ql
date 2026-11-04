@@ -21,7 +21,7 @@ use crate::storage::Storage;
 use super::setops::materialize_set_body;
 use super::{
     CatalogScopeCols, Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full,
-    cmp_key_rows, collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
+    cmp_key_rows, collect_aggs, collect_table_sample_expressions, fold_aggregates,
     fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
     select_into_rows_recycling, where_passes,
 };
@@ -770,6 +770,7 @@ pub(super) fn correlated_scan_conjuncts<'a>(
             None => *conjunct,
             Some(left) => arena
                 .alloc(Expr::Binary {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     operator: BinaryOp::And,
                     left,
                     right: conjunct,
@@ -915,6 +916,38 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.scope.is_none_or(|scope| scope.n == 0)
+            && self.outer.is_none_or(|outer| outer.is_empty_scope())
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.scope
+            .and_then(|scope| {
+                scope.qualified_star_columns(table).ok()?;
+                Some(scope.func_scalar_type(table).unwrap_or(ColType::Record))
+            })
+            .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         if self
             .scope
@@ -1159,7 +1192,12 @@ fn row_projected<'a>(
 ) -> Result<(&'a Select<'a>, usize), SqlError> {
     fn arity(operand: &Expr) -> usize {
         match operand {
-            Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => args.len(),
+            Expr::Call {
+                kind: crate::sql::ast::CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("row") => args.len(),
             // PostgreSQL retains RowExpr arity through an explicit cast when
             // checking the sublink's projected column count. A scalar cast
             // from text to a composite remains one value.
@@ -1474,14 +1512,32 @@ fn subquery_exists<'a>(
         // FROM-less: an aggregate query yields its one output row even over
         // zero input rows (WHERE false), so EXISTS is true unless HAVING
         // filters it. A plain query yields one row when WHERE holds.
+        let aggregate_columns = SubqueryColumns {
+            scope: None,
+            outer,
+            catalog: crate::sql::exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
+        };
         let mut agg_nodes = ArenaList::new(arena);
         for item in select.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_aggs(expression, &mut agg_nodes, storage, txid)?;
+                collect_aggs(
+                    expression,
+                    &mut agg_nodes,
+                    storage,
+                    txid,
+                    &aggregate_columns,
+                )?;
             }
         }
         if let Some(h) = select.having {
-            collect_aggs(h, &mut agg_nodes, storage, txid)?;
+            collect_aggs(h, &mut agg_nodes, storage, txid, &aggregate_columns)?;
         }
         if !agg_nodes.is_empty() || select.having.is_some() {
             let base = Chained {
@@ -2331,15 +2387,54 @@ fn subquery_witness_with_outer(
 
 /// Query and procedural subqueries resolve inner columns before outer values,
 /// while retaining catalog identities for domains, routines and nested queries.
-struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
-    scope: Option<&'scope QueryScope<'definition>>,
-    outer: Option<&'outer dyn ColumnLookup<'row>>,
-    catalog: crate::sql::exec::CatalogCols<'catalog>,
+pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
+    pub(super) scope: Option<&'scope QueryScope<'definition>>,
+    pub(super) outer: Option<&'outer dyn ColumnLookup<'row>>,
+    pub(super) catalog: crate::sql::exec::CatalogCols<'catalog>,
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
-    fn validate_explicit_cast(&self, source_oid: i32, target: ColType) -> Result<(), SqlError> {
-        self.catalog.validate_explicit_cast(source_oid, target)
+    fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_enum_input_literal(text, target_oid)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.scope.is_none_or(|scope| scope.n == 0)
+            && self.outer.is_none_or(|outer| outer.is_empty_scope())
+            && self.catalog.is_empty_scope()
+    }
+
+    fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
+        self.catalog.type_name_fixed(oid)
+    }
+
+    fn routine_call_selection(
+        &self,
+        name: &str,
+        kind: crate::sql::ast::CallKind,
+        bound_oid: Option<i32>,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<crate::storage::RoutineCallSelection> {
+        self.catalog.routine_call_selection(
+            name,
+            kind,
+            bound_oid,
+            argument_names,
+            variadic,
+            arguments,
+        )
+    }
+
+    fn validate_explicit_cast(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        target: ColType,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_explicit_cast(source_oid, target_oid, target)
     }
 
     fn visit_named_composite_fields(
@@ -2353,6 +2448,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
@@ -2361,6 +2457,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         self.catalog.routine_record_field(
             name,
+            kind,
             bound_oid,
             argument_names,
             variadic,
@@ -2382,9 +2479,17 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
+                if qualifier.is_some_and(|qualifier| {
+                    self.scope.map_or_else(
+                        || self.catalog.is_whole_row(qualifier),
+                        |scope| scope.qualified_star_columns(qualifier).is_ok(),
+                    )
+                }) {
+                    return Err(error);
+                }
                 self.outer
-                    .and_then(|outer| outer.col_type(qualifier, name))
-                    .ok_or(error)
+                    .ok_or(error)?
+                    .resolve_column_type(qualifier, name)
             }
             Err(error) => Err(error),
         }
@@ -2396,6 +2501,16 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         name: &str,
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         if let Some(scope) = self.scope
+            && scope.find_column(qualifier, name).is_err_and(|error| {
+                !matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            })
+        {
+            return None;
+        }
+        if let Some(scope) = self.scope
             && scope.find_column(qualifier, name).is_ok()
         {
             return CatalogScopeCols {
@@ -2406,6 +2521,14 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                 arena: self.catalog.arena,
             }
             .column_meta(qualifier, name);
+        }
+        if qualifier.is_some_and(|qualifier| {
+            self.scope.map_or_else(
+                || self.catalog.is_whole_row(qualifier),
+                |scope| scope.qualified_star_columns(qualifier).is_ok(),
+            )
+        }) {
+            return None;
         }
         let outer = self.outer?;
         let ctype = outer.col_type(qualifier, name)?;
@@ -2433,13 +2556,14 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     fn routine_result(
         &self,
         name: &str,
+        kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         argument_names: &[Option<&str>],
         variadic: bool,
         arguments: &[i32],
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         self.catalog
-            .routine_result(name, bound_oid, argument_names, variadic, arguments)
+            .routine_result(name, kind, bound_oid, argument_names, variadic, arguments)
     }
 
     fn operator_result(
@@ -2889,11 +3013,11 @@ fn run_subquery<'a>(
     };
     // A window function needs rows materialized before it can be computed, so
     // its body belongs to the row-source executor just as a grouped one does.
-    let mut win_probe = ArenaList::new(arena);
-    collect_windows(item, &mut win_probe, storage, txid)?;
-    for ob in select.order_by {
-        collect_windows(ob.expression, &mut win_probe, storage, txid)?;
-    }
+    let has_window = super::expr_has_window(item)
+        || select
+            .order_by
+            .iter()
+            .any(|key| super::expr_has_window(key.expression));
     // A set-returning function in the subquery's select list expands to many
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
@@ -2901,7 +3025,7 @@ fn run_subquery<'a>(
     if !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
-        || !win_probe.is_empty()
+        || has_window
         || has_srf
     {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
@@ -2997,8 +3121,20 @@ fn run_subquery<'a>(
         // FROM-less: one row (outer columns still visible if correlated).
         // Aggregates fold over that single virtual row (zero when WHERE is
         // false) and still yield their one output row.
+        let aggregate_columns = SubqueryColumns {
+            scope: None,
+            outer,
+            catalog: crate::sql::exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
+        };
         let mut agg_nodes = ArenaList::new(arena);
-        collect_aggs(item, &mut agg_nodes, storage, txid)?;
+        collect_aggs(item, &mut agg_nodes, storage, txid, &aggregate_columns)?;
         if !agg_nodes.is_empty() {
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 select,
@@ -3102,8 +3238,20 @@ fn run_subquery<'a>(
     };
 
     // Aggregate subquery: one row.
+    let aggregate_columns = SubqueryColumns {
+        scope: Some(&scope),
+        outer,
+        catalog: crate::sql::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    };
     let mut agg_nodes = ArenaList::new(arena);
-    collect_aggs(item, &mut agg_nodes, storage, txid)?;
+    collect_aggs(item, &mut agg_nodes, storage, txid, &aggregate_columns)?;
     if !agg_nodes.is_empty() {
         let agg_values = fold_aggregates(
             storage,
@@ -3405,6 +3553,7 @@ fn normalize_array_subquery_element<'a>(
             storage,
             txid,
             arena,
+            None,
         ),
         _ => crate::sql::eval::cast_to(value, element.to_coltype(), arena),
     }

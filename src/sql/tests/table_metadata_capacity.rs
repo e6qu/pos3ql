@@ -1,6 +1,182 @@
 use super::*;
 
 #[test]
+fn completed_mutable_routines_reclaim_body_memory_and_retain_typed_effects() {
+    let mut config = test_config("completed-routine-body-memory");
+    config.row_overlay_slots = 1024;
+    config.txn_rows = 512;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 1 << 20);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE body_calls CACHE 1; \
+         CREATE TABLE body_audit(input integer,call_number bigint); \
+         CREATE TYPE body_result AS(input integer,call_number bigint,width integer); \
+         CREATE FUNCTION body_record(input_value integer) RETURNS body_result \
+           LANGUAGE plpgsql AS $$ \
+           DECLARE payload text; assigned_call bigint; \
+           BEGIN \
+             assigned_call:=nextval('body_calls'); \
+             INSERT INTO body_audit VALUES(input_value,assigned_call); \
+             payload:=repeat('x',CASE WHEN input_value<0 THEN 2097152 \
+                                    WHEN input_value>=1000 THEN 655360 ELSE 65536 END); \
+             RETURN ROW(input_value,assigned_call,length(payload))::body_result; \
+           END $$",
+        true,
+    );
+    // Two MiB of completed scratch must fit one MiB of statement storage.
+    let output = session.success(
+        &mut engine,
+        "SELECT (result).input,(result).call_number,(result).width \
+         FROM(SELECT body_record(value) AS result FROM generate_series(1,32) AS source(value)) AS result_rows \
+         ORDER BY (result).input",
+        true,
+    );
+    let expected: Vec<_> = (1..=32)
+        .map(|value| format!("{value}|{value}|65536"))
+        .collect();
+    assert_eq!(data_rows(&output), expected);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*),min(input),max(input),sum(call_number) FROM body_audit; \
+             SELECT currval('body_calls')",
+            true,
+        )),
+        ["32|1|32|528", "32"]
+    );
+    let exhausted = session.execute(&mut engine, "SELECT body_record(-1)", true);
+    assert_eq!(error_sqlstates(&exhausted), ["54000"]);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM body_audit; SELECT currval('body_calls'); \
+             SELECT (body_record(33)).input; SELECT currval('body_calls')",
+            true,
+        )),
+        ["32", "33", "33", "34"]
+    );
+    session.success(
+        &mut engine,
+        "CREATE TABLE body_source(input integer); \
+         INSERT INTO body_source SELECT value FROM generate_series(1,256) AS source(value); \
+         CREATE FUNCTION body_nested(input_value integer) RETURNS body_result LANGUAGE plpgsql AS $$ \
+           DECLARE held text; result body_result; \
+           BEGIN \
+             held:=repeat('a',131072); result:=body_record(input_value); \
+             held:=repeat('b',393216); RETURN result; \
+           END $$; \
+         CREATE FUNCTION body_series(input_value integer) RETURNS SETOF body_result LANGUAGE plpgsql AS $$ \
+           DECLARE payload text; \
+           BEGIN \
+             payload:=repeat('s',65536); \
+             RETURN NEXT ROW(input_value,nextval('body_calls'),length(payload))::body_result; \
+             RETURN; \
+           END $$",
+        true,
+    );
+    // A physical source selects the retained row-frame path, not whole-query replay.
+    let output = session.success(
+        &mut engine,
+        "SELECT body_record(input) FROM body_source",
+        true,
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 256);
+    let mut inputs = Vec::new();
+    let mut calls = Vec::new();
+    for row in rows {
+        let fields: Vec<_> = row.trim_matches(['(', ')']).split(',').collect();
+        assert_eq!(fields.len(), 3);
+        inputs.push(fields[0].parse::<i32>().unwrap());
+        calls.push(fields[1].parse::<i32>().unwrap());
+        assert_eq!(fields[2], "65536");
+    }
+    inputs.sort_unstable();
+    calls.sort_unstable();
+    assert_eq!(inputs, (1..=256).collect::<Vec<_>>());
+    assert_eq!(calls, (35..=290).collect::<Vec<_>>());
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT body_record(1001),body_record(1002) FROM body_source LIMIT 1; \
+             SELECT body_nested(1003) FROM body_source LIMIT 1",
+            true,
+        )),
+        ["(1001,291,655360)|(1002,292,655360)", "(1003,293,655360)"]
+    );
+    let output = session.success(
+        &mut engine,
+        "SELECT body_series(value) FROM generate_series(1,32) AS source(value)",
+        true,
+    );
+    let expected: Vec<_> = (1..=32)
+        .map(|value| format!("({value},{},65536)", value + 293))
+        .collect();
+    assert_eq!(data_rows(&output), expected);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM body_audit; SELECT currval('body_calls')",
+            true,
+        )),
+        ["292", "325"]
+    );
+}
+
+#[test]
+fn projection_type_visitors_release_schema_scratch_on_success_and_error() {
+    let config = test_config("projection-schema-scratch");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let engine = Engine::new(&config, &mut budget).unwrap();
+    let mut arena = Arena::new(&mut budget, "projection schema scratch", 4 << 20).unwrap();
+    for sql in [
+        "SELECT value FROM generate_series(1,1100) AS input(value)",
+        "SELECT * FROM generate_series(1,1100) AS input(value)",
+        "SELECT 1 UNION ALL SELECT 2",
+        "WITH input AS(SELECT 1 AS value) SELECT value FROM input",
+    ] {
+        arena.reset();
+        let select = crate::sql::parser::parse_query(sql, &arena).unwrap();
+        let baseline = arena.used();
+        for _ in 0..1100 {
+            let mut columns = 0;
+            crate::mem::guard::forbid_alloc(|| {
+                crate::sql::query::visit_projection_types(
+                    select,
+                    &engine.storage,
+                    0,
+                    &arena,
+                    None,
+                    &mut |oid, _| {
+                        assert_eq!(oid, crate::sql::types::oid::INT4);
+                        columns += 1;
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(columns, 1, "{sql}");
+            assert_eq!(arena.used(), baseline, "{sql}");
+        }
+        let error = crate::mem::guard::forbid_alloc(|| {
+            crate::sql::query::visit_projection_types(
+                select,
+                &engine.storage,
+                0,
+                &arena,
+                None,
+                &mut |_, _| Err(sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "visitor failed")),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::NUMERIC_OUT_OF_RANGE);
+        assert_eq!(arena.used(), baseline, "{sql}");
+    }
+}
+
+#[test]
 fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_recovery() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -187,7 +363,7 @@ fn commit_admission_waits_preserve_defaults_triggers_and_command_responses() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut responder,
                         session.connection_id,
                         timeout,
@@ -210,7 +386,7 @@ fn commit_admission_waits_preserve_defaults_triggers_and_command_responses() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut responder,
                         session.connection_id,
                         timeout,
@@ -466,7 +642,7 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
                 &mut session.transaction,
                 &mut session.pool,
                 &mut session.cursors,
-                &mut session.guc,
+                &session.guc,
                 &mut Responder::new(&mut session.send),
                 session.connection_id,
                 false,
@@ -499,7 +675,7 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
                 &mut session.transaction,
                 &mut session.pool,
                 &mut session.cursors,
-                &mut session.guc,
+                &session.guc,
                 &mut Responder::new(&mut session.send),
                 session.connection_id,
                 false,
@@ -679,10 +855,44 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
         }
     }
     assert!(session.transaction.commit_admission().is_none());
-    assert_eq!(
-        data_rows(&session.success(&mut engine, "SELECT id FROM cold_commit_rows", true)),
-        ["2"]
-    );
+    let query = "SELECT id FROM cold_commit_rows";
+    let mut status = session.execute_status(&mut engine, query, true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait,
+    } = status
+    {
+        assert_eq!(wait, StatementWait::ObjectIo);
+        assert!(Instant::now() < deadline, "cold SELECT did not finish");
+        session.send.truncate_to(output_mark);
+        engine.bind_query_connection(session.connection_id);
+        status = crate::mem::guard::forbid_alloc(|| {
+            for slot in 0..engine.block_read_slots() {
+                engine.advance_pending_block_read(slot).unwrap();
+            }
+            engine
+                .execute_simple_from(
+                    query,
+                    completed_statements,
+                    &session.arena,
+                    &mut session.transaction,
+                    &mut session.pool,
+                    &mut session.cursors,
+                    &session.guc,
+                    &mut Responder::new(&mut session.send),
+                    session.connection_id,
+                    false,
+                )
+                .unwrap()
+        });
+        std::thread::yield_now();
+    }
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert_eq!(data_rows(session.send.readable()), ["2"]);
+    assert!(!engine.block_reads_pending());
     let mut truncates = 0;
     let mut updates = 0;
     // Inspect the complete journal after the final engine operation.

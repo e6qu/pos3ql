@@ -203,9 +203,12 @@ impl TypeReferenceMove {
 
     pub(super) fn references_definition(self, definition: &TableDef) -> bool {
         definition
-            .columns()
-            .iter()
-            .any(|column| self.matches(column.ctype, column.user_type))
+            .type_inputs
+            .references_type(self.identity.slot().kind(), self.identity.created_at())
+            || definition
+                .columns()
+                .iter()
+                .any(|column| self.matches(column.ctype, column.user_type))
     }
 
     pub(super) fn rewrite_definition(self, definition: &mut TableDefBuilder) -> bool {
@@ -980,6 +983,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .map(|_change| unrelated)
                             };
@@ -1248,6 +1252,7 @@ mod tests {
                             not_null_name: None,
                             not_null_identity: None,
                             default_expr: None,
+                            default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                             checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                             n_checks: 0,
                         },
@@ -1463,7 +1468,13 @@ mod tests {
                     movement.current
                 );
                 let error = storage
-                    .write_table_def(selected_table, selected_definition, &mapping("id"), false)
+                    .write_table_def(
+                        selected_table,
+                        selected_definition,
+                        &mapping("id"),
+                        false,
+                        crate::storage::ColumnSet::EMPTY,
+                    )
                     .unwrap_err();
                 assert_eq!(
                     error.sqlstate,
@@ -1507,7 +1518,10 @@ mod tests {
                     TableDefBuilder::from_definition(&storage.table_def(related, 0));
                 definition.name = SqlName::parse("blocked_type_table").unwrap();
                 assert_eq!(
-                    storage.create_table_in(definition, 9).unwrap_err().sqlstate,
+                    storage
+                        .create_table_in(definition.clone(), 9)
+                        .unwrap_err()
+                        .sqlstate,
                     sqlstate::INTERNAL_LOCK_WAIT
                 );
                 assert!(
@@ -1533,7 +1547,13 @@ mod tests {
                 definition.name = SqlName::parse("unrelated").unwrap();
                 assert_eq!(
                     storage
-                        .write_table_def(selected, definition, &mapping("id"), false)
+                        .write_table_def(
+                            selected,
+                            definition.clone(),
+                            &mapping("id"),
+                            false,
+                            crate::storage::ColumnSet::EMPTY,
+                        )
                         .unwrap_err()
                         .sqlstate,
                     sqlstate::INTERNAL_LOCK_WAIT
@@ -1635,6 +1655,7 @@ mod tests {
                     not_null_name: None,
                     not_null_identity: None,
                     default_expr: None,
+                    default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                     checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                     n_checks: 0,
                 };
@@ -1719,7 +1740,7 @@ mod tests {
     fn source_identity(catalog: &TypeCatalog, movement: TypeReferenceMove) -> UserTypeName {
         let (schema, name) = match movement.identity.slot() {
             NamedTypeSlot::Domain(_) => {
-                let definition = catalog.domains[movement.identity.slot().index()];
+                let definition = &catalog.domains[movement.identity.slot().index()];
                 (definition.schema, definition.name)
             }
             NamedTypeSlot::Enum(_) => {
@@ -2440,6 +2461,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .map(|_change| related)
                             }
@@ -2485,7 +2507,7 @@ mod tests {
             crate::mem::guard::forbid_alloc(|| {
                 publish_move(&storage, movement, source);
                 captured.name = SqlName::parse("late_create").unwrap();
-                let created = storage.create_table_in(captured, 7).unwrap();
+                let created = storage.create_table_in(captured.clone(), 7).unwrap();
                 assert_identity(&storage, created, 7, movement.current);
                 for (index, column) in storage.table_def(created, 7).columns().iter().enumerate() {
                     assert_eq!(column.user_type, originals[index]);
@@ -2498,9 +2520,10 @@ mod tests {
                     storage
                         .write_table_def(
                             storage.select_table_definition(table, 9).0,
-                            captured,
+                            captured.clone(),
                             &mapping("id"),
-                            false
+                            false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                         .unwrap_err()
                         .sqlstate,
@@ -2513,6 +2536,7 @@ mod tests {
                         captured,
                         &mapping("id"),
                         false,
+                        crate::storage::ColumnSet::EMPTY,
                     )
                     .unwrap();
                 assert_identity(&storage, table, 9, movement.current);
@@ -2703,10 +2727,13 @@ mod tests {
                                 .is_none()
                         );
                     }
-                    let mut submitted = captured;
+                    let mut submitted = captured.clone();
                     submitted.name = SqlName::parse("invalid_create").unwrap();
                     assert_eq!(
-                        storage.create_table_in(submitted, 7).unwrap_err().sqlstate,
+                        storage
+                            .create_table_in(submitted.clone(), 7)
+                            .unwrap_err()
+                            .sqlstate,
                         crate::sql::eval::sqlstate::UNDEFINED_OBJECT
                     );
                     assert_eq!(
@@ -2715,7 +2742,8 @@ mod tests {
                                 storage.select_table_definition(table, 7).0,
                                 submitted,
                                 &mapping("id"),
-                                false
+                                false,
+                                crate::storage::ColumnSet::EMPTY,
                             )
                             .unwrap_err()
                             .sqlstate,
@@ -3059,6 +3087,7 @@ mod tests {
                             pending,
                             &mapping("id"),
                             false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                     }))
                 } else {
@@ -3203,6 +3232,7 @@ mod tests {
                             definition,
                             &mapping(name),
                             false,
+                            crate::storage::ColumnSet::EMPTY,
                         )
                         .unwrap()
                 });
@@ -3261,6 +3291,7 @@ mod tests {
                                         definition,
                                         &mapping("id"),
                                         false,
+                                        crate::storage::ColumnSet::EMPTY,
                                     )
                                     .unwrap();
                                 storage.rollback_table_def(change);
@@ -3345,6 +3376,7 @@ mod tests {
                     pending,
                     &mapping("id"),
                     false,
+                    crate::storage::ColumnSet::EMPTY,
                 )
                 .unwrap();
             crate::mem::guard::forbid_alloc(|| {

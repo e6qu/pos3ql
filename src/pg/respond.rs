@@ -1865,8 +1865,10 @@ impl<'b> Responder<'b> {
         m.u8(b'M');
         m.cstr(message);
         if let Some(d) = diagnostic {
-            m.u8(b'D');
-            m.cstr(d.detail.as_str());
+            if let Some(detail) = &d.detail {
+                m.u8(b'D');
+                m.cstr(detail.as_str());
+            }
             if let Some(h) = &d.hint {
                 m.u8(b'H');
                 m.cstr(h.as_str());
@@ -1903,8 +1905,10 @@ impl<'b> Responder<'b> {
         m.u8(b'M');
         m.cstr(message);
         if let Some(d) = &diagnostic {
-            m.u8(b'D');
-            m.cstr(d.detail.as_str());
+            if let Some(detail) = &d.detail {
+                m.u8(b'D');
+                m.cstr(detail.as_str());
+            }
             if let Some(h) = &d.hint {
                 m.u8(b'H');
                 m.cstr(h.as_str());
@@ -2024,6 +2028,45 @@ mod tests {
         let text = core::str::from_utf8(&bytes[5..]).unwrap();
         assert!(text.contains("42601"));
         assert!(text.contains("syntax error"));
+    }
+
+    #[test]
+    fn diagnostics_preserve_absent_and_explicitly_empty_detail_fields() {
+        let mut budget = Budget::new(256);
+        let mut buffer = FixedBuf::new(&mut budget, "optional diagnostic fields", 256).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for empty_detail in [false, true] {
+                for notice in [false, true] {
+                    buffer.clear();
+                    crate::sql::eval::stash_diagnostic(
+                        empty_detail.then(crate::util::StackStr::new),
+                        Some(crate::util::StackStr::from_str("use an authorized role")),
+                    );
+                    let mut responder = Responder::new(&mut buffer);
+                    if notice {
+                        responder.notice("42501", "denied").unwrap();
+                    } else {
+                        responder.error("42501", "denied").unwrap();
+                    }
+                    let expected: &[u8] = match (notice, empty_detail) {
+                        (false, false) => {
+                            b"SERROR\0VERROR\0C42501\0Mdenied\0Huse an authorized role\0\0"
+                        }
+                        (false, true) => {
+                            b"SERROR\0VERROR\0C42501\0Mdenied\0D\0Huse an authorized role\0\0"
+                        }
+                        (true, false) => {
+                            b"SNOTICE\0VNOTICE\0C42501\0Mdenied\0Huse an authorized role\0\0"
+                        }
+                        (true, true) => {
+                            b"SNOTICE\0VNOTICE\0C42501\0Mdenied\0D\0Huse an authorized role\0\0"
+                        }
+                    };
+                    assert_eq!(&buffer.readable()[5..], expected);
+                    assert!(crate::sql::eval::take_diagnostic().is_none());
+                }
+            }
+        });
     }
 
     #[test]

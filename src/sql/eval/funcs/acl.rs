@@ -153,6 +153,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     other => return Err(type_mismatch(name, &other)),
                 };
+                crate::sql::acl::validate_array_shape(raw)?;
                 for value in crate::sql::array::elements(raw, element) {
                     if !matches!(value, Datum::Text(_) | Datum::AclItem(_)) {
                         return Err(sql_err!(

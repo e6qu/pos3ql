@@ -50,7 +50,7 @@ pub(super) fn stage_truncate(
                 "prepared TRUNCATE contains trailing relation bytes"
             ));
         }
-        transaction.record_truncate(selected, *cascade, *restart_identity, *command_id)?;
+        transaction.record_truncate(storage, selected, *cascade, *restart_identity, *command_id)?;
         for &table in selected.iter() {
             storage.record_relation_transaction_truncate(transaction.txid, table)?;
         }

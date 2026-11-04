@@ -4,7 +4,7 @@ use core::cell::Cell;
 use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
-use crate::sql::ast::{DropTable, Stmt};
+use crate::sql::ast::Stmt;
 use crate::sql::catalog;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::txn::DdlUndo;
@@ -18,12 +18,17 @@ type EventAddressPart = StackStr<512>;
 
 pub(crate) struct BeforeDdl<'a> {
     altered_table: Option<(usize, crate::storage::TableDefinitionImages)>,
+    // Keep the selected objects while their names and search-path entries exist.
+    original_drops: &'a [ObjectRef],
+    indexes: &'a [(usize, crate::storage::RelationIdentity)],
     dependent_drops: &'a [(EventObjectRef, bool)],
 }
 
 impl BeforeDdl<'_> {
     pub(crate) const EMPTY: Self = Self {
         altered_table: None,
+        original_drops: &[],
+        indexes: &[],
         dependent_drops: &[],
     };
 }
@@ -35,6 +40,20 @@ pub(crate) fn capture_before<'a>(
     arena: &'a Arena,
 ) -> Result<BeforeDdl<'a>, SqlError> {
     let mut before = BeforeDdl::EMPTY;
+    before.original_drops = capture_original_drops(storage, txid, statement, arena)?;
+    let mut indexes = ArenaList::new(arena);
+    for slot in 0..storage.index_count() {
+        if let Some(index) = storage.index_visible_to(slot, txid) {
+            indexes
+                .push((
+                    slot,
+                    crate::storage::RelationIdentity::parse(index.created_at)
+                        .expect("admitted index has a relation identity"),
+                ))
+                .map_err(|_| graph_full())?;
+        }
+    }
+    before.indexes = indexes.as_slice();
     let mut dependent_drops = ArenaList::new(arena);
     let alter_root = match statement {
         Stmt::AlterTable(alter)
@@ -64,17 +83,14 @@ pub(crate) fn capture_before<'a>(
     }
 
     let table_is_explicitly_dropped = |slot: usize| {
-        let (table_schema, table_name) = {
+        let table_schema = {
             let table = storage.table_def(slot, txid);
-            (table.schema, table.name)
+            table.schema
         };
         match statement {
-            Stmt::DropTable(drop) => drop.names.iter().any(|name| {
-                name.name == table_name.as_str()
-                    && name
-                        .schema
-                        .is_none_or(|schema| schema == table_schema.as_str())
-            }),
+            Stmt::DropTable(_) | Stmt::DropForeignTable(_) => {
+                before.original_drops.contains(&ObjectRef::Table(slot))
+            }
             Stmt::DropSchema { names, .. } => {
                 names.iter().any(|schema| *schema == table_schema.as_str())
             }
@@ -180,18 +196,49 @@ impl EventObject {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DdlCommand {
-    reference: EventObjectRef,
+    reference: CommandReference,
     pub command_tag: StackStr<64>,
     pub in_extension: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "event objects stay inline in the bounded statement arena; heap boxing is forbidden"
+)]
+enum CommandReference {
+    Object(EventObjectRef),
+    ReindexedIndex {
+        slot: usize,
+        identity: crate::storage::RelationIdentity,
+    },
+}
+
 impl DdlCommand {
-    pub(crate) fn object(self, storage: &Storage, txid: u32) -> Result<EventObject, SqlError> {
-        self.reference.materialize(storage, txid)
+    pub(crate) fn object(
+        self,
+        storage: &Storage,
+        txid: u32,
+    ) -> Result<Option<EventObject>, SqlError> {
+        match self.reference {
+            CommandReference::Object(reference) => reference.materialize(storage, txid).map(Some),
+            CommandReference::ReindexedIndex { slot, identity } => {
+                let Some(index) = storage.index_visible_to(slot, txid) else {
+                    return Ok(None);
+                };
+                if index.created_at != identity.created_at() {
+                    return Ok(None);
+                }
+                index_definition_object(&index, txid).map(Some)
+            }
+        }
     }
 
     pub(crate) const fn addressed(self) -> bool {
-        !matches!(self.reference, EventObjectRef::Utility(_))
+        !matches!(
+            self.reference,
+            CommandReference::Object(EventObjectRef::Utility(_))
+        )
     }
 }
 
@@ -440,7 +487,7 @@ impl EventObjectRef {
                 base_object(
                     catalog::PG_CLASS_OID,
                     if is_index {
-                        catalog::toast_index_oid(storage, slot)
+                        catalog::toast_index_oid(storage, slot, txid)
                     } else {
                         catalog::toast_relation_oid(storage, slot)
                     },
@@ -1373,19 +1420,6 @@ fn index_object<Definition0: crate::storage::DefinitionBacking>(
     ))
 }
 
-fn inline_primary_name<Definition0: crate::storage::DefinitionBacking>(
-    table: &crate::storage::TableDefinition<Definition0>,
-) -> StackStr<128> {
-    crate::stack_format!(128, "{}_pkey", table.name.as_str())
-}
-
-fn inline_unique_name<Definition0: crate::storage::DefinitionBacking>(
-    table: &crate::storage::TableDefinition<Definition0>,
-    column: &crate::storage::ColumnMeta,
-) -> StackStr<128> {
-    crate::stack_format!(128, "{}_{}_key", table.name.as_str(), column.name.as_str())
-}
-
 fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacking>(
     table: &crate::storage::TableDefinition<Definition0>,
     name: &str,
@@ -1395,13 +1429,11 @@ fn foreign_key_references_named_key<Definition0: crate::storage::DefinitionBacki
         return key.columns() == parent_columns;
     }
     for (index, column) in table.columns().iter().enumerate() {
-        let generated = if column.primary {
-            Some(inline_primary_name(table))
-        } else if column.unique {
-            Some(inline_unique_name(table, column))
-        } else {
-            None
-        };
+        let generated = (column.primary || column.unique).then(|| {
+            table
+                .column_key_name(index)
+                .expect("admitted inline key has a name")
+        });
         if generated
             .as_ref()
             .is_some_and(|generated| generated.as_str() == name)
@@ -1563,6 +1595,22 @@ fn operator_object(storage: &Storage, txid: u32, slot: usize) -> Result<EventObj
     Ok(object)
 }
 
+fn index_definition_object(
+    index: &crate::storage::IndexDef,
+    txid: u32,
+) -> Result<EventObject, SqlError> {
+    let name = index.name_for(txid);
+    Ok(base_object(
+        catalog::PG_CLASS_OID,
+        catalog::explicit_index_oid(index),
+        "index",
+        Some(index.schema.as_str()),
+        Some(name.as_str()),
+        qualified(index.schema.as_str(), name.as_str())?,
+        false,
+    ))
+}
+
 fn access_method_object(
     class_id: i32,
     oid: i32,
@@ -1673,16 +1721,7 @@ fn primary_object(
             let index = storage
                 .index_for_event_trigger(slot, txid)
                 .ok_or_else(graph_full)?;
-            let name = index.name_for(txid);
-            base_object(
-                catalog::PG_CLASS_OID,
-                catalog::explicit_index_oid(&index),
-                "index",
-                Some(index.schema.as_str()),
-                Some(name.as_str()),
-                qualified(index.schema.as_str(), name.as_str())?,
-                false,
-            )
+            index_definition_object(&index, txid)?
         }
         ObjectRef::Schema(slot) => {
             let schema = storage.schema_def(slot).name;
@@ -1984,9 +2023,9 @@ fn primary_object(
                 .foreign_server_by_slot(slot, txid)
                 .ok_or_else(graph_full)?;
             base_object(
-                1417,
+                catalog::PG_FOREIGN_SERVER_OID,
                 storage.foreign_server_entry(slot).oid(),
-                "foreign server",
+                "server",
                 None,
                 Some(server.name.as_str()),
                 StackStr::from_str(identifier(server.name.as_str()).as_str()),
@@ -1998,9 +2037,9 @@ fn primary_object(
                 .foreign_wrapper_by_slot(slot, txid)
                 .ok_or_else(graph_full)?;
             base_object(
-                2328,
+                catalog::PG_FOREIGN_DATA_WRAPPER_OID,
                 storage.foreign_wrapper_entry(slot).oid(),
-                "foreign data wrapper",
+                "foreign-data wrapper",
                 None,
                 Some(wrapper.name.as_str()),
                 StackStr::from_str(identifier(wrapper.name.as_str()).as_str()),
@@ -2129,6 +2168,8 @@ pub(crate) fn catalog_object_address(
             | "policy"
             | "publication"
             | "subscription"
+            | "server"
+            | "foreign-data wrapper"
             | "extension"
             | "large object"
             | "role"
@@ -2309,6 +2350,12 @@ pub(crate) fn catalog_object_address(
     for (slot, _) in storage.extensions_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::Extension(slot)));
     }
+    for (slot, _) in storage.foreign_servers(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::ForeignServer(slot)));
+    }
+    for (slot, _) in storage.foreign_wrappers(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(slot)));
+    }
     for (slot, _) in storage.large_objects_visible_to(txid) {
         consider!(EventObjectRef::Primary(ObjectRef::LargeObject(slot)));
     }
@@ -2392,6 +2439,12 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
                     .matview_slot_for_table(slot, txid)
                     .map_or(ObjectRef::Table(slot), ObjectRef::MaterializedView),
             ));
+        }
+        if storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).has_toast
+            && catalog::toast_relation_oid(storage, slot) == object_id
+        {
+            return Some(EventObjectRef::ToastRelation(u16::try_from(slot).ok()?));
         }
     }
     for slot in 0..storage.view_count() {
@@ -2744,6 +2797,20 @@ fn existing_catalog_object(
                 .find_map(|(slot, extension)| (extension.oid() == object_id).then_some(slot))
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
+        catalog::PG_FOREIGN_SERVER_OID => EventObjectRef::Primary(ObjectRef::ForeignServer(
+            storage
+                .foreign_servers(txid)
+                .find_map(|(slot, entry)| (entry.oid() == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_FOREIGN_DATA_WRAPPER_OID => {
+            EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
+                storage
+                    .foreign_wrappers(txid)
+                    .find_map(|(slot, entry)| (entry.oid() == object_id).then_some(slot))
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+            ))
+        }
         catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(
             storage
                 .large_objects_visible_to(txid)
@@ -2816,6 +2883,8 @@ pub(crate) fn catalog_object(
                 catalog::PG_POLICY_OID => "policy",
                 catalog::PG_PUBLICATION_OID => "publication",
                 catalog::PG_SUBSCRIPTION_OID => "subscription",
+                catalog::PG_FOREIGN_SERVER_OID => "server",
+                catalog::PG_FOREIGN_DATA_WRAPPER_OID => "foreign-data wrapper",
                 catalog::PG_EXTENSION_OID => "extension",
                 catalog::PG_LARGEOBJECT_OID => "large object",
                 1260 => "role",
@@ -2835,227 +2904,293 @@ pub(crate) fn catalog_object(
     }
 }
 
-fn explicit_table_drop(statement: &Stmt<'_>, object: &EventObject) -> bool {
-    let Stmt::DropTable(DropTable { names, .. }) = statement else {
-        return false;
-    };
-    names.iter().any(|name| {
-        name.name
-            == object
-                .object_name
-                .as_ref()
-                .map_or("", |value| value.as_str())
-            && Some(name.schema.unwrap_or("public"))
-                == object.schema_name.as_ref().map(|value| value.as_str())
-    })
-}
-
-fn qualified_name_matches(name: crate::sql::ast::QualName<'_>, object: &EventObject) -> bool {
-    name.name
-        == object
-            .object_name
-            .as_ref()
-            .map_or("", |value| value.as_str())
-        && Some(name.schema.unwrap_or("public"))
-            == object.schema_name.as_ref().map(|value| value.as_str())
-}
-
-fn routine_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::RoutineIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let routine = storage.routine_for(slot, txid);
-    if identity.name.name != routine.name_for(txid).as_str()
-        || identity.name.schema.unwrap_or("public") != routine.schema_for(txid).as_str()
-    {
-        return Ok(false);
-    }
-    if !identity.signature_is_explicit {
-        return Ok(true);
-    }
-    if routine.arguments().len() != identity.argument_types.len() {
-        return Ok(false);
-    }
-    let resolved =
-        crate::sql::exec::resolve_routine_signature(storage, txid, identity.argument_types)?;
-    Ok(routine
-        .arguments()
-        .iter()
-        .zip(resolved)
-        .all(|(stored, written)| {
-            stored.ctype == written.ctype && stored.user_type == written.user_type
-        }))
-}
-
-fn aggregate_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::AggregateIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let mut names = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-    let count = identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
-    if count > names.len() {
-        return Ok(false);
-    }
-    names[..identity.direct_argument_types.len()].copy_from_slice(identity.direct_argument_types);
-    names[identity.direct_argument_types.len()..count]
-        .copy_from_slice(identity.aggregated_argument_types);
-    routine_identity_matches(
-        storage,
-        txid,
-        slot,
-        crate::sql::ast::RoutineIdentity {
-            name: identity.name,
-            argument_types: &names[..count],
-            signature_is_explicit: true,
-        },
-    )
-}
-
-fn operator_identity_matches(
-    storage: &Storage,
-    txid: u32,
-    slot: usize,
-    identity: crate::sql::ast::OperatorIdentity<'_>,
-) -> Result<bool, SqlError> {
-    let definition = storage.operator(slot).definition_for(txid);
-    if identity.name.name != definition.name.as_str()
-        || identity.name.schema.unwrap_or("public") != definition.schema.as_str()
-    {
-        return Ok(false);
-    }
-    let signature = match identity.operands {
-        crate::sql::ast::OperatorOperands::Prefix(right) => crate::storage::OperatorSignature {
-            left: None,
-            right: Some(crate::sql::exec::resolve_routine_type(
-                storage, txid, right,
-            )?),
-        },
-        crate::sql::ast::OperatorOperands::Binary { left, right } => {
-            crate::storage::OperatorSignature {
-                left: Some(crate::sql::exec::resolve_routine_type(storage, txid, left)?),
-                right: Some(crate::sql::exec::resolve_routine_type(
-                    storage, txid, right,
-                )?),
-            }
-        }
-    };
-    Ok(signature == definition.signature)
-}
-
-fn is_original(
+fn capture_original_drops<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
-    reference: ObjectRef,
-    object: &EventObject,
-) -> Result<bool, SqlError> {
-    Ok(match (statement, reference) {
-        (Stmt::DropTable(_), ObjectRef::Table(_)) => explicit_table_drop(statement, object),
-        (Stmt::DropView { names, .. }, ObjectRef::View(_))
-        | (Stmt::DropSequence { names, .. }, ObjectRef::Sequence(_))
-        | (Stmt::DropDomain { names, .. }, ObjectRef::Domain(_))
-        | (Stmt::DropType { names, .. }, ObjectRef::Enum(_) | ObjectRef::Composite(_))
-        | (Stmt::DropIndex { names, .. }, ObjectRef::Index(_)) => names.iter().any(|name| {
-            name.name
-                == object
-                    .object_name
-                    .as_ref()
-                    .map_or("", |value| value.as_str())
-                && Some(name.schema.unwrap_or("public"))
-                    == object.schema_name.as_ref().map(|value| value.as_str())
-        }),
-        (Stmt::DropSchema { names, .. }, ObjectRef::Schema(_)) => names.iter().any(|name| {
-            *name
-                == object
-                    .object_name
-                    .as_ref()
-                    .map_or("", |value| value.as_str())
-        }),
-        (Stmt::DropMaterializedView { names, .. }, ObjectRef::MaterializedView(_)) => names
-            .iter()
-            .any(|name| qualified_name_matches(*name, object)),
-        (Stmt::DropFunction { functions, .. }, ObjectRef::Routine(slot))
-        | (
-            Stmt::DropProcedure {
-                procedures: functions,
-                ..
-            },
-            ObjectRef::Routine(slot),
-        )
-        | (
-            Stmt::DropRoutine {
-                routines: functions,
-                ..
-            },
-            ObjectRef::Routine(slot),
-        ) => functions.iter().try_fold(false, |matched, identity| {
-            if matched {
-                Ok(true)
-            } else {
-                routine_identity_matches(storage, txid, slot, *identity)
+    arena: &'a Arena,
+) -> Result<&'a [ObjectRef], SqlError> {
+    use crate::sql::ast::{RoutineIdentity, RoutineTargetKind};
+    let mut roots = ArenaList::new(arena);
+    let mut remember = |reference: Option<ObjectRef>| -> Result<(), SqlError> {
+        if let Some(reference) = reference
+            && !roots.as_slice().contains(&reference)
+        {
+            roots.push(reference).map_err(|_| graph_full())?;
+        }
+        Ok(())
+    };
+    let relation = |name: crate::sql::ast::QualName<'_>| {
+        let (schema, _) = storage.classify_relation(name.schema, name.name, txid)?;
+        relation_reference(storage, txid, schema.as_str(), name.name)
+    };
+    let routine = |identity: &RoutineIdentity<'_>| match crate::sql::exec::resolve_routine_identity(
+        storage,
+        txid,
+        identity,
+        RoutineTargetKind::Either,
+    ) {
+        Ok(slot) => Ok(Some(ObjectRef::Routine(slot))),
+        Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => Ok(None),
+        Err(error) => Err(error),
+    };
+    match statement {
+        Stmt::DropTable(drop) | Stmt::DropForeignTable(drop) => {
+            for name in drop.names {
+                remember(relation(*name))?;
             }
-        })?,
-        (Stmt::DropAggregate { aggregates, .. }, ObjectRef::Routine(slot)) => {
-            aggregates.iter().try_fold(false, |matched, identity| {
-                if matched {
-                    Ok(true)
-                } else {
-                    aggregate_identity_matches(storage, txid, slot, *identity)
+        }
+        Stmt::DropView { names, .. } | Stmt::DropMaterializedView { names, .. } => {
+            for name in *names {
+                remember(relation(*name))?;
+            }
+        }
+        Stmt::DropSequence { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .sequence_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::Sequence),
+                )?;
+            }
+        }
+        Stmt::DropDomain { names, .. } | Stmt::DropType { names, .. } => {
+            for name in *names {
+                let domain = match name.schema {
+                    Some(schema) => storage.domain_slot(schema, name.name, txid),
+                    None => storage.resolve_domain_slot(name.name, txid),
+                };
+                if let Some(slot) = domain {
+                    remember(Some(ObjectRef::Domain(slot)))?;
+                    continue;
                 }
-            })?
-        }
-        (Stmt::DropCast(_), ObjectRef::Cast(_)) => true,
-        (Stmt::DropOperator { identities, .. }, ObjectRef::Operator(slot)) => {
-            identities.iter().try_fold(false, |matched, identity| {
-                if matched {
-                    Ok(true)
-                } else {
-                    operator_identity_matches(storage, txid, slot, *identity)
+                if matches!(statement, Stmt::DropDomain { .. }) {
+                    continue;
                 }
-            })?
+                let enumeration = match name.schema {
+                    Some(schema) => storage.enum_slot(schema, name.name, txid),
+                    None => storage.resolve_enum_slot(name.name, txid),
+                };
+                if let Some(slot) = enumeration {
+                    remember(Some(ObjectRef::Enum(slot)))?;
+                    continue;
+                }
+                let composite = match name.schema {
+                    Some(schema) => storage.composite_slot(schema, name.name, txid),
+                    None => storage.resolve_composite_slot(name.name, txid),
+                };
+                remember(composite.map(ObjectRef::Composite))?;
+            }
         }
-        (Stmt::DropOperatorFamily { names, .. }, ObjectRef::OperatorFamily(_))
-        | (Stmt::DropOperatorClass { names, .. }, ObjectRef::OperatorClass(_))
-        | (Stmt::DropStatistics { names, .. }, ObjectRef::Statistics(_)) => names
-            .iter()
-            .any(|name| qualified_name_matches(*name, object)),
-        (Stmt::DropCollation { name, .. }, ObjectRef::Collation(_))
-        | (Stmt::DropConversion { name, .. }, ObjectRef::Conversion(_)) => {
-            qualified_name_matches(*name, object)
+        Stmt::DropIndex { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .resolve_index_slot(name.schema, name.name, txid)
+                        .map(ObjectRef::Index),
+                )?;
+            }
         }
-        (Stmt::DropTextSearch { name, .. }, ObjectRef::TextSearch(_)) => {
-            qualified_name_matches(*name, object)
+        Stmt::DropSchema { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .find_schema_visible(name, txid)
+                        .map(ObjectRef::Schema),
+                )?;
+            }
         }
-        (Stmt::DropPolicy { policy, .. }, ObjectRef::Policy(_)) => {
-            policy.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && policy.table.name == object.address_names[1].as_str()
+        Stmt::DropFunction { functions, .. }
+        | Stmt::DropProcedure {
+            procedures: functions,
+            ..
         }
-        (Stmt::DropPublication { names, .. }, ObjectRef::Publication(_))
-        | (Stmt::DropSubscription { names, .. }, ObjectRef::Subscription(_))
-        | (Stmt::DropExtension { names, .. }, ObjectRef::Extension(_))
-        | (Stmt::DropAccessMethod { names, .. }, ObjectRef::AccessMethod(_)) => {
-            names.iter().any(|name| {
-                *name
-                    == object
-                        .object_name
-                        .as_ref()
-                        .map_or("", |value| value.as_str())
-            })
+        | Stmt::DropRoutine {
+            routines: functions,
+            ..
+        } => {
+            for identity in *functions {
+                remember(routine(identity)?)?;
+            }
         }
-        (Stmt::DropTrigger { trigger, .. }, ObjectRef::Trigger(_)) => {
-            trigger.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && trigger.table.name == object.address_names[1].as_str()
+        Stmt::DropAggregate { aggregates, .. } => {
+            for identity in *aggregates {
+                let mut types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let count =
+                    identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
+                if count > types.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many aggregate arguments"
+                    ));
+                }
+                types[..identity.direct_argument_types.len()]
+                    .copy_from_slice(identity.direct_argument_types);
+                types[identity.direct_argument_types.len()..count]
+                    .copy_from_slice(identity.aggregated_argument_types);
+                remember(routine(&RoutineIdentity {
+                    name: identity.name,
+                    argument_types: &types[..count],
+                    signature_is_explicit: true,
+                })?)?;
+            }
         }
-        (Stmt::DropRule(rule), ObjectRef::Rule(_)) => {
-            rule.name == object.object_name.as_ref().map_or("", |name| name.as_str())
-                && rule.table.name == object.address_names[1].as_str()
+        Stmt::DropCast(cast) => {
+            let source = crate::sql::exec::resolve_routine_type(storage, txid, cast.source_type)?;
+            let target = crate::sql::exec::resolve_routine_type(storage, txid, cast.target_type)?;
+            remember(storage.cast_slot(source, target, txid).map(ObjectRef::Cast))?;
         }
-        _ => false,
-    })
+        Stmt::DropOperator { identities, .. } => {
+            for identity in *identities {
+                match crate::sql::exec::resolve_operator_identity(storage, txid, *identity) {
+                    Ok((slot, _)) => remember(Some(ObjectRef::Operator(slot)))?,
+                    Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Stmt::DropOperatorFamily { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .operator_family_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::OperatorFamily),
+                )?;
+            }
+        }
+        Stmt::DropOperatorClass { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .operator_class_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::OperatorClass),
+                )?;
+            }
+        }
+        Stmt::DropStatistics { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .extended_statistics_slot_on_path(name.schema, name.name, txid)
+                        .map(ObjectRef::Statistics),
+                )?;
+            }
+        }
+        Stmt::DropCollation { name, .. } => remember(
+            storage
+                .collation_slot_on_path(name.schema, name.name, txid)
+                .map(ObjectRef::Collation),
+        )?,
+        Stmt::DropConversion { name, .. } => remember(
+            storage
+                .conversion_slot_on_path(name.schema, name.name, txid)
+                .map(ObjectRef::Conversion),
+        )?,
+        Stmt::DropTextSearch { kind, name, .. } => remember(
+            storage
+                .text_search_slot_on_path(*kind, name.schema, name.name, txid)
+                .map(ObjectRef::TextSearch),
+        )?,
+        Stmt::DropPolicy { policy, .. } => {
+            if let Some(ObjectRef::Table(table)) = relation(policy.table) {
+                remember(
+                    storage
+                        .policy_slot_on(table, policy.name, txid)
+                        .map(ObjectRef::Policy),
+                )?;
+            }
+        }
+        Stmt::DropTrigger { trigger, .. } => {
+            let target = match relation(trigger.table) {
+                Some(ObjectRef::Table(table)) => {
+                    Some(crate::storage::TriggerTarget::Table(table as u16))
+                }
+                Some(ObjectRef::View(view)) => {
+                    Some(crate::storage::TriggerTarget::View(view as u16))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                remember(
+                    storage
+                        .trigger_slot_on(target, trigger.name, txid)
+                        .map(ObjectRef::Trigger),
+                )?;
+            }
+        }
+        Stmt::DropRule(rule) => {
+            let target = match relation(rule.table) {
+                Some(ObjectRef::Table(table)) => {
+                    Some(crate::storage::RuleTarget::Table(table as u16))
+                }
+                Some(ObjectRef::View(view)) => Some(crate::storage::RuleTarget::View(view as u16)),
+                _ => None,
+            };
+            if let Some(target) = target {
+                remember(
+                    storage
+                        .rule_slot(target, rule.name, txid)
+                        .map(ObjectRef::Rule),
+                )?;
+            }
+        }
+        Stmt::DropPublication { names, .. } => {
+            for (slot, definition) in storage.publications_with_slots_visible_to(txid) {
+                if names.contains(&definition.name_for(txid).as_str()) {
+                    remember(Some(ObjectRef::Publication(slot)))?;
+                }
+            }
+        }
+        Stmt::DropSubscription { names, .. } => {
+            for (slot, definition) in storage
+                .subscriptions_with_slots_visible_to(Some(storage.current_database_oid()), txid)
+            {
+                if names.contains(&definition.name_for(txid).as_str()) {
+                    remember(Some(ObjectRef::Subscription(slot)))?;
+                }
+            }
+        }
+        Stmt::DropExtension { names, .. } => {
+            for name in *names {
+                remember(storage.extension_slot(name, txid).map(ObjectRef::Extension))?;
+            }
+        }
+        Stmt::DropAccessMethod { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .access_method_slot(name, txid)
+                        .and_then(|slot| storage.access_method_oid_at(slot))
+                        .map(ObjectRef::AccessMethod),
+                )?;
+            }
+        }
+        Stmt::DropEventTrigger { name, .. } => remember(
+            storage
+                .event_trigger_slot(name, txid)
+                .map(ObjectRef::EventTrigger),
+        )?,
+        Stmt::DropForeignDataWrapper { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .foreign_wrapper(name, txid)
+                        .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
+                )?;
+            }
+        }
+        Stmt::DropForeignServer { names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .foreign_server(name, txid)
+                        .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(roots.as_slice())
 }
 
 fn push_command(
@@ -3067,7 +3202,7 @@ fn push_command(
 ) -> Result<(), SqlError> {
     output
         .push(DdlCommand {
-            reference,
+            reference: CommandReference::Object(reference),
             command_tag: StackStr::from_str(tag),
             in_extension,
         })
@@ -3207,6 +3342,19 @@ fn push_alter_table_drops(
     };
     let slot = *slot;
     let old = definitions.definition(storage, slot, txid)?;
+    let index_reference = |oid: i32, name: &str| {
+        before
+            .indexes
+            .iter()
+            .find_map(|&(index_slot, identity)| {
+                (identity.oid() == oid
+                    && storage
+                        .dropped_table_index_for_event(index_slot, slot, txid)
+                        .is_some_and(|index| index.created_at == identity.created_at()))
+                .then_some(EventObjectRef::Primary(ObjectRef::Index(index_slot)))
+            })
+            .unwrap_or_else(|| detached_index(old, oid, name))
+    };
     let Stmt::AlterTable(alter) = statement else {
         return Ok(());
     };
@@ -3222,9 +3370,13 @@ fn push_alter_table_drops(
                 .exclusions()
                 .iter()
                 .any(|item| item.name.as_str() == name)
-            && !new.columns().iter().any(|column| {
-                (column.primary && inline_primary_name(&new).as_str() == name)
-                    || (column.unique && inline_unique_name(&new, column).as_str() == name)
+            && !new.columns().iter().enumerate().any(|(index, column)| {
+                ((column.primary || column.unique)
+                    && new
+                        .column_key_name(index)
+                        .expect("admitted inline key has a name")
+                        .as_str()
+                        == name)
                     || (column.not_null.is_required()
                         && not_null_name(&new, column).as_str() == name)
             })
@@ -3307,7 +3459,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            old.uniques()[index]
+                                .identity
+                                .expect("admitted unique key has a constraint identity")
+                                .oid(),
                             *name,
                         ),
                         true,
@@ -3316,7 +3471,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_index(old, index_oid, *name),
+                        index_reference(index_oid, name),
                         false,
                         false,
                     )?;
@@ -3332,7 +3487,10 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            old.exclusions()[index]
+                                .identity
+                                .expect("admitted exclusion has a constraint identity")
+                                .oid(),
                             *name,
                         ),
                         true,
@@ -3341,16 +3499,18 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_index(old, index_oid, *name),
+                        index_reference(index_oid, name),
                         false,
                         false,
                     )?;
                 } else {
                     for (column_index, column) in old.columns().iter().enumerate() {
-                        let generated = if column.primary {
-                            Some(inline_primary_name(old))
-                        } else if column.unique {
-                            Some(inline_unique_name(old, column))
+                        let generated = if column.primary || column.unique {
+                            Some(StackStr::from_str(
+                                old.column_key_name(column_index)
+                                    .expect("admitted inline key has a name")
+                                    .as_str(),
+                            ))
                         } else if column.not_null.is_required() {
                             Some(not_null_name(old, column))
                         } else {
@@ -3369,7 +3529,9 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                                        old.column_constraint_identity(column_index)
+                                            .expect("admitted inline key has a constraint identity")
+                                            .oid(),
                                         *name,
                                     ),
                                     true,
@@ -3378,7 +3540,7 @@ fn push_alter_table_drops(
                                 push_drop_once(
                                     output,
                                     count,
-                                    detached_index(old, index_oid, *name),
+                                    index_reference(index_oid, name),
                                     false,
                                     false,
                                 )?;
@@ -3429,9 +3591,8 @@ fn push_alter_table_drops(
     }
     for (column_index, column) in old.columns().iter().enumerate() {
         let survives = new
-            .columns()
-            .iter()
-            .find(|new_column| new_column.name == column.name);
+            .attribute_column(old.attribute_number(column_index))
+            .map(|index| &new.columns()[index]);
         if column.not_null.is_required()
             && survives.is_none_or(|new_column| !new_column.not_null.is_required())
         {
@@ -3453,11 +3614,9 @@ fn push_alter_table_drops(
                 (column.primary && !new_column.primary) || (column.unique && !new_column.unique)
             })
         {
-            let name = if column.primary {
-                inline_primary_name(old)
-            } else {
-                inline_unique_name(old, column)
-            };
+            let name = old
+                .column_key_name(column_index)
+                .expect("admitted inline key has a name");
             let index_oid = old.implicit_index_oid(usize::from(
                 inline_positions[column_index].ok_or_else(graph_full)?,
             ));
@@ -3466,7 +3625,9 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    old.column_constraint_identity(column_index)
+                        .expect("admitted inline key has a constraint identity")
+                        .oid(),
                     name.as_str(),
                 ),
                 false,
@@ -3475,7 +3636,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, name.as_str()),
+                index_reference(index_oid, name.as_str()),
                 false,
                 false,
             )?;
@@ -3493,7 +3654,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    unique
+                        .identity
+                        .expect("admitted unique key has a constraint identity")
+                        .oid(),
                     unique.name.as_str(),
                 ),
                 false,
@@ -3502,7 +3666,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, unique.name.as_str()),
+                index_reference(index_oid, unique.name.as_str()),
                 false,
                 false,
             )?;
@@ -3520,7 +3684,10 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    exclusion
+                        .identity
+                        .expect("admitted exclusion has a constraint identity")
+                        .oid(),
                     exclusion.name.as_str(),
                 ),
                 false,
@@ -3529,7 +3696,7 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_index(old, index_oid, exclusion.name.as_str()),
+                index_reference(index_oid, exclusion.name.as_str()),
                 false,
                 false,
             )?;
@@ -3548,14 +3715,15 @@ fn push_table_indexes(
 ) -> Result<(), SqlError> {
     let table = storage.table_def(slot, txid);
     let mut position = 0usize;
-    for column in table.columns() {
-        let name = if column.primary {
-            Some(inline_primary_name(&table))
-        } else if column.unique {
-            Some(inline_unique_name(&table, column))
-        } else {
-            None
-        };
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let name = (column.primary || column.unique).then(|| {
+            StackStr::from_str(
+                table
+                    .column_key_name(column_index)
+                    .expect("admitted inline key has a name")
+                    .as_str(),
+            )
+        });
         if let Some(name) = name {
             push_command(
                 output,
@@ -3606,11 +3774,29 @@ fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    indexes: &[(usize, crate::storage::RelationIdentity)],
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     let table = storage.table_def(slot, txid);
     let table_ref = u16::try_from(slot).map_err(|_| graph_full())?;
+    let index_reference =
+        |position: usize, name: StackStr<128>| -> Result<EventObjectRef, SqlError> {
+            let oid = table.implicit_index_oid(position);
+            for &(index_slot, identity) in indexes {
+                if let Some(index) = storage.dropped_table_index_for_event(index_slot, slot, txid)
+                    && index.created_at == identity.created_at()
+                    && catalog::explicit_index_oid(&index) == oid
+                {
+                    return Ok(EventObjectRef::Primary(ObjectRef::Index(index_slot)));
+                }
+            }
+            Ok(EventObjectRef::TableIndex {
+                table: table_ref,
+                position: u16::try_from(position).map_err(|_| graph_full())?,
+                name,
+            })
+        };
     push_drop(
         output,
         count,
@@ -3677,32 +3863,48 @@ fn push_table_drop_dependents(
             false,
             false,
         )?;
-        push_drop(
-            output,
-            count,
-            EventObjectRef::ToastIndex(table_ref),
-            false,
-            false,
-        )?;
+        let anchor = table
+            .toast_index_identity
+            .expect("admitted TOAST index has an identity");
+        let registered_anchor = indexes.iter().any(|&(index_slot, identity)| {
+            identity == anchor
+                && storage
+                    .dropped_table_index_for_event(index_slot, slot, txid)
+                    .is_some_and(|index| {
+                        index.relation_kind() == crate::storage::IndexRelationKind::Toast
+                    })
+        });
+        if !registered_anchor {
+            push_drop(
+                output,
+                count,
+                EventObjectRef::ToastIndex(table_ref),
+                false,
+                false,
+            )?;
+        }
     }
 
     let mut position = 0usize;
-    for column in table.columns() {
-        let name = if column.primary {
-            Some(inline_primary_name(&table))
-        } else if column.unique {
-            Some(inline_unique_name(&table, column))
-        } else {
-            None
-        };
+    for (column_index, column) in table.columns().iter().enumerate() {
+        let name = (column.primary || column.unique).then(|| {
+            StackStr::from_str(
+                table
+                    .column_key_name(column_index)
+                    .expect("admitted inline key has a name")
+                    .as_str(),
+            )
+        });
         if let Some(name) = name {
-            let index_oid = table.implicit_index_oid(position);
             push_drop(
                 output,
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    oid: table
+                        .column_constraint_identity(column_index)
+                        .expect("admitted inline key has a constraint identity")
+                        .oid(),
                     name,
                 },
                 false,
@@ -3711,11 +3913,7 @@ fn push_table_drop_dependents(
             push_drop(
                 output,
                 count,
-                EventObjectRef::TableIndex {
-                    table: table_ref,
-                    position: u16::try_from(position).map_err(|_| graph_full())?,
-                    name,
-                },
+                index_reference(position, name)?,
                 false,
                 false,
             )?;
@@ -3723,13 +3921,15 @@ fn push_table_drop_dependents(
         }
     }
     for unique in table.uniques() {
-        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                oid: unique
+                    .identity
+                    .expect("admitted unique key has a constraint identity")
+                    .oid(),
                 name: StackStr::from_str(unique.name.as_str()),
             },
             false,
@@ -3738,24 +3938,22 @@ fn push_table_drop_dependents(
         push_drop(
             output,
             count,
-            EventObjectRef::TableIndex {
-                table: table_ref,
-                position: u16::try_from(position).map_err(|_| graph_full())?,
-                name: StackStr::from_str(unique.name.as_str()),
-            },
+            index_reference(position, StackStr::from_str(unique.name.as_str()))?,
             false,
             false,
         )?;
         position += 1;
     }
     for exclusion in table.exclusions() {
-        let index_oid = table.implicit_index_oid(position);
         push_drop(
             output,
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                oid: exclusion
+                    .identity
+                    .expect("admitted exclusion has a constraint identity")
+                    .oid(),
                 name: StackStr::from_str(exclusion.name.as_str()),
             },
             false,
@@ -3764,15 +3962,24 @@ fn push_table_drop_dependents(
         push_drop(
             output,
             count,
-            EventObjectRef::TableIndex {
-                table: table_ref,
-                position: u16::try_from(position).map_err(|_| graph_full())?,
-                name: StackStr::from_str(exclusion.name.as_str()),
-            },
+            index_reference(position, StackStr::from_str(exclusion.name.as_str()))?,
             false,
             false,
         )?;
         position += 1;
+    }
+    for &(index_slot, identity) in indexes {
+        if let Some(index) = storage.dropped_table_index_for_event(index_slot, slot, txid)
+            && index.created_at == identity.created_at()
+        {
+            push_drop_once(
+                output,
+                count,
+                EventObjectRef::Primary(ObjectRef::Index(index_slot)),
+                false,
+                false,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3873,16 +4080,24 @@ fn push_type_drop_dependents(
 fn push_drop_dependents(
     storage: &Storage,
     txid: u32,
+    before: &BeforeDdl<'_>,
     reference: ObjectRef,
     parent_is_normal: bool,
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     match reference {
-        ObjectRef::Table(slot) => push_table_drop_dependents(storage, txid, slot, output, count),
-        ObjectRef::MaterializedView(slot) => {
-            push_table_drop_dependents(storage, txid, storage.matview_table(slot), output, count)
+        ObjectRef::Table(slot) => {
+            push_table_drop_dependents(storage, txid, slot, before.indexes, output, count)
         }
+        ObjectRef::MaterializedView(slot) => push_table_drop_dependents(
+            storage,
+            txid,
+            storage.matview_table(slot),
+            before.indexes,
+            output,
+            count,
+        ),
         ObjectRef::View(slot) => {
             push_view_drop_dependents(storage, slot, parent_is_normal, output, count)
         }
@@ -3904,6 +4119,43 @@ pub(crate) struct CollectChanges<'a, 'b> {
 pub(crate) struct EventGraphs<'a> {
     pub commands: &'a [DdlCommand],
     pub drops: &'a [DroppedObject],
+}
+
+/// PostgreSQL collects index addresses across internal commits and calls the
+/// outer end hook once; pg_event_trigger_ddl_commands resolves current names
+/// and omits addresses that have since disappeared (REL_18_6 event_trigger.c).
+pub(crate) fn completed_reindex_graphs<'a>(
+    storage: &Storage,
+    txid: u32,
+    replacements: &[crate::storage::IndexReplacement],
+    tag: &str,
+    in_extension: bool,
+    arena: &'a Arena,
+) -> Result<EventGraphs<'a>, SqlError> {
+    let mut commands = ArenaList::new(arena);
+    for replacement in replacements {
+        let Some(index) = storage.index_visible_to(replacement.new_slot, txid) else {
+            continue;
+        };
+        if index.created_at != replacement.new_created_at {
+            continue;
+        }
+        commands
+            .push(DdlCommand {
+                reference: CommandReference::ReindexedIndex {
+                    slot: replacement.new_slot,
+                    identity: crate::storage::RelationIdentity::parse(replacement.new_created_at)
+                        .expect("completed reindex has an admitted relation identity"),
+                },
+                command_tag: StackStr::from_str(tag),
+                in_extension,
+            })
+            .map_err(|_| graph_full())?;
+    }
+    Ok(EventGraphs {
+        commands: commands.as_slice(),
+        drops: &[],
+    })
 }
 
 pub(crate) fn collect<'a>(
@@ -3935,15 +4187,14 @@ pub(crate) fn collect<'a>(
         )?;
     }
     for original_pass in [true, false] {
-        for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
+        for (entry, &entry_origin) in undo.iter().cloned().zip(undo_origins) {
             if entry_origin != origin {
                 continue;
             }
             let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
-            let object = primary_object(storage, txid, reference)?;
-            let original = is_original(storage, txid, statement, reference, &object)?;
+            let original = before.original_drops.contains(&reference);
             if original != original_pass {
                 continue;
             }
@@ -3957,6 +4208,7 @@ pub(crate) fn collect<'a>(
             push_drop_dependents(
                 storage,
                 txid,
+                before,
                 reference,
                 !original,
                 &mut drops,
@@ -3975,8 +4227,26 @@ pub(crate) fn collect<'a>(
     for (reference, normal) in before.dependent_drops.iter().copied() {
         push_drop_once(&mut drops, &mut drop_count, reference, false, normal)?;
     }
+    let owner_target = match statement {
+        Stmt::AlterOwner { kind, name, .. } => {
+            super::exec::alter_owner_target(storage, txid, *kind, name)?.and_then(access_reference)
+        }
+        Stmt::AlterForeignServer {
+            name,
+            action: crate::sql::ast::AlterForeignServerAction::Owner(_),
+        } => storage
+            .foreign_server(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignServer(slot)),
+        Stmt::AlterForeignDataWrapper {
+            name,
+            action: crate::sql::ast::AlterForeignDataWrapperAction::Owner(_),
+        } => storage
+            .foreign_wrapper(name, txid)
+            .map(|(slot, _)| ObjectRef::ForeignDataWrapper(slot)),
+        _ => None,
+    };
     let mut seen_commands = ArenaList::new(arena);
-    for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
+    for (entry, &entry_origin) in undo.iter().cloned().zip(undo_origins) {
         if entry_origin != origin {
             continue;
         }
@@ -4004,6 +4274,10 @@ pub(crate) fn collect<'a>(
             continue;
         };
         if mutation != Mutation::Drop {
+            // Cascaded owner updates do not add commands beyond the named root.
+            if matches!(statement, Stmt::AlterOwner { .. }) && owner_target != Some(reference) {
+                continue;
+            }
             if let Stmt::AlterTable(_) = statement
                 && let Some((root, _)) = before.altered_table.as_ref()
                 && matches!(reference, ObjectRef::Table(slot) if slot != *root)
@@ -4036,6 +4310,20 @@ pub(crate) fn collect<'a>(
                     in_extension,
                 )?;
             }
+        }
+    }
+    // A successful OWNER command is observable even when ownership is unchanged.
+    // PostgreSQL REL_18_6 src/backend/tcop/utility.c collects its returned address.
+    if let Some(reference) = owner_target {
+        let reference = EventObjectRef::Primary(reference);
+        if !seen_commands.as_slice().contains(&reference) {
+            push_command(
+                &mut commands,
+                &mut command_count,
+                reference,
+                tag,
+                in_extension,
+            )?;
         }
     }
     debug_assert_eq!(command_count, commands.len());

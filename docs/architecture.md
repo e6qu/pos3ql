@@ -52,6 +52,11 @@ needs a download yields with its original data owners and command deadline;
 another connection can run cached work. Adding connections or
 `query_workspace_slots` does not add CPU execution workers.
 
+A waiting command keeps the downloads it needs. Completion or failure releases
+unused read-ahead requests. Commit does so once all required row images are in
+the journal, before waiting for its durable receipt; an abandoned speculative
+download cannot hold up the next checkpoint.
+
 State-changing routines, procedure commit boundaries, administrative work and
 large-result reads after their first transport flush still have synchronous
 reads. A cold read on one
@@ -59,18 +64,136 @@ of these paths can occupy that worker. [PLAN.md](../PLAN.md) tracks their
 conversion and the later CPU worker pool separately.
 
 Function calls bind their selected function, input mapping and declared types
-before running arguments. Reached inputs and defaults run in declaration order;
-lookup never evaluates an argument as a probe. Defaults keep the object identities
+before running arguments. At execution, reached inputs and defaults run in
+declaration order; lookup never evaluates an argument as a probe. Defaults keep the object identities
 captured when the routine was created. A renamed sequence therefore cannot be
 replaced accidentally by another sequence with its old name.
 
-When a mutable function needs the engine, input preparation preserves completed
+Lookup retains explicit built-in namespaces and compares compatible user and
+built-in function signatures before selecting a call. An exact input-type match
+can beat a generic match in an earlier schema; identical signatures follow
+`search_path` order. Result fields come from the selected function's declaration,
+including empty table-function results used by client metadata queries.
+For example, with `search_path=public,pg_catalog`, a user's `sum(integer)`
+can produce one value per input row; selecting the built-in aggregate instead
+produces one value per group. Planning follows the selected declaration.
+SQL constructors carry an explicit syntax tag through parsing and rewrites;
+a quoted routine name cannot imitate an internal operator or JSON constructor.
+The callable declarations come from PostgreSQL 18.6. Static name/OID indexes
+and streamed candidates avoid a growing candidate list or runtime sort.
+Planner safety facts also cover internal type-conversion procedures from the
+pinned PostgreSQL catalog sources. For example, numeric text input is immutable,
+while date input can depend on session settings. These facts guide planning;
+they do not make additional procedures callable from SQL.
+
+Conversion lookup also uses declared types, including typed NULL values, before
+input effects. Each array child converts before the following child runs. For
+`INSERT ... SELECT`, the SELECT's sorting and limits determine its output; each
+complete output row then converts before the next row is produced. For example,
+an overflowing first array child must not advance a sequence in a later child.
+
+Some literal values are checked while SQL is prepared. For example, preparing
+`SELECT '{approved}'::checked_status[]` can run checks on a domain, a type with
+extra constraints. The same applies when an untyped string gets that array type
+from a column or function parameter. The parser records each occurrence's
+position, selected type identity and encoded value. Describe, Execute and
+retries restore that value without repeating its checks. Equal literals at
+different positions remain distinct inputs. A typed text expression or an
+`ARRAY[...]` constructor keeps its later execution-time checks.
+
+Checked values belong to the SQL source that analyzed them:
+
+| Source | Input preparation and lifetime |
+|---|---|
+| Simple command | Prepared at command admission; a new command analyzes its inputs again. |
+| SQL `PREPARE` or protocol Parse | Prepared once and retained with that statement and its bound portals. Describe and repeated execution reuse the values. |
+| SQL string function or procedure body | `CREATE` validation is separate. The first runtime call prepares inputs retained by the backend for the routine definition and resolved call types. Later commands reuse them. |
+| SQL function considered for inlining | The caller's planner checks the body. An accepted inline keeps its checked values with that caller plan; a rejected attempt leaves runtime preparation separate. |
+| Supported static PL/pgSQL source | Prepared when reached and retained by the backend for that routine definition, resolved input types, input collation and source occurrence. An unreached branch does not prepare its inputs. |
+| Dynamic `EXECUTE` | Each execution owns a fresh plan, even when the command text equals an earlier command. |
+| Stored view, rule, default or SQL `BEGIN ATOMIC` body | Prepared with the definition and retained in its immutable metadata image, including domain and view-column defaults. Recovery restores values and captured type identities without rerunning checks. |
+
+For example, an opaque SQL function containing a checked array literal checks
+once at `CREATE`, then once at its first runtime call in that backend. A later
+`SELECT` reuses that runtime value. A function considered for inlining can
+check during planning even when the caller returns no rows; a rejected attempt
+does not replace the first runtime check. Cursor plans retain accepted inputs
+across separate `FETCH` commands and while a `WITH HOLD` cursor survives commit.
+
+Planning uses facts from all 3,397 procedures in the pinned PostgreSQL catalog,
+including internal operator, cast and type-input functions. For example, checking
+whether a SQL function can be inlined needs the properties of text concatenation,
+even though its internal `textcat` function is not exposed as a SQL call.
+Initialized callable declarations take precedence over bootstrap facts. Adding
+these facts does not add callable functions; [source hashes and generation
+details](../tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
+record their origin.
+
+Parameterized Bind attempts keep separate checked planner values. Parameterless
+Bind messages share their prepared statement's plan; each bound portal keeps
+that plan alive. Bind retains decoded parameters through a preparation wait,
+and cancellation releases the unfinished portal before another Bind can reuse
+its slot. Planning can inspect already decoded parameters to skip a branch
+such as `CASE WHEN $1=0 THEN checked_function() ELSE 17 END`, without running
+the skipped function's constraints.
+
+Planning checks expression types before evaluating constants. For example,
+`SELECT min(active) FROM orders WHERE 1/0>0` rejects `min(boolean)` before
+division by zero. A true constant `CASE` condition discards later branches.
+The type-only pass releases its arena and temporary record descriptions while
+preserving descriptions owned by the enclosing statement. SQL `EXECUTE` carries
+declared parameter types through planning and execution, even for NULL values.
+Metadata adapters carry declared sizes, collations and anonymous record shapes.
+For example, `(q).f1` remains usable when `q` comes from `ROW(7)` in a nested
+query. Expanded views retain their original schema and name while aliases
+control which names SQL can reference. `RETURNING` adds the target's old/new
+names without adding duplicate sources of unqualified columns.
+
+Protocol preparation distinguishes starting a command from executing a block of
+commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
+without making it an explicit transaction. An earlier execution before `Sync`,
+or an explicit `BEGIN`, still prevents that command with `25001`. Query analysis
+pins the data snapshot; preparing a transaction-setting utility does not. Errors
+roll back implicit work, while an explicit failed block remains failed until a
+transaction-exit command such as `ROLLBACK`.
+Standalone utilities with an immediate commit boundary, such as `CREATE DATABASE`,
+complete durable publication before their Execute response. A storage wait resumes
+that publication without executing the utility again. Prepared resolution retains
+its dedicated completion path. Utilities that restart internal transactions need
+their own publication boundaries; a blanket immediate commit is incorrect.
+
+`DISCARD PLANS` makes future query admissions prepare again. Running calls and
+bound portals or cursors retain their checked images; a compiled PL/pgSQL
+function keeps its identity while its SQL statements can get new plans.
+Ordinary PL statements without checked inputs or SQL planner candidates use
+their enclosing function identity and reserve no checked-plan slot.
+`DISCARD ALL` releases cached routine-input plans and their value owners.
+Neither command re-evaluates inputs saved in schema definitions.
+The [compatibility guide](postgresql-18-compatibility.md) records procedural
+boundaries. Native regressions in `src/sql/tests/type_input_binding.rs` and
+`src/sql/tests/type_input_positions.rs` retain the PostgreSQL 18.6 reference
+SQL digests for these phase distinctions.
+
+When an expression hands a mutable function to the engine, input preparation preserves completed
 expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',
 current_setting('application_name') || '.', false))` appends one dot when the
-input finishes, even if `save_order` pauses. Simple builtin trees that cannot
+input finishes across those function handoffs. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+Nested SQL queries, including a `ts_rewrite` rule query, have their own input
+scope. Their row scans may reclaim temporary storage without retaining a
+caller's unfinished input frames in that storage. Returning from the nested
+query restores the caller's input scope, including after an error.
+
+Waiting for another connection's lock can require restarting an unfinished
+function body. Completed cursor operations and checked routine inputs keep
+their results and sequence effects. A caught input-check error keeps its exact
+failed attempt too; replay restores that error without running the check again.
+If restarting would lose their data writes
+or session changes, the command fails explicitly with `0A000` and rolls back;
+it does not silently repeat or discard those effects. Retaining the remaining
+function-body execution position is still a roadmap item.
 
 SQL `SET` parses SQL syntax; `set_config` and saved settings take decoded values.
 For example, `set_config('search_path', 'orders,public', false)` preserves that
@@ -92,14 +215,22 @@ capacity limits and the regression suites for individual cases.
 Single-table statements with supported scalar expressions reuse the owned
 physical reader across mutable function handoffs. Execution keeps the current
 row, finishes its predicate once and retains each completed projection item
-before advancing to the next. Function targets, original defaults, builtin cast choices and whether null
-inputs skip a call bind before row effects. Replacing a function can change
-its body when it starts, while the current query keeps that null-handling
+before advancing to the next. Function targets, original defaults, selected
+conversions and whether null inputs skip a call bind before row effects.
+Replacing a function can change its body when it starts, while the current
+query keeps that null-handling
 decision. A session-setting change in an earlier column cannot redirect
 a later bound call. Each active row borrows the unused region of its existing
 statement arena; completed output is copied before that region is released.
 Nested function execution can borrow a further region without growing memory.
 Row ownership and scan positions survive outside those temporary regions.
+Completed function bodies also release their parsed statements, local values
+and temporary plans. Only encoded results move into the caller's arena; this
+applies to scalar functions, table functions and engine-owned calls, including
+nested calls within a row. For example, a function can create and discard 64 KiB
+of text for each of 1,100 input rows without retaining all that text. Live outer
+locals and results still need space, and a single oversized call fails with
+`54000` rather than growing memory.
 Issued sequence numbers keep command-lived records in the owning arena. For
 example, a number issued before a lock wait must not be issued again when that
 command retries. Temporary row regions and the command's retained records share
@@ -108,8 +239,11 @@ runs, and ending a row preserves those command records.
 
 This does not complete every query continuation. Complex plans, functions with
 subqueries or set expansion, named/custom casts and function bodies still have
-restart paths. The cursor reader retains simple physical input positions but
-currently excludes calls and casts. Cursors and results already sent to the
+restart paths. The cursor reader retains simple table scans, constant derived
+VALUES rows and one-row queries without a table source, including scalar function
+calls and built-in casts. A typed syntax marker distinguishes comma-separated
+VALUES from explicit set operations when selecting PostgreSQL's scroll behavior.
+Other cursor plans still materialize their results when opened. Cursors and results already sent to the
 client need the same once-only execution positions before all storage waits can
 yield. Exhaustion remains a named error; no extra per-table or per-query backing
 allocation is introduced by the scoped row region. [PLAN.md](../PLAN.md) owns the
@@ -233,6 +367,57 @@ cache's transaction ownership. It does not turn a committed cache into a private
 one or replace another transaction's cache. Rebuilding from rows also avoids
 depending on the damaged saved index that the command is repairing.
 
+For example, `REINDEX TABLE CONCURRENTLY orders` creates replacement indexes
+while normal reads and writes continue. It first commits their catalog entries,
+waits for earlier writers, builds each index, then validates it against later
+writes and waits for earlier readers. It swaps names and constraint links,
+retires the old indexes, and commits their removal before reporting completion.
+The table's primary-key constraint keeps its identifier and comment; its
+backing index receives a new identifier. Index registration leaves the table
+shape intact so an existing writer cannot block publication of the replacement.
+Inline keys are normalized when their backing index is swapped. An inline key
+and its stored physical index produce one catalog row, joined by the index's
+creation identity. That row keeps the constraint's primary-key flag and the
+index's current placement and build flags. Index comments
+move through the journal with the replacement and survive restart; reusing a
+retired name cannot move another index's comment. The virtual large-value index follows
+the same lifetime rules without introducing a separate PostgreSQL chunk heap.
+Schema and database rebuilds finish one table before moving to the next.
+Their end hooks run once after the complete command. If another connection
+renames an earlier index while a later table waits, the hook reports its current
+name. If that connection drops the index, the hook omits it. An index that later
+reuses its catalog slot does not appear in that earlier event.
+
+Keys retain the name chosen at creation. For example, renaming `orders` to
+`archived_orders` preserves `orders_pkey`; rebuilding it also preserves that
+name. The saved name follows the column's stable number through column removal
+and recovery. The shared index description includes each key's comparison rules,
+so rebuilding a primary or unique key writes the same rules to the journal.
+Incomplete index records fail before changing the journal buffer.
+`ALTER INDEX orders_pkey RENAME TO archived_orders_pkey` works before any
+rebuild. It stores a physical index description when needed, preserving the
+index and constraint identifiers, comments and rollback behavior. Ownership is
+checked before reserving that description or taking the maintenance lock.
+Renaming an inline key recognizes its own stored index by both table and index
+identity. A different relation with that name still raises `42P07`.
+Changing a table or materialized view's owner also changes its
+live indexes' owner in the same transaction, including replacement and large-value
+indexes. Rolling back restores those owners together. An old index that the
+rebuild has stopped maintaining (`indislive=false`) keeps its former owner until
+it is dropped.
+Catalog rows report each stored index's selected owner, including retired
+indexes and the separate indexes used for large values.
+
+These waits retain their source, selected table lifetime and bounded metadata
+leases across commits. Cancellation can leave a committed invalid replacement
+or a retired index, as in PostgreSQL; rollback cannot erase an earlier committed
+phase. Temporary indexes rebuild in place. Direct concurrent rebuilding of an
+exclusion index is rejected; a table rebuild warns and skips it. A table rebuild
+also warns and skips live invalid indexes. An explicit user-index rebuild can
+repair one; retired indexes stay untouched by table-wide maintenance. See the
+[compatibility guide](postgresql-18-compatibility.md)
+for supported boundaries and [durable formats](durable-format.md) for recovery.
+
 Application jobs, migration scheduling and backup schedules are operator work.
 There is no built-in SQL job scheduler or PostgreSQL background-worker ABI.
 See [operations](operations.md#scheduled-work-and-schema-migrations) for examples
@@ -261,7 +446,8 @@ reserving a maximum array for every potential table.
 
 `table_metadata_bytes` reserves one shared backing pool for actual-length table
 columns, physical column-number records, constraints, pending edit mappings and
-index-binding collections. Its starter value is 64 MiB;
+index-binding collections, plus actual bytes of saved checked SQL inputs.
+SQL sources without such inputs reserve no input payload. Its starter value is 64 MiB;
 `table_metadata_leases` starts at 8,192 concurrently occupied ranges. File
 configurations must name both settings. Bytes must be a positive multiple of 64;
 allocator controls and per-table headers are additional startup reservations.
@@ -273,6 +459,62 @@ Each range rounds to 64 bytes. Fragmentation, retained old versions and the
 overlap with replacement data can exhaust bytes or descriptors independently.
 The named `54000` diagnostic identifies the metadata pool and requested, free
 and largest contiguous bytes plus available descriptors. Pools never grow.
+
+Each connection reserves `prepared_bytes` for every SQL and protocol prepared
+statement slot, plus one `prepared_bytes` buffer for active input preparation.
+For example, with `max_prepared=8`, those buffers reserve `17 * prepared_bytes`.
+Text, parameter declarations and checked literal values share each buffer.
+Exhaustion returns `54000`; increasing the setting takes effect at startup.
+
+`routine_input_slots` reserves plan-control records per backend; the starter
+configuration uses 128. Encoded values lease only their actual bytes from the
+global `table_metadata_bytes` pool and consume its lease descriptors. There is
+no maximum-sized value buffer per plan or per table. Nested and backend-static
+plans share the fixed control capacity. Exhaustion returns `54000` naming
+`routine_input_slots` or the metadata pool; neither grows at runtime.
+The same input-slot limit bounds each backend's watched plans. A watch shares
+the plan's actual dependency array; it does not reserve a list for every table.
+The transaction's fixed DDL log retains matching invalidation receipts, so
+commit and rollback use the selected object even if a name has changed or a
+catalog slot is later reused. Other backends receive committed changes; an
+aborted edit affects only its originating backend's cache.
+The existing transaction TRUNCATE log also retains each affected table's creation
+identity. These actual-length records share `table_metadata_bytes` and its lease
+limit; no table-count-sized identity array is reserved per connection. The
+transaction reserves only `max_ddl_per_transaction` event controls and its
+existing table-name encoding buffer. Pool exhaustion returns `54000` before
+publishing an event. No catalog lookup is needed after a table's definition has
+been released.
+Index renames preserve saved inputs. Whole-relation catalog statistics changes,
+index creation, index deletion and TRUNCATE refresh plans that depend on the
+affected table. Repeating ANALYZE without changing those catalog fields does
+not itself require a new input check.
+A compiled procedural function tracks its own definition. Each reached SQL
+statement separately tracks its schemas, role-sensitive dependencies and
+selected support functions, including custom operators and casts.
+
+`statistics_bytes` and `statistics_leases` reserve a separate shared pool for
+analyzed-column records. The starter configuration uses 1 MiB and 1,024 ranges.
+Each immutable image stores only its analyzed columns, identified by their
+original PostgreSQL column numbers. Readers, pending changes and checkpoints
+retain selected images until they release them. `ANALYZE orders(total)` merges
+that column's new statistics with the other columns' existing records. It
+reserves the replacement before changing visible state. DDL removes statistics
+for dropped or altered columns with the same admission and rollback rules.
+Retained images and replacement overlap can return named `54000` exhaustion;
+commit and rollback use the already admitted ownership.
+
+`index_statistics_slots` independently bounds index activity counters; the
+starter configuration uses 4,096 slots. Index creation reserves a counter
+before catalog publication. Readers pin the selected index's qualified counter,
+so a dropped index cannot redirect a late update to a replacement object.
+Counter reset preserves catalog admission. A retired counter becomes reusable
+after its readers release it. A table without indexes owns no such counter.
+
+SERIAL defaults and identity columns use the shared sequence catalog rather
+than another maximum-width counter array for every table. Sequence ownership
+and the default expression are distinct: `OWNED BY NONE` removes the ownership
+dependency while the column can continue calling that sequence.
 
 A one-column table stores its actual columns instead of a maximum-width array.
 Dropped columns still retain their PostgreSQL column numbers. Committed schemas,
@@ -307,22 +549,24 @@ pressure, write admission examines at most 64 row metadata positions and retries
 with its owned input. Each history chain has the separate per-row version bound.
 It never repeats SQL expressions or drains the whole
 database synchronously; remaining pressure returns the named capacity error.
-Per-table statistics, serial counters, foreign-table/catalog records and other
-fixed controls still make many small embedded tables expensive. Pending ANALYZE
-and other definition families retain separate bounds. Sharing table payloads
-does not remove these reservations. Row bytes, committed history and immutable
+Foreign-table/catalog records and other fixed controls still add per-table
+startup cost. Pending statistics and other definition families retain bounded
+control slots, while column payloads share the independent statistics pool.
+Row bytes, committed history and immutable
 block caches also use shared startup pools. The
 [adaptive resource design](adaptive-resources.md) separates implemented hard
 capacities from future workload policies; no controller resizes startup backing
 according to load. Catalog capacities remain independent: changing `max_tables`
 does not silently resize indexes, routines, views or extended statistics.
 
-The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/examples/embedded-memory.rs) and
-[runner script](https://github.com/e6qu/pos3ql/blob/14e1cdd24e775ea92e2646c07d9671744898e29a/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
+The [embedded memory helper](https://github.com/e6qu/pos3ql/blob/main/examples/embedded-memory.rs) and
+[runner script](https://github.com/e6qu/pos3ql/blob/main/tools/measure-embedded-capacity.py) measure 1, 8, 32 and 128
 configured tables with the same explicit shared capacities in each transaction
-mode, including `table_metadata_bytes` and `table_metadata_leases`. Its 48 samples
+mode, including table metadata, statistics backing and index-counter capacity. Its 64 samples
 cover empty, hot, even, moving-demand, 64-column and schema/index replacement
-workloads. The single session does not measure pinned-reader pressure; separate
+workloads, plus narrow/wide statistics collection and targeted statistics
+replacement through a type change and savepoint rollback. The single session
+does not measure pinned-reader pressure; separate
 ownership regressions cover that behavior. The helper retains named startup draws, configured reservation, peak resident
 memory, stack size and startup time. Populated workloads are reported separately
 from empty engines and include their session costs. These results must be

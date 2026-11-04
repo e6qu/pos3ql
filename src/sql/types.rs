@@ -11,6 +11,10 @@ pub(crate) fn builtin_implicit_cast(actual: ColType, expected: ColType) -> bool 
     if actual == expected {
         return true;
     }
+    if let (ColType::Geometry(_), ColType::Geometry(_)) = (actual, expected) {
+        return crate::sql::catalog::builtin_cast_context(actual.oid(), expected.oid())
+            .is_some_and(crate::storage::CastContext::permits_implicit);
+    }
     if let (ColType::Array(actual), ColType::Array(expected)) = (actual, expected) {
         return builtin_implicit_cast(actual.to_coltype(), expected.to_coltype());
     }
@@ -228,6 +232,7 @@ pub mod oid {
     /// PostgreSQL's opaque server-state pseudo-type.
     pub const INTERNAL: i32 = 2281;
     pub const FDW_HANDLER: i32 = 3115;
+    pub const ANY: i32 = 2276;
     pub const ANYELEMENT: i32 = 2283;
     pub const ANYNONARRAY: i32 = 2776;
     pub const ANYENUM: i32 = 3500;
@@ -2515,8 +2520,11 @@ impl ColType {
     ///
     /// Keeping this on the type prevents each catalog, DDL, and recovery path
     /// from making its own incomplete list of collatable types.
-    pub const fn is_collatable(self) -> bool {
-        matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name)
+    pub fn is_collatable(self) -> bool {
+        match self {
+            Self::Array(element) => element.to_coltype().is_collatable(),
+            _ => matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name),
+        }
     }
 
     /// Pseudo-types describe executor contracts rather than stored values.
@@ -4874,6 +4882,16 @@ pub struct RecordField<'a> {
 }
 
 impl<'a> Datum<'a> {
+    pub(crate) fn catalog_oid(&self) -> Option<u32> {
+        match self {
+            Self::Oid(value) => Some(*value),
+            Self::Regtype { referenced_oid, .. } | Self::RegObject { referenced_oid, .. } => {
+                Some(*referenced_oid as u32)
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Datum::Null)
     }

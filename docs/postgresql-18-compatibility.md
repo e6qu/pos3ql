@@ -40,6 +40,15 @@ pos3ql. For example, an identity column in a non-default schema must still be
 discovered correctly when an inspector queries the catalogs. These fixtures
 cover the recorded workflows, not every application or library feature.
 
+Create application objects in an ordinary schema such as `public`. pos3ql cannot
+store user objects in its built-in `pg_catalog`, `information_schema` or `pg_toast`
+schemas.
+For example, an authorized `CREATE TABLE information_schema.orders (id integer)`
+fails with `0A000`; it is never redirected to `public`. Creating a table, view,
+sequence or composite type in `pg_catalog` or `pg_toast` keeps PostgreSQL's `42501`
+protection.
+Missing CREATE permission also returns `42501`.
+
 `CREATE TABLE ... LIKE ... INCLUDING IDENTITY` creates independently owned
 sequences with the source's settings and declared starting value. Copying a
 `serial` default with `INCLUDING DEFAULTS` or `INCLUDING ALL` instead shares
@@ -59,15 +68,27 @@ child because it does not own that sequence. Detaching a partition clears its
 inherited identity generation; rolling back the detach restores it.
 
 Scalar functions, functions in `FROM`, and `CALL` share input binding with
-explicit rules for their evaluation context. Named arguments and omitted defaults run in the declared
-input order. Defaults share the caller's session: a default using `nextval('order_numbers')` updates that
+explicit rules for their evaluation context. At execution, named arguments and
+omitted defaults run in the declared input order. Defaults share the caller's
+session: a default using `nextval('order_numbers')` updates that
 connection's `currval('order_numbers')`. Function lookup and missing-function
 errors do not run arguments to discover their types.
+Aggregate support functions can refer to supported built-ins by their selected
+identifier. Using a built-in as the implementation of `CREATE CAST` or
+`CREATE OPERATOR` remains unsupported and fails explicitly with `0A000`.
 Stored defaults keep the objects and helper overloads chosen at creation, even
 after renames, schema moves or new overloads. Explicit text sequence inputs,
 such as `nextval('order_numbers'::text)`, request lookup when the call runs.
 If a missing-function diagnostic cannot fit the fixed 192-byte SQL error
 message, it returns `54000` naming that capacity before running any arguments.
+
+Permission-entry arrays (`aclitem[]`) must have one dimension. For example,
+`aclexplode(ARRAY[]::aclitem[])` fails with `22023`:
+`ACL arrays must be one-dimensional`; NULL arrays produce no rows.
+
+Use `(point(1,2))[0]` and `(point(1,2))[1]` for point coordinates.
+Converting an open path to a polygon fails with `22023`:
+`open path cannot be converted to polygon`.
 
 Catalog column references retain their schema, including in nested queries.
 For example, this form works when an application spells out every name:
@@ -75,6 +96,13 @@ For example, this form works when an application spells out every name:
 ```sql
 SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class;
 ```
+
+Queries can read the modeled `information_schema` views, but their numeric
+relation identifiers are unsupported. For example,
+`to_regclass('information_schema.columns')` and
+`'information_schema.columns'::regclass` fail with `0A000`:
+`relation OIDs for information_schema views are not supported`.
+A later user table named `columns` cannot supply its identifier instead.
 
 Array and `CASE` result types come from their declarations, including subqueries
 and null values. For example, `ARRAY[(SELECT NULL::date)]` is `date[]`, and
@@ -88,6 +116,47 @@ null inputs. For example, `ARRAY(SELECT d FROM unnest(orders.days) d)` keeps
 the declared element type of `orders.days`; a single-column function alias
 denotes its scalar value. Result descriptions do not require a sample row.
 
+Enum labels written directly in SQL are checked before choosing rows. If
+`order_status` contains `new` and `paid`, `'missing'::order_status` raises
+`22P02` even inside an unused `CASE` arm. A value already declared `text`
+converts when its expression runs: the same unused arm containing
+`'missing'::text::order_status` is skipped.
+
+An untyped serialized array can run domain checks during input preparation.
+For extended-protocol clients, Bind validates parameter values before preparing
+function inputs. A portal keeps the decoded parameters and its own checked
+planner values; Execute reuses them. For example, an invalid integer parameter
+fails at Bind before a function's domain constraint runs. Parameters and their
+resolved type OIDs share `portal_bytes`; exhaustion reports `54000`.
+For example, `PREPARE saved AS SELECT '{paid}'::checked_status[]` checks that
+value at `PREPARE`; repeated `EXECUTE saved` reuses it. A literal supplied to a
+column or function parameter of that type follows the same rule. In contrast,
+`ARRAY['paid']::checked_status[]` performs its domain checks when executed.
+
+SQL string functions and procedures validate their inputs at `CREATE`, then
+retain the first runtime call's body inputs for that backend, routine definition
+and resolved call types. Considering a function for inlining checks its body
+while planning the caller. Accepted inlining retains those values in the caller
+plan. A rejected attempt does not replace the separate runtime check. For
+example, an opaque function checks once at `CREATE`, once at the first
+`SELECT`, and reuses that runtime value for later commands in the same backend.
+A cursor retains its inputs across separate `FETCH` commands.
+Supported static procedural sources prepare
+when first reached and reuse the backend's plan; dynamic `EXECUTE` prepares
+each command afresh. Views, rules, SQL `BEGIN ATOMIC` bodies and stored defaults
+retain their checked inputs with the definition, including domain and
+view-column defaults. See [plan lifetimes](architecture.md#the-request-path).
+PL/pgSQL routines keep separate instances for resolved input types and input
+collation. For example, calling a polymorphic routine with an integer and then
+text prepares its reached statements separately. Repeating the integer call
+reuses that instance. Each used instance consumes one `routine_input_slots`
+control record and an actual-length key in the shared metadata pool; reached
+statement plans use the same fixed controls.
+`DISCARD PLANS` releases cached routine-input plans for future requests; existing
+portals and cursors keep their checked values. `DISCARD ALL` also clears
+prepared statements. Attempting either while a routine-input plan is executing
+returns `0A000` before invalidation. Stored definition inputs are unaffected.
+
 Arrays of domains over built-in arrays are supported. For example, a domain
 `integer_vector` over `integer[]` can be used as `integer_vector[]`.
 Arrays of domains whose base is an array of user-defined values are rejected:
@@ -95,6 +164,16 @@ the stored base code cannot retain that nested declaration. A scalar domain
 containing an array of scalar domains is supported.
 For example, `CREATE DOMAIN positive_ids AS positive_integer[]` is distinct
 from an unsupported `positive_ids[]` column.
+
+Data-change triggers currently reject a reached SQL string literal that needs
+checked input for an array of a named domain, such as
+`PERFORM cardinality('{1}'::positive_integer[])`. They raise `0A000` before
+running the domain constraint. Unreached branches and trigger expressions that
+need no checked input continue normally. These triggers cannot yet retain
+their unfinished execution while the engine prepares that value; replaying
+after undoing earlier row changes would give constraints the wrong data.
+Event triggers use the engine's procedural execution context and retain each
+statement's checked inputs across calls.
 
 Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
 reject client text and binary input with `0A000`, matching PostgreSQL. Reports
@@ -136,11 +215,17 @@ ordering. Expression results are recomputed from fetched rows rather than
 projected directly from an index expression tuple. Native PostgreSQL index page
 layouts and custom native callbacks are not implemented.
 
-Moving indexes to a tablespace during `REINDEX` requires explicitly created
-indexes. For example, `REINDEX (TABLESPACE archive) INDEX orders_pkey` returns
+Moving indexes to a tablespace during `REINDEX` without `CONCURRENTLY` requires
+explicitly created indexes. For example,
+`REINDEX (TABLESPACE archive) INDEX orders_pkey` returns
 `0A000` if a primary-key constraint created `orders_pkey`. Table, schema and
 database targets also reject that option if they include constraint-generated
 indexes. Rejection happens before changing any selected index.
+Concurrent rebuilding creates replacements for constraint-generated indexes
+and can move those replacements. A table rebuild preserves its large-value
+index's existing tablespace; directly selecting that index with `TABLESPACE`
+returns `0A000`. An invalid large-value index is skipped with a warning by a
+table rebuild and cannot be rebuilt directly.
 
 ### Partition column order
 
@@ -196,6 +281,7 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Other definition breadth | Documented 64-item constructs, including LIST bounds, inheritance parents, trigger arguments, and routine configuration entries | Shared parse/storage boundary; widening requires review of representation and identity |
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
+| Completed routine workspaces | Existing statement arena; one scoped workspace for each active scalar, table-function or engine-owned call | Completed parsing, locals and temporary plans are reclaimed; only typed result bytes survive in the caller. Nested calls share the same fixed capacity. SQLSTATE 54000 rejects an oversized active call without heap growth |
 | Connection startup options | 256 bytes per decoded option word; backslashes escape spaces and backslashes | SQLSTATE 54000 on word exhaustion; values are decoded without SQL quoting rules, and RESET restores the startup value |
 | MVCC row history | Explicit shared `row_history_slots` across tables/large objects, plus `max_row_versions_per_row` per row | Updates reserve before durability, including queued/prepared commits; exhaustion is `54000`; locking mode requires zero history slots |
 | Durable object requests | `object_store_get_slots` read clients, `object_store_put_slots` journal upload clients, `object_store_block_put_slots` physical upload clients, one separate atomic block client, administrative and independent journal/file cleanup clients, manifest publication clients, and configured credential/ownership clients | Each reserves header and response capacity; journal upload slots also reserve `wal_upload_buffer_bytes` immutable body bytes; physical slots reserve 256 KiB each and share a fixed writer-emission buffer. Read controls, upload outcomes and a 256 KiB block scratch buffer are charged separately from caches; atomic operations may wait synchronously |
@@ -204,11 +290,14 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Query SST root retention | 64 source slots per query workspace; configured generation capacity per slot; shared unique-root capacity twice the startup table-slot × generation capacity | Startup-owned roots, schema, and reader buffers; scans with no resident overlay remain usable after table/Storage retirement; SQLSTATE 54000 before partial capture |
 | Object-row source retention | 64 point-source slots per query workspace, separate from scan sources; checked shared lease counts | Complete captured generations and newest deletion metadata; SQLSTATE 54000 on exhaustion, without reducing scan capacity |
 | Retained row metadata | 64 copied point reads per query workspace; each reserves the configured maximum pending and committed versions | Startup-owned metadata, heap sources, and saved-file roots; SQLSTATE 54000 on exhaustion, with no shared version lock held during retention; captured-table admission returns 40001 before reserving a slot when its identity changed |
-| Bound prepared statements | Existing `max_prepared` statement slots and `prepared_bytes` per slot | Releasing a name preserves bytes needed by bound portals; slots are reusable after the last portal closes; exhaustion remains SQLSTATE 54000 |
+| Bound prepared statements | `max_prepared` slots per SQL/protocol namespace; `prepared_bytes` per slot and one active SQL input record | Text, parameter metadata and checked literal values share each reservation. Releasing a name preserves values needed by bound portals; the last portal releases the slot. Exhaustion is SQLSTATE 54000. |
+| Routine input plans | `routine_input_slots` startup control records per backend; actual checked values share global `table_metadata_bytes` and `table_metadata_leases` | Caller plans and supported static procedural sources retain separately owned values. No maximum-width payload is reserved per plan or table. SQLSTATE 54000 names control or metadata exhaustion; settings take effect at startup. |
 | Temporary namespaces | One fixed entry per connection/subscription slot; first creation consumes a transaction DDL undo entry | Creation rolls back; an established empty namespace survives ordinary drops and DISCARD, then disappears at disconnect. Namespace state never enters durable records |
 | Streamed COPY statement-trigger inputs | `txn_rows` records and `copy_transition_bytes` (256 KiB default) per connection and subscription worker | Startup-owned encoded values; no later source lookup; SQLSTATE 54000 aborts COPY on row/byte exhaustion; cleanup permits a smaller retry |
 | Execution schema images | `definition_image_slots` retained identities for physical schema pins and separately typed synthetic column payloads | SQLSTATE 54000 before partial description on exhaustion; identifiers include pool and generation identity; synthetic hidden fields retain their full backing width |
-| Table/index metadata | Explicit `table_metadata_bytes` backing and `table_metadata_leases` occupied ranges; starter values 64 MiB and 8,192; bytes positive and divisible by 64 | Actual-length immutable schema/binding slices share owners. Old/replacement overlap, alignment and fragmentation consume fixed capacity; named 54000 reports requested/free/largest bytes and available descriptors. Statistics, serial state and other catalog families remain separate |
+| Table/index metadata | Explicit `table_metadata_bytes` backing and `table_metadata_leases` occupied ranges; starter values 64 MiB and 8,192; bytes positive and divisible by 64 | Actual-length immutable schema/binding slices share owners. Old/replacement overlap, alignment and fragmentation consume fixed capacity; named 54000 reports requested/free/largest bytes and available descriptors. Other catalog families retain separate bounds |
+| Column statistics | Explicit `statistics_bytes` and `statistics_leases`; starter values 1 MiB and 1,024; bytes positive and divisible by 64 | Images contain actual analyzed columns, keyed by original column number. Retained readers, replacement images and undo remain charged; exhaustion fails before effects |
+| Index counters | Explicit global `index_statistics_slots`; starter value 4,096 | Actual index lifetimes reserve counters before publication. Dropped sources remain charged while readers hold them; reset does not remove admission |
 | Commit admission | Complete definition, binding and row-key reservations before durability; Share locks on affected tables | Waits retain completed SQL effects and buffered output; readers/unrelated work proceed. Cancellation can abort admission. Prepared locks are captured after admission; durable installation consumes reserved owners |
 | Resident row metadata | `row_overlay_slots` ordinary row cells shared across tables/databases; separate `large_object_pages` for the internal page table | Startup-fixed cells and lookup controls; table ownership and generations prevent reuse from changing another table's rows; exhausted admission returns named SQLSTATE 54000 |
 | Foreground row workspace | One `row_work_bytes` byte pool, a positive multiple of 64, and `row_work_leases` concurrent leases shared by retained row-ID lists and DML buffers; each extent rounds to 64 bytes, at most 63 alignment-padding bytes per live lease; active buffers may also hold spare capacity and old/new copy ranges | Named SQLSTATE 54000 reports requested/free/largest contiguous bytes and available leases; fragmentation can prevent a request despite enough total free bytes; release, rollback and failed capture return ownership without heap growth |

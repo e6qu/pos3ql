@@ -272,7 +272,7 @@ impl Storage {
             log_count: 0,
             dirty: alteration.restart.is_some(),
             generation: sequence_values.pending.generation.wrapping_add(1),
-            staged_generation: 0,
+            staged_generation: None,
         };
         owners.catalog.definitions[slot].pending_definition = Some(PendingSequenceDefinition {
             txid: transaction,
@@ -350,9 +350,9 @@ impl Storage {
         let values = &mut owners.catalog.values[slot];
         values.committed = values.pending;
         values.committed.dirty = false;
-        values.committed.staged_generation = 0;
+        values.committed.staged_generation = None;
         values.pending.dirty = false;
-        values.pending.staged_generation = 0;
+        values.pending.staged_generation = None;
         self.commit_object_comment_identity_locked(
             owners
                 .comments
@@ -411,7 +411,7 @@ impl Storage {
                 log_count,
                 dirty: false,
                 generation: values.pending.generation.wrapping_add(1),
-                staged_generation: 0,
+                staged_generation: None,
             };
         } else {
             values.pending.dirty = false;

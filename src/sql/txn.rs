@@ -78,6 +78,9 @@ pub(crate) struct StatementMark {
     pub deferred_trigger_bytes: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransactionEffectMark([usize; 15]);
+
 pub const DEFAULT_MAX_SAVEPOINTS: usize = 16;
 pub const DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS: usize = 64;
 
@@ -87,7 +90,7 @@ pub(crate) struct LargeObjectDescriptorMode {
     pub writable: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LargeObjectDescriptor {
     pub oid: crate::storage::LargeObjectOid,
     pub position: i64,
@@ -117,13 +120,26 @@ const DEFAULT_MAX_TRUNCATE_TABLES: usize = 16;
 /// One SQL TRUNCATE command, retained until commit so durable logical
 /// decoding preserves its statement-level semantics instead of inferring them
 /// from the row deletes used by the heap.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct TruncateEvent {
+    scope: crate::storage::RuntimeInputScope,
     pub command_id: u32,
-    pub table_offset: usize,
-    pub table_count: usize,
+    targets: crate::mem::lease_pool::SharedSlice<crate::storage::TruncateTarget>,
     pub cascade: bool,
     pub restart_identity: bool,
+}
+
+impl TruncateEvent {
+    fn plan_event(&self, created_at: u64) -> super::plan_invalidations::PlanInvalidationEvent {
+        super::plan_invalidations::PlanInvalidationEvent {
+            scope: self.scope,
+            change: super::plan_invalidations::CatalogPlanChange {
+                global: false,
+                roles: false,
+            },
+            selected: Some(crate::storage::SelectedPlanTarget::Relation { created_at }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +148,8 @@ pub enum TxnMode {
     Idle,
     /// Started automatically for a statement/message.
     Implicit,
+    /// An extended Execute completed; later commands share the block until Sync.
+    ImplicitBlock,
     /// BEGIN was issued.
     Explicit,
 }
@@ -210,6 +228,11 @@ pub(crate) fn validate_isolation_mode(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitTarget {
     Ordinary,
+    Utility(super::UtilityCommand),
+    ConcurrentIndex {
+        command: u64,
+        phase: super::concurrent_index::CommitPhase,
+    },
     Prepare {
         slot: usize,
         gid: super::ast::PreparedTransactionId,
@@ -271,6 +294,7 @@ pub(super) struct CacheCapacityWait {
 }
 
 pub struct TxnState {
+    plan_invalidations: Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
     staged_commit: Option<StagedCommit>,
     commit_admission: Option<CommitAdmission>,
     pub(super) catalog_history: Option<crate::storage::CatalogHistoryBatch>,
@@ -311,16 +335,18 @@ pub struct TxnState {
     /// A concurrent partition detach published its first durable phase. The
     /// protocol executor commits that phase before it parks for finalization.
     concurrent_partition_detach_pending: bool,
+    pub(super) concurrent_index: Option<super::concurrent_index::Command>,
+    pub(super) immediate_index_utility: Option<super::UtilityCommand>,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
     touched: FixedVec<(u32, u64, PriorPending)>,
     truncates: FixedVec<TruncateEvent>,
-    truncate_table_slots: FixedVec<u16>,
     truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
     ddl_origins: FixedVec<u32>,
+    ddl_plan_events: FixedVec<super::plan_invalidations::PlanInvalidationEvent>,
     ddl_origin: u32,
     next_ddl_origin: u32,
     /// Transaction-private ANALYZE versions, kept outside `DdlUndo`. The
@@ -353,7 +379,7 @@ pub struct TxnState {
 }
 
 /// How to undo one DDL statement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[allow(
     clippy::large_enum_variant,
     reason = "CommentSet carries its payload inline (no heap after startup); the undo list is a small fixed pool"
@@ -586,14 +612,6 @@ pub(crate) enum DdlUndo {
         prior_owner: Option<crate::storage::PendingOwnership>,
     },
     DatabaseDropped(u32),
-    /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
-    /// restoring the prior counter. (A plain advance is *not* undone: a
-    /// rolled-back insert still consumes its number, as PostgreSQL has it.)
-    SequenceReset {
-        table: u32,
-        column: u16,
-        prior: i64,
-    },
     /// CREATE SCHEMA at this slot — undo by dropping it.
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
@@ -787,7 +805,10 @@ enum ConstraintLifecycle {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StatisticsUndo {
-    Table(u32),
+    Table {
+        table: u32,
+        event: Option<super::plan_invalidations::PlanInvalidationEvent>,
+    },
     Extended(u32),
 }
 
@@ -849,14 +870,11 @@ impl TxnState {
                     .saturating_mul(core::mem::size_of::<TruncateEvent>()),
             )
             .saturating_add(capacity.tables.saturating_mul(128))
-            .saturating_add(
-                capacity
-                    .ddl
-                    .saturating_mul(capacity.tables)
-                    .saturating_mul(core::mem::size_of::<u16>()),
-            )
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<DdlUndo>()))
             .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<u32>()))
+            .saturating_add(capacity.ddl.saturating_mul(core::mem::size_of::<
+                super::plan_invalidations::PlanInvalidationEvent,
+            >()))
             .saturating_add(
                 capacity
                     .analyze
@@ -916,6 +934,11 @@ impl TxnState {
                     .descriptors
                     .saturating_mul(core::mem::size_of::<LargeObjectDescriptor>()),
             )
+            .saturating_add(core::mem::size_of::<
+                Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+            >())
+            .saturating_add(core::mem::size_of::<Option<super::concurrent_index::Command>>())
+            .saturating_add(core::mem::size_of::<Option<super::UtilityCommand>>())
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -964,6 +987,17 @@ impl TxnState {
         budget: &mut Budget,
         capacity: TransactionCapacity,
     ) -> Result<Self, BudgetError> {
+        budget.draw(
+            core::mem::size_of::<
+                Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+            >(),
+            "transaction plan invalidation owner",
+        )?;
+        budget.draw(
+            core::mem::size_of::<Option<super::concurrent_index::Command>>()
+                + core::mem::size_of::<Option<super::UtilityCommand>>(),
+            "concurrent index command",
+        )?;
         let mut large_object_descriptors =
             FixedVec::new(budget, "large_object_descriptors", capacity.descriptors)?;
         for _ in 0..capacity.descriptors {
@@ -972,6 +1006,7 @@ impl TxnState {
                 .expect("sized to descriptor capacity");
         }
         Ok(Self {
+            plan_invalidations: None,
             staged_commit: None,
             commit_admission: None,
             catalog_history: None,
@@ -996,13 +1031,10 @@ impl TxnState {
             rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
             concurrent_partition_detach_pending: false,
+            concurrent_index: None,
+            immediate_index_utility: None,
             touched: FixedVec::new(budget, "txn_touched", capacity.rows)?,
             truncates: FixedVec::new(budget, "txn_truncates", capacity.ddl)?,
-            truncate_table_slots: FixedVec::new(
-                budget,
-                "txn_truncate_table_slots",
-                capacity.ddl * capacity.tables,
-            )?,
             truncate_wal_tables: FixedBuf::new(
                 budget,
                 "txn_truncate_wal_tables",
@@ -1010,6 +1042,7 @@ impl TxnState {
             )?,
             ddl: FixedVec::new(budget, "txn_ddl", capacity.ddl)?,
             ddl_origins: FixedVec::new(budget, "txn_ddl_origins", capacity.ddl)?,
+            ddl_plan_events: FixedVec::new(budget, "txn_plan_invalidations", capacity.ddl)?,
             ddl_origin: 0,
             next_ddl_origin: 0,
             statistics_undo: FixedVec::new(budget, "txn_statistics_undo", capacity.analyze)?,
@@ -1071,6 +1104,45 @@ impl TxnState {
             )?,
             large_object_descriptors,
         })
+    }
+
+    pub(crate) fn statement_large_object_descriptors<'a>(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [LargeObjectDescriptor], SqlError> {
+        let count = self
+            .large_object_descriptors
+            .iter()
+            .rposition(|descriptor| descriptor.active)
+            .map_or(0, |index| index + 1);
+        arena
+            .alloc_slice_copy(&self.large_object_descriptors[..count])
+            .map(|descriptors| &*descriptors)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "large-object retry state exceeds statement memory"
+                )
+            })
+    }
+
+    pub(crate) fn restore_statement_large_object_descriptors(
+        &mut self,
+        descriptors: &[LargeObjectDescriptor],
+    ) {
+        assert!(descriptors.len() <= self.large_object_descriptors.len());
+        self.large_object_descriptors[..descriptors.len()].copy_from_slice(descriptors);
+        self.large_object_descriptors[descriptors.len()..].fill(LargeObjectDescriptor::EMPTY);
+    }
+
+    pub(crate) fn matches_statement_large_object_descriptors(
+        &self,
+        saved: &[LargeObjectDescriptor],
+    ) -> bool {
+        self.large_object_descriptors.get(..saved.len()) == Some(saved)
+            && self.large_object_descriptors[saved.len()..]
+                .iter()
+                .all(|descriptor| !descriptor.active)
     }
 
     pub(crate) fn open_large_object_descriptor(
@@ -1162,6 +1234,26 @@ impl TxnState {
 
     pub fn is_explicit(&self) -> bool {
         self.mode == TxnMode::Explicit
+    }
+
+    pub(crate) fn is_implicit(&self) -> bool {
+        matches!(self.mode, TxnMode::Implicit | TxnMode::ImplicitBlock)
+    }
+
+    pub(crate) fn is_transaction_block(&self) -> bool {
+        matches!(self.mode, TxnMode::Explicit | TxnMode::ImplicitBlock)
+    }
+
+    pub(crate) fn begin_implicit_block(&mut self) {
+        if self.mode == TxnMode::Implicit {
+            self.mode = TxnMode::ImplicitBlock;
+        }
+    }
+
+    pub(crate) fn defer_concurrent_index_cancel(&mut self) {
+        if let Some(command) = &mut self.concurrent_index {
+            command.cancel_after_commit = true;
+        }
     }
 
     pub(crate) fn begin_concurrent_partition_detach(&mut self) {
@@ -1699,6 +1791,7 @@ impl TxnState {
 
     pub(crate) fn record_truncate(
         &mut self,
+        storage: &Storage,
         tables: &[usize],
         cascade: bool,
         restart_identity: bool,
@@ -1712,20 +1805,20 @@ impl TxnState {
                 "transaction TRUNCATE capacity exceeded"
             ));
         }
-        let table_offset = self.truncate_table_slots.len();
-        for &table in tables {
-            self.truncate_table_slots
-                .push(u16::try_from(table).expect("validated physical table slot"))
-                .expect("one full table set reserved per TRUNCATE event");
+        let event = TruncateEvent {
+            scope: storage.runtime_input_scope(),
+            targets: storage.capture_truncate_targets(tables, self.txid)?,
+            command_id,
+            cascade,
+            restart_identity,
+        };
+        if let Some(owner) = &self.plan_invalidations {
+            for target in event.targets.iter() {
+                owner.apply(event.plan_event(target.created_at));
+            }
         }
         self.truncates
-            .push(TruncateEvent {
-                command_id,
-                table_offset,
-                table_count: tables.len(),
-                cascade,
-                restart_identity,
-            })
+            .push(event)
             .expect("TRUNCATE event capacity checked before mutation");
         Ok(())
     }
@@ -1742,12 +1835,11 @@ impl TxnState {
         self.deferred_constraints.capacity()
     }
 
-    pub(crate) fn truncate_wal_tables(&mut self, event: TruncateEvent) -> (&[u16], &mut FixedBuf) {
-        (
-            &self.truncate_table_slots.as_slice()
-                [event.table_offset..event.table_offset + event.table_count],
-            &mut self.truncate_wal_tables,
-        )
+    pub(crate) fn truncate_wal_tables<'a>(
+        &'a mut self,
+        event: &'a TruncateEvent,
+    ) -> (&'a [crate::storage::TruncateTarget], &'a mut FixedBuf) {
+        (&event.targets, &mut self.truncate_wal_tables)
     }
 
     /// Buffers a NOTIFY, collapsing an identical (channel, payload) already
@@ -2432,6 +2524,26 @@ impl TxnState {
         }
     }
 
+    pub(crate) fn transaction_effect_mark(&self) -> TransactionEffectMark {
+        TransactionEffectMark([
+            self.touched.len(),
+            self.truncates.len(),
+            self.ddl.len(),
+            self.statistics_undo.len(),
+            self.pending_notifies.len(),
+            self.notify_payloads.mark(),
+            self.pending_listen_ops.len(),
+            self.subscription_advances.len(),
+            self.deferred_constraints.len(),
+            self.completed_constraints.len(),
+            self.constraint_modes.len(),
+            self.constraint_renames.len(),
+            self.deferred_triggers.len(),
+            self.completed_deferred_triggers.len(),
+            self.deferred_trigger_bytes.mark(),
+        ])
+    }
+
     pub(crate) fn owns_statement_mark(&self, mark: StatementMark) -> bool {
         self.is_active() && self.txid == mark.txid
     }
@@ -2481,22 +2593,31 @@ impl TxnState {
     pub(crate) fn rewind_truncates(&mut self, truncate_mark: usize) {
         while self.truncates.len() > truncate_mark {
             let event = self.truncates.pop().expect("nonempty TRUNCATE event list");
-            while self.truncate_table_slots.len() > event.table_offset {
-                self.truncate_table_slots.pop();
+            if let Some(owner) = &self.plan_invalidations {
+                for target in event.targets.iter() {
+                    owner.apply(event.plan_event(target.created_at));
+                }
             }
         }
     }
 
     pub fn rewind_ddl(&mut self, ddl_mark: usize) {
         while self.ddl.len() > ddl_mark {
-            self.ddl.pop();
+            self.ddl.pop().expect("DDL exceeds its rewind mark");
+            let event = self
+                .ddl_plan_events
+                .pop()
+                .expect("DDL events parallel their changes");
+            if let Some(owner) = &self.plan_invalidations {
+                owner.apply(event);
+            }
             self.ddl_origins.pop();
         }
     }
 
     pub(crate) fn record_statistics(&mut self, table: u32) -> Result<(), SqlError> {
         self.statistics_undo
-            .push(StatisticsUndo::Table(table))
+            .push(StatisticsUndo::Table { table, event: None })
             .map_err(|_| {
                 sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -2504,6 +2625,42 @@ impl TxnState {
                     self.statistics_undo.capacity()
                 )
             })
+    }
+
+    pub(crate) fn record_statistics_plan_change(
+        &mut self,
+        storage: &crate::storage::Storage,
+        table: u32,
+    ) {
+        let Some(StatisticsUndo::Table {
+            table: selected,
+            event,
+        }) = self.statistics_undo.last_mut()
+        else {
+            panic!("ANALYZE retained its statistics receipt before publication")
+        };
+        assert_eq!(*selected, table, "ANALYZE publishes its admitted relation");
+        assert!(
+            event.is_none(),
+            "ANALYZE publishes each relation estimate once"
+        );
+        let captured = super::plan_invalidations::PlanInvalidationEvent {
+            scope: storage.runtime_input_scope(),
+            change: super::plan_invalidations::CatalogPlanChange {
+                global: false,
+                roles: false,
+            },
+            selected: Some(crate::storage::SelectedPlanTarget::Relation {
+                created_at: storage
+                    .table_def(table as usize, self.txid)
+                    .identity()
+                    .created_at,
+            }),
+        };
+        *event = Some(captured);
+        // PostgreSQL heap_inplace_update_and_unlock sends an immediate shared
+        // invalidation and retains another receipt for commit or local abort.
+        storage.publish_plan_invalidations(core::iter::once(captured));
     }
 
     pub(crate) fn record_extended_statistics(&mut self, slot: u32) -> Result<(), SqlError> {
@@ -2524,7 +2681,13 @@ impl TxnState {
 
     pub(crate) fn rewind_statistics(&mut self, mark: usize) {
         while self.statistics_undo.len() > mark {
-            self.statistics_undo.pop();
+            if let Some(StatisticsUndo::Table {
+                event: Some(event), ..
+            }) = self.statistics_undo.pop()
+                && let Some(owner) = &self.plan_invalidations
+            {
+                owner.apply(event);
+            }
         }
     }
 
@@ -2541,6 +2704,7 @@ impl TxnState {
         definition: crate::storage::TableDefBuilder,
         column_mapping: &[Option<crate::storage::SqlName>; crate::storage::MAX_COLUMNS],
         rewrites_rows: bool,
+        invalidated_statistics: crate::storage::ColumnSet,
     ) -> Result<crate::storage::TableDefinitionTarget, SqlError> {
         if target.transaction() != self.txid {
             return Err(sql_err!(
@@ -2548,8 +2712,14 @@ impl TxnState {
                 "table definition selection belongs to another transaction"
             ));
         }
-        let change = storage.write_table_def(target, definition, column_mapping, rewrites_rows)?;
-        if let Err(error) = self.record_ddl(DdlUndo::TableAltered(change)) {
+        let change = storage.write_table_def(
+            target,
+            definition,
+            column_mapping,
+            rewrites_rows,
+            invalidated_statistics,
+        )?;
+        if let Err(error) = self.record_ddl(storage, DdlUndo::TableAltered(change)) {
             storage.rollback_table_def(change);
             return Err(error);
         }
@@ -2593,6 +2763,7 @@ impl TxnState {
             Some(match undo {
                 DdlUndo::IndexCreated(slot) => IndexGenerationChange::Created(*slot as usize),
                 DdlUndo::IndexDropped(slot) => IndexGenerationChange::Dropped(*slot as usize),
+                DdlUndo::IndexAltered { slot, .. } => IndexGenerationChange::State(*slot as usize),
                 DdlUndo::IndexRenamed { slot, .. } => {
                     IndexGenerationChange::Renamed(*slot as usize)
                 }
@@ -2630,7 +2801,7 @@ impl TxnState {
         undo: crate::storage::CatalogDdlUndo,
     ) -> Result<(), SqlError> {
         storage.validate_table_drop(undo, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::Dropped(undo)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::Dropped(undo)) {
             storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2643,7 +2814,7 @@ impl TxnState {
         change: crate::storage::MatviewDdlUndo,
     ) -> Result<(), SqlError> {
         storage.validate_matview_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::MatviewChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::MatviewChanged(change)) {
             storage.finish_matview_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2656,7 +2827,7 @@ impl TxnState {
         change: crate::storage::RoutineChange,
     ) -> Result<(), SqlError> {
         storage.validate_routine_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::RoutineChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::RoutineChanged(change)) {
             storage.finish_routine_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2669,7 +2840,7 @@ impl TxnState {
         change: crate::storage::SequenceChange,
     ) -> Result<(), SqlError> {
         storage.validate_sequence_change(change, self.txid)?;
-        if let Err(error) = self.record_ddl(DdlUndo::SequenceChanged(change)) {
+        if let Err(error) = self.record_ddl(storage, DdlUndo::SequenceChanged(change)) {
             storage.finish_sequence_change(change, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
         }
@@ -2681,29 +2852,182 @@ impl TxnState {
         storage: &mut crate::storage::Storage,
         undo: DdlUndo,
     ) -> Result<(), SqlError> {
-        if let Err(error) = self.record_ddl(undo) {
+        if let Err(error) = self.record_ddl(storage, undo.clone()) {
             super::rollback_catalog_change(storage, undo, self.txid);
             return Err(error);
         }
         Ok(())
     }
 
-    pub(crate) fn record_ddl(&mut self, undo: DdlUndo) -> Result<(), SqlError> {
-        self.ddl.push(undo).map_err(|_| {
-            sql_err!(
+    pub(crate) fn record_ddl(&mut self, storage: &Storage, undo: DdlUndo) -> Result<(), SqlError> {
+        if self.ddl.len() == self.ddl.capacity()
+            || self.ddl_plan_events.len() == self.ddl_plan_events.capacity()
+        {
+            return Err(sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction contains more than {} catalog changes",
                 self.ddl.capacity()
-            )
-        })?;
+            ));
+        }
+        let event =
+            super::plan_invalidations::PlanInvalidationEvent::capture(storage, &undo, self.txid)?;
+        self.ddl
+            .push(undo)
+            .expect("DDL capacity was checked before capturing its event");
         self.ddl_origins
             .push(self.ddl_origin)
             .expect("parallel DDL origin pool has the same capacity");
+        self.ddl_plan_events
+            .push(event)
+            .expect("parallel DDL event pool has the same capacity");
+        if let Some(owner) = &self.plan_invalidations {
+            owner.apply(event);
+        }
         Ok(())
+    }
+
+    pub(crate) fn bind_plan_invalidations(
+        &mut self,
+        owner: &std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>,
+    ) -> Result<(), SqlError> {
+        if let Some(current) = &self.plan_invalidations {
+            if std::sync::Arc::ptr_eq(current, owner) {
+                return Ok(());
+            }
+            if self.mode != TxnMode::Idle {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "active transaction cannot change its SQL plan owner"
+                ));
+            }
+        }
+        self.plan_invalidations = Some(std::sync::Arc::clone(owner));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_invalidation_owner(
+        &self,
+    ) -> Option<&std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>> {
+        self.plan_invalidations.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plan_invalidation_stamp(
+        &self,
+        depends_on_roles: bool,
+    ) -> Result<super::plan_invalidations::LocalPlanStamp, SqlError> {
+        self.plan_invalidations
+            .as_ref()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "transaction has no SQL plan invalidation owner"
+                )
+            })?
+            .stamp(depends_on_roles)
+    }
+
+    pub(crate) fn watch_plan_inputs(
+        &self,
+        storage: &Storage,
+        depends_on_roles: bool,
+        dependencies: crate::mem::lease_pool::SharedSlice<crate::storage::RuntimeInputDependency>,
+        own_routine: Option<i32>,
+    ) -> Result<super::plan_invalidations::LocalPlanStamp, SqlError> {
+        let owner = self.plan_invalidations.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "transaction has no SQL plan invalidation owner"
+            )
+        })?;
+        storage.register_plan_backend(owner)?;
+        owner.watch(
+            depends_on_roles,
+            storage.runtime_input_scope(),
+            dependencies,
+            own_routine,
+        )
+    }
+
+    pub(crate) fn invalidate_prepared_plan_inputs(&self) {
+        if let Some(owner) = &self.plan_invalidations {
+            for event in self.plan_events() {
+                owner.apply(event);
+            }
+        }
+    }
+
+    /// Prepared transaction data has no backend. Moving it cannot exchange
+    /// the frontend's plan ownership with a reused detached slot.
+    pub(crate) fn swap_prepared_state(&mut self, detached: &mut Self) {
+        assert!(detached.plan_invalidations.is_none());
+        core::mem::swap(self, detached);
+        core::mem::swap(
+            &mut self.plan_invalidations,
+            &mut detached.plan_invalidations,
+        );
+    }
+
+    /// Prepared changes never belonged to the resolving backend's local plans.
+    /// Their commit publishes shared invalidations; rollback publishes none.
+    pub(crate) fn with_detached_plan_owner<R>(
+        &mut self,
+        resolve: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        struct RestoreOwner<'a> {
+            transaction: &'a mut TxnState,
+            owner: Option<std::sync::Arc<super::plan_invalidations::LocalPlanInvalidations>>,
+        }
+        impl Drop for RestoreOwner<'_> {
+            fn drop(&mut self) {
+                self.transaction.plan_invalidations = self.owner.take();
+            }
+        }
+        let owner = self.plan_invalidations.take();
+        let restore = RestoreOwner {
+            transaction: self,
+            owner,
+        };
+        let result = resolve(&mut *restore.transaction);
+        assert!(restore.transaction.plan_invalidations.is_none());
+        result
+    }
+
+    /// A queued commit and its waiting frontend share the same backend until
+    /// the frontend collects its durable result.
+    pub(crate) fn stage_commit_state(&mut self, worker: &mut Self) {
+        let owner = self.plan_invalidations.clone();
+        core::mem::swap(self, worker);
+        self.plan_invalidations = owner;
+    }
+
+    pub(crate) fn finish_commit_state(&mut self, worker: &mut Self) {
+        core::mem::swap(self, worker);
+        worker.clear();
+        worker.plan_invalidations = None;
     }
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {
         &self.ddl
+    }
+
+    pub(crate) fn plan_events(
+        &self,
+    ) -> impl Iterator<Item = super::plan_invalidations::PlanInvalidationEvent> + '_ {
+        self.ddl_plan_events
+            .iter()
+            .copied()
+            .chain(self.truncates.iter().flat_map(|event| {
+                event
+                    .targets
+                    .iter()
+                    .map(move |target| event.plan_event(target.created_at))
+            }))
+            .chain(self.statistics_undo.iter().filter_map(|undo| match undo {
+                StatisticsUndo::Table { event, .. } => *event,
+                StatisticsUndo::Extended(_) => None,
+            }))
     }
 
     pub(crate) fn ddl_capacity(&self) -> usize {
@@ -2733,6 +3057,13 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.concurrent_index = None;
+        self.immediate_index_utility = None;
+        if let Some(owner) = &self.plan_invalidations {
+            for event in self.plan_events() {
+                owner.apply(event);
+            }
+        }
         self.staged_commit = None;
         self.commit_admission = None;
         self.catalog_history = None;
@@ -2755,9 +3086,9 @@ impl TxnState {
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();
-        self.truncate_table_slots.clear();
         self.ddl.clear();
         self.ddl_origins.clear();
+        self.ddl_plan_events.clear();
         self.ddl_origin = 0;
         self.next_ddl_origin = 0;
         self.concurrent_partition_detach_pending = false;
@@ -2786,8 +3117,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn statement_retry_restores_large_object_positions_and_descriptor_lifetimes() {
+        let mut budget = Budget::new(TxnState::budget_bytes(8) + 4096);
+        let mut txn = TxnState::new(&mut budget, 8).unwrap();
+        let arena = crate::mem::arena::Arena::new(&mut budget, "descriptor retry", 4096).unwrap();
+        let mode = LargeObjectDescriptorMode {
+            readable: true,
+            writable: true,
+        };
+        let oid = crate::storage::LargeObjectOid::parse(42).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let empty = txn.statement_large_object_descriptors(&arena).unwrap();
+            assert!(empty.is_empty());
+            let first = txn.open_large_object_descriptor(oid, mode).unwrap();
+            txn.large_object_descriptor_mut(first).unwrap().position = 19;
+            let saved = txn.statement_large_object_descriptors(&arena).unwrap();
+            for _ in 0..3 {
+                txn.large_object_descriptor_mut(first).unwrap().position += 11;
+                txn.close_large_object_descriptor(first).unwrap();
+                let reused = txn
+                    .open_large_object_descriptor(
+                        crate::storage::LargeObjectOid::parse(43).unwrap(),
+                        mode,
+                    )
+                    .unwrap();
+                assert_eq!(reused, first);
+                txn.open_large_object_descriptor(oid, mode).unwrap();
+                txn.restore_statement_large_object_descriptors(saved);
+                assert_eq!(txn.large_object_descriptor(first).unwrap().position, 19);
+                assert_eq!(txn.large_object_descriptor(first).unwrap().oid, oid);
+                assert!(txn.large_object_descriptor(first + 1).is_err());
+            }
+            txn.restore_statement_large_object_descriptors(empty);
+            assert!(txn.large_object_descriptor(first).is_err());
+        });
+    }
+
+    #[test]
     fn configured_transaction_budgets_saturate_and_valid_reservations_are_exact() {
-        for field in 0..9 {
+        for field in 0..8 {
             let mut config = crate::config::Config::default_dev();
             match field {
                 0 => config.txn_rows = usize::MAX,
@@ -2798,10 +3166,6 @@ mod tests {
                 5 => config.max_deferred_constraints_per_transaction = usize::MAX,
                 6 => config.deferred_trigger_bytes = usize::MAX,
                 7 => config.max_large_object_descriptors = usize::MAX,
-                8 => {
-                    config.max_tables = usize::MAX / 1024;
-                    config.max_ddl_per_transaction = 1024;
-                }
                 _ => unreachable!(),
             }
             assert_eq!(

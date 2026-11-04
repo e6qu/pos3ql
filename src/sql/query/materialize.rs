@@ -36,6 +36,22 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        ScopeSchema(self.scope).column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.scope.n == 0
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
             (0..t)
@@ -117,6 +133,15 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.scope.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.scope.qualified_star_columns(table).ok()?;
+        Some(
+            self.scope
+                .func_scalar_type(table)
+                .unwrap_or(ColType::Record),
+        )
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -358,6 +383,44 @@ fn materialized_value_at<'a>(
 /// and bare ungrouped references remain the same error.
 pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        crate::sql::exec::ColTypeResolver::column_meta(&super::ScopeCols(self.0), qualifier, name)
+            .map_or(-1, |column| column.type_mod)
+    }
+
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        let entry = self.0.qualified_star_entry(table, index).ok()?;
+        match entry {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs.get(table)?.columns().get(column).copied()
+            }
+            super::scope::ResolvedColumn::Merged(_) => Some(crate::storage::ColumnMeta {
+                name: crate::storage::SqlName::parse(self.0.output_name(entry)).ok()?,
+                ctype: self.0.output_type(entry),
+                collation: self.0.output_collation(entry),
+                ..crate::storage::ColumnMeta::EMPTY
+            }),
+        }
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        match self.0.find_column(qualifier, name) {
+            Ok(column) => Ok(self.0.output_type(column)),
+            Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+                self.whole_row_type(name).ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.n == 0
+    }
+
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -409,6 +472,11 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.qualified_star_columns(table).ok()?;
+        Some(self.0.func_scalar_type(table).unwrap_or(ColType::Record))
     }
 }
 

@@ -77,6 +77,14 @@ pub(crate) struct ArenaHandle<T> {
     invariant: PhantomData<fn(T) -> T>,
 }
 
+impl<T> PartialEq for ArenaHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.offset == other.offset
+    }
+}
+
+impl<T> Eq for ArenaHandle<T> {}
+
 impl<T> Copy for ArenaHandle<T> {}
 
 impl<T> Clone for ArenaHandle<T> {
@@ -194,6 +202,33 @@ impl Arena {
         self.region_active.set(true);
         self.set_frontier(start);
         Ok(each(&region.arena))
+    }
+
+    /// Reclaims a scoped workspace while retaining only its encoded output.
+    /// The output is moved into this arena, including when this is a borrowed
+    /// row arena; temporary child-persistent values do not pin its workspace.
+    pub(crate) fn with_remaining_bytes<E>(
+        &self,
+        each: impl for<'region> FnOnce(&'region Arena) -> Result<&'region [u8], E>,
+    ) -> Result<Result<&[u8], E>, ArenaFull> {
+        let output = self.with_remaining_region(|region| {
+            each(region).map(|bytes| (bytes.as_ptr(), bytes.len()))
+        })?;
+        let (source, len) = match output {
+            Ok(output) => output,
+            Err(error) => return Ok(Err(error)),
+        };
+        let layout = Layout::array::<u8>(len).map_err(|_| self.full(len))?;
+        let destination = self.alloc_raw(layout)?;
+        // SAFETY: ending the region releases its allocation frontier, not the
+        // backing allocation or its initialized bytes. Reserve the output
+        // without initializing over its source; memmove permits overlap as
+        // these bytes compact into the parent's newly available front. No
+        // reference into the old child escapes this boundary.
+        unsafe {
+            core::ptr::copy(source, destination, len);
+            Ok(Ok(core::slice::from_raw_parts(destination, len)))
+        }
     }
 
     /// State that must survive scoped row regions belongs to the owning
@@ -879,6 +914,107 @@ pub fn stable_sort_via<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_encoded_outputs_compact_overlapping_bytes_and_preserve_durable_effects() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "encoded result", 1024).unwrap();
+        let prefix = arena.alloc_slice_copy(&[0xa5u8; 3]).unwrap();
+        let source = Cell::new(0usize);
+        let durable = Cell::new(None);
+        crate::mem::guard::forbid_alloc(|| {
+            let output = arena
+                .with_remaining_bytes::<()>(|body| {
+                    let bytes = body.alloc_slice_with(128, |index| index as u8).unwrap();
+                    durable.set(Some(arena.retain(71u64).unwrap()));
+                    source.set(bytes[5..69].as_ptr() as usize);
+                    Ok(&bytes[5..69])
+                })
+                .unwrap()
+                .unwrap();
+            let destination = output.as_ptr() as usize;
+            assert!(destination < source.get() && source.get() < destination + output.len());
+            let expected: [u8; 64] = core::array::from_fn(|index| (index + 5) as u8);
+            assert_eq!(output, &expected);
+            assert_eq!(prefix, &[0xa5; 3]);
+            assert_eq!(arena.retained(durable.get().unwrap()), Some(71));
+            assert_eq!(arena.used(), 3 + 64 + 8);
+        });
+    }
+
+    #[test]
+    fn scoped_encoded_outputs_reclaim_nested_borrowed_plans_without_promoting_rows() {
+        let mut budget = Budget::new(2048);
+        let arena = Arena::new(&mut budget, "nested result", 2048).unwrap();
+        let effect = arena.retain(83u64).unwrap();
+        let before = arena.used();
+        crate::mem::guard::forbid_alloc(|| {
+            for _ in 0..4 {
+                arena
+                    .with_remaining_region(|row| {
+                        let prefix = row.alloc_slice_copy(&[17u8; 3]).unwrap();
+                        let output = row
+                            .with_remaining_bytes::<()>(|body| {
+                                body.alloc_persistent_slice_with(128, |_| 0xadu8).unwrap();
+                                let nested = body
+                                    .with_remaining_bytes::<()>(|inner| {
+                                        inner.alloc_persistent_slice_with(96, |_| 0xbcu8).unwrap();
+                                        assert_eq!(arena.retained(effect), Some(83));
+                                        Ok(inner.alloc_slice_copy(&[31u8; 48]).unwrap())
+                                    })
+                                    .unwrap()
+                                    .unwrap();
+                                Ok(nested)
+                            })
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(output, &[31; 48]);
+                        assert_eq!(prefix, &[17; 3]);
+                        assert_eq!(row.used(), 3 + 48);
+                    })
+                    .unwrap();
+                assert_eq!(arena.used(), before);
+            }
+            assert_eq!(arena.retained(effect), Some(83));
+        });
+    }
+
+    #[test]
+    fn scoped_encoded_outputs_restore_owners_after_errors_unwind_and_capacity_failure() {
+        static TOO_LARGE: [u8; 2048] = [0x7e; 2048];
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "failed result", 1024).unwrap();
+        let prefix = arena.alloc(19u64).unwrap();
+        let before = arena.used();
+        let effect = Cell::new(None);
+        let failed = arena
+            .with_remaining_bytes(|body| {
+                body.alloc_persistent_slice_with(128, |_| 0xa5u8).unwrap();
+                effect.set(Some(arena.retain(97u64).unwrap()));
+                Err("body failed")
+            })
+            .unwrap();
+        assert_eq!(failed, Err("body failed"));
+        assert_eq!(arena.used(), before + 8);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<Result<&[u8], ()>, _> = arena.with_remaining_bytes(|body| {
+                body.alloc_persistent_slice_with(128, |_| 0xbcu8).unwrap();
+                panic!("stop encoded result");
+            });
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(arena.used(), before + 8);
+        let failed = arena.with_remaining_bytes::<()>(|_| Ok(&TOO_LARGE));
+        assert_eq!(failed.unwrap_err().what, "failed result");
+        assert_eq!(arena.used(), before + 8);
+        let output = arena
+            .with_remaining_bytes::<()>(|body| Ok(body.alloc_slice_copy(&[23u8; 8]).unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, &[23; 8]);
+        assert_eq!(*prefix, 19);
+        assert_eq!(arena.retained(effect.get().unwrap()), Some(97));
+    }
+
     #[test]
     fn cursor_owned_query_regions_reuse_storage_without_aliasing_or_heap_allocation() {
         let mut budget = Budget::new(256);

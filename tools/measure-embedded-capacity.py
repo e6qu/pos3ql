@@ -89,7 +89,7 @@ def main():
             "rss_metrics": rss_metric_contract(platform.system()),
             "hash_chunk_bytes": HASH_CHUNK_BYTES,
             "table_counts": [1, 8, 32, 128],
-            "workloads": ["empty", "hot", "even", "moving", "wide", "replacement"],
+            "workloads": ["empty", "hot", "even", "moving", "wide", "replacement", "statistics", "statistics-wide"],
             "schema_columns": {"narrow": 2, "wide": 64},
             "row_overlay_slots": 8192,
             "row_work_bytes": 8 * 1024**2,
@@ -97,6 +97,9 @@ def main():
             "definition_image_slots": 256,
             "table_metadata_bytes": 64 * 1024**2,
             "table_metadata_leases": 8192,
+            "statistics_bytes": 1024**2,
+            "statistics_leases": 1024,
+            "index_statistics_slots": 4096,
             "active_rows": 512,
             "local_only": True,
         }
@@ -125,6 +128,9 @@ def main():
                                  "--data-dir", data, "--budget-limit-bytes", str(args.budget_limit_bytes)]
                     arguments.extend(["--table-metadata-bytes", str(environment["table_metadata_bytes"]),
                                       "--table-metadata-leases", str(environment["table_metadata_leases"])])
+                    arguments.extend(["--statistics-bytes", str(environment["statistics_bytes"]),
+                                      "--statistics-leases", str(environment["statistics_leases"]),
+                                      "--index-statistics-slots", str(environment["index_statistics_slots"])])
                     try:
                         with (output / f"{label}.stdout").open("w") as stdout, (output / f"{label}.budget.log").open("w") as stderr:
                             command(arguments, stdout=stdout, stderr=stderr)
@@ -152,7 +158,8 @@ def main():
                     draws.append({"mode": mode, "max_tables": tables, "workload": workload, "components": components})
         fixed_components = ["engine:row_overlay_slots", "engine:row work pool", "engine:row work free ranges",
                             "engine:table definition image owner", "engine:table definition image occupancy", "engine:table definition images",
-                            "engine:table metadata pool", "engine:table metadata free ranges"]
+                            "engine:table metadata pool", "engine:table metadata free ranges",
+                            "engine:statistics pool", "engine:statistics free ranges", "engine:index_cumulative_statistics"]
         for component in fixed_components:
             if any(component not in draw["components"] for draw in draws):
                 raise RuntimeError(f"missing fixed-pool evidence: {component}")
@@ -172,10 +179,13 @@ def main():
                   "allocation during SQL execution. Moving demand uses TRUNCATE before refilling.", "",
                   "Wide samples create 64-column tables; ordinary populated samples use two columns.",
                   "Replacement samples add columns, roll back a schema savepoint and replace a unique index,",
-                  "then verify the original row counts and sums. Retained-reader pressure is covered by",
+                  "then verify the original row counts and sums. Statistics samples analyze every table;",
+                  "wide statistics samples also change a column type, analyze it and roll back the savepoint.",
+                  "Retained-reader pressure is covered by",
                   "ownership/capacity regressions; this single-session matrix does not measure it.", "",
-                  "Session reservation is a full configured connection ceiling; session draws report",
-                  "the direct embedded client's actual buffers. These are local-only debug samples,",
+                  "Populated samples reserve a full configured connection ceiling; session draws report",
+                  "the direct embedded client's actual buffers. Empty samples start no session and",
+                  "report zero session reservation and draw. These are local-only debug samples,",
                   "not a production memory minimum or an object-store throughput qualification.", "",
                   "| Mode | Tables | Workload | Engine reserved MiB | Session drawn MiB | Startup peak MiB | Final peak MiB | Final current MiB | Final getrusage diagnostic MiB |",
                   "|---|---:|---|---:|---:|---:|---:|---:|---:|"]

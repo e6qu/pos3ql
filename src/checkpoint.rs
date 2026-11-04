@@ -218,7 +218,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v34";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v38";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -363,7 +363,7 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                 types_finished = true;
                 true
             }
-            Some("dom6" | "enm3" | "cmp2") if types_finished => {
+            Some("dom7" | "enm3" | "cmp2") if types_finished => {
                 return Err("type source follows its catalog boundary");
             }
             Some("end") => {
@@ -4158,18 +4158,17 @@ impl Checkpointer {
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
         // Validated source table positions; current records retain their original slots.
         let mut slot_of: Vec<Option<usize>> = Vec::new();
-        // (source slot, creation stamp, definition, columns seen, sequence values)
-        let mut pending_def: Option<(
-            usize,
-            u64,
-            TableDefBuilder,
-            usize,
-            [i64; crate::storage::MAX_COLUMNS],
-        )> = None;
+        // (source slot, creation stamp, definition, columns seen)
+        let mut pending_def: Option<(usize, u64, TableDefBuilder, usize)> = None;
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
         let mut value_indexes: Vec<LoadedValueIndex> = Vec::new();
-        let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
+        let mut table_statistics: Vec<(
+            usize,
+            crate::storage::TableStatistics,
+            crate::mem::lease_pool::MutableSlice<crate::storage::AnalyzedColumn>,
+            usize,
+        )> = Vec::new();
         let mut relation_index_hints: Vec<(usize, bool)> = Vec::new();
         struct LoadedExtendedStatistics {
             database: crate::storage::DatabaseOid,
@@ -4355,8 +4354,17 @@ impl Checkpointer {
                     if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
                         return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
                     }
-                    let name = rest_of(line, 12 + inheritance_count)?;
+                    let inputs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("table type inputs missing"))?,
+                    )?;
+                    let type_inputs = storage
+                        .decode_stored_type_inputs(&inputs)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid table type inputs"))?;
+                    let name = rest_of(line, 13 + inheritance_count)?;
                     let def = TableDefBuilder {
+                        type_inputs,
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
                         name: sql_name(name)?,
@@ -4380,17 +4388,11 @@ impl Checkpointer {
                         },
                         ..TableDefBuilder::empty()
                     };
-                    pending_def = Some((
-                        mindex,
-                        created_at,
-                        def,
-                        0,
-                        [0i64; crate::storage::MAX_COLUMNS],
-                    ));
+                    pending_def = Some((mindex, created_at, def, 0));
                 }
                 Some("attributes2") => {
                     use crate::storage::column_attributes::{AttributeSlot, ColumnAttributes};
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("attributes outside table"));
                     };
                     let number: usize = parse_field(words.next(), "attribute number")?;
@@ -4443,7 +4445,7 @@ impl Checkpointer {
                     }
                 }
                 Some("persist") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("persist outside table"));
                     };
                     let code = words
@@ -4461,7 +4463,7 @@ impl Checkpointer {
                     def.persistence = code;
                 }
                 Some("col4") => {
-                    let Some((_, _, def, seen, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, seen)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
@@ -4504,7 +4506,6 @@ impl Checkpointer {
                             dexpr_hex,
                         )?))
                     };
-                    let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
                     let statistics_target: i16 =
                         parse_field(words.next(), "col statistics target")?;
                     if !(-1..=10_000).contains(&statistics_target) {
@@ -4611,7 +4612,6 @@ impl Checkpointer {
                         default,
                         is_identity: not_null & 64 != 0,
                         identity_always: not_null & 128 != 0,
-                        auto_increment_step,
                         statistics_target,
                         statistics_options,
                     };
@@ -4646,10 +4646,13 @@ impl Checkpointer {
                         parse_field(words.next(), "stats average row width")?;
                     let analyzed_generation: u64 =
                         parse_field(words.next(), "stats analyzed generation")?;
-                    if words.next().is_some()
+                    let column_count: usize =
+                        parse_field(words.next(), "stats analyzed column count")?;
+                    if column_count > crate::storage::MAX_RELATION_COLUMNS
+                        || words.next().is_some()
                         || table_statistics
                             .iter()
-                            .any(|(existing, _)| *existing == table_index)
+                            .any(|(existing, _, _, _)| *existing == table_index)
                     {
                         return Err(CheckpointSetupError::Corrupt(
                             "duplicate or malformed table statistics",
@@ -4662,15 +4665,18 @@ impl Checkpointer {
                             rows,
                             average_row_width,
                             analyzed_generation,
-                            columns: [crate::storage::ColumnStatistics::EMPTY;
-                                crate::storage::MAX_COLUMNS],
+                            columns: crate::mem::lease_pool::SharedSlice::EMPTY,
                         },
+                        storage
+                            .reserve_statistics_columns(column_count)
+                            .map_err(CheckpointSetupError::Replay)?,
+                        column_count,
                     ));
                 }
                 Some("cstat") => {
                     let table_index: usize = parse_field(words.next(), "cstat table index")?;
-                    let column: usize = parse_field(words.next(), "cstat column")?;
-                    if column >= crate::storage::MAX_COLUMNS {
+                    let column: u16 = parse_field(words.next(), "cstat attribute")?;
+                    if column == 0 || usize::from(column) > crate::storage::MAX_RELATION_COLUMNS {
                         return Err(CheckpointSetupError::Corrupt(
                             "statistics column out of range",
                         ));
@@ -4693,24 +4699,39 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed column statistics"));
                     }
-                    let Some((_, statistics)) = table_statistics
+                    let Some((_, _, columns, expected)) = table_statistics
                         .iter_mut()
-                        .find(|(existing, _)| *existing == table_index)
+                        .find(|(existing, _, _, _)| *existing == table_index)
                     else {
                         return Err(CheckpointSetupError::Corrupt(
                             "column statistics precede table statistics",
                         ));
                     };
-                    if statistics.columns[column].valid {
-                        return Err(CheckpointSetupError::Corrupt("duplicate column statistics"));
+                    if columns.len() == *expected
+                        || columns
+                            .last()
+                            .is_some_and(|previous| previous.attribute() >= column)
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or unordered column statistics",
+                        ));
                     }
-                    statistics.columns[column] = crate::storage::ColumnStatistics {
-                        valid: true,
-                        null_fraction_ppm,
-                        distinct_values,
-                        distinct_fraction_ppm,
-                        average_width,
-                    };
+                    let record = crate::storage::AnalyzedColumn::new(
+                        column,
+                        crate::storage::ColumnStatistics {
+                            valid: true,
+                            null_fraction_ppm,
+                            distinct_values,
+                            distinct_fraction_ppm,
+                            average_width,
+                        },
+                    )
+                    .map_err(|_| {
+                        CheckpointSetupError::Corrupt("invalid analyzed column statistics")
+                    })?;
+                    columns
+                        .push_reserved(record)
+                        .expect("manifest statistics count was reserved");
                 }
                 Some("estat") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
@@ -4956,7 +4977,7 @@ impl Checkpointer {
                     entry.base_frequency_bits = bits;
                 }
                 Some("tsch") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("tsch outside table"));
                     };
                     let hex = words
@@ -4965,13 +4986,13 @@ impl Checkpointer {
                     def.schema = sql_name(&decode_hex_name(hex)?)?;
                 }
                 Some("part") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("part outside table"));
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
                 Some("rls") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("rls outside table"));
                     };
                     def.row_level_security = crate::storage::RowLevelSecurityState {
@@ -5816,19 +5837,8 @@ impl Checkpointer {
                             ))
                         })?;
                 }
-                Some("seq") => {
-                    let Some((_, _, _, _, serials)) = pending_def.as_mut() else {
-                        return Err(CheckpointSetupError::Corrupt("seq outside table"));
-                    };
-                    let column: usize = parse_field(words.next(), "seq column")?;
-                    let last: i64 = parse_field(words.next(), "seq last")?;
-                    if column >= crate::storage::MAX_COLUMNS {
-                        return Err(CheckpointSetupError::Corrupt("seq column out of range"));
-                    }
-                    serials[column] = last;
-                }
                 Some("ukey") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("ukey outside table"));
                     };
                     if def.n_uniques >= crate::storage::MAX_UNIQUES {
@@ -5865,7 +5875,7 @@ impl Checkpointer {
                     def.n_uniques += 1;
                 }
                 Some("chk") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
                     if def.n_checks >= crate::storage::MAX_CHECKS {
@@ -5893,7 +5903,7 @@ impl Checkpointer {
                     def.n_checks += 1;
                 }
                 Some("fkey") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("fkey outside table"));
                     };
                     if def.n_fkeys >= crate::storage::MAX_FKEYS {
@@ -5945,7 +5955,7 @@ impl Checkpointer {
                     def.n_fkeys += 1;
                 }
                 Some("excl") => {
-                    let Some((_, _, def, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
                     if def.n_exclusions >= crate::storage::MAX_EXCLUSIONS {
@@ -5987,12 +5997,50 @@ impl Checkpointer {
                     def.exclusions[index] = exclusion;
                     def.n_exclusions += 1;
                 }
+                Some("inline_key_name") => {
+                    let Some((_, _, definition, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "inline key name outside table",
+                        ));
+                    };
+                    let attribute: u16 = parse_field(words.next(), "inline key column number")?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("inline key name missing"))?,
+                    )?;
+                    if definition.n_inline_key_names == crate::storage::MAX_COLUMNS
+                        || words.next().is_some()
+                        || definition
+                            .inline_key_names()
+                            .iter()
+                            .any(|key| key.attribute == attribute)
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate or malformed inline key name",
+                        ));
+                    }
+                    definition.inline_key_names[definition.n_inline_key_names] =
+                        crate::storage::InlineKeyName {
+                            attribute,
+                            name: sql_name(&name)?,
+                        };
+                    definition.n_inline_key_names += 1;
+                }
                 Some("implicit_index") => {
-                    let Some((_, _, definition, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, definition, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt(
                             "implicit index outside table",
                         ));
                     };
+                    if storage.is_large_object_page_relation(
+                        definition.schema.as_str(),
+                        definition.name.as_str(),
+                    ) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "internal storage table has no SQL index identities",
+                        ));
+                    }
                     let position: usize = parse_field(words.next(), "implicit index position")?;
                     let created_at: u64 = parse_field(words.next(), "implicit index creation")?;
                     let identity = crate::storage::RelationIdentity::parse(created_at)
@@ -6006,7 +6054,7 @@ impl Checkpointer {
                         ));
                     }
                     let target = definition
-                        .implicit_index_identities_mut()
+                        .table_index_identities_mut()
                         .nth(position)
                         .ok_or(CheckpointSetupError::Corrupt(
                             "invalid implicit index position",
@@ -6019,7 +6067,7 @@ impl Checkpointer {
                     *target = Some(identity);
                 }
                 Some("constraint_identity") => {
-                    let Some((_, _, definition, _, _)) = pending_def.as_mut() else {
+                    let Some((_, _, definition, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt(
                             "constraint identity outside table",
                         ));
@@ -6351,7 +6399,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw13") => {
+                Some("vw14") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -6681,7 +6729,19 @@ impl Checkpointer {
                         ))?)?,
                         "invalid routine creation search path",
                     )?;
-                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+                        storage,
+                        |section| match section {
+                            crate::storage::StoredInputSection::RoutineBody => Some(body.as_str()),
+                            crate::storage::StoredInputSection::ParameterDefault(index) => {
+                                parameters
+                                    .get(usize::from(index))
+                                    .filter(|_| usize::from(index) < parameter_count)
+                                    .and_then(|parameter| parameter.mode.default_sql())
+                            }
+                            _ => None,
+                        },
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed routine record"));
                     }
@@ -6902,7 +6962,22 @@ impl Checkpointer {
                             )?)?,
                             "invalid rule creation search path",
                         )?;
-                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+                        storage,
+                        |section| match section {
+                            crate::storage::StoredInputSection::RuleSource => Some(source.as_str()),
+                            crate::storage::StoredInputSection::Query
+                                if name.as_str() == "_RETURN"
+                                    && condition.is_none()
+                                    && action_count == 1 =>
+                            {
+                                let span = actions[0];
+                                let start = usize::from(span.start);
+                                source.as_str().get(start..start + usize::from(span.len))
+                            }
+                            _ => None,
+                        },
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rule fields"));
                     }
@@ -7901,7 +7976,7 @@ impl Checkpointer {
                         log_count,
                     );
                 }
-                Some("dom6") => {
+                Some("dom7") => {
                     let source_slot: usize = parse_field(words.next(), "domain source slot")?;
                     if source_slot >= storage.domain_count() {
                         return Err(CheckpointSetupError::Corrupt(
@@ -8033,6 +8108,14 @@ impl Checkpointer {
                     } else {
                         None
                     };
+                    let inputs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("domain type inputs missing"))?,
+                    )?;
+                    let default_inputs = storage
+                        .decode_stored_type_inputs(&inputs)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid domain type inputs"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("unexpected domain fields"));
                     }
@@ -8046,6 +8129,7 @@ impl Checkpointer {
                         not_null_identity,
                         default_expr: (!default_text.is_empty())
                             .then(|| crate::util::StackStr::from_str(&default_text)),
+                        default_inputs,
                         checks,
                         n_checks,
                     };
@@ -8678,6 +8762,29 @@ impl Checkpointer {
                     if created_at == 0 {
                         return Err(CheckpointSetupError::Corrupt("bad index catalog sequence"));
                     }
+                    let relation_tag: u8 = parse_field(words.next(), "idx relation source")?;
+                    let relation_slot: usize = parse_field(words.next(), "idx owner position")?;
+                    let relation_birth: u64 = parse_field(words.next(), "idx owner identity")?;
+                    let relation = match (relation_tag, relation_slot, relation_birth) {
+                        (0, 0, 0) => crate::storage::IndexRelationSource::Table,
+                        (1, slot, birth) if birth <= metadata.catalog_sequence => {
+                            crate::storage::IndexRelationSource::Toast(
+                                crate::storage::CatalogPosition::new(slot, birth).map_err(
+                                    |_| {
+                                        CheckpointSetupError::Corrupt(
+                                            "invalid TOAST index owner identity",
+                                        )
+                                    },
+                                )?,
+                            )
+                        }
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid index relation source",
+                            ));
+                        }
+                    };
+                    let immediate = parse_bool_field(words.next(), "idx immediate uniqueness")?;
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
                     let n_cols: usize = parse_field(words.next(), "idx ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
@@ -8985,12 +9092,11 @@ impl Checkpointer {
                         }
                     }
                     let parent: u16 = parse_field(words.next(), "idx parent")?;
-                    let kind = match parse_field(words.next(), "idx kind")? {
-                        0 => crate::storage::IndexKind::Ordinary,
-                        1 => crate::storage::IndexKind::Partitioned { valid: false },
-                        2 => crate::storage::IndexKind::Partitioned { valid: true },
-                        _ => return Err(CheckpointSetupError::Corrupt("bad index kind")),
-                    };
+                    let kind = crate::storage::IndexKind::from_code(parse_field(
+                        words.next(),
+                        "idx kind",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("bad index kind"))?;
                     let clustered = match parse_field(words.next(), "idx clustered")? {
                         0 => false,
                         1 => true,
@@ -8998,7 +9104,7 @@ impl Checkpointer {
                     };
                     if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
                         return Err(CheckpointSetupError::Corrupt(
-                            "partitioned index cannot be clustered",
+                            "invalid or partitioned index cannot be clustered",
                         ));
                     }
                     let replica_identity = match parse_field(words.next(), "idx replica identity")?
@@ -9011,6 +9117,11 @@ impl Checkpointer {
                             ));
                         }
                     };
+                    if replica_identity && !matches!(kind, crate::storage::IndexKind::Ordinary) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid or partitioned index cannot be replica identity",
+                        ));
+                    }
                     let pages_per_range = match words.next() {
                         None => None,
                         Some(value) => match parse_field(Some(value), "idx pages per range")? {
@@ -9265,6 +9376,7 @@ impl Checkpointer {
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
+                                relation,
                                 database: crate::storage::DatabaseOid::POSTGRES,
                                 created_at,
                                 schema: sql_name(&schema)?,
@@ -9306,9 +9418,11 @@ impl Checkpointer {
                                     kind,
                                     clustered,
                                     replica_identity,
+                                    immediate,
                                 },
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
+                                pending_parent_drop_txid: None,
                             },
                             0,
                         )
@@ -9500,7 +9614,7 @@ impl Checkpointer {
                 .replay_relation_index_hint(storage.table_position(slot), has_index, 0)
                 .map_err(|_| CheckpointSetupError::Corrupt("invalid relation index hint source"))?;
         }
-        for (manifest_index, statistics) in table_statistics {
+        for (manifest_index, mut statistics, columns, expected) in table_statistics {
             let slot = slot_of.get(manifest_index).copied().flatten().ok_or(
                 CheckpointSetupError::Corrupt("statistics reference unknown table"),
             )?;
@@ -9509,16 +9623,17 @@ impl Checkpointer {
                     "statistics row count exceeds addressable memory",
                 ));
             }
-            let n_columns = storage.table(slot).definition().n_columns;
-            if statistics.columns[n_columns..]
-                .iter()
-                .any(|column| column.valid)
-            {
+            if columns.len() != expected {
                 return Err(CheckpointSetupError::Corrupt(
-                    "statistics reference a nonexistent column",
+                    "incomplete analyzed column statistics",
                 ));
             }
-            storage.install_table_statistics(slot, statistics);
+            statistics.columns = columns.freeze();
+            storage
+                .install_table_statistics(slot, statistics)
+                .map_err(|_| {
+                    CheckpointSetupError::Corrupt("statistics reference a nonexistent attribute")
+                })?;
         }
         for statistics in extended_statistics {
             storage
@@ -10349,7 +10464,7 @@ impl Checkpointer {
             use core::fmt::Write;
             write!(
                 &mut self.manifest_output,
-                "dom6 {} {} {} {} {} {}",
+                "dom7 {} {} {} {} {} {}",
                 slot,
                 d.created_at,
                 d.base.code(),
@@ -10397,7 +10512,12 @@ impl Checkpointer {
                 write!(&mut self.manifest_output, " {}", identity.created_at())
                     .map_err(|_| manifest_full())?;
             }
-            writeln!(&mut self.manifest_output).map_err(|_| manifest_full())?;
+            writeln!(
+                &mut self.manifest_output,
+                " {}",
+                ManifestInputBytes(d.default_inputs.bytes())
+            )
+            .map_err(|_| manifest_full())?;
         }
         // Enum types: `enm <hex-schema> <hex-name> <n-members> [<hex-label>
         // <sort-bits>]...`. Written before tables so an enum-typed column
@@ -10621,13 +10741,15 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
-            write!(table_line, " {}", definition.name.as_str()).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table manifest line exceeds fixed capacity"
-                )
-            })?;
-            write_manifest(&mut self.manifest_output, table_line.as_str())?;
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!(
+                    "{} {} {}",
+                    table_line.as_str(),
+                    ManifestInputBytes(definition.type_inputs.bytes()),
+                    definition.name.as_str()
+                ),
+            )?;
             write_manifest(
                 &mut self.manifest_output,
                 format_args!("persist {}", definition.persistence.code() as char),
@@ -10742,7 +10864,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         u8::from(c.not_null_inheritable),
@@ -10750,7 +10872,6 @@ impl Checkpointer {
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
-                        c.auto_increment_step,
                         c.statistics_target,
                         c.statistics_options.encoded().0,
                         c.statistics_options.encoded().1,
@@ -10776,19 +10897,16 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "stats {slot} {} {} {}",
+                        "stats {slot} {} {} {} {}",
                         table_statistics.rows,
                         table_statistics.average_row_width,
-                        table_statistics.analyzed_generation
+                        table_statistics.analyzed_generation,
+                        table_statistics.columns.len()
                     ),
                 )?;
-                for (column, statistics) in table_statistics.columns[..definition.n_columns]
-                    .iter()
-                    .enumerate()
-                {
-                    if !statistics.valid {
-                        continue;
-                    }
+                for record in table_statistics.columns.iter() {
+                    let column = record.attribute();
+                    let statistics = record.statistics();
                     write_manifest(
                         &mut self.manifest_output,
                         format_args!(
@@ -10798,15 +10916,6 @@ impl Checkpointer {
                             statistics.distinct_fraction_ppm,
                             statistics.average_width
                         ),
-                    )?;
-                }
-            }
-            let serial_values = storage.table_serial_values(slot);
-            for (ci, c) in definition.columns().iter().enumerate() {
-                if c.auto_increment {
-                    write_manifest(
-                        &mut self.manifest_output,
-                        format_args!("seq {ci} {}", serial_values[ci]),
                     )?;
                 }
             }
@@ -10939,20 +11048,31 @@ impl Checkpointer {
                 )?;
             }
 
-            for (position, identity) in definition.implicit_index_identities().enumerate() {
-                let identity = identity.ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::DATA_EXCEPTION,
-                        "checkpoint implicit index has no creation identity"
-                    )
-                })?;
+            Storage::validate_inline_key_names(definition)?;
+            for key in definition.inline_key_names() {
                 write_manifest(
                     &mut self.manifest_output,
-                    format_args!("implicit_index {position} {}", identity.created_at()),
+                    format_args!(
+                        "inline_key_name {} {}",
+                        key.attribute,
+                        ManifestName(key.name.as_str())
+                    ),
                 )?;
             }
-
             if slot != storage.large_object_page_table() {
+                for (position, identity) in definition.table_index_identities().enumerate() {
+                    let identity = identity.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "checkpoint implicit index has no creation identity"
+                        )
+                    })?;
+                    write_manifest(
+                        &mut self.manifest_output,
+                        format_args!("implicit_index {position} {}", identity.created_at()),
+                    )?;
+                }
+
                 for (position, identity) in definition.constraint_identities().enumerate() {
                     let identity = identity.ok_or_else(|| {
                         sql_err!(
@@ -11383,7 +11503,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw13 {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw14 {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11401,6 +11521,7 @@ impl Checkpointer {
                         .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
                     ManifestViewColumns(view.columns),
+                    ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
                 ),
             )?;
@@ -12865,11 +12986,7 @@ impl Checkpointer {
                 Some(false) => 1,
                 Some(true) => 2,
             };
-            let kind = match mutable.kind {
-                crate::storage::IndexKind::Ordinary => 0,
-                crate::storage::IndexKind::Partitioned { valid: false } => 1,
-                crate::storage::IndexKind::Partitioned { valid: true } => 2,
-            };
+            let kind = mutable.kind.code();
             let pages_per_range = mutable.options.pages_per_range.unwrap_or(0);
             let autosummarize = match mutable.options.autosummarize {
                 None => 0,
@@ -12894,8 +13011,21 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
+                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
                     index.created_at,
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(_) => 1,
+                    },
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(owner) => owner.slot(),
+                    },
+                    match index.relation {
+                        crate::storage::IndexRelationSource::Table => 0,
+                        crate::storage::IndexRelationSource::Toast(owner) => owner.created_at(),
+                    },
+                    u8::from(mutable.immediate),
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -17824,15 +17954,9 @@ fn verify_extension_object_key(
 fn finish_pending(
     storage: &mut Storage,
     slot_of: &mut Vec<Option<usize>>,
-    pending: &mut Option<(
-        usize,
-        u64,
-        TableDefBuilder,
-        usize,
-        [i64; crate::storage::MAX_COLUMNS],
-    )>,
+    pending: &mut Option<(usize, u64, TableDefBuilder, usize)>,
 ) -> Result<(), CheckpointSetupError> {
-    if let Some((manifest_index, created_at, definition, seen, serials)) = pending.take() {
+    if let Some((manifest_index, created_at, definition, seen)) = pending.take() {
         if seen != definition.n_columns {
             return Err(CheckpointSetupError::Corrupt(
                 "manifest column count mismatch",
@@ -17851,6 +17975,8 @@ fn finish_pending(
                 || &definition.not_null_names[..definition.n_columns]
                     != expected.not_null_names.as_ref()
                 || definition.has_toast != expected.has_toast
+                || definition.toast_index_identity != expected.toast_index_identity
+                || definition.inline_key_names() != expected.inline_key_names()
                 || definition
                     .columns()
                     .iter()
@@ -17886,7 +18012,6 @@ fn finish_pending(
                 "duplicate table source position",
             ));
         }
-        storage.install_table_serial_values(slot, serials);
         if slot_of.len() <= manifest_index {
             slot_of.resize(manifest_index + 1, None);
         }
@@ -18081,7 +18206,18 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
     };
     let using = expression(words.next())?;
     let with_check = expression(words.next())?;
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?.materialize(
+        storage,
+        |section| match section {
+            crate::storage::StoredInputSection::PolicyUsing => {
+                using.as_ref().map(|sql| sql.as_str())
+            }
+            crate::storage::StoredInputSection::PolicyCheck => {
+                with_check.as_ref().map(|sql| sql.as_str())
+            }
+            _ => None,
+        },
+    )?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt("trailing policy fields"));
     }
@@ -18752,7 +18888,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw13") {
+    if words.next() != Some("vw14") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -18778,6 +18914,7 @@ fn load_view(
     let sql = read_hex(words.next(), "view sql missing")?;
     let schema = read_hex(words.next(), "view schema missing")?;
     let path = read_hex(words.next(), "view path missing")?;
+    let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let name = read_hex(words.next(), "view name missing")?;
     let security = match parse_field::<u8>(words.next(), "view security missing")? {
         0 => crate::storage::ViewSecurity::Definer,
@@ -18883,13 +19020,34 @@ fn load_view(
             ))
         })?;
     }
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let bytes = decode_manifest_hex_bytes(words.next().ok_or(CheckpointSetupError::Corrupt(
+        "view default type inputs missing",
+    ))?)?;
+    let default_inputs = storage
+        .restore_definition_type_inputs(
+            &bytes,
+            |section| {
+                let crate::storage::StoredInputSection::ViewDefault(attribute) = section else {
+                    return None;
+                };
+                columns.default_sql(usize::from(attribute) - 1)
+            },
+            0,
+        )
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid view default type inputs"))?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?
+        .materialize(storage, |section| {
+            (section == crate::storage::StoredInputSection::Query).then_some(sql.as_str())
+        })?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt("trailing view fields"));
+    }
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let definition = crate::storage::ViewDefinition {
         persistence: crate::storage::RelationPersistence::Permanent,
+        default_inputs,
         columns,
         query: crate::storage::StoredQueryDefinition {
             sql: buffer,
@@ -18946,9 +19104,13 @@ fn load_matview(
     let sql = read_hex(words.next(), "materialized-view sql missing")?;
     let schema = read_hex(words.next(), "materialized-view schema missing")?;
     let path = read_hex(words.next(), "materialized-view path missing")?;
+    let path_buffer = parse_creation_path(&path, "invalid materialized-view creation search path")?;
     let name = read_hex(words.next(), "materialized-view name missing")?;
     let populated: u8 = parse_field(words.next(), "materialized-view populated")?;
-    let dependencies = parse_stored_query_dependencies(&mut words)?;
+    let dependencies = parse_stored_query_dependencies(&mut words)?
+        .materialize(storage, |section| {
+            (section == crate::storage::StoredInputSection::Query).then_some(sql.as_str())
+        })?;
     if populated > 1 || words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt(
             "invalid materialized-view fields",
@@ -18957,7 +19119,6 @@ fn load_matview(
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
     let _ = write!(buffer, "{sql}");
-    let path_buffer = parse_creation_path(&path, "invalid materialized-view creation search path")?;
     let backing_table = backing.slot();
     if backing_table >= storage.table_count()
         || !storage.table_slot_visible_to(backing_table, 0)
@@ -19215,7 +19376,7 @@ impl core::fmt::Display for ManifestRoutineResult {
 
 impl core::fmt::Display for ManifestDependencies<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(output, "{}", self.0.entries().len())?;
+        write!(output, "i2 {}", self.0.entries().len())?;
         for dependency in self.0.entries() {
             write!(output, " {} ", dependency.class as u8)?;
             write!(output, "{} ", dependency.identity.storage_key())?;
@@ -19236,13 +19397,61 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             }
             write!(output, " {}", dependency.referenced_columns)?;
         }
+        write!(
+            output,
+            " {}",
+            ManifestInputBytes(
+                self.0
+                    .type_inputs()
+                    .map_or(&[][..], |inputs| inputs.bytes())
+            )
+        )?;
         Ok(())
     }
 }
 
-fn parse_stored_query_dependencies(
-    words: &mut core::str::Split<'_, char>,
-) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
+struct ManifestInputBytes<'a>(&'a [u8]);
+
+impl core::fmt::Display for ManifestInputBytes<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return output.write_str("-");
+        }
+        for byte in self.0 {
+            write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+struct ParsedManifestDependencies<'a> {
+    dependencies: crate::storage::StoredQueryDependencies,
+    inputs: &'a str,
+}
+
+impl ParsedManifestDependencies<'_> {
+    fn materialize<'source>(
+        mut self,
+        storage: &Storage,
+        source: impl FnMut(crate::storage::StoredInputSection) -> Option<&'source str>,
+    ) -> Result<crate::storage::StoredQueryDependencies, CheckpointSetupError> {
+        let bytes = decode_manifest_hex_bytes(self.inputs)?;
+        let inputs = storage
+            .restore_stored_type_inputs(&bytes, source, self.dependencies.view(), 0)
+            .map_err(|_| CheckpointSetupError::Corrupt("invalid stored SQL type inputs"))?;
+        self.dependencies.set_type_inputs(inputs);
+        Ok(self.dependencies)
+    }
+}
+
+fn parse_stored_query_dependencies<'a>(
+    words: &mut core::str::Split<'a, char>,
+) -> Result<ParsedManifestDependencies<'a>, CheckpointSetupError> {
+    if words.next() != Some("i2") {
+        return Err(CheckpointSetupError::Corrupt(
+            "unsupported stored SQL dependency image",
+        ));
+    }
     let count: usize = parse_field(words.next(), "stored-query dependency count")?;
     if count > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
         return Err(CheckpointSetupError::Corrupt(
@@ -19290,7 +19499,16 @@ fn parse_stored_query_dependencies(
             })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
-    Ok(dependencies)
+    let inputs = words.next().ok_or(CheckpointSetupError::Corrupt(
+        "stored SQL type inputs missing",
+    ))?;
+    let bytes = decode_manifest_hex_bytes(inputs)?;
+    crate::storage::StoredTypeInputs::validate_encoded(&bytes)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid stored SQL type inputs"))?;
+    Ok(ParsedManifestDependencies {
+        dependencies,
+        inputs,
+    })
 }
 
 fn sql_name(s: &str) -> Result<SqlName, CheckpointSetupError> {
@@ -19343,7 +19561,6 @@ fn empty_column() -> ColumnMeta {
         default: ColumnDefault::NONE,
         is_identity: false,
         identity_always: false,
-        auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
         statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
@@ -19705,7 +19922,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw13 0 1 0 2 {} {} {} {} 0 0 0 0:0: 0",
+                "vw14 0 1 0 2 {} {} {} {} 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),
@@ -19721,7 +19938,7 @@ mod stored_dependency_tests {
                 "{path:?}"
             );
             let matview = format!(
-                "mv6 0 1 0 2 {} {} {} {} 0 0",
+                "mv6 0 1 0 2 {} {} {} {} 0 i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),
@@ -19836,6 +20053,106 @@ mod stored_dependency_tests {
         };
         let table = storage.create_table(definition).unwrap();
         (checkpointer, storage, table, config)
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_independent_inline_and_named_key_identities() {
+        let (mut checkpoint, mut storage, inline, config) =
+            index_gc_fixture("constraint-identity-manifest", 16);
+        let mut definition = TableDefBuilder::empty();
+        definition.schema = SqlName::parse("public").unwrap();
+        definition.name = SqlName::parse("named_keys").unwrap();
+        definition.n_columns = 1;
+        definition.columns[0] = ColumnMeta {
+            name: SqlName::parse("id").unwrap(),
+            ctype: ColType::Text,
+            ..ColumnMeta::EMPTY
+        };
+        definition.n_uniques = 1;
+        definition.uniques[0].name = SqlName::parse("named_key").unwrap();
+        definition.uniques[0].columns[0] = 0;
+        definition.uniques[0].n_cols = 1;
+        let named = crate::mem::guard::forbid_alloc(|| storage.create_table(definition)).unwrap();
+        let owner = storage.table_position(named);
+        let anchor = storage.table_def(named, 0).toast_index_identity.unwrap();
+        let main_oid = crate::storage::RelationIdentity::parse(owner.created_at())
+            .unwrap()
+            .oid();
+        let toast_name = crate::stack_format!(64, "pg_toast_{main_oid}");
+        let toast_index_name = crate::stack_format!(64, "pg_toast_{main_oid}_index");
+        let mut toast = crate::storage::IndexDef {
+            relation: crate::storage::IndexRelationSource::Toast(owner),
+            created_at: anchor.created_at(),
+            schema: SqlName::parse("pg_toast").unwrap(),
+            table: SqlName::parse(toast_name.as_str()).unwrap(),
+            name: SqlName::parse(toast_index_name.as_str()).unwrap(),
+            n_cols: 2,
+            unique: true,
+            collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+            ..crate::storage::IndexDef::EMPTY
+        };
+        toast.columns[1] = 1;
+        toast.resolved_operator_classes[0] = Some(crate::storage::IndexOperatorClass::Btree(
+            crate::sql::types::BtreeOperatorClass::Oid,
+        ));
+        toast.resolved_operator_classes[1] = Some(crate::storage::IndexOperatorClass::Btree(
+            crate::sql::types::BtreeOperatorClass::Int4,
+        ));
+        let toast_slot = crate::mem::guard::forbid_alloc(|| {
+            let slot = storage.create_index(toast, 0).unwrap();
+            storage.commit_index_create(slot).unwrap();
+            slot
+        });
+        let toast_before = storage.index_visible_to(toast_slot, 0).unwrap();
+        let inline_before = TableDefBuilder::from_definition(&storage.table_def(inline, 0));
+        let named_before = TableDefBuilder::from_definition(&storage.table_def(named, 0));
+        checkpoint.prepare_manifest(&storage, 0).unwrap();
+        let manifest = String::from_utf8(checkpoint.manifest_output.readable().to_vec()).unwrap();
+        drop(storage);
+        let mut budget = Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config));
+        let mut restored = Storage::new(&config, &mut budget, 0).unwrap();
+        checkpoint
+            .load_manifest_text(&mut restored, &manifest)
+            .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (slot, before) in [(inline, &inline_before), (named, &named_before)] {
+                let after = restored.table_def(slot, 0);
+                assert_eq!(after.inline_key_names(), before.inline_key_names());
+                assert!(
+                    after
+                        .constraint_identities()
+                        .eq(before.constraint_identities())
+                );
+                assert!(
+                    after
+                        .table_index_identities()
+                        .eq(before.table_index_identities())
+                );
+                for constraint in after.constraint_identities().flatten() {
+                    assert!(
+                        after
+                            .table_index_identities()
+                            .flatten()
+                            .all(|index| constraint.oid() != index.oid())
+                    );
+                }
+            }
+            let toast_after = restored
+                .index_definition("pg_toast", toast_index_name.as_str(), 0)
+                .unwrap();
+            assert_eq!(toast_after.relation, toast_before.relation);
+            assert_eq!(toast_after.relation_oid(), toast_before.relation_oid());
+            assert_eq!(restored.indexes_for("public", "named_keys", 0).count(), 0);
+            restored
+                .validate_restored_relation_identities(restored.catalog_identity_sequence())
+                .unwrap();
+            restored
+                .validate_restored_constraint_identities(restored.catalog_identity_sequence())
+                .unwrap();
+        });
+        drop(restored);
+        drop(checkpoint);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 
     #[test]
@@ -20540,7 +20857,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v38\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -21356,7 +21673,7 @@ mod stored_dependency_tests {
             );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
-            let manifest = b"pos3ql-manifest-v34\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let manifest = b"pos3ql-manifest-v38\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
             let body: &[u8] = match phase {
                 "rows" | "index" => &root_body,
                 "manifest" => manifest,
@@ -21487,7 +21804,7 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
-        let manifest = b"pos3ql-manifest-v34\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v38\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
         for index in 0..65 {
             checkpoint
                 .client
@@ -22096,7 +22413,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -22122,7 +22439,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -22131,7 +22448,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v34\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -22332,7 +22649,11 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v31",
                 "pos3ql-manifest-v32",
                 "pos3ql-manifest-v33",
-                "pos3ql-manifest-v34 trailing",
+                "pos3ql-manifest-v34",
+                "pos3ql-manifest-v35",
+                "pos3ql-manifest-v36",
+                "pos3ql-manifest-v37",
+                "pos3ql-manifest-v38 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -22414,11 +22735,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v38\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v34\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v38\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -22530,7 +22851,9 @@ mod stored_dependency_tests {
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));
         let mut words = encoded.split(' ');
         assert_eq!(
-            parse_stored_query_dependencies(&mut words).unwrap(),
+            parse_stored_query_dependencies(&mut words)
+                .unwrap()
+                .dependencies,
             dependencies
         );
         for (class, key) in [
@@ -22556,7 +22879,9 @@ mod stored_dependency_tests {
                 .unwrap();
             let encoded = format!("{}", ManifestDependencies(dependencies.view()));
             assert_eq!(
-                parse_stored_query_dependencies(&mut encoded.split(' ')).unwrap(),
+                parse_stored_query_dependencies(&mut encoded.split(' '))
+                    .unwrap()
+                    .dependencies,
                 dependencies
             );
         }
@@ -22583,13 +22908,13 @@ mod stored_dependency_tests {
                 "v:31"
             };
             let valid = format!(
-                "1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {}",
+                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} -",
                 class as u8,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
             let input = format!(
-                "1 {} {key} 7075626c6963 6974656d73  6974656d73 {}",
+                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} -",
                 class as u8,
                 crate::storage::ColumnSet::EMPTY
             );
@@ -22823,7 +23148,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v34\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v38\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

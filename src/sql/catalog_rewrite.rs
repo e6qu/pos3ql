@@ -277,6 +277,7 @@ pub(super) fn rule_definition<'a>(
     storage: &Storage,
     transaction: u32,
     oid: i32,
+    pretty: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let Some(values) = selected_rule(storage, transaction, oid, arena)? else {
@@ -304,9 +305,10 @@ pub(super) fn rule_definition<'a>(
             ));
         }
     };
-    let name = crate::sql::eval::quote_ident_str(string(values[1])?, arena)?;
-    let schema = crate::sql::eval::quote_ident_str(schema.as_str(), arena)?;
-    let relation = crate::sql::eval::quote_ident_str(relation.as_str(), arena)?;
+    let unqualified = pretty
+        && super::relation_oid_for_name(storage, transaction, None, relation.as_str())
+            .matches_oid(relation_oid);
+    let name = string(values[1])?;
     let event = match character(values[3])? {
         b'1' => "SELECT",
         b'2' => "UPDATE",
@@ -332,12 +334,24 @@ pub(super) fn rule_definition<'a>(
         ));
     }
     let mut body = crate::sql::array::elements(raw, element);
+    let condition = body.next().expect("body condition was counted");
+    let actions = crate::sql::array::len(raw) - 1;
+    if pretty && (condition != Datum::Null || actions != 0) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pretty formatting of rewrite rule conditions or actions is not supported"
+        ));
+    }
     let mut output = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
-    let _ = write!(
-        output,
-        "CREATE RULE {name} AS ON {event} TO {schema}.{relation}"
-    );
-    match body.next().expect("body condition was counted") {
+    let _ = output.write_str("CREATE RULE ");
+    super::write_identifier(&mut output, name);
+    let _ = write!(output, " AS\n    ON {event} TO ");
+    if !unqualified {
+        super::write_identifier(&mut output, schema.as_str());
+        let _ = output.write_char('.');
+    }
+    super::write_identifier(&mut output, relation.as_str());
+    match condition {
         Datum::Null => {}
         value => {
             let _ = write!(output, " WHERE ({})", string(value)?);
@@ -346,13 +360,8 @@ pub(super) fn rule_definition<'a>(
     let _ = write!(
         output,
         " DO {}",
-        if boolean(values[5])? {
-            "INSTEAD "
-        } else {
-            "ALSO "
-        }
+        if boolean(values[5])? { "INSTEAD " } else { "" }
     );
-    let actions = crate::sql::array::len(raw) - 1;
     if actions == 0 {
         let _ = output.write_str("NOTHING;");
     } else if actions == 1 {

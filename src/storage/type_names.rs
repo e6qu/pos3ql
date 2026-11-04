@@ -203,7 +203,7 @@ impl Storage {
                     |owner| view.schema_for(owner) == schema && view.name_for(owner) == name;
                 for owner in [
                     view.ddl_state.pending_txid(),
-                    view.pending_definition.map(|pending| pending.txid),
+                    view.pending_definition.as_ref().map(|pending| pending.txid),
                 ]
                 .into_iter()
                 .flatten()
@@ -370,6 +370,7 @@ mod tests {
                         not_null_name: None,
                         not_null_identity: None,
                         default_expr: None,
+                        default_inputs: crate::storage::StoredTypeInputs::EMPTY,
                         checks: [CheckConstraint::EMPTY; MAX_DOMAIN_CHECKS],
                         n_checks: 0,
                     },

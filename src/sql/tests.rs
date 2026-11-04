@@ -7,24 +7,42 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod builtin_aggregate_resolution;
+mod builtin_argument_binding;
+mod canonical_sequences;
 mod catalog_identity_lookup;
 mod client_catalog;
+mod constraint_index_identity;
 mod cursor_execution;
 mod foreign_parent_admission;
+mod geometric_casts;
+mod geometry_assignments;
+mod index_parent_ownership;
 mod key_preparation;
-mod object_reads;
+mod nested_planner_inputs;
+pub(super) mod object_reads;
+mod oid_alias_comparisons;
+mod owner_role_inheritance;
 mod prepared_object_capacity;
+mod procedural_expression_calls;
 mod query_execution;
 mod routine_calls;
+mod routine_selection;
 mod row_history;
 mod row_layout;
+mod runtime_input_validity;
+mod runtime_plan_invalidation;
 mod sequence_inheritance;
 mod shared_row_capacity;
 mod shared_row_work;
+mod shared_statistics;
 mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_input_binding;
+mod type_input_positions;
+mod virtual_search_path;
 
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
@@ -283,9 +301,10 @@ fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_wr
             true,
         );
         let sql = "ALTER DOMAIN locked_domain ADD CONSTRAINT locked_large CHECK (VALUE > 10)";
-        let blocked = editor.execute(&mut engine, sql, true);
+        let status = editor.execute_status(&mut engine, sql, true);
+        assert!(matches!(status, ExecutionStatus::Blocked { .. }));
         assert!(
-            blocked.is_empty(),
+            editor.send.is_empty(),
             "a waiting domain edit must not emit a response"
         );
         assert!(editor.transaction.ddl().is_empty());
@@ -299,7 +318,7 @@ fn catalog_publication_domain_validation_allows_readers_and_rechecks_finished_wr
                 &mut editor.transaction,
                 &mut editor.pool,
                 &mut editor.cursors,
-                &mut editor.guc,
+                &editor.guc,
                 &mut Responder::new(&mut editor.send),
                 editor.connection_id,
                 false,
@@ -388,7 +407,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut Responder::new(&mut session.send),
                         session.connection_id,
                         false,
@@ -411,7 +430,7 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut Responder::new(&mut session.send),
                         session.connection_id,
                         false,
@@ -499,7 +518,12 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                 engine.commit_txn_with_triggers(
                     &mut editor.transaction,
                     &editor.guc,
-                    Some(&mut editor.cursors),
+                    crate::sql::txn::CommitTarget::Ordinary,
+                    Some(CursorCommitContext {
+                        cursors: &mut editor.cursors,
+                        plans: &mut editor.pool,
+                        arena: &editor.arena,
+                    }),
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -1029,7 +1053,14 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
         let mut mapping = [None; crate::storage::MAX_COLUMNS];
         mapping[0] = Some(definition.columns[0].name);
         transaction
-            .write_table_definition(&engine.storage, target, definition, &mapping, false)
+            .write_table_definition(
+                &engine.storage,
+                target,
+                definition,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )
             .unwrap();
         let result = if binary {
             copy_binary_row(
@@ -3708,7 +3739,7 @@ fn relation_identity_exhaustion_keeps_existing_data_and_cold_recovery_usable() {
         session.success(&mut engine, "CREATE DOMAIN identity_limit_domain AS integer; CREATE TYPE identity_limit_enum AS ENUM ('ready'); CREATE TYPE identity_limit_composite AS (value integer)", false);
         engine
             .storage
-            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 3);
+            .replace_catalog_sequence_for_test(crate::storage::MAX_RELATION_GENERATION - 4);
         session.success(&mut engine, "CREATE TABLE identity_limit_orders(id integer PRIMARY KEY); INSERT INTO identity_limit_orders VALUES (7)", false);
         for sql in [
             "CREATE TABLE identity_limit_rejected(id integer)",
@@ -5347,12 +5378,12 @@ fn shared_row_publication_rollback_keeps_sst_deletions_through_cold_recovery() {
 fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
     let (mut engine, mut budget) = test_engine();
     let mut txn = TxnState::new(&mut budget, 16).unwrap();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let setup = run_session_transaction(
         &mut engine,
         &mut budget,
         &mut txn,
-        &mut guc,
+        &guc,
         "BEGIN; CREATE TABLE exhausted_command (id integer); INSERT INTO exhausted_command VALUES (1)",
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
@@ -5361,11 +5392,11 @@ fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
         &mut engine,
         &mut budget,
         &mut txn,
-        &mut guc,
+        &guc,
         "UPDATE exhausted_command SET id = 2",
     );
     assert!(String::from_utf8_lossy(&output).contains("54000"));
-    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "ROLLBACK");
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &guc, "ROLLBACK");
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     assert_eq!(txn.command_id(), 0);
     assert!(!txn.is_active());
@@ -5375,7 +5406,7 @@ fn visible_row_heap_ownership_command_exhaustion_allows_rollback() {
             .find_table("public", "exhausted_command")
             .is_none()
     );
-    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &mut guc, "SELECT 1");
+    let output = run_session_transaction(&mut engine, &mut budget, &mut txn, &guc, "SELECT 1");
     assert_eq!(data_rows(&output), ["1"]);
 }
 
@@ -7252,7 +7283,6 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
         assert!(
             crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
                 + crate::storage::MAX_INDEX_OID_GENERATION
-                + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
                 < first.oid() as u64
         );
         for trigger in ForeignKeyTrigger::ALL {
@@ -7666,6 +7696,7 @@ fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
                 &first_oid.to_be_bytes(),
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -7688,6 +7719,7 @@ fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
                 &binary_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -8492,13 +8524,13 @@ fn sql_xml_validation_and_xmloption_reject_invalid_states() {
         String::from_utf8_lossy(&validation),
     );
 
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let document_mode = run_with_guc(
         &mut engine,
         &mut budget,
         "SET xmloption = document; SHOW xmloption; SELECT '<a/>'::xml; SELECT '<a/><b/>'::xml",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert_eq!(data_rows(&document_mode), ["document", "<a/>"]);
     assert!(
@@ -8511,18 +8543,18 @@ fn sql_xml_validation_and_xmloption_reject_invalid_states() {
         &mut budget,
         "SET xmloption = content; SELECT '<a/><b/>'::xml",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert_eq!(data_rows(&content_mode), ["<a/><b/>"]);
 
     let arena = Arena::new(&mut budget, "xml binary input", 1 << 16).unwrap();
     let binary = engine
-        .decode_binary_parameter(crate::sql::types::oid::XML, b"<binary/>", &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::XML, b"<binary/>", &arena, 0, None)
         .unwrap();
     assert_eq!(binary, Datum::Xml("<binary/>"));
     assert!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::XML, b"<broken>", &arena, 0)
+            .decode_binary_parameter(crate::sql::types::oid::XML, b"<broken>", &arena, 0, None)
             .is_err()
     );
 }
@@ -11932,7 +11964,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
          GRANT INSERT ON prepared_identity_rows TO prepared_owner",
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let prepared = run_with_guc(
         &mut engine,
         &mut budget,
@@ -11940,7 +11972,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
          INSERT INTO prepared_identity_rows VALUES (1); \
          PREPARE TRANSACTION 'owned'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(!String::from_utf8_lossy(&prepared).contains("ERROR"));
 
@@ -11949,7 +11981,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "BEGIN; PREPARE TRANSACTION 'owned'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(
         String::from_utf8_lossy(&duplicate)
@@ -11963,7 +11995,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "RESET SESSION AUTHORIZATION; BEGIN; PREPARE TRANSACTION 'second'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(
         String::from_utf8_lossy(&full).contains("maximum number of prepared transactions reached"),
@@ -11975,14 +12007,14 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "SET SESSION AUTHORIZATION prepared_other",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     let denied = run_with_guc(
         &mut engine,
         &mut budget,
         "COMMIT PREPARED 'owned'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(
         String::from_utf8_lossy(&denied)
@@ -11995,14 +12027,14 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "RESET SESSION AUTHORIZATION",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     let committed = run_with_guc(
         &mut engine,
         &mut budget,
         "COMMIT PREPARED 'owned'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(!String::from_utf8_lossy(&committed).contains("ERROR"));
 
@@ -12012,7 +12044,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         "BEGIN; SELECT pg_current_xact_id() IS NOT NULL; \
          PREPARE TRANSACTION 'database-bound'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(!String::from_utf8_lossy(&prepared).contains("ERROR"));
     let template = engine
@@ -12026,7 +12058,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "ROLLBACK PREPARED 'database-bound'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(
         String::from_utf8_lossy(&wrong_database)
@@ -12042,7 +12074,7 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
         &mut budget,
         "ROLLBACK PREPARED 'database-bound'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(!String::from_utf8_lossy(&rolled_back).contains("ERROR"));
 }
@@ -12721,8 +12753,10 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
             (commands[1], locking, "C42809\0"),
             (table_command, locking, "ALTER TABLE"),
         ] {
-            let initial = writer.execute(&mut engine, command, true);
+            let status = writer.execute_status(&mut engine, command, true);
+            let initial = writer.send.readable();
             if waits {
+                assert!(matches!(status, ExecutionStatus::Blocked { .. }));
                 assert!(initial.is_empty(), "{mode:?}: {command}: {initial:?}");
                 // Deliver the scheduler's timeout notification to the parked command.
                 let completed = crate::mem::guard::forbid_alloc(|| {
@@ -12733,7 +12767,7 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
                         &mut writer.transaction,
                         &mut writer.pool,
                         &mut writer.cursors,
-                        &mut writer.guc,
+                        &writer.guc,
                         &mut Responder::new(&mut writer.send),
                         writer.connection_id,
                         true,
@@ -12747,8 +12781,9 @@ fn relation_mode_changes_check_ownership_locks_and_relation_kinds() {
                     writer.send.readable()
                 );
             } else {
+                assert_eq!(status, ExecutionStatus::Complete);
                 assert!(
-                    String::from_utf8_lossy(&initial).contains(completion),
+                    String::from_utf8_lossy(initial).contains(completion),
                     "{mode:?}: {command}: {initial:?}"
                 );
             }
@@ -13567,6 +13602,11 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "cannot reference OLD",
         ),
         (
+            "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
+             DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
+            "cannot reference NEW",
+        ),
+        (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
              WHERE NEW.id = 1 DO NOTIFY conditional_rule",
             "can only have SELECT, INSERT, UPDATE, or DELETE actions",
@@ -13575,9 +13615,12 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         let rejected = run_with(&mut engine, &mut budget, sql);
         assert!(
             String::from_utf8_lossy(&rejected).contains(expected),
-            "{}",
+            "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
+        if expected.starts_with("cannot reference") {
+            assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
+        }
     }
 }
 
@@ -14267,6 +14310,43 @@ fn event_trigger_original_routine_uses_the_typed_signature() {
 }
 
 #[test]
+fn event_trigger_drop_roots_retain_the_selected_search_path_objects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("event-drop-search-path-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../tests/external/differential/220_event_drop_search_path.sql"),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "function|drop_path_a|shared_function|t",
+                "function|drop_path_b|shared_function|f",
+                "index|drop_path_a|shared_index|t",
+                "operator|drop_path_a|##|t",
+                "table|drop_path_a|shared_base|t",
+                "type|drop_path_a|shared_domain|t",
+                "view|drop_path_b|shared_view|f",
+                "0",
+                "5|106",
+                "1",
+                "1",
+            ],
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
 fn event_trigger_alter_comment_owner_and_privilege_graphs_are_exact() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -14659,7 +14739,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
         [
             "access method",
             "cast",
-            "foreign data wrapper",
+            "foreign-data wrapper",
             "language",
             "operator",
             "operator class",
@@ -15091,7 +15171,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
 
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let arena = Arena::new(&mut budget, "login event test", 1 << 18).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut sqlprep = test_pool(&mut budget);
@@ -15103,7 +15183,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
             &mut txn,
             &mut sqlprep,
             &mut cursors,
-            &mut guc,
+            &guc,
             &arena,
             &mut Responder::new(&mut buffer),
         )
@@ -15137,7 +15217,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
             &mut txn,
             &mut sqlprep,
             &mut cursors,
-            &mut guc,
+            &guc,
             &arena,
             &mut Responder::new(&mut buffer),
         )
@@ -15554,6 +15634,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
                     &arena,
                     &transaction,
                     2,
+                    &[],
                     &[],
                 )
                 .unwrap();
@@ -18022,8 +18103,8 @@ fn finish_test_request(
 }
 
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
-    let mut guc = GucState::new();
-    run_with_guc(engine, budget, sql_text, 32 << 20, &mut guc)
+    let guc = GucState::new();
+    run_with_guc(engine, budget, sql_text, 32 << 20, &guc)
 }
 
 fn run_with_ddl_capacity(
@@ -18039,7 +18120,7 @@ fn run_with_ddl_capacity(
     let arena = Arena::new(budget, "ddl capacity sql", arena_bytes).unwrap();
     let mut txn = TxnState::new_with_ddl_capacity(budget, 1024, ddl_capacity).unwrap();
     let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     let status = engine
         .execute_simple(
@@ -18048,7 +18129,7 @@ fn run_with_ddl_capacity(
             &mut txn,
             &mut pool,
             &mut test_cursors(budget),
-            &mut guc,
+            &guc,
             &mut responder,
             1,
         )
@@ -18135,8 +18216,8 @@ fn run_with_arena_bytes(
     sql_text: &str,
     arena_bytes: usize,
 ) -> Vec<u8> {
-    let mut guc = GucState::new();
-    run_with_guc(engine, budget, sql_text, arena_bytes, &mut guc)
+    let guc = GucState::new();
+    run_with_guc(engine, budget, sql_text, arena_bytes, &guc)
 }
 
 fn run_with_fixed_memory(
@@ -18165,7 +18246,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
     let mut txn = TxnState::new_with_ddl_capacity(&mut request_budget, 1024, ddl_capacity).unwrap();
     let mut pool = test_pool(&mut request_budget);
     let mut cursors = test_cursors(&mut request_budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut resume_statement = 0;
     let mut completed = false;
     for _ in 0..64 {
@@ -18177,7 +18258,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut Responder::new(&mut buffer),
                 1,
                 false,
@@ -18246,9 +18327,16 @@ impl ConfiguredTransactionSession {
         self
     }
 
-    fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+    fn execute_status(
+        &mut self,
+        engine: &mut Engine,
+        sql: &str,
+        fixed_memory: bool,
+    ) -> ExecutionStatus {
         self.send.clear();
-        self.arena.reset();
+        if self.transaction.suspended_statement_context().is_none() {
+            self.arena.reset();
+        }
         let mut responder = Responder::new(&mut self.send);
         let mut execute = || {
             engine.execute_simple(
@@ -18257,7 +18345,7 @@ impl ConfiguredTransactionSession {
                 &mut self.transaction,
                 &mut self.pool,
                 &mut self.cursors,
-                &mut self.guc,
+                &self.guc,
                 &mut responder,
                 self.connection_id,
             )
@@ -18267,7 +18355,12 @@ impl ConfiguredTransactionSession {
         } else {
             execute()
         }
-        .unwrap();
+        .unwrap()
+    }
+
+    fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        let status = self.execute_status(engine, sql, fixed_memory);
+        assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
     }
 
@@ -19202,7 +19295,7 @@ fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() 
                     &mut session.transaction,
                     &mut session.pool,
                     &mut session.cursors,
-                    &mut session.guc,
+                    &session.guc,
                     &mut responder,
                     session.connection_id,
                 )
@@ -19402,7 +19495,7 @@ fn run_with_guc(
     budget: &mut Budget,
     sql_text: &str,
     arena_bytes: usize,
-    guc: &mut GucState,
+    guc: &GucState,
 ) -> Vec<u8> {
     // These fixtures drop every request-local pool before returning. Charge
     // their peak against remaining live memory, not cumulative freed requests.
@@ -19433,7 +19526,7 @@ fn run_with_session(
     engine: &mut Engine,
     budget: &mut Budget,
     sql_text: &str,
-    guc: &mut GucState,
+    guc: &GucState,
     txn: &mut TxnState,
     pool: &mut SqlPreparedPool,
     cursors: &mut crate::sql::cursor::CursorPool,
@@ -19459,7 +19552,7 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
         let mut responder =
             Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
         engine
-            .describe(sql_text, &arena, &transaction, None, &mut responder)
+            .describe(sql_text, &arena, &transaction, None, &mut responder, &[])
             .unwrap()
     };
     assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
@@ -19485,7 +19578,7 @@ fn stage_without_publication(
             &mut session.transaction,
             &mut session.pool,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut Responder::new(&mut session.send),
             session.connection_id,
             false,
@@ -19515,7 +19608,7 @@ fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -19524,7 +19617,7 @@ fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str
             &mut txn,
             &mut pool,
             &mut test_cursors(budget),
-            &mut guc,
+            &guc,
             &mut responder,
             conn_id,
         )
@@ -21146,13 +21239,13 @@ fn money_is_exact_cataloged_storable_indexable_and_aggregatable() {
         );
     }
 
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let locale = run_with_guc(
         &mut engine,
         &mut budget,
         "SHOW lc_monetary; SET lc_monetary = 'C'; SHOW lc_monetary; SELECT 1234.56::money",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert_eq!(data_rows(&locale), ["C.UTF-8", "C", "$1,234.56"]);
     let unsupported_locale = run_with_guc(
@@ -21160,7 +21253,7 @@ fn money_is_exact_cataloged_storable_indexable_and_aggregatable() {
         &mut budget,
         "SET lc_monetary = 'de_DE.UTF-8'",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert!(String::from_utf8_lossy(&unsupported_locale).contains("22023"));
 }
@@ -21510,6 +21603,59 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     assert_eq!(
         data_rows(&output),
         [format!("changes|pgoutput|logical|f|{lsn}|{lsn}|t|t|f")]
+    );
+}
+
+#[test]
+fn selected_acl_operator_functions_resolve_both_operand_identities() {
+    let config = test_config("selected-acl-operator-functions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT ARRAY[[1,NULL],[3,4]], \
+         CASE WHEN false THEN ARRAY[[[[[[[1]]]]]]] ELSE ARRAY[1] END",
+            true
+        )),
+        ["{{1,NULL},{3,4}}|{1}"]
+    );
+    let output = session.success(
+        &mut engine,
+        "CREATE ROLE acl_callable_reader; CREATE ROLE acl_callable_grantor; \
+         SELECT aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=r/acl_callable_grantor'), \
+                pg_catalog.aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                                       'acl_callable_reader=r/acl_callable_grantor'::aclitem), \
+                aclcontains(ARRAY['acl_callable_reader=r/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=w/acl_callable_grantor'), \
+                aclcontains(ARRAY['acl_callable_reader=rw/acl_callable_grantor'::aclitem], \
+                            'acl_callable_reader=r*/acl_callable_grantor'), \
+                aclcontains(NULL::aclitem[], 'acl_callable_reader=r/acl_callable_grantor')",
+        true,
+    );
+    assert_eq!(row_description_type_oids(&output), [16; 5]);
+    assert_eq!(data_rows(&output), ["t|t|f|f|NULL"]);
+    for sql in [
+        "SELECT aclcontains(ARRAY[]::aclitem[], 'acl_callable_reader=r/acl_callable_grantor')",
+        "SELECT ARRAY[]::aclitem[] @> 'acl_callable_reader=r/acl_callable_grantor'::aclitem",
+        "SELECT * FROM aclexplode(ARRAY[]::aclitem[])",
+        "SELECT aclcontains(ARRAY[['acl_callable_reader=r/acl_callable_grantor'::aclitem]], \
+                            'acl_callable_reader=r/acl_callable_grantor')",
+    ] {
+        let output = session.execute(&mut engine, sql, true);
+        assert_eq!(error_sqlstates(&output), ["22023"], "{sql}");
+        assert!(String::from_utf8_lossy(&output).contains("ACL arrays must be one-dimensional"));
+    }
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT aclcontains('[0:0]={acl_callable_reader=rw/acl_callable_grantor}'::aclitem[], \
+                            'acl_callable_reader=r/acl_callable_grantor')",
+            true
+        )),
+        ["t"]
     );
 }
 
@@ -23423,7 +23569,7 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
     let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -23433,7 +23579,7 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -23754,7 +23900,7 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
         &mut budget,
         "EXPLAIN (SETTINGS) SELECT 1",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     let configured_explain = String::from_utf8_lossy(&configured_explain_bytes);
     assert!(
@@ -23796,7 +23942,7 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
         &mut recovered_budget,
         "EXPLAIN (SETTINGS) SELECT 1",
         1 << 18,
-        &mut recovered_guc,
+        &recovered_guc,
     );
     let recovered_explain = String::from_utf8_lossy(&recovered_explain_bytes);
     assert!(
@@ -24710,12 +24856,12 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         "SELECT obj_description({table_oid}::oid, 'pg_class'), obj_description({table_oid}::oid), col_description({table_oid}::oid, 1)"
     );
     let mut transaction = TxnState::new(&mut budget, 64).unwrap();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let initial = run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         &format!("BEGIN ISOLATION LEVEL REPEATABLE READ; {query}"),
     );
     assert_eq!(data_rows(&initial), ["old table|old table|old column"]);
@@ -24729,7 +24875,7 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         &format!(
             "SAVEPOINT before_comment;
              COMMENT ON TABLE described_orders IS 'new table'; {query};
@@ -24749,7 +24895,7 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         "{}",
         String::from_utf8_lossy(&private)
     );
-    let scans = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+    let scans = run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc,
         &format!("SAVEPOINT before_scan;
             COMMENT ON TABLE described_orders IS 'own table';
             SELECT description FROM (SELECT * FROM pg_description OFFSET 0) d WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 0 ORDER BY description;
@@ -24783,7 +24929,7 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         "COMMENT ON COLUMN described_orders.id IS NULL",
     );
     assert!(!String::from_utf8_lossy(&removed).contains("ERROR"));
-    let absent_removal = run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc,
+    let absent_removal = run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc,
         &format!("SAVEPOINT before_absent_removal; COMMENT ON COLUMN described_orders.id IS NULL; {query};
             SELECT description FROM pg_description WHERE objoid = {table_oid}::oid AND classoid = 'pg_class'::regclass AND objsubid = 1;
             ROLLBACK TO before_absent_removal"));
@@ -24807,7 +24953,7 @@ fn catalog_snapshot_comment_functions_preserve_private_changes_and_deleted_objec
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         &format!("{query}; ROLLBACK"),
     );
     assert_eq!(
@@ -24993,12 +25139,12 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
         ))[0]
             .clone();
         let mut reader = TxnState::new(&mut budget, 64).unwrap();
-        let mut guc = GucState::new();
+        let guc = GucState::new();
         let selected = run_session_transaction(
             &mut engine,
             &mut budget,
             &mut reader,
-            &mut guc,
+            &guc,
             &format!(
                 "BEGIN ISOLATION LEVEL {isolation}; SELECT relacl IS NOT NULL FROM pg_class WHERE oid='permission_orders'::regclass"
             ),
@@ -25015,7 +25161,7 @@ fn catalog_snapshot_permission_rows_keep_role_identity_and_current_acl_lookups()
             "{}",
             String::from_utf8_lossy(&changed)
         );
-        let observed = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+        let observed = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
             &format!("SELECT relacl::text LIKE '%visibility_acl_renamed=r/%' FROM pg_class WHERE oid='permission_orders'::regclass;
                 SELECT pg_get_acl('pg_class'::regclass, 'permission_orders'::regclass, 0)::text LIKE '%visibility_acl_renamed=rw/%';
                 SELECT has_table_privilege('visibility_acl_renamed', 'permission_orders', 'UPDATE');
@@ -25181,8 +25327,8 @@ fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
         String::from_utf8_lossy(&setup)
     );
     let mut reader = TxnState::new(&mut budget, 64).unwrap();
-    let mut guc = GucState::new();
-    let selected = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+    let guc = GucState::new();
+    let selected = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
         "BEGIN ISOLATION LEVEL REPEATABLE READ;
          SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename='catalog_view_orders';
          SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname='catalog_view_reader';");
@@ -25214,7 +25360,7 @@ fn catalog_snapshot_system_views_keep_selected_rows_and_current_owner_names() {
         "{}",
         String::from_utf8_lossy(&vacuum)
     );
-    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
         "SELECT tablename,tableowner,hasindexes FROM pg_tables WHERE tablename IN ('catalog_view_orders','catalog_view_sales');
          SELECT rolname,rolconfig::text FROM pg_roles WHERE rolname IN ('catalog_view_reader','catalog_view_renamed');
          ROLLBACK;");
@@ -25267,13 +25413,13 @@ fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
         let setup = run_with(&mut engine, &mut budget, "CREATE TABLE orders(id integer)");
         assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
         let mut transaction = TxnState::new(&mut budget, 64).unwrap();
-        let mut guc = GucState::new();
+        let guc = GucState::new();
         let rows = "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid WHERE c.relname IN ('orders', 'sales') AND a.attnum > 0 ORDER BY a.attnum";
         let started = run_session_transaction(
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut guc,
+            &guc,
             &format!("BEGIN ISOLATION LEVEL {isolation}; {rows}"),
         );
         assert_eq!(data_rows(&started), ["orders|id"]);
@@ -25288,7 +25434,7 @@ fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
             String::from_utf8_lossy(&changed)
         );
         let selected =
-            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, rows);
+            run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, rows);
         assert_eq!(
             data_rows(&selected),
             [expected],
@@ -25299,7 +25445,7 @@ fn catalog_snapshot_rows_follow_isolation_while_object_names_remain_current() {
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut guc,
+            &guc,
             "SELECT to_regclass('orders') IS NULL, to_regclass('sales')::text; CREATE TABLE private_orders(id integer); SELECT relname FROM pg_class WHERE relname = 'private_orders'; ROLLBACK",
         );
         assert_eq!(
@@ -25324,12 +25470,12 @@ fn catalog_snapshot_exhaustion_rolls_back_before_durability_and_releases_owners(
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut transaction = TxnState::new(&mut budget, 64).unwrap();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let started = run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM pg_class",
     );
     assert!(!String::from_utf8_lossy(&started).contains("ERROR"));
@@ -25349,13 +25495,7 @@ fn catalog_snapshot_exhaustion_rolls_back_before_durability_and_releases_owners(
             .find_visible("public", "bounded_catalog_rows", 0)
             .is_none()
     );
-    run_session_transaction(
-        &mut engine,
-        &mut budget,
-        &mut transaction,
-        &mut guc,
-        "ROLLBACK",
-    );
+    run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, "ROLLBACK");
     let retried = run_with(
         &mut engine,
         &mut budget,
@@ -25433,7 +25573,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    let mut operator = GucState::new();
+    let operator = GucState::new();
     operator.set_role(
         engine.role_login("parameter_operator").unwrap().identity,
         false,
@@ -25441,14 +25581,14 @@ fn parameter_acls_are_typed_enforced_and_visible() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "SET event_triggers = off",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "ALTER SYSTEM SET event_triggers = off",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
@@ -25461,7 +25601,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut operator,
+        &operator,
         "ALTER SYSTEM SET event_triggers = on",
     );
     assert!(
@@ -25557,12 +25697,12 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
         String::from_utf8_lossy(&restored)
     );
     let mut reader = TxnState::new(&mut budget, 64).unwrap();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let selected = run_session_transaction(
         &mut engine,
         &mut budget,
         &mut reader,
-        &mut guc,
+        &guc,
         "BEGIN ISOLATION LEVEL REPEATABLE READ;
          SELECT obj_description('relation_estimates'::regclass, 'pg_class');",
     );
@@ -25579,10 +25719,15 @@ fn catalog_snapshot_relation_estimates_comments_and_hints_survive_cold_recovery(
         );
     }
     assert_eq!(
-        engine.storage.table_statistics(table, 0).columns[1].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, 0)
+            .column(2)
+            .unwrap()
+            .null_fraction_ppm,
         500_000
     );
-    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &mut guc,
+    let retained = run_session_transaction(&mut engine, &mut budget, &mut reader, &guc,
         "COMMENT ON TABLE relation_estimates IS 'own comment';
          SELECT obj_description('relation_estimates'::regclass, 'pg_class');
          SELECT description FROM pg_description WHERE objoid='relation_estimates'::regclass AND classoid='pg_class'::regclass AND objsubid=0;
@@ -25719,12 +25864,12 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     );
     assert_eq!(data_rows(&resolved), ["0", "{}"]);
     let mut old_catalog = TxnState::new(&mut restarted_budget, 64).unwrap();
-    let mut old_catalog_guc = GucState::new();
+    let old_catalog_guc = GucState::new();
     let selected = run_session_transaction(
         &mut restarted,
         &mut restarted_budget,
         &mut old_catalog,
-        &mut old_catalog_guc,
+        &old_catalog_guc,
         "BEGIN ISOLATION LEVEL REPEATABLE READ;
          SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
          SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';",
@@ -25745,7 +25890,7 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         &mut restarted,
         &mut restarted_budget,
         &mut old_catalog,
-        &mut old_catalog_guc,
+        &old_catalog_guc,
         "SELECT count(*) FROM pg_parameter_acl WHERE parname = 'application_name';
          SELECT count(*) FROM pg_authid WHERE rolname = 'prepared_parameter_operator';
          SELECT has_parameter_privilege('prepared_parameter_operator', 'application_name', 'SET');
@@ -25811,7 +25956,7 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
          GRANT SET ON PARAMETER event_triggers TO parameter_delegate WITH GRANT OPTION;",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
-    let mut delegate = GucState::new();
+    let delegate = GucState::new();
     delegate.set_role(
         engine.role_login("parameter_delegate").unwrap().identity,
         false,
@@ -25819,7 +25964,7 @@ fn parameter_acl_grant_options_obey_restrict_and_cascade() {
     let output = run_session(
         &mut engine,
         &mut budget,
-        &mut delegate,
+        &delegate,
         "GRANT SET ON PARAMETER event_triggers TO parameter_leaf",
     );
     assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
@@ -26409,7 +26554,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut budget,
             "CREATE PUBLICATION source_slot_publication",
             1 << 18,
-            &mut actor,
+            &actor,
         );
         assert!(
             !message_types(&output).contains(&b'E'),
@@ -26443,7 +26588,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut recovered_budget,
             "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
             1 << 18,
-            &mut unauthorized,
+            &unauthorized,
         );
         assert!(message_types(&output).contains(&b'E'));
         let mut authorized = GucState::new();
@@ -26453,7 +26598,7 @@ fn catalog_creation_role_slots_preserve_publication_ownership_in_recovery() {
             &mut recovered_budget,
             "ALTER PUBLICATION source_slot_publication SET (publish = 'insert')",
             1 << 18,
-            &mut authorized,
+            &authorized,
         );
         assert!(
             !message_types(&output).contains(&b'E'),
@@ -26643,7 +26788,7 @@ fn catalog_creation_prepared_owner_keeps_role_slots_after_checkpoint() {
         &mut recovered_budget,
         "COMMIT PREPARED 'retained-owner'",
         1 << 18,
-        &mut actor,
+        &actor,
     );
     assert!(
         !message_types(&output).contains(&b'E'),
@@ -26727,7 +26872,7 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
                 &mut budget,
                 &format!("{command} PREPARED 'source-owner'"),
                 1 << 18,
-                &mut actor,
+                &actor,
             );
             assert!(
                 String::from_utf8_lossy(&output)
@@ -26770,7 +26915,7 @@ fn catalog_creation_prepared_owner_survives_replacement_and_recovery() {
                 &mut recovered_budget,
                 &format!("{command} PREPARED 'source-owner'"),
                 1 << 18,
-                &mut actor,
+                &actor,
             );
             assert!(
                 String::from_utf8_lossy(&output)
@@ -26948,7 +27093,7 @@ fn reset_session_authorization_survives_a_dropped_authenticated_role() {
          DROP ROLE authenticated_super;
          RESET SESSION AUTHORIZATION;",
         1 << 18,
-        &mut guc,
+        &guc,
     );
     assert_eq!(
         command_tags(&output),
@@ -28094,6 +28239,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[..2], [enum_oid, domain_oid]);
@@ -28103,6 +28249,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &arena,
             &transaction,
             2,
+            &[],
             &[],
         )
         .unwrap();
@@ -28116,6 +28263,7 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             2,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
@@ -28126,15 +28274,30 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
             &transaction,
             1,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
     let inferred = engine
-        .infer_param_types("CALL protocol_record($1)", &arena, &transaction, 1, &[])
+        .infer_param_types(
+            "CALL protocol_record($1)",
+            &arena,
+            &transaction,
+            1,
+            &[],
+            &[],
+        )
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
     let inferred = engine
-        .infer_param_types("CALL protocol_output($1, $2)", &arena, &transaction, 2, &[])
+        .infer_param_types(
+            "CALL protocol_output($1, $2)",
+            &arena,
+            &transaction,
+            2,
+            &[],
+            &[],
+        )
         .unwrap();
     assert_eq!(
         inferred[..2],
@@ -28502,20 +28665,20 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
     let inferred = engine
-        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[])
+        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[], &[])
         .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
     assert_eq!(
         engine
-            .decode_binary_parameter(enum_oid, b"ready", &arena, 0)
+            .decode_binary_parameter(enum_oid, b"ready", &arena, 0, None)
             .unwrap()
             .to_string(),
         "ready"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(domain_oid, &7_i32.to_be_bytes(), &arena, 0)
+            .decode_binary_parameter(domain_oid, &7_i32.to_be_bytes(), &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
@@ -28527,14 +28690,14 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     ];
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_oid, &composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_oid, &composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8)"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_domain_oid, &composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8)"
@@ -28560,7 +28723,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     composite_array_binary.extend_from_slice(&(composite_binary.len() as i32).to_be_bytes());
     composite_array_binary.extend_from_slice(&composite_binary);
     let composite_array = engine
-        .decode_binary_parameter(composite_array_oid, &composite_array_binary, &arena, 0)
+        .decode_binary_parameter(
+            composite_array_oid,
+            &composite_array_binary,
+            &arena,
+            0,
+            None,
+        )
         .unwrap();
     assert_eq!(composite_array.to_string(), "{\"(4,8)\"}");
     let Datum::Array { element, raw } = composite_array else {
@@ -28592,7 +28761,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         crate::mem::FixedBuf::new(&mut budget, "binary parameter send", 1 << 16).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder =
             Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
@@ -28606,7 +28775,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                     &mut transaction,
                     &mut pool,
                     &mut cursors,
-                    &mut guc,
+                    &guc,
                     &mut responder,
                     1,
                     false,
@@ -28637,6 +28806,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &composite_domain_array_binary,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28664,14 +28834,20 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     ];
     assert_eq!(
         engine
-            .decode_binary_parameter(composite_oid, &evolved_composite_binary, &arena, 0)
+            .decode_binary_parameter(composite_oid, &evolved_composite_binary, &arena, 0, None)
             .unwrap()
             .to_string(),
         "(4,8,12)"
     );
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::UNKNOWN,
+                b"wire text",
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "wire text"
@@ -28681,53 +28857,59 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     // is observed by the executor.
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::INT4, b"7", &arena, 0)
+            .decode_text_parameter(crate::sql::types::oid::INT4, b"7", &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(enum_oid, b"ready", &arena, 0)
+            .decode_text_parameter(enum_oid, b"ready", &arena, 0, None)
             .unwrap()
             .to_string(),
         "ready"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(domain_oid, b"7", &arena, 0)
+            .decode_text_parameter(domain_oid, b"7", &arena, 0, None)
             .unwrap()
             .to_string(),
         "7"
     );
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::UNKNOWN, b"wire text", &arena, 0)
+            .decode_text_parameter(
+                crate::sql::types::oid::UNKNOWN,
+                b"wire text",
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "wire text"
     );
     let invalid_text = engine
-        .decode_text_parameter(crate::sql::types::oid::TEXT, b"\xff", &arena, 0)
+        .decode_text_parameter(crate::sql::types::oid::TEXT, b"\xff", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_text.sqlstate, sqlstate::CHARACTER_NOT_IN_REPERTOIRE);
     let invalid_text_enum = engine
-        .decode_text_parameter(enum_oid, b"missing", &arena, 0)
+        .decode_text_parameter(enum_oid, b"missing", &arena, 0, None)
         .unwrap_err();
     assert_eq!(
         invalid_text_enum.sqlstate,
         sqlstate::INVALID_TEXT_REPRESENTATION
     );
     let invalid_text_domain = engine
-        .decode_text_parameter(domain_oid, b"-1", &arena, 0)
+        .decode_text_parameter(domain_oid, b"-1", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_text_domain.sqlstate, sqlstate::CHECK_VIOLATION);
     let invalid_enum = engine
-        .decode_binary_parameter(enum_oid, b"missing", &arena, 0)
+        .decode_binary_parameter(enum_oid, b"missing", &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_enum.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
     let invalid_domain = engine
-        .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0)
+        .decode_binary_parameter(domain_oid, &(-1_i32).to_be_bytes(), &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_domain.sqlstate, sqlstate::CHECK_VIOLATION);
     for (oid, bytes) in [
@@ -28735,7 +28917,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         (crate::sql::types::oid::JSONB, b"\x01{not json}".as_slice()),
     ] {
         let error = engine
-            .decode_binary_parameter(oid, bytes, &arena, 0)
+            .decode_binary_parameter(oid, bytes, &arena, 0, None)
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INVALID_TEXT_REPRESENTATION);
     }
@@ -28752,7 +28934,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             .creation(),
     );
     let null_domain = engine
-        .coerce_parameter_null(required_domain_oid, &arena, 0)
+        .coerce_parameter_null(required_domain_oid, &arena, 0, None)
         .unwrap_err();
     assert_eq!(null_domain.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
@@ -28795,7 +28977,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         0xff, // NULL element
     ];
     let null_domain_array = engine
-        .decode_binary_parameter(required_domain_array_oid, &required_domain_array, &arena, 0)
+        .decode_binary_parameter(
+            required_domain_array_oid,
+            &required_domain_array,
+            &arena,
+            0,
+            None,
+        )
         .unwrap_err();
     assert_eq!(null_domain_array.sqlstate, sqlstate::NOT_NULL_VIOLATION);
 
@@ -28827,6 +29015,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &enum_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28850,6 +29039,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 b"{ready,blocked}",
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28884,6 +29074,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &domain_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28907,6 +29098,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 b"{3,5}",
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -28929,6 +29121,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             b"{3,-1}",
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -28951,7 +29144,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     bit_array.extend_from_slice(&(-1_i32).to_be_bytes());
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::BIT_ARRAY, &bit_array, &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::BIT_ARRAY,
+                &bit_array,
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "{10110,00111,NULL}"
@@ -28959,7 +29158,13 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     bit_array[8..12].copy_from_slice(&crate::sql::types::oid::VARBIT.to_be_bytes());
     assert_eq!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::VARBIT_ARRAY, &bit_array, &arena, 0)
+            .decode_binary_parameter(
+                crate::sql::types::oid::VARBIT_ARRAY,
+                &bit_array,
+                &arena,
+                0,
+                None
+            )
             .unwrap()
             .to_string(),
         "{10110,00111,NULL}"
@@ -28982,6 +29187,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &domain_array,
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29004,6 +29210,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &malformed_array,
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29017,6 +29224,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &[0x98], // reserved bit plus both infinity flags
             &arena,
             0,
+            None,
         )
         .unwrap();
     assert_eq!(reserved_range_flags.to_string(), "(,)");
@@ -29026,6 +29234,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             &[0x00, 0xff, 0xff, 0xff, 0xff], // finite bound cannot be NULL
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(
@@ -29060,7 +29269,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
         record.extend_from_slice(value);
     }
     let record_value = engine
-        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0, None)
         .unwrap();
     let Datum::Record(fields) = record_value else {
         panic!("binary record must decode as a record")
@@ -29085,6 +29294,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &record_with_null_domain_array,
                 &arena,
                 0,
+                None,
             )
             .unwrap_err()
             .sqlstate,
@@ -29111,6 +29321,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
                 &direct_null_domain_record,
                 &arena,
                 0,
+                None,
             )
             .unwrap_err()
             .sqlstate,
@@ -29118,7 +29329,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     );
     record[25..29].copy_from_slice(&(-1_i32).to_be_bytes());
     let invalid_record = engine
-        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::RECORD, &record, &arena, 0, None)
         .unwrap_err();
     assert_eq!(invalid_record.sqlstate, sqlstate::CHECK_VIOLATION);
     let missing_type = engine
@@ -29127,6 +29338,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             b"ready",
             &arena,
             0,
+            None,
         )
         .unwrap_err();
     assert_eq!(missing_type.sqlstate, sqlstate::UNDEFINED_OBJECT);
@@ -29157,7 +29369,11 @@ fn run_txn_bytes(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = txn.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
+    let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -29166,7 +29382,7 @@ fn run_txn_bytes(
             txn,
             &mut pool,
             &mut test_cursors(budget),
-            &mut guc,
+            &guc,
             &mut responder,
             connection_id,
         )
@@ -29186,7 +29402,11 @@ fn run_txn_conn(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = txn.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
+    let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -29195,7 +29415,7 @@ fn run_txn_conn(
             txn,
             &mut pool,
             &mut test_cursors(budget),
-            &mut guc,
+            &guc,
             &mut responder,
             connection_id,
         )
@@ -32121,7 +32341,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let setup = {
         let mut responder = Responder::new(&mut send);
         engine
@@ -32131,7 +32351,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -32223,8 +32443,8 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
     let mut right_pool = test_pool(&mut budget);
     let mut left_cursors = test_cursors(&mut budget);
     let mut right_cursors = test_cursors(&mut budget);
-    let mut left_guc = GucState::new();
-    let mut right_guc = GucState::new();
+    let left_guc = GucState::new();
+    let right_guc = GucState::new();
     let mut left_inserted = copy_transition_scratch(&mut budget);
     let mut right_inserted = copy_transition_scratch(&mut budget);
 
@@ -32235,7 +32455,7 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
             &mut left_txn,
             &mut left_pool,
             &mut left_cursors,
-            &mut left_guc,
+            &left_guc,
             &mut Responder::new(&mut left_send),
             1,
         )
@@ -32248,7 +32468,7 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
             &mut right_txn,
             &mut right_pool,
             &mut right_cursors,
-            &mut right_guc,
+            &right_guc,
             &mut Responder::new(&mut right_send),
             2,
         )
@@ -34127,12 +34347,12 @@ fn set_show_transaction_and_show_all() {
 #[test]
 fn transaction_configuration_distinguishes_session_defaults_and_current_state() {
     let (mut engine, mut budget) = test_engine();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
 
     let configured = run_session(
         &mut engine,
         &mut budget,
-        &mut guc,
+        &guc,
         "SET SESSION CHARACTERISTICS AS TRANSACTION \
            ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE",
     );
@@ -34141,7 +34361,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SELECT current_setting('default_transaction_isolation'), \
                     current_setting('default_transaction_read_only'), \
                     current_setting('default_transaction_deferrable'), \
@@ -34155,7 +34375,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SELECT name, setting, reset_val, source FROM pg_settings \
              WHERE name IN ('default_transaction_isolation', \
                             'default_transaction_read_only', \
@@ -34176,7 +34396,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
     let read_only = run_session(
         &mut engine,
         &mut budget,
-        &mut guc,
+        &guc,
         "CREATE TABLE forbidden_by_session_default (id integer)",
     );
     assert!(String::from_utf8_lossy(&read_only).contains("25006"));
@@ -34184,7 +34404,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
     run_session(
         &mut engine,
         &mut budget,
-        &mut guc,
+        &guc,
         "SET default_transaction_read_only = off; \
          SET default_transaction_deferrable = off; \
          SET default_transaction_isolation = 'read committed'",
@@ -34194,7 +34414,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; \
          SHOW transaction_isolation; SHOW transaction_read_only; \
          SHOW transaction_deferrable; \
@@ -34218,7 +34438,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut guc,
+            &guc,
             "ROLLBACK; BEGIN; \
              SELECT set_config('transaction_read_only', 'on', false), \
                     current_setting('transaction_read_only'); ROLLBACK"
@@ -34230,7 +34450,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE",
     );
     assert!(
@@ -34239,19 +34459,13 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         "{}",
         String::from_utf8_lossy(&late_characteristic)
     );
-    run_session_transaction(
-        &mut engine,
-        &mut budget,
-        &mut transaction,
-        &mut guc,
-        "ROLLBACK",
-    );
+    run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, "ROLLBACK");
 
     assert_eq!(
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SET SCHEMA 'pg_catalog'; SHOW search_path"
         )),
         ["pg_catalog"]
@@ -34259,7 +34473,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
     let seeded = data_rows(&run_session(
         &mut engine,
         &mut budget,
-        &mut guc,
+        &guc,
         "SET seed TO 0.5; SELECT random(); SELECT setseed(0.5); SELECT random()",
     ));
     assert_eq!(seeded.len(), 3);
@@ -34269,7 +34483,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
     let time_zones = run_session(
         &mut engine,
         &mut budget,
-        &mut guc,
+        &guc,
         "SET TIME ZONE +2; SHOW TIME ZONE; \
          SET TIME ZONE INTERVAL '-03:30'; SHOW TIME ZONE; \
          SET TIME ZONE INTERVAL '2:30' HOUR TO MINUTE; SHOW TIME ZONE; \
@@ -34295,7 +34509,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SET XML OPTION CONTENT; SHOW xmloption"
         )),
         ["content"]
@@ -34304,7 +34518,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SET application_name = 'transaction-suite'; \
              SET application_name FROM CURRENT; SHOW application_name; \
              SET NAMES; SHOW client_encoding; \
@@ -34318,7 +34532,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN; SHOW transaction_deferrable; \
          SET TRANSACTION DEFERRABLE; SHOW transaction_deferrable; ROLLBACK",
     );
@@ -34330,7 +34544,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN; RESET TRANSACTION ISOLATION LEVEL",
     );
     assert!(
@@ -34339,19 +34553,13 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         "{}",
         String::from_utf8_lossy(&reset_characteristic)
     );
-    run_session_transaction(
-        &mut engine,
-        &mut budget,
-        &mut transaction,
-        &mut guc,
-        "ROLLBACK",
-    );
+    run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, "ROLLBACK");
     assert_eq!(
         data_rows(&run_session_transaction(
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut guc,
+            &guc,
             "BEGIN READ ONLY; RESET ALL; SHOW transaction_read_only; ROLLBACK"
         )),
         ["on"]
@@ -34361,7 +34569,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut guc,
+            &guc,
             "BEGIN; SAVEPOINT characteristics; \
              SET TRANSACTION READ ONLY; SHOW transaction_read_only; \
              ROLLBACK TO characteristics; SHOW transaction_read_only; \
@@ -34374,26 +34582,19 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         "BEGIN; SAVEPOINT characteristics; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
         "BEGIN; SAVEPOINT characteristics; SET TRANSACTION DEFERRABLE",
     ] {
-        let output =
-            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, sql);
+        let output = run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, sql);
         assert!(
             String::from_utf8_lossy(&output).contains("subtransaction"),
             "{sql}: {}",
             String::from_utf8_lossy(&output)
         );
-        run_session_transaction(
-            &mut engine,
-            &mut budget,
-            &mut transaction,
-            &mut guc,
-            "ROLLBACK",
-        );
+        run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, "ROLLBACK");
     }
     let nested_begin = run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut guc,
+        &guc,
         "BEGIN READ ONLY; BEGIN READ WRITE; SHOW transaction_read_only; ROLLBACK",
     );
     assert_eq!(data_rows(&nested_begin), ["on"]);
@@ -34407,7 +34608,7 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         "SET TIME ZONE INTERVAL '1 day' DAY",
         "SET TIME ZONE UTC junk",
     ] {
-        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        let output = run_session(&mut engine, &mut budget, &guc, sql);
         assert!(
             String::from_utf8_lossy(&output).contains("42601"),
             "{sql}: {}",
@@ -34415,22 +34616,21 @@ fn transaction_configuration_distinguishes_session_defaults_and_current_state() 
         );
     }
     for sql in ["RESET seed", "SET transaction_read_only = DEFAULT"] {
-        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        let output = run_session(&mut engine, &mut budget, &guc, sql);
         assert!(
             String::from_utf8_lossy(&output).contains("cannot be reset"),
             "{sql}: {}",
             String::from_utf8_lossy(&output)
         );
     }
-    let seed_from_current =
-        run_session(&mut engine, &mut budget, &mut guc, "SET seed FROM CURRENT");
+    let seed_from_current = run_session(&mut engine, &mut budget, &guc, "SET seed FROM CURRENT");
     assert!(
         String::from_utf8_lossy(&seed_from_current)
             .contains("invalid value for parameter \"seed\": \"unavailable\""),
         "{}",
         String::from_utf8_lossy(&seed_from_current)
     );
-    let catalog = run_session(&mut engine, &mut budget, &mut guc, "SET CATALOG 'other'");
+    let catalog = run_session(&mut engine, &mut budget, &guc, "SET CATALOG 'other'");
     assert!(String::from_utf8_lossy(&catalog).contains("0A000"));
 }
 
@@ -34588,9 +34788,11 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
                 session.success(&mut engine, "CREATE TABLE serial_saved (id serial)", false);
-                let table = engine.storage.find_table("public", "serial_saved").unwrap();
-                // Both saved counter layers are independent of explicitly inserted values.
-                engine.storage.set_table_serial_value(table, 0, 21);
+                session.success(
+                    &mut engine,
+                    "SELECT setval('serial_saved_id_seq',21,false)",
+                    false,
+                );
                 session.success(&mut engine, "INSERT INTO serial_saved VALUES (100)", false);
                 assert_eq!(
                     data_rows(&session.success(
@@ -34598,7 +34800,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
                         false
                     )),
-                    ["1"]
+                    ["21"]
                 );
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());
@@ -34610,10 +34812,13 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                 let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-                let table = engine.storage.find_table("public", "serial_saved").unwrap();
                 assert_eq!(
-                    engine.storage.table_serial_value(table, 0),
-                    21,
+                    data_rows(&session.success(
+                        &mut engine,
+                        "SELECT last_value,is_called FROM serial_saved_id_seq",
+                        false
+                    )),
+                    ["21|t"],
                     "checkpoint={checkpoint}, mode={mode:?}"
                 );
                 assert_eq!(
@@ -34622,7 +34827,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "INSERT INTO serial_saved DEFAULT VALUES RETURNING id",
                         false
                     )),
-                    ["2"]
+                    ["22"]
                 );
                 assert_eq!(
                     data_rows(&session.success(
@@ -34630,7 +34835,7 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
                         "SELECT id FROM serial_saved ORDER BY id",
                         false
                     )),
-                    ["1", "2", "100"]
+                    ["21", "22", "100"]
                 );
             }
             std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -34640,65 +34845,63 @@ fn serial_recovery_keeps_saved_counters_independent_of_rows() {
 }
 
 #[test]
-fn table_serial_state_wal_recovery_rejects_unknown_positions() {
+fn sequence_wal_recovery_rejects_wrong_names_slots_and_reused_lifetimes() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE serial_replay (id bigint)",
+        "CREATE SEQUENCE serial_replay AS BIGINT",
     );
-    let table = engine
+    let slot = engine
         .storage
-        .find_table("public", "serial_replay")
+        .sequence_slot("public", "serial_replay", 0)
         .unwrap();
+    let position = engine.storage.sequence_position(slot);
     crate::mem::guard::forbid_alloc(|| {
         apply_wal_op(
             &mut engine.storage,
             1,
-            WalOp::SequenceSet {
+            WalOp::SequenceAdvance {
+                identity: position,
                 schema: "public",
-                table: "serial_replay",
-                column: 0,
+                name: "serial_replay",
                 last: 81,
+                is_called: true,
             },
             &engine.work,
         )
         .unwrap();
-        for column in [1, u16::MAX] {
+        for (identity, name) in [
+            (
+                crate::storage::CatalogPosition::new(usize::from(u16::MAX), position.created_at())
+                    .unwrap(),
+                "serial_replay",
+            ),
+            (position, "missing_serial"),
+            (
+                crate::storage::CatalogPosition::new(slot, position.created_at() + 1).unwrap(),
+                "serial_replay",
+            ),
+        ] {
             assert_eq!(
                 apply_wal_op(
                     &mut engine.storage,
                     2,
-                    WalOp::SequenceSet {
+                    WalOp::SequenceAdvance {
+                        identity,
                         schema: "public",
-                        table: "serial_replay",
-                        column,
-                        last: 99
+                        name,
+                        last: 99,
+                        is_called: true,
                     },
-                    &engine.work,
+                    &engine.work
                 )
                 .unwrap_err()
                 .sqlstate,
-                sqlstate::INTERNAL_ERROR
+                sqlstate::DATA_EXCEPTION
             );
         }
-        assert_eq!(
-            apply_wal_op(
-                &mut engine.storage,
-                2,
-                WalOp::SequenceSet {
-                    schema: "public",
-                    table: "missing_serial",
-                    column: 0,
-                    last: 99
-                },
-                &engine.work,
-            )
-            .unwrap_err()
-            .sqlstate,
-            sqlstate::UNDEFINED_TABLE
-        );
-        assert_eq!(engine.storage.table_serial_value(table, 0), 81);
+        assert_eq!(engine.storage.sequence_value_for(slot, 0), (81, true));
     });
 }
 
@@ -35781,13 +35984,14 @@ fn jsonpath_type_is_validated_canonical_and_durable() {
             b"\x01strict $.a[0]",
             &arena,
             0,
+            None,
         )
         .unwrap();
     assert_eq!(binary.to_string(), "strict $.\"a\"[0]");
     assert_eq!(binary.type_oid(), crate::sql::types::oid::JSONPATH);
     assert!(
         engine
-            .decode_binary_parameter(crate::sql::types::oid::JSONPATH, b"\x02$", &arena, 0,)
+            .decode_binary_parameter(crate::sql::types::oid::JSONPATH, b"\x02$", &arena, 0, None)
             .is_err()
     );
 
@@ -36195,6 +36399,58 @@ fn sql_json_aggregates_support_options_ordering_and_returning() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn sql_json_aggregates_over_physical_rows_preserve_syntax_and_routine_namespaces() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("physical-sql-json-aggregates-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE physical_json_inputs(id integer,j jsonb); \
+             INSERT INTO physical_json_inputs VALUES(1,'1'::jsonb),(2,NULL)",
+            true,
+        );
+        let aggregates = "SELECT JSON_OBJECTAGG(id VALUE j ABSENT ON NULL RETURNING jsonb) FROM physical_json_inputs; \
+                          SELECT JSON_ARRAYAGG(j ABSENT ON NULL RETURNING jsonb) FROM physical_json_inputs";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, aggregates, true)),
+            ["{\"1\": 1}", "[1]"]
+        );
+        assert_eq!(
+            error_sqlstates(&session.execute(
+                &mut engine,
+                "SELECT __json_objectagg_absent_jsonb(id,j) FROM physical_json_inputs",
+                true
+            )),
+            [sqlstate::UNDEFINED_FUNCTION]
+        );
+        session.success(
+            &mut engine,
+            "CREATE FUNCTION __json_objectagg_absent_jsonb(integer,jsonb) RETURNS text \
+               LANGUAGE sql IMMUTABLE AS $$SELECT 'ordinary routine'$$",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT __json_objectagg_absent_jsonb(id,j) FROM physical_json_inputs",
+                true
+            )),
+            ["ordinary routine", "ordinary routine"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, aggregates, true)),
+            ["{\"1\": 1}", "[1]"]
+        );
+    }
 }
 
 #[test]
@@ -37013,7 +37269,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
     let mut transaction = TxnState::new(&mut budget, 128).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -37023,7 +37279,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -37065,7 +37321,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -39142,7 +39398,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     engine
         .execute_simple(
             "COPY copy_deferred FROM STDIN",
@@ -39150,7 +39406,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
             &mut txn,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             1,
         )
@@ -40050,7 +40306,7 @@ fn implicit_transaction_rolls_back_whole_message() {
 fn run_session(
     engine: &mut Engine,
     budget: &mut Budget,
-    guc: &mut GucState,
+    guc: &GucState,
     sql_text: &str,
 ) -> Vec<u8> {
     run_with_guc(engine, budget, sql_text, 1 << 21, guc)
@@ -40060,7 +40316,7 @@ fn run_session_transaction(
     engine: &mut Engine,
     budget: &mut Budget,
     transaction: &mut TxnState,
-    guc: &mut GucState,
+    guc: &GucState,
     sql_text: &str,
 ) -> Vec<u8> {
     let mut request_budget = Budget::new(budget.remaining());
@@ -40069,6 +40325,10 @@ fn run_session_transaction(
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
+    // These helpers keep temporary caches but share the retained backend control.
+    if let Some(owner) = transaction.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(
@@ -40636,11 +40896,11 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     {
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut guc = GucState::new();
+        let guc = GucState::new();
         let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
         macro_rules! execute {
             ($sql:expr) => {
-                run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, $sql)
+                run_session_transaction(&mut engine, &mut budget, &mut transaction, &guc, $sql)
             };
         }
         let created = run_with(
@@ -41840,7 +42100,7 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
     let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let call = "CALL procedure_wait()";
     let rejected = engine
@@ -41850,7 +42110,7 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             &mut caller,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             2,
         )
@@ -42807,17 +43067,20 @@ fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
         )),
         ["11"]
     );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT aggregate_old_tick(*) FROM aggregate_input; \
-             SELECT aggregate_first(v), aggregate_first(g::text) FROM aggregate_input; \
-             SELECT aggregate_array_first(ARRAY[v])::text, \
-                    aggregate_compatible_first(v::bigint) FROM aggregate_input"
-        )),
-        ["5", "3|1", "{3}|3"]
+    let polymorphic = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT aggregate_old_tick(*) FROM aggregate_input; \
+         SELECT aggregate_first(v), aggregate_first(g::text) FROM aggregate_input; \
+         SELECT aggregate_array_first(ARRAY[v])::text, \
+                aggregate_compatible_first(v::bigint) FROM aggregate_input",
     );
+    assert!(
+        error_sqlstates(&polymorphic).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&polymorphic)
+    );
+    assert_eq!(data_rows(&polymorphic), ["5", "3|1", "{3}|3"]);
     assert_eq!(
         row_description_type_oids(&describe_with(
             &mut engine,
@@ -43335,6 +43598,8 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
          CREATE ROLE aggregate_reader; \
          GRANT CREATE ON SCHEMA public TO aggregate_owner; \
          CREATE SCHEMA aggregate_target; \
+         GRANT CREATE ON SCHEMA aggregate_target TO aggregate_owner; \
+         GRANT USAGE ON SCHEMA aggregate_target TO aggregate_reader; \
          CREATE FUNCTION protected_aggregate_state(state bigint, value integer) \
            RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; \
          REVOKE EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) FROM PUBLIC",
@@ -43407,6 +43672,9 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
         &mut engine,
         &mut budget,
         "RESET ROLE; \
+         CREATE OR REPLACE FUNCTION protected_aggregate_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS \
+           $body$SELECT coalesce(state, 0) + CASE WHEN current_user::text='aggregate_reader' THEN value ELSE 100 END$body$; \
          GRANT EXECUTE ON ROUTINE aggregate_target.moved_total(integer) TO aggregate_reader; \
          SET ROLE aggregate_reader; \
          SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value); \
@@ -43418,10 +43686,35 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
         "{}",
         String::from_utf8_lossy(&granted_call)
     );
+    let support_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE aggregate_reader; SELECT protected_aggregate_state(0::bigint, 2); RESET ROLE",
+    );
+    assert!(
+        String::from_utf8_lossy(&support_denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&support_denied)
+    );
+    let owner_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         ALTER AGGREGATE aggregate_target.moved_total(integer) OWNER TO aggregate_owner; \
+         REVOKE EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) FROM aggregate_owner; \
+         SET ROLE aggregate_reader; \
+         SELECT aggregate_target.moved_total(value) FROM (SELECT 2 AS value WHERE FALSE) input",
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_denied).contains("42501")
+            && String::from_utf8_lossy(&owner_denied).contains("protected_aggregate_state"),
+        "{}",
+        String::from_utf8_lossy(&owner_denied)
+    );
     let restricted = run_with(
         &mut engine,
         &mut budget,
-        "DROP FUNCTION protected_aggregate_state(bigint, integer)",
+        "RESET ROLE; DROP FUNCTION protected_aggregate_state(bigint, integer)",
     );
     assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
     let cascade = run_with(
@@ -46096,6 +46389,40 @@ fn statement_trigger_for_query_materializes_transition_rows_before_dml() {
     assert_eq!(
         data_rows(&output),
         ["1", "3"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn statement_trigger_for_record_query_rebinds_each_transition_rowset() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE trigger_for_record_driver(id integer PRIMARY KEY, value integer);
+         CREATE TABLE trigger_for_record_audit(value integer, observed integer);
+         CREATE FUNCTION trigger_for_record_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE item record;
+            BEGIN
+              FOR item IN SELECT value, value + 100 AS observed FROM changed_rows ORDER BY value LOOP
+                INSERT INTO trigger_for_record_audit VALUES(item.value, item.observed);
+              END LOOP;
+              RETURN NULL;
+            END';
+         CREATE TRIGGER trigger_for_record_after AFTER UPDATE ON trigger_for_record_driver
+           REFERENCING NEW TABLE AS changed_rows FOR EACH STATEMENT
+           EXECUTE FUNCTION trigger_for_record_program();
+         INSERT INTO trigger_for_record_driver VALUES(1,1),(2,2),(3,3),(4,4);
+         UPDATE trigger_for_record_driver SET value=value+10;
+         UPDATE trigger_for_record_driver SET value=value+10;
+         SELECT value,observed FROM trigger_for_record_audit ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "11|111", "12|112", "13|113", "14|114", "21|121", "22|122", "23|123", "24|124"
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -48810,44 +49137,34 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
 fn sequence_basics() {
     let (mut e, mut b) = test_engine();
     // A persistent session GucState so currval/lastval survive across statements.
-    let mut g = GucState::new();
-    run_session(
-        &mut e,
-        &mut b,
-        &mut g,
-        "CREATE SEQUENCE s START 5 INCREMENT 2",
-    );
+    let g = GucState::new();
+    run_session(&mut e, &mut b, &g, "CREATE SEQUENCE s START 5 INCREMENT 2");
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["5"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT currval('s')")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT lastval()")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT lastval()")),
         ["7"]
     );
     assert_eq!(
-        data_rows(&run_session(
-            &mut e,
-            &mut b,
-            &mut g,
-            "SELECT setval('s', 100)"
-        )),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT setval('s', 100)")),
         ["100"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT currval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT currval('s')")),
         ["100"]
     );
     assert_eq!(
-        data_rows(&run_session(&mut e, &mut b, &mut g, "SELECT nextval('s')")),
+        data_rows(&run_session(&mut e, &mut b, &g, "SELECT nextval('s')")),
         ["102"]
     );
     // relkind 'S' in pg_class; pg_sequences lists it.
@@ -48935,7 +49252,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
             "slot {slot}"
         );
     }
-    let mut owner_session =
+    let owner_session =
         GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -48946,7 +49263,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
              SELECT currval('owned_capacity_69'); \
              SELECT lastval()",
             1 << 18,
-            &mut owner_session,
+            &owner_session,
         )),
         ["1", "1", "1"]
     );
@@ -49013,7 +49330,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
         String::from_utf8_lossy(&durable)
     );
 
-    let mut high_session =
+    let high_session =
         GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49024,7 +49341,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
              SELECT count(*) FROM pg_sequences; \
              SELECT count(*) FROM pg_class WHERE relkind = 'S'",
             1 << 18,
-            &mut high_session,
+            &high_session,
         )),
         ["1", "1", "80", "80"]
     );
@@ -49045,7 +49362,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
 
     let mut cold_budget = test_engine_budget(&config, 1 << 30);
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
-    let mut cold_session =
+    let cold_session =
         GucState::new_with_sequence_capacity(&mut cold_budget, config.max_sequences).unwrap();
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49054,7 +49371,7 @@ fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_rec
             "SELECT count(*) FROM pg_sequences; \
              SELECT nextval('sequence_capacity_durable')",
             1 << 18,
-            &mut cold_session,
+            &cold_session,
         )),
         ["80", "4"]
     );
@@ -49484,15 +49801,15 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
          CREATE SEQUENCE cycling_cache MINVALUE 1 MAXVALUE 3 CACHE 5 CYCLE; \
          CREATE SEQUENCE bounded_cache MINVALUE 1 MAXVALUE 3 CACHE 5 NO CYCLE",
     );
-    let mut first = GucState::new();
-    let mut second = GucState::new();
+    let first = GucState::new();
+    let second = GucState::new();
     assert_eq!(
         data_rows(&run_with_guc(
             &mut engine,
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["1"]
     );
@@ -49502,7 +49819,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["6"]
     );
@@ -49512,7 +49829,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["2"]
     );
@@ -49522,7 +49839,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["7"]
     );
@@ -49542,7 +49859,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
         &mut budget,
         "ALTER SEQUENCE cached_sequence INCREMENT 10",
         1 << 18,
-        &mut first,
+        &first,
     );
     assert_eq!(
         data_rows(&run_with_guc(
@@ -49550,7 +49867,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
             &mut budget,
             "SELECT nextval('cached_sequence')",
             1 << 18,
-            &mut second,
+            &second,
         )),
         ["20"]
     );
@@ -49563,7 +49880,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
              SELECT nextval('cached_sequence'); \
              SELECT last_value, log_cnt FROM cached_sequence",
             1 << 18,
-            &mut first,
+            &first,
         )),
         ["70", "100", "110", "150|32"]
     );
@@ -52356,7 +52673,7 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
         .storage
         .extended_statistics_data(extended, reader.txid);
     assert_eq!(statistics.rows, 3);
-    assert_eq!(statistics.columns[3].null_fraction_ppm, 333_333);
+    assert_eq!(statistics.column(4).unwrap().null_fraction_ppm, 333_333);
     assert_eq!(data.rows, 3);
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(data.mcv[0].values.as_str(), "{1,1}");
@@ -52406,7 +52723,12 @@ fn analyze_current_rows_preserves_repeatable_read_for_base_and_extended_statisti
     assert_eq!(data.mcv[0].values.as_str(), "{4,4}");
     assert_eq!(data.mcv[0].count, 2);
     assert_eq!(
-        engine.storage.table_statistics(table, reader.txid).columns[3].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, reader.txid)
+            .column(4)
+            .unwrap()
+            .null_fraction_ppm,
         1_000_000
     );
     run_txn(
@@ -52597,7 +52919,8 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
         engine
             .storage
             .table_statistics(table, session.transaction.txid)
-            .columns[3]
+            .column(4)
+            .unwrap()
             .null_fraction_ppm,
         1_000_000
     );
@@ -52616,7 +52939,12 @@ fn analyze_retained_sources_preserve_pending_changes_rollback_and_cold_recovery(
         true,
     );
     assert_eq!(
-        engine.storage.table_statistics(table, 0).columns[3].null_fraction_ppm,
+        engine
+            .storage
+            .table_statistics(table, 0)
+            .column(4)
+            .unwrap()
+            .null_fraction_ppm,
         333_333
     );
     assert_eq!(
@@ -52712,9 +53040,9 @@ fn vacuum_and_analyze() {
     let statistics = e.storage.table_statistics(slot, 0);
     assert!(statistics.valid);
     assert_eq!(statistics.rows, 2);
-    assert_eq!(statistics.columns[0].distinct_values, 2);
-    assert_eq!(statistics.columns[1].distinct_values, 2);
-    assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
+    assert_eq!(statistics.column(1).unwrap().distinct_values, 2);
+    assert_eq!(statistics.column(2).unwrap().distinct_values, 2);
+    assert_eq!(statistics.column(1).unwrap().null_fraction_ppm, 0);
     assert!(statistics.average_row_width > 0);
     let inheritance = run_with(
         &mut e,
@@ -54543,6 +54871,7 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
             &transaction,
             2,
             &[],
+            &[],
         )
         .unwrap();
     assert_eq!(
@@ -54606,16 +54935,16 @@ fn comment_roundtrip_and_removal() {
     );
     run_with(&mut e, &mut b, "CREATE SCHEMA cs");
     run_with(&mut e, &mut b, "CREATE TABLE cs.source (value int)");
-    let mut guc = GucState::new();
-    run_session(&mut e, &mut b, &mut guc, "SET search_path = cs, public");
+    let guc = GucState::new();
+    run_session(&mut e, &mut b, &guc, "SET search_path = cs, public");
     let bytes = run_session(
         &mut e,
         &mut b,
-        &mut guc,
+        &guc,
         "CREATE VIEW public.captured AS SELECT value AS captured_value FROM source",
     );
     assert_eq!(message_types(&bytes), [b'C']);
-    run_session(&mut e, &mut b, &mut guc, "SET search_path = public");
+    run_session(&mut e, &mut b, &guc, "SET search_path = public");
     run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'the table'");
     run_with(&mut e, &mut b, "COMMENT ON COLUMN ct.a IS 'col a'");
     run_with(&mut e, &mut b, "COMMENT ON VIEW cv IS 'view object'");
@@ -54630,7 +54959,7 @@ fn comment_roundtrip_and_removal() {
     let bytes = run_session(
         &mut e,
         &mut b,
-        &mut guc,
+        &guc,
         "COMMENT ON COLUMN captured.captured_value IS 'captured path col'",
     );
     assert_eq!(message_types(&bytes), [b'C']);
@@ -54662,7 +54991,7 @@ fn comment_roundtrip_and_removal() {
     let bytes = run_session(
         &mut e,
         &mut b,
-        &mut guc,
+        &guc,
         "SELECT col_description('captured'::regclass, 1)",
     );
     assert_eq!(
@@ -55891,13 +56220,13 @@ fn drop_composite_type_reports_dependencies_across_one_connection_lifetime() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut execute = |engine: &mut Engine,
                        buffer: &mut crate::mem::FixedBuf,
                        txn: &mut TxnState,
                        pool: &mut SqlPreparedPool,
                        cursors: &mut crate::sql::cursor::CursorPool,
-                       guc: &mut GucState,
+                       guc: &GucState,
                        text: &str| {
         buffer.clear();
         let mut responder = Responder::new(buffer);
@@ -55949,7 +56278,7 @@ fn drop_composite_type_reports_dependencies_across_one_connection_lifetime() {
             &mut txn,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             statement,
         );
         assert!(!message_types(&result).contains(&b'E'));
@@ -55973,7 +56302,7 @@ fn drop_composite_type_reports_dependencies_across_one_connection_lifetime() {
         &mut txn,
         &mut pool,
         &mut cursors,
-        &mut guc,
+        &guc,
         "DROP TYPE composite_connection_root",
     );
     assert!(
@@ -55991,7 +56320,7 @@ fn drop_composite_type_reports_nested_dependency_in_one_query_batch() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple_from(
@@ -56012,7 +56341,7 @@ fn drop_composite_type_reports_nested_dependency_in_one_query_batch() {
             &mut txn,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut responder,
             1,
             false,
@@ -57141,7 +57470,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
     let mut transaction = TxnState::new(&mut b, 128).unwrap();
     let mut pool = test_pool(&mut b);
     let mut cursors = test_cursors(&mut b);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder =
             Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
@@ -57154,7 +57483,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
                 false,
@@ -57188,7 +57517,7 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
                 false,
@@ -57327,16 +57656,16 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
         String::from_utf8_lossy(&bytes)
     );
     let mut transaction = TxnState::new(&mut b, 128).unwrap();
-    let mut guc = GucState::new();
-    run_session_transaction(&mut e, &mut b, &mut transaction, &mut guc, "BEGIN");
+    let guc = GucState::new();
+    run_session_transaction(&mut e, &mut b, &mut transaction, &guc, "BEGIN");
     run_session_transaction(
         &mut e,
         &mut b,
         &mut transaction,
-        &mut guc,
+        &guc,
         "CREATE TYPE discarded AS (v integer)",
     );
-    run_session_transaction(&mut e, &mut b, &mut transaction, &mut guc, "ROLLBACK");
+    run_session_transaction(&mut e, &mut b, &mut transaction, &guc, "ROLLBACK");
     let bytes = run_with(
         &mut e,
         &mut b,
@@ -58224,13 +58553,13 @@ fn geometric_constructors_and_inspectors_match_postgresql_forms() {
     let response = run_with(
         &mut engine,
         &mut budget,
-        "SELECT point(1, 2)::text, x(point(1, 2)), y(point(1, 2)), \
+        "SELECT point(1, 2)::text, (point(1, 2))[0], (point(1, 2))[1], \
                 lseg(point(1, 2), point(3, 4))::text, \
                 box(point(1, 2), point(3, 4))::text, \
                 line(point(1, 2), point(3, 4))::text, \
                 circle(point(1, 2), 3)::text, center(box(point(1, 2), point(3, 4)))::text, \
                 length(lseg(point(1, 2), point(4, 6))), radius(circle(point(1, 2), 3)), \
-                pclose('[(1,2),(3,4)]'::path)::text, polygon('[(1,2),(3,4),(5,6)]'::path)::text, \
+                pclose('[(1,2),(3,4)]'::path)::text, polygon('((1,2),(3,4),(5,6))'::path)::text, \
                 area('((0,0),(4,0),(0,3))'::path), area('[(0,0),(4,0),(0,3)]'::path) IS NULL",
     );
     assert_eq!(
@@ -58239,6 +58568,35 @@ fn geometric_constructors_and_inspectors_match_postgresql_forms() {
             "(1,2)|1|2|[(1,2),(3,4)]|(3,4),(1,2)|{1,-1,1}|<(1,2),3>|(2,3)|5|3|((1,2),(3,4))|((1,2),(3,4),(5,6))|6|t"
         ]
     );
+}
+
+#[test]
+fn geometric_path_conversion_and_point_fields_match_postgresql() {
+    let config = test_config("geometry-postgresql-boundaries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT (point(1,2))[0], (point(1,2))[1], \
+                polygon('((1,2),(3,4),(5,6))'::path)::text",
+            true
+        )),
+        ["1|2|((1,2),(3,4),(5,6))"]
+    );
+    for (sql, state) in [
+        ("SELECT x(point(1,2))", "42883"),
+        ("SELECT y(point(1,2))", "42883"),
+        ("SELECT polygon('[(1,2),(3,4),(5,6)]'::path)", "22023"),
+        ("SELECT ('[(1,2),(3,4),(5,6)]'::path)::polygon", "22023"),
+    ] {
+        assert_eq!(
+            error_sqlstates(&session.execute(&mut engine, sql, true)),
+            [state],
+            "{sql}"
+        );
+    }
 }
 
 #[test]
@@ -58856,7 +59214,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
     let mut transaction = TxnState::new(&mut budget, 128).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut copy_send =
         crate::mem::FixedBuf::new(&mut budget, "domain binary copy send", 1 << 18).unwrap();
     {
@@ -58868,7 +59226,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -58944,7 +59302,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
                     &mut transaction,
                     &mut pool,
                     &mut cursors,
-                    &mut guc,
+                    &guc,
                     &mut responder,
                     1,
                     false,
@@ -59484,11 +59842,17 @@ fn describe_preserves_builtin_function_result_types() {
         [
             crate::sql::types::oid::JSONB,
             crate::sql::types::oid::JSON,
-            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Text).oid(),
+            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Name).oid(),
             crate::sql::types::oid::INT4,
             crate::sql::types::oid::INT8,
         ]
     );
+    let schemas = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT current_schemas(NULL) IS NULL, current_schemas('true')=current_schemas(true)",
+    );
+    assert_eq!(data_rows(&schemas), ["t|t"]);
     let typeof_output = run_with(&mut engine, &mut budget, "SELECT pg_typeof(7)");
     assert_eq!(data_rows(&typeof_output), ["integer"], "{typeof_output:?}");
     assert_eq!(
@@ -59524,7 +59888,7 @@ fn describe_preserves_builtin_function_result_types() {
     let arena = Arena::new(&mut budget, "regtype Bind", 256).unwrap();
     assert_eq!(
         engine
-            .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"integer", &arena, 0)
+            .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"integer", &arena, 0, None)
             .unwrap()
             .to_string(),
         "integer"
@@ -59536,17 +59900,24 @@ fn describe_preserves_builtin_function_result_types() {
                 &crate::sql::types::oid::INT4.to_be_bytes(),
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
         "integer"
     );
     let invalid_regtype = engine
-        .decode_text_parameter(crate::sql::types::oid::REGTYPE, b"not_a_type", &arena, 0)
+        .decode_text_parameter(
+            crate::sql::types::oid::REGTYPE,
+            b"not_a_type",
+            &arena,
+            0,
+            None,
+        )
         .unwrap_err();
     assert_eq!(invalid_regtype.sqlstate, sqlstate::UNDEFINED_OBJECT);
     let invalid_binary_regtype = engine
-        .decode_binary_parameter(crate::sql::types::oid::REGTYPE, b"\x00", &arena, 0)
+        .decode_binary_parameter(crate::sql::types::oid::REGTYPE, b"\x00", &arena, 0, None)
         .unwrap_err();
     assert_eq!(
         invalid_binary_regtype.sqlstate,
@@ -62181,7 +62552,10 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
     let mut send = crate::mem::FixedBuf::new(&mut budget, "lock wait send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "lock wait sql", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
-    let mut guc = GucState::new();
+    if let Some(owner) = waiter.plan_invalidation_owner() {
+        pool.plan_invalidations = std::sync::Arc::clone(owner);
+    }
+    let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let sql = "UPDATE row_lock_test SET value = 11 WHERE id = 1";
     let status = engine
@@ -62191,7 +62565,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             &mut waiter,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             2,
         )
@@ -62202,7 +62576,9 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             completed_statements: 0,
             output_mark: 0,
             wait: crate::sql::StatementWait::Lock,
-        }
+        },
+        "{}",
+        String::from_utf8_lossy(send.readable())
     );
     assert!(send.is_empty(), "a parked statement emits no wire output");
 
@@ -62214,7 +62590,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             &mut waiter,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             2,
             true,
@@ -62237,7 +62613,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             &mut resume_waiter,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             3,
         )
@@ -62253,7 +62629,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
             &mut resume_waiter,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             3,
             false,
@@ -62787,13 +63163,13 @@ fn altered_sequence_definition_and_value_survive_restart() {
 #[test]
 fn configuration_changes_follow_transaction_scope() {
     let (mut engine, mut budget) = test_engine();
-    let mut guc = GucState::new();
+    let guc = GucState::new();
 
     assert_eq!(
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SELECT set_config('application_name', 'committed', false), \
                     current_setting('application_name')"
         )),
@@ -62803,7 +63179,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SHOW application_name"
         )),
         ["committed"]
@@ -62815,7 +63191,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "BEGIN; SET application_name = rolled_back; \
              SELECT current_setting('application_name'); ROLLBACK; \
              SHOW application_name"
@@ -62826,7 +63202,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "BEGIN; SET application_name = session_value; \
              SET LOCAL application_name = local_value; \
              SELECT current_setting('application_name'); COMMIT; \
@@ -62840,7 +63216,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "BEGIN; SET LOCAL search_path = private; \
              SET application_name = mixed_session; COMMIT; \
              SELECT current_setting('application_name'), current_setting('search_path')"
@@ -62853,7 +63229,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "BEGIN; SAVEPOINT s; SET application_name = doomed; \
              SET LOCAL search_path = private; ROLLBACK TO s; \
              SELECT current_setting('application_name'), current_setting('search_path'); \
@@ -62866,7 +63242,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "RESET application_name; SHOW application_name; \
              SET search_path = private; RESET ALL; \
              SELECT current_setting('search_path')"
@@ -62878,7 +63254,7 @@ fn configuration_changes_follow_transaction_scope() {
         data_rows(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SELECT set_config('application_name', 'null-scope', NULL), \
                     current_setting('application_name'); \
              SELECT set_config('application_name', NULL, false), \
@@ -62890,7 +63266,7 @@ fn configuration_changes_follow_transaction_scope() {
         String::from_utf8_lossy(&run_session(
             &mut engine,
             &mut budget,
-            &mut guc,
+            &guc,
             "SELECT set_config(NULL, 'x', false)"
         ))
         .contains("22004")
@@ -62899,26 +63275,26 @@ fn configuration_changes_follow_transaction_scope() {
     // The transaction and GUC state normally persist across protocol messages,
     // not merely across semicolon-separated statements in one message.
     let mut transaction = TxnState::new(&mut budget, 128).unwrap();
-    let mut connection_guc = GucState::new();
+    let connection_guc = GucState::new();
     run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut connection_guc,
+        &connection_guc,
         "SET application_name = before",
     );
     run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut connection_guc,
+        &connection_guc,
         "BEGIN",
     );
     run_session_transaction(
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut connection_guc,
+        &connection_guc,
         "SET application_name = inside",
     );
     assert_eq!(
@@ -62926,7 +63302,7 @@ fn configuration_changes_follow_transaction_scope() {
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut connection_guc,
+            &connection_guc,
             "SHOW application_name"
         )),
         ["inside"]
@@ -62935,7 +63311,7 @@ fn configuration_changes_follow_transaction_scope() {
         &mut engine,
         &mut budget,
         &mut transaction,
-        &mut connection_guc,
+        &connection_guc,
         "ROLLBACK",
     );
     assert_eq!(
@@ -62943,7 +63319,7 @@ fn configuration_changes_follow_transaction_scope() {
             &mut engine,
             &mut budget,
             &mut transaction,
-            &mut connection_guc,
+            &connection_guc,
             "SHOW application_name"
         )),
         ["before"]
@@ -63404,7 +63780,15 @@ fn subquery_wildcard_multi_column_errors() {
 #[test]
 fn scalar_functions() {
     let (mut e, mut b) = test_engine();
-    let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| {
+        let output = run_with(e, b, sql);
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        data_rows(&output)
+    };
     assert_eq!(r(&mut e, &mut b, "SELECT trim('  hi  ')"), ["hi"]);
     assert_eq!(r(&mut e, &mut b, "SELECT ltrim('xxhi', 'x')"), ["hi"]);
     assert_eq!(r(&mut e, &mut b, "SELECT rtrim('hixx', 'x')"), ["hi"]);
@@ -68672,6 +69056,9 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
     // observable while their replacements take fresh slots above the old cap.
     config.max_tables = TABLES + 2;
     config.row_overlay_slots = TABLES + 2;
+    // Each one-column ANALYZE retains one aligned record and one pool lease.
+    config.statistics_bytes = TABLES * 64;
+    config.statistics_leases = TABLES;
     config.definition_image_slots = TABLES + 4;
     config.txn_rows = 8;
     config.memtable_bytes = 16 << 20;
@@ -73970,7 +74357,7 @@ fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
     let mut send = crate::mem::FixedBuf::new(&mut budget, "detach wait send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "detach wait sql", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let sql =
         "ALTER TABLE pending_detach_parent DETACH PARTITION pending_detach_child CONCURRENTLY";
@@ -73981,7 +74368,7 @@ fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
             &mut detacher,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             11,
         )
@@ -74034,7 +74421,7 @@ fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
             &mut detacher,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             11,
             false,
@@ -74084,7 +74471,7 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
         crate::mem::FixedBuf::new(&mut budget, "pending recovery send", 1 << 18).unwrap();
     let arena = Arena::new(&mut budget, "pending recovery sql", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let status = engine
         .execute_simple(
@@ -74093,7 +74480,7 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
             &mut detacher,
             &mut pool,
             &mut cursors,
-            &mut guc,
+            &guc,
             &mut Responder::new(&mut send),
             12,
         )
@@ -75558,20 +75945,20 @@ fn nontransactional_utility_commands_require_one_top_level_statement() {
 #[test]
 fn alter_system_and_discard_have_real_session_state() {
     let (mut engine, mut budget) = test_engine_with_budget(test_engine_budget_bytes(1 << 27));
-    let mut session = GucState::new();
+    let session = GucState::new();
     run_with_guc(
         &mut engine,
         &mut budget,
         "ALTER SYSTEM SET application_name = 'cluster-default'",
         1 << 18,
-        &mut session,
+        &session,
     );
     let output = run_with_guc(
         &mut engine,
         &mut budget,
         "SHOW application_name; SELECT NOT pg_reload_conf(), pg_reload_conf() AND true;",
         1 << 18,
-        &mut session,
+        &session,
     );
     assert_eq!(data_rows(&output), ["", "f|t"]);
     let output = run_with_guc(
@@ -75580,14 +75967,14 @@ fn alter_system_and_discard_have_real_session_state() {
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
         1 << 18,
-        &mut session,
+        &session,
     );
     assert_eq!(
         data_rows(&output),
         ["cluster-default", "configuration file|cluster-default"]
     );
 
-    let mut reloaded_session = GucState::new();
+    let reloaded_session = GucState::new();
     engine.apply_system_settings(&reloaded_session).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
@@ -75596,7 +75983,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "CREATE SEQUENCE discard_sequence",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75605,7 +75992,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SELECT nextval('discard_sequence')",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75615,7 +76002,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SET application_name = 'session-value'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75624,7 +76011,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "ALTER SYSTEM SET application_name = 'reloaded-cluster-default'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75635,7 +76022,7 @@ fn alter_system_and_discard_have_real_session_state() {
         "SELECT pg_reload_conf();
          SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75648,7 +76035,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "PREPARE discarded AS SELECT 1",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75657,7 +76044,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "DISCARD ALL",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75667,7 +76054,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut budget,
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75683,7 +76070,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "EXECUTE discarded",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75697,7 +76084,7 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut engine,
         &mut budget,
         "SELECT currval('discard_sequence')",
-        &mut reloaded_session,
+        &reloaded_session,
         &mut txn,
         &mut pool,
         &mut cursors,
@@ -75709,14 +76096,14 @@ fn alter_system_and_discard_have_real_session_state() {
         &mut budget,
         "ALTER SYSTEM RESET application_name",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     run_with_guc(
         &mut engine,
         &mut budget,
         "SELECT pg_reload_conf()",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     let output = run_with_guc(
         &mut engine,
@@ -75724,7 +76111,7 @@ fn alter_system_and_discard_have_real_session_state() {
         "SHOW application_name;
          SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
         1 << 18,
-        &mut reloaded_session,
+        &reloaded_session,
     );
     assert_eq!(data_rows(&output), ["", "default|"]);
 }
@@ -76011,7 +76398,7 @@ fn publication_table_function_supports_postgresql_subscriber_introspection() {
     );
     assert_eq!(
         data_rows(&catalog_contract),
-        ["6119|2249|t|25|1|u", "6120|2205|f|0|10|u"]
+        ["6119|2249|t|25|1|s", "6120|2205|f|0|10|s"]
     );
     let replication_tool_setting = run_with(
         &mut engine,
@@ -76663,7 +77050,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         runtime.bootstrap,
         crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
     );
-    let mut lifecycle_guc = GucState::new();
+    let lifecycle_guc = GucState::new();
     let mut lifecycle_txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
     let mut lifecycle_pool = test_pool(&mut budget);
     let mut lifecycle_cursors = test_cursors(&mut budget);
@@ -76671,7 +77058,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "BEGIN; ALTER SUBSCRIPTION staged_changes DISABLE; ALTER SUBSCRIPTION staged_changes SET (slot_name = NONE)",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -76680,7 +77067,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "ALTER SUBSCRIPTION staged_changes REFRESH PUBLICATION WITH (copy_data = false)",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -76695,7 +77082,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "ROLLBACK",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -76704,7 +77091,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "BEGIN; ALTER SUBSCRIPTION staged_changes DISABLE; ALTER SUBSCRIPTION staged_changes SET (slot_name = NONE)",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -76713,7 +77100,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "ALTER SUBSCRIPTION staged_changes ENABLE",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -76728,7 +77115,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         &mut engine,
         &mut budget,
         "ROLLBACK",
-        &mut lifecycle_guc,
+        &lifecycle_guc,
         &mut lifecycle_txn,
         &mut lifecycle_pool,
         &mut lifecycle_cursors,
@@ -78617,7 +79004,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         "CREATE TABLE owner_publication_table (id integer); \
          CREATE PUBLICATION owner_publication FOR TABLE owner_publication_table",
         1 << 18,
-        &mut owner_guc,
+        &owner_guc,
     );
     let mut other_guc = GucState::new();
     other_guc.bind_session_user(engine.role_login("publication_other").unwrap().identity);
@@ -78627,7 +79014,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         "ALTER PUBLICATION owner_publication SET (publish = 'insert'); \
          DROP PUBLICATION owner_publication",
         1 << 18,
-        &mut other_guc,
+        &other_guc,
     );
     assert!(
         String::from_utf8_lossy(&not_owner).contains("must be owner of publication"),
@@ -78639,7 +79026,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         &mut budget,
         "ALTER PUBLICATION owner_publication ADD TABLE other_publication_table",
         1 << 18,
-        &mut owner_guc,
+        &owner_guc,
     );
     assert!(
         String::from_utf8_lossy(&not_table_owner).contains("must be owner of table"),
@@ -78667,14 +79054,14 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE TABLE publication_scope_target (id integer PRIMARY KEY)",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     let no_database_create = run_with_guc(
         &mut engine,
         &mut budget,
         "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&no_database_create).contains("permission denied for database"),
@@ -78691,7 +79078,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     let explicit = String::from_utf8_lossy(&explicit);
     assert!(explicit.contains("CREATE PUBLICATION"), "{explicit}");
@@ -78700,7 +79087,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&owner_without_database_create)
@@ -78718,7 +79105,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&owner_with_database_create).contains("ALTER PUBLICATION"),
@@ -78730,7 +79117,7 @@ fn publication_scope_and_column_selection_require_postgresql_privileges() {
         &mut budget,
         "CREATE PUBLICATION publication_scope_all FOR ALL TABLES",
         1 << 18,
-        &mut limited,
+        &limited,
     );
     assert!(
         String::from_utf8_lossy(&all_tables)
@@ -78782,7 +79169,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         "CREATE TABLE publication_owner_source (id integer); \
          CREATE PUBLICATION publication_owner_changes FOR TABLE publication_owner_source",
         1 << 18,
-        &mut first_owner,
+        &first_owner,
     );
     assert_eq!(
         data_rows(&run_with(
@@ -78816,7 +79203,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         &mut budget,
         "ALTER PUBLICATION publication_owner_changes SET (publish = 'insert')",
         1 << 18,
-        &mut second_owner,
+        &second_owner,
     );
     assert!(
         !String::from_utf8_lossy(&altered).contains("ERROR"),
@@ -80044,7 +80431,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let restarted_statistics = restarted.storage.table_statistics(restarted_slot, 0);
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
-    assert_eq!(restarted_statistics.columns[0].distinct_values, 2);
+    assert_eq!(restarted_statistics.column(1).unwrap().distinct_values, 2);
     let composite_slot = restarted
         .storage
         .extended_statistics_slot("public", "snapshot_rows_id_value_stats", 0)
@@ -81349,7 +81736,7 @@ fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
         .unwrap();
     let statistics = recovered.storage.table_statistics(slot, 0);
     assert_eq!(statistics.rows, 512);
-    assert!(statistics.columns[1].distinct_values > 100);
+    assert!(statistics.column(2).unwrap().distinct_values > 100);
     assert!(statistics.average_row_width > 8_000);
 
     let before = recovered.storage.block_io_stats();
@@ -86197,13 +86584,13 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut connection_a = TxnState::new(&mut budget, 256).unwrap();
     let mut connection_b = TxnState::new(&mut budget, 256).unwrap();
-    let mut guc_a = GucState::new();
-    let mut guc_b = GucState::new();
+    let guc_a = GucState::new();
+    let guc_b = GucState::new();
     run_session_transaction(
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE checkpoint_base (id int PRIMARY KEY); \
          INSERT INTO checkpoint_base VALUES (1)",
     );
@@ -86213,7 +86600,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "BEGIN; \
          CREATE TABLE rolled_back_catalog (id int); \
          CREATE UNIQUE INDEX rolled_back_index ON checkpoint_base(id)",
@@ -86225,7 +86612,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE committed_while_a_open (id int PRIMARY KEY); \
          INSERT INTO committed_while_a_open VALUES (2)",
     );
@@ -86233,7 +86620,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "ROLLBACK",
     );
 
@@ -86241,7 +86628,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "BEGIN; \
          CREATE TABLE late_commit (id int PRIMARY KEY); \
          INSERT INTO late_commit VALUES (3); \
@@ -86261,7 +86648,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_b,
-        &mut guc_b,
+        &guc_b,
         "CREATE TABLE middle_commit (id int PRIMARY KEY); \
          INSERT INTO middle_commit VALUES (5)",
     );
@@ -86269,7 +86656,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         &mut engine,
         &mut budget,
         &mut connection_a,
-        &mut guc_a,
+        &guc_a,
         "COMMIT",
     );
     drop(engine);
@@ -86503,7 +86890,7 @@ fn distinct_aggregates() {
     // DISTINCT outside an aggregate is rejected loudly.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT length(distinct 'x')"))
-            .contains("42883")
+            .contains("42809")
     );
     assert_eq!(
         data_rows(&run_with(
@@ -87162,7 +87549,7 @@ fn recursive_cte_search_and_cycle() {
     let mut transaction = TxnState::new(&mut b, 128).unwrap();
     let mut pool = test_pool(&mut b);
     let mut cursors = test_cursors(&mut b);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder =
             Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
@@ -87177,7 +87564,7 @@ fn recursive_cte_search_and_cycle() {
                 &mut transaction,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
                 false,
@@ -87492,7 +87879,7 @@ fn statement_timeout_nested_sql_inherits_outer_deadline_before_effects() {
                     &mut session.transaction,
                     &mut session.pool,
                     &mut session.cursors,
-                    &mut session.guc,
+                    &session.guc,
                     &mut responder,
                     None,
                 )
@@ -87901,8 +88288,8 @@ fn postgresql_18_temporal_boundaries() {
         ("SELECT ln(numeric '-Infinity')", "2201E"),
         ("SELECT numeric 'Infinity'/0", "22012"),
         ("SELECT power(0::numeric,numeric '-Infinity')", "2201F"),
-        ("SELECT interval 'infinity' * 0", "22015"),
-        ("SELECT interval 'infinity' / 'Infinity'::float8", "22015"),
+        ("SELECT interval 'infinity' * 0", "22008"),
+        ("SELECT interval 'infinity' / 'Infinity'::float8", "22008"),
         (
             "SELECT timestamp 'infinity' + interval '-infinity'",
             "22008",
@@ -88967,6 +89354,7 @@ fn arrays_of_array_domains_preserve_the_domain_element_identity() {
                 &outer,
                 &arena,
                 0,
+                None,
             )
             .unwrap()
             .to_string(),
@@ -89005,6 +89393,8 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
          CREATE TABLE copy_defaults (
              input integer,
              sequence_value bigint DEFAULT nextval('copy_sequence'),
+             serial_value serial,
+             identity_value bigint GENERATED ALWAYS AS IDENTITY (START WITH 20 INCREMENT BY 2),
              numbers integer[] DEFAULT ARRAY[1, 2],
              doubled integer GENERATED ALWAYS AS (input * 2) STORED,
              state copy_mood DEFAULT 'ready'::copy_mood
@@ -89016,7 +89406,7 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -89026,7 +89416,7 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -89060,9 +89450,9 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     let rows = data_rows(&run_with(
         &mut engine,
         &mut budget,
-        "SELECT input, sequence_value, numbers, doubled, state FROM copy_defaults",
+        "SELECT input, sequence_value, serial_value, identity_value, numbers, doubled, state FROM copy_defaults",
     ));
-    assert_eq!(rows, ["5|10|{1,2}|10|ready"]);
+    assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
     let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
     assert!(
@@ -89086,7 +89476,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -89098,7 +89488,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -89199,7 +89589,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -89209,7 +89599,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -89286,7 +89676,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -89361,7 +89751,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -89371,7 +89761,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -89430,7 +89820,7 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder = Responder::new(&mut send);
         engine
@@ -89440,7 +89830,7 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
             )
@@ -92001,6 +92391,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     &session.transaction,
                     Some(&session.cursors),
                     &mut responder,
+                    &[],
                 ))
                 .unwrap()
             );
@@ -92049,7 +92440,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
     );
     let mut owned = false;
     engine.storage.visit_object_locks(|owner, _, target, mode| {
-        owned |= owner == session.transaction.txid
+        owned |= owner == crate::storage::ObjectLockOwner::Transaction(session.transaction.txid)
             && target == crate::storage::ObjectLockTarget::View(view)
             && mode == ast::TableLockMode::RowExclusive;
     });
@@ -93779,14 +94170,18 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         "SELECT 0 UNION ALL SELECT nextval('s')",
         "SELECT currval('s'); SELECT 0",
     ] {
-        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
         assert!(
             query::routine_program_requires_mutable_execution(&program),
             "{body}"
         );
     }
     for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
-        let program = query::parse_routine_function_program(body, &arena, false, "f", &[]).unwrap();
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
         assert!(
             !query::routine_program_requires_mutable_execution(&program),
             "{body}"
@@ -94284,7 +94679,7 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
             if extended {
                 match engine.execute_extended("INSERT INTO cleanup_orders VALUES (1000 + nextval('admission_sequence'), 'new')",
                     &session.arena, &[], &[], &mut session.transaction, &mut session.pool,
-                    &mut session.cursors, &mut session.guc, &mut responder, session.connection_id, false).unwrap() {
+                    &mut session.cursors, &session.guc, &mut responder, session.connection_id, false).unwrap() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
                         completed_statements: 0, output_mark: responder.buffer.mark(), wait,
@@ -94293,7 +94688,7 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
             } else {
                 engine.execute_simple_from("SELECT nextval('admission_sequence'); INSERT INTO cleanup_orders VALUES (1000 + nextval('admission_sequence'), 'new')",
                     skip, &session.arena, &mut session.transaction, &mut session.pool,
-                    &mut session.cursors, &mut session.guc, &mut responder, session.connection_id, false).unwrap()
+                    &mut session.cursors, &session.guc, &mut responder, session.connection_id, false).unwrap()
             }
         })
     }
@@ -94490,7 +94885,7 @@ fn sliced_heap_cleanup_queries_and_late_writes_progress_between_server_turns() {
     let mut txn = TxnState::new(&mut request_budget, 128).unwrap();
     let mut pool = test_pool(&mut request_budget);
     let mut cursors = test_cursors(&mut request_budget);
-    let mut guc = GucState::new();
+    let guc = GucState::new();
     {
         let mut responder =
             Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
@@ -94503,7 +94898,7 @@ fn sliced_heap_cleanup_queries_and_late_writes_progress_between_server_turns() {
                 &mut txn,
                 &mut pool,
                 &mut cursors,
-                &mut guc,
+                &guc,
                 &mut responder,
                 1,
                 false,
@@ -94862,6 +95257,10 @@ fn check_cleanup_during_download(
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
     engine.enable_async_block_reads();
     assert!(blocks.lock().unwrap().async_gets_enabled());
+    // The suspended reader is a different backend from the cached commands.
+    let download_owner =
+        ExecutionIdentity::new(2, engine.execution_identity().database_oid).read_owner();
+    let foreground_owner = engine.replace_read_owner(Some(download_owner));
     let payload = b"the download still belongs to its waiting reader";
     let mut framed = [0u8; crate::store::BLOCK_SIZE];
     let (id, framed_len) =
@@ -94871,6 +95270,7 @@ fn check_cleanup_during_download(
         crate::mem::guard::forbid_alloc(|| blocks.lock().unwrap().get(&id, &mut output)),
         Err(StoreError::NotReady)
     );
+    let _ = engine.replace_read_owner(foreground_owner);
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let (mut stream, _) = loop {
@@ -94978,7 +95378,9 @@ fn check_cleanup_during_download(
                 break;
             }
         }
+        let prior_owner = engine.replace_read_owner(Some(download_owner));
         let result = blocks.lock().unwrap().get(&id, &mut output);
+        let _ = engine.replace_read_owner(prior_owner);
         if fail_read {
             assert_eq!(result, Err(StoreError::NotFound));
         } else {
@@ -95221,8 +95623,17 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         );
         engine.enable_async_durability();
         namespace.borrow_mut().faults.fail_from_op = Some(0);
-        let failed = session.execute(&mut engine, "COMMIT", false);
-        assert_eq!(error_sqlstates(&failed), ["58030"]);
+        let status = session.execute_status(&mut engine, "COMMIT", false);
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            output_mark,
+            wait,
+        } = status
+        else {
+            panic!("failed durability retains the COMMIT continuation: {status:?}");
+        };
+        assert_eq!(wait, StatementWait::ObjectIo);
+        assert_eq!(error_sqlstates(session.send.readable()), ["58030"]);
         assert!(engine.durable_retry_pending());
         assert!(session.transaction.staged_commit().is_some());
         assert!(engine.fatal_commit_failure().is_none());
@@ -95252,9 +95663,26 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
-        engine
-            .finish_pending_transaction(&mut session.transaction, &session.guc)
-            .unwrap();
+        session.send.truncate_to(output_mark);
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                "COMMIT",
+                completed_statements,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(error_sqlstates(session.send.readable()).is_empty());
+        assert_eq!(command_tags(session.send.readable()), ["COMMIT"]);
+        assert!(session.transaction.staged_commit().is_none());
         assert!(!engine.durable_retry_pending());
         prepare_sliced_cleanup(&mut engine);
         assert!(engine.maybe_checkpoint());
@@ -95356,7 +95784,7 @@ fn atomic_block_reads_cached_extended_write_preserves_pending_get() {
         let mut txn = TxnState::new(&mut request_budget, 128).unwrap();
         let mut pool = test_pool(&mut request_budget);
         let mut cursors = test_cursors(&mut request_budget);
-        let mut guc = GucState::new();
+        let guc = GucState::new();
         {
             let mut responder =
                 Responder::for_execute(&mut send, crate::pg::respond::ResultFmt::ALL_TEXT);
@@ -95369,7 +95797,7 @@ fn atomic_block_reads_cached_extended_write_preserves_pending_get() {
                     &mut txn,
                     &mut pool,
                     &mut cursors,
-                    &mut guc,
+                    &guc,
                     &mut responder,
                     1,
                     false,
@@ -95399,7 +95827,7 @@ fn atomic_snapshot_execute(
             &mut session.transaction,
             &mut session.pool,
             &mut session.cursors,
-            &mut session.guc,
+            &session.guc,
             &mut responder,
             identity,
         )
@@ -95768,7 +96196,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(&mut reader.cursors),
+                        Some(CursorCommitContext {
+                            cursors: &mut reader.cursors,
+                            plans: &mut reader.pool,
+                            arena: &reader.arena,
+                        }),
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,
@@ -96872,7 +97304,7 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                 &mut session.transaction,
                 &mut session.pool,
                 &mut session.cursors,
-                &mut session.guc,
+                &session.guc,
                 &mut Responder::new(&mut session.send),
                 session.connection_id,
                 false,
@@ -97001,7 +97433,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut responder,
                         session.connection_id,
                         false,
@@ -97024,7 +97456,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                         &mut session.transaction,
                         &mut session.pool,
                         &mut session.cursors,
-                        &mut session.guc,
+                        &session.guc,
                         &mut responder,
                         session.connection_id,
                         false,
@@ -98954,7 +99386,7 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             &mut writer.transaction,
             &mut writer.pool,
             &mut writer.cursors,
-            &mut writer.guc,
+            &writer.guc,
             &mut Responder::new(&mut writer.send),
             writer.connection_id,
         )
@@ -99049,7 +99481,7 @@ fn parallel_checkpoint_requests_finish_their_own_snapshot_without_chasing_later_
             &mut writer.transaction,
             &mut writer.pool,
             &mut writer.cursors,
-            &mut writer.guc,
+            &writer.guc,
             &mut Responder::new(&mut writer.send),
             writer.connection_id,
             false,
@@ -99144,7 +99576,7 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
             &mut writer.transaction,
             &mut writer.pool,
             &mut writer.cursors,
-            &mut writer.guc,
+            &writer.guc,
             &mut Responder::new(&mut writer.send),
             writer.connection_id,
         )
@@ -99253,7 +99685,7 @@ fn parallel_checkpoint_failures_reach_waiters_and_do_not_poison_new_or_cancelled
             &mut writer.transaction,
             &mut writer.pool,
             &mut writer.cursors,
-            &mut writer.guc,
+            &writer.guc,
             &mut Responder::new(&mut writer.send),
             writer.connection_id,
             false,
@@ -99382,7 +99814,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                     &mut session.transaction,
                     &mut session.pool,
                     &mut session.cursors,
-                    &mut session.guc,
+                    &session.guc,
                     &mut responder,
                     session.connection_id,
                     false,
@@ -99430,7 +99862,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
                     &mut session.transaction,
                     &mut session.pool,
                     &mut session.cursors,
-                    &mut session.guc,
+                    &session.guc,
                     &mut responder,
                     session.connection_id,
                     false,
@@ -99998,3 +100430,5 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
         }
     }
 }
+
+mod relation_input_granularity;

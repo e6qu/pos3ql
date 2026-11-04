@@ -383,8 +383,8 @@ mod ownership_tests {
         use crate::mem::budget::Budget;
         use crate::mem::lease_pool::{LeasePool, Purpose};
         let bytes = 64 * 1024;
-        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 9));
-        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 9).unwrap();
+        let mut budget = Budget::new(LeasePool::budget_bytes(bytes, 11));
+        let pool = LeasePool::new(&mut budget, Purpose::TABLE_METADATA, bytes, 11).unwrap();
         let mut draft = TableDefBuilder::empty();
         draft.name = SqlName::parse("actual_width").unwrap();
         draft.n_columns = 1;
@@ -395,6 +395,11 @@ mod ownership_tests {
             compression: draft.columns[0].compression.code(),
         };
         draft.attributes.slots[1] = AttributeSlot::Live(0);
+        draft.columns[0].unique = true;
+        draft
+            .set_column_key_name(0, SqlName::parse("retained_key").unwrap())
+            .unwrap();
+        assert!(core::mem::size_of::<ColumnMeta>() <= 512);
         draft.n_uniques = 1;
         draft.n_checks = 1;
         draft.n_fkeys = 1;
@@ -406,6 +411,9 @@ mod ownership_tests {
             assert_eq!(saved.attributes.slots.len(), 2);
             assert_eq!(saved.not_null_identities.len(), 2);
             assert_eq!(saved.inline_index_identities.len(), 2);
+            assert_eq!(saved.inline_constraint_identities.len(), 2);
+            assert_eq!(saved.inline_key_names.len(), 1);
+            assert_eq!(saved.inline_key_names[0].attribute, 2);
             assert_eq!(saved.uniques.len(), 1);
             assert_eq!(saved.checks.len(), 1);
             assert_eq!(saved.fkeys.len(), 1);
@@ -419,6 +427,8 @@ mod ownership_tests {
                 ));
                 assert_eq!(borrowed.columns.len(), 1);
                 assert_eq!(borrowed.not_null_identities.len(), 2);
+                assert_eq!(borrowed.inline_constraint_identities.len(), 2);
+                assert_eq!(borrowed.inline_key_names.len(), 1);
                 assert_eq!(borrowed.attribute_number(0), 2);
             }
             let pinned = saved.clone();
@@ -428,6 +438,7 @@ mod ownership_tests {
             assert_eq!(restored.columns[0].name, draft.columns[0].name);
             assert_eq!(restored.attributes, draft.attributes);
             assert_eq!(restored.n_checks, 1);
+            assert_eq!(restored.inline_key_names(), pinned.inline_key_names());
             drop(pinned);
             assert!(pool.lease::<u8>(1).is_ok());
         });

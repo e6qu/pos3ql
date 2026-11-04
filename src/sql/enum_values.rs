@@ -1,4 +1,4 @@
-//! Bind durable enum member identities to the selected catalog image.
+//! Resolve durable enum and sequence identities in selected catalog images.
 
 pub(crate) mod checks;
 
@@ -118,6 +118,19 @@ const QUERY_HEADER: &str = "pos3ql-bound-query-v1\n";
 
 pub(crate) fn is_bound_query(source: &str) -> bool {
     source.starts_with(QUERY_HEADER)
+}
+
+pub(crate) fn query_binding_source(source: &str) -> Result<&str, SqlError> {
+    if let Some(body) = source.strip_prefix(QUERY_HEADER) {
+        return Ok(body);
+    }
+    if source.starts_with("pos3ql-bound-query-") {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "unsupported stored query encoding"
+        ));
+    }
+    Ok(source)
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +364,32 @@ pub(crate) fn bind_query<const N: usize>(
             N
         ));
     }
+    let inputs = dependencies
+        .type_inputs()
+        .detached_bindings(crate::storage::StoredInputSection::Query, arena)?;
+    if !inputs.is_empty() {
+        let encoded_source = query_binding_source(output.as_str())?;
+        let inputs = super::type_inputs::rebase(
+            source,
+            encoded_source,
+            super::parser::StoredSqlKind::Statements,
+            inputs,
+            |name| {
+                Ok(super::query::captured_type_oid(name, dependencies.view())
+                    .or_else(|| super::type_inputs::target_oid(storage, txid, name)))
+            },
+            arena,
+        )?;
+        let root = storage.capture_stored_type_inputs(
+            &[crate::storage::StoredInputSource {
+                section: crate::storage::StoredInputSection::Query,
+                sql: encoded_source,
+                bindings: inputs,
+            }],
+            dependencies.view(),
+        )?;
+        dependencies.set_type_inputs(root);
+    }
     Ok(output)
 }
 
@@ -505,7 +544,7 @@ impl core::fmt::Display for SqlString<'_> {
 }
 
 /// Catalog SQL must follow a frozen value's identity, just like execution.
-/// Re-render only changed enum constants; preserve other expression sources.
+/// Render captured enum and sequence identities with their current SQL names.
 pub(crate) fn default_expression<'a>(
     default: &crate::storage::ColumnDefault,
     base: Option<crate::sql::types::ColType>,
@@ -516,6 +555,41 @@ pub(crate) fn default_expression<'a>(
     let Some(expression) = default.expression() else {
         return Ok(None);
     };
+    if default.constant().is_none() && !checks::is_bound(expression.as_str()) {
+        let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena)?;
+        if let crate::sql::ast::Expr::Call {
+            name: "pg_catalog.nextval",
+            args: [argument],
+            ..
+        } = parsed
+            && let crate::sql::ast::Expr::Cast {
+                operand: crate::sql::ast::Expr::Str(reference),
+                type_name: "regclass" | "pg_catalog.regclass",
+                ..
+            } = argument
+            && let Ok(oid) = reference.parse::<u32>()
+        {
+            if super::catalog::sequence_slot_by_oid(storage, txid, oid as i32).is_none() {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "column default sequence identity is no longer present"
+                ));
+            }
+            let name = super::catalog::relname_text(storage, txid, oid as i32, arena)?.ok_or_else(
+                || {
+                    sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column default sequence identity is no longer present"
+                    )
+                },
+            )?;
+            let literal = super::eval::quote_literal_str(name, arena)?;
+            return arena
+                .alloc_str_display(format_args!("nextval({literal}::regclass)"))
+                .map(Some)
+                .map_err(|_| super::query::arena_full_pub());
+        }
+    }
     if default.constant().is_none() {
         if let Some(base) = base {
             return checks::describe_default(expression.as_str(), base, storage, txid, arena)

@@ -250,6 +250,18 @@ mod window;
 
 mod ddl;
 
+struct TypeInputSources<'a> {
+    strings: ArenaList<'a, (&'a Expr<'a>, NamespaceSource)>,
+    candidates: ArenaList<'a, super::type_inputs::Candidate<'a>>,
+    restored: ArenaList<
+        'a,
+        (
+            super::type_inputs::Candidate<'a>,
+            super::type_inputs::Binding<'a>,
+        ),
+    >,
+}
+
 pub struct Parser<'a> {
     text: &'a str,
     lexer: Lexer<'a>,
@@ -258,6 +270,8 @@ pub struct Parser<'a> {
     previous_token: Option<(Tok<'a>, usize, usize)>,
     column_sources: Option<core::cell::RefCell<QuerySourceCollector<'a>>>,
     namespace_sources: Option<core::cell::RefCell<SchemaSqlSourceCollector<'a>>>,
+    type_input_sources: Option<core::cell::RefCell<TypeInputSources<'a>>>,
+    type_inputs: &'a [super::type_inputs::Binding<'a>],
     arena: &'a Arena,
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
@@ -361,6 +375,55 @@ pub(crate) enum StoredSqlKind {
     RoutineIdentity,
     OperatorName,
     OperatorIdentity,
+}
+
+pub(crate) struct TypeInputSyntax<'a> {
+    pub casts: &'a [super::type_inputs::Candidate<'a>],
+    pub literals: &'a [(&'a Expr<'a>, NamespaceSource)],
+    pub expression: Option<&'a Expr<'a>>,
+}
+
+pub(crate) fn type_input_sources<'a>(
+    sql: &'a str,
+    kind: StoredSqlKind,
+    arena: &'a Arena,
+) -> Result<TypeInputSyntax<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.capture_type_inputs();
+    let mut expression = None;
+    match kind {
+        StoredSqlKind::Expression => {
+            expression = Some(
+                parser
+                    .expression(0)
+                    .map_err(|error| super::parse_error_to_sql(&error))?,
+            );
+        }
+        StoredSqlKind::Statements => {
+            while parser
+                .next_stmt()
+                .map_err(|error| super::parse_error_to_sql(&error))?
+                .is_some()
+            {}
+        }
+        _ => {
+            return Err(crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored type input has no expression source"
+            ));
+        }
+    }
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after type input source"
+        ));
+    }
+    Ok(TypeInputSyntax {
+        casts: parser.type_input_candidates(),
+        literals: parser.string_literals(),
+        expression,
+    })
 }
 
 /// Namespace positions come from grammar nodes, so table aliases and record
@@ -499,6 +562,51 @@ pub fn parse_query<'a>(
     parse_query_with_string_parameters(sql, arena, &[])
 }
 
+pub(crate) fn parse_expression_with_type_inputs<'a>(
+    sql: &'a str,
+    bindings: &'a [super::type_inputs::Binding<'a>],
+    arena: &'a Arena,
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
+) -> Result<&'a Expr<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(bindings);
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after expression"
+        ));
+    }
+    validate(&parser)?;
+    Ok(expression)
+}
+
+pub(crate) fn parse_query_with_type_inputs<'a>(
+    sql: &'a str,
+    bindings: &'a [super::type_inputs::Binding<'a>],
+    arena: &'a Arena,
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
+) -> Result<&'a Select<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    parser.set_type_inputs(bindings);
+    let select = parser
+        .query_select()
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after query"
+        ));
+    }
+    validate(&parser)?;
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
 /// Analyze ordinary expression strings as parameters while preserving syntax
 /// that requires literal tokens, including JSON_TABLE paths and typed constants.
 /// Parameter positions are sorted source byte offsets; indices start at one.
@@ -534,9 +642,12 @@ pub(crate) fn parse_cursor_command<'a>(
     sql: &'a str,
     arena: &'a Arena,
     parameters: &'a [NamedParameter<'a>],
+    inputs: &'a [super::type_inputs::Binding<'a>],
+    validate: impl FnOnce(&Parser<'a>) -> Result<(), super::eval::SqlError>,
 ) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
     let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
     parser.named_parameters = parameters;
+    parser.set_type_inputs(inputs);
     let mut statement = None;
     let mut multiple = false;
     while let Some(parsed) = parser
@@ -555,6 +666,7 @@ pub(crate) fn parse_cursor_command<'a>(
             "cannot open multi-query plan as cursor"
         ));
     }
+    validate(&parser)?;
     arena
         .alloc(statement.unwrap())
         .map(|statement| &*statement)
@@ -671,6 +783,7 @@ pub(crate) fn parse_type_name<'a>(
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_expression<'a>(
     sql: &'a str,
     arena: &'a Arena,
@@ -682,10 +795,32 @@ pub(crate) fn parse_expression<'a>(
     if parser.peeked != Tok::Eof {
         return Err(crate::sql_err!(
             sqlstate::SYNTAX_ERROR,
-            "trailing tokens after routine parameter default"
+            "trailing tokens after expression"
         ));
     }
     Ok(expression)
+}
+
+pub(crate) fn parse_expression_list<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], super::eval::SqlError> {
+    let parse = || -> Result<_, ParseError> {
+        let mut parser = Parser::new(sql, arena)?;
+        let mut expressions = ArenaList::new(arena);
+        loop {
+            let expression = parser.expression(0)?;
+            parser.push(&mut expressions, expression)?;
+            if !parser.eat_op(",")? {
+                break;
+            }
+        }
+        if parser.peeked != Tok::Eof {
+            return Err(parser.err_here("trailing tokens after expression list"));
+        }
+        Ok(expressions.as_slice())
+    };
+    parse().map_err(|error| super::parse_error_to_sql(&error))
 }
 
 impl<'a> Parser<'a> {
@@ -704,6 +839,8 @@ impl<'a> Parser<'a> {
             previous_token: None,
             column_sources: None,
             namespace_sources: None,
+            type_input_sources: None,
+            type_inputs: &[],
             windows: ArenaList::new(arena),
             warnings: ArenaList::new(arena),
             allow_into: false,
@@ -715,11 +852,193 @@ impl<'a> Parser<'a> {
         })
     }
 
+    pub(crate) fn capture_type_inputs(&mut self) {
+        if self.type_input_sources.is_none() {
+            self.type_input_sources = Some(core::cell::RefCell::new(TypeInputSources {
+                strings: ArenaList::new(self.arena),
+                candidates: ArenaList::new(self.arena),
+                restored: ArenaList::new(self.arena),
+            }));
+        }
+    }
+
+    pub(crate) fn type_input_candidates(&self) -> &'a [super::type_inputs::Candidate<'a>] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().candidates.as_slice())
+    }
+
+    pub(crate) fn string_literals(&self) -> &'a [(&'a Expr<'a>, NamespaceSource)] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().strings.as_slice())
+    }
+
+    pub(crate) fn add_contextual_type_input(
+        &self,
+        expression: &Expr<'_>,
+        target_oid: i32,
+        type_mod: i32,
+    ) -> Result<(), super::eval::SqlError> {
+        let Some(candidate) = super::type_inputs::contextual_candidate(
+            self.string_literals(),
+            expression,
+            target_oid,
+            type_mod,
+        )?
+        else {
+            return Ok(());
+        };
+        let sources = self.type_input_sources.as_ref().ok_or_else(|| {
+            crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL type input source capture is unavailable"
+            )
+        })?;
+        if let Some(prior) = sources.borrow().candidates.as_slice().iter().find(|prior| {
+            (prior.start, prior.end, prior.kind) == (candidate.start, candidate.end, candidate.kind)
+        }) {
+            if prior.target != candidate.target || prior.type_mod != candidate.type_mod {
+                return Err(crate::sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "SQL type input expected type changed"
+                ));
+            }
+            return Ok(());
+        }
+        sources
+            .borrow_mut()
+            .candidates
+            .push(candidate)
+            .map_err(|_| super::query::arena_full_pub())
+    }
+
+    pub(crate) fn reorder_type_input_candidates(
+        &self,
+        order: &[(usize, usize, super::type_inputs::InputKind)],
+    ) -> Result<(), super::eval::SqlError> {
+        let Some(first) = order.iter().map(|key| key.0).min() else {
+            return Ok(());
+        };
+        let sources = self.type_input_sources.as_ref().ok_or_else(|| {
+            crate::sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "SQL type input source capture is unavailable"
+            )
+        })?;
+        let current = sources.borrow().candidates.as_slice();
+        let key = |candidate: &super::type_inputs::Candidate<'_>| {
+            (candidate.start, candidate.end, candidate.kind)
+        };
+        for (index, wanted) in order.iter().enumerate() {
+            if order[..index].contains(wanted)
+                || !current.iter().any(|candidate| key(candidate) == *wanted)
+            {
+                return Err(crate::sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "SQL type input order changed"
+                ));
+            }
+        }
+        let mut reordered = ArenaList::new(self.arena);
+        for candidate in current.iter().filter(|candidate| candidate.start < first) {
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        for wanted in order {
+            let candidate = current
+                .iter()
+                .find(|candidate| key(candidate) == *wanted)
+                .expect("checked input occurrence");
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        for candidate in current
+            .iter()
+            .filter(|candidate| candidate.start >= first && !order.contains(&key(candidate)))
+        {
+            reordered
+                .push(*candidate)
+                .map_err(|_| super::query::arena_full_pub())?;
+        }
+        sources.borrow_mut().candidates = reordered;
+        Ok(())
+    }
+
+    pub(crate) fn restored_type_inputs(
+        &self,
+    ) -> &'a [(
+        super::type_inputs::Candidate<'a>,
+        super::type_inputs::Binding<'a>,
+    )] {
+        self.type_input_sources
+            .as_ref()
+            .map_or(&[], |sources| sources.borrow().restored.as_slice())
+    }
+
+    pub(crate) fn type_inputs_complete(&self) -> bool {
+        self.type_input_sources.is_some()
+            && self.restored_type_inputs().len() == self.type_inputs.len()
+    }
+
+    pub(crate) fn set_type_inputs(&mut self, bindings: &'a [super::type_inputs::Binding<'a>]) {
+        self.capture_type_inputs();
+        self.type_inputs = bindings;
+    }
+
     fn string_expression(
         &mut self,
         value: &'a str,
         source_at: usize,
     ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_end = self.previous_token.map_or(source_at, |(_, _, end)| end);
+        let key = (
+            source_at,
+            source_end,
+            super::type_inputs::InputKind::ImplicitLiteral,
+        );
+        if let Ok(index) = self
+            .type_inputs
+            .binary_search_by_key(&key, |binding| (binding.start, binding.end, binding.kind))
+        {
+            let binding = self.type_inputs[index];
+            let expression = self.arena_expr(Expr::Str(value))?;
+            if let Some(sources) = &self.type_input_sources
+                && !sources
+                    .borrow()
+                    .restored
+                    .as_slice()
+                    .iter()
+                    .any(|(_, prior)| (prior.start, prior.end, prior.kind) == key)
+            {
+                sources
+                    .borrow_mut()
+                    .restored
+                    .push((
+                        super::type_inputs::Candidate {
+                            start: source_at,
+                            end: source_end,
+                            target: super::type_inputs::CandidateTarget::ContextualOid(
+                                binding.type_oid,
+                            ),
+                            kind: binding.kind,
+                            type_mod: binding.type_mod,
+                            expression,
+                        },
+                        binding,
+                    ))
+                    .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+            }
+            return self.arena_expr(Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded),
+                type_oid: binding.type_oid,
+                type_mod: binding.type_mod,
+                collation: binding.collation,
+                source: expression,
+            });
+        }
         if let Ok(index) = self.string_parameters.binary_search(&source_at) {
             let parameter = index
                 .checked_add(1)
@@ -803,6 +1122,19 @@ impl<'a> Parser<'a> {
         let parsed = self.expression(0);
         self.stop_default_at_not_null = prior;
         parsed
+    }
+
+    pub(crate) fn source_position(&self) -> usize {
+        self.peek_at
+    }
+
+    pub(crate) fn source_range(&self, fragment: &str) -> Option<(usize, usize)> {
+        let start = (fragment.as_ptr() as usize).checked_sub(self.text.as_ptr() as usize)?;
+        let end = start.checked_add(fragment.len())?;
+        (end <= self.text.len()
+            && self.text.is_char_boundary(start)
+            && self.text.is_char_boundary(end))
+        .then_some((start, end))
     }
 
     pub fn max_param(&self) -> u32 {
@@ -2675,6 +3007,7 @@ impl<'a> Parser<'a> {
             let all = self.set_all()?;
             let right = self.set_intersect()?;
             left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                 operator,
                 all,
                 left,
@@ -2691,6 +3024,7 @@ impl<'a> Parser<'a> {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
             left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                 operator: SetOp::Intersect,
                 all,
                 left,
@@ -2804,6 +3138,7 @@ impl<'a> Parser<'a> {
                 tree = Some(match tree {
                     None => leaf,
                     Some(l) => self.alloc_set(SetTree::Op {
+                        syntax: crate::sql::ast::SetOperationSyntax::Values,
                         operator: SetOp::Union,
                         all: true,
                         left: l,
@@ -2846,6 +3181,7 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: None,
                 inheritance,
@@ -2973,6 +3309,7 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     func_argument_names: &[],
                     func_variadic: false,
+                    func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                     rows_from: Some(functions.as_slice()),
                     col_alias,
                     inheritance: RelationInheritance::Descendants,
@@ -3027,6 +3364,7 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias,
                 inheritance: RelationInheritance::Descendants,
@@ -3044,6 +3382,7 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let quoted_function_name = matches!(self.peeked, Tok::QuotedIdent(_));
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
@@ -3061,21 +3400,29 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let mut func_args =
-            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
-                Some(self.json_table_arguments()?)
-            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
-                Some(self.xml_table_arguments()?)
-            } else if self.peeked == Tok::Op("(") {
-                self.advance()?;
-                let mut args = ArenaList::new(self.arena);
-                let mut names = ArenaList::new(self.arena);
-                let mut saw_named = false;
-                if self.peeked != Tok::Op(")") {
-                    loop {
-                        let this_variadic = self.eat_ident("variadic")?;
-                        let first = self.expression(0)?;
-                        let (argument, argument_name) = if self.eat_op("=>")? {
+        let mut func_args = if schema.is_none()
+            && !quoted_function_name
+            && table == "json_table"
+            && self.peeked == Tok::Op("(")
+        {
+            Some(self.json_table_arguments()?)
+        } else if schema.is_none()
+            && !quoted_function_name
+            && table == "xmltable"
+            && self.peeked == Tok::Op("(")
+        {
+            Some(self.xml_table_arguments()?)
+        } else if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            let mut args = ArenaList::new(self.arena);
+            let mut names = ArenaList::new(self.arena);
+            let mut saw_named = false;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    let this_variadic = self.eat_ident("variadic")?;
+                    let first = self.expression(0)?;
+                    let (argument, argument_name) =
+                        if self.eat_op("=>")? {
                             let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
@@ -3096,28 +3443,28 @@ impl<'a> Parser<'a> {
                             }
                             (first, None)
                         };
-                        self.push(&mut args, argument)?;
-                        self.push(&mut names, argument_name)?;
-                        if this_variadic {
-                            func_variadic = true;
-                            if self.peeked != Tok::Op(")") {
-                                return Err(self.err_here("VARIADIC argument must be last"));
-                            }
-                            break;
+                    self.push(&mut args, argument)?;
+                    self.push(&mut names, argument_name)?;
+                    if this_variadic {
+                        func_variadic = true;
+                        if self.peeked != Tok::Op(")") {
+                            return Err(self.err_here("VARIADIC argument must be last"));
                         }
-                        if !self.eat_op(",")? {
-                            break;
-                        }
+                        break;
+                    }
+                    if !self.eat_op(",")? {
+                        break;
                     }
                 }
-                self.expect_op(")")?;
-                if saw_named {
-                    func_argument_names = names.as_slice();
-                }
-                Some(args.as_slice())
-            } else {
-                None
-            };
+            }
+            self.expect_op(")")?;
+            if saw_named {
+                func_argument_names = names.as_slice();
+            }
+            Some(args.as_slice())
+        } else {
+            None
+        };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -3164,7 +3511,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(TableRef {
+        let source = TableRef {
             schema,
             table,
             alias,
@@ -3172,6 +3519,9 @@ impl<'a> Parser<'a> {
             func_args,
             func_argument_names,
             func_variadic,
+            func_source_position: crate::sql::ast::SourcePosition::new(
+                func_args.map(|_| source.start),
+            ),
             rows_from: None,
             col_alias,
             inheritance,
@@ -3182,7 +3532,41 @@ impl<'a> Parser<'a> {
             authorization_role: None,
             bound_table: None,
             view_access: None,
-        })
+        };
+        // PostgreSQL expands only an unqualified FROM UNNEST with multiple
+        // positional inputs into independent catalog calls in lockstep.
+        if source.schema.is_none()
+            && source.table == "unnest"
+            && !source.func_variadic
+            && source.func_argument_names.is_empty()
+            && let Some(arguments) = source.func_args
+            && arguments.len() > 1
+        {
+            let mut functions = ArenaList::new(self.arena);
+            for argument in arguments {
+                let input = self.arena_slice(&[*argument])?;
+                self.push(
+                    &mut functions,
+                    TableRef {
+                        schema: Some("pg_catalog"),
+                        table: "unnest",
+                        alias: None,
+                        func_args: Some(input),
+                        with_ordinality: false,
+                        lateral: false,
+                        col_alias: None,
+                        ..source
+                    },
+                )?;
+            }
+            return Ok(TableRef {
+                table: "unnest",
+                func_args: None,
+                rows_from: Some(functions.as_slice()),
+                ..source
+            });
+        }
+        Ok(source)
     }
 
     /// Parses `JSON_TABLE` into an ordinary bounded table-function source.
@@ -6954,6 +7338,7 @@ impl<'a> Parser<'a> {
     }
 
     fn insert(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
@@ -7024,6 +7409,7 @@ impl<'a> Parser<'a> {
         let on_conflict = self.on_conflict()?;
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
+            source_position,
             table,
             columns: column_names.as_slice(),
             rows: rows.as_slice(),
@@ -7252,6 +7638,7 @@ impl<'a> Parser<'a> {
     }
 
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("update")?;
         let table = self.qual_name("table name")?;
         let alias =
@@ -7276,6 +7663,7 @@ impl<'a> Parser<'a> {
         let where_clause = self.where_clause()?;
         let returning = self.returning()?;
         Ok(Stmt::Update(Update {
+            source_position,
             table,
             alias,
             assignments,
@@ -7288,6 +7676,7 @@ impl<'a> Parser<'a> {
     /// `MERGE INTO [ONLY] target [*] [AS alias] USING source [AS alias] ON cond
     /// { WHEN MATCHED | WHEN NOT MATCHED [BY SOURCE | BY TARGET] ... }...`.
     fn merge(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         use crate::sql::ast::{Merge, MergeMatchKind, MergeWhen};
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
@@ -7368,6 +7757,7 @@ impl<'a> Parser<'a> {
         }
         let returning = self.returning()?;
         Ok(Stmt::Merge(Merge {
+            source_position,
             target,
             target_inheritance,
             target_alias,
@@ -8440,6 +8830,17 @@ impl<'a> Parser<'a> {
         expression: &'a Expr<'a>,
         source: NamespaceSource,
     ) -> Result<(), ParseError> {
+        if let Some(sources) = &self.type_input_sources {
+            let original = match expression {
+                Expr::BoundLiteral { source, .. } => *source,
+                _ => expression,
+            };
+            sources
+                .borrow_mut()
+                .strings
+                .push((original, source))
+                .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+        }
         if let Some(sources) = &self.namespace_sources {
             sources
                 .borrow_mut()
@@ -8635,10 +9036,99 @@ impl<'a> Parser<'a> {
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
         }
-        self.arena
+        let expression = self
+            .arena
             .alloc(e)
             .map(|m| &*m)
-            .map_err(|_| self.arena_full("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        if let Some(sources) = &self.type_input_sources
+            && let Expr::Cast {
+                operand,
+                type_name,
+                type_mod,
+                ..
+            } = expression
+            && let Expr::Str(_) = operand
+        {
+            let source =
+                sources
+                    .borrow()
+                    .strings
+                    .as_slice()
+                    .iter()
+                    .find_map(|(candidate, source)| {
+                        core::ptr::eq(*candidate, *operand).then_some(*source)
+                    });
+            if let Some(source) = source {
+                let end = self.previous_token.map_or(source.end, |(_, _, end)| end);
+                let key = (
+                    source.start,
+                    end,
+                    super::type_inputs::InputKind::ExplicitCast,
+                );
+                if let Ok(index) = self.type_inputs.binary_search_by_key(&key, |binding| {
+                    (binding.start, binding.end, binding.kind)
+                }) {
+                    let binding = self.type_inputs[index];
+                    if binding.type_mod != *type_mod {
+                        return Err(self.err_here("bound type input has a different type modifier"));
+                    }
+                    if !sources
+                        .borrow()
+                        .restored
+                        .as_slice()
+                        .iter()
+                        .any(|(_, prior)| (prior.start, prior.end, prior.kind) == key)
+                    {
+                        sources
+                            .borrow_mut()
+                            .restored
+                            .push((
+                                super::type_inputs::Candidate {
+                                    start: source.start,
+                                    end,
+                                    target: super::type_inputs::CandidateTarget::TypeName(
+                                        type_name,
+                                    ),
+                                    kind: super::type_inputs::InputKind::ExplicitCast,
+                                    type_mod: *type_mod,
+                                    expression,
+                                },
+                                binding,
+                            ))
+                            .map_err(|_| {
+                                self.arena_full("type input source map exceeds SQL arena")
+                            })?;
+                    }
+                    return self
+                        .arena
+                        .alloc(Expr::BoundLiteral {
+                            value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(
+                                binding.encoded,
+                            ),
+                            type_oid: binding.type_oid,
+                            type_mod: binding.type_mod,
+                            collation: binding.collation,
+                            source: expression,
+                        })
+                        .map(|expression| &*expression)
+                        .map_err(|_| self.arena_full("bound type input exceeds SQL arena"));
+                }
+                sources
+                    .borrow_mut()
+                    .candidates
+                    .push(super::type_inputs::Candidate {
+                        start: source.start,
+                        end,
+                        target: super::type_inputs::CandidateTarget::TypeName(type_name),
+                        kind: super::type_inputs::InputKind::ExplicitCast,
+                        type_mod: *type_mod,
+                        expression,
+                    })
+                    .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
+            }
+        }
+        Ok(expression)
     }
 
     /// Parses a flat, deduplicated grouping-expression list plus PostgreSQL's
@@ -8940,6 +9430,22 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "syntax error: {}", expected),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
+    fn syntax_error_here(&self) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: if self.peeked == Tok::Eof {
+                StackStr::from_str("syntax error at end of input")
+            } else {
+                stack_format!(
+                    96,
+                    "syntax error at or near \"{}\"",
+                    &self.text[self.peek_at..self.lexer.token_end()]
+                )
+            },
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -10972,6 +11478,7 @@ mod tests {
                 operator: BinaryOp::Add,
                 left,
                 right,
+                ..
             } = expression
             else {
                 panic!()
@@ -11926,5 +12433,231 @@ mod tests {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}");
             });
         }
+    }
+
+    #[test]
+    fn sql_constructor_and_temporal_calls_keep_their_syntax_identity() {
+        for (sql, expected) in [
+            (
+                "SELECT json_scalar(1)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT xmlconcat('<a/>'::xml)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT merge_action()",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT current_time(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            ("SELECT localtime(3)", crate::sql::ast::CallKind::SqlSyntax),
+            (
+                "SELECT current_timestamp(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT localtimestamp(0)",
+                crate::sql::ast::CallKind::SqlSyntax,
+            ),
+            (
+                "SELECT \"json_scalar\"(1)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT pg_catalog.xmlconcat('<a/>'::xml)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT \"merge_action\"()",
+                crate::sql::ast::CallKind::Routine,
+            ),
+            (
+                "SELECT pg_catalog.current_time(0)",
+                crate::sql::ast::CallKind::Routine,
+            ),
+        ] {
+            with_parser(sql, |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected SELECT");
+                };
+                let [
+                    SelectItem::Expr {
+                        expression: Expr::Call { kind, .. },
+                        ..
+                    },
+                ] = select.items
+                else {
+                    panic!("expected call");
+                };
+                assert_eq!(*kind, expected, "{sql}");
+            });
+        }
+        for sql in [
+            "SELECT json_scalar()",
+            "SELECT xmlconcat()",
+            "SELECT merge_action(1)",
+            "SELECT current_time(1+1)",
+            "SELECT localtime(NULL)",
+            "SELECT json_scalar(DISTINCT 1)",
+            "SELECT xmlconcat('<a/>'::xml) OVER ()",
+        ] {
+            with_parser(sql, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR,
+                    "{sql}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn sql_expression_modifiers_fail_at_the_original_token() {
+        for (sql, token) in [
+            ("SELECT COALESCE(DISTINCT 1,2)", "DISTINCT"),
+            ("SELECT ROW(VARIADIC ARRAY[1])", "VARIADIC"),
+            ("SELECT NULLIF(1,2) FILTER (WHERE true)", "FILTER"),
+            ("SELECT GREATEST(a=>1,b=>2)", "=>"),
+            ("SELECT JSON_ARRAY(DISTINCT 1)", "DISTINCT"),
+            ("SELECT JSON_ARRAY(VARIADIC ARRAY[1])", "VARIADIC"),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(
+                    error.message,
+                    stack_format!(96, "syntax error at or near \"{}\"", token)
+                );
+                assert_eq!(&sql[error.at..error.at + token.len()], token);
+            });
+        }
+        for sql in [
+            "SELECT \"coalesce\"(DISTINCT 1,2)",
+            "SELECT unnest(DISTINCT ARRAY[1])",
+            "SELECT unnest(VARIADIC ARRAY[1])",
+        ] {
+            with_parser(sql, |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    select.items,
+                    [SelectItem::Expr {
+                        expression: Expr::Call {
+                            kind: CallKind::Routine,
+                            ..
+                        },
+                        ..
+                    }]
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn ordinary_call_closing_errors_keep_the_unexpected_token() {
+        for (sql, message) in [
+            (
+                "SELECT pg_catalog.json_object('x':1)",
+                "syntax error at or near \":\"",
+            ),
+            (
+                "SELECT \"pg_catalog\".json_object('x':1)",
+                "syntax error at or near \":\"",
+            ),
+            ("SELECT arbitrary(1:2)", "syntax error at or near \":\""),
+            ("SELECT arbitrary(1", "syntax error at end of input"),
+            ("SELECT count(*", "syntax error at end of input"),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+                assert_eq!(error.message.as_str(), message);
+            });
+        }
+    }
+
+    #[test]
+    fn array_brackets_build_nested_array_expressions() {
+        with_parser("SELECT ARRAY[[1,NULL],[3,4]]", |parser| {
+            let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
+            let [
+                SelectItem::Expr {
+                    expression: Expr::Array(rows),
+                    ..
+                },
+            ] = select.items
+            else {
+                panic!()
+            };
+            assert!(matches!(
+                rows,
+                [
+                    Expr::Array([Expr::Int(1), Expr::Null]),
+                    Expr::Array([Expr::Int(3), Expr::Int(4)])
+                ]
+            ));
+        });
+        with_parser(
+            "SELECT CASE WHEN false THEN ARRAY[[[[[[[1]]]]]]] ELSE ARRAY[1] END",
+            |parser| {
+                assert!(parser.next_stmt().unwrap().is_some());
+            },
+        );
+        with_parser("SELECT ARRAY[[1],ARRAY[2]]", |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().message.as_str(),
+                "syntax error at or near \"ARRAY\""
+            );
+        });
+        let deep = format!("SELECT ARRAY{}1{}", "[".repeat(65), "]".repeat(65));
+        with_parser(&deep, |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod source_position_tests {
+    use super::*;
+
+    #[test]
+    fn source_positions_preserve_occurrence_identity_without_affecting_expression_equality() {
+        let mut budget = crate::mem::budget::Budget::new(64 << 10);
+        let arena = Arena::new(&mut budget, "expression source metadata", 64 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let first = parse_expr("f(1)+g(2)::integer", &arena).unwrap();
+            let second = parse_expr(" f(1)+g(2)::integer", &arena).unwrap();
+            assert_eq!(first, second, "nested provenance is not SQL semantics");
+            assert_eq!(first.source_position().get(), Some(4));
+            assert_eq!(second.source_position().get(), Some(5));
+            let Expr::Binary { left, right, .. } = first else {
+                panic!("binary expression")
+            };
+            assert_eq!(left.source_position().get(), Some(0));
+            assert_eq!(right.source_position().get(), Some(9));
+            let copied = crate::sql::ast::duplicate_expression(first, &arena, &[]).unwrap();
+            assert_eq!(copied, first);
+            assert_eq!(copied.source_position().get(), Some(4));
+            let Expr::Binary { left, right, .. } = copied else {
+                panic!("copied binary")
+            };
+            assert_eq!(left.source_position().get(), Some(0));
+            assert_eq!(right.source_position().get(), Some(9));
+            let query =
+                parse_query("SELECT * FROM first_fn() JOIN second_fn() ON true", &arena).unwrap();
+            let from = query.from.unwrap();
+            assert_eq!(from.base.func_source_position.get(), Some(14));
+            assert_eq!(from.joins[0].table.func_source_position.get(), Some(30));
+        });
     }
 }

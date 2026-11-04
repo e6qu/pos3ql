@@ -94,8 +94,8 @@ notifications, sequence-session state and session advisory locks. A temporary
 cleanup capacity error leaves those other session settings intact.
 
 `DISCARD SEQUENCES` clears this connection's remembered sequence values; it does
-not rewind the sequence. `DISCARD PLANS` succeeds because execution rebuilds
-plans rather than retaining a reusable execution-plan cache. Temporary schemas
+not rewind the sequence. `DISCARD PLANS` refreshes future preparation; running
+calls, bound portals and open cursors keep their checked values. Temporary schemas
 currently support tables, views and sequences; named types and routines require
 ordinary schemas.
 
@@ -136,6 +136,13 @@ to their source. Membership edits for the same role
 wait for its transaction, including a prepared transaction after recovery;
 other roles and catalog readers can proceed. Repeated grants emit a NOTICE,
 while revoking a missing grant emits a WARNING, matching PostgreSQL's fields.
+
+Owner privileges follow inherited membership; permission to `SET ROLE` is
+separate. For example, an `app` account with INHERIT FALSE and SET TRUE for
+`owners` cannot alter their table until it executes `SET ROLE owners`. With
+INHERIT TRUE and SET FALSE, it can alter the table directly, but `SET ROLE owners`
+returns `42501`. The same distinction applies to changing default privileges
+and dropping or reassigning owned objects.
 
 Default privileges describe what new objects receive. Their catalog identifier
 belongs to the owner, schema and object class, while their permission list is
@@ -199,6 +206,23 @@ SQL JSON constructors use registered enum-to-JSON conversions, including inside
 arrays and records. Arrays and records retain their structural representation
 instead of invoking a cast registered for the whole container.
 
+Geometric conversions follow PostgreSQL's cast rules. For example, assigning a
+polygon to a path column is allowed; assigning a box to a point column needs
+an explicit `::point` cast. Those rules also apply to typed NULL values and
+arrays. Converting an open path to a polygon fails with `22023`, whether written
+as `polygon(value)` or `value::polygon`.
+Registered conversion functions receive the declared size limit and whether the
+SQL requested an explicit conversion. For example, `SELECT 7::varchar(5)` passes
+modifier `9` (PostgreSQL's length-plus-four encoding) and true to a three-argument
+integer-to-varchar cast. Inserting `7` into a `varchar(5)` column passes the same
+modifier and false. Element conversions inside arrays and domains keep that
+size limit too.
+
+Explicit array conversions honor a registered whole-array cast first, then
+element conversions when applicable. Element conversions run once in array
+order and preserve dimensions and starting subscripts. A user function that
+accepts NULL may convert a NULL element; a NULL array has no elements to convert.
+
 `array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
 `btarraycmp` use the array comparison rules of the SQL operators. They accept
 arrays wrapped in domains (types with extra checks), preserving dimensions and
@@ -233,7 +257,18 @@ cursor can use repeated small fetches without retaining earlier batches.
 `MOVE` advances without saving output; a forward jump saves its target row.
 This path accepts columns, wildcards, constants, captured parameters, built-in
 binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
-array construction, element access, slices and filters composed from them.
+array construction, element access, slices, scalar function calls, built-in
+casts and filters composed from them. A query without a table source retains
+one input row: `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')`
+does not issue a number until its first nonzero fetch. `FETCH 0` issues none,
+and fetching after its one row issues no further number. A holdable cursor
+evaluates an unread row when commit saves its remaining results.
+Fixed input rows use the same fetch boundary. For example,
+`SELECT nextval('order_numbers') FROM (VALUES(10),(20)) input(id)` issues one
+number per fetched row. These constant VALUES sources retain their rows without
+running the outer expressions. Two comma-separated VALUES rows allow backward
+fetching by default; one row and explicit UNION ALL remain forward-only unless
+`SCROLL` is requested. Other cursor plans still execute when opened.
 `BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
 and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
 the lower comparison is false. PostgreSQL can evaluate the tested expression
@@ -312,6 +347,12 @@ generated-column calculation, before AFTER row triggers. An AFTER row trigger
 cannot rewrite those saved transition values. Each connection and subscription
 worker has `copy_transition_bytes` plus `txn_rows` records reserved at startup.
 Exhaustion returns `54000` and aborts COPY; cleanup permits a smaller retry.
+If a statement trigger declares `REFERENCING NEW TABLE AS inserted_rows`, its
+queries can read `inserted_rows` while preparing and executing the trigger.
+For example, `INSERT INTO audit SELECT id FROM inserted_rows` sees that COPY
+statement's saved values. Discovering those columns' types does not run the
+trigger's queries or functions. A local `WITH inserted_rows AS (...)` uses its
+own rows under the ordinary SQL name rules.
 
 `COPY TO` retains the selected schema and row sources and releases them on
 completion or error. Table form reads only that relation; use query form to
@@ -428,6 +469,19 @@ tests the inserted row's identifier. A scalar subquery with no rows returns
 NULL; more than one row fails with `21000`. A subquery in a skipped `CASE` or
 boolean branch does not run.
 
+Numeric `FOR` loops create a private integer variable. For example, if a routine
+declares `value text := 'outer'`, then `FOR value IN 1..2 LOOP NULL; END LOOP`
+leaves that outer `value` unchanged. Query `FOR` loops and `FOREACH` instead assign
+their declared target, which keeps the last assigned row or element after the
+loop. An empty query loop assigns a null row; an empty array loop leaves the
+target unchanged. These distinctions also apply to function output variables.
+The [PostgreSQL reference evidence](https://github.com/e6qu/pos3ql/blob/bcbaba7ba47b735c123198a03d14e80935340a3e/tests/external/reference/2026-11-03-input-plans/README.md)
+includes matching examples and raw results.
+
+An `EXCEPTION WHEN OTHERS` handler excludes query cancellation and assertion
+failures. Catch those deliberately with `WHEN query_canceled` or
+`WHEN assert_failure`; a broad handler does not keep cancelled work running.
+
 DDL success follows its end-of-command event triggers. A hook that raises an
 error rolls the command back and keeps its notices, without sending a success
 tag first. Supported static DDL in a `DO` block or routine uses the same
@@ -500,6 +554,14 @@ an insert therefore conflicts with an ordinary read of that target, while
 unrelated tables remain usable. Replacement keeps enable mode and comments;
 `_RETURN` cannot be renamed. View rule/trigger mode changes and materialized-view
 mode changes retain PostgreSQL's explicit relation-kind errors.
+
+`pg_get_ruledef` reads its identifier and formatting flag once. Unconditional
+`DO NOTHING` rules support both PostgreSQL formatting modes. Other rules return
+their saved SQL when the flag is omitted or false; requesting pretty formatting
+for a condition or action returns `0A000`. For example,
+`pg_get_ruledef(rule_oid, false)` reconstructs a rule without requesting that
+unsupported formatting. Names are quoted when their spelling requires it,
+including reserved words and embedded quotes. A missing rule returns NULL in either mode.
 
 ## Catalog listings and current lookups
 

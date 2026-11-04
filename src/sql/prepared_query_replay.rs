@@ -28,11 +28,13 @@ pub(super) fn stage_query_record(
             check_option,
             dependencies,
         } => {
-            let columns = columns
-                .materialize()
-                .ok_or_else(|| invalid("view columns"))?;
-            let dependencies =
-                storage.rebind_stored_query_dependencies(dependencies.materialize()?, txid)?;
+            let (columns, default_inputs) = columns.materialize(storage, txid)?;
+            let dependencies = storage.rebind_stored_query_dependencies(
+                dependencies.materialize(storage, txid, |section| {
+                    (section == crate::storage::StoredInputSection::Query).then_some(*sql)
+                })?,
+                txid,
+            )?;
             let sql = text::<VIEW_SQL_MAX>(sql)?;
             let creation_path = text::<128>(path)?;
             let publication = storage.restore_prepared_view(
@@ -41,6 +43,7 @@ pub(super) fn stage_query_record(
                 SqlName::parse(name)?,
                 ViewDefinition {
                     persistence: RelationPersistence::Permanent,
+                    default_inputs,
                     columns,
                     query: StoredQueryDefinition {
                         sql,
@@ -103,13 +106,12 @@ pub(super) fn stage_query_record(
             let slot = storage
                 .view_slot(schema, name, txid)
                 .ok_or_else(|| invalid("view source"))?;
-            let columns = columns
-                .materialize()
-                .ok_or_else(|| invalid("view columns"))?;
+            let (columns, default_inputs) = columns.materialize(storage, txid)?;
             let prior = storage.stage_view_columns(
                 storage.prepare_view_edit(slot, txid)?,
                 columns,
                 txid,
+                default_inputs,
             )?;
             transaction.record_catalog_change(
                 storage,
@@ -155,8 +157,20 @@ pub(super) fn stage_query_record(
             dependencies,
         } => {
             let target = rule_target(storage, *target, table_schema, table, txid)?;
-            let dependencies =
-                storage.rebind_stored_query_dependencies(dependencies.materialize()?, txid)?;
+            let dependencies = storage.rebind_stored_query_dependencies(
+                dependencies.materialize(storage, txid, |section| match section {
+                    crate::storage::StoredInputSection::RuleSource => Some(*source),
+                    crate::storage::StoredInputSection::Query
+                        if *name == "_RETURN" && condition.is_none() && *action_count == 1 =>
+                    {
+                        let span = actions[0];
+                        let start = usize::from(span.start);
+                        source.get(start..start + usize::from(span.len))
+                    }
+                    _ => None,
+                })?,
+                txid,
+            )?;
             let publication = storage.restore_prepared_rule(
                 usize::from(*slot),
                 *created_at,
@@ -368,8 +382,14 @@ pub(super) fn stage_query_record(
                         .ok_or_else(|| invalid("policy role"))?
                 };
             }
-            let dependencies =
-                storage.rebind_stored_query_dependencies(dependencies.materialize()?, txid)?;
+            let dependencies = storage.rebind_stored_query_dependencies(
+                dependencies.materialize(storage, txid, |section| match section {
+                    crate::storage::StoredInputSection::PolicyUsing => *using,
+                    crate::storage::StoredInputSection::PolicyCheck => *with_check,
+                    _ => None,
+                })?,
+                txid,
+            )?;
             let slot = identity.slot();
             if slot >= storage.policy_count() {
                 return Err(invalid("policy position"));

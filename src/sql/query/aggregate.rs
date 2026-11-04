@@ -22,6 +22,22 @@ use super::{
     scan_source_with_pax_columns,
 };
 
+fn support_function_strict(storage: &Storage, oid: i32, txid: u32) -> Result<bool, SqlError> {
+    if let Some(slot) = storage.routine_slot_by_oid(oid, txid) {
+        return Ok(storage.routine_for(slot, txid).attributes.strict);
+    }
+    crate::sql::catalog::builtin_callable_by_oid(oid)
+        .filter(|signature| signature.kind == b'f' && !signature.returns_set)
+        .map(|signature| signature.catalog.strict)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "aggregate support function with OID {} does not exist",
+                oid
+            )
+        })
+}
+
 struct JsonAggregateDisplay<'a> {
     values: &'a [Datum<'a>],
     jsonb: bool,
@@ -145,6 +161,16 @@ pub(crate) fn fold_aggregates<'a>(
         .alloc_slice_with(agg_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
     for (i, state) in states[..agg_nodes.len()].iter_mut().enumerate() {
+        state.initialize_direct_inputs(
+            agg_nodes[i].1,
+            arena,
+            params,
+            &Chained {
+                inner: &super::ScopeSchema(scope),
+                outer: outer_arg,
+            },
+            hooks,
+        )?;
         out[i] = state.finish(arena, hooks.catalog)?;
     }
     Ok(out)
@@ -153,7 +179,7 @@ pub(crate) fn fold_aggregates<'a>(
 #[derive(Clone, Copy)]
 pub(crate) struct AggState<'a> {
     kind: AggKind,
-    custom: Option<&'a crate::storage::AggregateRoutine>,
+    custom: Option<(i32, &'a crate::storage::AggregateRoutine)>,
     custom_moving: bool,
     custom_state_initialized: bool,
     custom_transition_strict: bool,
@@ -166,6 +192,7 @@ pub(crate) struct AggState<'a> {
     custom_moving_state_oid: i32,
     custom_direct_oids: &'a [i32],
     custom_argument_oids: &'a [i32],
+    custom_input_collation: Collation,
     star: bool,
     count: u64,
     sum_int: i128,
@@ -174,6 +201,7 @@ pub(crate) struct AggState<'a> {
     sum_interval_micros: i128,
     sum_interval_infinity: i8,
     sum_float: f64,
+    percentile: Option<Datum<'a>>,
     // `sum(real)` accumulates in single precision, matching PostgreSQL's
     // float4 sum (so a running total loses the same low bits it does there);
     // avg/variance over real still fold into the f64 accumulators below.
@@ -442,6 +470,7 @@ impl Default for AggState<'_> {
             custom_moving_state_oid: 0,
             custom_direct_oids: &[],
             custom_argument_oids: &[],
+            custom_input_collation: Collation::None,
             star: false,
             count: 0,
             sum_int: 0,
@@ -450,6 +479,7 @@ impl Default for AggState<'_> {
             sum_interval_micros: 0,
             sum_interval_infinity: 0,
             sum_float: 0.0,
+            percentile: None,
             sum_float4: 0.0,
             sum_numeric: None,
             sum_sq: 0.0,
@@ -488,6 +518,7 @@ impl Default for AggState<'_> {
 /// non-numeric value).
 fn agg_f64(d: &Datum) -> Option<f64> {
     match d {
+        Datum::Int2(v) => Some(f64::from(*v)),
         Datum::Int4(v) => Some(*v as f64),
         Datum::Int8(v) => Some(*v as f64),
         Datum::Float4(v) => Some(f64::from(*v)),
@@ -495,6 +526,83 @@ fn agg_f64(d: &Datum) -> Option<f64> {
         Datum::Numeric(n) => Some(n.to_f64()),
         _ => None,
     }
+}
+
+fn percentile_fraction(value: Datum<'_>) -> Result<f64, SqlError> {
+    let fraction = agg_f64(&value).ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "percentile value must be numeric"
+        )
+    })?;
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "percentile value {} is not between 0 and 1",
+            fraction
+        ));
+    }
+    Ok(fraction)
+}
+
+fn percentile_value<'a>(
+    values: &[Datum<'a>],
+    fraction: f64,
+    continuous: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let n = values.len();
+    if !continuous {
+        let index = ((fraction * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        return Ok(values[index]);
+    }
+    let position = fraction * (n as f64 - 1.0);
+    let low = position.floor() as usize;
+    let high = position.ceil() as usize;
+    let weight = position - low as f64;
+    if let (Datum::Interval(_), Datum::Interval(_)) = (values[low], values[high]) {
+        if low == high {
+            return Ok(values[low]);
+        }
+        let Datum::Interval(difference) = crate::sql::eval::binary(
+            crate::sql::ast::BinaryOp::Sub,
+            values[high],
+            values[low],
+            false,
+            false,
+            arena,
+        )?
+        else {
+            unreachable!("interval subtraction result");
+        };
+        let scaled = crate::sql::datetime::interval_scale(difference, weight, false)?;
+        return crate::sql::eval::binary(
+            crate::sql::ast::BinaryOp::Add,
+            Datum::Interval(scaled),
+            values[low],
+            false,
+            false,
+            arena,
+        );
+    }
+    let low_value = agg_f64(&values[low]).ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "continuous percentile input must be numeric or interval"
+        )
+    })?;
+    if low == high {
+        return Ok(Datum::Float8(low_value));
+    }
+    let high_value = agg_f64(&values[high]).ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "continuous percentile input must be numeric or interval"
+        )
+    })?;
+    Ok(Datum::Float8(low_value + weight * (high_value - low_value)))
 }
 
 impl<'a> AggState<'a> {
@@ -526,7 +634,7 @@ impl<'a> AggState<'a> {
         unsafe { core::slice::from_raw_parts_mut(self.ord_collations, self.ord_collations_len) }
     }
 
-    pub(crate) fn initialize_custom_direct(
+    pub(crate) fn initialize_direct_inputs(
         &mut self,
         node: &Expr<'a>,
         arena: &'a Arena,
@@ -534,9 +642,55 @@ impl<'a> AggState<'a> {
         row: &impl ColumnLookup<'a>,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<(), SqlError> {
-        let Some(aggregate) = self.custom else {
+        if self.custom.is_none()
+            && matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc)
+        {
+            if self.percentile.is_none() {
+                let Expr::Call { args, .. } = node else {
+                    unreachable!("aggregate state belongs to a call");
+                };
+                let fraction = args.first().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "percentile aggregate has no direct input"
+                    )
+                })?;
+                let value = eval_full(fraction, arena, params, row, hooks)?;
+                let target = if matches!(value, Datum::Array { .. }) {
+                    crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Float8)
+                } else {
+                    crate::sql::types::ColType::Float8
+                };
+                self.percentile = Some(crate::sql::eval::cast_to(value, target, arena)?);
+            }
+            return Ok(());
+        }
+        let Some((_, aggregate)) = self.custom else {
             return Ok(());
         };
+        let Expr::Call { args, order_by, .. } = node else {
+            unreachable!("aggregate state belongs to a call")
+        };
+        let mut expressions = [&Expr::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let count = if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+            args.len()
+        } else {
+            args.len() + order_by.len()
+        };
+        if count > expressions.len() {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_ARGUMENTS,
+                "aggregate has too many arguments"
+            ));
+        }
+        expressions[..args.len()].copy_from_slice(args);
+        if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+            for (output, ordering) in expressions[args.len()..count].iter_mut().zip(*order_by) {
+                *output = ordering.expression;
+            }
+        }
+        self.custom_input_collation =
+            crate::sql::eval::routine_input_collation(&expressions[..count], row, hooks.catalog)?;
         if self.custom_direct_initialized || aggregate.direct_argument_count == 0 {
             return Ok(());
         }
@@ -556,7 +710,7 @@ impl<'a> AggState<'a> {
     }
 
     pub(crate) fn supports_partial(&self) -> bool {
-        self.custom.is_some_and(|aggregate| {
+        self.custom.is_some_and(|(_, aggregate)| {
             matches!(aggregate.kind, crate::storage::AggregateKind::Normal)
                 && aggregate.partial.is_some()
                 && !self.distinct
@@ -570,7 +724,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<(), SqlError> {
-        let aggregate = self.custom.expect("partial aggregate is catalog-defined");
+        let (aggregate_oid, aggregate) = self.custom.expect("partial aggregate is catalog-defined");
         let partial = aggregate
             .partial
             .expect("partial aggregate contract selected");
@@ -589,6 +743,8 @@ impl<'a> AggState<'a> {
                     serde.serialize_oid,
                     &[incoming],
                     &[self.custom_state_oid],
+                    self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -605,6 +761,8 @@ impl<'a> AggState<'a> {
                         crate::sql::types::oid::BYTEA,
                         crate::sql::types::oid::INTERNAL,
                     ],
+                    self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -637,6 +795,8 @@ impl<'a> AggState<'a> {
                     partial.combine_oid,
                     &[current, incoming],
                     &[self.custom_state_oid, self.custom_state_oid],
+                    self.custom_input_collation,
+                    crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                     arena,
                 )?
                 .ok_or_else(|| {
@@ -667,7 +827,10 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
         let Expr::Call {
+            kind,
             name,
+            argument_names,
+            variadic,
             star,
             distinct,
             order_by,
@@ -679,6 +842,48 @@ impl<'a> AggState<'a> {
             return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
         self.init_order_collations(args.len().saturating_add(order_by.len()).max(2), arena)?;
+        let custom_aggregate = |inputs: &[i32]| -> Result<
+            Option<(usize, crate::storage::AggregateRoutine)>,
+            SqlError,
+        > {
+            if *kind == crate::sql::ast::CallKind::SqlSyntax {
+                return Ok(None);
+            }
+            match storage.select_routine_call(
+                name,
+                argument_names,
+                inputs,
+                *variadic,
+                txid,
+                crate::storage::RoutineCallKind::Aggregate,
+            ) {
+                crate::storage::RoutineCallSelection::Stored(slot) => {
+                    let Some((selected, _, aggregate)) =
+                        storage.aggregate_for_call_oids(name, inputs, txid)
+                    else {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "{} is not an aggregate",
+                            name
+                        ));
+                    };
+                    debug_assert_eq!(slot, selected);
+                    Ok(Some((slot, aggregate)))
+                }
+                crate::storage::RoutineCallSelection::Builtin { .. }
+                | crate::storage::RoutineCallSelection::Absent => Ok(None),
+                crate::storage::RoutineCallSelection::Ambiguous => Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "function {} is not unique",
+                    name
+                )),
+                crate::storage::RoutineCallSelection::WrongKind { .. } => Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "{} is not an aggregate",
+                    name
+                )),
+            }
+        };
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if args.len() <= argument_oids.len() {
             let mut inferred = true;
@@ -689,8 +894,7 @@ impl<'a> AggState<'a> {
                 }
             }
             if inferred
-                && let Some((slot, _, aggregate)) =
-                    storage.aggregate_for_call_oids(name, &argument_oids[..args.len()], txid)
+                && let Some((slot, aggregate)) = custom_aggregate(&argument_oids[..args.len()])?
             {
                 storage.require_routine_execute(slot, txid)?;
                 if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
@@ -700,7 +904,10 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
+                self.custom = Some((
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    arena.alloc(aggregate).map_err(|_| arena_full())?,
+                ));
             }
         }
         if self.custom.is_none()
@@ -715,11 +922,8 @@ impl<'a> AggState<'a> {
                 }
             }
             if inferred
-                && let Some((slot, _, aggregate)) = storage.aggregate_for_call_oids(
-                    name,
-                    &argument_oids[..args.len() + order_by.len()],
-                    txid,
-                )
+                && let Some((slot, aggregate)) =
+                    custom_aggregate(&argument_oids[..args.len() + order_by.len()])?
             {
                 storage.require_routine_execute(slot, txid)?;
                 if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
@@ -729,10 +933,25 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
+                self.custom = Some((
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    arena.alloc(aggregate).map_err(|_| arena_full())?,
+                ));
             }
         }
-        if let Some(aggregate) = self.custom {
+        if let Some((aggregate_oid, aggregate)) = self.custom {
+            // PostgreSQL checks component privileges as the aggregate owner
+            // during initialization, even if no input row invokes the function.
+            let access = crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid);
+            super::require_routine_call_access(storage, aggregate.transition_oid, txid, access)?;
+            if let Some(final_function) = aggregate.final_function {
+                super::require_routine_call_access(
+                    storage,
+                    final_function.function_oid,
+                    txid,
+                    access,
+                )?;
+            }
             self.custom_state_oid = storage
                 .routine_type_oid(
                     aggregate.state_type.ctype,
@@ -778,11 +997,8 @@ impl<'a> AggState<'a> {
                     name
                 ));
             }
-            let transition_slot = storage
-                .routine_slot_by_oid(aggregate.transition_oid, txid)
-                .expect("aggregate transition dependency remains catalog-visible");
             self.custom_transition_strict =
-                storage.routine_for(transition_slot, txid).attributes.strict;
+                support_function_strict(storage, aggregate.transition_oid, txid)?;
             self.star = *star;
             self.distinct = *distinct;
             if *star && !args.is_empty() {
@@ -818,12 +1034,14 @@ impl<'a> AggState<'a> {
                     initial.as_bytes(),
                     arena,
                     txid,
+                    None,
                 )?);
                 self.custom_state_initialized = true;
             }
             return Ok(());
         }
-        self.kind = match *name {
+        let builtin_name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+        self.kind = match builtin_name {
             "count" => AggKind::Count,
             "sum" => AggKind::Sum,
             "avg" => AggKind::Avg,
@@ -943,6 +1161,19 @@ impl<'a> AggState<'a> {
                 ));
             }
         };
+        if matches!(
+            self.kind,
+            AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode
+        ) {
+            if over.is_some() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "OVER is not supported for ordered-set aggregate {}",
+                    name
+                ));
+            }
+            self.ord_spec = order_by;
+        }
         if self.kind == AggKind::StringAgg {
             self.binary_string_agg = argument_oids.first() == Some(&crate::sql::types::oid::BYTEA);
         }
@@ -987,7 +1218,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
     ) -> Result<bool, SqlError> {
         self.init(node, storage, txid, columns, arena)?;
-        let Some(aggregate) = self.custom else {
+        let Some((_, aggregate)) = self.custom else {
             return Ok(false);
         };
         let Some(moving) = aggregate.moving else {
@@ -999,18 +1230,20 @@ impl<'a> AggState<'a> {
         {
             return Ok(false);
         }
+        let access = crate::sql::eval::RoutineCallAccess::Aggregate(
+            self.custom.expect("moving aggregate is bound").0,
+        );
+        super::require_routine_call_access(storage, moving.transition_oid, txid, access)?;
+        super::require_routine_call_access(storage, moving.inverse_oid, txid, access)?;
+        if let Some(final_function) = moving.final_function {
+            super::require_routine_call_access(storage, final_function.function_oid, txid, access)?;
+        }
         self.custom_moving = true;
         self.best = None;
         self.custom_state_initialized = false;
-        let transition_slot = storage
-            .routine_slot_by_oid(moving.transition_oid, txid)
-            .expect("moving transition dependency remains catalog-visible");
         self.custom_transition_strict =
-            storage.routine_for(transition_slot, txid).attributes.strict;
-        let inverse_slot = storage
-            .routine_slot_by_oid(moving.inverse_oid, txid)
-            .expect("moving inverse dependency remains catalog-visible");
-        self.custom_inverse_strict = storage.routine_for(inverse_slot, txid).attributes.strict;
+            support_function_strict(storage, moving.transition_oid, txid)?;
+        self.custom_inverse_strict = support_function_strict(storage, moving.inverse_oid, txid)?;
         if let Some(initial) = moving.initial_condition {
             let initial = arena
                 .alloc_str(initial.as_str())
@@ -1024,6 +1257,7 @@ impl<'a> AggState<'a> {
                 initial.as_bytes(),
                 arena,
                 txid,
+                None,
             )?);
             self.custom_state_initialized = true;
         }
@@ -1049,7 +1283,7 @@ impl<'a> AggState<'a> {
         {
             return Ok(true);
         }
-        let aggregate = self.custom.expect("moving aggregate is catalog-defined");
+        let (aggregate_oid, aggregate) = self.custom.expect("moving aggregate is catalog-defined");
         let moving = aggregate
             .moving
             .expect("moving aggregate contract selected");
@@ -1078,6 +1312,8 @@ impl<'a> AggState<'a> {
                 moving.inverse_oid,
                 &arguments[..1 + args.len()],
                 &argument_type_oids[..1 + args.len()],
+                self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {
@@ -1248,25 +1484,14 @@ impl<'a> AggState<'a> {
                     "an ordered-set aggregate requires WITHIN GROUP"
                 ));
             };
-            if matches!(self.kind, AggKind::PercentileCont | AggKind::PercentileDisc)
-                && let Some(fraction) = args.first()
-            {
-                self.sum_float = match eval_full(fraction, arena, params, row, hooks)? {
-                    Datum::Float8(f) => f,
-                    Datum::Float4(f) => f64::from(f),
-                    Datum::Numeric(n) => n.to_f64(),
-                    Datum::Int2(v) => f64::from(v),
-                    Datum::Int4(v) => f64::from(v),
-                    Datum::Int8(v) => v as f64,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                            "percentile value must be numeric"
-                        ));
-                    }
-                };
-            }
             let value = eval_full(item.expression, arena, params, row, hooks)?;
+            let value = if self.kind == AggKind::PercentileCont
+                && !matches!(value, Datum::Interval(_) | Datum::Null)
+            {
+                crate::sql::eval::cast_to(value, crate::sql::types::ColType::Float8, arena)?
+            } else {
+                value
+            };
             if value.is_null() {
                 return Ok(());
             }
@@ -1323,7 +1548,7 @@ impl<'a> AggState<'a> {
         row: &impl ColumnLookup<'a>,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<(), SqlError> {
-        let aggregate = self.custom.expect("custom aggregate selected at init");
+        let (_, aggregate) = self.custom.expect("custom aggregate selected at init");
         let Expr::Call {
             args,
             order_by,
@@ -1333,7 +1558,7 @@ impl<'a> AggState<'a> {
         else {
             unreachable!("aggregate state belongs to a call")
         };
-        self.initialize_custom_direct(node, arena, params, row, hooks)?;
+        self.initialize_direct_inputs(node, arena, params, row, hooks)?;
         let mut ordered_expressions = [&Expr::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let (transition_expressions, sort_spec): (&[&Expr<'a>], &[crate::sql::ast::OrderBy<'a>]) =
             if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
@@ -1402,6 +1627,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<(), SqlError> {
+        let (aggregate_oid, _) = self.custom.expect("aggregate transition is bound");
         if self.custom_transition_strict {
             if values.iter().any(Datum::is_null) {
                 return Ok(());
@@ -1434,6 +1660,8 @@ impl<'a> AggState<'a> {
                 transition_oid,
                 &arguments[..1 + values.len()],
                 &argument_type_oids[..1 + values.len()],
+                self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {
@@ -1930,6 +2158,22 @@ impl<'a> AggState<'a> {
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         let n = self.vals_len;
+        let fraction = if self.kind == AggKind::Mode {
+            Datum::Null
+        } else {
+            self.percentile.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "percentile direct input was not initialized"
+                )
+            })?
+        };
+        if self.kind != AggKind::Mode && !matches!(fraction, Datum::Array { .. }) {
+            if fraction.is_null() {
+                return Ok(Datum::Null);
+            }
+            percentile_fraction(fraction)?;
+        }
         if n == 0 {
             return Ok(Datum::Null);
         }
@@ -1937,10 +2181,19 @@ impl<'a> AggState<'a> {
         // Stable insertion sort (compare_datums is fallible, so no library sort).
         for i in 1..n {
             let mut j = i;
-            while j > 0
-                && compare_datums_with_catalog(self.collation, catalog, &values[j - 1], &values[j])?
-                    .is_gt()
-            {
+            while j > 0 && {
+                let ordering = compare_datums_with_catalog(
+                    self.collation,
+                    catalog,
+                    &values[j - 1],
+                    &values[j],
+                )?;
+                if self.ord_spec.first().is_some_and(|order| order.descending) {
+                    ordering.is_lt()
+                } else {
+                    ordering.is_gt()
+                }
+            } {
                 values.swap(j - 1, j);
                 j -= 1;
             }
@@ -1971,49 +2224,67 @@ impl<'a> AggState<'a> {
                 }
                 Ok(values[best_index])
             }
-            AggKind::PercentileDisc => {
-                let fraction = self.sum_float.clamp(0.0, 1.0);
-                let index = if fraction <= 0.0 {
-                    0
+            AggKind::PercentileDisc | AggKind::PercentileCont => {
+                let continuous = self.kind == AggKind::PercentileCont;
+                if let Datum::Array { element, raw } = fraction {
+                    let shape = crate::sql::array::shape(raw).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "percentile array has invalid dimensions"
+                        )
+                    })?;
+                    let output = arena
+                        .alloc_slice_with(crate::sql::array::len(raw), |_| Datum::Null)
+                        .map_err(|_| arena_full())?;
+                    for (index, output) in output.iter_mut().enumerate() {
+                        let fraction =
+                            crate::sql::array::get(raw, element, index).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "percentile array has an invalid element"
+                                )
+                            })?;
+                        if !fraction.is_null() {
+                            *output = percentile_value(
+                                values,
+                                percentile_fraction(fraction)?,
+                                continuous,
+                                arena,
+                            )?;
+                        }
+                    }
+                    let ctype = if continuous {
+                        if matches!(values[0], Datum::Interval(_)) {
+                            crate::sql::types::ColType::Interval
+                        } else {
+                            crate::sql::types::ColType::Float8
+                        }
+                    } else {
+                        crate::sql::exec::coltype_of_oid(values[0].type_oid()).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "percentile input type is unavailable"
+                            )
+                        })?
+                    };
+                    let element =
+                        crate::sql::types::ArrElem::from_coltype(ctype).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "percentile result cannot form an array"
+                            )
+                        })?;
+                    Ok(Datum::Array {
+                        element,
+                        raw: crate::sql::array::build_shaped(output, shape, arena)?,
+                    })
+                } else if fraction.is_null() {
+                    Ok(Datum::Null)
                 } else {
-                    ((fraction * n as f64).ceil() as usize)
-                        .saturating_sub(1)
-                        .min(n - 1)
-                };
-                Ok(values[index])
-            }
-            _ => {
-                // PercentileCont: linear interpolation between the two nearest
-                // ranks. Numeric input yields numeric; int/float yield double
-                // precision (PostgreSQL's signatures).
-                let fraction = self.sum_float.clamp(0.0, 1.0);
-                let position = fraction * (n as f64 - 1.0);
-                let low = position.floor() as usize;
-                let high = position.ceil() as usize;
-                let weight = position - low as f64;
-                let to_f64 = |d: &Datum<'a>| -> f64 {
-                    match d {
-                        Datum::Int2(v) => f64::from(*v),
-                        Datum::Int4(v) => f64::from(*v),
-                        Datum::Int8(v) => *v as f64,
-                        Datum::Float8(v) => *v,
-                        Datum::Numeric(v) => v.to_f64(),
-                        _ => 0.0,
-                    }
-                };
-                let interpolated =
-                    to_f64(&values[low]) + (to_f64(&values[high]) - to_f64(&values[low])) * weight;
-                match values[low] {
-                    Datum::Numeric(_) => {
-                        let text = crate::stack_format!(48, "{}", interpolated);
-                        Ok(Datum::Numeric(crate::sql::numeric::Numeric::parse(
-                            text.as_str(),
-                            arena,
-                        )?))
-                    }
-                    _ => Ok(Datum::Float8(interpolated)),
+                    percentile_value(values, percentile_fraction(fraction)?, continuous, arena)
                 }
             }
+            _ => unreachable!("ordered-set aggregate kind"),
         }
     }
 
@@ -2418,7 +2689,7 @@ impl<'a> AggState<'a> {
         arena: &'a Arena,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<Datum<'a>, SqlError> {
-        let aggregate = self.custom.expect("custom aggregate selected at init");
+        let (aggregate_oid, aggregate) = self.custom.expect("custom aggregate selected at init");
         if self.ord_len > 0 {
             let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
             let argument_count = usize::from(self.custom_argument_count);
@@ -2536,6 +2807,8 @@ impl<'a> AggState<'a> {
                 final_function.function_oid,
                 &arguments[..count],
                 &argument_type_oids[..count],
+                self.custom_input_collation,
+                crate::sql::eval::RoutineCallAccess::Aggregate(aggregate_oid),
                 arena,
             )?
             .ok_or_else(|| {

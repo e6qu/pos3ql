@@ -143,11 +143,41 @@ fn expand_ctes_with_path<'a>(
     if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
+    with_schema_context(
+        sel.with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        depth,
+        authorization_role,
+        arena,
+        None,
+        |context| subst_select_body(sel, context, arena),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "schema-only stored query binding context"
+)]
+fn with_schema_context<'a, 's, R>(
+    with: &'a [Cte<'a>],
+    storage: &'s Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
+    depth: u32,
+    authorization_role: Option<u16>,
+    arena: &'a Arena,
+    mut visit: Option<&mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>>,
+    build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'a>) -> Result<R, SqlError>,
+) -> Result<R, SqlError> {
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
     let mut resolved = ArenaList::new(arena);
     let mut materialized = ArenaList::new(arena);
-    for (index, cte) in sel.with.iter().enumerate() {
-        if sel.with[..index].iter().any(|prior| prior.name == cte.name) {
+    for (index, cte) in with.iter().enumerate() {
+        if with[..index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "WITH query name \"{}\" specified more than once",
@@ -191,6 +221,11 @@ fn expand_ctes_with_path<'a>(
                 }
             };
             let entry = describe_dml_materialized(cte, &expanded, storage, txid, arena)?;
+            if let Some(visit) = &mut visit {
+                visit(ScopedCte::DataModification(
+                    arena.alloc(expanded).map_err(|_| arena_full())?,
+                ))?;
+            }
             materialized
                 .push((cte.name, entry))
                 .map_err(|_| arena_full())?;
@@ -199,8 +234,28 @@ fn expand_ctes_with_path<'a>(
             materialized
                 .push((cte.name, entry))
                 .map_err(|_| arena_full())?;
+            if let Some(visit) = &mut visit {
+                let context = Subst {
+                    ctes: resolved.as_slice(),
+                    materialized: materialized.as_slice(),
+                    storage,
+                    txid,
+                    depth,
+                    path,
+                    dependencies,
+                    authorization_role,
+                    qualifier: None,
+                    rule_transition: None,
+                    recursive_state: None,
+                    execution: None,
+                };
+                visit(ScopedCte::Select(subst_select(cte.query, context, arena)?))?;
+            }
         } else {
             let query = subst_select(cte.query, context, arena)?;
+            if let Some(visit) = &mut visit {
+                visit(ScopedCte::Select(query))?;
+            }
             resolved
                 .push((cte.name, query, cte.columns))
                 .map_err(|_| arena_full())?;
@@ -222,7 +277,102 @@ fn expand_ctes_with_path<'a>(
         recursive_state: None,
         execution: None,
     };
-    subst_select_body(sel, context, arena)
+    build(context)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ScopedCte<'a> {
+    Select(&'a Select<'a>),
+    DataModification(&'a Stmt<'a>),
+}
+
+/// Visit each CTE after binding earlier entries and a recursive self-reference.
+pub(super) fn visit_cte_sources<'a>(
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
+    arena: &'a Arena,
+    visit: &mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    with_schema_context(
+        with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        0,
+        None,
+        arena,
+        Some(visit),
+        |_| Ok(()),
+    )
+}
+
+/// Resolve input shapes without materializing a CTE or executing its defaults.
+pub(crate) fn expand_dml_ctes_schema<'a>(
+    statement: &'a Stmt<'a>,
+    with: &'a [Cte<'a>],
+    storage: &Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    with_schema_context(
+        with,
+        storage,
+        txid,
+        path,
+        dependencies,
+        0,
+        None,
+        arena,
+        None,
+        |context| {
+            let statement = match statement {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "assignment statement kind is invalid"
+                    ));
+                }
+            };
+            Ok(&*arena.alloc(statement).map_err(|_| arena_full())?)
+        },
+    )
+}
+
+/// Expand stored-view sources for metadata-only DML target/source lookup.
+pub(super) fn expand_from_schema<'a>(
+    from: &'a FromClause<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a FromClause<'a>, SqlError> {
+    if !storage.has_any_view() {
+        return Ok(from);
+    }
+    with_schema_context(
+        &[],
+        storage,
+        txid,
+        None,
+        None,
+        0,
+        None,
+        arena,
+        None,
+        |context| {
+            let expanded = subst_from(from, context, arena)?;
+            Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
+        },
+    )
 }
 
 /// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is
@@ -271,7 +421,45 @@ pub(crate) fn bind_materialized_relations<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let context = Subst {
+    let context = materialized_input_context(relations, storage, txid);
+    subst_select(select, context, arena)
+}
+
+pub(crate) fn bind_materialized_expression<'a>(
+    expression: &'a Expr<'a>,
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    subst_expr(
+        expression,
+        materialized_input_context(relations, storage, txid),
+        arena,
+    )
+}
+
+/// Binds relation metadata without executing CTEs or converting row values.
+pub(crate) fn bind_materialized_statement<'a>(
+    statement: &'a Stmt<'a>,
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    subst_materialized_statement(
+        statement,
+        materialized_input_context(relations, storage, txid),
+        arena,
+    )
+}
+
+fn materialized_input_context<'a, 's>(
+    relations: &'a [(&'a str, &'a MaterializedCte<'a>)],
+    storage: &'s Storage,
+    txid: u32,
+) -> Subst<'a, 'a, 's, 'a> {
+    Subst {
         ctes: &[],
         materialized: relations,
         storage,
@@ -284,8 +472,96 @@ pub(crate) fn bind_materialized_relations<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+    }
+}
+
+fn materialized_not_shadowed<'a, 'scope>(
+    with: &[Cte<'a>],
+    relations: &'scope [(&'a str, &'a MaterializedCte<'a>)],
+    arena: &'a Arena,
+) -> Result<&'scope [(&'a str, &'a MaterializedCte<'a>)], SqlError>
+where
+    'a: 'scope,
+{
+    if !relations
+        .iter()
+        .any(|relation| with.iter().any(|cte| cte.name == relation.0))
+    {
+        return Ok(relations);
+    }
+    let mut visible = ArenaList::new(arena);
+    for relation in relations {
+        if !with.iter().any(|cte| cte.name == relation.0) {
+            visible.push(*relation).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(visible.as_slice())
+}
+
+fn subst_materialized_statement<'a>(
+    statement: &'a Stmt<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let statement = match statement {
+        Stmt::Select(select) => Stmt::Select(*subst_select(select, context, arena)?),
+        Stmt::SetQuery(query) if !query.with.is_empty() => {
+            let statement = arena
+                .alloc(Stmt::SetQuery(SetQuery {
+                    with: &[],
+                    ..*query
+                }))
+                .map_err(|_| arena_full())?;
+            let statement = arena
+                .alloc(Stmt::With {
+                    ctes: query.with,
+                    statement,
+                })
+                .map_err(|_| arena_full())?;
+            return subst_materialized_statement(statement, context, arena);
+        }
+        Stmt::SetQuery(query) => Stmt::SetQuery(*subst_set_query_body(query, context, arena)?),
+        Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+        Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+        Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+        Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+        Stmt::With { ctes, statement } => {
+            let mut bound = ArenaList::new(arena);
+            for (index, cte) in ctes.iter().enumerate() {
+                let visible = materialized_not_shadowed(
+                    &ctes[..index + usize::from(cte.recursive)],
+                    context.materialized,
+                    arena,
+                )?;
+                let child = Subst {
+                    materialized: visible,
+                    ..context
+                };
+                let cte = Cte {
+                    query: subst_select(cte.query, child, arena)?,
+                    dml: cte
+                        .dml
+                        .map(|statement| subst_materialized_statement(statement, child, arena))
+                        .transpose()?,
+                    ..*cte
+                };
+                bound.push(cte).map_err(|_| arena_full())?;
+            }
+            let child = Subst {
+                materialized: materialized_not_shadowed(ctes, context.materialized, arena)?,
+                ..context
+            };
+            Stmt::With {
+                ctes: bound.as_slice(),
+                statement: subst_materialized_statement(statement, child, arena)?,
+            }
+        }
+        _ => return Ok(statement),
     };
-    subst_select(select, context, arena)
+    arena
+        .alloc(statement)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
 }
 
 /// Expands a `WITH` list into a data-modifying main statement. The returned
@@ -511,6 +787,7 @@ fn rule_relation_ref<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -579,6 +856,7 @@ fn coerce_rule_transition<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     let cast = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand: expression,
             type_name: target.type_name,
             type_mod: target.type_mod,
@@ -869,6 +1147,7 @@ pub(crate) fn rule_transition_source<'a>(
                         Some(left) => arena
                             .alloc(SetTree::Op {
                                 operator: SetOp::Union,
+                                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                                 all: true,
                                 left,
                                 right: leaf,
@@ -896,6 +1175,7 @@ pub(crate) fn rule_transition_source<'a>(
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: Some(input_columns),
                 inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -963,6 +1243,7 @@ pub(crate) fn rule_transition_source<'a>(
         func_args: None,
         func_argument_names: &[],
         func_variadic: false,
+        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
         col_alias: None,
         inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -1067,6 +1348,7 @@ pub(crate) fn attach_rule_source<'a>(
                     tree = arena
                         .alloc(SetTree::Op {
                             operator: SetOp::Union,
+                            syntax: crate::sql::ast::SetOperationSyntax::Explicit,
                             all: true,
                             left: tree,
                             right: leaf,
@@ -1122,8 +1404,10 @@ fn attach_rule_source_to_set_tree<'a>(
             all,
             left,
             right,
+            syntax,
         } => SetTree::Op {
             operator: *operator,
+            syntax: *syntax,
             all: *all,
             left: attach_rule_source_to_set_tree(left, source, condition, arena)?,
             right: attach_rule_source_to_set_tree(right, source, condition, arena)?,
@@ -1479,14 +1763,15 @@ pub(crate) fn filter_view_rows<'a>(
         arena,
     )?;
     let mut rewritten = *select;
-    let grouped = !select.group_by.is_empty()
-        || select.having.is_some()
-        || projected.iter().any(|expression| {
-            super::expr_has_aggregate(expression)
-                || expression_contains_function(expression, &|name, arity| {
-                    storage.has_aggregate_candidate(name, arity, txid)
-                })
-        });
+    let mut grouped = !select.group_by.is_empty() || select.having.is_some();
+    if !grouped {
+        for expression in projected {
+            if super::expr_has_aggregate(expression, storage, txid, source_columns)? {
+                grouped = true;
+                break;
+            }
+        }
+    }
     if grouped {
         rewritten.having = and_where(select.having, pushed, arena)?;
     } else {
@@ -1544,6 +1829,7 @@ fn filter_set_view_rows<'a>(
         operator: super::super::ast::BinaryOp::And,
         left,
         right,
+        ..
     } = predicate
     {
         let (body, left_keep) = filter_set_view_rows(
@@ -1663,6 +1949,7 @@ fn filter_set_view_conjunct<'a>(
             all,
             left,
             right,
+            syntax,
         } => {
             let Some(left) = filter_set_view_conjunct(
                 left,
@@ -1692,6 +1979,7 @@ fn filter_set_view_conjunct<'a>(
             };
             SetTree::Op {
                 operator: *operator,
+                syntax: *syntax,
                 all: *all,
                 left,
                 right,
@@ -1786,6 +2074,7 @@ fn split_view_predicate<'a>(
         operator: super::super::ast::BinaryOp::And,
         left,
         right,
+        ..
     } = predicate
     {
         let (left_push, left_keep) = split_view_predicate(Some(left), context, safety, arena)?;
@@ -1796,7 +2085,7 @@ fn split_view_predicate<'a>(
         ));
     }
     if expr_has_subquery(predicate)
-        || super::expr_has_aggregate(predicate)
+        || super::expr_has_aggregate(predicate, context.storage, context.txid, safety.columns)?
         || super::expr_has_window(predicate)
         || !view_predicate_columns_safe(
             predicate,
@@ -1836,6 +2125,12 @@ pub fn rewrite_view_dml<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Stmt<'a>, SqlError> {
+    let alias = match statement {
+        Stmt::Update(update) => update.alias,
+        Stmt::Delete(delete) => delete.alias,
+        _ => None,
+    };
+    let visible_name = alias.unwrap_or(view_name);
     let context = Subst {
         ctes: &[],
         materialized: &[],
@@ -1846,9 +2141,9 @@ pub fn rewrite_view_dml<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: Some(ViewQualifier {
-            from: view_name,
+            from: visible_name,
             from_schema: None,
-            to: base_name,
+            to: alias.unwrap_or(base_name),
             to_schema: base_schema,
             exposed_columns,
             base_columns,
@@ -1859,7 +2154,7 @@ pub fn rewrite_view_dml<'a>(
         execution: None,
     };
     let expanded_returning =
-        |items| expand_view_returning(items, view_name, exposed_columns, arena);
+        |items| expand_view_returning(items, visible_name, exposed_columns, arena);
     let rewritten = match statement {
         Stmt::Insert(insert) => {
             for column in insert.columns {
@@ -2321,7 +2616,7 @@ pub fn describe_set_query<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
-    let body = expand_set_tree(q.with, q.body, storage, txid, arena)?;
+    let body = expand_set_tree(q.with, q.body, storage, txid, None, None, arena)?;
     describe_set_body(storage, body, txid, columns, arena, None)
 }
 
@@ -2331,15 +2626,18 @@ pub fn describe_set_query<'a>(
 pub(crate) fn expand_set_tree<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && !storage.has_any_view() {
+    if with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes(wrapper, storage, txid, arena)?;
+    let expanded =
+        expand_ctes_with_path(wrapper, storage, txid, path, dependencies, 0, None, arena)?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -3126,6 +3424,7 @@ fn recursive_parts<'a>(
         all,
         left,
         right,
+        ..
     }) = q.set_body
     else {
         return Err(sql_err!(
@@ -4620,6 +4919,11 @@ fn subst_select<'a>(
         }
         let child = Subst {
             ctes: scoped.as_slice(),
+            materialized: materialized_not_shadowed(
+                &select.with[..index + usize::from(cte.recursive)],
+                context.materialized,
+                arena,
+            )?,
             ..context
         };
         let query = if cte.recursive && select_references(cte.query, cte.name) > 0 {
@@ -4646,6 +4950,7 @@ fn subst_select<'a>(
         select,
         Subst {
             ctes: scoped.as_slice(),
+            materialized: materialized_not_shadowed(select.with, context.materialized, arena)?,
             ..context
         },
         arena,
@@ -4853,6 +5158,7 @@ fn subst_insert<'a>(
         None => None,
     };
     Ok(Insert {
+        source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
         columns: statement.columns,
         rows,
@@ -4872,6 +5178,7 @@ fn subst_update<'a>(
     arena: &'a Arena,
 ) -> Result<Update<'a>, SqlError> {
     Ok(Update {
+        source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
         alias: statement.alias,
         assignments: subst_assignments(statement.assignments, context, arena)?,
@@ -4966,6 +5273,7 @@ fn subst_merge<'a>(
             .map_err(|_| arena_full())?;
     }
     Ok(Merge {
+        source_position: statement.source_position,
         target: rewrite_stored_relation_name(statement.target, context, arena)?,
         target_inheritance: statement.target_inheritance,
         target_alias: statement.target_alias,
@@ -5037,8 +5345,10 @@ fn subst_set_tree<'a>(
             all,
             left,
             right,
+            syntax,
         } => SetTree::Op {
             operator: *operator,
+            syntax: *syntax,
             all: *all,
             left: subst_set_tree(left, context, arena)?,
             right: subst_set_tree(right, context, arena)?,
@@ -5163,6 +5473,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: t.col_alias,
             inheritance: t.inheritance,
@@ -5195,6 +5506,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: renames,
             inheritance: t.inheritance,
@@ -5319,10 +5631,17 @@ fn subst_tableref<'a>(
             context
                 .storage
                 .compute_path(query.creation_path.as_str(), user.as_str(), context.txid);
-        let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
         let dependencies = query.dependencies;
+        let vsel = super::parse_stored_query(
+            view_sql,
+            query.input_source.unwrap_or(view_sql),
+            context.storage,
+            context.txid,
+            dependencies.view(),
+            arena,
+        )?;
         let expanded = if let Some(execution) = context.execution {
             with_exec_context(
                 vsel.with,
@@ -5364,6 +5683,7 @@ fn subst_tableref<'a>(
                 func_args: None,
                 func_argument_names: &[],
                 func_variadic: false,
+                func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
                 rows_from: None,
                 col_alias: None,
                 inheritance: t.inheritance,
@@ -5397,6 +5717,7 @@ fn subst_tableref<'a>(
             func_args: None,
             func_argument_names: &[],
             func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             rows_from: None,
             col_alias: aliases.map(|aliases| &*aliases),
             inheritance: t.inheritance,
@@ -5857,6 +6178,7 @@ fn rewrite_stored_text_search_arguments<'a>(
         .map_err(|_| arena_full())?;
     let first = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand,
             type_name: "regconfig",
             type_mod: -1,
@@ -5903,6 +6225,7 @@ fn rewrite_stored_sequence_arguments<'a>(
     let operand = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
     let first = arena
         .alloc(Expr::Cast {
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
             operand,
             type_name: "regclass",
             type_mod: -1,
@@ -5934,6 +6257,9 @@ fn rewrite_stored_routine_name<'a>(
         ));
     };
     let bound_oid = *bound_oid;
+    if crate::sql::eval::is_sql_syntax_call(call) {
+        return Ok((name, bound_oid));
+    }
     let Some(dependencies) = context.dependencies else {
         return Ok((name, bound_oid));
     };
@@ -6072,7 +6398,10 @@ fn subst_expr<'a>(
             select: subst_select(select, context, arena)?,
             all: *all,
         },
-        Expr::Unary { operator, operand } => Expr::Unary {
+        Expr::Unary {
+            operator, operand, ..
+        } => Expr::Unary {
+            source_position: e.source_position(),
             operator: *operator,
             operand: subst_expr(operand, context, arena)?,
         },
@@ -6080,7 +6409,9 @@ fn subst_expr<'a>(
             operator,
             left,
             right,
+            ..
         } => Expr::Binary {
+            source_position: e.source_position(),
             operator: *operator,
             left: subst_expr(left, context, arena)?,
             right: subst_expr(right, context, arena)?,
@@ -6090,9 +6421,11 @@ fn subst_expr<'a>(
             type_name,
             type_mod,
             binding,
+            ..
         } => {
             let operand = subst_expr(operand, context, arena)?;
             Expr::Cast {
+                source_position: e.source_position(),
                 operand: rewrite_stored_regcollation_operand(operand, type_name, context, arena)?,
                 type_name: rewrite_stored_type_name(type_name, context, arena)?,
                 type_mod: *type_mod,
@@ -6125,9 +6458,15 @@ fn subst_expr<'a>(
             over,
             filter,
             bound_strict,
+            kind,
+            source_position,
             ..
         } => {
-            let name = rewrite_stored_operator_name(name, args, context, arena)?;
+            let name = if *kind == crate::sql::ast::CallKind::SqlSyntax {
+                rewrite_stored_operator_name(name, args, context, arena)?
+            } else {
+                *name
+            };
             let (name, bound_oid) = rewrite_stored_routine_name(e, name, context, arena)?;
             let mut ob: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
             for o in order_by.iter() {
@@ -6174,8 +6513,10 @@ fn subst_expr<'a>(
             let args = rewrite_stored_sequence_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
+                kind: *kind,
                 bound_oid,
                 bound_strict: *bound_strict,
+                source_position: *source_position,
                 args,
                 argument_names,
                 variadic: *variadic,

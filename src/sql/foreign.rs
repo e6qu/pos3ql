@@ -101,27 +101,44 @@ fn client_error(error: ClientError) -> SqlError {
 /// that the local executor may safely encode. A PostgreSQL composite arrives
 /// as a transient record; coercing through the declared column makes its
 /// durable representation explicit before it can reach `rowenc`.
-fn decode_foreign_field<'a>(
+pub(super) fn decode_foreign_field<'a>(
     storage: &Storage,
     table: &TableDef,
     column: usize,
     raw: Option<&'a [u8]>,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     let declared = storage.declared_column_type(&table.columns()[column], txid)?;
     let value = match raw {
-        Some(raw) => {
-            super::exec::decode_text_input(storage, declared.catalog_oid(), raw, arena, txid)?
-        }
-        None => {
-            super::exec::coerce_binary_input_null(storage, declared.catalog_oid(), arena, txid)?
-        }
+        Some(raw) => super::exec::decode_text_input(
+            storage,
+            declared.catalog_oid(),
+            raw,
+            arena,
+            txid,
+            sequences,
+        )?,
+        None => super::exec::coerce_binary_input_null(
+            storage,
+            declared.catalog_oid(),
+            arena,
+            txid,
+            sequences,
+        )?,
     };
     if value.is_null() {
         return Ok(value);
     }
-    super::exec::coerce(value, &table.columns()[column], storage, txid, arena)
+    super::exec::coerce(
+        value,
+        &table.columns()[column],
+        storage,
+        txid,
+        arena,
+        sequences,
+    )
 }
 
 fn poll_client(
@@ -854,6 +871,7 @@ pub(crate) fn materialize<'a>(
     table_slot: usize,
     txid: u32,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign
@@ -928,7 +946,7 @@ pub(crate) fn materialize<'a>(
                         let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
                         for (column, raw) in remote.columns().iter().enumerate() {
                             values[column] = match decode_foreign_field(
-                                storage, &table, column, *raw, txid, arena,
+                                storage, &table, column, *raw, txid, arena, sequences,
                             ) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1012,6 +1030,7 @@ pub(crate) fn visit_mutable_rows<'arena>(
     txid: u32,
     arena: &'arena Arena,
     visit: &mut impl FnMut(RemoteTupleId, &'arena [u8]) -> Result<(), SqlError>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign
@@ -1086,7 +1105,7 @@ pub(crate) fn visit_mutable_rows<'arena>(
                         let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
                         for (column, raw) in row.columns()[1..].iter().enumerate() {
                             values[column] = match decode_foreign_field(
-                                storage, &table, column, *raw, txid, arena,
+                                storage, &table, column, *raw, txid, arena, sequences,
                             ) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1140,6 +1159,10 @@ pub(crate) fn visit_mutable_rows<'arena>(
 /// `RETURNING` image.  PostgreSQL's unnamed extended query keeps values as
 /// length-delimited protocol fields; only catalog-derived identifiers enter
 /// the SQL source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "foreign values preserve their explicit statement sequence context"
+)]
 pub(crate) fn insert_row<'a>(
     storage: &Storage,
     table_slot: usize,
@@ -1148,6 +1171,7 @@ pub(crate) fn insert_row<'a>(
     on_conflict_do_nothing: bool,
     render: crate::sql::guc::RenderContext,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Option<RemoteTupleId>, SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign
@@ -1270,7 +1294,7 @@ pub(crate) fn insert_row<'a>(
                                 None => None,
                             };
                             values[column] = match decode_foreign_field(
-                                storage, &table, column, raw, txid, arena,
+                                storage, &table, column, raw, txid, arena, sequences,
                             ) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1310,6 +1334,10 @@ pub(crate) fn insert_row<'a>(
     Ok(returned)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "foreign values preserve their explicit statement sequence context"
+)]
 fn remote_returning_row<'a>(
     storage: &Storage,
     session: crate::storage::ForeignSessionLease,
@@ -1318,6 +1346,7 @@ fn remote_returning_row<'a>(
     query: &str,
     parameters: &[Option<&[u8]>],
     operation: &str,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Option<&'a [u8]>, SqlError> {
     let txid = session.transaction_id();
     let mut returned = None;
@@ -1361,7 +1390,7 @@ fn remote_returning_row<'a>(
                         let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
                         for (column, raw) in row.columns().iter().enumerate() {
                             values[column] = match decode_foreign_field(
-                                storage, table, column, *raw, txid, arena,
+                                storage, table, column, *raw, txid, arena, sequences,
                             ) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1418,6 +1447,7 @@ pub(crate) fn fetch_row<'a>(
     txid: u32,
     tuple_id: RemoteTupleId,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Option<&'a [u8]>, SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign
@@ -1458,6 +1488,7 @@ pub(crate) fn fetch_row<'a>(
         query.as_str(),
         &[Some(parameter.as_str().as_bytes())],
         "row fetch",
+        sequences,
     )
 }
 
@@ -1480,6 +1511,7 @@ pub(crate) fn update_row<'data>(
     txid: u32,
     request: RemoteUpdate<'_, 'data>,
     arena: &'data Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<bool, SqlError> {
     let RemoteUpdate {
         tuple_id,
@@ -1543,6 +1575,7 @@ pub(crate) fn update_row<'data>(
         query.as_str(),
         &parameters[..target_columns.len() + 1],
         "UPDATE",
+        sequences,
     )?
     else {
         return Ok(false);
@@ -1561,6 +1594,7 @@ pub(crate) fn delete_row<'a>(
     txid: u32,
     tuple_id: RemoteTupleId,
     arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<Option<&'a [u8]>, SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign
@@ -1600,6 +1634,7 @@ pub(crate) fn delete_row<'a>(
         query.as_str(),
         &[Some(parameter.as_str().as_bytes())],
         "DELETE",
+        sequences,
     )
 }
 

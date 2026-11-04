@@ -320,11 +320,11 @@ errors and the crash's source, tool and stack identities. The historical failure
 diagnoses the lifetime defect; final-head correctness still requires ordinary CI.
 
 [implicit-index-ddl-reference.zip](implicit-index-ddl-reference.zip), SHA256
-`cca80b345d12b79c9304f97e36b0c05241ac9f3885075864bdba125ab8814790`,
+`2019fea9eab6fb06964e0d84c97325771e9f259abe9fc4a8b42c885c22940c70`,
 records fixture `235_implicit_index_ddl.sql` on PostgreSQL 18.6. Primary, unique
 and exclusion indexes can be renamed before any rebuild. Their identifiers and
-comments survive rollback; an index setting persists. An unauthorized role gets
-`42501` before any rename. Exact SQL, seven result rows, commands and binary/source
-hashes were captured with the fixture uncommitted at `0077930f`. Extract it and
+comments survive rollback; direct and procedural index settings persist. An
+unauthorized role gets `42501` before any rename. Exact SQL, eight result rows, commands and binary/source
+hashes were captured with the fixture uncommitted at `a3e1bf9a`. Extract it and
 run `python3 verify-implicit-index-ddl.py .` to verify all 12 file hashes and the
 observed results. This is reference behavior; pos3ql still needs passing CI.

@@ -18,6 +18,8 @@ SELECT c.oid=b.oid,c.conindid=b.conindid,obj_description(c.oid,'pg_constraint'),
 FROM pg_constraint c JOIN implicit_index_before b ON c.oid=b.oid WHERE c.conname='implicit_index_rows_pkey';
 ALTER INDEX implicit_index_rows_pkey SET(fillfactor=77);
 SELECT reloptions::text FROM pg_class WHERE relname='implicit_index_rows_pkey';
+DO $$BEGIN ALTER INDEX implicit_index_rows_code_key SET(fillfactor=78); END$$;
+SELECT reloptions::text FROM pg_class WHERE relname='implicit_index_rows_code_key';
 ALTER INDEX implicit_index_rows_pkey RENAME TO implicit_index_primary_done;
 ALTER INDEX implicit_index_rows_code_key RENAME TO implicit_index_unique_done;
 ALTER INDEX implicit_index_exclusion RENAME TO implicit_index_exclusion_done;

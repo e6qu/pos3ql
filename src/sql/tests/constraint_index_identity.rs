@@ -36,6 +36,7 @@ fn implicit_constraint_indexes_support_ddl_without_prior_rebuild() {
                 "t|t|primary constraint|primary index",
                 "t|t|primary constraint|primary index",
                 "{fillfactor=77}",
+                "{fillfactor=78}",
                 "implicit_index_exclusion_done|t|t|NULL|NULL",
                 "implicit_index_primary_done|t|t|primary constraint|primary index",
                 "implicit_index_unique_done|t|t|NULL|NULL",

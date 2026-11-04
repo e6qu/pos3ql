@@ -25333,7 +25333,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     name,
                     *if_exists,
                     *action,
-                    arena,
+                    context.arena,
                     responder,
                 ),
                 Stmt::AlterIndexesTablespace {
@@ -56434,7 +56434,7 @@ fn materialize_index_definition(
         {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
-                "REINDEX selected index lifetime changed"
+                "selected index lifetime changed"
             ));
         }
         return Ok(slot);

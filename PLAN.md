@@ -37,22 +37,13 @@ first result column and writes an audit row through a function in its second.
 It must produce three increments, three audit rows and three result rows,
 including when a function pauses. Completed columns must not run again.
 
-Supported single-table scalar statements retain their source, predicate and
-projection positions through mutable function handoffs, using the existing
-physical reader and startup arenas. Temporary call state belongs to active rows.
-Calls retain selected identities, original defaults and null handling; explicit
-variadic arrays remain distinct from expanded arguments.
-Declared casts retain their selected conversions and evaluation order through
-arrays and assignments, including typed NULL values. Array children convert in
-order; `INSERT ... SELECT` converts each complete selected row before the next row.
-Planning and dependency visits release their temporary schema descriptions,
-including queries without stored-function calls. Repeated visits reuse the same
-statement space; the small-arena enum and composite-query regression keeps its
-original 256 KiB limit.
-Nested query descriptions share that scratch safely. Ordinary casts do not
-reserve checked-input request storage when they have no preparation-time checks.
-Completed calls release body workspaces while preserving typed results and
-command effects, including nested calls and table-function results.
+Simple table scans already preserve their source position and completed values
+when a function pauses. Extend that behavior to the remaining query shapes and
+statement bodies described below. Preserve declared types, selected objects,
+defaults, null handling and evaluation order. Reclaim temporary memory between
+calls; ordinary expressions without preparation-time checks must not reserve
+checked-input storage. The [architecture](docs/architecture.md#the-request-path)
+owns the current execution details and memory rules.
 Finish retaining values checked while SQL is prepared. For example, preparing
 `SELECT '{approved}'::checked_status[]` can run a user-defined constraint;
 describing or executing that prepared statement must reuse its checked value.

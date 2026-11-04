@@ -2079,6 +2079,9 @@ where
 {
     let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
     for index in storage.indexes_for(definition.schema.as_str(), definition.name.as_str(), txid) {
+        if !index.mutable_for(txid).kind.valid() {
+            continue;
+        }
         let Some(binding) = storage.value_binding_for_index(slot, index.created_at) else {
             continue;
         };

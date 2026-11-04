@@ -9778,7 +9778,6 @@ pub(crate) fn consume_query_rows(
     ) -> Result<(), SqlError>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
-    const CONSUMER_COMPLETE: &str = "PZ004";
     let mut remaining = limit.get();
     let mut completed = false;
     let result = evaluate(&mut |values| {
@@ -9787,14 +9786,16 @@ pub(crate) fn consume_query_rows(
         if remaining == 0 {
             completed = true;
             return Err(sql_err!(
-                CONSUMER_COMPLETE,
+                sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE,
                 "bounded query consumer completed"
             ));
         }
         Ok(())
     });
     match result {
-        Err(error) if completed && error.sqlstate == CONSUMER_COMPLETE => Ok(()),
+        Err(error) if completed && error.sqlstate == sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE => {
+            Ok(())
+        }
         result => result,
     }
 }

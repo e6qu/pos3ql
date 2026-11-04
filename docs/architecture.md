@@ -120,6 +120,15 @@ check during planning even when the caller returns no rows; a rejected attempt
 does not replace the first runtime check. Cursor plans retain accepted inputs
 across separate `FETCH` commands and while a `WITH HOLD` cursor survives commit.
 
+Planning uses facts from all 3,397 procedures in the pinned PostgreSQL catalog,
+including internal operator, cast and type-input functions. For example, checking
+whether a SQL function can be inlined needs the properties of text concatenation,
+even though its internal `textcat` function is not exposed as a SQL call.
+Initialized callable declarations take precedence over bootstrap facts. Adding
+these facts does not add callable functions; [source hashes and generation
+details](../tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
+record their origin.
+
 Parameterized Bind attempts keep separate checked planner values. Parameterless
 Bind messages share their prepared statement's plan; each bound portal keeps
 that plan alive. Bind retains decoded parameters through a preparation wait,

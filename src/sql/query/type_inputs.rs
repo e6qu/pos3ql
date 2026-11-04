@@ -137,7 +137,7 @@ pub(crate) fn capture_procedural_statement_type_inputs<'a>(
         };
         match statement {
             Stmt::Select(select) => walker.select(select, Some(&outer), None),
-            Stmt::SetQuery(query) => walker.set_tree(query.body, Some(&outer)),
+            Stmt::SetQuery(query) => walker.set_query(query, Some(&outer)),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                 walker.dml(statement, Some(&outer))
             }
@@ -482,7 +482,7 @@ pub(crate) fn visit_planner_calls<'a>(
     };
     match statement {
         Stmt::Select(select) => walker.select(select, Some(&metadata), None),
-        Stmt::SetQuery(query) => walker.set_tree(query.body, Some(&metadata)),
+        Stmt::SetQuery(query) => walker.set_query(query, Some(&metadata)),
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
             walker.dml(statement, Some(&metadata))
         }
@@ -1157,6 +1157,45 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         Ok(())
     }
 
+    fn set_query<'a>(
+        &mut self,
+        query: &'a ast::SetQuery<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        let storage = self.storage;
+        let txid = self.txid;
+        let arena = self.arena;
+        let mark = arena.mark();
+        let result = (|| {
+            let planner = self.planner.is_some();
+            super::cte::visit_cte_sources(
+                query.with,
+                storage,
+                txid,
+                None,
+                None,
+                arena,
+                &mut |source| match source {
+                    super::cte::ScopedCte::Select(select) if !planner => {
+                        self.select(select, outer, None)
+                    }
+                    super::cte::ScopedCte::Select(_) => Ok(()),
+                    super::cte::ScopedCte::DataModification(statement) => self.statement(statement),
+                },
+            )?;
+            let tree = super::cte::expand_set_tree(
+                query.with, query.body, storage, txid, None, None, arena,
+            )?;
+            self.set_tree(tree, outer)
+        })();
+        // Selected facts are copied before the shared CTE shapes are reclaimed.
+        unsafe { arena.rewind_to(mark) };
+        result
+    }
+
     fn set_tree<'a>(
         &mut self,
         tree: &'a ast::SetTree<'a>,
@@ -1180,7 +1219,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     {
         match statement {
             Stmt::Select(select) => self.select(select, None, None),
-            Stmt::SetQuery(query) => self.set_tree(query.body, None),
+            Stmt::SetQuery(query) => self.set_query(query, None),
             Stmt::With { ctes, statement } => {
                 let storage = self.storage;
                 let txid = self.txid;

@@ -5588,6 +5588,14 @@ pub enum CallKind {
     SqlSyntax,
 }
 
+/// The producer determines which encoded value contract the executor checks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundLiteralValue<'a> {
+    CheckedArrayInput(&'a [u8]),
+    /// Encoded by the executor after materializing a catalog default.
+    CachedDefault(&'a [u8]),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Expr<'a> {
     Null,
@@ -5636,10 +5644,10 @@ pub enum Expr<'a> {
         type_mod: i32,
         binding: CastBinding,
     },
-    /// Type input has already run for this SQL source occurrence. The source
-    /// syntax remains available to deparsers and dependency capture only.
+    /// Input checking or catalog-default materialization has already run.
+    /// Source syntax is retained for deparsers and dependency capture only.
     BoundLiteral {
-        encoded: &'a [u8],
+        value: BoundLiteralValue<'a>,
         type_oid: i32,
         type_mod: i32,
         collation: Option<Collation>,

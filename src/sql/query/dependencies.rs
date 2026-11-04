@@ -512,38 +512,70 @@ fn collect_set_query(
     arena: &Arena,
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
-    let mut ctes = CteNames::EMPTY;
-    for cte in query.with {
-        collect_select(cte.query, storage, txid, ctes, dependencies, arena, context)?;
-        ctes.push(cte.name)?;
-    }
-    collect_set_tree(
-        query.body,
-        storage,
-        txid,
-        ctes,
-        dependencies,
-        arena,
-        context,
-    )?;
-    for expression in query
-        .order_by
-        .iter()
-        .map(|order| order.expression)
-        .chain(query.limit)
-        .chain(query.offset)
-    {
-        collect_expression(
-            expression,
+    let mark = arena.mark();
+    let result = (|| {
+        super::cte::visit_cte_sources(
+            query.with,
             storage,
             txid,
-            ctes,
+            Some(*context.path),
+            context.bindings,
+            arena,
+            &mut |source| match source {
+                super::cte::ScopedCte::Select(select) => collect_select(
+                    select,
+                    storage,
+                    txid,
+                    CteNames::EMPTY,
+                    dependencies,
+                    arena,
+                    context,
+                ),
+                super::cte::ScopedCte::DataModification(statement) => {
+                    collect_statement(statement, storage, txid, dependencies, arena, context)
+                }
+            },
+        )?;
+        let tree = super::cte::expand_set_tree(
+            query.with,
+            query.body,
+            storage,
+            txid,
+            Some(*context.path),
+            context.bindings,
+            arena,
+        )?;
+        collect_set_tree(
+            tree,
+            storage,
+            txid,
+            CteNames::EMPTY,
             dependencies,
             arena,
             context,
         )?;
-    }
-    Ok(())
+        for expression in query
+            .order_by
+            .iter()
+            .map(|order| order.expression)
+            .chain(query.limit)
+            .chain(query.offset)
+        {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                CteNames::EMPTY,
+                dependencies,
+                arena,
+                context,
+            )?;
+        }
+        Ok(())
+    })();
+    // Only copied selected catalog identities outlive these shared CTE shapes.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 fn record_routine_target(

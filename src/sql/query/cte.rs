@@ -2616,7 +2616,7 @@ pub fn describe_set_query<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
-    let body = expand_set_tree(q.with, q.body, storage, txid, arena)?;
+    let body = expand_set_tree(q.with, q.body, storage, txid, None, None, arena)?;
     describe_set_body(storage, body, txid, columns, arena, None)
 }
 
@@ -2626,15 +2626,18 @@ pub fn describe_set_query<'a>(
 pub(crate) fn expand_set_tree<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && !storage.has_any_view() {
+    if with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes(wrapper, storage, txid, arena)?;
+    let expanded =
+        expand_ctes_with_path(wrapper, storage, txid, path, dependencies, 0, None, arena)?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 

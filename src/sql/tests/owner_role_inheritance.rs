@@ -1,6 +1,119 @@
 use super::*;
 
 #[test]
+fn foreign_owner_changes_check_wrapper_superusers_and_destination_usage() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("foreign-owner-permissions-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE ROLE fdw_old; CREATE ROLE fdw_new; CREATE ROLE fdw_outsider; \
+             CREATE ROLE fdw_super SUPERUSER; CREATE ROLE fdw_unreachable; CREATE ROLE fdw_usage; \
+             CREATE FOREIGN DATA WRAPPER permission_wrapper; \
+             CREATE SERVER permission_server FOREIGN DATA WRAPPER permission_wrapper; \
+             ALTER SERVER permission_server OWNER TO fdw_old; \
+             GRANT USAGE ON FOREIGN DATA WRAPPER permission_wrapper TO fdw_old; \
+             GRANT fdw_new TO fdw_old WITH INHERIT FALSE, SET TRUE",
+            true,
+        );
+        for (identity, command, message, hint) in [
+            (
+                "fdw_old",
+                "ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO postgres",
+                "permission denied to change owner of foreign-data wrapper \"permission_wrapper\"",
+                "Must be superuser to change owner of a foreign-data wrapper.",
+            ),
+            (
+                "postgres",
+                "ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO fdw_new",
+                "permission denied to change owner of foreign-data wrapper \"permission_wrapper\"",
+                "The owner of a foreign-data wrapper must be a superuser.",
+            ),
+            (
+                "fdw_outsider",
+                "ALTER SERVER permission_server OWNER TO fdw_new",
+                "must be owner of foreign server permission_server",
+                "",
+            ),
+            (
+                "fdw_old",
+                "ALTER SERVER permission_server OWNER TO fdw_unreachable",
+                "must be able to SET ROLE \"fdw_unreachable\"",
+                "",
+            ),
+            (
+                "fdw_old",
+                "ALTER SERVER permission_server OWNER TO fdw_new",
+                "permission denied for foreign-data wrapper permission_wrapper",
+                "",
+            ),
+        ] {
+            session.success(
+                &mut engine,
+                &format!("RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION {identity}"),
+                true,
+            );
+            let output = session.execute(&mut engine, command, true);
+            assert_eq!(error_sqlstates(&output), ["42501"], "{identity}: {command}");
+            let wire = String::from_utf8_lossy(&output);
+            assert!(wire.contains(&format!("M{message}\0")), "{wire}");
+            if !hint.is_empty() {
+                assert!(wire.contains(&format!("H{hint}\0")), "{wire}");
+            }
+        }
+        session.success(&mut engine, "RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION fdw_outsider; BEGIN; ALTER SERVER permission_server OWNER TO fdw_old", true);
+        assert!(session.transaction.ddl().is_empty());
+        session.success(&mut engine, "COMMIT; RESET SESSION AUTHORIZATION; ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO fdw_super; ALTER ROLE fdw_super NOSUPERUSER", true);
+        for identity in ["postgres", "fdw_super"] {
+            session.success(
+                &mut engine,
+                &format!("RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION {identity}"),
+                true,
+            );
+            let output = session.execute(
+                &mut engine,
+                "ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO fdw_super",
+                true,
+            );
+            assert_eq!(error_sqlstates(&output), ["42501"]);
+            let expected = if identity == "postgres" {
+                "The owner of a foreign-data wrapper must be a superuser."
+            } else {
+                "Must be superuser to change owner of a foreign-data wrapper."
+            };
+            assert!(String::from_utf8_lossy(&output).contains(&format!("H{expected}\0")));
+        }
+        session.success(
+            &mut engine,
+            "RESET SESSION AUTHORIZATION; ALTER ROLE fdw_super SUPERUSER; \
+             ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO postgres; \
+             GRANT USAGE ON FOREIGN DATA WRAPPER permission_wrapper TO fdw_usage; \
+             GRANT fdw_usage TO fdw_new WITH INHERIT TRUE, SET FALSE; \
+             SET SESSION AUTHORIZATION fdw_old; BEGIN; \
+             ALTER SERVER permission_server OWNER TO fdw_new",
+            true,
+        );
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='permission_server'", true)), ["fdw_new"]);
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='permission_server'", true)), ["fdw_old"]);
+        session.success(
+            &mut engine,
+            "RESET SESSION AUTHORIZATION; ALTER SERVER permission_server OWNER TO fdw_unreachable",
+            true,
+        );
+        assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='permission_server'", true)), ["fdw_unreachable"]);
+        drop((session, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn reassign_owned_preserves_target_objects_and_foreign_owners_through_recovery() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -50,6 +163,10 @@ fn reassign_owned_preserves_target_objects_and_foreign_owners_through_recovery()
             &mut engine,
             "REASSIGN OWNED BY reassign_source,reassign_target TO reassign_target",
             true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, owners, true)),
+            ["reassign_target"; 3]
         );
         drop((session, engine));
         let mut reopened_budget = test_engine_budget(&config, 1 << 29);

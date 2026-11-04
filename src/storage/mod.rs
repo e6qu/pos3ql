@@ -4263,6 +4263,7 @@ struct EnforcerSnapshot {
 pub(crate) enum BindingChange {
     IndexCreate { created_at: u64 },
     IndexDrop { created_at: u64 },
+    IndexState { created_at: u64, kind: IndexKind },
     TableDefinition { revision: u64 },
 }
 
@@ -4270,6 +4271,7 @@ pub(crate) enum BindingChange {
 pub(crate) enum IndexBindingOperation {
     Create,
     Drop,
+    State,
 }
 
 #[derive(Clone, Copy)]
@@ -11778,6 +11780,9 @@ impl IndexStorageOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexKind {
     Ordinary,
+    OrdinaryUnbuilt,
+    OrdinaryReady,
+    OrdinaryDead,
     Partitioned { valid: bool },
 }
 
@@ -11785,7 +11790,42 @@ impl IndexKind {
     pub const fn valid(self) -> bool {
         match self {
             Self::Ordinary => true,
+            Self::OrdinaryUnbuilt | Self::OrdinaryReady | Self::OrdinaryDead => false,
             Self::Partitioned { valid } => valid,
+        }
+    }
+
+    pub const fn ready(self) -> bool {
+        matches!(
+            self,
+            Self::Ordinary | Self::OrdinaryReady | Self::Partitioned { .. }
+        )
+    }
+
+    pub const fn live(self) -> bool {
+        !matches!(self, Self::OrdinaryDead)
+    }
+
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Ordinary => 0,
+            Self::Partitioned { valid: false } => 1,
+            Self::Partitioned { valid: true } => 2,
+            Self::OrdinaryUnbuilt => 3,
+            Self::OrdinaryReady => 4,
+            Self::OrdinaryDead => 5,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Ordinary),
+            1 => Some(Self::Partitioned { valid: false }),
+            2 => Some(Self::Partitioned { valid: true }),
+            3 => Some(Self::OrdinaryUnbuilt),
+            4 => Some(Self::OrdinaryReady),
+            5 => Some(Self::OrdinaryDead),
+            _ => None,
         }
     }
 
@@ -14468,9 +14508,14 @@ struct LockState {
 }
 
 impl LockState {
-    fn next_sequence(&mut self) -> u64 {
-        self.sequence = self.sequence.wrapping_add(1).max(1);
-        self.sequence
+    fn next_sequence(&mut self) -> Result<u64, SqlError> {
+        self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "lock acquisition identity is exhausted"
+            )
+        })?;
+        Ok(self.sequence)
     }
 }
 
@@ -26990,10 +27035,14 @@ impl Storage {
             } else {
                 foreign::ForeignObjectClass::Server
             };
-            return self
-                .foreign_catalog()
+            let mut catalog = self.foreign_catalog();
+            let prior = catalog
                 .stage_owner(class, usize::from(object.slot), owner as u16, txid)
                 .expect("foreign ownership conflict is handled at the DDL boundary");
+            if txid == 0 {
+                catalog.commit_owner(class, usize::from(object.slot), 0);
+            }
+            return prior;
         }
         if matches!(
             object.class,
@@ -38413,6 +38462,9 @@ impl Storage {
                 CatalogDdlState::PendingCreate { txid } | CatalogDdlState::PendingCreateDrop { txid }
                     if txid == transaction),
             IndexBindingOperation::Drop => index.ddl_state.pending_drop_txid() == Some(transaction),
+            IndexBindingOperation::State => index
+                .pending_definition
+                .is_some_and(|pending| pending.txid == transaction),
         };
         if index.database != current_database() || !owned || index.created_at == 0 {
             return Err(sql_err!(
@@ -38465,12 +38517,21 @@ impl Storage {
                 ));
             }
         }
+        if matches!(operation, IndexBindingOperation::State)
+            && index.mutable.kind.ready() == index.mutable_for(transaction).kind.ready()
+        {
+            return Ok(());
+        }
         let change = match operation {
             IndexBindingOperation::Create => BindingChange::IndexCreate {
                 created_at: index.created_at,
             },
             IndexBindingOperation::Drop => BindingChange::IndexDrop {
                 created_at: index.created_at,
+            },
+            IndexBindingOperation::State => BindingChange::IndexState {
+                created_at: index.created_at,
+                kind: index.mutable_for(transaction).kind,
             },
         };
         self.prepare_index_enforcers(table, transaction, change)
@@ -38770,6 +38831,7 @@ impl Storage {
                         index.visible_to(owner)
                     }) && selection.matches_index_source(index)
                         && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
+                        && index.mutable_for(txid.unwrap_or(0)).kind.ready()
                 })
                 .count(),
             );
@@ -38828,6 +38890,7 @@ impl Storage {
                     index.visible_to(owner)
                 }) && selection.matches_index_source(index)
                     && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
+                    && index.mutable_for(txid.unwrap_or(0)).kind.ready()
             })
             .map(|(_, index)| index)
         {
@@ -49042,24 +49105,72 @@ impl Storage {
         Ok(prior)
     }
 
-    pub(crate) fn commit_index_definition(&mut self, slot: usize, txid: u32) {
-        let mut catalog = self.index_catalog();
-        let index = &mut catalog[slot];
-        if let Some(pending) = index.pending_definition
-            && pending.txid == txid
+    pub(crate) fn commit_index_definition(&mut self, slot: usize) -> Result<(), SqlError> {
+        self.install_index_definition(slot, 0, None)
+    }
+
+    pub(crate) fn publish_index_definition(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        self.install_index_definition(slot, transaction, Some(transaction))
+    }
+
+    fn install_index_definition(
+        &mut self,
+        slot: usize,
+        transaction: u32,
+        admitted: Option<u32>,
+    ) -> Result<(), SqlError> {
+        let selected = self.index(slot);
+        let Some(pending) = selected
+            .pending_definition
+            .filter(|pending| pending.txid == transaction)
+        else {
+            return Ok(());
+        };
+        let table = (selected.mutable.kind.ready() != pending.definition.kind.ready())
+            .then(|| self.index_table_slot_to(slot, transaction))
+            .flatten();
+        if let Some(table) = table {
+            self.preview_index_generation(table, admitted)?;
+        }
         {
+            let mut catalog = self.index_catalog();
+            let index = &mut catalog[slot];
             index.mutable = pending.definition;
             index.expressions = pending.expressions;
             index.predicate = pending.predicate;
             index.pending_definition = None;
         }
+        if let Some(table) = table {
+            self.publish_index_generation(table, admitted)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn rollback_index_definition(
-        &mut self,
+        &self,
         slot: usize,
         prior: Option<PendingIndexDefinition>,
     ) {
+        let selected = self.index(slot);
+        if let Some(pending) = selected.pending_definition {
+            let prior_kind = prior.map_or(selected.mutable.kind, |prior| prior.definition.kind);
+            if prior_kind.ready() != pending.definition.kind.ready()
+                && let Some(table) = self.index_table_slot_to(slot, pending.txid)
+            {
+                self.rollback_binding_change(
+                    table,
+                    pending.txid,
+                    BindingChange::IndexState {
+                        created_at: selected.created_at,
+                        kind: pending.definition.kind,
+                    },
+                );
+            }
+        }
         self.index_catalog()[slot].pending_definition = prior;
     }
 
@@ -49347,7 +49458,8 @@ impl Storage {
         table: &'a str,
         txid: u32,
     ) -> impl Iterator<Item = IndexDef> + 'a {
-        self.indexes_for(schema, table, txid).filter(|x| x.unique)
+        self.indexes_for(schema, table, txid)
+            .filter(move |index| index.unique && index.mutable_for(txid).kind.ready())
     }
 
     /// All committed indexes, for checkpoint serialization.
@@ -50463,6 +50575,10 @@ impl Storage {
         {
             lock.wait_owner = prepared_owner;
         }
+        // Incoming edges identify a backend, not an individual held resource.
+        // Its session locks stay with that backend after PREPARE; wake waiters
+        // to resolve the holder again before detaching transaction locks.
+        locks.row.resource_released(prior_owner);
         locks.row.rebind_wait_owner(prior_owner, prepared_owner);
         locks
             .advisory
@@ -50722,7 +50838,7 @@ impl Storage {
             crate::sql::lock::AdvisoryOwner::Session(connection_id)
         };
         let mut locks = self.lock_state();
-        let sequence = locks.next_sequence();
+        let sequence = locks.next_sequence()?;
         let LockState { advisory, row, .. } = &mut *locks;
         advisory.acquire(key, owner, wait_owner, mode, try_only, sequence, row)
     }
@@ -51023,7 +51139,7 @@ impl Storage {
                 "statement is waiting for a relation lock"
             ));
         }
-        let sequence = locks.next_sequence();
+        let sequence = locks.next_sequence()?;
         if let Some(index) = own_index {
             locks.table[index].modes[mode as usize] = sequence;
             locks.table[index].modes[protection as usize] = sequence;
@@ -51299,7 +51415,7 @@ impl Storage {
                     };
                     let wait_owner = crate::sql::lock::prepared_wait_owner(txid);
                     let mut locks = self.lock_state();
-                    let sequence = locks.next_sequence();
+                    let sequence = locks.next_sequence()?;
                     let LockState { advisory, row, .. } = &mut *locks;
                     let decision = advisory.acquire(
                         key,
@@ -51419,7 +51535,7 @@ impl Storage {
     ) -> Result<crate::sql::lock::LockDecision, SqlError> {
         let wait_owner = self.transaction_wait_owner(txid);
         let mut locks = self.lock_state();
-        let sequence = locks.next_sequence();
+        let sequence = locks.next_sequence()?;
         locks
             .row
             .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)

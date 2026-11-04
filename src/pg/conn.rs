@@ -5977,7 +5977,8 @@ mod tests {
                 "CREATE SEQUENCE input_wait_checks; \
                  CREATE TABLE input_wait_audit(value text, draw double precision); \
                  CREATE TABLE input_wait_gate(id integer PRIMARY KEY, hits integer); \
-                 INSERT INTO input_wait_gate VALUES(1,0),(2,0); \
+                 CREATE TABLE input_wait_second_gate(id integer PRIMARY KEY, hits integer); \
+                 INSERT INTO input_wait_gate VALUES(1,0); INSERT INTO input_wait_second_gate VALUES(2,0); \
                  CREATE TYPE input_wait_choice AS ENUM('a','b'); \
                  CREATE FUNCTION input_wait_allowed(value input_wait_choice) RETURNS boolean LANGUAGE plpgsql AS $$ \
                  DECLARE draw double precision; BEGIN \
@@ -5985,7 +5986,8 @@ mod tests {
                    PERFORM set_config('application_name',current_setting('application_name')||value::text,false); \
                    draw := random(); \
                    INSERT INTO input_wait_audit VALUES(value::text,draw); \
-                   UPDATE input_wait_gate SET hits=hits+1 WHERE id=CASE WHEN value='a' THEN 1 ELSE 2 END; \
+                   IF value='a' THEN UPDATE input_wait_gate SET hits=hits+1 WHERE id=1; \
+                   ELSE UPDATE input_wait_second_gate SET hits=hits+1 WHERE id=2; END IF; \
                    RETURN true; END$$; \
                  CREATE DOMAIN input_wait_domain AS input_wait_choice CHECK(input_wait_allowed(VALUE))",
             );
@@ -5994,13 +5996,15 @@ mod tests {
                     request(
                         &mut writer,
                         &mut engine,
-                        "TRUNCATE input_wait_audit; UPDATE input_wait_gate SET hits=0; \
+                        "TRUNCATE input_wait_audit; UPDATE input_wait_gate SET hits=0; UPDATE input_wait_second_gate SET hits=0; \
                          SELECT setval('input_wait_checks',1,false); SET application_name=''; SET lock_timeout='10s'; SELECT setseed(0.5)",
                     );
+                    // Separate tables let Locking mode finish the first input
+                    // before the second input reaches its conflicting write.
                     request(
                         &mut holder,
                         &mut engine,
-                        "BEGIN; UPDATE input_wait_gate SET hits=hits WHERE id=2",
+                        "BEGIN; UPDATE input_wait_second_gate SET hits=hits WHERE id=2",
                     );
                     writer.send.clear();
                     let sql = "SELECT '{a}'::input_wait_domain[], '{b}'::input_wait_domain[]";

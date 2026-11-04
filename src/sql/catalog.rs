@@ -38,7 +38,8 @@ pub(crate) struct BuiltinPlannerProcedure {
 
 pub(crate) fn builtin_planner_procedure(oid: i32) -> Option<BuiltinPlannerProcedure> {
     // Callable attributes describe the initialized catalog, including SQL
-    // functions installed after bootstrap. Internal I/O has its own inventory.
+    // functions installed after bootstrap. Bootstrap facts also cover support
+    // procedures that are not exposed as SQL-callable routines.
     if let Some(signature) = builtin_callable_by_oid(oid) {
         return Some(BuiltinPlannerProcedure {
             volatility: match signature.catalog.volatility {
@@ -330,7 +331,7 @@ mod callable_contract_tests {
     use super::*;
 
     #[test]
-    fn planner_procedures_include_type_io_without_exposing_new_callables() {
+    fn planner_procedures_cover_support_functions_without_exposing_new_callables() {
         let numeric = builtin_planner_procedure(1701).unwrap();
         assert_eq!(numeric.volatility, 0);
         assert!(numeric.strict && !numeric.forbidden);
@@ -339,11 +340,23 @@ mod callable_contract_tests {
         for oid in [1084, 1150, 750] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
-        assert_eq!(planner_properties::PROCEDURES.len(), 194);
-        for (oid, properties) in planner_properties::PROCEDURES {
+        assert_eq!(planner_properties::PROCEDURES.len(), 3397);
+        assert!(
+            planner_properties::PROCEDURES
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+        );
+        for oid in [67, 1258] {
+            let properties = builtin_planner_procedure(oid).unwrap();
+            assert_eq!(properties.volatility, 0);
+            assert!(properties.strict && !properties.forbidden);
+            assert!(builtin_callable_by_oid(oid).is_none());
+        }
+        for (oid, _) in planner_properties::PROCEDURES {
             let Some(signature) = builtin_callable_by_oid(*oid) else {
                 continue;
             };
+            let properties = builtin_planner_procedure(*oid).unwrap();
             assert_eq!(
                 properties.volatility,
                 match signature.catalog.volatility {
@@ -4172,6 +4185,22 @@ pub(crate) fn builtin_operator_procedure(
     if ambiguous { None } else { best }
 }
 
+/// Operator support procedures need not be exposed as SQL-callable routines.
+pub(crate) fn builtin_operator_input_oids(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> Option<(Option<i32>, Option<i32>)> {
+    let procedure = builtin_operator_procedure(name, left, right)?;
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    builtin_properties::OPERATORS
+        .iter()
+        .find_map(|&(candidate, left, right, selected)| {
+            (candidate == name && selected == procedure)
+                .then_some(((left != 0).then_some(left), (right != 0).then_some(right)))
+        })
+}
+
 /// NULLIF retains the first argument after equality overload coercion.
 /// Match exact inputs before PostgreSQL's same-category preferred types.
 pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i32), SqlError> {
@@ -4594,6 +4623,10 @@ mod builtin_property_tests {
                     assert_eq!(
                         builtin_operator_procedure("=", Some(left), Some(right)),
                         Some(procedure)
+                    );
+                    assert_eq!(
+                        builtin_operator_input_oids("=", Some(left), Some(right)),
+                        Some((Some(known), Some(known)))
                     );
                     assert_eq!(
                         builtin_operator_properties("=", Some(left), Some(right)),
@@ -22986,8 +23019,14 @@ fn pg_index<'a>(
                     Some(predicate) => text(predicate.as_str(), arena)?,
                     None => Datum::Null,
                 },
-                Datum::Bool(true),
-                Datum::Bool(true),
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_none_or(|definition| definition.kind.ready()),
+                ),
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_none_or(|definition| definition.kind.live()),
+                ),
                 match (0..info.n_cols)
                     .find_map(|position| index_expression_source(storage, info, position, txid))
                 {

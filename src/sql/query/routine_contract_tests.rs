@@ -28,7 +28,12 @@ fn bounded_consumer_stops_before_another_row_effect_and_keeps_unowned_errors() {
         }
         let error = consume_query_rows(
             core::num::NonZeroU64::MIN,
-            |_| Err(sql_err!("PZ004", "unowned source error")),
+            |_| {
+                Err(sql_err!(
+                    sqlstate::INTERNAL_QUERY_CONSUMER_COMPLETE,
+                    "unowned source error"
+                ))
+            },
             &mut |_| panic!("source failed before any row"),
         )
         .unwrap_err();

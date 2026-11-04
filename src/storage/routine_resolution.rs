@@ -438,20 +438,34 @@ impl Storage {
             return None;
         }
         let mapping = candidate.mapping(argument_names, actual_oids.len(), explicit_variadic)?;
+        let mut declared = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (input, mapped) in declared.iter_mut().zip(mapping).take(actual_oids.len()) {
+            *input = candidate.parameter_oid(usize::from(mapped), !explicit_variadic);
+        }
+        self.bind_builtin_input_types(&declared[..actual_oids.len()], actual_oids, txid)
+    }
+
+    fn bind_builtin_input_types(
+        &self,
+        declared: &[i32],
+        actual: &[i32],
+        txid: u32,
+    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
+        if declared.len() != actual.len() || actual.len() > MAX_ROUTINE_ARGUMENTS {
+            return None;
+        }
         let mut binding = PolymorphicBinding::EMPTY;
-        for (actual, input) in actual_oids.iter().zip(mapping) {
-            let declared = candidate.parameter_oid(usize::from(input), !explicit_variadic);
+        for (&declared, &actual) in declared.iter().zip(actual) {
             if let Some(kind) = polymorphic(declared)
-                && *actual != oid::UNKNOWN
+                && actual != oid::UNKNOWN
             {
-                binding.bind(kind, base_oid(self, txid, *actual))?;
+                binding.bind(kind, base_oid(self, txid, actual))?;
             }
         }
         let mut expected = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
-        for (index, (actual, input)) in actual_oids.iter().zip(mapping).enumerate() {
-            let declared = candidate.parameter_oid(usize::from(input), !explicit_variadic);
-            expected[index] = if declared == oid::ANY {
-                *actual
+        for ((output, &declared), &actual) in expected.iter_mut().zip(declared).zip(actual) {
+            *output = if declared == oid::ANY {
+                actual
             } else if let Some(kind) = polymorphic(declared) {
                 binding.concrete_oid(kind)?
             } else {
@@ -459,6 +473,41 @@ impl Storage {
             };
         }
         Some(expected)
+    }
+
+    pub(crate) fn builtin_operator_input_oids(
+        &self,
+        name: &str,
+        left: Option<i32>,
+        right: Option<i32>,
+        txid: u32,
+    ) -> Option<(Option<i32>, Option<i32>)> {
+        let (expected_left, expected_right) =
+            crate::sql::catalog::builtin_operator_input_oids(name, left, right)?;
+        let mut declared = [oid::UNKNOWN; 2];
+        let mut actual = [oid::UNKNOWN; 2];
+        let mut positions = [None; 2];
+        let mut count = 0;
+        for (position, (source, target)) in positions
+            .iter_mut()
+            .zip([(left, expected_left), (right, expected_right)])
+        {
+            match (source, target) {
+                (Some(source), Some(target)) => {
+                    declared[count] = target;
+                    actual[count] = source;
+                    *position = Some(count);
+                    count += 1;
+                }
+                (None, None) => {}
+                _ => return None,
+            }
+        }
+        let bound = self.bind_builtin_input_types(&declared[..count], &actual[..count], txid)?;
+        Some((
+            positions[0].map(|index| bound[index]),
+            positions[1].map(|index| bound[index]),
+        ))
     }
 
     pub(crate) fn builtin_call_result_oid(

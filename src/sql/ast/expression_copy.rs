@@ -57,10 +57,15 @@ pub(crate) fn duplicate_expression<'a>(
     }
     let mut copied = *expression;
     match &mut copied {
-        Expr::BoundLiteral {
-            encoded, source, ..
-        } => {
-            *encoded = arena.alloc_slice_copy(encoded)?;
+        Expr::BoundLiteral { value, source, .. } => {
+            *value = match *value {
+                super::BoundLiteralValue::CheckedArrayInput(encoded) => {
+                    super::BoundLiteralValue::CheckedArrayInput(arena.alloc_slice_copy(encoded)?)
+                }
+                super::BoundLiteralValue::CachedDefault(encoded) => {
+                    super::BoundLiteralValue::CachedDefault(arena.alloc_slice_copy(encoded)?)
+                }
+            };
             *source = duplicate_expression(source, arena, &[])?;
         }
         Expr::Unary { operand, .. }

@@ -1032,7 +1032,7 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.arena_full("type input source map exceeds SQL arena"))?;
             }
             return self.arena_expr(Expr::BoundLiteral {
-                encoded: binding.encoded,
+                value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(binding.encoded),
                 type_oid: binding.type_oid,
                 type_mod: binding.type_mod,
                 collation: binding.collation,
@@ -9103,7 +9103,9 @@ impl<'a> Parser<'a> {
                     return self
                         .arena
                         .alloc(Expr::BoundLiteral {
-                            encoded: binding.encoded,
+                            value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(
+                                binding.encoded,
+                            ),
                             type_oid: binding.type_oid,
                             type_mod: binding.type_mod,
                             collation: binding.collation,

@@ -777,7 +777,10 @@ fn retain_effect_error(
     };
     let (detail, hint) = match diagnostic {
         Some(diagnostic) => (
-            Some(copy(diagnostic.detail.as_str())?),
+            diagnostic
+                .detail
+                .map(|detail| copy(detail.as_str()))
+                .transpose()?,
             diagnostic
                 .hint
                 .map(|hint| copy(hint.as_str()))
@@ -805,25 +808,29 @@ fn restore_effect_error(
     handle: ArenaHandle<StatementEffectError>,
 ) -> Result<SqlError, SqlError> {
     let saved = arena.retained(handle).ok_or_else(replay_changed)?;
-    if let Some(detail) = saved.detail {
+    let detail = if let Some(detail) = saved.detail {
         let detail = arena
             .retained_slice_mut(detail)
             .map_err(|_| replay_changed())?;
-        let text = crate::util::StackStr::from_str(
+        Some(crate::util::StackStr::from_str(
             core::str::from_utf8(&detail).map_err(|_| replay_changed())?,
+        ))
+    } else {
+        None
+    };
+    let hint = if let Some(hint) = saved.hint {
+        let hint = arena
+            .retained_slice_mut(hint)
+            .map_err(|_| replay_changed())?;
+        let text = crate::util::StackStr::from_str(
+            core::str::from_utf8(&hint).map_err(|_| replay_changed())?,
         );
-        let hint = if let Some(hint) = saved.hint {
-            let hint = arena
-                .retained_slice_mut(hint)
-                .map_err(|_| replay_changed())?;
-            let text = crate::util::StackStr::from_str(
-                core::str::from_utf8(&hint).map_err(|_| replay_changed())?,
-            );
-            Some(text)
-        } else {
-            None
-        };
-        super::eval::stash_diagnostic(text, hint);
+        Some(text)
+    } else {
+        None
+    };
+    if detail.is_some() || hint.is_some() {
+        super::eval::stash_diagnostic(detail, hint);
     }
     Ok(SqlError {
         sqlstate: saved.state,
@@ -1465,7 +1472,7 @@ mod tests {
                         .unwrap();
                         session.record_nextval(0, 1, value);
                         super::super::eval::stash_diagnostic(
-                            crate::util::StackStr::from_str("caught literal detail"),
+                            Some(crate::util::StackStr::from_str("caught literal detail")),
                             None,
                         );
                         StatementEffectAttempt {
@@ -1480,6 +1487,7 @@ mod tests {
                     super::super::eval::take_diagnostic()
                         .unwrap()
                         .detail
+                        .unwrap()
                         .as_str(),
                     "caught literal detail"
                 );
@@ -1520,6 +1528,7 @@ mod tests {
                     super::super::eval::take_diagnostic()
                         .unwrap()
                         .detail
+                        .unwrap()
                         .as_str(),
                     "caught literal detail"
                 );
@@ -1856,7 +1865,7 @@ mod tests {
                     &arena,
                     || {
                         super::super::eval::stash_diagnostic(
-                            crate::util::StackStr::from_str("one row required"),
+                            Some(crate::util::StackStr::from_str("one row required")),
                             None,
                         );
                         StatementEffectAttempt {
@@ -1874,6 +1883,7 @@ mod tests {
                     super::super::eval::take_diagnostic()
                         .unwrap()
                         .detail
+                        .unwrap()
                         .as_str(),
                     "one row required"
                 );
@@ -1894,10 +1904,51 @@ mod tests {
                     super::super::eval::take_diagnostic()
                         .unwrap()
                         .detail
+                        .unwrap()
                         .as_str(),
                     "one row required"
                 );
                 scope.finish(session).unwrap();
+            }
+            for detail in [None, Some("")] {
+                arena.reset();
+                {
+                    let _scope = enter_statement(&arena, session, false);
+                    statement_effect(
+                        StatementEffectKind::Cursor,
+                        &[Datum::Text("optional fields")],
+                        StatementEffectRetry::Continue,
+                        &arena,
+                        || {
+                            super::super::eval::stash_diagnostic(
+                                detail.map(crate::util::StackStr::from_str),
+                                Some(crate::util::StackStr::from_str("hint without detail")),
+                            );
+                            StatementEffectAttempt {
+                                result: Err(sql_err!(sqlstate::INSUFFICIENT_PRIVILEGE, "denied")),
+                                rewound_state: false,
+                            }
+                        },
+                    )
+                    .unwrap_err();
+                    let diagnostic = super::super::eval::take_diagnostic().unwrap();
+                    assert_eq!(diagnostic.detail.as_ref().map(|text| text.as_str()), detail);
+                }
+                {
+                    let scope = enter_statement(&arena, session, true);
+                    statement_effect(
+                        StatementEffectKind::Cursor,
+                        &[Datum::Text("optional fields")],
+                        StatementEffectRetry::Continue,
+                        &arena,
+                        || panic!("terminal diagnostic cannot execute twice"),
+                    )
+                    .unwrap_err();
+                    let diagnostic = super::super::eval::take_diagnostic().unwrap();
+                    assert_eq!(diagnostic.detail.as_ref().map(|text| text.as_str()), detail);
+                    assert_eq!(diagnostic.hint.unwrap().as_str(), "hint without detail");
+                    scope.finish(session).unwrap();
+                }
             }
             arena.reset();
             {

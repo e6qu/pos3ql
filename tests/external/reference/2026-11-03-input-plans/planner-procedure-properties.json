@@ -1,0 +1,25 @@
+{
+  "upstream_tag": "REL_18_6",
+  "procedure_count": 3397,
+  "sources": [
+    {
+      "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_6/src/include/catalog/pg_proc.dat",
+      "sha256": "1f934ce80d460159dda137714374a35f9896315ea2476709cbb4da13b38ef95a"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/postgres/postgres/REL_18_6/src/include/catalog/pg_proc.h",
+      "sha256": "f7d59f07c5b95e2f3c7141762a0f576e8a3af7581ba54c27537f4d500472bea5"
+    }
+  ],
+  "generator": {
+    "path": "tools/generate-pg18-planner-properties.py",
+    "sha256": "d6086fc1e56efbd82eaa17c3703e71ea1d55ebda79fbfe24cb9a8909aa7a71c0"
+  },
+  "generated": {
+    "path": "src/sql/catalog_planner_properties.rs",
+    "sha256": "ec90cc9080f1e659c4782316701ab7ea1301c1f301d21832cfd04865a75782a6"
+  },
+  "reproduce": "python3 tools/generate-pg18-planner-properties.py --source pg_proc.dat --header pg_proc.h --output src/sql/catalog_planner_properties.rs",
+  "authority": "Initialized callable declarations override bootstrap planner attributes. Procedure metadata does not expose additional SQL-callable routines.",
+  "verification": "Pinned source hashes, 3397 unique OIDs, and byte-identical regeneration; runtime behavior remains subject to CI."
+}

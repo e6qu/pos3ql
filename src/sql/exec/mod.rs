@@ -2076,7 +2076,6 @@ fn require_foreign_owner(
     class: crate::storage::foreign::ForeignObjectClass,
     slot: usize,
     txid: u32,
-    noun: &'static str,
 ) -> Result<(), SqlError> {
     let current = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
@@ -2091,10 +2090,43 @@ fn require_foreign_owner(
     {
         return Ok(());
     }
+    let (noun, name) = match class {
+        crate::storage::foreign::ForeignObjectClass::Wrapper => (
+            "foreign-data wrapper",
+            storage
+                .foreign_wrapper_by_slot(slot, txid)
+                .map(|definition| definition.name),
+        ),
+        crate::storage::foreign::ForeignObjectClass::Server => (
+            "foreign server",
+            storage
+                .foreign_server_by_slot(slot, txid)
+                .map(|definition| definition.name),
+        ),
+        crate::storage::foreign::ForeignObjectClass::Mapping => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "user mappings have no independent owner"
+            ));
+        }
+        crate::storage::foreign::ForeignObjectClass::Table => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign tables use relation ownership"
+            ));
+        }
+    };
+    let name = name.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "selected foreign object is unavailable"
+        )
+    })?;
     Err(sql_err!(
         sqlstate::INSUFFICIENT_PRIVILEGE,
-        "must be owner of {}",
-        noun
+        "must be owner of {} {}",
+        noun,
+        name.as_str()
     ))
 }
 
@@ -2104,7 +2136,6 @@ fn alter_foreign_owner(
     class: crate::storage::foreign::ForeignObjectClass,
     slot: usize,
     role: &str,
-    noun: &'static str,
 ) -> Result<(), SqlError> {
     let role = resolve_role_name(role);
     let owner = storage
@@ -2116,24 +2147,81 @@ fn alter_foreign_owner(
                 role.as_str()
             )
         })?;
-    if storage.foreign_catalog_owner_to(class, slot, txn.txid) as usize == owner {
-        return Ok(());
-    }
-    require_foreign_owner(storage, class, slot, txn.txid, noun)?;
     let current = storage.current_role_slot(txn.txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "current role is not present in the role catalog"
         )
     })?;
-    if !storage.role(current).attributes_to(txn.txid).superuser
-        && !storage.role_can_set(current, owner, txn.txid)
-    {
+    let superuser = storage.role(current).attributes_to(txn.txid).superuser;
+    if class == crate::storage::foreign::ForeignObjectClass::Wrapper {
+        let hint = if !superuser {
+            Some("Must be superuser to change owner of a foreign-data wrapper.")
+        } else if !storage.role(owner).attributes_to(txn.txid).superuser {
+            Some("The owner of a foreign-data wrapper must be a superuser.")
+        } else {
+            None
+        };
+        if let Some(hint) = hint {
+            let definition = storage
+                .foreign_wrapper_by_slot(slot, txn.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "selected foreign-data wrapper is unavailable"
+                    )
+                })?;
+            super::eval::stash_diagnostic(None, Some(crate::util::StackStr::from_str(hint)));
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to change owner of foreign-data wrapper \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+    }
+    if storage.foreign_catalog_owner_to(class, slot, txn.txid) as usize == owner {
+        return Ok(());
+    }
+    require_foreign_owner(storage, class, slot, txn.txid)?;
+    if !superuser && !storage.role_can_set(current, owner, txn.txid) {
         return Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "must be able to SET ROLE \"{}\"",
             role.as_str()
         ));
+    }
+    if !superuser && class == crate::storage::foreign::ForeignObjectClass::Server {
+        let definition = storage
+            .foreign_server_by_slot(slot, txn.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected foreign server is unavailable"
+                )
+            })?;
+        if !storage.has_object_privilege(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::ForeignDataWrapper,
+                slot: definition.wrapper,
+            },
+            owner,
+            crate::storage::PrivilegeSet::USAGE,
+            txn.txid,
+        ) {
+            let wrapper = storage
+                .foreign_wrapper_by_slot(usize::from(definition.wrapper), txn.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "foreign server wrapper is unavailable"
+                    )
+                })?;
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for foreign-data wrapper {}",
+                wrapper.name.as_str()
+            ));
+        }
     }
     let prior = storage.stage_foreign_catalog_owner(class, slot, owner as u16, txn.txid)?;
     if let Err(error) = txn.record_ddl(
@@ -2165,13 +2253,14 @@ pub fn alter_foreign_data_wrapper(
             name
         ));
     };
-    if let Err(error) = require_foreign_owner(
-        storage,
-        crate::storage::foreign::ForeignObjectClass::Wrapper,
-        slot,
-        txn.txid,
-        "foreign-data wrapper",
-    ) {
+    if !matches!(action, super::ast::AlterForeignDataWrapperAction::Owner(_))
+        && let Err(error) = require_foreign_owner(
+            storage,
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot,
+            txn.txid,
+        )
+    {
         return sql_fail(error);
     }
     match action {
@@ -2182,7 +2271,6 @@ pub fn alter_foreign_data_wrapper(
                 crate::storage::foreign::ForeignObjectClass::Wrapper,
                 slot,
                 role,
-                "foreign-data wrapper",
             ) {
                 return sql_fail(error);
             }
@@ -2293,7 +2381,6 @@ pub fn alter_foreign_server(
             crate::storage::foreign::ForeignObjectClass::Server,
             slot,
             txn.txid,
-            "server",
         )
     {
         return sql_fail(error);
@@ -2306,7 +2393,6 @@ pub fn alter_foreign_server(
                 crate::storage::foreign::ForeignObjectClass::Server,
                 slot,
                 role,
-                "server",
             ) {
                 return sql_fail(error);
             }
@@ -2662,7 +2748,6 @@ pub fn drop_foreign_server(
             crate::storage::foreign::ForeignObjectClass::Server,
             slot,
             txn.txid,
-            "server",
         ) {
             return sql_fail(error);
         }
@@ -2711,7 +2796,6 @@ pub fn drop_foreign_data_wrapper(
             crate::storage::foreign::ForeignObjectClass::Wrapper,
             slot,
             txn.txid,
-            "foreign-data wrapper",
         ) {
             return sql_fail(error);
         }
@@ -6885,7 +6969,7 @@ pub fn create_schema(
             &mut detail,
             "The prefix \"pg_\" is reserved for system schemas.",
         );
-        crate::sql::eval::stash_diagnostic(detail, None);
+        crate::sql::eval::stash_diagnostic(Some(detail), None);
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::RESERVED_NAME,
             "unacceptable schema name \"{}\"",
@@ -14149,7 +14233,7 @@ pub(crate) fn drop_schema(
             hint,
             "Use DROP ... CASCADE to drop the dependent objects too."
         );
-        crate::sql::eval::stash_diagnostic(detail, Some(hint));
+        crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop schema {} because other objects depend on it",
@@ -14251,7 +14335,7 @@ pub(crate) fn drop_schema(
                 line.as_str()
             );
         }
-        crate::sql::eval::stash_diagnostic(detail, None);
+        crate::sql::eval::stash_diagnostic(Some(detail), None);
         responder.notice(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
             stack_format!(
@@ -19727,6 +19811,10 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::CARDINALITY_VIOLATION
     } else if text.eq_ignore_ascii_case("invalid_transaction_termination") {
         sqlstate::INVALID_TRANSACTION_TERMINATION
+    } else if text.eq_ignore_ascii_case("no_data_found") {
+        sqlstate::NO_DATA_FOUND
+    } else if text.eq_ignore_ascii_case("too_many_rows") {
+        sqlstate::TOO_MANY_ROWS
     } else if text.eq_ignore_ascii_case("raise_exception") {
         sqlstate::RAISE_EXCEPTION
     } else if text.eq_ignore_ascii_case("assert_failure") {
@@ -20050,6 +20138,52 @@ fn parse_trigger_statement<'a>(
     Err(unsupported_trigger_body())
 }
 
+fn parse_trigger_exception_handlers<'a>(
+    segments: &[&'a str],
+    at: &mut usize,
+    arena: &'a Arena,
+    loop_labels: &mut [Option<SqlName>],
+    loop_depth: usize,
+    program_kind: PlpgsqlProgramKind,
+    protected: TriggerBlock<'a>,
+) -> Result<TriggerException<'a>, SqlError> {
+    let mut handlers = ProgramList::new(arena);
+    let Some(&header) = segments.get(*at) else {
+        return Err(unsupported_trigger_body());
+    };
+    let Some(conditions) = strip_trigger_keyword(header, "when") else {
+        return Err(unsupported_trigger_body());
+    };
+    let Some(mut conditions) = trigger_tail(conditions, "then") else {
+        return Err(unsupported_trigger_body());
+    };
+    *at += 1;
+    loop {
+        let (block, ending) = parse_trigger_block(
+            segments,
+            at,
+            arena,
+            loop_labels,
+            loop_depth,
+            true,
+            program_kind,
+        )?;
+        handlers.push(TriggerExceptionHandler {
+            conditions: parse_trigger_exception_conditions(conditions, arena)?,
+            block,
+        })?;
+        match ending {
+            TriggerBlockEnd::End => break,
+            TriggerBlockEnd::When(next) => conditions = next,
+            _ => return Err(unsupported_trigger_body()),
+        }
+    }
+    Ok(TriggerException {
+        protected,
+        handlers: handlers.as_slice(),
+    })
+}
+
 fn parse_trigger_block<'a>(
     segments: &[&'a str],
     at: &mut usize,
@@ -20274,43 +20408,15 @@ fn parse_trigger_block<'a>(
                 program_kind,
             )?;
             if matches!(ending, TriggerBlockEnd::Exception) {
-                let mut handlers = ProgramList::new(arena);
-                let Some(&header) = segments.get(*at) else {
-                    return Err(unsupported_trigger_body());
-                };
-                let Some(conditions) = strip_trigger_keyword(header, "when") else {
-                    return Err(unsupported_trigger_body());
-                };
-                let Some(mut conditions) = trigger_tail(conditions, "then") else {
-                    return Err(unsupported_trigger_body());
-                };
-                *at += 1;
-                loop {
-                    let (block, ending) = parse_trigger_block(
-                        segments,
-                        at,
-                        arena,
-                        loop_labels,
-                        loop_depth,
-                        true,
-                        program_kind,
-                    )?;
-                    handlers.push(TriggerExceptionHandler {
-                        conditions: parse_trigger_exception_conditions(conditions, arena)?,
-                        block,
-                    })?;
-                    match ending {
-                        TriggerBlockEnd::End => break,
-                        TriggerBlockEnd::When(next) => {
-                            conditions = next;
-                        }
-                        _ => return Err(unsupported_trigger_body()),
-                    }
-                }
-                TriggerStatement::Exception(TriggerException {
+                TriggerStatement::Exception(parse_trigger_exception_handlers(
+                    segments,
+                    at,
+                    arena,
+                    loop_labels,
+                    loop_depth,
+                    program_kind,
                     protected,
-                    handlers: handlers.as_slice(),
-                })
+                )?)
             } else {
                 if !matches!(ending, TriggerBlockEnd::End) {
                     return Err(unsupported_trigger_body());
@@ -20502,7 +20608,27 @@ fn parse_plpgsql_program_inner<'a>(
         false,
         program_kind,
     )?;
-    if !matches!(ending, TriggerBlockEnd::End) || at != segments.len() {
+    let body = match ending {
+        TriggerBlockEnd::End => body,
+        TriggerBlockEnd::Exception => {
+            let exception = parse_trigger_exception_handlers(
+                segments,
+                &mut at,
+                arena,
+                loop_labels,
+                0,
+                program_kind,
+                body,
+            )?;
+            TriggerBlock {
+                statements: arena
+                    .alloc_slice_copy(&[TriggerStatement::Exception(exception)])
+                    .map_err(|_| super::query::arena_full_pub())?,
+            }
+        }
+        _ => return Err(unsupported_trigger_body()),
+    };
+    if at != segments.len() {
         return Err(unsupported_trigger_body());
     }
     Ok(ParsedTriggerProgram {
@@ -21720,6 +21846,42 @@ mod trigger_program_tests {
                 "END",
             ]
         );
+    }
+
+    #[test]
+    fn outer_exception_blocks_share_nested_handler_parsing() {
+        let mut budget = Budget::new(1 << 18);
+        let arena = Arena::new(&mut budget, "outer PL exception handlers", 1 << 17).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (source, kind, expected) in [
+                (
+                    "BEGIN RETURN QUERY SELECT 10/0; EXCEPTION WHEN division_by_zero THEN RETURN QUERY SELECT 99; END",
+                    PlpgsqlProgramKind::SetFunction,
+                    sqlstate::DIVISION_BY_ZERO,
+                ),
+                (
+                    "DECLARE selected integer; BEGIN SELECT 1 INTO STRICT selected WHERE false; EXCEPTION WHEN no_data_found THEN NULL; END",
+                    PlpgsqlProgramKind::Procedure,
+                    sqlstate::NO_DATA_FOUND,
+                ),
+                (
+                    "DECLARE selected integer; BEGIN SELECT 1 INTO STRICT selected; EXCEPTION WHEN too_many_rows THEN NULL; END",
+                    PlpgsqlProgramKind::Procedure,
+                    sqlstate::TOO_MANY_ROWS,
+                ),
+            ] {
+                let program = parse_plpgsql_program(source, &arena, kind).unwrap();
+                let [TriggerStatement::Exception(exception)] = program.body.statements else {
+                    panic!("outer handler must own the protected block");
+                };
+                let [TriggerExceptionCondition::SqlState(state)] = exception.handlers[0].conditions
+                else {
+                    panic!("named handler must retain its canonical SQLSTATE");
+                };
+                assert_eq!(*state, expected);
+                assert_eq!(exception.protected.statements.len(), 1);
+            }
+        });
     }
 
     #[test]
@@ -27452,7 +27614,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     exception.expect("bare RAISE is parsed only in an exception handler");
                 if exception.detail.is_some() || exception.hint.is_some() {
                     crate::sql::eval::stash_diagnostic(
-                        StackStr::from_str(exception.detail.unwrap_or("")),
+                        exception.detail.map(StackStr::from_str),
                         exception.hint.map(StackStr::from_str),
                     );
                 }
@@ -27505,7 +27667,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
                         .transpose()?;
                     if detail.is_some() || hint.is_some() {
-                        crate::sql::eval::stash_diagnostic(detail.unwrap_or_default(), hint);
+                        crate::sql::eval::stash_diagnostic(detail, hint);
                     }
                     match raise.level {
                         TriggerRaiseLevel::Debug => context
@@ -27643,7 +27805,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             .map_err(|_| super::query::arena_full_pub())?;
                         let detail = diagnostic
                             .as_ref()
-                            .map(|value| context.arena.alloc_str(value.detail.as_str()))
+                            .and_then(|value| value.detail.as_ref())
+                            .map(|value| context.arena.alloc_str(value.as_str()))
                             .transpose()
                             .map_err(|_| super::query::arena_full_pub())?;
                         let hint = diagnostic
@@ -28929,7 +29092,11 @@ fn cursor_effect_error_fields<'a>(
     output[0] = copy(error.sqlstate.as_str())?;
     output[1] = copy(error.message.as_str())?;
     if let Some(diagnostic) = super::eval::take_diagnostic() {
-        output[2] = copy(diagnostic.detail.as_str())?;
+        output[2] = diagnostic
+            .detail
+            .map(|detail| copy(detail.as_str()))
+            .transpose()?
+            .unwrap_or(Datum::Null);
         output[3] = diagnostic
             .hint
             .map(|hint| copy(hint.as_str()))
@@ -28956,12 +29123,28 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
             "cursor replay error is invalid"
         ));
     };
-    if let Datum::Text(detail) = output[2] {
-        let hint = match output[3] {
-            Datum::Text(hint) => Some(StackStr::from_str(hint)),
-            _ => None,
-        };
-        super::eval::stash_diagnostic(StackStr::from_str(detail), hint);
+    let detail = match output[2] {
+        Datum::Text(detail) => Some(StackStr::from_str(detail)),
+        Datum::Null => None,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor replay error detail is invalid"
+            ));
+        }
+    };
+    let hint = match output[3] {
+        Datum::Text(hint) => Some(StackStr::from_str(hint)),
+        Datum::Null => None,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor replay error hint is invalid"
+            ));
+        }
+    };
+    if detail.is_some() || hint.is_some() {
+        super::eval::stash_diagnostic(detail, hint);
     }
     Err(SqlError {
         sqlstate: state,
@@ -46846,15 +47029,16 @@ pub(crate) fn drop_type(
             .enumerate()
             .take(storage.domain_count())
         {
-            let domain = storage.domain(domain_slot);
-            if domain.visible_to(txn.txid)
-                && matches!(
-                    domain.base,
-                    ColType::Enum(enum_slot)
-                        | ColType::Array(super::types::ArrElem::Enum(enum_slot))
-                        if enum_slot == Some(creation)
-                )
-            {
+            if !storage.domain_slot_visible_to(domain_slot, txn.txid) {
+                continue;
+            }
+            let domain = storage.domain_for(domain_slot, txn.txid);
+            if matches!(
+                domain.base,
+                ColType::Enum(enum_slot)
+                    | ColType::Array(super::types::ArrElem::Enum(enum_slot))
+                    if enum_slot == Some(creation)
+            ) {
                 *is_dependent = true;
             }
         }
@@ -47383,7 +47567,7 @@ fn report_composite_type_dependents(
             "Use DROP ... CASCADE to drop the dependent objects too."
         );
     }
-    crate::sql::eval::stash_diagnostic(detail, (!cascade).then_some(hint));
+    crate::sql::eval::stash_diagnostic(Some(detail), (!cascade).then_some(hint));
     if cascade {
         responder
             .notice(
@@ -48986,7 +49170,7 @@ fn report_stored_query_dependents(
                 .notice(sqlstate::SUCCESSFUL_COMPLETION, detail.as_str())
                 .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "response buffer full"))?;
         } else {
-            crate::sql::eval::stash_diagnostic(detail, None);
+            crate::sql::eval::stash_diagnostic(Some(detail), None);
             responder
                 .notice(
                     sqlstate::SUCCESSFUL_COMPLETION,
@@ -49000,7 +49184,7 @@ fn report_stored_query_dependents(
             hint,
             "Use DROP ... CASCADE to drop the dependent objects too."
         );
-        crate::sql::eval::stash_diagnostic(detail, Some(hint));
+        crate::sql::eval::stash_diagnostic(Some(detail), Some(hint));
     }
     Ok(())
 }

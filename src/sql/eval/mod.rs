@@ -58,7 +58,7 @@ pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 
 #[derive(Clone, Copy)]
 pub struct Diagnostic {
-    pub detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
+    pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     pub hint: Option<StackStr<128>>,
 }
 
@@ -68,7 +68,7 @@ std::thread_local! {
 }
 
 pub fn stash_diagnostic(
-    detail: StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>,
+    detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     hint: Option<StackStr<128>>,
 ) {
     PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
@@ -286,6 +286,7 @@ pub mod sqlstate {
     /// Evaluation yielded a scalar routine which must run after the caller
     /// releases its immutable storage borrow.
     pub(crate) const INTERNAL_ROUTINE_INVOCATION: &str = "PZ003";
+    pub(crate) const INTERNAL_QUERY_CONSUMER_COMPLETE: &str = "PZ004";
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
@@ -3423,6 +3424,23 @@ pub fn eval_full<'a>(
     )
 }
 
+pub(crate) fn bound_literal_value<'a>(
+    value: crate::sql::ast::BoundLiteralValue<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        crate::sql::ast::BoundLiteralValue::CheckedArrayInput(encoded) => {
+            super::type_inputs::value(encoded, arena)
+        }
+        crate::sql::ast::BoundLiteralValue::CachedDefault(encoded) => {
+            let mut values = [Datum::Null];
+            let width = super::exec::decode_projected_row_into(encoded, arena, &mut values)?;
+            debug_assert_eq!(width, 1, "cached default contains one encoded value");
+            Ok(values[0])
+        }
+    }
+}
+
 fn eval_full_inner<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -3540,7 +3558,7 @@ fn eval_full_inner<'a>(
         }
     }
     match *expression {
-        Expr::BoundLiteral { encoded, .. } => super::type_inputs::value(encoded, arena),
+        Expr::BoundLiteral { value, .. } => bound_literal_value(value, arena),
         Expr::BoundDefault { expression, .. } => eval_full(expression, arena, params, row, hooks),
         Expr::Null => Ok(Datum::Null),
         // A whole-row value: NULL for an outer-join null row, else a non-null

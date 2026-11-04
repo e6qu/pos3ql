@@ -10966,3 +10966,225 @@ fn publication_filters_share_one_bounded_catalog_payload() {
         sqlstate::PROGRAM_LIMIT_EXCEEDED
     );
 }
+
+#[test]
+fn prepare_rechecks_waiters_without_detaching_session_advisory_holders() {
+    use crate::sql::ast::TableLockMode;
+    use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
+
+    let mut config = test_config();
+    config.max_connections = 3;
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage
+        .create_table(make_def("phase_prepare", &[("id", ColType::Int4, false)]))
+        .unwrap();
+    let previous = crate::sql::execution_connection_id();
+    crate::mem::guard::forbid_alloc(|| {
+        crate::sql::set_execution_connection_id(41);
+        let holder = storage.start_transaction_identity().unwrap();
+        storage
+            .lock_table(holder, table, TableLockMode::ShareUpdateExclusive, false)
+            .unwrap();
+        let key = AdvisoryKey::from_bigint(123);
+        assert_eq!(
+            storage
+                .acquire_advisory_lock(holder, key, AdvisoryMode::Exclusive, false, false)
+                .unwrap(),
+            AdvisoryDecision::Acquired
+        );
+        crate::sql::set_execution_connection_id(42);
+        let relation_waiter = storage.start_transaction_identity().unwrap();
+        assert_eq!(
+            storage
+                .lock_table(
+                    relation_waiter,
+                    table,
+                    TableLockMode::AccessExclusive,
+                    false
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        crate::sql::set_execution_connection_id(43);
+        let advisory_waiter = storage.start_transaction_identity().unwrap();
+        assert_eq!(
+            storage
+                .acquire_advisory_lock(advisory_waiter, key, AdvisoryMode::Exclusive, true, false)
+                .unwrap(),
+            AdvisoryDecision::Waiting
+        );
+        let mut wait_start = None;
+        storage.visit_advisory_locks(|lock| {
+            if !lock.granted {
+                wait_start = lock.wait_start;
+            }
+        });
+        assert!(wait_start.is_some());
+        assert_ne!(storage.lock_wait_generation(42), 0);
+        assert_ne!(storage.lock_wait_generation(43), 0);
+        storage.prepare_transaction_locks(holder);
+        assert_eq!(storage.lock_wait_generation(42), 0);
+        assert_eq!(storage.lock_wait_generation(43), 0);
+        crate::sql::set_execution_connection_id(42);
+        assert_eq!(
+            storage
+                .lock_table(
+                    relation_waiter,
+                    table,
+                    TableLockMode::AccessExclusive,
+                    false
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::INTERNAL_LOCK_WAIT
+        );
+        assert_ne!(storage.lock_wait_generation(42), 0);
+        assert_eq!(storage.blocking_backend_pid_count(42), 0);
+        crate::sql::set_execution_connection_id(43);
+        assert_eq!(
+            storage
+                .acquire_advisory_lock(advisory_waiter, key, AdvisoryMode::Exclusive, true, false)
+                .unwrap(),
+            AdvisoryDecision::Waiting
+        );
+        let mut blockers = [0; 2];
+        assert_eq!(storage.blocking_backend_pids(43, &mut blockers), 1);
+        assert_eq!(blockers[0], 41);
+        storage.visit_advisory_locks(|lock| {
+            if !lock.granted {
+                assert_eq!(lock.wait_start, wait_start);
+            }
+        });
+        storage.release_object_locks(holder);
+        storage
+            .lock_table(
+                relation_waiter,
+                table,
+                TableLockMode::AccessExclusive,
+                false,
+            )
+            .unwrap();
+        storage.release_object_locks(relation_waiter);
+        storage.release_connection_advisory_locks(41);
+        storage.cancel_backend_wait(42);
+        storage.cancel_backend_wait(43);
+        storage.finish_transaction_identity(holder, false);
+        storage.finish_transaction_identity(relation_waiter, false);
+        storage.finish_transaction_identity(advisory_waiter, false);
+    });
+    crate::sql::set_execution_connection_id(previous);
+}
+
+#[test]
+fn lock_acquisition_identity_exhaustion_preserves_existing_holders() {
+    let config = test_config();
+    let mut budget = test_budget(&config);
+    let storage = Storage::new(&config, &mut budget, 0).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        storage
+            .lock_object(
+                7,
+                ObjectLockTarget::View(0),
+                crate::sql::ast::TableLockMode::AccessShare,
+                false,
+            )
+            .unwrap();
+        storage.lock_state().sequence = u64::MAX;
+        assert_eq!(
+            storage
+                .lock_object(
+                    8,
+                    ObjectLockTarget::View(1),
+                    crate::sql::ast::TableLockMode::AccessShare,
+                    false
+                )
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
+        assert_eq!(storage.object_lock_view_count(), 1);
+        assert_eq!(storage.lock_mark(), u64::MAX);
+        storage.release_object_locks(7);
+    });
+}
+
+#[test]
+fn index_ready_transitions_publish_and_rollback_owned_binding_roots() {
+    let mut config = test_config();
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let table = storage
+        .create_table(make_def("phase_rows", &[("id", ColType::Int4, false)]))
+        .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut definition = IndexDef {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("phase_rows_id_idx").unwrap(),
+            table: SqlName::parse("phase_rows").unwrap(),
+            n_cols: 1,
+            collations: [crate::sql::ast::Collation::None; MAX_INDEX_COLS],
+            ..IndexDef::EMPTY
+        };
+        definition.mutable.kind = IndexKind::OrdinaryUnbuilt;
+        let index = storage.create_index(definition, 7).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 7, IndexBindingOperation::Create)
+            .unwrap();
+        storage
+            .prepare_commit_generations(
+                7,
+                core::iter::empty(),
+                core::iter::once(IndexGenerationChange::Created(index)),
+            )
+            .unwrap();
+        storage.publish_index_create(index, 7).unwrap();
+        storage.finish_bindings(table, 7);
+        storage.release_commit_generations(7);
+        assert_eq!(storage.tables[table].enforcer_count(), 0);
+        let mut ready = storage.index(index).mutable;
+        ready.kind = IndexKind::OrdinaryReady;
+        let prior = storage.alter_index_definition(index, ready, 8).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 8, IndexBindingOperation::State)
+            .unwrap();
+        assert_eq!(storage.tables[table].enforcer_count(), 1);
+        assert!(!storage.index(index).mutable.kind.ready());
+        assert!(storage.index(index).mutable_for(8).kind.ready());
+        storage.rollback_index_definition(index, prior);
+        assert_eq!(storage.tables[table].enforcer_count(), 0);
+        assert_eq!(
+            storage.index(index).mutable.kind,
+            IndexKind::OrdinaryUnbuilt
+        );
+        storage.alter_index_definition(index, ready, 8).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 8, IndexBindingOperation::State)
+            .unwrap();
+        storage
+            .prepare_commit_generations(
+                8,
+                core::iter::empty(),
+                core::iter::once(IndexGenerationChange::State(index)),
+            )
+            .unwrap();
+        storage.publish_index_definition(index, 8).unwrap();
+        storage.finish_bindings(table, 8);
+        storage.release_commit_generations(8);
+        assert_eq!(storage.index(index).mutable.kind, IndexKind::OrdinaryReady);
+        assert_eq!(storage.tables[table].enforcer_count(), 1);
+        let mut dead = ready;
+        dead.kind = IndexKind::OrdinaryDead;
+        let prior = storage.alter_index_definition(index, dead, 9).unwrap();
+        storage
+            .prepare_index_definition_enforcers(index, 9, IndexBindingOperation::State)
+            .unwrap();
+        assert_eq!(storage.tables[table].enforcer_count(), 0);
+        storage.rollback_index_definition(index, prior);
+        assert_eq!(storage.index(index).mutable.kind, IndexKind::OrdinaryReady);
+        assert_eq!(storage.tables[table].enforcer_count(), 1);
+    });
+}

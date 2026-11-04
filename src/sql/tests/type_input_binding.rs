@@ -67,6 +67,10 @@ fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_data
         session.success(
             &mut engine,
             "CREATE TYPE cascade_choice AS ENUM('a'); \
+             CREATE DOMAIN cascade_checked AS cascade_choice CHECK(VALUE='a'); \
+             CREATE DOMAIN cascade_array AS cascade_checked[]; \
+             CREATE TABLE cascade_domain_rows(value cascade_array); \
+             INSERT INTO cascade_domain_rows VALUES('{a}'); \
              CREATE FUNCTION cascade_value() RETURNS cascade_choice LANGUAGE sql \
                BEGIN ATOMIC SELECT 'a'::cascade_choice; END; \
              CREATE VIEW cascade_view AS SELECT cascade_value() AS value; \
@@ -105,10 +109,12 @@ fn type_cascades_keep_copied_routines_views_and_materialized_views_in_their_data
             data_rows(&session.success(
                 &mut engine,
                 "SELECT cascade_value()::text; SELECT value::text FROM cascade_view; \
-             SELECT value::text FROM cascade_matview",
+             SELECT value::text FROM cascade_matview; \
+             SELECT value::text FROM cascade_domain_rows; \
+             SELECT count(*) FROM pg_type WHERE typname IN ('cascade_checked','cascade_array')",
                 true
             )),
-            ["a", "a", "a"],
+            ["a", "a", "a", "{a}", "2"],
             "{mode:?}"
         );
     }
@@ -465,6 +471,59 @@ fn stored_query_inputs_follow_enum_resolution_and_schema_edits_without_recheckin
             drop(server);
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
+    }
+}
+
+#[test]
+fn rewrite_defaults_reuse_cached_scalars_arrays_and_nulls_in_mixed_rows() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("rewrite-cached-default-values-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE cached_default_source(id integer DEFAULT 41,label text DEFAULT 'defaulted',items integer[] DEFAULT '{1,2}',optional integer DEFAULT NULL); \
+             CREATE TABLE cached_default_log(id integer,label text,items integer[],optional integer); \
+             CREATE RULE cached_default_capture AS ON INSERT TO cached_default_source DO ALSO \
+               INSERT INTO cached_default_log VALUES(NEW.id,NEW.label,NEW.items,NEW.optional)",
+            true);
+        session.success(&mut engine,
+            "INSERT INTO cached_default_source VALUES(DEFAULT,DEFAULT,DEFAULT,DEFAULT),(7,'given','{3}',9)",
+            true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT id,label,items,optional FROM cached_default_source ORDER BY id; \
+             SELECT id,label,items,optional FROM cached_default_log ORDER BY id",
+                true
+            )),
+            [
+                "7|given|{3}|9",
+                "41|defaulted|{1,2}|",
+                "7|given|{3}|9",
+                "41|defaulted|{1,2}|"
+            ]
+        );
+        let arena = Arena::new(&mut budget, "cached default value provenance", 8192).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let encoded = exec::encode_projected_pub(&[Datum::Int4(41)], &arena).unwrap();
+            let cached = ast::BoundLiteralValue::CachedDefault(encoded);
+            assert_eq!(
+                eval::bound_literal_value(cached, &arena).unwrap(),
+                Datum::Int4(41)
+            );
+            let error = eval::bound_literal_value(
+                ast::BoundLiteralValue::CheckedArrayInput(encoded),
+                &arena,
+            )
+            .unwrap_err();
+            assert_eq!(error.sqlstate, "22000");
+            assert_eq!(error.message.as_str(), "invalid bound SQL type input image");
+        });
     }
 }
 

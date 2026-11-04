@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 23;
+pub(crate) const RECORD_VERSION: u8 = 24;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -4684,11 +4684,7 @@ fn append_index_definition(
         Some(false) => 1,
         Some(true) => 2,
     };
-    let kind = match definition.kind {
-        crate::storage::IndexKind::Ordinary => 0,
-        crate::storage::IndexKind::Partitioned { valid: false } => 1,
-        crate::storage::IndexKind::Partitioned { valid: true } => 2,
-    };
+    let kind = definition.kind.code();
     let mut ok = buffer.append(&definition.tablespace.to_le_bytes())
         && buffer.append(&[fillfactor, deduplicate]);
     for statistic in definition.statistics {
@@ -7316,12 +7312,7 @@ fn decode_index_definition(
     }
     let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
     *at += 2;
-    let kind = match *payload.get(*at)? {
-        0 => crate::storage::IndexKind::Ordinary,
-        1 => crate::storage::IndexKind::Partitioned { valid: false },
-        2 => crate::storage::IndexKind::Partitioned { valid: true },
-        _ => return None,
-    };
+    let kind = crate::storage::IndexKind::from_code(*payload.get(*at)?)?;
     *at += 1;
     let clustered = match *payload.get(*at)? {
         0 => false,
@@ -7387,7 +7378,7 @@ fn decode_index_definition(
     } else {
         (None, None)
     };
-    if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
+    if (clustered || replica_identity) && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
     Some(crate::storage::IndexMutableDefinition {
@@ -16985,6 +16976,65 @@ mod tests {
         corrupt[..payload.len()].copy_from_slice(payload);
         corrupt[20] = (crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES + 1) as u8;
         assert!(decode_op(KIND_BRIN_MAINTENANCE, &corrupt[..payload.len()]).is_none());
+    }
+
+    #[test]
+    fn concurrent_index_states_round_trip_with_exact_catalog_flags() {
+        use crate::storage::IndexKind;
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "index lifecycle WAL", 1024).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (kind, valid, ready, live) in [
+                (IndexKind::Ordinary, true, true, true),
+                (IndexKind::OrdinaryUnbuilt, false, false, true),
+                (IndexKind::OrdinaryReady, false, true, true),
+                (IndexKind::OrdinaryDead, false, false, false),
+                (IndexKind::Partitioned { valid: false }, false, true, true),
+                (IndexKind::Partitioned { valid: true }, true, true, true),
+            ] {
+                let definition = crate::storage::IndexMutableDefinition {
+                    kind,
+                    ..crate::storage::IndexMutableDefinition::DEFAULT
+                };
+                payload.clear();
+                assert!(append_index_definition(&mut payload, definition));
+                let mut at = 0;
+                let decoded = decode_index_definition(payload.readable(), &mut at).unwrap();
+                assert_eq!(at, payload.len());
+                assert_eq!(decoded, definition);
+                assert_eq!(
+                    (
+                        decoded.kind.valid(),
+                        decoded.kind.ready(),
+                        decoded.kind.live()
+                    ),
+                    (valid, ready, live)
+                );
+                assert_eq!(IndexKind::from_code(kind.code()), Some(kind));
+            }
+            for kind in [
+                IndexKind::OrdinaryUnbuilt,
+                IndexKind::OrdinaryReady,
+                IndexKind::OrdinaryDead,
+                IndexKind::Partitioned { valid: true },
+            ] {
+                for (clustered, replica_identity) in [(true, false), (false, true)] {
+                    payload.clear();
+                    assert!(append_index_definition(
+                        &mut payload,
+                        crate::storage::IndexMutableDefinition {
+                            kind,
+                            clustered,
+                            replica_identity,
+                            ..crate::storage::IndexMutableDefinition::DEFAULT
+                        }
+                    ));
+                    assert!(decode_index_definition(payload.readable(), &mut 0).is_none());
+                }
+            }
+            assert_eq!(IndexKind::from_code(6), None);
+            assert_eq!(IndexKind::from_code(u8::MAX), None);
+        });
     }
 
     #[test]

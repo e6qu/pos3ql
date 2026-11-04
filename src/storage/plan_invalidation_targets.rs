@@ -221,7 +221,26 @@ impl Storage {
                 self.column_acl_entry(*slot as usize).target.relation,
                 transaction,
             )?,
-            DdlUndo::IndexRenamed { .. } | DdlUndo::IndexAltered { .. } => None,
+            DdlUndo::IndexAltered { slot, prior } => {
+                let index = self.index(*slot as usize);
+                let previous = prior
+                    .as_ref()
+                    .map_or(index.mutable, |prior| prior.definition);
+                if previous.kind == index.mutable_for(transaction).kind {
+                    None
+                } else {
+                    let binding = index.table_binding.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "index plan invalidation has no retained table identity"
+                        )
+                    })?;
+                    Some(SelectedPlanTarget::Relation {
+                        created_at: binding.source.created_at(),
+                    })
+                }
+            }
+            DdlUndo::IndexRenamed { .. } => None,
             _ => None,
         };
         Ok(selected)

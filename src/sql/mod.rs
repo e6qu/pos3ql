@@ -5734,6 +5734,13 @@ impl Engine {
                     txn.txid,
                     crate::storage::IndexBindingOperation::Drop,
                 )?,
+                DdlUndo::IndexAltered { slot, .. } => {
+                    self.storage.prepare_index_definition_enforcers(
+                        slot as usize,
+                        txn.txid,
+                        crate::storage::IndexBindingOperation::State,
+                    )?
+                }
                 _ => {}
             }
         }
@@ -7648,9 +7655,18 @@ impl Engine {
                 DdlUndo::IndexRenamed { slot, .. } => self
                     .storage
                     .publish_index_rename(*slot as usize, txn.txid)?,
-                DdlUndo::IndexAltered { slot, .. } => self
-                    .storage
-                    .commit_index_definition(*slot as usize, txn.txid),
+                DdlUndo::IndexAltered { slot, .. } => {
+                    let slot = *slot as usize;
+                    let table = self.storage.index_table_slot(slot);
+                    self.storage.publish_index_definition(slot, txn.txid)?;
+                    if let Some(table) = table
+                        && !self.commit_index_tables.contains(&table)
+                    {
+                        self.commit_index_tables
+                            .push(table)
+                            .expect("commit index scratch matches transaction DDL capacity");
+                    }
+                }
                 DdlUndo::TablespaceCreated(slot) => {
                     self.storage.commit_tablespace_create(*slot as usize)
                 }
@@ -13926,7 +13942,9 @@ impl Engine {
                             )?;
                             arena
                                 .alloc(Expr::BoundLiteral {
-                                    encoded: exec::encode_projected_pub(&[value], arena)?,
+                                    value: ast::BoundLiteralValue::CachedDefault(
+                                        exec::encode_projected_pub(&[value], arena)?,
+                                    ),
                                     type_oid,
                                     type_mod: column.type_mod,
                                     collation: Some(column.collation),
@@ -27374,7 +27392,7 @@ fn apply_wal_op(
                 )
             })?;
             storage.alter_index_definition(slot, definition, 0)?;
-            storage.commit_index_definition(slot, 0);
+            storage.commit_index_definition(slot)?;
         }
         WalOp::CreateTablespace {
             created_at,

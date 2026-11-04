@@ -967,7 +967,7 @@ mod tests {
                     panic!("expression")
                 };
                 let Expr::BoundLiteral {
-                    encoded,
+                    value: crate::sql::ast::BoundLiteralValue::CheckedArrayInput(encoded),
                     type_oid,
                     type_mod,
                     collation,

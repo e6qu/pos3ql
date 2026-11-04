@@ -1,5 +1,10 @@
 # PostgreSQL input preparation reference
 
+[planner-procedure-properties.json](planner-procedure-properties.json) separately
+records the pinned catalog sources and generator for all 3,397 planner procedure
+facts. This inventory includes internal operator support without exposing new
+SQL-callable functions. It supplements the historical runtime archives below.
+
 This archive records PostgreSQL 18.6 behavior used by the native and differential
 regressions. CI must test the final PR revision before merge.
 

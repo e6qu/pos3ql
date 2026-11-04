@@ -292,19 +292,19 @@ fn builtin_constant(
             {
                 return Ok(false);
             }
-            let Some(oid) = catalog::builtin_operator_procedure(name, Some(left), Some(right))
+            let Some((expected_left, expected_right)) =
+                storage.builtin_operator_input_oids(name, Some(left), Some(right), txid)
             else {
-                return Ok(false);
-            };
-            let Some(signature) = catalog::builtin_callable_by_oid(oid) else {
                 return Ok(false);
             };
             if [left, right]
                 .into_iter()
-                .zip(signature.arguments)
+                .zip([expected_left, expected_right])
                 .any(|(source, target)| {
-                    source != *target
-                        && catalog::defined_cast_path(storage, txid, source, *target).is_some()
+                    target.is_some_and(|target| {
+                        source != target
+                            && catalog::defined_cast_path(storage, txid, source, target).is_some()
+                    })
                 })
             {
                 return Ok(false);
@@ -741,8 +741,8 @@ fn known_null(
     }
     Ok(match expression {
         Expr::Null => true,
-        Expr::BoundLiteral { encoded, .. } => {
-            crate::sql::type_inputs::value(encoded, arena)?.is_null()
+        Expr::BoundLiteral { value, .. } => {
+            crate::sql::eval::bound_literal_value(*value, arena)?.is_null()
         }
         Expr::Collate { operand, .. } => {
             known_null(operand, columns, storage, txid, arena, depth + 1)?
@@ -1087,13 +1087,18 @@ fn operator_properties(
         return Ok(Properties::UNKNOWN);
     };
     let mut properties = procedure_properties(oid, storage, txid);
-    if let Some(signature) = catalog::builtin_callable_by_oid(oid) {
-        for (actual, expected) in left.into_iter().chain(right).zip(signature.arguments) {
+    let Some((expected_left, expected_right)) =
+        storage.builtin_operator_input_oids(name, left, right, txid)
+    else {
+        return Ok(Properties::UNKNOWN);
+    };
+    for (actual, expected) in [(left, expected_left), (right, expected_right)] {
+        if let (Some(actual), Some(expected)) = (actual, expected) {
             properties.include(cast_properties(
                 storage,
                 txid,
                 actual,
-                *expected,
+                expected,
                 CastBinding::Resolve,
             )?);
         }

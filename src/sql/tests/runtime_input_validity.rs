@@ -492,6 +492,125 @@ fn cte_dependency_capture_uses_bound_sources_without_running_modifications() {
 }
 
 #[test]
+fn set_query_metadata_keeps_shared_cte_shapes_without_running_sources() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("set-query-cte-metadata-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE TABLE set_query_source(id integer); INSERT INTO set_query_source VALUES(1),(2); \
+             CREATE SEQUENCE set_query_effects; \
+             CREATE FUNCTION set_query_identity(integer) RETURNS integer LANGUAGE sql AS $$SELECT $1$$",
+            true);
+        let arena = Arena::new(&mut budget, "set query CTE metadata", 256 << 10).unwrap();
+        let source = "WITH c AS (SELECT id FROM set_query_source) SELECT id FROM c UNION ALL SELECT 99 ORDER BY 1";
+        crate::mem::guard::forbid_alloc(|| {
+            let statement = parser::parse_stored_statement(source, &arena).unwrap();
+            let mut dependencies = engine
+                .storage
+                .empty_stored_query_dependencies(&arena)
+                .unwrap();
+            let retained = arena.used();
+            for _ in 0..64 {
+                crate::sql::planner_inputs::capture_planner_inputs(
+                    statement,
+                    None,
+                    &engine.storage,
+                    0,
+                    &arena,
+                )
+                .unwrap();
+                query::collect_runtime_statement(
+                    statement,
+                    &engine.storage,
+                    0,
+                    &mut dependencies,
+                    &arena,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(arena.used(), retained);
+            }
+            assert!(dependencies.entries().iter().any(|entry| entry.class
+                == crate::storage::DependencyClass::Table
+                && entry.name.as_str() == "set_query_source"));
+            let statement = parser::parse_stored_statement(
+                "WITH c AS (SELECT nextval('set_query_effects')::integer AS id) SELECT set_query_identity(id) FROM c UNION ALL SELECT 99",
+                &arena,
+            ).unwrap();
+            let mut dependencies = engine
+                .storage
+                .empty_stored_query_dependencies(&arena)
+                .unwrap();
+            query::collect_runtime_statement(
+                statement,
+                &engine.storage,
+                0,
+                &mut dependencies,
+                &arena,
+                None,
+            )
+            .unwrap();
+            assert!(dependencies.entries().iter().any(|entry| entry.class
+                == crate::storage::DependencyClass::Routine
+                && entry.name.as_str() == "set_query_identity"));
+        });
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT is_called FROM set_query_effects",
+                true
+            )),
+            ["f"]
+        );
+        for (sql, expected) in [
+            (source, vec!["1", "2", "99"]),
+            (
+                "WITH c(x) AS (SELECT 10) SELECT x FROM c UNION SELECT x+1 FROM c ORDER BY 1",
+                vec!["10", "11"],
+            ),
+            (
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<4) SELECT n FROM r UNION SELECT 100 ORDER BY 1",
+                vec!["1", "2", "3", "4", "100"],
+            ),
+            (
+                "WITH c AS (SELECT 5 AS x) SELECT x FROM c EXCEPT SELECT 6",
+                vec!["5"],
+            ),
+            (
+                "WITH c AS (SELECT * FROM unnest(ARRAY[1,2], ARRAY['p']) AS u(id,label)) SELECT id,label FROM c UNION ALL SELECT 3,'tail' ORDER BY 1",
+                vec!["1|p", "2|", "3|tail"],
+            ),
+            (
+                "WITH c AS (SELECT nextval('set_query_effects')::integer AS id) SELECT set_query_identity(id) FROM c UNION ALL SELECT 99 ORDER BY 1",
+                vec!["1", "99"],
+            ),
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, sql, true)),
+                expected,
+                "{mode:?}: {sql}"
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT last_value FROM set_query_effects",
+                true
+            )),
+            ["1"]
+        );
+        assert_eq!(error_sqlstates(&session.execute(&mut engine,
+            "WITH c AS (SELECT 1 AS id) SELECT id FROM c UNION ALL SELECT id FROM missing_set_source", true)), ["42P01"]);
+    }
+}
+
+#[test]
 fn describing_typed_routine_arguments_uses_complete_catalog_metadata_without_checks() {
     let config = test_config("typed-routine-describe-metadata");
     let mut budget = test_engine_budget(&config, 1 << 29);

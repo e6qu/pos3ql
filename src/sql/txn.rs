@@ -2742,6 +2742,7 @@ impl TxnState {
             Some(match undo {
                 DdlUndo::IndexCreated(slot) => IndexGenerationChange::Created(*slot as usize),
                 DdlUndo::IndexDropped(slot) => IndexGenerationChange::Dropped(*slot as usize),
+                DdlUndo::IndexAltered { slot, .. } => IndexGenerationChange::State(*slot as usize),
                 DdlUndo::IndexRenamed { slot, .. } => {
                     IndexGenerationChange::Renamed(*slot as usize)
                 }

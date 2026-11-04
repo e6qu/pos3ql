@@ -1893,8 +1893,15 @@ pub(super) fn plan_statement<'a>(
             plan_select(storage, txid, select, arena)
         }
         Stmt::SetQuery(set_query) => {
-            let body =
-                query::expand_set_tree(set_query.with, set_query.body, storage, txid, arena)?;
+            let body = query::expand_set_tree(
+                set_query.with,
+                set_query.body,
+                storage,
+                txid,
+                None,
+                None,
+                arena,
+            )?;
             let planned = SetQuery {
                 with: &[],
                 body,

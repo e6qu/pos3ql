@@ -361,6 +361,75 @@ fn builtin_constant(
             name: "coalesce",
             ..
         } => true,
+        Expr::Call {
+            kind: CallKind::Routine,
+            name,
+            bound_oid,
+            args,
+            argument_names,
+            variadic,
+            over: None,
+            filter: None,
+            distinct: false,
+            order_by: [],
+            star: false,
+            ..
+        } => {
+            let mut inputs = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > inputs.len() {
+                return Ok(false);
+            }
+            for (input, argument) in inputs.iter_mut().zip(*args) {
+                *input = infer_routine_argument_oid(argument, columns)?;
+            }
+            let inputs = &inputs[..args.len()];
+            let selected = match bound_oid {
+                Some(oid) if storage.routine_slot_by_oid(*oid, txid).is_none() => {
+                    crate::storage::RoutineCallSelection::Builtin {
+                        oid: *oid,
+                        schema: "pg_catalog",
+                    }
+                }
+                Some(_) => return Ok(false),
+                None => storage.select_routine_call(
+                    name,
+                    argument_names,
+                    inputs,
+                    *variadic,
+                    txid,
+                    crate::storage::RoutineCallKind::Function,
+                ),
+            };
+            let crate::storage::RoutineCallSelection::Builtin { oid, .. } = selected else {
+                return Ok(false);
+            };
+            let Some(signature) = catalog::builtin_callable_by_oid(oid) else {
+                return Ok(false);
+            };
+            if signature.kind != b'f'
+                || signature.returns_set
+                || signature.catalog.volatility != "i"
+            {
+                return Ok(false);
+            }
+            let Some(expected) =
+                storage.builtin_call_input_oids(oid, argument_names, inputs, *variadic, txid)
+            else {
+                return Ok(false);
+            };
+            for (source, target) in inputs.iter().copied().zip(expected) {
+                if source != target
+                    && catalog::defined_cast_path(storage, txid, source, target).is_some()
+                {
+                    return Ok(false);
+                }
+                let properties = builtin_cast_properties(storage, txid, source, target);
+                if !properties.known || properties.volatility != 0 {
+                    return Ok(false);
+                }
+            }
+            true
+        }
         _ => false,
     };
     if !safe {

@@ -901,7 +901,15 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             return Ok(());
         }
         if matches!(self.planner, PlannerPass::Capture(_))
-            && matches!(expression, Expr::Binary { .. } | Expr::Unary { .. })
+            && matches!(
+                expression,
+                Expr::Binary { .. }
+                    | Expr::Unary { .. }
+                    | Expr::Call {
+                        kind: ast::CallKind::Routine,
+                        ..
+                    }
+            )
         {
             crate::sql::planner_inputs::inline::constant_value(
                 expression,

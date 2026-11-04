@@ -5470,6 +5470,93 @@ fn index_statistics_source_pins_survive_table_slot_reuse_without_cross_database_
 }
 
 #[test]
+fn relation_identity_recovery_accepts_only_matching_inline_backing_relations() {
+    let config = test_config();
+    let mut budget = test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let mut definition = make_def(
+        "inline_recovery_rows",
+        &[
+            ("id", ColType::Int4, true),
+            (
+                "value",
+                ColType::Range(crate::sql::types::RangeKind::Int4),
+                false,
+            ),
+        ],
+    );
+    definition.columns[0].primary = true;
+    definition.n_exclusions = 1;
+    definition.exclusions[0] = ExclusionConstraint {
+        name: SqlName::parse("inline_recovery_value_exclusion").unwrap(),
+        columns: [1; MAX_INDEX_COLS],
+        n_cols: 1,
+        ..ExclusionConstraint::EMPTY
+    };
+    let table = storage.create_table(definition).unwrap();
+    let definition = storage.table_def(table, 0);
+    let backing = IndexDef {
+        created_at: definition.column_index_identity(0).unwrap().created_at(),
+        schema: definition.schema,
+        table: definition.name,
+        name: definition.column_key_name(0).unwrap(),
+        n_cols: 1,
+        unique: true,
+        ..IndexDef::EMPTY
+    };
+    let mut exclusion = IndexDef {
+        created_at: definition.exclusions()[0]
+            .index_identity
+            .unwrap()
+            .created_at(),
+        name: definition.exclusions()[0].name,
+        columns: [1; MAX_INDEX_COLS],
+        method: crate::sql::ast::IndexAccessMethod::Gist,
+        unique: false,
+        ..backing
+    };
+    exclusion.resolved_operator_classes[0] =
+        crate::sql::types::GistOperatorClass::for_type(definition.columns()[1].ctype)
+            .map(IndexOperatorClass::Gist);
+    let target = storage.table_definition_target(table, 0, &definition);
+    crate::mem::guard::forbid_alloc(|| {
+        let index = storage
+            .create_reindex_index(backing, target, IndexRelationKind::Table, 0)
+            .unwrap();
+        storage.commit_index_create(index).unwrap();
+        let excluded = storage
+            .create_reindex_index(exclusion, target, IndexRelationKind::Table, 0)
+            .unwrap();
+        storage.commit_index_create(excluded).unwrap();
+        let sequence = storage.catalog_identity_sequence();
+        storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap();
+        storage.index_catalog()[index].columns[0] = 1;
+        let error = storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+        assert!(error.message.as_str().contains("duplicated"));
+        storage.index_catalog()[index].columns[0] = 0;
+        storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap();
+        storage.index_catalog()[excluded].columns[0] = 0;
+        let error = storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
+        assert!(error.message.as_str().contains("duplicated"));
+        storage.index_catalog()[excluded].columns[0] = 1;
+        storage
+            .validate_restored_relation_identities(sequence)
+            .unwrap();
+        assert_eq!(storage.catalog_identity_sequence(), sequence);
+    });
+}
+
+#[test]
 fn relation_identity_recovery_rejects_cross_catalog_aliases_without_mutation() {
     let config = test_config();
     let mut budget = test_budget(&config);

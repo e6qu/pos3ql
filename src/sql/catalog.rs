@@ -4639,7 +4639,11 @@ mod builtin_property_tests {
             }
             assert_eq!(
                 builtin_operator_procedure("=", Some(oid::UNKNOWN), Some(oid::UNKNOWN)),
-                None
+                Some(67)
+            );
+            assert_eq!(
+                builtin_operator_properties("=", Some(oid::UNKNOWN), Some(oid::UNKNOWN)),
+                builtin_procedure_properties(67)
             );
         });
     }
@@ -11761,6 +11765,7 @@ struct IdxInfo {
     table_database: crate::storage::DatabaseOid,
     table_created_at: u64,
     name: StackStr<64>,
+    kind: crate::storage::IndexKind,
     method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
@@ -11939,6 +11944,11 @@ fn visit_indexes(
                 table_database: def.identity().database,
                 table_created_at: def.identity().created_at,
                 name,
+                kind: if def.partition.is_partitioned() {
+                    crate::storage::IndexKind::Partitioned { valid: true }
+                } else {
+                    crate::storage::IndexKind::Ordinary
+                },
                 method: if is_exclusion {
                     crate::sql::ast::IndexAccessMethod::Gist
                 } else {
@@ -12181,6 +12191,7 @@ fn visit_indexes(
             info.resolved_operator_classes = index.resolved_operator_classes;
             info.operator_class_options = index.operator_class_options;
             info.explicit_definition = Some(index.mutable_for(txid));
+            info.kind = index.mutable_for(txid).kind;
             if let Some(parent) = index.mutable_for(txid).parent {
                 info.index_parent_oid = storage
                     .index_visible_to(usize::from(parent), txid)
@@ -12390,6 +12401,7 @@ fn empty_index() -> IdxInfo {
         table_database: crate::storage::DatabaseOid::POSTGRES,
         table_created_at: 0,
         name: StackStr::new(),
+        kind: crate::storage::IndexKind::Ordinary,
         method: crate::sql::ast::IndexAccessMethod::Btree,
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expression_keys: [false; crate::storage::MAX_INDEX_COLS],
@@ -12669,11 +12681,7 @@ pub(crate) fn reindex_candidates<'a>(
             predicate: index.predicate,
             unique: index.is_unique,
             mutable: crate::storage::IndexMutableDefinition {
-                kind: if table.partition.is_partitioned() {
-                    crate::storage::IndexKind::Partitioned { valid: true }
-                } else {
-                    crate::storage::IndexKind::Ordinary
-                },
+                kind: index.kind,
                 tablespace: table.tablespace,
                 immediate: !index.timing.is_deferrable(),
                 ..crate::storage::IndexMutableDefinition::DEFAULT
@@ -17417,10 +17425,7 @@ fn write_index_target<Definition0: crate::storage::DefinitionBacking>(
     qualify: bool,
 ) {
     let _ = out.write_str(" ON ");
-    if info
-        .explicit_definition
-        .is_some_and(|definition| definition.kind.is_partitioned())
-    {
+    if info.kind.is_partitioned() {
         let _ = out.write_str("ONLY ");
     }
     if qualify {
@@ -21078,17 +21083,7 @@ fn pg_class<'a>(
                     storage.table_def(info.table_slot, txid).schema.as_str(),
                     txid,
                 )),
-                text(
-                    if info
-                        .explicit_definition
-                        .is_some_and(|definition| definition.kind.is_partitioned())
-                    {
-                        "I"
-                    } else {
-                        "i"
-                    },
-                    arena,
-                )?,
+                text(if info.kind.is_partitioned() { "I" } else { "i" }, arena)?,
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages

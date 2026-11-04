@@ -1874,6 +1874,9 @@ fn execute_routine_query_under<'a>(
     )>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    // Nested SQL owns its input frames; row recycling must not reclaim a
+    // caller's frames while that caller is still preparing its arguments.
+    let _input_body = input_progress::enter_body();
     match query {
         RoutineQuery::Select(select) => {
             let select = match stored {
@@ -3534,7 +3537,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         query_sql: &str,
         arena: &'a Arena,
     ) -> Result<&'a str, SqlError> {
+        let _input_body = input_progress::enter_body();
         let query = super::parser::parse_query(query_sql, arena)?;
+        let described = expand_ctes(query, self.storage, self.txid, arena)?;
+        let mut columns = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+        let count = describe_select(described, self.storage, self.txid, arena, &mut columns)?;
+        let valid = count == 2
+            && columns[..count]
+                .iter()
+                .all(|column| column.type_oid == super::types::oid::TSQUERY);
         let query = RoutineQuery::Select(query);
         let source = arena.alloc_str(source).map_err(|_| arena_full())?;
         let mut rewritten = super::full_text::canonical_query(source, arena)?;
@@ -3546,15 +3557,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             &[],
             false,
             &mut |row| {
-                if row.len() != 2 {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "ts_rewrite query must return two tsquery columns"
-                    ));
+                // PostgreSQL checks the result description after executing
+                // the query, including when it returns no rows.
+                if !valid || row.iter().any(Datum::is_null) {
+                    return Ok(());
                 }
+                debug_assert_eq!(row.len(), 2);
                 let (Datum::TsQuery(target), Datum::TsQuery(replacement)) = (row[0], row[1]) else {
                     return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
+                        sqlstate::INTERNAL_ERROR,
                         "ts_rewrite query must return two tsquery columns"
                     ));
                 };
@@ -3567,6 +3578,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 Ok(())
             },
         )?;
+        if !valid {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "ts_rewrite query must return two tsquery columns"
+            ));
+        }
         Ok(rewritten)
     }
 

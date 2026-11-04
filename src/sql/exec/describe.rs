@@ -2656,10 +2656,7 @@ pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<
                 } if columns.is_whole_row(name) => name,
                 _ => return None,
             };
-            let column = columns
-                .table_columns(table)?
-                .iter()
-                .find(|c| c.name.as_str().eq_ignore_ascii_case(field))?;
+            let column = columns.column_meta(Some(table), field)?;
             (column.ctype == ColType::Record && column.type_mod >= 0).then_some(column.type_mod)
         }
         _ => None,
@@ -4965,6 +4962,9 @@ pub fn infer_type_res(
         }
         Expr::Float(_) => of(ColType::Float8),
         Expr::NumericLit(_) => of(ColType::Numeric),
+        Expr::Column { qualifier, name } if columns.is_empty_scope() => {
+            return Err(crate::sql::eval::empty_scope_column_error(*qualifier, name));
+        }
         Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
             Ok(t) => of(t),
             // A bare name that is not a column but names a FROM item is a

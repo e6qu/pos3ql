@@ -12410,6 +12410,7 @@ impl Engine {
                                 }
                                 txn.compact_completed_constraints();
                                 if immediate.is_none()
+                                    && index_completion.is_none()
                                     && !matches!(
                                         statement,
                                         Stmt::Begin(_)

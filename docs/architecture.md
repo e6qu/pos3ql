@@ -181,6 +181,10 @@ current_setting('application_name') || '.', false))` appends one dot when the
 input finishes across those function handoffs. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+Nested SQL queries, including a `ts_rewrite` rule query, have their own input
+scope. Their row scans may reclaim temporary storage without retaining a
+caller's unfinished input frames in that storage. Returning from the nested
+query restores the caller's input scope, including after an error.
 
 Waiting for another connection's lock can require restarting an unfinished
 function body. Completed cursor operations and checked routine inputs keep

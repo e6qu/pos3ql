@@ -69555,6 +69555,63 @@ fn attach_constraint_using_index<Definition0: crate::storage::DefinitionBacking>
     stage_index_rename(storage, wal, txn, slot, constraint_name)
 }
 
+fn stage_constraint_comment_rename(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    from: SqlName,
+    to: SqlName,
+) -> Result<(), SqlError> {
+    let definition = storage.table_def(table, txn.txid);
+    let schema = definition.schema;
+    let temporary = definition.persistence == crate::storage::RelationPersistence::Temporary;
+    let Some(text) = storage.comment_text(
+        crate::storage::CommentClass::Constraint,
+        schema.as_str(),
+        from.as_str(),
+        table as u32,
+        txn.txid,
+    ) else {
+        return Ok(());
+    };
+    if !temporary {
+        for (name, value) in [(from, None), (to, Some(text.as_str()))] {
+            let lsn = storage.bump_lsn();
+            wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::Comment {
+                    class: crate::storage::CommentClass::Constraint.to_u8(),
+                    schema: schema.as_str(),
+                    name: name.as_str(),
+                    subid: table as u32,
+                    text: value,
+                },
+            )?;
+        }
+    }
+    let (slot, prior) = storage
+        .stage_constraint_comment_rename(table, schema, from, to, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint comment disappeared during rename"
+            )
+        })?;
+    if let Err(error) = txn.record_ddl(
+        storage,
+        super::txn::DdlUndo::CommentIdentityChanged {
+            slot: slot as u32,
+            prior,
+        },
+    ) {
+        storage.restore_comment_identity_pending(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn rename_attached_index_constraint(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -69591,7 +69648,9 @@ fn rename_attached_index_constraint(
             old_name.as_str()
         ));
     }
+    txn.rename_constraint(table_index as u32, old_name, new_name)?;
     stage_index_rename(storage, wal, txn, index_slot, new_name)?;
+    stage_constraint_comment_rename(storage, wal, txn, table_index, old_name, new_name)?;
     let mut mapping = [None; MAX_COLUMNS];
     let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
     for column in 0..current.n_columns {
@@ -74831,73 +74890,17 @@ fn alter_table_relation(
         let AlterAction::RenameConstraint { from, to } = action else {
             continue;
         };
-        let old_name = match SqlName::parse(from) {
-            Ok(name) => name,
-            Err(error) => return sql_fail(error),
-        };
-        let new_name = match SqlName::parse(to) {
-            Ok(name) => name,
-            Err(error) => return sql_fail(error),
-        };
-        let Some(text) = storage.comment_text(
-            crate::storage::CommentClass::Constraint,
-            def.schema.as_str(),
-            old_name.as_str(),
-            table_index as u32,
-            txn.txid,
-        ) else {
-            continue;
-        };
-        if def.persistence != crate::storage::RelationPersistence::Temporary {
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::Comment {
-                    class: crate::storage::CommentClass::Constraint.to_u8(),
-                    schema: def.schema.as_str(),
-                    name: old_name.as_str(),
-                    subid: table_index as u32,
-                    text: None,
-                },
-            ) {
-                return sql_fail(error);
-            }
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage_reserved(
-                txn.txid,
-                lsn,
-                &WalOp::Comment {
-                    class: crate::storage::CommentClass::Constraint.to_u8(),
-                    schema: def.schema.as_str(),
-                    name: new_name.as_str(),
-                    subid: table_index as u32,
-                    text: Some(text.as_str()),
-                },
-            ) {
-                return sql_fail(error);
-            }
-        }
-        let Some((slot, prior)) = storage.stage_constraint_comment_rename(
-            table_index,
-            def.schema,
-            old_name,
-            new_name,
-            txn.txid,
-        ) else {
-            return sql_fail(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "constraint comment disappeared during rename"
-            ));
-        };
-        if let Err(error) = txn.record_ddl(
-            storage,
-            super::txn::DdlUndo::CommentIdentityChanged {
-                slot: slot as u32,
-                prior,
-            },
-        ) {
-            storage.restore_comment_identity_pending(slot, prior);
+        let renamed = (|| {
+            stage_constraint_comment_rename(
+                storage,
+                wal,
+                txn,
+                table_index,
+                SqlName::parse(from)?,
+                SqlName::parse(to)?,
+            )
+        })();
+        if let Err(error) = renamed {
             return sql_fail(error);
         }
     }

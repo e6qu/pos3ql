@@ -1,6 +1,6 @@
 -- Composite field access and expansion: `(expr).field` and `(expr).*` bind
 -- to the expression's static type, exactly as PostgreSQL — anonymous ROW()
--- records have no named fields (only star expansion works), whole-row
+-- records name their fields f1, f2, and so on; whole-row
 -- references resolve against their table, record SRFs expose their declared
 -- columns, and non-composite values refuse column notation by type name.
 CREATE TABLE rt(a int, b text);
@@ -27,7 +27,7 @@ SELECT (rt.a).b FROM rt;
 SELECT ('x'::text).y;
 SELECT ((rt.*).a).nosuch FROM rt;
 
--- Anonymous ROW(): star expansion works, named fields never do.
+-- Anonymous ROW(): positional field names, missing fields and unknown inputs.
 SELECT (ROW(1,2)).*;
 SELECT (ROW(1,'a'::text)).*;
 SELECT (ROW(1,2)).f1;

@@ -11,8 +11,9 @@ Pending CI, uncollected measurements and reproducible failures being repaired
 belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
 current behavior belongs in the [owning guides](docs/README.md). Verify catalog
-identities and physical flags before and after maintenance; command completion
-alone cannot expose duplicate or detached index metadata.
+identities, comments and physical flags before and after maintenance and cold
+recovery; command completion alone cannot expose duplicate or detached index
+metadata. Preserve failing-thread stacks with native-crash repairs.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

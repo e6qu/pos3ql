@@ -3579,3 +3579,67 @@ fn planner_metadata_preserves_record_shapes_target_names_and_index_comments() {
         );
     }
 }
+
+#[test]
+fn nested_query_inputs_preserve_caller_scratch_record_shapes_and_index_metadata() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-query-inputs-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/234_nested_query_and_index_metadata.sql"
+        );
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let expected = if statement.contains("'SELECT target FROM nested_input_rules")
+                || statement.contains("'SELECT 1,2'")
+            {
+                Some("22023")
+            } else if statement.contains("\"a.b\".value") {
+                Some("42P01")
+            } else if statement.starts_with("SELECT substring(") {
+                Some("22011")
+            } else if statement.starts_with("SELECT 1/0,") {
+                Some("22012")
+            } else {
+                None
+            };
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(
+                error_sqlstates(&output),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{mode:?}: {statement}"
+            );
+            rows.extend(data_rows(&output));
+        }
+        assert_eq!(
+            rows,
+            [
+                "'c' & 'd'",
+                "64|'c' & 'd'",
+                "'a'",
+                "'c' & 'd'",
+                "kept",
+                "1|one|character varying",
+                "2|two|character varying",
+                "1|one",
+                "2|two",
+                "t|t|key comment|index comment",
+                "t|t|key comment|index comment",
+                "t|t|key comment|index comment",
+                "1|2",
+                "1|2",
+            ],
+            "{mode:?}"
+        );
+    }
+}

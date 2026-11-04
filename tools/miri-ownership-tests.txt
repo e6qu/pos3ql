@@ -77,6 +77,7 @@ sql::planner_inputs::parameter_tests::planner_parameters_confine_borrows_and_res
 sql::plpgsql_inputs::tests::parse_frames_copy_synthetic_sources_and_restore_nested_authority
 sql::query::input_progress::tests::assignment_sites_are_static_and_do_not_leak_into_nested_body_sources
 sql::query::input_progress::tests::pending_calls_keep_the_lexical_plan_owner_after_the_source_scope_ends
+sql::query::input_progress::tests::nested_query_scopes_keep_parent_frames_outside_recycled_scratch
 sql::query::input_progress::tests::retained_input_ownership_borrows_wide_values_until_suspension
 sql::query::input_progress::tests::retained_input_ownership_capacity_failure_restores_scopes
 sql::query::input_progress::tests::retained_input_ownership_keeps_cast_selections_and_builtin_absence_after_work_reset

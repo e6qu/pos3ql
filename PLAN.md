@@ -168,10 +168,10 @@ preserve comments, dependencies and partition links. Map a partition child's
 physical columns to the parent's selected columns when reporting those links.
 Retain each key's selected comparison rules when a constraint-created index
 becomes a stored index. Reject incomplete journal records before changing their
-buffer. Diagnose the earlier native coverage crash by replaying its failed
-revision and original test partition under the debugger; retain the stack and
-source/tool identities, then remove the temporary historical CI job. Diagnose
-native crashes with the failing threads' stacks, preserving
+buffer. Verify that nested SQL queries cannot append an outer call's input
+frames inside a recycling row scan. Cover repeated `ts_rewrite` queries,
+invalid and empty result descriptions, errors and restored caller scopes.
+Diagnose native crashes with the failing threads' stacks, preserving
 the configured stack, test parallelism and job deadlines.
 Rebuilding a table must leave retired indexes untouched. Explicit user-index
 repair and replacement must preserve the distinct flags and ownership rules.
@@ -180,7 +180,11 @@ preserves deferred uniqueness while its replacement is detached. Registration mu
 catalog entries before waiting for existing writers; table-shape normalization
 belongs with the later anchor swap. Each backing index must appear once in
 catalogs and rebuild selection, including inline keys with stored physical
-metadata after a tablespace change. Comments must follow the selected index
+metadata after a tablespace change. Recovery must recognize a materialized
+inline key's matching backing relation at each published cancellation point,
+while rejecting an identity reused for a different key. Partitioned indexes
+must retain their partitioned relation kind before and after materialization.
+Comments must follow the selected index
 through name reuse, commit and cold recovery. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.

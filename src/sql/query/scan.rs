@@ -4185,6 +4185,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
+    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+        super::ScopeSchema(self.scope).whole_row_column(table, index)
+    }
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,

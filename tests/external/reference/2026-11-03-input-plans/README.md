@@ -301,3 +301,20 @@ The catalog fixture was uncommitted at `82c3d71d`; the writer probe ran at that
 revision. Extract it and run `python3 verify-index-materialization.py .` to
 verify both references. These are PostgreSQL observations, not pos3ql runtime
 or performance qualification.
+
+[nested-query-reference.zip](nested-query-reference.zip), SHA256
+`f29b17c1ea0982bc9efde9e49ee6c4130e666653cc862637fdea9c4b71f31c5d`,
+records fixture `234_nested_query_and_index_metadata.sql` on PostgreSQL 18.6:
+14 result rows and six deliberate errors cover nested `ts_rewrite` queries,
+record fields, constant-error order, index-comment rename rollback and partitioned
+index kinds. Exact SQL, raw results, commands and binary/source hashes are retained;
+the fixture was uncommitted at `36623559`.
+The archive also preserves the original native crash reproduction from
+[the historical diagnostic](https://github.com/e6qu/pos3ql/actions/runs/41870892426/job/126721297240).
+Source `8efe894d` reproduced `SIGSEGV` in `InputAttempt::update_frame` while
+`full_text_query_rewrite_and_vector_unnest_are_typed` ran a nested query.
+The original 845-test partition, Rust 1.99.1, cargo-llvm-cov 0.9.1, 128 MiB
+thread stack and ordinary test parallelism were retained. Extract the archive and
+run `python3 verify-nested-query.py .` to verify 16 file hashes, reference rows,
+errors and the crash's source, tool and stack identities. The historical failure
+diagnoses the lifetime defect; final-head correctness still requires ordinary CI.

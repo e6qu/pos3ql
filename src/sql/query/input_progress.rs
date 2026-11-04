@@ -1529,6 +1529,52 @@ mod tests {
     }
 
     #[test]
+    fn nested_query_scopes_keep_parent_frames_outside_recycled_scratch() {
+        let mut budget = Budget::new(8192);
+        let statement = Arena::new(&mut budget, "nested input statement", 2048).unwrap();
+        let work = Arena::new(&mut budget, "nested input scratch", 4096).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        crate::mem::guard::forbid_alloc(|| {
+            let output = call(&work, || {
+                let _inputs = enter();
+                let parent = ACTIVE_INPUT.with(Cell::get).unwrap();
+                let value = value(InputSite::Query(InputQuery::Scalar), &work, || {
+                    let _body = enter_body();
+                    let mark = work.mark();
+                    for row in 0..64 {
+                        let nested = call(&work, || {
+                            let _inputs = enter();
+                            value(InputSite::Expression(InputNode::Value), &work, || {
+                                Ok(Datum::Int4(row))
+                            })
+                        })?;
+                        assert!(matches!(nested, Datum::Int4(value) if value == row));
+                        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                        // Only the copied integer escapes this nested row.
+                        unsafe { work.rewind_to(mark) };
+                    }
+                    Ok(Datum::Int4(64))
+                })?;
+                assert_eq!(ACTIVE_INPUT.with(Cell::get), Some(parent));
+                let attempt = unsafe { &*(parent as *const InputAttempt<'_, '_>) };
+                assert_eq!(attempt.frames.borrow().len(), 1);
+                assert_eq!(attempt.next.get(), 1);
+                Ok(value)
+            })
+            .unwrap();
+            assert!(matches!(output, Datum::Int4(64)));
+            assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+            assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+            assert_eq!(invocations.inputs.saved.borrow().len(), 0);
+            assert_eq!(statement.used(), 0);
+        });
+    }
+
+    #[test]
     fn retained_input_ownership_successful_inputs_do_not_grow_statement_memory_per_row() {
         let mut budget = Budget::new(8192);
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();

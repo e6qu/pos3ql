@@ -285,23 +285,49 @@ impl Storage {
                             check(toast.created_at())?;
                         }
                     }
+                    // An implicit key and its materialized backing catalog
+                    // entry describe one relation only when their key agrees.
+                    let backing = |identity: RelationIdentity,
+                                   name: Option<super::SqlName>,
+                                   columns: &[u16],
+                                   unique: bool| {
+                        indexes.iter().any(|index| {
+                            index.database == database.oid
+                                && index.ddl_state != super::CatalogDdlState::Absent
+                                && index.relation == super::IndexRelationSource::Table
+                                && index.created_at == identity.created_at()
+                                && index.schema == definition.schema
+                                && index.table == definition.name
+                                && Some(index.name) == name
+                                && index.unique == unique
+                                && index.n_cols == columns.len()
+                                && index.columns[..index.n_cols] == *columns
+                                && index.expressions[..index.n_cols]
+                                    .iter()
+                                    .all(Option::is_none)
+                        })
+                    };
                     for (column, _) in definition
                         .columns()
                         .iter()
                         .enumerate()
                         .filter(|(_, column)| column.primary || column.unique)
                     {
-                        check(
-                            definition
-                                .column_index_identity(column)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "restored inline index has no identity"
-                                    )
-                                })?
-                                .created_at(),
-                        )?;
+                        let identity =
+                            definition.column_index_identity(column).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "restored inline index has no identity"
+                                )
+                            })?;
+                        if !backing(
+                            identity,
+                            definition.column_key_name(column),
+                            &[column as u16],
+                            true,
+                        ) {
+                            check(identity.created_at())?;
+                        }
                     }
                     for key in definition.uniques() {
                         let identity = key.index_identity.ok_or_else(|| {
@@ -310,36 +336,20 @@ impl Storage {
                                 "restored unique index has no identity"
                             )
                         })?;
-                        // USING INDEX represents one relation in both catalogs.
-                        let adopted = indexes.iter().any(|index| {
-                            index.database == database.oid
-                                && index.ddl_state != super::CatalogDdlState::Absent
-                                && index.created_at == identity.created_at()
-                                && index.schema == definition.schema
-                                && index.table == definition.name
-                                && index.name == key.name
-                                && index.unique
-                                && index.n_cols == key.n_cols
-                                && index.columns[..index.n_cols] == key.columns[..key.n_cols]
-                                && index.expressions[..index.n_cols]
-                                    .iter()
-                                    .all(Option::is_none)
-                        });
-                        if !adopted {
+                        if !backing(identity, Some(key.name), key.columns(), true) {
                             check(identity.created_at())?;
                         }
                     }
                     for key in definition.exclusions() {
-                        check(
-                            key.index_identity
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATA_EXCEPTION,
-                                        "restored exclusion index has no identity"
-                                    )
-                                })?
-                                .created_at(),
-                        )?;
+                        let identity = key.index_identity.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "restored exclusion index has no identity"
+                            )
+                        })?;
+                        if !backing(identity, Some(key.name), key.columns(), false) {
+                            check(identity.created_at())?;
+                        }
                     }
                 }
                 for index in indexes.iter().filter(|index| {

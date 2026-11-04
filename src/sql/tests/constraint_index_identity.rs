@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn table_drop_rollback_restores_only_its_own_index_drops() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("table-index-drop-ownership-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        for setup in [
+            "CREATE TABLE drop_owner(id integer PRIMARY KEY, value integer)",
+            "CREATE INDEX drop_first ON drop_owner(value)",
+            "CREATE INDEX drop_parent ON drop_owner(value)",
+            "BEGIN",
+            "DROP INDEX drop_first",
+            "SAVEPOINT before_table_drop",
+            "DROP TABLE drop_owner",
+            "ROLLBACK TO before_table_drop",
+        ] {
+            session.success(&mut engine, setup, true);
+        }
+        let indexes = "SELECT relname FROM pg_class WHERE relname IN \
+            ('drop_first','drop_parent','drop_owner_pkey') ORDER BY relname";
+        assert_eq!(
+            data_rows(&session.success(&mut engine, indexes, true)),
+            ["drop_owner_pkey", "drop_parent"],
+            "{mode:?}: the earlier explicit drop survives the savepoint"
+        );
+        session.success(&mut engine, "DROP TABLE drop_owner", true);
+        session.success(&mut engine, "ROLLBACK", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, indexes, true)),
+            ["drop_first", "drop_owner_pkey", "drop_parent"],
+            "{mode:?}: full rollback restores every index exactly once"
+        );
+        for statement in [
+            "BEGIN",
+            "CREATE INDEX drop_created ON drop_owner(value)",
+            "DROP INDEX drop_created",
+            "DROP TABLE drop_owner",
+            "ROLLBACK",
+        ] {
+            session.success(&mut engine, statement, true);
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, indexes, true)),
+            ["drop_first", "drop_owner_pkey", "drop_parent"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM pg_class WHERE relname='drop_created'",
+                true,
+            )),
+            ["0"]
+        );
+    }
+}
+
+#[test]
 fn reordered_partition_keys_keep_parent_constraint_and_index_links_through_reindex() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

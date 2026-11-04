@@ -260,3 +260,16 @@ identifiers and leaves rows intact. The fixture was uncommitted at source
 revision `6e87c94c`. Extract it and run `python3 verify-reordered-index-links.py .`
 to verify the retained SQL, raw output, provenance and commands against 10 hashes
 and six output rows.
+
+[planner-drop-reference.zip](planner-drop-reference.zip), SHA256
+`013222aebd877802733ee1c932b78b39205194c3a8ccc5a0b1599cc1a5a52d62`,
+records fixtures `230_planner_constant_order.sql` and `231_index_drop_undo.sql`
+on PostgreSQL 18.6. It confirms type errors before constant evaluation,
+integer overflow before a later division error, skipped later CASE conditions,
+and LIKE escape expressions using columns, functions and subqueries. Rolling
+back a table drop preserves an earlier explicit index drop; full rollback
+restores each original index once. These fixtures were uncommitted at revision
+`e83543b8`. Extract the archive and run `python3 verify-planner-drop.py .` to
+check 12 file hashes, 23 result rows and the three expected error codes against
+the exact SQL, raw output, commands and binary provenance. This is reference
+behavior, not a passing pos3ql or performance result.

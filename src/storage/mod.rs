@@ -12086,6 +12086,7 @@ pub struct IndexDef {
     pub mutable: IndexMutableDefinition,
     pub(crate) pending_definition: Option<PendingIndexDefinition>,
     pub ddl_state: CatalogDdlState,
+    pub(crate) pending_parent_drop_txid: Option<u32>,
 }
 
 impl IndexDef {
@@ -12119,6 +12120,7 @@ impl IndexDef {
         mutable: IndexMutableDefinition::DEFAULT,
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
+        pending_parent_drop_txid: None,
     };
 
     /// Whether `txid` sees this index exist.
@@ -49370,6 +49372,7 @@ impl Storage {
             pending_name: None,
             pending_table: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
+            pending_parent_drop_txid: None,
             ..def
         };
         statistics_admission.commit();
@@ -49612,6 +49615,7 @@ impl Storage {
                     .is_some_and(|binding| binding.source == source)
             {
                 index.ddl_state = index.ddl_state.drop_by(txid);
+                index.pending_parent_drop_txid = Some(txid);
             }
         }
     }
@@ -49640,7 +49644,8 @@ impl Storage {
     }
 
     /// Discards this transaction's pending index drops on a table (a rolled
-    /// back DROP TABLE): committed indexes become visible again.
+    /// back DROP TABLE). Earlier explicit DROP INDEX operations retain their
+    /// own undo ownership, including when only the table drop is rolled back.
     pub fn rollback_indexes_for(&mut self, table: usize, txid: u32) {
         let identity = self.tables[table].identity();
         let source = self.catalog_object_identity(
@@ -49653,8 +49658,10 @@ impl Storage {
                 && x.table_binding
                     .is_some_and(|binding| binding.source == source)
                 && x.ddl_state.pending_drop_txid() == Some(txid)
+                && x.pending_parent_drop_txid == Some(txid)
             {
                 x.ddl_state = x.ddl_state.rollback_drop(txid);
+                x.pending_parent_drop_txid = None;
             }
         }
     }

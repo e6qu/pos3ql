@@ -202,6 +202,7 @@ PY
     if [ "$COVERAGE_NATIVE_DEBUGGER" = gdb ]; then
         set -- gdb --batch --return-child-result \
             -ex 'set pagination off' -ex 'set print thread-events off' \
+            -ex 'set startup-with-shell off' \
             -ex 'handle SIGPIPE nostop noprint pass' \
             -ex run -ex 'thread apply all bt 40' --args "$native_test_binary" "$@"
     else

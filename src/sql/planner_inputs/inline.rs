@@ -252,6 +252,32 @@ fn builtin_constant(
         Expr::IsNull { .. } | Expr::Collate { .. } | Expr::Array(_) | Expr::Subscript { .. } => {
             true
         }
+        Expr::Like {
+            operand,
+            pattern,
+            case_insensitive,
+            ..
+        } => {
+            let left = infer_routine_argument_oid(operand, columns)?;
+            let right = infer_routine_argument_oid(pattern, columns)?;
+            let properties = operator_properties(
+                storage,
+                txid,
+                Some("pg_catalog"),
+                if *case_insensitive { "~~*" } else { "~~" },
+                Some(if left == oid::UNKNOWN {
+                    oid::TEXT
+                } else {
+                    left
+                }),
+                Some(if right == oid::UNKNOWN {
+                    oid::TEXT
+                } else {
+                    right
+                }),
+            )?;
+            properties.known && properties.volatility == 0
+        }
         Expr::Unary {
             operator: UnaryOp::Not,
             ..

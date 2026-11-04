@@ -108,7 +108,7 @@ pub(crate) fn capture_contextual_expression_type_inputs<'a>(
             txid,
             arena,
             visit,
-            planner: None,
+            planner: PlannerPass::TypeInputs,
         };
         walker.expression(expression, columns, &metadata)
     })
@@ -137,7 +137,7 @@ pub(crate) fn capture_procedural_statement_type_inputs<'a>(
             txid,
             arena,
             visit,
-            planner: None,
+            planner: PlannerPass::TypeInputs,
         };
         match statement {
             Stmt::Select(select) => walker.select(select, Some(&outer), None),
@@ -432,7 +432,7 @@ fn discover_default_source(
         txid,
         arena,
         visit: &mut translate,
-        planner: None,
+        planner: PlannerPass::TypeInputs,
     };
     walker.expression(expression, &columns, &crate::sql::eval::NoColumns)?;
     walker.input(expression, target, type_mod)
@@ -450,7 +450,7 @@ fn discover(
         txid,
         arena,
         visit,
-        planner: None,
+        planner: PlannerPass::TypeInputs,
     };
     walker.statement(statement)
 }
@@ -465,14 +465,32 @@ pub(crate) fn visit_planner_calls<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     visit: &mut PlannerVisit<'_>,
 ) -> Result<(), SqlError> {
-    let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
-    let mut walker = Walker {
-        storage,
-        txid,
-        arena,
-        visit: &mut ignore,
-        planner: Some(visit),
-    };
+    arena
+        .with_remaining_region(|scratch| {
+            crate::sql::exec::with_temporary_record_shapes(|| {
+                let catalog = super::storage_catalog(storage, scratch, txid);
+                let empty = crate::sql::eval::NoColumns;
+                let outer = outer.unwrap_or(&empty);
+                let columns = RuntimeColumnTypes {
+                    row: outer,
+                    catalog: Some(&catalog),
+                };
+                let metadata = MetadataOnly {
+                    row: outer,
+                    columns: &columns,
+                };
+                let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
+                Walker {
+                    storage,
+                    txid,
+                    arena: scratch,
+                    visit: &mut ignore,
+                    planner: PlannerPass::Analyze,
+                }
+                .planner_statement(statement, &metadata)
+            })
+        })
+        .map_err(|_| super::arena_full())??;
     let catalog = super::storage_catalog(storage, arena, txid);
     let empty = crate::sql::eval::NoColumns;
     let outer = outer.unwrap_or(&empty);
@@ -484,14 +502,15 @@ pub(crate) fn visit_planner_calls<'a>(
         row: outer,
         columns: &columns,
     };
-    match statement {
-        Stmt::Select(select) => walker.select(select, Some(&metadata), None),
-        Stmt::SetQuery(query) => walker.set_query(query, Some(&metadata)),
-        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-            walker.dml(statement, Some(&metadata))
-        }
-        _ => walker.statement(statement),
+    let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
+    Walker {
+        storage,
+        txid,
+        arena,
+        visit: &mut ignore,
+        planner: PlannerPass::Capture(visit),
     }
+    .planner_statement(statement, &metadata)
 }
 
 pub(crate) fn visit_planner_expression<'a>(
@@ -502,14 +521,30 @@ pub(crate) fn visit_planner_expression<'a>(
     row: &dyn ColumnLookup<'a>,
     visit: &mut PlannerVisit<'_>,
 ) -> Result<(), SqlError> {
-    let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
-    let mut walker = Walker {
-        storage,
-        txid,
-        arena,
-        visit: &mut ignore,
-        planner: Some(visit),
-    };
+    arena
+        .with_remaining_region(|scratch| {
+            crate::sql::exec::with_temporary_record_shapes(|| {
+                let catalog = super::storage_catalog(storage, scratch, txid);
+                let columns = RuntimeColumnTypes {
+                    row,
+                    catalog: Some(&catalog),
+                };
+                let metadata = MetadataOnly {
+                    row,
+                    columns: &columns,
+                };
+                let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
+                Walker {
+                    storage,
+                    txid,
+                    arena: scratch,
+                    visit: &mut ignore,
+                    planner: PlannerPass::Analyze,
+                }
+                .expression(expression, &columns, &metadata)
+            })
+        })
+        .map_err(|_| super::arena_full())??;
     let catalog = super::storage_catalog(storage, arena, txid);
     let columns = RuntimeColumnTypes {
         row,
@@ -519,7 +554,21 @@ pub(crate) fn visit_planner_expression<'a>(
         row,
         columns: &columns,
     };
-    walker.expression(expression, &columns, &metadata)
+    let mut ignore = |_: &Expr<'_>, _: i32, _: i32, _: InputKind| Ok(());
+    Walker {
+        storage,
+        txid,
+        arena,
+        visit: &mut ignore,
+        planner: PlannerPass::Capture(visit),
+    }
+    .expression(expression, &columns, &metadata)
+}
+
+enum PlannerPass<'v, 'callback> {
+    TypeInputs,
+    Analyze,
+    Capture(&'v mut PlannerVisit<'callback>),
 }
 
 struct Walker<'a, 'v, 'callback> {
@@ -527,11 +576,32 @@ struct Walker<'a, 'v, 'callback> {
     txid: u32,
     arena: &'a Arena,
     visit: &'v mut Visit<'callback>,
-    planner: Option<&'v mut PlannerVisit<'callback>>,
+    planner: PlannerPass<'v, 'callback>,
 }
 
 impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
+    fn planner_statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        outer: &dyn ColumnLookup<'a>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        match statement {
+            Stmt::Select(select) => self.select(select, Some(outer), None),
+            Stmt::SetQuery(query) => self.set_query(query, Some(outer)),
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                self.dml(statement, Some(outer))
+            }
+            _ => self.statement(statement),
+        }
+    }
+
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
+        if matches!(self.planner, PlannerPass::Analyze) {
+            return Ok(());
+        }
         if matches!(expression, Expr::Str(_))
             && matches!(
                 NamedTypeKind::from_oid(target),
@@ -699,7 +769,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
-        if self.planner.is_some() {
+        if matches!(self.planner, PlannerPass::Capture(_)) {
             use crate::sql::planner_inputs::inline::ConstantValue;
             let storage = self.storage;
             let txid = self.txid;
@@ -800,7 +870,42 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         super::walk_children(expression, &mut |child| {
             self.expression(child, columns, row)
         })?;
-        if let Some(planner) = &mut self.planner {
+        if matches!(self.planner, PlannerPass::Analyze) {
+            if matches!(
+                expression,
+                Expr::Call {
+                    kind: ast::CallKind::Routine,
+                    ..
+                }
+            ) {
+                super::selected_aggregate_call(expression, self.storage, self.txid, columns)?;
+            }
+            if matches!(
+                expression,
+                Expr::Call { .. }
+                    | Expr::Cast { .. }
+                    | Expr::Binary { .. }
+                    | Expr::Unary { .. }
+                    | Expr::Case { .. }
+                    | Expr::InList { .. }
+                    | Expr::AnyAll { .. }
+            ) {
+                crate::sql::exec::infer_type_res(expression, columns)?;
+            }
+            return Ok(());
+        }
+        if matches!(self.planner, PlannerPass::Capture(_))
+            && matches!(expression, Expr::Binary { .. } | Expr::Unary { .. })
+        {
+            crate::sql::planner_inputs::inline::constant_value(
+                expression,
+                columns,
+                self.storage,
+                self.txid,
+                self.arena,
+            )?;
+        }
+        if let PlannerPass::Capture(planner) = &mut self.planner {
             if matches!(
                 expression,
                 Expr::Call {
@@ -879,7 +984,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     .map_err(|_| super::arena_full())?,
                 None => table.table,
             };
-            if let Some(planner) = &mut self.planner {
+            if let PlannerPass::Capture(planner) = &mut self.planner {
                 planner(
                     &Expr::Call {
                         kind: ast::CallKind::Routine,
@@ -899,7 +1004,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     columns,
                     None,
                 )?;
-            } else {
+            } else if matches!(self.planner, PlannerPass::TypeInputs) {
                 self.call(
                     name,
                     None,
@@ -953,7 +1058,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             let txid = self.txid;
             let arena = self.arena;
             if let Some(targets) = targets
-                && let Some(planner) = &mut self.planner
+                && let PlannerPass::Capture(planner) = &mut self.planner
             {
                 let mark = arena.mark();
                 let result: Result<(), SqlError> = (|| {
@@ -1054,7 +1159,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 if matches!(item, SelectItem::Expr { .. })
                     && let Some((target, type_mod, Some(site))) =
                         targets.and_then(|targets| targets.get(output_index))
-                    && let Some(planner) = &mut self.planner
+                    && let PlannerPass::Capture(planner) = &mut self.planner
                 {
                     planner(expression, &columns, Some((*target, *type_mod, *site)))?;
                 }
@@ -1075,7 +1180,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                             }
                             _ => scope.star_columns(),
                         };
-                        if let Some(planner) = &mut self.planner {
+                        if let PlannerPass::Capture(planner) = &mut self.planner {
                             for index in 0..count {
                                 let entry = match item {
                                     SelectItem::TableWildcard(name) => {
@@ -1113,7 +1218,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                             &columns,
                             |name, _| {
                                 if result.is_ok()
-                                    && let Some(planner) = &mut self.planner
+                                    && let PlannerPass::Capture(planner) = &mut self.planner
                                     && let Some((target, type_mod, Some(site))) =
                                         targets.and_then(|targets| targets.get(index))
                                 {
@@ -1174,7 +1279,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         let arena = self.arena;
         let mark = arena.mark();
         let result = (|| {
-            let planner = self.planner.is_some();
+            let planner = !matches!(self.planner, PlannerPass::TypeInputs);
             super::cte::visit_cte_sources(
                 query.with,
                 storage,
@@ -1228,7 +1333,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 let storage = self.storage;
                 let txid = self.txid;
                 let arena = self.arena;
-                let planner = self.planner.is_some();
+                let planner = !matches!(self.planner, PlannerPass::TypeInputs);
                 super::cte::visit_cte_sources(
                     ctes,
                     storage,
@@ -1436,7 +1541,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                             )
                         })?;
                     self.input(assignment.expression, target, column.type_mod)?;
-                    if let Some(planner) = &mut self.planner
+                    if let PlannerPass::Capture(planner) = &mut self.planner
                         && let Some(site) = assignment.site
                     {
                         planner(

@@ -240,6 +240,7 @@ pub(super) fn stage_type_record(
                     mutable: *definition,
                     pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
+                    pending_parent_drop_txid: None,
                 },
                 txid,
             )?;

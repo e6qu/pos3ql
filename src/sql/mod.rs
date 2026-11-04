@@ -21458,6 +21458,11 @@ impl Engine {
                         v
                     };
                 }
+                let parameter_oids =
+                    match arena.alloc_slice_with(decl.len(), |index| decl[index].oid()) {
+                        Ok(oids) => oids,
+                        Err(_) => return Ok(Err(eval::arena_full())),
+                    };
                 let mut inner = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
@@ -21488,17 +21493,19 @@ impl Engine {
                                     return Ok(Err(error));
                                 }
                                 sqlprep.record_custom_plan(name);
-                                self.execute_stmt(
-                                    &statement,
-                                    arena,
-                                    &inner_params[..args.len()],
-                                    txn,
-                                    sqlprep,
-                                    cursors,
-                                    guc,
-                                    exec::PlpgsqlTransactionContext::Atomic,
-                                    responder,
-                                )
+                                exec::with_bound_parameter_types(parameter_oids, || {
+                                    self.execute_stmt(
+                                        &statement,
+                                        arena,
+                                        &inner_params[..args.len()],
+                                        txn,
+                                        sqlprep,
+                                        cursors,
+                                        guc,
+                                        exec::PlpgsqlTransactionContext::Atomic,
+                                        responder,
+                                    )
+                                })
                             }
                             Ok(None) => Ok(Ok(())),
                             Err(e) => Ok(Err(SqlError {
@@ -27558,6 +27565,7 @@ fn apply_wal_op(
                     mutable: definition,
                     pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
+                    pending_parent_drop_txid: None,
                 },
                 0,
             )?;

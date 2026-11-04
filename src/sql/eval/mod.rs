@@ -2829,9 +2829,19 @@ fn fold_check<'a>(
             Ok(None)
         }
         Expr::Like {
-            operand, pattern, ..
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            fold_check(operand, arena, catalog)?;
+            fold_check(pattern, arena, catalog)?;
+            if let Some(escape) = escape {
+                fold_check(escape, arena, catalog)?;
+            }
+            Ok(None)
         }
-        | Expr::Match {
+        Expr::Match {
             operand, pattern, ..
         } => {
             fold_check(operand, arena, catalog)?;

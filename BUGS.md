@@ -23,6 +23,8 @@ Check predecessor flags and live/dead counts after replacement; command completi
 alone cannot prove that an old index stayed retired.
 Check complete comparison metadata before journaling a constraint-created index.
 Native crashes require thread backtraces; a retry or a longer deadline is not a fix.
+Table-drop undo must restore only indexes dropped by that operation. Verify
+`DROP INDEX; SAVEPOINT s; DROP TABLE; ROLLBACK TO s` and full rollback separately.
 Pending CI and uncollected measurements are acceptance work in [PLAN.md](PLAN.md),
 not blocked defects. Current behavior belongs in the [behavior guide](docs/implemented-baseline.md)
 and its [owning technical guides](docs/README.md).

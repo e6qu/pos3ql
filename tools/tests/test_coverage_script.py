@@ -62,7 +62,9 @@ Path(os.environ['DEBUGGER_CALLS']).write_text(json.dumps({'args': sys.argv[1:],
 command = sys.argv[sys.argv.index('--args') + 1:]
 raise SystemExit(subprocess.run(command, check=False).returncode)
 """)
-                for command in [native, cargo, debugger]:
+                llvm_cov = commands / "cargo-llvm-cov"
+                llvm_cov.write_text("#!/bin/sh\nexit 59\n")
+                for command in [native, cargo, debugger, llvm_cov]:
                     command.chmod(0o755)
                 native_calls = root / "native-calls.json"
                 debugger_calls = root / "debugger-calls.json"
@@ -78,6 +80,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 self.assertEqual(result.returncode, 0 if test_status == 0 else 1,
                     result.stdout + result.stderr)
                 self.assertEqual(output.exists(), test_status == 0)
+                self.assertIn("deliberate native result", result.stdout)
                 self.assertEqual(json.loads(native_calls.read_text()),
                     ["--exact", "--skip", "sample::two", "--skip", "sample::four"])
                 captured = json.loads(debugger_calls.read_text())
@@ -85,6 +88,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 self.assertEqual(captured["threads"], "3")
                 self.assertIn("--return-child-result", captured["args"])
                 self.assertIn("thread apply all bt 40", captured["args"])
+                self.assertIn("set startup-with-shell off", captured["args"])
                 self.assertNotIn("--test-threads=1", captured["args"])
 
     def test_build_failure_stops_instrumented_and_correctness_shards(self):

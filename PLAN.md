@@ -64,6 +64,9 @@ preparation succeeds. Closing or cancelling one portal must release its plan
 without changing another portal's checked values.
 Keep parameterless generic plans shared and live while portals use them;
 parameterized planning must use the supplied values when pruning branches.
+Check types before folding constant values. An invalid `min(boolean)` must
+win over a later division by zero, and a true `CASE` condition must discard
+later conditions. Retain declared SQL `EXECUTE` parameter types, including NULLs.
 `DISCARD PLANS` must change future preparation without repeating checks in an
 already bound portal or cursor. Verify cache changes across
 schema edits, commit, rollback, search paths and roles against PostgreSQL;

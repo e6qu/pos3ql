@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn planner_analysis_precedes_folding_and_unreached_conditions_stay_unevaluated() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("planner-constant-order-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture =
+            include_str!("../../../tests/external/differential/230_planner_constant_order.sql");
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            let error = if statement.starts_with("SELECT id,min")
+                || statement.starts_with("SELECT CASE WHEN true THEN 1 ELSE min")
+            {
+                Some("42883")
+            } else if statement.starts_with("SELECT CASE WHEN (b IS NULL") {
+                Some("22003")
+            } else {
+                None
+            };
+            if let Some(expected) = error {
+                let output = session.execute(&mut engine, statement, true);
+                assert_eq!(
+                    error_sqlstates(&output),
+                    [expected],
+                    "{mode:?}: {statement}"
+                );
+            } else {
+                rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+            }
+        }
+        assert_eq!(
+            rows,
+            [
+                "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "a_ba_b|0", "7", "1|t",
+                "2|f", "t", "t", "2", "t", "9",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn trigger_transition_relations_bind_before_atomic_type_analysis() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -635,5 +685,33 @@ fn cursor_planning_checks_inline_inputs_without_running_function_bodies() {
             );
             session.success(&mut engine, "CLOSE phase_cursor; COMMIT", true);
         }
+        session.success(
+            &mut engine,
+            "ALTER SEQUENCE phase_checks RESTART WITH 1; TRUNCATE phase_audit,phase_mutations; \
+             PREPARE phase_text_parameter(text) AS \
+             SELECT CASE WHEN $1='go' THEN phase_scalar() ELSE 17 END; \
+             PREPARE phase_integer_parameter(integer) AS SELECT pg_typeof($1)::text",
+            true,
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "EXECUTE phase_text_parameter('stop')", true)),
+            ["17"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["0|0|0"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "EXECUTE phase_integer_parameter(NULL)", true)),
+            ["integer"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "EXECUTE phase_text_parameter('go')", true)),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, counter, true)),
+            ["1|1|0"]
+        );
     }
 }

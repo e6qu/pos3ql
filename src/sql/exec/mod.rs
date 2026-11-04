@@ -764,7 +764,7 @@ pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
     record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
-    visit_array_constructor_conversions, wire_column_description,
+    visit_array_constructor_conversions, wire_column_description, with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
@@ -4857,6 +4857,7 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
                     },
                     pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
+                    pending_parent_drop_txid: None,
                 },
                 txn.txid,
             )?;
@@ -53720,6 +53721,7 @@ pub fn create_index(
         },
         pending_definition: None,
         ddl_state: crate::storage::CatalogDdlState::Present,
+        pending_parent_drop_txid: None,
     };
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
@@ -56670,25 +56672,6 @@ pub(super) fn swap_reindex_definitions(
             txn.txid,
         );
         stage_index_rename(storage, wal, txn, replacement.old_slot, retired_name)?;
-        stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
-        for (name, text) in [(retired_name, None), (original_name, comment)] {
-            if let Some((slot, prior)) = storage.set_comment(
-                crate::storage::CommentClass::Relation,
-                old.schema,
-                name,
-                0,
-                text,
-                txn.txid,
-            )? {
-                txn.record_ddl(
-                    storage,
-                    super::txn::DdlUndo::CommentSet {
-                        slot: slot as u32,
-                        prior,
-                    },
-                )?;
-            }
-        }
         let mut old_definition = old.mutable_for(txn.txid);
         let mut new_definition = new.mutable_for(txn.txid);
         new_definition.kind = crate::storage::IndexKind::Ordinary;
@@ -56728,6 +56711,25 @@ pub(super) fn swap_reindex_definitions(
         }
         if changed {
             stage_table_definition(storage, wal, txn, target, current, next)?;
+        }
+        stage_index_rename(storage, wal, txn, replacement.new_slot, original_name)?;
+        for (name, text) in [(retired_name, None), (original_name, comment)] {
+            if let Some((slot, prior)) = storage.set_comment(
+                crate::storage::CommentClass::Relation,
+                old.schema,
+                name,
+                0,
+                text,
+                txn.txid,
+            )? {
+                txn.record_ddl(
+                    storage,
+                    super::txn::DdlUndo::CommentSet {
+                        slot: slot as u32,
+                        prior,
+                    },
+                )?;
+            }
         }
         storage.prepare_index_definition_enforcers(
             replacement.old_slot,

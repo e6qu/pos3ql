@@ -90,7 +90,9 @@ Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
 CI uses `gdb` to print every thread's stack if a native test crashes. It runs
 the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,
 the same test selection and ordinary test parallelism. A crash still fails
-the job; the debugger does not retry or resume it.
+the job; the debugger does not retry or resume it. GDB launches the executable
+directly: rebuilding thousands of test filters as one shell argument exceeds
+Linux's argument-size limit before the tests start.
 
 SQL test harnesses prepare their Python clients with
 `tests/external/python_env.py VENV`. Dependencies and wheel hashes are pinned in

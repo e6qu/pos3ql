@@ -6021,9 +6021,16 @@ impl Expr<'_> {
                     && list.iter().all(|e| e.is_constant(catalog_aware))
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.is_constant(catalog_aware)
+                    && pattern.is_constant(catalog_aware)
+                    && escape.is_none_or(|expression| expression.is_constant(catalog_aware))
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => operand.is_constant(catalog_aware) && pattern.is_constant(catalog_aware),
             Expr::Case {
@@ -6122,9 +6129,16 @@ impl Expr<'_> {
                 operand.contains_call() || list.iter().any(|e| e.contains_call())
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.contains_call()
+                    || pattern.contains_call()
+                    || escape.is_some_and(|expression| expression.contains_call())
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => operand.contains_call() || pattern.contains_call(),
             Expr::Case {
@@ -6206,9 +6220,16 @@ impl Expr<'_> {
                 operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.contains_subquery()
+                    || pattern.contains_subquery()
+                    || escape.is_some_and(|expression| expression.contains_subquery())
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => operand.contains_subquery() || pattern.contains_subquery(),
             Expr::Case {
@@ -6300,9 +6321,15 @@ impl Expr<'_> {
                 .find_function(matches)
                 .or_else(|| list.iter().find_map(|e| e.find_function(matches))),
             Expr::Like {
-                operand, pattern, ..
-            }
-            | Expr::Match {
+                operand,
+                pattern,
+                escape,
+                ..
+            } => operand
+                .find_function(matches)
+                .or_else(|| pattern.find_function(matches))
+                .or_else(|| escape.and_then(|expression| expression.find_function(matches))),
+            Expr::Match {
                 operand, pattern, ..
             } => operand
                 .find_function(matches)
@@ -6387,9 +6414,18 @@ impl Expr<'_> {
                 list.iter().for_each(|e| e.for_each_column(f));
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.for_each_column(f);
+                pattern.for_each_column(f);
+                if let Some(expression) = escape {
+                    expression.for_each_column(f);
+                }
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => {
                 operand.for_each_column(f);
@@ -6482,9 +6518,18 @@ impl Expr<'_> {
                     .for_each(|expression| expression.for_each_column_reference(f));
             }
             Expr::Like {
-                operand, pattern, ..
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.for_each_column_reference(f);
+                pattern.for_each_column_reference(f);
+                if let Some(expression) = escape {
+                    expression.for_each_column_reference(f);
+                }
             }
-            | Expr::Match {
+            Expr::Match {
                 operand, pattern, ..
             } => {
                 operand.for_each_column_reference(f);

@@ -9422,6 +9422,7 @@ impl Checkpointer {
                                 },
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
+                                pending_parent_drop_txid: None,
                             },
                             0,
                         )

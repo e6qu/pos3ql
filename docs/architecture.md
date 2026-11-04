@@ -137,6 +137,13 @@ its slot. Planning can inspect already decoded parameters to skip a branch
 such as `CASE WHEN $1=0 THEN checked_function() ELSE 17 END`, without running
 the skipped function's constraints.
 
+Planning checks expression types before evaluating constants. For example,
+`SELECT min(active) FROM orders WHERE 1/0>0` rejects `min(boolean)` before
+division by zero. A true constant `CASE` condition discards later branches.
+The type-only pass releases its arena and temporary record descriptions while
+preserving descriptions owned by the enclosing statement. SQL `EXECUTE` carries
+declared parameter types through planning and execution, even for NULL values.
+
 Protocol preparation distinguishes starting a command from executing a block of
 commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
 without making it an explicit transaction. An earlier execution before `Sync`,

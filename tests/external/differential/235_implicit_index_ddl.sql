@@ -9,6 +9,9 @@ WHERE conrelid='implicit_index_rows'::regclass AND contype IN ('p','u','x');
 SET ROLE implicit_index_stranger;
 ALTER INDEX implicit_index_rows_pkey RENAME TO forbidden_index_name;
 RESET ROLE;
+CREATE INDEX implicit_index_collision ON implicit_index_rows(code);
+ALTER INDEX implicit_index_rows_pkey RENAME TO implicit_index_collision;
+DROP INDEX implicit_index_collision;
 BEGIN;
 ALTER INDEX implicit_index_rows_pkey RENAME TO implicit_index_temporary;
 SELECT c.oid=b.oid,c.conindid=b.conindid,obj_description(c.oid,'pg_constraint'),obj_description(c.conindid,'pg_class')

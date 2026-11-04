@@ -16,6 +16,8 @@ recovery; command completion alone cannot expose duplicate or detached index
 metadata. Preserve failing-thread stacks with native-crash repairs.
 Exercise constraint-index DDL before a rebuild and preserve retired-index owners
 through table-owner changes and recovery.
+Verify same-lifetime key/index name aliases separately from real collisions,
+and exercise maintenance whose requested index state already holds.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

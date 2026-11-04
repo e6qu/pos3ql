@@ -20,13 +20,18 @@ fn implicit_constraint_indexes_support_ddl_without_prior_rebuild() {
             .filter(|sql| !sql.is_empty())
         {
             let output = session.execute(&mut engine, statement, true);
-            let expected = statement
-                .contains("RENAME TO forbidden_index_name")
-                .then_some("42501");
+            let expected = if statement.contains("RENAME TO forbidden_index_name") {
+                Some("42501")
+            } else if statement.contains("RENAME TO implicit_index_collision") {
+                Some("42P07")
+            } else {
+                None
+            };
             assert_eq!(
                 error_sqlstates(&output),
                 expected.into_iter().collect::<Vec<_>>(),
-                "{mode:?}: {statement}"
+                "{mode:?}: {statement}: {}",
+                String::from_utf8_lossy(&output)
             );
             rows.extend(data_rows(&output));
         }

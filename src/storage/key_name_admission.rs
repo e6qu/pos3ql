@@ -10,6 +10,13 @@ pub(crate) enum GeneratedNameClass {
     Relation,
 }
 
+// A key shares a name only with the same index and table lifetimes.
+#[derive(Clone, Copy)]
+struct BackingIndexAlias {
+    source: super::catalog_sources::CatalogObjectIdentity,
+    identity: RelationIdentity,
+}
+
 pub(super) fn dirty_exists(state: CatalogDdlState, transaction: u32) -> bool {
     state != CatalogDdlState::Absent && state.pending_drop_txid() != Some(transaction)
 }
@@ -54,7 +61,7 @@ impl Storage {
         {
             return true;
         }
-        self.schema_generated_name_taken(definition.schema, name, transaction, exclude, class)
+        self.schema_generated_name_taken(definition.schema, name, transaction, exclude, class, None)
     }
 
     fn schema_generated_name_taken(
@@ -64,6 +71,7 @@ impl Storage {
         transaction: u32,
         exclude: Option<usize>,
         class: GeneratedNameClass,
+        backing: Option<BackingIndexAlias>,
     ) -> bool {
         let relation = !matches!(class, GeneratedNameClass::Constraint);
         for (slot, table) in self.tables.iter().enumerate() {
@@ -144,6 +152,7 @@ impl Storage {
             schema,
             name,
             transaction,
+            backing,
             RelationNameSources {
                 indexes: &indexes,
                 views: &views.views,
@@ -306,12 +315,20 @@ impl Storage {
             if previous.inline_key_names().iter().any(|prior| prior == key) {
                 continue;
             }
+            let backing = definition
+                .attribute_column(key.attribute)
+                .and_then(|column| definition.column_index_identity(column))
+                .map(|identity| BackingIndexAlias {
+                    source: target.source,
+                    identity,
+                });
             if self.schema_generated_name_taken(
                 definition.schema,
                 key.name,
                 target.transaction(),
                 Some(target.table()),
                 GeneratedNameClass::Relation,
+                backing,
             ) {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_TABLE,
@@ -337,10 +354,20 @@ fn catalog_relation_name_taken(
     schema: SqlName,
     name: SqlName,
     transaction: u32,
+    backing: Option<BackingIndexAlias>,
     sources: RelationNameSources<'_>,
 ) -> bool {
     for index in sources.indexes {
         if index.database != current_database() || !dirty_exists(index.ddl_state, transaction) {
+            continue;
+        }
+        if backing.is_some_and(|backing| {
+            matches!(index.relation, IndexRelationSource::Table)
+                && index.created_at == backing.identity.created_at()
+                && index
+                    .table_binding
+                    .is_some_and(|binding| binding.source == backing.source)
+        }) {
             continue;
         }
         let owner = index

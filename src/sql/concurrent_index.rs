@@ -498,11 +498,6 @@ impl super::Engine {
                             command.slot,
                             IndexKind::OrdinaryDead,
                         )?;
-                        self.storage.prepare_index_definition_enforcers(
-                            command.slot,
-                            txn.txid,
-                            crate::storage::IndexBindingOperation::State,
-                        )?;
                         command.advance(Phase::Commit(CommitPhase::Dead));
                     }
                     Phase::FinishDrop => {
@@ -548,11 +543,6 @@ impl super::Engine {
                                 txn,
                                 replacement.old_slot,
                                 IndexKind::OrdinaryDead,
-                            )?;
-                            self.storage.prepare_index_definition_enforcers(
-                                replacement.old_slot,
-                                txn.txid,
-                                crate::storage::IndexBindingOperation::State,
                             )?;
                         }
                         command.advance(Phase::Commit(CommitPhase::ReindexDead));
@@ -706,6 +696,7 @@ impl super::Engine {
             })?;
         let mut definition = index.mutable_for(txn.txid);
         if definition.kind == kind {
+            // An unchanged state has no pending image to bind.
             return Ok(());
         }
         definition.kind = kind;
@@ -713,7 +704,21 @@ impl super::Engine {
             definition.clustered = false;
             definition.replica_identity = false;
         }
-        super::exec::stage_index_definition(&mut self.storage, &mut self.wal, txn, slot, definition)
+        super::exec::stage_index_definition(
+            &mut self.storage,
+            &mut self.wal,
+            txn,
+            slot,
+            definition,
+        )?;
+        if kind == IndexKind::OrdinaryDead {
+            self.storage.prepare_index_definition_enforcers(
+                slot,
+                txn.txid,
+                crate::storage::IndexBindingOperation::State,
+            )?;
+        }
+        Ok(())
     }
 }
 

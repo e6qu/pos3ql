@@ -398,6 +398,8 @@ Incomplete index records fail before changing the journal buffer.
 rebuild. It stores a physical index description when needed, preserving the
 index and constraint identifiers, comments and rollback behavior. Ownership is
 checked before reserving that description or taking the maintenance lock.
+Renaming an inline key recognizes its own stored index by both table and index
+identity. A different relation with that name still raises `42P07`.
 Changing a table or materialized view's owner also changes its
 live indexes' owner in the same transaction, including replacement and large-value
 indexes. Rolling back restores those owners together. An old index that the

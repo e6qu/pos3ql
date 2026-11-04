@@ -188,6 +188,10 @@ Direct `ALTER INDEX` must resolve constraint indexes before any rebuild,
 preserving their identities, comments, permissions and rollback behavior.
 Retired indexes keep their own owner when their former table changes owner;
 catalog reports must reflect the selected index's ownership.
+An inline key may share its own backing index's name while being renamed;
+unrelated relations must still block the name. Rebuilding an already retired
+index must skip unchanged state transitions without requesting a pending
+binding that was never staged.
 Comments must follow the selected index
 through name reuse, commit and cold recovery. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache

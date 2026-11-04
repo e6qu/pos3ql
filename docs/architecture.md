@@ -369,16 +369,19 @@ Keys retain the name chosen at creation. For example, renaming `orders` to
 `archived_orders` preserves `orders_pkey`; rebuilding it also preserves that
 name. The saved name follows the column's stable number through column removal
 and recovery. Changing a table or materialized view's owner also changes its
-indexes' owner in the same transaction, including replacement and large-value
-indexes. Rolling back restores those owners together.
+live indexes' owner in the same transaction, including replacement and large-value
+indexes. Rolling back restores those owners together. An old index that the
+rebuild has stopped maintaining (`indislive=false`) keeps its former owner until
+it is dropped.
 
 These waits retain their source, selected table lifetime and bounded metadata
 leases across commits. Cancellation can leave a committed invalid replacement
 or a retired index, as in PostgreSQL; rollback cannot erase an earlier committed
 phase. Temporary indexes rebuild in place. Direct concurrent rebuilding of an
 exclusion index is rejected; a table rebuild warns and skips it. A table rebuild
-also warns and skips invalid indexes, which can be repaired by explicitly
-rebuilding the index. See the [compatibility guide](postgresql-18-compatibility.md)
+also warns and skips live invalid indexes. An explicit user-index rebuild can
+repair one; retired indexes stay untouched by table-wide maintenance. See the
+[compatibility guide](postgresql-18-compatibility.md)
 for supported boundaries and [durable formats](durable-format.md) for recovery.
 
 Application jobs, migration scheduling and backup schedules are operator work.

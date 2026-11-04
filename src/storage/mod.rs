@@ -11970,6 +11970,14 @@ impl IndexKind {
         !matches!(self, Self::OrdinaryDead)
     }
 
+    pub(crate) const fn invalidated(self) -> Self {
+        match self {
+            Self::Ordinary => Self::OrdinaryReady,
+            Self::Partitioned { .. } => Self::Partitioned { valid: false },
+            other => other,
+        }
+    }
+
     pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Ordinary => 0,

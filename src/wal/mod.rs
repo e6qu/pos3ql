@@ -17163,6 +17163,11 @@ mod tests {
                     (valid, ready, live)
                 );
                 assert_eq!(IndexKind::from_code(kind.code()), Some(kind));
+                let invalidated = kind.invalidated();
+                assert!(!invalidated.valid());
+                assert_eq!(invalidated.ready(), ready);
+                assert_eq!(invalidated.live(), live);
+                assert_eq!(invalidated.invalidated(), invalidated);
             }
             for kind in [
                 IndexKind::OrdinaryUnbuilt,

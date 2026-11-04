@@ -155,8 +155,12 @@ Concurrent reindexing must replace the index while preserving its owning
 constraint's identity. For example, an application's saved primary-key
 constraint identifier must still identify that constraint after its index is
 rebuilt. Store those identities separately, update the backing-index link, and
-preserve comments, dependencies and partition links. The current implementation
-also gives the large-value index its own lifetime and preserves deferred
+preserve comments, dependencies and partition links. Map a partition child's
+physical columns to the parent's selected columns when reporting those links.
+Rebuilding a table must leave retired indexes untouched. Explicit user-index
+repair and replacement must preserve the distinct flags and ownership rules.
+The current implementation gives the large-value index its own lifetime and
+preserves deferred
 uniqueness while its replacement is detached. Complete the runtime proofs for
 intermediate commit delays, earlier readers, cancellation and empty-cache
 recovery, including ordinary, constraint-owned and large-value indexes.

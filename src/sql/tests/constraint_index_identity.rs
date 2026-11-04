@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn reordered_partition_keys_keep_parent_constraint_and_index_links_through_reindex() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("reordered-index-links-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let fixture = include_str!(
+            "../../../tests/external/differential/229_reordered_partition_index_links.sql"
+        );
+        let mut rows = Vec::new();
+        for statement in fixture
+            .split(";\n")
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+        {
+            rows.extend(data_rows(&session.success(&mut engine, statement, true)));
+        }
+        assert_eq!(
+            rows,
+            [
+                "before|p|t|t|{2}|{1}",
+                "before|u|t|t|{2,1}|{1,2}",
+                "after|p|t|t|{2}|{1}",
+                "after|u|t|t|{2,1}|{1,2}",
+                "retained|t|t|t|t",
+                "row|1|7",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn generated_multicolumn_and_copied_key_names_follow_the_schema_namespace() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

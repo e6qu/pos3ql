@@ -2358,9 +2358,13 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
                 &mut recovered,
                 "REINDEX TABLE receipt_reindex_rows",
             );
-            assert!(has_message(&rebuilt, wire::MSG_NOTICE_RESPONSE));
-            assert!(rebuilt.windows(5).any(|bytes| bytes == b"0A000"));
-            assert!(String::from_utf8_lossy(&rebuilt).contains("on TOAST table, skipping"));
+            let warns = stop == Some(CommitPhase::ReindexRegistered);
+            assert_eq!(has_message(&rebuilt, wire::MSG_NOTICE_RESPONSE), warns);
+            assert_eq!(rebuilt.windows(5).any(|bytes| bytes == b"0A000"), warns);
+            assert_eq!(
+                String::from_utf8_lossy(&rebuilt).contains("on TOAST table, skipping"),
+                warns
+            );
             assert_eq!(
                 first_row(&query(
                     &mut verifier,
@@ -2377,12 +2381,205 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
                 }
             );
         }
+        const OWNERS: &str = "SELECT count(*) = 4 AND count(*) FILTER(WHERE x.indislive) = 2 \
+            AND count(*) FILTER(WHERE NOT x.indislive) = 2, \
+            bool_and(CASE WHEN x.indislive THEN r.rolname = 'receipt_reindex_owner' \
+            ELSE r.rolname = 'postgres' END) \
+            FROM pg_class t JOIN pg_index x ON x.indrelid = t.oid OR x.indrelid = t.reltoastrelid \
+            JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_roles r ON r.oid = i.relowner \
+            WHERE t.oid = 'receipt_reindex_rows'::regclass";
+        if stop == Some(CommitPhase::ReindexDead) {
+            query(
+                &mut verifier,
+                &mut recovered,
+                "CREATE ROLE receipt_reindex_owner",
+            );
+            query(
+                &mut verifier,
+                &mut recovered,
+                "BEGIN; ALTER TABLE receipt_reindex_rows OWNER TO receipt_reindex_owner",
+            );
+            assert_eq!(
+                first_row(&query(&mut verifier, &mut recovered, OWNERS)),
+                "t|t"
+            );
+            query(&mut verifier, &mut recovered, "ROLLBACK");
+            assert_eq!(
+                first_row(&query(
+                    &mut verifier,
+                    &mut recovered,
+                    "SELECT count(*) = 4, bool_and(r.rolname = 'postgres') \
+                 FROM pg_class t JOIN pg_index x ON x.indrelid = t.oid OR x.indrelid = t.reltoastrelid \
+                 JOIN pg_class i ON i.oid = x.indexrelid JOIN pg_roles r ON r.oid = i.relowner \
+                 WHERE t.oid = 'receipt_reindex_rows'::regclass"
+                )),
+                "t|t"
+            );
+            query(
+                &mut verifier,
+                &mut recovered,
+                "ALTER TABLE receipt_reindex_rows OWNER TO receipt_reindex_owner",
+            );
+            assert_eq!(
+                first_row(&query(&mut verifier, &mut recovered, OWNERS)),
+                "t|t"
+            );
+        }
         recovered.commit_wal().unwrap();
         drop(verifier);
         drop(recovered);
+        if stop == Some(CommitPhase::ReindexDead) {
+            for checkpoint in [false, true] {
+                std::fs::remove_dir_all(&config.data_dir).unwrap();
+                let mut cold_budget = crate::sql::test_engine_budget(&config, 1 << 29);
+                let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+                let mut verifier = Conn::new(&config, &mut cold_budget).unwrap();
+                verifier.id = 1;
+                verifier.phase = Phase::Ready;
+                assert_eq!(
+                    first_row(&query(&mut verifier, &mut cold, OWNERS)),
+                    "t|t",
+                    "retired index owners after checkpoint={checkpoint}"
+                );
+                if !checkpoint {
+                    assert!(cold.checkpoint().unwrap());
+                } else {
+                    query(
+                        &mut verifier,
+                        &mut cold,
+                        "REINDEX INDEX CONCURRENTLY receipt_reindex_rows_pkey_ccold",
+                    );
+                    assert_eq!(
+                        first_row(&query(
+                            &mut verifier,
+                            &mut cold,
+                            "SELECT r.rolname, x.indisvalid, x.indisready, x.indislive \
+                         FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid \
+                         JOIN pg_roles r ON r.oid = i.relowner \
+                         WHERE i.relname = 'receipt_reindex_rows_pkey_ccold'"
+                        )),
+                        "receipt_reindex_owner|t|t|t"
+                    );
+                }
+                cold.commit_wal().unwrap();
+                drop((verifier, cold, cold_budget));
+            }
+        }
         drop(server);
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
+}
+
+#[test]
+#[cfg(not(miri))]
+fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
+    use crate::sql::IndexCommitPhaseForTests as CommitPhase;
+    let mut config = config("reindex-unbuilt-swap", crate::config::TransactionMode::Mvcc);
+    config.object_store_on = true;
+    config.object_store_bucket = format!("reindex-unbuilt-swap-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let server = crate::sql::HttpObjectServer::start(&mut config);
+    let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut builder = Conn::new(&config, &mut budget).unwrap();
+    let mut observer = Conn::new(&config, &mut budget).unwrap();
+    builder.id = 1;
+    observer.id = 2;
+    builder.phase = Phase::Ready;
+    observer.phase = Phase::Ready;
+    query(
+        &mut builder,
+        &mut engine,
+        "CREATE TABLE unbuilt_swap_rows(id integer); INSERT INTO unbuilt_swap_rows VALUES(1),(1)",
+    );
+    let mut failed =
+        b"CREATE UNIQUE INDEX CONCURRENTLY unbuilt_swap_idx ON unbuilt_swap_rows(id)".to_vec();
+    failed.push(0);
+    let response = message(&mut builder, &mut engine, wire::FMSG_QUERY, &failed, true);
+    assert!(response.windows(5).any(|bytes| bytes == b"23505"));
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+         JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='unbuilt_swap_idx'"
+        )),
+        "f|f|t"
+    );
+    query(
+        &mut builder,
+        &mut engine,
+        "TRUNCATE unbuilt_swap_rows; INSERT INTO unbuilt_swap_rows VALUES(1),(2)",
+    );
+    engine.commit_wal().unwrap();
+    engine.enable_async_durability();
+    bind_command(
+        &mut builder,
+        &mut engine,
+        "REINDEX INDEX CONCURRENTLY unbuilt_swap_idx",
+    );
+    builder.send.clear();
+    assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+    let mut inspected = false;
+    let mut completed = false;
+    for _ in 0..16 {
+        let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
+        if matches!(step, Step::Continue) {
+            completed = true;
+            break;
+        }
+        assert!(
+            matches!(step, Step::Parked),
+            "{step:?}: {}",
+            String::from_utf8_lossy(builder.send.readable())
+        );
+        let target = builder
+            .txn
+            .staged_commit()
+            .expect("index phase awaits its receipt")
+            .target;
+        if matches!(
+            target,
+            crate::sql::txn::CommitTarget::ConcurrentIndex {
+                phase: CommitPhase::ReindexDead,
+                ..
+            }
+        ) {
+            // The swap is committed, while retirement is still private.
+            assert_eq!(
+                first_row(&query(
+                    &mut observer,
+                    &mut engine,
+                    "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+                 JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='unbuilt_swap_idx_ccold'"
+                )),
+                "f|f|t"
+            );
+            inspected = true;
+        }
+        engine.commit_wal().unwrap();
+    }
+    assert!(inspected && completed);
+    assert_eq!(
+        command_completion_in(builder.send.readable()),
+        Some("REINDEX")
+    );
+    message(&mut builder, &mut engine, wire::FMSG_SYNC, &[], false);
+    assert_eq!(
+        first_row(&query(
+            &mut observer,
+            &mut engine,
+            "SELECT i.indisvalid,i.indisready,i.indislive FROM pg_index i \
+         JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname='unbuilt_swap_idx'"
+        )),
+        "t|t|t"
+    );
+    engine.commit_wal().unwrap();
+    drop((builder, observer, engine, server));
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]

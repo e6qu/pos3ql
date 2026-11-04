@@ -7879,7 +7879,9 @@ pub fn alter_owner(
     if let Some(table) = index_table {
         for slot in 0..storage.index_count() {
             if storage.index_table_slot_to(slot, txn.txid) != Some(table)
-                || storage.index_visible_to(slot, txn.txid).is_none()
+                || storage
+                    .index_visible_to(slot, txn.txid)
+                    .is_none_or(|index| !index.mutable_for(txn.txid).kind.live())
             {
                 continue;
             }
@@ -56174,10 +56176,7 @@ pub fn drop_index(
                     })
             {
                 let mut invalid = definition.mutable_for(txn.txid);
-                invalid.kind = match invalid.kind {
-                    crate::storage::IndexKind::Ordinary => crate::storage::IndexKind::OrdinaryReady,
-                    other => other,
-                };
+                invalid.kind = invalid.kind.invalidated();
                 invalid.clustered = false;
                 invalid.replica_identity = false;
                 if let Err(error) = stage_index_definition(storage, wal, txn, slot, invalid)
@@ -56267,23 +56266,11 @@ fn register_reindex_definition(
 ) -> Result<usize, SqlError> {
     let target =
         storage.table_definition_target(table, txn.txid, &storage.table_def(table, txn.txid));
-    let owner = definition.ownership.owner_to(txn.txid);
     let slot =
         storage.create_reindex_index(definition, target, definition.relation_kind(), txn.txid)?;
     let result = (|| {
         journal_index_creation(storage, wal, txn, slot, table)?;
         txn.record_ddl(storage, super::txn::DdlUndo::IndexCreated(slot as u32))?;
-        let object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::Index,
-            slot: slot as u16,
-        };
-        if storage.object_owner(object, txn.txid) != usize::from(owner) {
-            let prior = storage.set_object_owner(object, usize::from(owner), txn.txid);
-            txn.record_ddl(
-                storage,
-                super::txn::DdlUndo::ObjectOwnerChanged { object, prior },
-            )?;
-        }
         Ok(slot)
     })();
     if result.is_err()
@@ -56356,6 +56343,7 @@ fn rebuild_reindex_table_cache(
         };
         if index.method == crate::sql::ast::IndexAccessMethod::Brin
             && selected.is_none_or(|oid| index.relation_oid() == oid)
+            && (selected.is_some() || index.mutable_for(txn.txid).kind.live())
             && storage.index_table_slot_to(index_slot, txn.txid) == Some(table)
         {
             storage.rebuild_brin_maintenance(index_slot, txn.txid)?;
@@ -56661,7 +56649,7 @@ pub(super) fn swap_reindex_definitions(
         new_definition.parent = old_definition.parent;
         new_definition.clustered = old_definition.clustered;
         new_definition.replica_identity = old_definition.replica_identity;
-        old_definition.kind = crate::storage::IndexKind::OrdinaryReady;
+        old_definition.kind = old_definition.kind.invalidated();
         old_definition.immediate = true;
         old_definition.parent = None;
         old_definition.clustered = false;
@@ -56985,7 +56973,10 @@ pub fn reindex(
                 continue;
             }
             let mut definition = index.mutable_for(txn.txid);
-            if definition.kind.is_partitioned() || definition.kind.valid() {
+            if definition.kind.is_partitioned()
+                || definition.kind.valid()
+                || (selected_index_oid.is_none() && !definition.kind.live())
+            {
                 continue;
             }
             if index.relation_kind() == crate::storage::IndexRelationKind::Toast {
@@ -57061,6 +57052,9 @@ pub fn reindex(
                 continue;
             }
             let mut definition = index.mutable_for(txn.txid);
+            if selected_index_oid.is_none() && !definition.kind.live() {
+                continue;
+            }
             definition.tablespace = selected_tablespace;
             if let Err(error) = stage_index_definition(storage, wal, txn, index_slot, definition) {
                 return sql_fail(error);
@@ -71276,7 +71270,7 @@ fn alter_partition_attachment(
                 match child_def.partition.detached_bound {
                     Some(constraint) => Some(constraint.name),
                     None => match detached_partition_constraint_name(
-                        storage, &child_def, scheme, txn.txid,
+                        storage, &child_def, scheme, txn.txid, child,
                     ) {
                         Ok(name) => Some(name),
                         Err(error) => return sql_fail(error),

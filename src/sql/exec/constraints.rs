@@ -1311,6 +1311,9 @@ fn check_index_tuple_sizes_inner(
         })?;
     let index_source = storage.table_def(table_slot, txid);
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        if !index.mutable_for(txid).kind.live() {
+            continue;
+        }
         let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut include_columns = [0u16; crate::storage::MAX_INDEX_COLS];
         for (target, source) in columns.iter_mut().zip(&index.columns[..index.n_cols]) {

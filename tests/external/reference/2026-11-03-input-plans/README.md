@@ -109,6 +109,25 @@ Extract it and run `python3 verify-index-parent-owner.py .` to verify 10 hashes
 and seven exact rows. Both archives retain exact SQL, raw results, commands and
 binary/source hashes; their fixtures were uncommitted at revision `8800db18`.
 
+The owner propagation rule excludes retired, non-live indexes. PostgreSQL 18.6's
+[ATExecChangeOwner](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/tablecmds.c#L15289-L15294)
+uses `RelationGetIndexList`, which
+[omits indexes with indislive=false](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/cache/relcache.c#L4570-L4577).
+The native delayed-publication test cancels a rebuild after retirement, then
+checks that live user and large-value indexes follow the new owner while non-live
+ones retain the old owner, across rollback, journal recovery and checkpoint recovery.
+This additional lifetime case is derived from the pinned source; it is not an
+observation recorded in the owner archive above.
+
+Table-wide rebuilding obtains the same live-index list
+([index.c](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/index.c#L3750)).
+Invalidating an index clears validity while retaining its readiness and lifetime
+flags; swapping a replacement must preserve those predecessor flags
+([index.c](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/index.c#L1530-L1553)).
+The native delayed-receipt tests exercise an unbuilt predecessor and a retired
+index, including explicit repair under a changed parent owner. These cases are
+source-derived checks alongside the archived PostgreSQL observations.
+
 [reference.zip](reference.zip) contains raw SQL output, the two-session records,
 server/image identifiers, the checkout revision and all input hashes from the
 [original runner artifact](https://github.com/e6qu/pos3ql/actions/runs/41685422665/artifacts/13257235290).
@@ -229,3 +248,15 @@ within PostgreSQL's byte limit and survive concurrent index rebuilding.
 The fixture was uncommitted at source revision `8f597543`. Exact SQL, raw output,
 commands, binary hashes and provenance are retained. Extract it and run
 `python3 verify-generated-key-names.py .` to verify 10 hashes and 13 output rows.
+
+[reordered-index-links-reference.zip](reordered-index-links-reference.zip), SHA256
+`57977a34d40cc8154779d4a1c0623d8fa4aab888e22df5f68fb9b313dbc2bea3`,
+records fixture `229_reordered_partition_index_links.sql` on PostgreSQL 18.6.
+An attached partition can store columns in a different order from its parent.
+Its primary and unique constraints retain their physical column numbers while
+linking to the correct parent constraint and index. Concurrent rebuilding
+preserves those links and constraint identifiers, replaces the child index
+identifiers and leaves rows intact. The fixture was uncommitted at source
+revision `6e87c94c`. Extract it and run `python3 verify-reordered-index-links.py .`
+to verify the retained SQL, raw output, provenance and commands against 10 hashes
+and six output rows.

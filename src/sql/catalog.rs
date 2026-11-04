@@ -11785,16 +11785,23 @@ struct IdxInfo {
     explicit_definition: Option<crate::storage::IndexMutableDefinition>,
 }
 
-fn parent_constraint(
+fn parent_constraint<Definition: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txid: u32,
-    child_slot: usize,
+    child: &crate::storage::TableDefinition<Definition>,
     index: &IdxInfo,
 ) -> Option<(crate::storage::ConstraintIdentity, i32)> {
-    let attachment = storage.table_def(child_slot, txid).partition.attachment?;
+    let attachment = child.partition.attachment?;
     let parent_slot = usize::from(attachment.parent);
     let parent = storage.table_def(parent_slot, txid);
-    let columns = &index.columns[..index.n_cols];
+    let child_columns = &index.columns[..index.n_cols];
+    // Attached partitions can store the same named columns in a different order.
+    let mut parent_columns = [0u16; crate::storage::MAX_INDEX_COLS];
+    for (target, &column) in parent_columns.iter_mut().zip(child_columns) {
+        let name = child.columns()[usize::from(column)].name;
+        *target = parent.column_index(name.as_str())? as u16;
+    }
+    let columns = &parent_columns[..index.n_cols];
     let is_primary = index.is_primary;
     let is_exclusion = index.is_exclusion;
     let mut position = 0usize;
@@ -11847,13 +11854,12 @@ fn parent_constraint(
         position += 1;
     }
     if is_exclusion {
-        let child = storage.table_def(child_slot, txid);
         let child_exclusion = child
             .exclusions()
             .iter()
-            .find(|exclusion| exclusion.columns() == columns)?;
+            .find(|exclusion| exclusion.columns() == child_columns)?;
         for exclusion in parent.exclusions() {
-            if exclusion.columns() == child_exclusion.columns()
+            if exclusion.columns() == columns
                 && exclusion.operators[..exclusion.n_cols]
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
@@ -11951,7 +11957,7 @@ fn visit_indexes(
                 explicit_definition: None,
             };
             if constraint_identity.is_some()
-                && let Some((parent, parent_index)) = parent_constraint(storage, txid, slot, &info)
+                && let Some((parent, parent_index)) = parent_constraint(storage, txid, &def, &info)
             {
                 info.constraint_parent = Some(parent);
                 info.index_parent_oid = Some(parent_index);
@@ -12519,7 +12525,8 @@ pub(crate) struct ReindexCandidate {
     pub exclusion: bool,
 }
 
-/// Maintenance selects the same physical index lifetimes exposed by pg_index.
+/// Table maintenance follows PostgreSQL's live-index list; a direct INDEX
+/// request still selects its exact lifetime, including an invalid index.
 pub(crate) fn reindex_candidates<'a>(
     storage: &Storage,
     txid: u32,
@@ -12529,6 +12536,10 @@ pub(crate) fn reindex_candidates<'a>(
 ) -> Result<&'a [ReindexCandidate], SqlError> {
     let matches = |index: &IdxInfo| {
         tables.contains(&index.table_slot)
+            && (selected.is_some()
+                || index
+                    .explicit_definition
+                    .is_none_or(|definition| definition.kind.live()))
             && selected.is_none_or(|oid| {
                 if oid == index.oid {
                     return true;
@@ -12557,7 +12568,9 @@ pub(crate) fn reindex_candidates<'a>(
     });
     visit_toast_indexes(storage, txid, |index| {
         count += usize::from(
-            tables.contains(&index.table) && selected.is_none_or(|oid| oid == index.oid),
+            tables.contains(&index.table)
+                && selected.is_none_or(|oid| oid == index.oid)
+                && (selected.is_some() || index.definition.kind.live()),
         );
     });
     let result = arena
@@ -12638,7 +12651,10 @@ pub(crate) fn reindex_candidates<'a>(
         return Err(error);
     }
     visit_toast_indexes(storage, txid, |index| {
-        if !tables.contains(&index.table) || selected.is_some_and(|oid| oid != index.oid) {
+        if !tables.contains(&index.table)
+            || selected.is_some_and(|oid| oid != index.oid)
+            || (selected.is_none() && !index.definition.kind.live())
+        {
             return;
         }
         let table = storage.table_def(index.table, txid);

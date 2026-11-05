@@ -549,7 +549,7 @@ impl SubscriptionApply {
             engine.subscription_copy_start(
                 &setup,
                 &mut worker.txn,
-                worker.guc.seq_session(),
+                &worker.guc,
                 &worker.arena,
                 &mut responder,
                 &mut worker.trigger_scratch,
@@ -574,7 +574,7 @@ impl SubscriptionApply {
                     line,
                     crate::sql::CopyRowContext::for_subscription_worker(
                         &mut worker.txn,
-                        worker.guc.seq_session(),
+                        &worker.guc,
                         &worker.arena,
                         &mut responder,
                         &mut worker.trigger_scratch,
@@ -603,7 +603,7 @@ impl SubscriptionApply {
                     row,
                     crate::sql::CopyRowContext::for_subscription_worker(
                         &mut worker.txn,
-                        worker.guc.seq_session(),
+                        &worker.guc,
                         &worker.arena,
                         &mut responder,
                         &mut worker.trigger_scratch,

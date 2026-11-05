@@ -492,7 +492,9 @@ time. Another connection uses its own deadline. COPY retains its original timer
 between data messages: an expired incoming row fails with `57014`; finishing an
 empty stream does not itself require a row check. The
 [PostgreSQL probe](../tests/external/reference/2026-11-05-procedural-deadlines/README.md)
-records these boundaries; native tests also interleave connections.
+records these boundaries; native tests also interleave connections. COPY binds
+the owning session at start, each row and completion, so trigger handlers can
+restore settings after an error even when other connections run between chunks.
 Its completed control effects must not be replayed after a wait; retained handler
 positions remain part of the execution work in [PLAN.md](../PLAN.md).
 

@@ -732,7 +732,7 @@ pub(crate) struct CursorStatementContext<'a, 'response> {
 /// Mutable session state used while ingesting one streamed COPY row.
 pub struct CopyRowContext<'a, 'response> {
     txn: &'a mut TxnState,
-    seq_session: &'a guc::SeqSession,
+    guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
     dml_scratch: CopyDmlScratch<'a>,
@@ -767,14 +767,14 @@ impl<'a> SubscriptionCopyWorkspace<'a> {
 impl<'a, 'response> CopyRowContext<'a, 'response> {
     pub(crate) fn new(
         txn: &'a mut TxnState,
-        seq_session: &'a guc::SeqSession,
+        guc: &'a GucState,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         transition_rows: &'a mut exec::CopyTransitionRows,
     ) -> Self {
         Self {
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             dml_scratch: CopyDmlScratch::ActiveWorkspace,
@@ -784,7 +784,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
 
     pub(crate) fn for_subscription_worker(
         txn: &'a mut TxnState,
-        seq_session: &'a guc::SeqSession,
+        guc: &'a GucState,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         dml_scratch: &'a mut exec::DmlScratch,
@@ -792,7 +792,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
     ) -> Self {
         Self {
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             dml_scratch: CopyDmlScratch::SubscriptionWorker(dml_scratch),
@@ -10589,6 +10589,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _settings = guc::enter_eval_scope(context.guc, context.txn);
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
@@ -10599,7 +10600,7 @@ impl Engine {
         exec::copy_row(
             &mut self.storage,
             context.txn,
-            context.seq_session,
+            context.guc.seq_session(),
             setup,
             line,
             context.arena,
@@ -10627,6 +10628,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _settings = guc::enter_eval_scope(context.guc, context.txn);
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
@@ -10637,7 +10639,7 @@ impl Engine {
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
-            context.seq_session,
+            context.guc.seq_session(),
             setup,
             row,
             context.arena,
@@ -10651,7 +10653,7 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
@@ -10660,7 +10662,7 @@ impl Engine {
             &mut self.storage,
             setup,
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             &mut self.dml_scratch,
@@ -10671,7 +10673,7 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
@@ -10681,7 +10683,7 @@ impl Engine {
             &mut self.storage,
             setup,
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             scratch,
@@ -10692,12 +10694,21 @@ impl Engine {
         storage: &mut Storage,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
-        exec::copy_statement_begin(storage, txn, setup, seq_session, arena, responder, scratch)
+        let _settings = guc::enter_eval_scope(guc, txn);
+        exec::copy_statement_begin(
+            storage,
+            txn,
+            setup,
+            guc.seq_session(),
+            arena,
+            responder,
+            scratch,
+        )
     }
 
     pub(crate) fn subscription_copy_setup(
@@ -10832,6 +10843,7 @@ impl Engine {
         inserted: &exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
+        let _settings = guc::enter_eval_scope(guc, txn);
         let _files = setup.restore_snapshot(storage)?;
         exec::copy_statement_end(
             storage,
@@ -21336,9 +21348,7 @@ impl Engine {
                     if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
                         return Ok(Err(error));
                     }
-                    if let Err(error) =
-                        self.copy_start(&setup, txn, guc.seq_session(), arena, responder)
-                    {
+                    if let Err(error) = self.copy_start(&setup, txn, guc, arena, responder) {
                         return Ok(Err(error));
                     }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;

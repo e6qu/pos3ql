@@ -2728,7 +2728,7 @@ impl Conn {
                             line,
                             crate::sql::CopyRowContext::new(
                                 &mut self.txn,
-                                self.guc.seq_session(),
+                                &self.guc,
                                 &self.arena,
                                 &mut responder,
                                 &mut self.copy_transition_scratch,
@@ -2817,7 +2817,7 @@ impl Conn {
                                 row,
                                 crate::sql::CopyRowContext::new(
                                     &mut self.txn,
-                                    self.guc.seq_session(),
+                                    &self.guc,
                                     &self.arena,
                                     &mut responder,
                                     &mut self.copy_transition_scratch,
@@ -2878,7 +2878,7 @@ impl Conn {
                         line,
                         crate::sql::CopyRowContext::new(
                             &mut self.txn,
-                            self.guc.seq_session(),
+                            &self.guc,
                             &self.arena,
                             &mut responder,
                             &mut self.copy_transition_scratch,
@@ -6114,6 +6114,122 @@ mod tests {
                 }
                 assert!(conn.copy.is_none());
                 assert_eq!(crate::sql::query::statement_deadline(), i64::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_copy_trigger_handlers_keep_the_owning_session_in_text_and_binary() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) {
+            let bytes = frontend(kind, payload);
+            conn.send.clear();
+            assert!(conn.recv.append(&bytes));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(conn.recv.is_empty());
+            assert!(
+                !has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(conn.send.readable())
+            );
+        }
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-copy-handler-session-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 4;
+            config.max_connections = 2;
+            config.row_overlay_slots = 64;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let mut other = Conn::new(&config, &mut budget).unwrap();
+            conn.id = 1;
+            other.id = 2;
+            conn.phase = Phase::Ready;
+            other.phase = Phase::Ready;
+            conn.guc
+                .set_config("application_name", Some("copy-owner"), false)
+                .unwrap();
+            other
+                .guc
+                .set_config("application_name", Some("other-owner"), false)
+                .unwrap();
+            let setup = b"CREATE TABLE session_copy(id integer); CREATE TABLE session_copy_audit(timing text, level text, owner text); \
+                CREATE FUNCTION session_copy_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
+                  BEGIN PERFORM set_config('application_name','rolled-back',false); PERFORM 1/0; \
+                  EXCEPTION WHEN division_by_zero THEN \
+                    IF current_setting('application_name') <> 'copy-owner' THEN RAISE EXCEPTION 'wrong COPY owner'; END IF; \
+                    INSERT INTO session_copy_audit VALUES(TG_WHEN,TG_LEVEL,current_setting('application_name')); \
+                  END; RETURN NEW; END$$; \
+                CREATE TRIGGER session_copy_bs BEFORE INSERT ON session_copy FOR EACH STATEMENT EXECUTE FUNCTION session_copy_trigger(); \
+                CREATE TRIGGER session_copy_br BEFORE INSERT ON session_copy FOR EACH ROW EXECUTE FUNCTION session_copy_trigger(); \
+                CREATE TRIGGER session_copy_ar AFTER INSERT ON session_copy FOR EACH ROW EXECUTE FUNCTION session_copy_trigger(); \
+                CREATE TRIGGER session_copy_as AFTER INSERT ON session_copy FOR EACH STATEMENT EXECUTE FUNCTION session_copy_trigger()\0";
+            message(&mut conn, &mut engine, wire::FMSG_QUERY, setup);
+            for binary in [false, true] {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_QUERY,
+                    if binary {
+                        b"COPY session_copy FROM STDIN (FORMAT binary)\0"
+                    } else {
+                        b"COPY session_copy FROM STDIN\0"
+                    },
+                );
+                message(
+                    &mut other,
+                    &mut engine,
+                    wire::FMSG_QUERY,
+                    b"SELECT current_setting('application_name')\0",
+                );
+                if binary {
+                    let mut data = b"PGCOPY\n\xff\r\n\0".to_vec();
+                    data.extend_from_slice(&[0; 8]);
+                    data.extend_from_slice(&[0, 1, 0, 0, 0, 4, 0, 0, 0, 2, 255, 255]);
+                    message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, &data);
+                } else {
+                    message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, b"1\n");
+                }
+                message(
+                    &mut other,
+                    &mut engine,
+                    wire::FMSG_QUERY,
+                    b"SELECT current_setting('application_name')\0",
+                );
+                message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, &[]);
+                assert!(conn.copy.is_none());
+                assert_eq!(
+                    conn.guc.get_owned("application_name").unwrap().as_str(),
+                    "copy-owner"
+                );
+                assert_eq!(
+                    other.guc.get_owned("application_name").unwrap().as_str(),
+                    "other-owner"
+                );
+            }
+            message(&mut conn, &mut engine, wire::FMSG_QUERY, b"SELECT count(*) FROM session_copy_audit WHERE owner='copy-owner'; SELECT count(*) FROM session_copy\0");
+            for value in [b'8', b'2'] {
+                let row = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, value];
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(row.len())
+                        .any(|found| found == row)
+                );
             }
         }
     }

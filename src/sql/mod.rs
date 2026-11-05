@@ -16051,7 +16051,39 @@ impl Engine {
             responder.buffer.truncate_to(output_mark);
             return Ok(Err(error));
         }
-        let value = match eval::cast_to(result.get(), result_type, arena) {
+        let converted = if let ColType::Composite(creation) = result_type {
+            let txid = txn.txid;
+            let snapshot = self.storage.read_snapshot();
+            let target = crate::storage::RoutineArgumentDef {
+                name: crate::storage::SqlName::EMPTY,
+                ctype: ColType::Composite(creation),
+                user_type: routine
+                    .function_result_contract()
+                    .and_then(|result| result.user_type),
+            };
+            self.execute_retained_expression(
+                arena,
+                snapshot,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+                |storage, _work, sequences, _invocations, _cursors| {
+                    exec::coerce_routine_argument(
+                        result.get(),
+                        target,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )
+                },
+            )?
+        } else {
+            eval::cast_to(result.get(), result_type, arena)
+        };
+        let value = match converted {
             Ok(value) => value,
             Err(error) => {
                 responder.buffer.truncate_to(output_mark);

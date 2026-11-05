@@ -33,11 +33,40 @@ CREATE FUNCTION from_named(input integer) RETURNS from_pair
 LANGUAGE sql STRICT AS $$SELECT input,'named:'||input$$;
 SELECT n,label FROM from_named(12);
 SELECT n,label FROM from_named(NULL);
+SELECT (from_named(13)).n,(from_named(14)).label;
+CREATE FUNCTION from_named_value(input integer) RETURNS from_pair
+LANGUAGE sql AS $$SELECT ROW(input,'wrapped:'||input)::from_pair$$;
+SELECT n,label FROM from_named_value(15);
+CREATE FUNCTION from_named_empty() RETURNS from_pair
+LANGUAGE sql AS $$SELECT 1,'empty'::text WHERE false$$;
+SELECT n,label FROM from_named_empty();
+CREATE TYPE from_outer AS (pair from_pair,code smallint);
+CREATE FUNCTION from_outer_value() RETURNS from_outer
+LANGUAGE sql AS $$SELECT ROW(16,'nested')::from_pair,17::smallint$$;
+SELECT (pair).n,(pair).label,code FROM from_outer_value();
+CREATE SEQUENCE from_check_numbers;
+CREATE FUNCTION from_field_check(value integer) RETURNS boolean LANGUAGE plpgsql
+AS $$BEGIN PERFORM nextval('from_check_numbers'); RETURN value>0; END$$;
+CREATE DOMAIN from_positive AS integer CHECK(from_field_check(VALUE));
+CREATE TYPE from_checked_pair AS (n from_positive,label text);
+CREATE FUNCTION from_checked(input integer) RETURNS from_checked_pair
+LANGUAGE sql AS $$SELECT input,'checked'::text$$;
+SELECT n,label FROM from_checked(1);
+SELECT currval('from_check_numbers');
 CREATE FUNCTION from_scalar(input integer) RETURNS integer
 LANGUAGE sql AS $$SELECT input+number FROM generate_series(1,2) AS series(number)$$;
 SELECT * FROM from_scalar(20);
 SELECT * FROM from_scalar(NULL);
 DROP FUNCTION from_scalar(integer);
+DROP FUNCTION from_checked(integer);
+DROP TYPE from_checked_pair;
+DROP DOMAIN from_positive;
+DROP FUNCTION from_field_check(integer);
+DROP SEQUENCE from_check_numbers;
+DROP FUNCTION from_outer_value();
+DROP TYPE from_outer;
+DROP FUNCTION from_named_empty();
+DROP FUNCTION from_named_value(integer);
 DROP FUNCTION from_named(integer);
 DROP TYPE from_pair;
 DROP FUNCTION from_empty();

@@ -1134,6 +1134,10 @@ impl<'a> RoutineCallContract<'a> {
 pub(crate) enum RoutineResultShape<'a> {
     Scalar,
     Record(&'a [super::types::RecordField<'a>]),
+    Composite {
+        creation: crate::storage::TypeCreation,
+        width: usize,
+    },
 }
 
 impl<'a> RoutineResultShape<'a> {
@@ -1143,6 +1147,25 @@ impl<'a> RoutineResultShape<'a> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
+        if let Some(ColType::Composite(Some(creation))) = routine.kind.function_result() {
+            let target = crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Composite,
+                creation,
+            )?;
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            return Ok(Self::Composite {
+                creation,
+                width: definition.active_field_count(),
+            });
+        }
         if !matches!(
             routine.kind,
             crate::storage::RoutineKind::RecordFunction { .. }
@@ -1179,9 +1202,22 @@ impl<'a> RoutineResultShape<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
+        if let Self::Composite { creation, .. } = self
+            && let [value] = values
+            && match value {
+                Datum::Null | Datum::Record(_) => true,
+                Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
+                    slot == creation
+                }
+                _ => false,
+            }
+        {
+            return super::exec::detach_routine_datum(*value, arena);
+        }
         let width = match self {
             Self::Scalar => 1,
             Self::Record(fields) => fields.len(),
+            Self::Composite { width, .. } => *width,
         };
         if values.len() != width {
             return Err(sql_err!(
@@ -1196,6 +1232,23 @@ impl<'a> RoutineResultShape<'a> {
             Self::Scalar => super::exec::decode_projected_col_record(encoded, 0, arena),
             Self::Record(shape) => {
                 let fields = arena.alloc_slice_copy(shape).map_err(|_| arena_full())?;
+                for (index, field) in fields.iter_mut().enumerate() {
+                    field.value = super::exec::decode_projected_col_record(encoded, index, arena)?;
+                }
+                Ok(Datum::Record(fields))
+            }
+            Self::Composite { .. } => {
+                let fields = arena
+                    .alloc_slice_with(values.len(), |index| super::types::RecordField {
+                        name: "",
+                        type_oid: if values[index].is_null() {
+                            super::types::oid::UNKNOWN
+                        } else {
+                            values[index].type_oid()
+                        },
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
                 for (index, field) in fields.iter_mut().enumerate() {
                     field.value = super::exec::decode_projected_col_record(encoded, index, arena)?;
                 }
@@ -3315,7 +3368,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
             if result_contract.polymorphic_type().is_some() {
                 Ok(Some(result))
             } else {
-                super::eval::cast_to(result, result_type, arena).map(Some)
+                if matches!(result_type, ColType::Composite(_)) {
+                    self.coerce_result(result, result_contract, arena, None)
+                        .map(Some)
+                } else {
+                    super::eval::cast_to(result, result_type, arena).map(Some)
+                }
             }
         })();
         if let Some((total, own)) = super::statistics::finish_function_timing(timed)

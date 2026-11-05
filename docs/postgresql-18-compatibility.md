@@ -78,6 +78,9 @@ returning one value produces one row, including a null value; a set-returning
 function produces the rows it returns. For example,
 `SELECT total FROM calculate_order(42)` can select its declared `OUT total`
 column without expanding a record expression in the select list.
+A SQL function returning a named row type can select its fields or return one
+complete row value. Its field constraints run when the result is converted;
+calling a constraint helper does not rerun the completed function body.
 Aggregate support functions can refer to supported built-ins by their selected
 identifier. Using a built-in as the implementation of `CREATE CAST` or
 `CREATE OPERATOR` remains unsupported and fails explicitly with `0A000`.

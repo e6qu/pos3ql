@@ -794,8 +794,10 @@ pub(crate) use describe::{describe_data_modification_columns, describe_returning
 mod control_flow;
 mod loop_rows;
 mod numeric_loops;
+mod set_rows;
 
 use control_flow::{ControlFrames, execute_trigger_block};
+use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
@@ -3956,7 +3958,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         ..invocation
     };
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
     initialize_trigger_locals(
         context,
         invocation,
@@ -17930,125 +17932,21 @@ struct TriggerExceptionDiagnostic<'a> {
     context: &'a str,
 }
 
-/// Per-function execution state, deliberately distinct from local variables
-/// and transaction state. Nested trigger functions receive a fresh value.
 #[derive(Clone, Copy)]
-struct PlpgsqlSetContract {
-    scalar_result: Option<crate::storage::RoutineResult>,
-    columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
-    count: usize,
+struct OutputBinding<'a> {
+    local: usize,
+    value: Datum<'a>,
+    shadow_depth: u8,
 }
 
-/// Statement-arena materialization for one PL/pgSQL set invocation. The raw
-/// pointer is only ever replaced with a larger arena slice; no result can
-/// outlive the invocation arena that owns both the row bytes and this list.
-struct PlpgsqlSetResult<'a> {
-    contract: PlpgsqlSetContract,
-    rows: *mut &'a [u8],
-    len: usize,
-    cap: usize,
-}
-
-impl<'a> PlpgsqlSetResult<'a> {
-    fn for_routine(routine: &crate::storage::RoutineDef) -> Self {
-        let contract = match routine.kind {
-            crate::storage::RoutineKind::SetFunction { result } => PlpgsqlSetContract {
-                scalar_result: Some(result),
-                columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
-                count: 0,
-            },
-            crate::storage::RoutineKind::RecordFunction { .. }
-            | crate::storage::RoutineKind::TableFunction => PlpgsqlSetContract {
-                scalar_result: None,
-                columns: routine.result_columns,
-                count: routine.result_column_count,
-            },
-            _ => unreachable!("set result requires a set-returning routine"),
-        };
-        Self {
-            contract,
-            rows: core::ptr::null_mut(),
-            len: 0,
-            cap: 0,
-        }
-    }
-
-    fn append(&mut self, values: &[Datum<'a>], arena: &'a Arena) -> Result<(), SqlError> {
-        const EMPTY: &[u8] = &[];
-        let encoded = match self.contract.scalar_result {
-            Some(result) => {
-                if values.len() != 1 {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "RETURN NEXT must provide one column"
-                    ));
-                }
-                let value = cast_to(detach_routine_datum(values[0], arena)?, result.ctype, arena)?;
-                encode_projected_pub(&[value], arena)?
-            }
-            None => {
-                let columns = self.contract.columns;
-                let count = self.contract.count;
-                if values.len() != count {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "RETURN NEXT must provide {} column{}",
-                        count,
-                        if count == 1 { "" } else { "s" }
-                    ));
-                }
-                let mut cast = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
-                for (index, column) in columns[..count].iter().enumerate() {
-                    cast[index] = cast_to(
-                        detach_routine_datum(values[index], arena)?,
-                        column.ctype,
-                        arena,
-                    )?;
-                }
-                encode_projected_pub(&cast[..count], arena)?
-            }
-        };
-        if self.len == self.cap {
-            let new_cap = if self.cap == 0 { 8 } else { self.cap * 2 };
-            let fresh = arena.alloc_slice_with(new_cap, |_| EMPTY).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "statement arena exhausted while materializing PL/pgSQL function"
-                )
-            })?;
-            if self.len != 0 {
-                let prior = unsafe { core::slice::from_raw_parts(self.rows, self.len) };
-                fresh[..self.len].copy_from_slice(prior);
-            }
-            self.rows = fresh.as_mut_ptr();
-            self.cap = new_cap;
-        }
-        unsafe { self.rows.add(self.len).write(encoded) };
-        self.len += 1;
-        Ok(())
-    }
-
-    fn rows(&self) -> &'a [&'a [u8]] {
-        if self.len == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(self.rows, self.len) }
-        }
-    }
-}
-
-/// Per-function execution state, deliberately distinct from local variables
-/// and transaction state. Nested trigger functions receive a fresh value.
+/// Per-function state, separate from locals and transaction state.
 struct TriggerExecutionStatus<'a> {
     numeric_frames: NumericLoopFrames<'a>,
     control_frames: Option<ControlFrames<'a>>,
     found: Option<bool>,
     row_count: i64,
-    set_result: Option<*mut PlpgsqlSetResult<'a>>,
-    set_output_locals: [usize; MAX_ROUTINE_OUTPUT_COLUMNS],
-    set_output_count: usize,
-    set_output_values: [Datum<'a>; MAX_ROUTINE_OUTPUT_COLUMNS],
-    set_output_shadow_depth: [u8; MAX_ROUTINE_OUTPUT_COLUMNS],
+    set_result: Option<PlpgsqlSetResult>,
+    outputs: &'a mut [OutputBinding<'a>],
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -18056,6 +17954,7 @@ impl<'a> TriggerExecutionStatus<'a> {
         arena: &'a Arena,
         block: TriggerBlock<'a>,
         locals: &[TriggerLocalDecl<'a>],
+        output_count: usize,
     ) -> Result<Self, SqlError> {
         Ok(Self {
             numeric_frames: NumericLoopFrames::new(arena, block, locals)?,
@@ -18063,70 +17962,78 @@ impl<'a> TriggerExecutionStatus<'a> {
             found: Some(false),
             row_count: 0,
             set_result: None,
-            set_output_locals: [0; MAX_ROUTINE_OUTPUT_COLUMNS],
-            set_output_count: 0,
-            set_output_values: [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS],
-            set_output_shadow_depth: [0; MAX_ROUTINE_OUTPUT_COLUMNS],
+            outputs: arena
+                .alloc_slice_with(output_count, |_| OutputBinding {
+                    local: 0,
+                    value: Datum::Null,
+                    shadow_depth: 0,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "PL/pgSQL output-variable bindings exceed statement memory"
+                    )
+                })?,
         })
     }
-    fn collect_set_rows(&mut self, result: &mut PlpgsqlSetResult<'a>) {
+    fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
         self.set_result = Some(result);
     }
 
     fn set_output_locals(&mut self, locals: &[usize], values: &[Datum<'a>]) {
-        self.set_output_locals[..locals.len()].copy_from_slice(locals);
-        for (index, local) in locals.iter().copied().enumerate() {
-            self.set_output_values[index] = values[local];
+        assert_eq!(
+            self.outputs.len(),
+            locals.len(),
+            "declared output-variable capacity"
+        );
+        for (output, local) in self.outputs.iter_mut().zip(locals.iter().copied()) {
+            output.local = local;
+            output.value = values[local];
         }
-        self.set_output_count = locals.len();
     }
 
     fn assign_output_local(&mut self, local: usize, value: Datum<'a>) {
-        for output in 0..self.set_output_count {
-            if self.set_output_locals[output] == local && self.set_output_shadow_depth[output] == 0
-            {
-                self.set_output_values[output] = value;
+        for output in self.outputs.iter_mut() {
+            if output.local == local && output.shadow_depth == 0 {
+                output.value = value;
             }
         }
     }
 
     fn shadow_output_local(&mut self, local: usize) -> Result<(), SqlError> {
-        for output in 0..self.set_output_count {
-            if self.set_output_locals[output] == local {
-                self.set_output_shadow_depth[output] = self.set_output_shadow_depth[output]
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "PL/pgSQL loop nesting exceeds the output-variable limit"
-                        )
-                    })?;
+        for output in self.outputs.iter_mut() {
+            if output.local == local {
+                output.shadow_depth = output.shadow_depth.checked_add(1).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "PL/pgSQL loop nesting exceeds the output-variable limit"
+                    )
+                })?;
             }
         }
         Ok(())
     }
 
     fn unshadow_output_local(&mut self, local: usize) {
-        for output in 0..self.set_output_count {
-            if self.set_output_locals[output] == local {
-                self.set_output_shadow_depth[output] -= 1;
+        for output in self.outputs.iter_mut() {
+            if output.local == local {
+                output.shadow_depth -= 1;
             }
         }
     }
 
-    fn emit_set_row(&mut self, values: &[Datum<'a>], arena: &'a Arena) -> Result<(), SqlError> {
-        let Some(result) = self.set_result else {
+    fn emit_set_row(&mut self, values: &[Datum<'_>], arena: &Arena) -> Result<(), SqlError> {
+        let Some(result) = self.set_result.as_mut() else {
             return Err(unsupported_trigger_body());
         };
-        // The only pointer source is `collect_set_rows`; execution is
-        // synchronous and the collector stays live until the block returns.
-        unsafe { (&mut *result).append(values, arena) }?;
-        self.row_count = self.row_count.checked_add(1).ok_or_else(|| {
+        let row_count = self.row_count.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "PL/pgSQL function returned too many rows"
             )
         })?;
+        result.append(values, arena)?;
+        self.row_count = row_count;
         self.found = Some(true);
         Ok(())
     }
@@ -21243,7 +21150,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21320,7 +21227,7 @@ pub(crate) fn execute_event_trigger<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21474,7 +21381,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21645,7 +21552,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21695,9 +21602,8 @@ pub(crate) fn execute_plpgsql_function<'a>(
     }
 }
 
-/// Executes a PL/pgSQL set function and materializes its typed rows in the
-/// statement arena. The outer query already owns that arena, so a restarted
-/// table scan can replay the same encoded rows without re-running effects.
+/// Collects set-function rows in shared work memory, then exports independent
+/// statement-owned rows for the enclosing query's invocation receipt.
 #[expect(
     clippy::too_many_arguments,
     reason = "stored set-function execution owns its complete typed call context"
@@ -21816,22 +21722,15 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
-    initialize_trigger_locals(
-        &mut context,
-        invocation,
-        TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
-            old: None,
-            new: None,
-        },
-        locals,
-        &seeded[..seeded_count],
-        local_values,
-    )?;
-    let mut result = PlpgsqlSetResult::for_routine(routine);
-    status.collect_set_rows(&mut result);
-    let mut output_local_indices = [0usize; MAX_ROUTINE_OUTPUT_COLUMNS];
+    let mut status =
+        TriggerExecutionStatus::new(context.arena, program.body, locals, output_columns.len())?;
+    status.collect_set_rows(PlpgsqlSetResult::for_routine(
+        routine,
+        &context.storage().row_work,
+    )?);
+    let output_local_indices = arena
+        .alloc_slice_with(output_columns.len(), |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
     for (index, output) in output_columns.iter().enumerate() {
         output_local_indices[index] = locals
             .iter()
@@ -21845,6 +21744,18 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
                 )
             })?;
     }
+    initialize_trigger_locals(
+        &mut context,
+        invocation,
+        TriggerTransition {
+            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            old: None,
+            new: None,
+        },
+        locals,
+        &seeded[..seeded_count],
+        local_values,
+    )?;
     status.set_output_locals(&output_local_indices[..output_columns.len()], local_values);
     let mut no_new = None;
     match execute_trigger_block(
@@ -21861,7 +21772,11 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &mut status,
         None,
     )? {
-        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(result.rows()),
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => status
+            .set_result
+            .as_ref()
+            .expect("set invocation owns its result collector")
+            .rows(arena),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
             Err(unsupported_trigger_body())
         }
@@ -26753,58 +26668,65 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             Ok(None)
         }),
         TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
-            let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
-            let count = match expression {
-                Some(expression) => {
-                    let transition = TriggerTransition {
-                        definition: crate::storage::RelationDefinition::from_definition(definition),
-                        old,
-                        new: new.as_deref(),
+            context
+                .arena
+                .with_remaining_region(|arena| {
+                    let host = context.host.reborrow();
+                    let mut context = TriggerExecContext {
+                        host,
+                        txn: context.txn,
+                        arena,
+                        params: context.params,
+                        responder: context.responder,
                     };
-                    let scope = TriggerLocalScope {
-                        locals,
-                        values: &local_values[..locals.len()],
-                        found: status.found,
-                        invocation,
-                        transition: &transition,
+                    let values = match expression {
+                        Some(expression) => {
+                            let transition = TriggerTransition {
+                                definition: crate::storage::RelationDefinition::from_definition(
+                                    definition,
+                                ),
+                                old,
+                                new: new.as_deref(),
+                            };
+                            let scope = TriggerLocalScope {
+                                locals,
+                                values: &local_values[..locals.len()],
+                                found: status.found,
+                                invocation,
+                                transition: &transition,
+                            };
+                            match eval_procedural_expression(&mut context, expression, &scope)? {
+                                Datum::Record(fields) => {
+                                    if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
+                                        return Err(sql_err!(
+                                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                            "RETURN NEXT record has too many columns"
+                                        ));
+                                    }
+                                    arena
+                                        .alloc_slice_with(fields.len(), |index| fields[index].value)
+                                        .map_err(|_| super::query::arena_full_pub())?
+                                }
+                                value => arena
+                                    .alloc_slice_copy(&[value])
+                                    .map_err(|_| super::query::arena_full_pub())?,
+                            }
+                        }
+                        None => arena
+                            .alloc_slice_with(status.outputs.len(), |index| {
+                                let output = &status.outputs[index];
+                                if output.shadow_depth == 0 {
+                                    local_values[output.local]
+                                } else {
+                                    output.value
+                                }
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?,
                     };
-                    match eval_procedural_expression(context, expression, &scope)? {
-                        Datum::Record(fields) => {
-                            if fields.len() > values.len() {
-                                return Err(sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "RETURN NEXT record has too many columns"
-                                ));
-                            }
-                            for (index, field) in fields.iter().enumerate() {
-                                values[index] = field.value;
-                            }
-                            fields.len()
-                        }
-                        value => {
-                            values[0] = value;
-                            1
-                        }
-                    }
-                }
-                None => {
-                    for (index, local) in status.set_output_locals[..status.set_output_count]
-                        .iter()
-                        .copied()
-                        .enumerate()
-                    {
-                        values[index] = if status.set_output_shadow_depth[index] == 0 {
-                            local_values[local]
-                        } else {
-                            status.set_output_values[index]
-                        };
-                    }
-                    status.set_output_count
-                }
-            };
-            status.emit_set_row(&values[..count], context.arena)?;
-
-            Ok(None)
+                    status.emit_set_row(values, arena)?;
+                    Ok(None)
+                })
+                .map_err(|_| super::query::arena_full_pub())?
         }),
         TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
             let query = match transition_relations {
@@ -30018,7 +29940,8 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         };
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-        let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
+        let mut status =
+            TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
         initialize_trigger_locals(
             &mut context,
             invocation,

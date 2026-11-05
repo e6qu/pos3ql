@@ -103,6 +103,12 @@ Materialized query and array loop inputs now own encoded values in the fixed
 shared work pool. Keep field names/types, array bounds, empty-query assignment
 and once-only effects while releasing source scratch. Local variables, handler
 diagnostics and the enclosing write still need complete saved owners.
+Set-function results now own their encoded row prefix and actual output metadata
+in shared work memory. Keep append failure atomic, preserve rows emitted before
+a caught error, and reclaim `RETURN NEXT` scratch on each iteration. Output
+bindings reserve actual width before local initialization. Qualify these changes
+alongside loop-input ownership; the new record-loop regression currently reports
+statement-memory exhaustion and must be diagnosed and fixed before completion.
 Preserve PostgreSQL's error and hint when no procedural CASE branch matches and
 there is no ELSE; matched branches and an explicit ELSE must still succeed.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait

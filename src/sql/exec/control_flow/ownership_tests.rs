@@ -77,7 +77,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, program.body, &locals).unwrap();
+        let mut status = TriggerExecutionStatus::new(&arena, program.body, &locals, 0).unwrap();
         let mut frames = status.control_frames.take().unwrap();
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {

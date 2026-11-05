@@ -230,6 +230,16 @@ released before the loop body. Each iteration decodes its selected value into
 statement memory; record field names/types, nulls and array bounds survive.
 Finishing a loop, leaving it early or raising an error returns its input lease.
 Exhaustion names the shared work settings with `54000`.
+Set-function result collectors own encoded rows and actual output-column
+metadata in that same shared pool. A row becomes visible to the collector only
+after conversion, capacity admission and encoding finish. A failed append keeps
+earlier rows, including a prefix returned before a caught SQL error; the next
+append overwrites any unpublished bytes. `RETURN NEXT` releases expression and
+conversion scratch after each row. Output-variable bindings reserve their actual
+count before local initialization, rather than a maximum-width array for every
+invocation. At function completion, exported rows receive independent statement
+storage before the collector releases its leases. These owners do not yet make
+the whole invocation resumable across connection-scheduler returns.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal

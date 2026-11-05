@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn owned_set_results_reclaim_conversion_scratch_and_preserve_caught_prefixes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("owned-set-results-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql = include_str!("../../../tests/external/differential/248_owned_set_results.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "4096|384|384",
+                "0|first",
+                "1|prefix",
+                "3|caught",
+                "0",
+                "outside|1",
+                "outside|3",
+                "outside|3"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn loop_input_exhaustion_rolls_back_writes_and_releases_shared_capacity() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -57,8 +86,23 @@ fn owned_loop_inputs_preserve_records_empty_rows_and_once_only_effects() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let sql = include_str!("../../../tests/external/differential/247_owned_loop_rows.sql");
+        // Notices survive a later error and identify the failing source without
+        // changing the PostgreSQL reference fixture or its expected rows.
+        let mut diagnostic_sql = sql.to_owned();
+        for (source, stage) in [
+            ("FOR r IN SELECT input.n", "static record"),
+            ("FOR r IN EXECUTE", "dynamic record"),
+            ("FOR r IN SELECT 99", "empty record"),
+            ("FOR r IN SELECT source.n", "function record"),
+            ("FOREACH item IN ARRAY", "empty array"),
+        ] {
+            diagnostic_sql = diagnostic_sql.replace(
+                source,
+                &format!("RAISE NOTICE 'loop input stage: {stage}'; {source}"),
+            );
+        }
         assert_eq!(
-            data_rows(&session.success(&mut engine, sql, true)),
+            data_rows(&session.success(&mut engine, &diagnostic_sql, true)),
             [
                 "array_empty|42|12|f",
                 "dynamic|four|7|t",

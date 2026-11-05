@@ -76,7 +76,8 @@ connection between Parse, Bind, Describe and Execute, and COPY retains its timer
 while waiting for client data. Keep native interleaving and recovery coverage
 while adding saved procedural positions. COPY start, row and completion paths
 now bind the owning session explicitly; preserve settings rollback inside row
-and statement trigger handlers, including interleaved text/binary streams. An empty or `NULL`-only loop must
+and statement trigger handlers, including interleaved text/binary streams. Bind
+identity, name resolution and rendering at the same resumed-message boundary. An empty or `NULL`-only loop must
 observe its deadline. Exercise timer ownership with explicit timestamps under
 Miri isolation, and exercise the real clock in native runtime tests. A caught timeout must not be delivered again or replay
 the timed-out loop when its handler waits; a user-raised cancellation must not

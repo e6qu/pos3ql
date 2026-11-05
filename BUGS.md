@@ -28,7 +28,9 @@ transition proofs deterministic; ownership tests must not require Miri to read
 the host wall clock or disable isolation. Test interleaved protocol messages and
 COPY rows: a different connection must neither inherit nor renew their timers.
 Streamed COPY must bind its own session settings at start, each row and completion
-before a trigger can establish or rewind an exception boundary.
+before a trigger can establish or rewind an exception boundary. Rebind SQL
+identity, search path and rendering as well as configuration pointers; another
+connection may have changed the worker context between COPY messages.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

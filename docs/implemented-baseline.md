@@ -495,6 +495,8 @@ empty stream does not itself require a row check. The
 records these boundaries; native tests also interleave connections. COPY binds
 the owning session at start, each row and completion, so trigger handlers can
 restore settings after an error even when other connections run between chunks.
+It also restores the stream's SQL user, search path and formatting before firing
+those triggers.
 Its completed control effects must not be replayed after a wait; retained handler
 positions remain part of the execution work in [PLAN.md](../PLAN.md).
 

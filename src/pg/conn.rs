@@ -1947,6 +1947,7 @@ impl Conn {
         }
 
         if let Some(copy) = &self.copy {
+            engine.bind_query_connection(self.id);
             let _deadline_scope = crate::sql::query::enter_deadline_scope();
             self.txn.restore_statement_deadline(copy.deadline);
             let step = self.process_copy_message(engine, msg_type, total);
@@ -6167,11 +6168,11 @@ mod tests {
                 .guc
                 .set_config("application_name", Some("other-owner"), false)
                 .unwrap();
-            let setup = b"CREATE TABLE session_copy(id integer); CREATE TABLE session_copy_audit(timing text, level text, owner text); \
+            let setup = b"CREATE ROLE copy_other; CREATE SCHEMA copy_elsewhere; CREATE TABLE session_copy(id integer); CREATE TABLE session_copy_audit(timing text, level text, owner text); \
                 CREATE FUNCTION session_copy_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
                   BEGIN PERFORM set_config('application_name','rolled-back',false); PERFORM 1/0; \
                   EXCEPTION WHEN division_by_zero THEN \
-                    IF current_setting('application_name') <> 'copy-owner' THEN RAISE EXCEPTION 'wrong COPY owner'; END IF; \
+                    IF current_setting('application_name') <> 'copy-owner' OR current_user <> 'postgres' OR current_schema() <> 'public' THEN RAISE EXCEPTION 'wrong COPY owner'; END IF; \
                     INSERT INTO session_copy_audit VALUES(TG_WHEN,TG_LEVEL,current_setting('application_name')); \
                   END; RETURN NEW; END$$; \
                 CREATE TRIGGER session_copy_bs BEFORE INSERT ON session_copy FOR EACH STATEMENT EXECUTE FUNCTION session_copy_trigger(); \
@@ -6179,6 +6180,12 @@ mod tests {
                 CREATE TRIGGER session_copy_ar AFTER INSERT ON session_copy FOR EACH ROW EXECUTE FUNCTION session_copy_trigger(); \
                 CREATE TRIGGER session_copy_as AFTER INSERT ON session_copy FOR EACH STATEMENT EXECUTE FUNCTION session_copy_trigger()\0";
             message(&mut conn, &mut engine, wire::FMSG_QUERY, setup);
+            message(
+                &mut other,
+                &mut engine,
+                wire::FMSG_QUERY,
+                b"SET ROLE copy_other; SET search_path TO copy_elsewhere\0",
+            );
             for binary in [false, true] {
                 message(
                     &mut conn,

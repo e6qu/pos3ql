@@ -10582,6 +10582,24 @@ impl Engine {
         }
     }
 
+    /// A streamed COPY can resume after another connection has used the worker.
+    /// Restore its SQL identity, name resolution and formatting before triggers.
+    fn enter_copy_session(
+        &self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<guc::EvalScope, SqlError> {
+        let scope = guc::enter_eval_scope(guc, txn);
+        guc.refresh_identities(&self.storage, txn.txid);
+        eval::funcs::system::set_session_user(guc.session_identity());
+        eval::funcs::system::set_current_user(guc.current_identity());
+        self.publish_session_context(guc, txn, guc.current_role().as_str())?;
+        timezone::set_session(guc.timezone());
+        responder.set_render(guc.render());
+        Ok(scope)
+    }
+
     /// One complete COPY data line (no trailing newline).
     pub fn copy_row_line(
         &mut self,
@@ -10589,7 +10607,7 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
-        let _settings = guc::enter_eval_scope(context.guc, context.txn);
+        let _settings = self.enter_copy_session(context.txn, context.guc, context.responder)?;
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
@@ -10628,7 +10646,7 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
-        let _settings = guc::enter_eval_scope(context.guc, context.txn);
+        let _settings = self.enter_copy_session(context.txn, context.guc, context.responder)?;
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
@@ -10657,6 +10675,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
@@ -10678,6 +10697,7 @@ impl Engine {
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
@@ -10699,7 +10719,6 @@ impl Engine {
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
-        let _settings = guc::enter_eval_scope(guc, txn);
         exec::copy_statement_begin(
             storage,
             txn,
@@ -10738,6 +10757,7 @@ impl Engine {
         inserted: &exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         let _active_cursors = cursors
             .as_ref()
@@ -10801,6 +10821,7 @@ impl Engine {
         responder: &mut Responder,
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
             return self.finish_pending_transaction(txn, guc);
@@ -10843,7 +10864,6 @@ impl Engine {
         inserted: &exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
-        let _settings = guc::enter_eval_scope(guc, txn);
         let _files = setup.restore_snapshot(storage)?;
         exec::copy_statement_end(
             storage,

@@ -760,7 +760,7 @@ impl super::Engine {
         if result.is_ok() {
             command.after_commit(phase);
             datetime::restore_statement_clock(command.clock);
-            super::query::restore_statement_deadline(command.deadline);
+            txn.restore_statement_deadline(command.deadline);
         }
         let canceled = command.cancel_after_commit;
         txn.concurrent_index = Some(command);

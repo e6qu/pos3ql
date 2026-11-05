@@ -359,7 +359,7 @@ pub(crate) struct StatementEffectAttempt<'a> {
 fn nonreplayable_effect() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
-        "a cursor or routine input with transactional or session effects cannot resume after a statement wait"
+        "a finished operation cannot be repeated after a statement wait"
     )
 }
 
@@ -371,6 +371,13 @@ pub(crate) fn ensure_statement_effects_replayable() -> Result<(), SqlError> {
             Ok(())
         }
     })
+}
+
+pub(crate) fn record_caught_cancellation(session: &SeqSession) {
+    let mut replay = session.statement_replay.get();
+    replay.nonreplayable = true;
+    session.statement_replay.set(replay);
+    super::query::protect_statement_effects();
 }
 
 fn effect_full() -> SqlError {

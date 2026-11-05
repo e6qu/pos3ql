@@ -26651,7 +26651,9 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    super::query::check_timeout()?;
     for statement in block.statements {
+        super::query::check_timeout()?;
         let (statement, input_plan) = {
             let transition = TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
@@ -28199,6 +28201,10 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         }) else {
                             return Err(error);
                         };
+                        if error.sqlstate == sqlstate::QUERY_CANCELED {
+                            context.txn.catch_query_cancellation();
+                            super::sequence::record_caught_cancellation(context.seq_session());
+                        }
                         let diagnostic = crate::sql::eval::take_diagnostic();
                         let message = context
                             .arena
@@ -28234,7 +28240,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             context: context_text,
                         };
                         let invocation = invocation.with_exception(caught);
-                        if let Some(flow) = execute_trigger_block(
+                        let handled = execute_trigger_block(
                             context,
                             definition,
                             invocation,
@@ -28247,7 +28253,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             handler.block,
                             status,
                             Some(&caught),
-                        )? {
+                        );
+                        if let Some(flow) = handled? {
                             return Ok(Some(flow));
                         }
                     }

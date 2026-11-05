@@ -21,6 +21,9 @@ Caught errors must also restore schema, journal, settings and deferred work;
 test cursor creation separately from the motion of an older cursor.
 Open foreign connections inside nested exception blocks too: a savepoint list
 captured only at command admission misses boundaries created within that command.
+Check procedural deadlines with empty and scalar-only blocks as well as scans.
+Distinguish a consumed timeout from a user-raised cancellation, and keep the
+original timer through binding, storage waits and internal commits.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

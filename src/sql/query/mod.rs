@@ -875,6 +875,18 @@ pub fn disarm_timeout() {
     DEADLINE.with(|d| d.set(0));
 }
 
+pub(crate) fn consume_expired_timeout() -> bool {
+    DEADLINE.with(|deadline| {
+        let at = deadline.get();
+        if at != 0 && super::datetime::now_micros() >= at {
+            deadline.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Errors 57014 if the armed statement deadline has passed. Every scan
 /// boundary reads the deadline: amortization can turn an expired statement
 /// into a successful partial result when a small outer scan owns a huge inner
@@ -891,6 +903,85 @@ pub fn check_timeout() -> Result<(), SqlError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod deadline_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_timeouts_survive_saved_deadlines_and_internal_transaction_cleanup() {
+        struct Restore(i64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore_statement_deadline(self.0);
+            }
+        }
+        let _restore = Restore(statement_deadline());
+        let mut budget = crate::mem::Budget::new(crate::sql::txn::TxnState::budget_bytes(1));
+        let mut txn = crate::sql::txn::TxnState::new(&mut budget, 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            restore_statement_deadline(i64::MIN);
+            txn.catch_query_cancellation();
+            assert_eq!(statement_deadline(), 0);
+            txn.suspend_statement(
+                None,
+                crate::sql::datetime::statement_clock(),
+                i64::MIN,
+                crate::sql::exec::PlpgsqlTransactionContext::Atomic,
+            );
+            assert_eq!(txn.suspended_statement_deadline(), Some(0));
+            txn.enter_statement_timeout(60_000);
+            assert_eq!(statement_deadline(), 0);
+            txn.clear();
+            txn.restore_statement_deadline(i64::MIN);
+            assert_eq!(statement_deadline(), 0);
+            txn.enter_statement_timeout(0);
+            restore_statement_deadline(i64::MAX);
+            txn.catch_query_cancellation();
+            assert_eq!(statement_deadline(), i64::MAX);
+            txn.suspend_statement(
+                None,
+                crate::sql::datetime::statement_clock(),
+                i64::MAX,
+                crate::sql::exec::PlpgsqlTransactionContext::Atomic,
+            );
+            disarm_timeout();
+            txn.enter_statement_timeout(0);
+            assert_eq!(statement_deadline(), i64::MAX);
+            txn.release_suspended_statement();
+            txn.enter_statement_timeout(0);
+            assert_eq!(statement_deadline(), 0);
+        });
+    }
+
+    #[test]
+    fn caught_timeouts_release_only_expired_deadlines_and_preserve_future_timeouts() {
+        struct Restore(i64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore_statement_deadline(self.0);
+            }
+        }
+        let _restore = Restore(statement_deadline());
+        crate::mem::guard::forbid_alloc(|| {
+            restore_statement_deadline(i64::MIN);
+            assert_eq!(
+                check_timeout().unwrap_err().sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+            assert!(consume_expired_timeout());
+            assert_eq!(statement_deadline(), 0);
+            check_timeout().unwrap();
+            restore_statement_deadline(i64::MAX);
+            assert!(!consume_expired_timeout());
+            assert_eq!(statement_deadline(), i64::MAX);
+            check_timeout().unwrap();
+            disarm_timeout();
+            assert!(!consume_expired_timeout());
+            assert_eq!(statement_deadline(), 0);
+        });
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

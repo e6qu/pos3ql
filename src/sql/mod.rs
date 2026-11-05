@@ -7065,7 +7065,7 @@ impl Engine {
             {
                 return Ok(());
             }
-            query::arm_timeout(0);
+            query::disarm_timeout();
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "commit is waiting for object storage"
@@ -7076,7 +7076,7 @@ impl Engine {
             && staged.barrier == txn::CommitBarrier::Journal
             && staged.lsn > self.durable_lsn
         {
-            query::arm_timeout(0);
+            query::disarm_timeout();
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "commit is waiting for object storage"
@@ -10402,7 +10402,7 @@ impl Engine {
         context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
         if let Some(wait) = &txn.cache_capacity_wait {
-            query::restore_statement_deadline(wait.deadline);
+            txn.restore_statement_deadline(wait.deadline);
             query::check_timeout()?;
             if let Some((epoch, error)) = &self.cache_capacity_failure
                 && Some(*epoch) != wait.failure_epoch
@@ -10462,11 +10462,7 @@ impl Engine {
                     || checkpointer.merge_work_pending(&self.storage)
             });
         if active && txn.cache_capacity_wait.is_none() {
-            if let Some(deadline) = txn.suspended_statement_deadline() {
-                query::restore_statement_deadline(deadline);
-            } else {
-                query::arm_timeout(guc.statement_timeout_ms());
-            }
+            txn.enter_statement_timeout(guc.statement_timeout_ms());
             query::check_timeout()?;
             // Old maintenance failures belong to their original requests. A
             // new waiter observes only failures raised after it starts waiting.
@@ -11415,7 +11411,7 @@ impl Engine {
             return Ok(());
         }
         txn.begin_statement_clock();
-        query::restore_statement_deadline(
+        txn.restore_statement_deadline(
             txn.suspended_statement_deadline()
                 .expect("admission retains its deadline"),
         );
@@ -12551,11 +12547,7 @@ impl Engine {
         let _atomic_reads = self.atomic_block_read_scope();
         self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
-        if let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
-        }
+        txn.enter_statement_timeout(guc.statement_timeout_ms());
         let outcome = (|| {
             if let Err(error) = self
                 .check_writer_fence()
@@ -12805,11 +12797,7 @@ impl Engine {
                     )));
                 }
                 txn.begin_statement_clock();
-                if let Some(deadline) = txn.suspended_statement_deadline() {
-                    query::restore_statement_deadline(deadline);
-                } else {
-                    query::arm_timeout(guc.statement_timeout_ms());
-                }
+                txn.enter_statement_timeout(guc.statement_timeout_ms());
                 let candidates = parser.type_input_candidates();
                 let bindings =
                     match arena.alloc_slice_with(candidates.len(), |_| type_inputs::Binding {
@@ -13045,11 +13033,7 @@ impl Engine {
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
         timezone::set_session(guc.timezone());
-        if let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
-        }
+        txn.enter_statement_timeout(guc.statement_timeout_ms());
         if lock_timeout_expired {
             return Err(sql_err!(
                 sqlstate::LOCK_NOT_AVAILABLE,
@@ -18824,13 +18808,7 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         if reset_workspace {
             self.dml_scratch.clear();
-            if txn.staged_commit().is_some() {
-                query::arm_timeout(0);
-            } else if let Some(deadline) = txn.suspended_statement_deadline() {
-                query::restore_statement_deadline(deadline);
-            } else {
-                query::arm_timeout(guc.statement_timeout_ms());
-            }
+            txn.enter_statement_timeout(guc.statement_timeout_ms());
         }
         // Nested SQL shares its caller's deadline, including after a wait.
         if let Err(error) = query::check_timeout() {
@@ -18903,7 +18881,6 @@ impl Engine {
             return Ok(Err(error));
         }
         let statement_clock = datetime::statement_clock();
-        let statement_deadline = query::statement_deadline();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
         timezone::set_session(guc.timezone());
@@ -19008,7 +18985,7 @@ impl Engine {
             txn.suspend_statement(
                 Some(lease),
                 statement_clock,
-                statement_deadline,
+                query::statement_deadline(),
                 routine_transaction_context,
             );
         }

@@ -481,6 +481,11 @@ includes matching examples and raw results.
 An `EXCEPTION WHEN OTHERS` handler excludes query cancellation and assertion
 failures. Catch those deliberately with `WHEN query_canceled` or
 `WHEN assert_failure`; a broad handler does not keep cancelled work running.
+Procedural dispatch checks deadlines at block entry and before each instruction,
+including empty loop bodies. A matched cancellation handler consumes an expired
+timeout while preserving a future timer after a user-raised cancellation.
+Its completed control effects must not be replayed after a wait; retained handler
+positions remain part of the execution work in [PLAN.md](../PLAN.md).
 
 A caught block is a subtransaction: its database changes are undone while the
 enclosing transaction continues. For example, a handler after a failed

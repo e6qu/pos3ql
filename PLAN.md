@@ -99,6 +99,10 @@ early returns. These arena-borrowed frames still need an owner that survives
 returning to the connection scheduler; their value payloads and enclosing row
 operation do not yet resume across waits. Preserve the position test that frees
 the original parse storage and resolves the same source again.
+Materialized query and array loop inputs now own encoded values in the fixed
+shared work pool. Keep field names/types, array bounds, empty-query assignment
+and once-only effects while releasing source scratch. Local variables, handler
+diagnostics and the enclosing write still need complete saved owners.
 Preserve PostgreSQL's error and hint when no procedural CASE branch matches and
 there is no ELSE; matched branches and an explicit ELSE must still succeed.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait

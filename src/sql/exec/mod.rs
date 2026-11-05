@@ -792,6 +792,7 @@ pub(crate) use describe::{
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
 mod control_flow;
+mod loop_rows;
 mod numeric_loops;
 
 use control_flow::{ControlFrames, execute_trigger_block};
@@ -22880,6 +22881,34 @@ enum PlpgsqlExecHost<'s> {
 }
 
 impl PlpgsqlExecHost<'_> {
+    // A scoped arena borrows the complete host; its parent keeps ownership.
+    fn reborrow(&mut self) -> PlpgsqlExecHost<'_> {
+        match self {
+            PlpgsqlExecHost::Atomic {
+                storage,
+                scratch,
+                seq_session,
+            } => PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: *scratch,
+                seq_session,
+            },
+            PlpgsqlExecHost::Routine {
+                engine,
+                guc,
+                sqlprep,
+                cursors,
+                transaction_context,
+            } => PlpgsqlExecHost::Routine {
+                engine,
+                guc,
+                sqlprep,
+                cursors,
+                transaction_context: *transaction_context,
+            },
+        }
+    }
+
     fn storage(&self) -> &Storage {
         match self {
             Self::Atomic { storage, .. } => storage,
@@ -27937,30 +27966,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             // Only the count escapes. The region reclaims query front
             // storage and nested invocation receipts together.
             let row_count = context.arena.with_remaining_region(|arena| {
-                let host = match &mut context.host {
-                    PlpgsqlExecHost::Atomic {
-                        storage,
-                        scratch,
-                        seq_session,
-                    } => PlpgsqlExecHost::Atomic {
-                        storage,
-                        scratch: *scratch,
-                        seq_session,
-                    },
-                    PlpgsqlExecHost::Routine {
-                        engine,
-                        guc,
-                        sqlprep,
-                        cursors,
-                        transaction_context,
-                    } => PlpgsqlExecHost::Routine {
-                        engine,
-                        guc,
-                        sqlprep,
-                        cursors,
-                        transaction_context: *transaction_context,
-                    },
-                };
+                let host = context.host.reborrow();
                 let mut context = TriggerExecContext {
                     host,
                     txn: context.txn,
@@ -28582,176 +28588,190 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     program.source,
                     TriggerForSource::Query(_) | TriggerForSource::DynamicQuery(_)
                 );
-                let values = match program.source {
-                    TriggerForSource::Query(query) => {
-                        let query = match transition_relations {
-                            Some(relations) => super::query::bind_materialized_relations(
-                                query,
-                                relations,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                            )?,
-                            None => query,
+                let pool = std::sync::Arc::clone(&context.storage().row_work);
+                let values = context
+                    .arena
+                    .with_remaining_region(|arena| {
+                        let host = context.host.reborrow();
+                        let mut context = TriggerExecContext {
+                            host,
+                            txn: context.txn,
+                            arena,
+                            params: context.params,
+                            responder: context.responder,
                         };
-                        let transition = TriggerTransition {
-                            definition: crate::storage::RelationDefinition::from_definition(
-                                definition,
-                            ),
-                            old,
-                            new: new.as_deref(),
-                        };
-                        let scope = TriggerLocalScope {
-                            locals,
-                            values: &local_values[..locals.len()],
-                            found: status.found,
-                            invocation,
-                            transition: &transition,
-                        };
-                        let arena = context.arena;
-                        let params = context.params;
-                        let txid = context.txn.txid;
-                        execute_procedural_query(context, |storage, sequence| {
-                            if locals[target].ctype == ColType::Record {
-                                materialize_trigger_for_record_query(
-                                    storage, query, arena, arena, txid, params, sequence, &scope,
-                                )
-                            } else {
-                                materialize_trigger_for_query(
-                                    storage, query, arena, arena, txid, params, sequence, &scope,
-                                )
-                            }
-                        })?
-                    }
-                    TriggerForSource::DynamicQuery(query) => {
-                        let transition = TriggerTransition {
-                            definition: crate::storage::RelationDefinition::from_definition(
-                                definition,
-                            ),
-                            old,
-                            new: new.as_deref(),
-                        };
-                        let scope = TriggerLocalScope {
-                            locals,
-                            values: &local_values[..locals.len()],
-                            found: status.found,
-                            invocation,
-                            transition: &transition,
-                        };
-                        materialize_plpgsql_dynamic_for_query(
-                            context,
-                            query,
-                            &scope,
-                            locals[target].ctype == ColType::Record,
-                        )?
-                    }
-                    TriggerForSource::Array { expression, slice } => {
-                        let transition = TriggerTransition {
-                            definition: crate::storage::RelationDefinition::from_definition(
-                                definition,
-                            ),
-                            old,
-                            new: new.as_deref(),
-                        };
-                        let scope = TriggerLocalScope {
-                            locals,
-                            values: &local_values[..locals.len()],
-                            found: status.found,
-                            invocation,
-                            transition: &transition,
-                        };
-                        let array = eval_procedural_expression(context, expression, &scope)?;
-                        let Datum::Array { element, raw } = array else {
-                            if array.is_null() {
-                                return Err(sql_err!(
-                                    sqlstate::NULL_VALUE_NOT_ALLOWED,
-                                    "FOREACH expression must not be null"
-                                ));
-                            }
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "FOREACH expression must yield an array"
-                            ));
-                        };
-                        let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-                        let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
-                        if slice_rank > shape.dimension_count() {
-                            return Err(sql_err!(
-                                sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                                "FOREACH SLICE {} exceeds array dimensions {}",
-                                slice_rank,
-                                shape.dimension_count()
-                            ));
-                        }
-                        let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
-                        let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
-                        for index in 0..slice_rank {
-                            let source = shape.dimension_count() - slice_rank + index;
-                            dimensions[index] = shape.dimension(source).unwrap();
-                            lower_bounds[index] = shape.lower_bound(source).unwrap();
-                        }
-                        let slice_shape = crate::sql::array::Shape::new(
-                            &dimensions[..slice_rank],
-                            &lower_bounds[..slice_rank],
-                        )?;
-                        let width = if slice_rank == 0 {
-                            1
-                        } else {
-                            slice_shape.element_count()
-                        };
-                        let values = context
-                            .arena
-                            .alloc_slice_with(crate::sql::array::len(raw) / width, |_| Datum::Null)
-                            .map_err(|_| super::query::arena_full_pub())?;
-                        let mut elements = crate::sql::array::elements(raw, element);
-                        for value in values.iter_mut() {
-                            if slice_rank == 0 {
-                                *value = detached_trigger_datum(
-                                    elements.next().expect("array datum invariant"),
-                                    context.arena,
-                                )?;
-                            } else {
-                                let items = context
-                                    .arena
-                                    .alloc_slice_with(width, |_| Datum::Null)
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                for (item, source) in
-                                    items.iter_mut().zip(elements.by_ref().take(width))
-                                {
-                                    *item = source;
-                                }
-                                *value = Datum::Array {
-                                    element,
-                                    raw: crate::sql::array::build_shaped(
-                                        items,
-                                        slice_shape,
+                        let values = match program.source {
+                            TriggerForSource::Query(query) => {
+                                let query = match transition_relations {
+                                    Some(relations) => super::query::bind_materialized_relations(
+                                        query,
+                                        relations,
+                                        context.storage(),
+                                        context.txn.txid,
                                         context.arena,
                                     )?,
+                                    None => query,
                                 };
+                                let transition = TriggerTransition {
+                                    definition: crate::storage::RelationDefinition::from_definition(
+                                        definition,
+                                    ),
+                                    old,
+                                    new: new.as_deref(),
+                                };
+                                let scope = TriggerLocalScope {
+                                    locals,
+                                    values: &local_values[..locals.len()],
+                                    found: status.found,
+                                    invocation,
+                                    transition: &transition,
+                                };
+                                let arena = context.arena;
+                                let params = context.params;
+                                let txid = context.txn.txid;
+                                execute_procedural_query(&mut context, |storage, sequence| {
+                                    if locals[target].ctype == ColType::Record {
+                                        materialize_trigger_for_record_query(
+                                            storage, query, arena, arena, txid, params, sequence,
+                                            &scope,
+                                        )
+                                    } else {
+                                        materialize_trigger_for_query(
+                                            storage, query, arena, arena, txid, params, sequence,
+                                            &scope,
+                                        )
+                                    }
+                                })?
                             }
-                        }
-                        TriggerForRows {
-                            values: &*values,
-                            empty: Datum::Null,
-                        }
-                    }
-                    TriggerForSource::Numeric { .. } => unreachable!("numeric loop handled above"),
-                };
-                if query_source && values.values.is_empty() {
-                    assign_trigger_local(
-                        context,
-                        locals,
-                        local_values,
-                        program.target,
-                        values.empty,
-                    )?;
-                    status.assign_output_local(target, local_values[target]);
-                }
+                            TriggerForSource::DynamicQuery(query) => {
+                                let transition = TriggerTransition {
+                                    definition: crate::storage::RelationDefinition::from_definition(
+                                        definition,
+                                    ),
+                                    old,
+                                    new: new.as_deref(),
+                                };
+                                let scope = TriggerLocalScope {
+                                    locals,
+                                    values: &local_values[..locals.len()],
+                                    found: status.found,
+                                    invocation,
+                                    transition: &transition,
+                                };
+                                materialize_plpgsql_dynamic_for_query(
+                                    &mut context,
+                                    query,
+                                    &scope,
+                                    locals[target].ctype == ColType::Record,
+                                )?
+                            }
+                            TriggerForSource::Array { expression, slice } => {
+                                let transition = TriggerTransition {
+                                    definition: crate::storage::RelationDefinition::from_definition(
+                                        definition,
+                                    ),
+                                    old,
+                                    new: new.as_deref(),
+                                };
+                                let scope = TriggerLocalScope {
+                                    locals,
+                                    values: &local_values[..locals.len()],
+                                    found: status.found,
+                                    invocation,
+                                    transition: &transition,
+                                };
+                                let array =
+                                    eval_procedural_expression(&mut context, expression, &scope)?;
+                                let Datum::Array { element, raw } = array else {
+                                    if array.is_null() {
+                                        return Err(sql_err!(
+                                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                            "FOREACH expression must not be null"
+                                        ));
+                                    }
+                                    return Err(sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "FOREACH expression must yield an array"
+                                    ));
+                                };
+                                let shape =
+                                    crate::sql::array::shape(raw).expect("array datum invariant");
+                                let slice_rank = slice.map_or(0, |slice| usize::from(slice.get()));
+                                if slice_rank > shape.dimension_count() {
+                                    return Err(sql_err!(
+                                        sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                                        "FOREACH SLICE {} exceeds array dimensions {}",
+                                        slice_rank,
+                                        shape.dimension_count()
+                                    ));
+                                }
+                                let mut dimensions = [0usize; crate::sql::array::MAX_DIMENSIONS];
+                                let mut lower_bounds = [0i32; crate::sql::array::MAX_DIMENSIONS];
+                                for index in 0..slice_rank {
+                                    let source = shape.dimension_count() - slice_rank + index;
+                                    dimensions[index] = shape.dimension(source).unwrap();
+                                    lower_bounds[index] = shape.lower_bound(source).unwrap();
+                                }
+                                let slice_shape = crate::sql::array::Shape::new(
+                                    &dimensions[..slice_rank],
+                                    &lower_bounds[..slice_rank],
+                                )?;
+                                let width = if slice_rank == 0 {
+                                    1
+                                } else {
+                                    slice_shape.element_count()
+                                };
+                                let values = context
+                                    .arena
+                                    .alloc_slice_with(crate::sql::array::len(raw) / width, |_| {
+                                        Datum::Null
+                                    })
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                let mut elements = crate::sql::array::elements(raw, element);
+                                for value in values.iter_mut() {
+                                    if slice_rank == 0 {
+                                        *value = detached_trigger_datum(
+                                            elements.next().expect("array datum invariant"),
+                                            context.arena,
+                                        )?;
+                                    } else {
+                                        let items = context
+                                            .arena
+                                            .alloc_slice_with(width, |_| Datum::Null)
+                                            .map_err(|_| super::query::arena_full_pub())?;
+                                        for (item, source) in
+                                            items.iter_mut().zip(elements.by_ref().take(width))
+                                        {
+                                            *item = source;
+                                        }
+                                        *value = Datum::Array {
+                                            element,
+                                            raw: crate::sql::array::build_shaped(
+                                                items,
+                                                slice_shape,
+                                                context.arena,
+                                            )?,
+                                        };
+                                    }
+                                }
+                                TriggerForRows {
+                                    values: &*values,
+                                    empty: Datum::Null,
+                                }
+                            }
+                            TriggerForSource::Numeric { .. } => {
+                                unreachable!("numeric loop handled above")
+                            }
+                        };
+                        loop_rows::LoopRows::capture(&pool, values)
+                    })
+                    .map_err(|_| super::query::arena_full_pub())??;
                 control_flow::start_row_loop(
                     context,
                     program,
                     target,
                     values,
+                    query_source,
                     locals,
                     local_values,
                     status,

@@ -223,6 +223,13 @@ not recursively call the interpreter. Leaving a scope
 restores shadowed counters, copies assignments back and releases its references.
 The frames still borrow statement memory; they do not yet survive returning
 to the connection scheduler during a storage wait.
+Materialized query and array loop inputs own their encoded values in
+`row_work_bytes`/`row_work_leases`, shared with other foreground row work.
+Source query work and nested invocation receipts use one scoped arena and are
+released before the loop body. Each iteration decodes its selected value into
+statement memory; record field names/types, nulls and array bounds survive.
+Finishing a loop, leaving it early or raising an error returns its input lease.
+Exhaustion names the shared work settings with `54000`.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal

@@ -107,7 +107,7 @@ enum Continuation<'a> {
     Numeric(NumericLoop<'a>),
     Rows {
         target: SqlName,
-        values: &'a [Datum<'a>],
+        values: super::loop_rows::LoopRows,
         index: usize,
     },
     Protected {
@@ -358,26 +358,40 @@ pub(super) fn start_numeric_loop<'a>(
     )))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row loop entry preserves source cardinality and its complete local scope"
+)]
 pub(super) fn start_row_loop<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     program: TriggerFor<'a>,
     target: usize,
-    rows: TriggerForRows<'a>,
+    rows: super::loop_rows::LoopRows,
+    query_source: bool,
     locals: &[TriggerLocalDecl<'a>],
     values: &mut [Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'a>, SqlError> {
-    let Some(value) = rows.values.first().copied() else {
+    if rows.is_empty() {
+        let empty = query_source
+            .then(|| rows.empty_query_row(context.arena))
+            .transpose()?;
+        drop(rows);
+        if let Some(empty) = empty {
+            assign_trigger_local(context, locals, values, program.target, empty)?;
+            status.assign_output_local(target, values[target]);
+        }
         status.set_found(false);
         return Ok(Step::complete());
-    };
+    }
+    let value = rows.value(0, context.arena)?;
     assign_trigger_local(context, locals, values, program.target, value)?;
     status.assign_output_local(target, values[target]);
     Ok(Step::Enter(FrameEntry::new(
         program.block,
         Continuation::Rows {
             target: program.target,
-            values: rows.values,
+            values: rows,
             index: 0,
         },
     )))
@@ -497,20 +511,20 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 }
                 Continuation::Rows {
                     target,
-                    values: rows,
+                    values: ref rows,
                     index,
                 } => {
-                    if let Some(value) = rows.get(index + 1).copied() {
+                    if index + 1 < rows.len() {
+                        let value = rows.value(index + 1, context.arena)?;
                         let (scope, scope_values) = frames.scope(locals, values);
                         let local = trigger_local_index(scope, target)?;
                         assign_trigger_local(context, scope, scope_values, target, value)?;
                         status.assign_output_local(local, scope_values[local]);
                         let frame = frames.last_mut();
-                        frame.continuation = Continuation::Rows {
-                            target,
-                            values: rows,
-                            index: index + 1,
+                        let Continuation::Rows { index, .. } = &mut frame.continuation else {
+                            unreachable!("row-loop frame")
                         };
+                        *index += 1;
                         frame.next = 0;
                     } else {
                         let frame = frames.pop();

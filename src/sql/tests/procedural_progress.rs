@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn loop_input_exhaustion_rolls_back_writes_and_releases_shared_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("owned-loop-capacity-{mode:?}"));
+        config.transaction_mode = mode;
+        config.row_work_bytes = 256;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE loop_capacity_audit(n integer)",
+            true,
+        );
+        let output = session.execute(&mut engine,
+            "DO $$DECLARE v text; BEGIN INSERT INTO loop_capacity_audit VALUES(1); FOR v IN SELECT repeat('x',2048) LOOP RAISE EXCEPTION 'oversized input was admitted'; END LOOP; END$$", true);
+        assert_eq!(error_sqlstates(&output), ["54000"], "{mode:?}");
+        assert!(
+            String::from_utf8_lossy(&output).contains("PL/pgSQL loop rows:"),
+            "{mode:?}: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("row_work_bytes"),
+            "{mode:?}: {output:?}"
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM loop_capacity_audit",
+                true
+            )),
+            ["0"]
+        );
+        session.success(&mut engine,
+            "DO $$DECLARE v text; BEGIN FOR v IN SELECT 'ok'::text LOOP INSERT INTO loop_capacity_audit VALUES(2); END LOOP; END$$", true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT n FROM loop_capacity_audit", true)),
+            ["2"]
+        );
+    }
+}
+
+#[test]
+fn owned_loop_inputs_preserve_records_empty_rows_and_once_only_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("owned-loop-inputs-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql = include_str!("../../../tests/external/differential/247_owned_loop_rows.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "array_empty|42|12|f",
+                "dynamic|four|7|t",
+                "empty|<null>|7|f",
+                "function|call:1|12|t",
+                "saved|four|12|t",
+                "static|two|3|t",
+                "1",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn procedural_control_frames_preserve_nested_loops_handlers_and_returns() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

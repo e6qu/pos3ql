@@ -26,6 +26,7 @@ pub(super) struct Site<'a> {
     pub key: usize,
     pub position: usize,
     pub text: &'a str,
+    pub exception_variables: bool,
 }
 
 struct Capture<'a> {
@@ -85,6 +86,7 @@ pub(super) fn record(kind: Kind, key: usize, text: &str, original: &str) -> Resu
                 .alloc_str(text)
                 .map_err(|_| super::query::arena_full_pub())?
         };
+        let exception_variables = references_exception_variables(text, frame.arena)?;
         frame
             .sites
             .push(Site {
@@ -92,9 +94,30 @@ pub(super) fn record(kind: Kind, key: usize, text: &str, original: &str) -> Resu
                 key,
                 position: start,
                 text,
+                exception_variables,
             })
             .map_err(|_| super::query::arena_full_pub())
     })
+}
+
+// Keep only a flag; identifier unescaping and case folding use temporary space.
+fn references_exception_variables(text: &str, arena: &Arena) -> Result<bool, SqlError> {
+    arena
+        .with_remaining_region(|scratch| {
+            use super::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(text, scratch);
+            loop {
+                match lexer.next_token().map_err(|error| {
+                    sql_err!(error.kind.sqlstate(), "{}", error.message.as_str())
+                })? {
+                    Tok::Ident("sqlstate" | "sqlerrm")
+                    | Tok::QuotedIdent("sqlstate" | "sqlerrm") => return Ok(true),
+                    Tok::Eof => return Ok(false),
+                    _ => {}
+                }
+            }
+        })
+        .map_err(|_| super::query::arena_full_pub())?
 }
 
 fn invalid_source() -> SqlError {
@@ -209,6 +232,31 @@ pub(super) fn reject_atomic<'a>(
 mod tests {
     use super::*;
     use crate::mem::Budget;
+
+    #[test]
+    fn exception_variable_flags_follow_identifiers_without_retaining_lexer_scratch() {
+        let mut budget = Budget::new(16 << 10);
+        let arena = Arena::new(&mut budget, "handler variable tokens", 16 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (source, expected) in [
+                ("SQLERRM || sqlstate", true),
+                ("\"sqlerrm\"", true),
+                ("\"SQLERRM\"", false),
+                ("'sqlerrm' /* SQLSTATE */", false),
+                ("$x$SQLERRM$x$ -- sqlstate", false),
+                ("\"sql\"\"errm\"", false),
+                ("repeat('x',8192)", false),
+            ] {
+                let used = arena.used();
+                assert_eq!(
+                    references_exception_variables(source, &arena).unwrap(),
+                    expected,
+                    "{source}"
+                );
+                assert_eq!(arena.used(), used);
+            }
+        });
+    }
 
     #[test]
     fn parse_frames_copy_synthetic_sources_and_restore_nested_authority() {

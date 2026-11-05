@@ -90,8 +90,10 @@ handler waits; a user-raised cancellation must not disable a future timeout.
 Finish the saved owners for local variables, handler diagnostics and the
 enclosing write. The indexed control frames still borrow statement memory and
 cannot yet survive returning to the connection scheduler. Keep the bounded
-loop scopes, owned loop/result bytes, actual-width output reservations and
-scoped scratch described in the architecture. Qualify every reference fixture
+loop scopes, owned loop/result bytes, actual-width output reservations,
+reusable caught-error buffers and scoped scratch described in the architecture.
+A function that saves the first error message must keep it after later catches
+reuse their handler storage; nested handlers and rethrow retain the outer error. Qualify every reference fixture
 under unchanged capacities; repair the current record-loop memory regression
 before completing this work. A caught `RETURN QUERY` error keeps its completed
 result prefix; a private wait must not publish that prefix twice.

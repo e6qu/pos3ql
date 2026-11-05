@@ -87,8 +87,8 @@ fn frame_layout(
     depth: usize,
     counts: &mut [usize],
 ) {
-    visit_nested_blocks(block, |block, counter| {
-        if let Some(name) = counter {
+    visit_nested_blocks(block, |block, edge| {
+        if let BlockEdge::Numeric(name) = edge {
             let existing = locals.iter().any(|local| local.name == name)
                 || counters.is_some_and(|parent| parent.contains(name));
             // Only a fresh name adds a slot; shadowed counters reuse one.
@@ -114,45 +114,56 @@ fn frame_full() -> SqlError {
 
 fn numeric_depth(block: TriggerBlock<'_>) -> usize {
     let mut depth = 0;
-    visit_nested_blocks(block, |block, counter| {
-        depth = depth.max(numeric_depth(block) + usize::from(counter.is_some()));
+    visit_nested_blocks(block, |block, edge| {
+        depth =
+            depth.max(numeric_depth(block) + usize::from(matches!(edge, BlockEdge::Numeric(_))));
     });
     depth
 }
 
-// Both layout passes visit the same exhaustive set of lexical block edges.
+#[derive(Clone, Copy)]
+pub(super) enum BlockEdge {
+    Ordinary,
+    Numeric(SqlName),
+    Handler,
+}
+
+// Layout passes share this exhaustive set of lexical block edges.
 pub(super) fn visit_nested_blocks<'a>(
     block: TriggerBlock<'a>,
-    mut visit: impl FnMut(TriggerBlock<'a>, Option<SqlName>),
+    mut visit: impl FnMut(TriggerBlock<'a>, BlockEdge),
 ) {
     for statement in block.statements {
         match statement {
             TriggerStatement::For(program) => visit(
                 program.block,
-                matches!(program.source, TriggerForSource::Numeric { .. })
-                    .then_some(program.target),
+                if matches!(program.source, TriggerForSource::Numeric { .. }) {
+                    BlockEdge::Numeric(program.target)
+                } else {
+                    BlockEdge::Ordinary
+                },
             ),
             TriggerStatement::If(program) => {
                 for branch in program.branches {
-                    visit(branch.block, None);
+                    visit(branch.block, BlockEdge::Ordinary);
                 }
             }
             TriggerStatement::Case(program) => {
                 for branch in program.branches {
-                    visit(branch.block, None);
+                    visit(branch.block, BlockEdge::Ordinary);
                 }
                 if let TriggerCaseElse::Block(block) = program.otherwise {
-                    visit(block, None);
+                    visit(block, BlockEdge::Ordinary);
                 }
             }
             TriggerStatement::Exception(program) => {
-                visit(program.protected, None);
+                visit(program.protected, BlockEdge::Ordinary);
                 for handler in program.handlers {
-                    visit(handler.block, None);
+                    visit(handler.block, BlockEdge::Handler);
                 }
             }
-            TriggerStatement::While(program) => visit(program.block, None),
-            TriggerStatement::Loop(block) => visit(*block, None),
+            TriggerStatement::While(program) => visit(program.block, BlockEdge::Ordinary),
+            TriggerStatement::Loop(block) => visit(*block, BlockEdge::Ordinary),
             TriggerStatement::Null
             | TriggerStatement::TransactionControl(_)
             | TriggerStatement::Assign(_)

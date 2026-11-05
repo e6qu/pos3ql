@@ -792,6 +792,7 @@ pub(crate) use describe::{
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
 mod control_flow;
+mod diagnostics;
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
@@ -3855,6 +3856,7 @@ fn row_trigger_when_passes<'a, Definition0: crate::storage::DefinitionBacking>(
             key: core::ptr::from_ref(condition) as usize,
             position: 0,
             text: source,
+            exception_variables: false,
         },
         context.storage(),
         context.txn.txid,
@@ -17133,7 +17135,7 @@ struct TriggerInvocation<'a> {
     argv: Datum<'a>,
     event: &'a str,
     tag: &'a str,
-    exception: Option<TriggerExceptionDiagnostic<'a>>,
+    exception: Option<TriggerExceptionVariables<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -17486,7 +17488,7 @@ impl<'a> TriggerInvocation<'a> {
         Ok(super::type_input_plans::Key { owner, source })
     }
 
-    fn with_exception(mut self, exception: TriggerExceptionDiagnostic<'a>) -> Self {
+    fn with_exception(mut self, exception: TriggerExceptionVariables<'a>) -> Self {
         self.exception = Some(exception);
         self
     }
@@ -17923,13 +17925,9 @@ enum TriggerFlow<'a> {
 /// The caught error is an explicitly scoped execution value. Lexically nested
 /// blocks inherit it; a matching nested exception handler shadows it.
 #[derive(Clone, Copy)]
-struct TriggerExceptionDiagnostic<'a> {
-    sqlstate: crate::sql::eval::SqlState,
+struct TriggerExceptionVariables<'a> {
     sqlstate_text: &'a str,
     message: &'a str,
-    detail: Option<&'a str>,
-    hint: Option<&'a str>,
-    context: &'a str,
 }
 
 #[derive(Clone, Copy)]
@@ -23293,6 +23291,7 @@ fn bind_plpgsql_dynamic_query<'a>(
             _ => unreachable!(),
         },
         text: command,
+        exception_variables: false,
     };
     let prepared = match &mut context.host {
         PlpgsqlExecHost::Routine {
@@ -26638,7 +26637,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     local_values: &mut [Datum<'a>],
     statement: TriggerStatement<'a>,
     status: &mut TriggerExecutionStatus<'a>,
-    exception: Option<&TriggerExceptionDiagnostic<'_>>,
+    exception: Option<&diagnostics::CaughtDiagnostic<'a>>,
 ) -> Result<control_flow::Step<'a>, SqlError> {
     super::query::check_timeout()?;
     let (statement, input_plan) = {
@@ -27989,15 +27988,17 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
             let exception = exception.expect("bare RAISE is parsed only in an exception handler");
-            if exception.detail.is_some() || exception.hint.is_some() {
-                crate::sql::eval::stash_diagnostic(
-                    exception.detail.map(StackStr::from_str),
-                    exception.hint.map(StackStr::from_str),
-                );
-            }
+            crate::sql::eval::stash_diagnostic(
+                exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
+                    diagnostics::Field::Detail,
+                )?,
+                exception.stack::<128>(diagnostics::Field::Hint)?,
+            );
             Err(SqlError {
                 sqlstate: exception.sqlstate,
-                message: StackStr::from_str(exception.message),
+                message: exception
+                    .stack::<192>(diagnostics::Field::Message)?
+                    .expect("caught error has a message"),
             })
         }),
         TriggerStatement::Raise(TriggerRaise::Message(raise)) => execute_trigger_statement(|| {
@@ -28097,28 +28098,26 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 ));
             };
             for assignment in statement.assignments {
-                let value = match assignment.item {
-                    TriggerStackedDiagnostic::ReturnedSqlstate => Some(exception.sqlstate.as_str()),
-                    TriggerStackedDiagnostic::MessageText => Some(exception.message),
+                let field = match assignment.item {
+                    TriggerStackedDiagnostic::ReturnedSqlstate => {
+                        Some(diagnostics::Field::Sqlstate)
+                    }
+                    TriggerStackedDiagnostic::MessageText => Some(diagnostics::Field::Message),
                     TriggerStackedDiagnostic::ColumnName
                     | TriggerStackedDiagnostic::ConstraintName
                     | TriggerStackedDiagnostic::PgDatatypeName
                     | TriggerStackedDiagnostic::TableName
-                    | TriggerStackedDiagnostic::SchemaName => Some(""),
-                    TriggerStackedDiagnostic::PgExceptionDetail => exception.detail,
-                    TriggerStackedDiagnostic::PgExceptionHint => exception.hint,
-                    TriggerStackedDiagnostic::PgExceptionContext => Some(exception.context),
+                    | TriggerStackedDiagnostic::SchemaName => None,
+                    TriggerStackedDiagnostic::PgExceptionDetail => Some(diagnostics::Field::Detail),
+                    TriggerStackedDiagnostic::PgExceptionHint => Some(diagnostics::Field::Hint),
+                    TriggerStackedDiagnostic::PgExceptionContext => {
+                        Some(diagnostics::Field::Context)
+                    }
                 };
-                let value = value
-                    .map(|value| {
-                        context
-                            .arena
-                            .alloc_str(value)
-                            .map(Datum::Text)
-                            .map_err(|_| super::query::arena_full_pub())
-                    })
-                    .transpose()?
-                    .unwrap_or(Datum::Null);
+                let value = Datum::Text(match field {
+                    Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
+                    None => "",
+                });
                 assign_trigger_local(context, locals, local_values, assignment.target, value)?;
             }
 

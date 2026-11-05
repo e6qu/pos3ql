@@ -1,8 +1,9 @@
 //! Procedural positions and lexical scopes belong to bounded execution frames.
 
+use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
 use super::*;
 use crate::mem::arena::OwnedArenaSlice;
-use numeric_loops::NumericLoopWorkspace;
+use numeric_loops::{BlockEdge, NumericLoopWorkspace};
 
 pub(super) enum Step<'a> {
     Complete(Option<TriggerFlow<'a>>),
@@ -114,7 +115,7 @@ enum Continuation<'a> {
         boundary: TriggerSubtransaction,
         releasing: bool,
     },
-    Handler(TriggerExceptionDiagnostic<'a>),
+    Handler(CaughtDiagnostic<'a>),
 }
 
 /// The lexical maximum is reserved before local initializers can have effects.
@@ -124,26 +125,30 @@ pub(super) struct ControlFrames<'a> {
     blocks: &'a [TriggerBlock<'a>],
     slots: OwnedArenaSlice<'a, Option<Frame<'a>>>,
     active: usize,
+    diagnostics: DiagnosticBuffers<'a>,
 }
 
 impl<'a> ControlFrames<'a> {
     pub(super) fn new(arena: &'a Arena, block: TriggerBlock<'a>) -> Result<Self, SqlError> {
-        fn layout(block: TriggerBlock<'_>) -> (usize, usize) {
+        fn layout(block: TriggerBlock<'_>) -> (usize, usize, usize) {
             let mut count = 1;
             let mut depth = 1;
-            numeric_loops::visit_nested_blocks(block, |child, _| {
-                let (child_count, child_depth) = layout(child);
+            let mut handlers = 0;
+            numeric_loops::visit_nested_blocks(block, |child, edge| {
+                let (child_count, child_depth, child_handlers) = layout(child);
                 count += child_count;
                 depth = depth.max(child_depth + 1);
+                handlers =
+                    handlers.max(child_handlers + usize::from(matches!(edge, BlockEdge::Handler)));
             });
-            (count, depth)
+            (count, depth, handlers)
         }
         fn compile<'a>(block: TriggerBlock<'a>, blocks: &mut [TriggerBlock<'a>], next: &mut usize) {
             blocks[*next] = block;
             *next += 1;
             numeric_loops::visit_nested_blocks(block, |child, _| compile(child, blocks, next));
         }
-        let (count, depth) = layout(block);
+        let (count, depth, handlers) = layout(block);
         let blocks = arena
             .alloc_slice_with(count, |_| TriggerBlock { statements: &[] })
             .map_err(|_| frame_full())?;
@@ -156,6 +161,7 @@ impl<'a> ControlFrames<'a> {
                 .alloc_owned_slice_with(depth, |_| None)
                 .map_err(|_| frame_full())?,
             active: 0,
+            diagnostics: DiagnosticBuffers::new(arena, handlers)?,
         })
     }
 
@@ -248,7 +254,7 @@ impl<'a> ControlFrames<'a> {
         (locals, values)
     }
 
-    fn diagnostic(&self) -> Option<TriggerExceptionDiagnostic<'a>> {
+    fn diagnostic(&self) -> Option<CaughtDiagnostic<'a>> {
         self.slots[..self.active]
             .iter()
             .rev()
@@ -279,6 +285,7 @@ impl<'a> ControlFrames<'a> {
                 }
             }
             Continuation::Rows { .. } if success => status.set_found(true),
+            Continuation::Handler(diagnostic) => self.diagnostics.release(diagnostic),
             _ => {}
         }
     }
@@ -413,7 +420,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     values: &mut [Datum<'a>],
     block: TriggerBlock<'a>,
     status: &mut TriggerExecutionStatus<'a>,
-    exception: Option<&TriggerExceptionDiagnostic<'_>>,
+    exception: Option<&CaughtDiagnostic<'a>>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
     let mut frames = status
         .control_frames
@@ -425,7 +432,6 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     let mut pending_error = None;
     while frames.active != 0 {
         let caught = frames.diagnostic();
-        let invocation = caught.map_or(invocation, |caught| invocation.with_exception(caught));
         let exception = caught.as_ref().or(exception);
         let action = (|| {
             if let Some(error) = pending_error.take() {
@@ -438,6 +444,8 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 .get(frames.last().next)
                 .copied()
             {
+                let invocation =
+                    bind_exception_variables(invocation, exception, statement, context.arena)?;
                 let (scope, scope_values) = frames.scope(locals, values);
                 return execute_trigger_step(
                     context,
@@ -466,6 +474,12 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         unreachable!("while frame source")
                     };
                     let condition = program.condition;
+                    let invocation = bind_exception_variables(
+                        invocation,
+                        exception,
+                        TriggerStatement::While(program),
+                        context.arena,
+                    )?;
                     let (scope, scope_values) = frames.scope(locals, values);
                     if trigger_condition(
                         context,
@@ -630,7 +644,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     outcome = Err(error);
                     break;
                 };
-                match catch_diagnostic(context, invocation, &error) {
+                match catch_diagnostic(context, invocation, &error, &mut frames.diagnostics) {
                     Ok(caught) => frames.push(
                         FrameEntry::new(handler.block, Continuation::Handler(caught)),
                         FrameSource::Handler,
@@ -650,11 +664,113 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     outcome
 }
 
+// Bind snapshots before a child query borrows the remaining arena. Only input
+// sites that can resolve the handler variables need independent copies.
+fn bind_exception_variables<'a>(
+    invocation: TriggerInvocation<'a>,
+    diagnostic: Option<&CaughtDiagnostic<'a>>,
+    statement: TriggerStatement<'a>,
+    arena: &'a Arena,
+) -> Result<TriggerInvocation<'a>, SqlError> {
+    use super::super::plpgsql_inputs::Kind;
+    let Some(diagnostic) = diagnostic else {
+        return Ok(invocation);
+    };
+    let site = |kind, key| {
+        invocation
+            .input_sites
+            .iter()
+            .any(|site| (site.kind, site.key) == (kind, key) && site.exception_variables)
+    };
+    let expression = |value: &Expr<'a>| site(Kind::Expression, core::ptr::from_ref(value) as usize);
+    let optional = |value: Option<&Expr<'a>>| value.is_some_and(expression);
+    let dynamic = |query: PlpgsqlDynamicQuery<'a>| {
+        expression(query.command) || query.arguments.iter().any(|value| expression(value))
+    };
+    let needed = match statement {
+        TriggerStatement::Assign(value) => expression(value.expression),
+        TriggerStatement::LocalAssign(value) => expression(value.expression),
+        TriggerStatement::Perform(query)
+        | TriggerStatement::ReturnQuery(query)
+        | TriggerStatement::SelectInto(TriggerSelectInto { query, .. }) => {
+            site(Kind::Query, core::ptr::from_ref(query) as usize)
+        }
+        TriggerStatement::Utility { source, .. }
+        | TriggerStatement::Dml { source, .. }
+        | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+            query: PlpgsqlCursorQuery::Static(source),
+            ..
+        }) => site(Kind::Statement, source.as_ptr() as usize),
+        TriggerStatement::DynamicQuery(query)
+        | TriggerStatement::ReturnDynamicQuery(query)
+        | TriggerStatement::DynamicSelectInto(PlpgsqlDynamicSelectInto { query, .. })
+        | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+            query: PlpgsqlCursorQuery::Dynamic(query),
+            ..
+        }) => dynamic(query),
+        TriggerStatement::Assert(value) => expression(value.condition) || optional(value.message),
+        TriggerStatement::Raise(TriggerRaise::Message(value)) => {
+            value.arguments.iter().any(|value| expression(value))
+                || optional(value.message)
+                || optional(value.detail)
+                || optional(value.hint)
+                || match value.sqlstate {
+                    TriggerRaiseSqlState::Parsed(_) => false,
+                    TriggerRaiseSqlState::Expression(value) => expression(value),
+                }
+        }
+        TriggerStatement::If(value) => value
+            .branches
+            .iter()
+            .any(|branch| optional(branch.condition)),
+        TriggerStatement::Case(value) => {
+            optional(value.operand) || value.branches.iter().any(|branch| expression(branch.when))
+        }
+        TriggerStatement::For(value) => match value.source {
+            TriggerForSource::Numeric {
+                lower, upper, step, ..
+            } => expression(lower) || expression(upper) || expression(step),
+            TriggerForSource::Query(query) => {
+                site(Kind::Query, core::ptr::from_ref(query) as usize)
+            }
+            TriggerForSource::DynamicQuery(query) => dynamic(query),
+            TriggerForSource::Array {
+                expression: value, ..
+            } => expression(value),
+        },
+        TriggerStatement::While(value) => expression(value.condition),
+        TriggerStatement::LoopControl(
+            TriggerLoopControl::Exit { condition, .. }
+            | TriggerLoopControl::Continue { condition, .. },
+        ) => optional(condition),
+        TriggerStatement::ReturnNext(value) => optional(value),
+        TriggerStatement::Return(TriggerReturn::Value(value)) => expression(value),
+        TriggerStatement::Null
+        | TriggerStatement::TransactionControl(_)
+        | TriggerStatement::CursorMotion(_)
+        | TriggerStatement::CursorClose(_)
+        | TriggerStatement::Raise(TriggerRaise::Rethrow)
+        | TriggerStatement::GetDiagnostics(_)
+        | TriggerStatement::GetStackedDiagnostics(_)
+        | TriggerStatement::Exception(_)
+        | TriggerStatement::Loop(_)
+        | TriggerStatement::Return(
+            TriggerReturn::New | TriggerReturn::Old | TriggerReturn::Null | TriggerReturn::Void,
+        ) => false,
+    };
+    if needed {
+        Ok(invocation.with_exception(diagnostic.variables(arena)?))
+    } else {
+        Ok(invocation)
+    }
+}
+
 fn catch_diagnostic<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     invocation: TriggerInvocation<'a>,
     error: &SqlError,
-) -> Result<TriggerExceptionDiagnostic<'a>, SqlError> {
+    buffers: &mut DiagnosticBuffers<'a>,
+) -> Result<CaughtDiagnostic<'a>, SqlError> {
     if error.sqlstate == sqlstate::QUERY_CANCELED {
         context
             .txn
@@ -662,28 +778,7 @@ fn catch_diagnostic<'a>(
         super::super::sequence::record_caught_cancellation(context.seq_session());
     }
     let diagnostic = crate::sql::eval::take_diagnostic();
-    let copy = |text: &str| {
-        context
-            .arena
-            .alloc_str(text)
-            .map_err(|_| super::super::query::arena_full_pub())
-    };
-    Ok(TriggerExceptionDiagnostic {
-        sqlstate: error.sqlstate,
-        sqlstate_text: copy(error.sqlstate.as_str())?,
-        message: copy(error.message.as_str())?,
-        detail: diagnostic
-            .as_ref()
-            .and_then(|value| value.detail.as_ref())
-            .map(|value| copy(value.as_str()))
-            .transpose()?,
-        hint: diagnostic
-            .as_ref()
-            .and_then(|value| value.hint.as_ref())
-            .map(|value| copy(value.as_str()))
-            .transpose()?,
-        context: copy(invocation.context().as_str())?,
-    })
+    buffers.capture(error, diagnostic.as_ref(), invocation.context().as_str())
 }
 
 #[cfg(test)]

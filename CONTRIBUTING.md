@@ -189,6 +189,9 @@ must cover output names in `FROM`, nulls, whole and nested named rows, and field
 constraints that call helpers with side effects. Keep extended fixtures within
 their configured catalog limits by releasing completed definitions between
 transactions; retain every assertion and the original capacities.
+Test repeated and nested error handlers with unchanged statement memory.
+Saved SQLERRM values must survive reuse, absent stacked fields must be empty
+text, and an exhausted diagnostic buffer must leave its outer handler usable.
 Test indexed execution positions after releasing their original parsing
 storage. Resumption must retain the selected source, definitions and types;
 reparsing a replacement definition must not redirect unfinished work.

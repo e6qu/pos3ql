@@ -1,6 +1,30 @@
 use super::*;
 
 #[test]
+fn caught_diagnostics_reuse_storage_and_preserve_saved_and_nested_values() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("caught-diagnostic-reuse-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/250_caught_diagnostic_reuse.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "4096:error 1",
+                "outer:inner:outer:P0001:outer detail:outer hint:true:true:true"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn wide_table_function_records_use_output_width_in_select_lists_and_from() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

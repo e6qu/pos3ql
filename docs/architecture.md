@@ -126,7 +126,7 @@ whether a SQL function can be inlined needs the properties of text concatenation
 even though its internal `textcat` function is not exposed as a SQL call.
 Initialized callable declarations take precedence over bootstrap facts. Adding
 these facts does not add callable functions; [source hashes and generation
-details](../tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
+details](https://github.com/e6qu/pos3ql/blob/d79ba0232874d6dfbd7a9f7a744af9a9a12f3318/tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
 record their origin.
 
 Parameterized Bind attempts keep separate checked planner values. Parameterless
@@ -221,8 +221,17 @@ conditions and handler syntax resolve through that program; loop values and
 handler diagnostic/savepoint state stay with the active frame. Child blocks do
 not recursively call the interpreter. Leaving a scope
 restores shadowed counters, copies assignments back and releases its references.
-The frames still borrow statement memory; they do not yet survive returning
-to the connection scheduler during a storage wait.
+Caught error text uses a reusable, checked buffer for each simultaneously
+active handler depth. Buffer payloads grow geometrically within the statement
+arena; repeated catches reuse their storage. Leaving a handler invalidates its
+view. Nested handlers keep the outer error available; SQLSTATE/SQLERRM and
+requested stacked fields copy text before exposing it to local variables.
+For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
+keep that message after later catches reuse the handler buffer. Missing stacked
+fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
+records repeated catches, nested handlers and rethrow.
+The frames and diagnostic buffers still borrow statement memory; they do not
+yet survive returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.
 Source query work and nested invocation receipts use one scoped arena and are

@@ -133,14 +133,6 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         PlpgsqlProgramKind::Anonymous,
     )
     .unwrap();
-    let diagnostic = TriggerExceptionDiagnostic {
-        sqlstate: sqlstate::DIVISION_BY_ZERO.into(),
-        sqlstate_text: "22012",
-        message: "division by zero",
-        detail: None,
-        hint: None,
-        context: "handler",
-    };
     let TriggerStatement::Exception(protected) = program.body.statements[0] else {
         panic!("protected block")
     };
@@ -152,6 +144,8 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         let mut frames = ControlFrames::new(&arena, program.body).unwrap();
         frames.start(program.body);
         frames.last_mut().next = 1;
+        let error = sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero");
+        let diagnostic = frames.diagnostics.capture(&error, None, "handler").unwrap();
         frames.push(
             FrameEntry::new(handler, Continuation::Handler(diagnostic)),
             FrameSource::Handler,
@@ -160,7 +154,15 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             branches.branches[0].block,
             Continuation::Once,
         ));
-        assert_eq!(frames.diagnostic().unwrap().message, "division by zero");
+        assert_eq!(
+            frames
+                .diagnostic()
+                .unwrap()
+                .variables(&arena)
+                .unwrap()
+                .message,
+            "division by zero"
+        );
         let child = frames.pop();
         assert!(matches!(
             frames.source_statement(child.source),
@@ -168,7 +170,11 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         ));
         assert_eq!(frames.last().next, 1);
         assert_eq!(frames.diagnostic().unwrap().sqlstate, "22012");
-        frames.pop();
+        let handler = frames.pop();
+        let Continuation::Handler(diagnostic) = handler.continuation else {
+            panic!("handler");
+        };
+        frames.diagnostics.release(diagnostic);
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();

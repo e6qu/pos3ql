@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn lowered_assignments_bind_handler_variables_in_values_and_subscripts() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("handler-assignment-inputs-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/251_handler_assignment_inputs.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["P0001", "P0001"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn caught_diagnostics_reuse_storage_and_preserve_saved_and_nested_values() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

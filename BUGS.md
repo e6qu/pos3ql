@@ -12,7 +12,8 @@ Pending CI, uncollected measurements and reproducible failures being repaired
 belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
 current behavior belongs in the [owning guides](docs/README.md), including
-reused caught-error storage and PostgreSQL stacked-diagnostic values.
+reused caught-error storage, rewritten assignment inputs and PostgreSQL
+stacked-diagnostic values.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

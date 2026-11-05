@@ -688,8 +688,8 @@ fn bind_exception_variables<'a>(
         expression(query.command) || query.arguments.iter().any(|value| expression(value))
     };
     let needed = match statement {
-        TriggerStatement::Assign(value) => expression(value.expression),
-        TriggerStatement::LocalAssign(value) => expression(value.expression),
+        TriggerStatement::Assign(value) => value.exception_variables,
+        TriggerStatement::LocalAssign(value) => value.exception_variables,
         TriggerStatement::Perform(query)
         | TriggerStatement::ReturnQuery(query)
         | TriggerStatement::SelectInto(TriggerSelectInto { query, .. }) => {

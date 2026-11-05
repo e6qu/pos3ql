@@ -17064,12 +17064,16 @@ fn plpgsql_output_value<'a>(
 struct TriggerAssignment<'a> {
     column: SqlName,
     expression: &'a Expr<'a>,
+    // Dependencies include the original target's subscripts after lowering.
+    exception_variables: bool,
 }
 
 #[derive(Clone, Copy)]
 struct TriggerLocalAssignment<'a> {
     name: SqlName,
     expression: &'a Expr<'a>,
+    // Dependencies include the original target's subscripts after lowering.
+    exception_variables: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -18654,7 +18658,13 @@ fn parse_trigger_assignment<'a>(
     if !qualifier.is_some_and(|record| record.eq_ignore_ascii_case("new")) {
         return Ok(None);
     }
-    Ok(Some(TriggerAssignment { column, expression }))
+    Ok(Some(TriggerAssignment {
+        column,
+        expression,
+        exception_variables: super::plpgsql_inputs::references_exception_variables(
+            statement, arena,
+        )?,
+    }))
 }
 
 /// Resolves a PL/pgSQL assignment target and lowers any chained subscripts to
@@ -18732,7 +18742,13 @@ fn parse_trigger_local_assignment<'a>(
     if qualifier.is_some() {
         return Ok(None);
     }
-    Ok(Some(TriggerLocalAssignment { name, expression }))
+    Ok(Some(TriggerLocalAssignment {
+        name,
+        expression,
+        exception_variables: super::plpgsql_inputs::references_exception_variables(
+            statement, arena,
+        )?,
+    }))
 }
 
 fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {

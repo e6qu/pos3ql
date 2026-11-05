@@ -101,7 +101,7 @@ pub(super) fn record(kind: Kind, key: usize, text: &str, original: &str) -> Resu
 }
 
 // Keep only a flag; identifier unescaping and case folding use temporary space.
-fn references_exception_variables(text: &str, arena: &Arena) -> Result<bool, SqlError> {
+pub(super) fn references_exception_variables(text: &str, arena: &Arena) -> Result<bool, SqlError> {
     arena
         .with_remaining_region(|scratch| {
             use super::lexer::{Lexer, Tok};

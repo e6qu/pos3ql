@@ -221,3 +221,50 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
         assert!(matches!(program.condition, Expr::Bool(true)));
     });
 }
+
+#[test]
+fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
+    let mut budget = Budget::new(1 << 18);
+    let parse = Arena::new(&mut budget, "handler assignment parsing", 1 << 16).unwrap();
+    let arena = Arena::new(&mut budget, "handler assignment values", 1 << 16).unwrap();
+    let program = parse_plpgsql_program(
+        "DECLARE document jsonb := '{}'; BEGIN BEGIN RAISE EXCEPTION 'caught'; EXCEPTION WHEN OTHERS THEN document[SQLERRM] := to_jsonb(SQLSTATE); END; END",
+        &parse, PlpgsqlProgramKind::Anonymous,
+    ).unwrap();
+    let TriggerStatement::Exception(block) = program.body.statements[0] else {
+        panic!("exception");
+    };
+    let statement = block.handlers[0].block.statements[0];
+    let TriggerStatement::LocalAssign(assignment) = statement else {
+        panic!("assignment");
+    };
+    assert!(assignment.exception_variables);
+    assert!(matches!(
+        assignment.expression,
+        Expr::Call {
+            name: "__jsonb_subscript_set",
+            ..
+        }
+    ));
+    crate::mem::guard::forbid_alloc(|| {
+        let mut buffers = DiagnosticBuffers::new(&arena, 1).unwrap();
+        let caught = buffers
+            .capture(
+                &sql_err!(sqlstate::RAISE_EXCEPTION, "caught"),
+                None,
+                "handler",
+            )
+            .unwrap();
+        let invocation = TriggerInvocation::anonymous()
+            .unwrap()
+            .with_input_sites(program.input_sites);
+        let bound = bind_exception_variables(invocation, Some(&caught), statement, &arena).unwrap();
+        let variables = bound
+            .exception
+            .expect("lowering preserves handler name dependencies");
+        assert_eq!(variables.message, "caught");
+        assert_eq!(variables.sqlstate_text, "P0001");
+        buffers.release(caught);
+        assert_eq!(variables.message, "caught");
+    });
+}

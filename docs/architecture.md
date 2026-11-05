@@ -226,6 +226,9 @@ active handler depth. Buffer payloads grow geometrically within the statement
 arena; repeated catches reuse their storage. Leaving a handler invalidates its
 view. Nested handlers keep the outer error available; SQLSTATE/SQLERRM and
 requested stacked fields copy text before exposing it to local variables.
+Assignment rewriting keeps the original target and value dependencies: for
+example, `document[SQLERRM] := to_jsonb(SQLSTATE)` still sees both handler
+variables after lowering to the shared JSON setter.
 For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)

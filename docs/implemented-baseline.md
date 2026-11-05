@@ -489,7 +489,7 @@ schema edits, staged journal records, settings and queued deferred triggers use
 the same savepoint boundary. The handler regains its login identity while preserving an enclosing function's
 owner permissions. Local variables and issued sequence values retain their effects. Cursors opened inside the failed scope close; older cursors keep
 their advanced position, and closing a cursor is not undone.
-[PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/main/tests/external/reference/2026-11-05-procedural-subtransactions)
+[PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions)
 cover these distinctions, including row and statement triggers.
 
 DDL success follows its end-of-command event triggers. A hook that raises an

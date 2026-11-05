@@ -384,6 +384,13 @@ Timeouts accept at most 2,147,483,647 milliseconds; invalid text and larger valu
 return `22023`. Disabled-only timeout settings accept equivalent zero values such
 as `0ms`; enabling them returns `0A000`.
 
+Application-defined error codes are ordinary SQL errors, including `PZ001`
+through `PZ004`. For example, `RAISE SQLSTATE 'PZ001'` can be caught by
+`WHEN SQLSTATE 'PZ001'`, `WHEN SQLSTATE 'PZ000'` or `WHEN OTHERS`; an uncaught
+error returns to the client. A code ending in `000` in an exception handler
+matches its two-character category. Internal storage waits use a separate typed
+marker and cannot be caught by SQL handlers.
+
 Each cursor reserves `cursor_bytes` for typed rows, `cursor_query_bytes` for its
 query, copied parameters and their
 declared types (a `NULL` date parameter still has the date type),

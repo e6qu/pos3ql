@@ -36,6 +36,9 @@ deadlines before buffered replies and protocol control messages too; an expired
 Sync still owes ReadyForQuery, and an interrupted simple Query must be consumed.
 Once commit publication has started, restoring a saved timer must not cancel its
 durability receipt. Cover all command-entry modes at that boundary.
+Application error codes must not construct private execution controls. Exercise
+uncaught, exact, category and `OTHERS` handling, including functions returning
+rows; an application error must neither park a connection nor end its results.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

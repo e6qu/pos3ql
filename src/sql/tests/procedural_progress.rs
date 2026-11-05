@@ -63,3 +63,62 @@ fn expired_procedural_blocks_stop_before_empty_and_scalar_only_control_flow() {
         session.success(&mut engine, "ROLLBACK", true);
     }
 }
+
+#[test]
+fn custom_sqlstates_remain_application_errors_through_handlers_and_routine_calls() {
+    let codes = ["PZ001", "PZ002", "PZ003", "PZ004", "PZ999"];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("application-control-codes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE application_codes_audit(code text, handler text)",
+            true,
+        );
+        for code in codes {
+            let direct = format!(
+                "DO $$BEGIN RAISE SQLSTATE '{code}' USING MESSAGE='application error'; END$$"
+            );
+            let output = session.execute(&mut engine, &direct, true);
+            assert_eq!(error_sqlstates(&output), [code], "{mode:?}: {direct}");
+            assert!(session.transaction.suspended_statement_context().is_none());
+            for (condition, handler) in [
+                ("OTHERS".to_owned(), "others"),
+                (format!("SQLSTATE '{code}'"), "exact"),
+                ("SQLSTATE 'PZ000'".to_owned(), "class"),
+            ] {
+                let caught = format!(
+                    "DO $$BEGIN BEGIN RAISE SQLSTATE '{code}' USING MESSAGE='application error'; EXCEPTION WHEN {condition} THEN INSERT INTO application_codes_audit VALUES('{code}','{handler}'); END; END$$"
+                );
+                session.success(&mut engine, &caught, true);
+            }
+            let routine = format!(
+                "CREATE OR REPLACE FUNCTION application_code() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RAISE SQLSTATE '{code}' USING MESSAGE='application routine error'; END$$"
+            );
+            session.success(&mut engine, &routine, true);
+            let output = session.execute(&mut engine, "SELECT application_code()", true);
+            assert_eq!(error_sqlstates(&output), [code], "{mode:?}: scalar {code}");
+        }
+        let mut expected = Vec::new();
+        for code in codes {
+            for handler in ["class", "exact", "others"] {
+                expected.push(format!("{code}:{handler}"));
+            }
+        }
+        let output = session.success(
+            &mut engine,
+            "SELECT code||':'||handler FROM application_codes_audit ORDER BY code,handler",
+            true,
+        );
+        assert_eq!(data_rows(&output), expected);
+        session.success(&mut engine, "CREATE FUNCTION application_code_rows() RETURNS SETOF integer LANGUAGE plpgsql AS $$BEGIN RETURN NEXT 1; RAISE SQLSTATE 'PZ004' USING MESSAGE='application row error'; END$$", true);
+        let output = session.execute(&mut engine, "SELECT * FROM application_code_rows()", true);
+        assert_eq!(error_sqlstates(&output), ["PZ004"]);
+    }
+}

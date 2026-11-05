@@ -1079,8 +1079,8 @@ pub(crate) fn statement_effect<'a>(
             Err(error)
                 if !effect.replayable
                     && matches!(
-                        error.sqlstate.as_str(),
-                        sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT
+                        error.sqlstate.internal_control(),
+                        Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
                     ) =>
             {
                 Err(nonreplayable_effect())
@@ -1101,10 +1101,12 @@ pub(crate) fn statement_effect<'a>(
                         kind,
                         StatementEffectKind::Cursor | StatementEffectKind::RoutineInput
                     ) && !matches!(
-                        error.sqlstate.as_str(),
-                        sqlstate::INTERNAL_IO_WAIT
-                            | sqlstate::INTERNAL_LOCK_WAIT
-                            | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        error.sqlstate.internal_control(),
+                        Some(
+                            sqlstate::INTERNAL_IO_WAIT
+                                | sqlstate::INTERNAL_LOCK_WAIT
+                                | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        )
                     ) =>
                 {
                     effect.after_sequences =

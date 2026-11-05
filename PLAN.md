@@ -60,6 +60,9 @@ operation without executing earlier rows or trigger statements again. Keep the
 original selected definitions, settings, statement snapshot and deadline.
 Cancellation or a real error must release retained owners and use the ordinary
 transaction rollback rules. A private wait must not be caught as a user error.
+Preserve typed control ownership: an application raising the same diagnostic
+code must still return or catch its own error normally, including in functions
+returning rows and category handlers.
 Cover row and statement triggers, nested calls, all firing times, partitioned
 writes, deferred triggers, COPY and replication apply. Compare visible rows,
 audit writes, sequence values and errors with PostgreSQL in both transaction

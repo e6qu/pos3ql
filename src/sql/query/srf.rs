@@ -1,5 +1,5 @@
-//! Set-returning functions: the ones written in the select list, and the ones
-//! written in FROM.
+//! Set-returning functions in the select list, and scalar or set-returning
+//! functions used as row sources in FROM.
 //!
 //! A set-returning function in the select list makes each input row produce as
 //! many output rows as the function yields, so the projection has to know how
@@ -3663,7 +3663,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 SqlName::parse(name)?,
                 routine.kind.function_result().expect("set routine result"),
                 routine.kind.function_result().and(match routine.kind {
-                    crate::storage::RoutineKind::SetFunction { result } => result.user_type,
+                    crate::storage::RoutineKind::Function { result }
+                    | crate::storage::RoutineKind::SetFunction { result } => result.user_type,
                     _ => None,
                 }),
                 -1,
@@ -4173,6 +4174,47 @@ struct TableFunctionRows<'a> {
     // SELECT keeps each named row as a value; FROM exposes its fields.
     encoded: &'a [&'a [u8]],
     composite: Option<crate::storage::TypeCreation>,
+}
+
+/// A scalar call in FROM produces one row, even for a null result. Anonymous
+/// OUT records expose their fields here; named composites are expanded later.
+fn scalar_function_row<'a>(
+    routine: &RoutineDef,
+    value: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let encoded = if let Some(columns) = routine.record_result_columns() {
+        if columns.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table function output exceeds configured column capacity"
+            ));
+        }
+        let values = arena
+            .alloc_slice_with(columns.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        match value {
+            Datum::Record(fields) if fields.len() == columns.len() => {
+                for (output, field) in values.iter_mut().zip(fields) {
+                    *output = field.value;
+                }
+            }
+            Datum::Null => {}
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "scalar function result changed its declared OUT shape"
+                ));
+            }
+        }
+        crate::sql::exec::encode_projected_pub(values, arena)?
+    } else {
+        crate::sql::exec::encode_projected_pub(&[value], arena)?
+    };
+    arena
+        .alloc_slice_copy(&[encoded])
+        .map(|rows| &*rows)
+        .map_err(|_| arena_full())
 }
 
 /// Evaluates a table function's arguments against `columns` — an
@@ -5748,7 +5790,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
         }
         if let Some((routine_slot, routine)) = selected {
-            let catalog = super::storage_catalog(storage, arena, txid);
+            let catalog = super::StorageCatalog {
+                storage,
+                routine_workspace: arena,
+                txid,
+                invocations,
+                statement_arena,
+            };
             let hooks = crate::sql::eval::EvalHooks {
                 catalog: Some(&catalog),
                 ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
@@ -5788,12 +5836,37 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 arena,
             )?
             else {
+                if !routine.kind.is_set_returning() {
+                    composite = routine_composite_result(routine, storage, txid)?;
+                    return scalar_function_row(routine, Datum::Null, arena);
+                }
                 return Ok(&[]);
             };
             let input_collation = routine_params.input_collation;
             let routine_params = routine_params.values;
-            let _input_body = super::input_progress::enter_body();
             composite = routine_composite_result(routine, storage, txid)?;
+            if !routine.kind.is_set_returning() {
+                let value = catalog
+                    .execute_routine(
+                        routine_slot,
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        input_collation,
+                        crate::sql::eval::RoutineCallAccess::Caller,
+                        tref.func_source_position
+                            .get()
+                            .map(super::InvocationSite::Expression),
+                        arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "scalar function produced no result"
+                        )
+                    })?;
+                return scalar_function_row(routine, value, arena);
+            }
+            let _input_body = super::input_progress::enter_body();
             let table_columns = routine.table_columns();
             let scalar_result = routine.kind.function_result();
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(

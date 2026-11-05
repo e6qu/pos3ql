@@ -9927,13 +9927,15 @@ impl RoutineDef {
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
-        matches!(
-            self.kind,
-            RoutineKind::TableFunction
-                | RoutineKind::RecordFunction {
-                    set_returning: true
-                }
-        )
+        // FROM exposes declared OUT names independently of result cardinality.
+        (self.result_column_count != 0
+            && matches!(
+                self.kind,
+                RoutineKind::TableFunction
+                    | RoutineKind::RecordFunction { .. }
+                    | RoutineKind::Function { .. }
+                    | RoutineKind::SetFunction { .. }
+            ))
         .then_some(&self.result_columns[..self.result_column_count])
     }
 

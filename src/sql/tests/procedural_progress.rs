@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn scalar_functions_in_from_preserve_out_columns_cardinality_and_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("scalar-from-contract-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/244_scalar_functions_in_from.sql");
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(
+            data_rows(&output),
+            [
+                "2|row:2",
+                "8|call:1",
+                "9|call:2|1",
+                "3|row:3|10|call:3|1",
+                "2|2|row:2",
+                "4|4|row:4",
+                "NULL|NULL",
+                "4",
+                "11",
+                "11",
+                "12",
+                "2",
+                "NULL|NULL",
+                "12|named:12",
+                "NULL|NULL",
+                "21",
+                "NULL",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn numeric_loop_frames_reuse_memory_and_restore_shadowed_locals_after_errors() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

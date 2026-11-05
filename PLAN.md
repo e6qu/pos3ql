@@ -74,6 +74,9 @@ input by bypassing its constraint or by replaying already completed changes.
 
 Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.
+Keep scalar function calls in `FROM` on the scalar invocation contract: their
+named output fields form one row, including a null result. Preserve argument
+effects, output aliases, lateral references and ordinality while resuming calls.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep the original command deadline, settings, identity, snapshot and clocks

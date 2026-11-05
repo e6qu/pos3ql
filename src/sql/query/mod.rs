@@ -2093,6 +2093,7 @@ pub(crate) fn execute_index_comparison<'a>(
             &[left, right],
             super::ast::Collation::None,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -2872,6 +2873,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     &arguments[..routine.argument_count],
                     input_collation,
                     super::eval::RoutineCallAccess::Caller,
+                    input_progress::invocation_site(),
                     arena,
                 )?
                 .unwrap_or(Datum::Null)
@@ -3041,6 +3043,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             &coerced[..expected_count],
             input_collation,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -3057,6 +3060,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected scalar calls retain source ownership in FROM and expression contexts"
+    )]
     fn execute_routine<'a>(
         &self,
         slot: usize,
@@ -3064,12 +3071,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         arguments: &[Datum<'a>],
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
+        source_position: Option<InvocationSite>,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
-        let source_position = input_progress::invocation_site();
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
@@ -4518,6 +4525,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             &completed.values[..declared.argument_count],
             completed.input_collation,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -4628,7 +4636,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(slot, &routine, arguments, input_collation, access, arena)
+        self.execute_routine(
+            slot,
+            &routine,
+            arguments,
+            input_collation,
+            access,
+            input_progress::invocation_site(),
+            arena,
+        )
     }
 
     fn cast_evaluation(

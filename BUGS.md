@@ -14,6 +14,8 @@ current behavior belongs in the [owning guides](docs/README.md). Preserve
 regression coverage when changing ownership or execution: successful results
 alone cannot prove that effects ran once, constraints saw the right rows, or
 temporary references were released safely.
+Function regressions must distinguish how many columns a call returns from how
+many rows it returns; selecting output names in `FROM` exercises both contracts.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -73,6 +73,11 @@ omitted defaults run in the declared input order. Defaults share the caller's
 session: a default using `nextval('order_numbers')` updates that
 connection's `currval('order_numbers')`. Function lookup and missing-function
 errors do not run arguments to discover their types.
+In `FROM`, named `OUT` and `INOUT` parameters become result columns. A function
+returning one value produces one row, including a null value; a set-returning
+function produces the rows it returns. For example,
+`SELECT total FROM calculate_order(42)` can select its declared `OUT total`
+column without expanding a record expression in the select list.
 Aggregate support functions can refer to supported built-ins by their selected
 identifier. Using a built-in as the implementation of `CREATE CAST` or
 `CREATE OPERATOR` remains unsupported and fails explicitly with `0A000`.

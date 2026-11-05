@@ -83,7 +83,6 @@ fn set_result_exhaustion_preserves_rows_and_admits_a_later_small_append() {
 #[test]
 fn output_contract_owns_only_actual_columns_and_survives_definition_reuse() {
     let mut budget = Budget::new(1 << 18);
-    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 512, 4).unwrap();
     let scratch = Arena::new(&mut budget, "set contract conversion", 1 << 16).unwrap();
     let output = Arena::new(&mut budget, "set contract output", 1 << 16).unwrap();
     let mut routine = crate::storage::RoutineDef::EMPTY;
@@ -99,6 +98,12 @@ fn output_contract_owns_only_actual_columns_and_survives_definition_reuse() {
         ctype: ColType::Text,
         user_type: None,
     };
+    // Metadata and the two nonempty result buffers each occupy whole pool
+    // alignment units. Charge actual metadata width on every target.
+    let pool_bytes =
+        core::mem::size_of_val(&routine.result_columns[..2]).next_multiple_of(64) + 2 * 64;
+    assert!(pool_bytes < core::mem::size_of::<crate::storage::RoutineDef>());
+    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, pool_bytes, 4).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let mut result = PlpgsqlSetResult::for_routine(&routine, &pool).unwrap();
         routine.result_columns.fill(RoutineArgumentDef::EMPTY);
@@ -114,7 +119,7 @@ fn output_contract_owns_only_actual_columns_and_survives_definition_reuse() {
         assert_eq!(scratch.used(), 0);
         let rows = result.rows(&output).unwrap();
         drop(result);
-        assert_eq!(pool.lease::<u8>(512).unwrap().capacity(), 512);
+        assert_eq!(pool.lease::<u8>(pool_bytes).unwrap().capacity(), pool_bytes);
         assert_eq!(
             decode_projected_col_record(rows[0], 0, &output).unwrap(),
             Datum::Int4(7)

@@ -484,6 +484,15 @@ failures. Catch those deliberately with `WHEN query_canceled` or
 Procedural dispatch checks deadlines at block entry and before each instruction,
 including empty loop bodies. A matched cancellation handler consumes an expired
 timeout while preserving a future timer after a user-raised cancellation.
+A command keeps its original deadline through input preparation and cache waits;
+nested SQL does not start a new timer. Extended-protocol Parse, Bind, Describe
+and Execute share the connection's timer until Execute or Sync finishes. For
+example, pausing a client between Bind and Execute does not buy the query more
+time. Another connection uses its own deadline. COPY retains its original timer
+between data messages: an expired incoming row fails with `57014`; finishing an
+empty stream does not itself require a row check. The
+[PostgreSQL probe](../tests/external/reference/2026-11-05-procedural-deadlines/README.md)
+records these boundaries; native tests also interleave connections.
 Its completed control effects must not be replayed after a wait; retained handler
 positions remain part of the execution work in [PLAN.md](../PLAN.md).
 

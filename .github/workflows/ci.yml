@@ -125,6 +125,7 @@ jobs:
             "$RUNNER_TEMP/native-test-artifact" "$GITHUB_SHA" "$NATIVE_TARGET")
           python3 tools/test_command.py "$native_test_binary" \
             routine_calls:: procedural_progress:: procedural_subtransactions:: \
+            protocol_deadlines_survive_message_boundaries_without_leaking_to_other_connections \
             object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing \
             --test-threads=1
 

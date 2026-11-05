@@ -69,6 +69,7 @@ pub(crate) struct RequestInputProgress {
     pub waiting: Option<PendingTypeInput>,
     pub complete: bool,
     pub mark: super::txn::StatementMark,
+    pub deadline: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

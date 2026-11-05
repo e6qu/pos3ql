@@ -862,6 +862,20 @@ pub fn arm_timeout(timeout_ms: u64) {
     DEADLINE.with(|d| d.set(dl));
 }
 
+/// The worker lends its timer to one connection or embedded invocation. Nested
+/// execution restores the caller's timer, including on errors and unwinding.
+pub(crate) struct DeadlineScope(i64);
+
+pub(crate) fn enter_deadline_scope() -> DeadlineScope {
+    DeadlineScope(statement_deadline())
+}
+
+impl Drop for DeadlineScope {
+    fn drop(&mut self) {
+        restore_statement_deadline(self.0);
+    }
+}
+
 pub(crate) fn statement_deadline() -> i64 {
     DEADLINE.with(Cell::get)
 }

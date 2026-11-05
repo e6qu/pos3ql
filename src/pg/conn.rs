@@ -443,6 +443,8 @@ pub struct Conn {
     portals: Vec<Portal>,
     /// Unpublished portal whose decoded parameters survive a planning wait.
     pending_bind: Option<usize>,
+    /// None means a new protocol command; Some(0) is an explicitly untimed one.
+    command_deadline: Option<i64>,
     phase: Phase,
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
@@ -614,6 +616,7 @@ impl Conn {
             prepared,
             portals,
             pending_bind: None,
+            command_deadline: None,
             phase: Phase::Startup,
             minor: 0,
             id: 0,
@@ -675,6 +678,7 @@ impl Conn {
         self.parked_generation = 0;
         self.parked_wait = crate::sql::StatementWait::Lock;
         self.parked_deadline = None;
+        self.command_deadline = None;
         self.resume_statement = 0;
         self.tls = None;
         self.pending_tls = None;
@@ -818,6 +822,7 @@ impl Conn {
             .filter(|length| *length <= self.recv.len())
             .unwrap_or(self.recv.len());
         self.recv.consume(message_bytes);
+        self.command_deadline = None;
         self.abandon_pending_bind();
         self.finish_lock_wait();
         self.sqlprep.clear_request_type_inputs();
@@ -1941,7 +1946,9 @@ impl Conn {
             return step;
         }
 
-        if self.copy.is_some() {
+        if let Some(copy) = &self.copy {
+            let _deadline_scope = crate::sql::query::enter_deadline_scope();
+            self.txn.restore_statement_deadline(copy.deadline);
             let step = self.process_copy_message(engine, msg_type, total);
             if !matches!(step, Step::Close | Step::Parked) {
                 self.recv.consume(total);
@@ -1969,6 +1976,23 @@ impl Conn {
             return Step::Continue;
         }
 
+        let _deadline_scope = crate::sql::query::enter_deadline_scope();
+        if matches!(
+            msg_type,
+            wire::FMSG_PARSE | wire::FMSG_BIND | wire::FMSG_DESCRIBE | wire::FMSG_EXECUTE
+        ) {
+            if let Some(deadline) = self.command_deadline {
+                self.txn.restore_statement_deadline(deadline);
+            } else {
+                self.txn
+                    .enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                        timeout_ms: self.guc.statement_timeout_ms(),
+                    });
+                self.command_deadline = Some(crate::sql::query::statement_deadline());
+            }
+        } else {
+            crate::sql::query::disarm_timeout();
+        }
         let step = match msg_type {
             wire::FMSG_QUERY => self.handle_query(engine, total),
             wire::FMSG_TERMINATE => Step::Close,
@@ -2079,6 +2103,15 @@ impl Conn {
             }
             self.finish_lock_wait();
             engine.finish_backend_statement(&self.txn, self.id);
+        }
+        if !matches!(step, Step::Parked)
+            && (matches!(
+                msg_type,
+                wire::FMSG_QUERY | wire::FMSG_SYNC | wire::FMSG_EXECUTE
+            ) || self.phase == Phase::SkipToSync
+                || matches!(step, Step::Close))
+        {
+            self.command_deadline = None;
         }
         step
     }
@@ -3138,10 +3171,11 @@ impl Conn {
                 &mut responder,
                 self.id,
                 lock_timeout_expired,
+                crate::sql::StatementTimeoutEntry::Nested,
             )
         };
         let bound_inputs = match bound_inputs {
-            Ok(Ok(bytes)) => bytes,
+            Ok(Ok(inputs)) => inputs.encoded,
             Ok(Err(error))
                 if error.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT =>
@@ -3820,6 +3854,7 @@ impl Conn {
                         self.id,
                         lock_timeout_expired,
                         prepared.type_inputs(),
+                        crate::sql::StatementTimeoutEntry::Nested,
                     )
                 } else {
                     let mut responder = Responder::for_execute(&mut self.send, rfmt);
@@ -3836,6 +3871,7 @@ impl Conn {
                         self.id,
                         lock_timeout_expired,
                         prepared.type_inputs(),
+                        crate::sql::StatementTimeoutEntry::Nested,
                     )
                 }
             });
@@ -3898,7 +3934,7 @@ impl Conn {
                     return Step::Close;
                 }
             }
-            if let Some(setup) = pending_copy {
+            if let Some((setup, deadline)) = pending_copy {
                 if paged {
                     let portal = &mut self.portals[portal_slot];
                     let bytes_ok = self.send.append(portal.result.readable());
@@ -3914,6 +3950,7 @@ impl Conn {
                 self.copy_transition_scratch.clear();
                 self.copy = Some(CopyInProgress {
                     setup,
+                    deadline,
                     count: 0,
                     ignored: 0,
                     line: 0,
@@ -4109,13 +4146,14 @@ impl Conn {
                 // A COPY FROM STDIN holds its query cycle open: the
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
-                if let Some(setup) = engine.take_pending_copy() {
+                if let Some((setup, deadline)) = engine.take_pending_copy() {
                     let header_pending =
                         !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                     let binary_header_pending = setup.fmt.binary;
                     self.copy_transition_scratch.clear();
                     self.copy = Some(CopyInProgress {
                         setup,
+                        deadline,
                         count: 0,
                         ignored: 0,
                         line: 0,
@@ -5462,6 +5500,7 @@ enum Step {
 /// PostgreSQL does), and whether the classic `\.` end marker was seen.
 struct CopyInProgress {
     setup: crate::sql::exec::CopySetup,
+    deadline: i64,
     count: u64,
     ignored: u64,
     line: u64,
@@ -5923,6 +5962,160 @@ mod tests {
             bytes = &bytes[1 + length as usize..];
         }
         false
+    }
+
+    #[test]
+    fn protocol_deadlines_survive_message_boundaries_without_leaking_to_other_connections() {
+        fn message(conn: &mut Conn, engine: &mut Engine, kind: u8, payload: &[u8]) {
+            let bytes = frontend(kind, payload);
+            conn.send.clear();
+            assert!(conn.recv.append(&bytes));
+            assert!(matches!(
+                crate::mem::guard::forbid_alloc(|| conn.process_message(engine)),
+                Step::Continue
+            ));
+            assert!(conn.recv.is_empty());
+        }
+        let _deadline_scope = crate::sql::query::enter_deadline_scope();
+        crate::sql::query::restore_statement_deadline(i64::MAX);
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = Config::default_dev();
+            config.data_dir = std::env::temp_dir()
+                .join(format!(
+                    "pos3ql-protocol-deadlines-{}-{mode:?}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            config.remove_test_data_dir_on_drop();
+            config.transaction_mode = mode;
+            config.max_tables = 4;
+            config.max_connections = 2;
+            config.row_overlay_slots = 64;
+            let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut conn = Conn::new(&config, &mut budget).unwrap();
+            let mut other = Conn::new(&config, &mut budget).unwrap();
+            conn.id = 1;
+            other.id = 2;
+            conn.phase = Phase::Ready;
+            other.phase = Phase::Ready;
+            conn.guc
+                .set_config("statement_timeout", Some("1s"), false)
+                .unwrap();
+            for boundary in [wire::FMSG_PARSE, wire::FMSG_BIND, wire::FMSG_DESCRIBE] {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_PARSE,
+                    b"s\0SELECT 7\0\0\0",
+                );
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                let parse_deadline = conn.command_deadline.expect("Parse owns the timer");
+                assert_ne!(parse_deadline, 0);
+                if boundary != wire::FMSG_PARSE {
+                    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
+                    assert_eq!(conn.command_deadline, None);
+                    if boundary == wire::FMSG_BIND {
+                        message(
+                            &mut conn,
+                            &mut engine,
+                            wire::FMSG_BIND,
+                            b"p\0s\0\0\0\0\0\0\0",
+                        );
+                    } else {
+                        message(&mut conn, &mut engine, wire::FMSG_DESCRIBE, b"Ss\0");
+                    }
+                    assert!(conn.command_deadline.is_some());
+                }
+                conn.command_deadline = Some(i64::MAX);
+                message(&mut conn, &mut engine, wire::FMSG_DESCRIBE, b"Ss\0");
+                assert_eq!(conn.command_deadline, Some(i64::MAX));
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                message(&mut other, &mut engine, wire::FMSG_QUERY, b"SELECT 9\0");
+                assert!(!has_backend_message(
+                    other.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                assert_eq!(crate::sql::query::statement_deadline(), i64::MAX);
+                conn.command_deadline = Some(i64::MIN);
+                if boundary == wire::FMSG_BIND {
+                    message(&mut conn, &mut engine, wire::FMSG_EXECUTE, b"p\0\0\0\0\0");
+                } else {
+                    message(
+                        &mut conn,
+                        &mut engine,
+                        wire::FMSG_BIND,
+                        b"p\0s\0\0\0\0\0\0\0",
+                    );
+                }
+                assert!(has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(5)
+                        .any(|value| value == b"57014")
+                );
+                assert_eq!(conn.phase, Phase::SkipToSync);
+                assert_eq!(conn.command_deadline, None);
+                assert_eq!(crate::sql::query::statement_deadline(), i64::MAX);
+                message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
+                message(&mut conn, &mut engine, wire::FMSG_QUERY, b"SELECT 7\0");
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Ss\0");
+            }
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_QUERY,
+                b"CREATE TABLE deadline_copy(id integer)\0",
+            );
+            for with_row in [false, true] {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_QUERY,
+                    b"COPY deadline_copy FROM STDIN\0",
+                );
+                let copy = conn.copy.as_mut().expect("COPY transfers its timer");
+                assert_ne!(copy.deadline, 0);
+                copy.deadline = i64::MIN;
+                message(&mut other, &mut engine, wire::FMSG_QUERY, b"SELECT 9\0");
+                if with_row {
+                    message(&mut conn, &mut engine, wire::FMSG_COPY_DATA, b"1\n");
+                }
+                message(&mut conn, &mut engine, wire::FMSG_COPY_DONE, &[]);
+                assert_eq!(
+                    has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),
+                    with_row
+                );
+                if with_row {
+                    assert!(
+                        conn.send
+                            .readable()
+                            .windows(5)
+                            .any(|value| value == b"57014")
+                    );
+                }
+                assert!(conn.copy.is_none());
+                assert_eq!(crate::sql::query::statement_deadline(), i64::MAX);
+            }
+        }
     }
 
     #[test]

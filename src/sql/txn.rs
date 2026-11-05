@@ -1523,7 +1523,15 @@ impl TxnState {
         }
     }
 
-    pub(super) fn enter_statement_timeout(&mut self, timeout_ms: u64) {
+    pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
+        let timeout_ms = match entry {
+            super::StatementTimeoutEntry::Command { timeout_ms } => timeout_ms,
+            super::StatementTimeoutEntry::Captured { deadline } => {
+                self.restore_statement_deadline(deadline);
+                return;
+            }
+            super::StatementTimeoutEntry::Nested => return,
+        };
         if self.staged_commit.is_some() {
             super::query::disarm_timeout();
         } else if let Some(deadline) = self.suspended_statement_deadline() {
@@ -1536,7 +1544,7 @@ impl TxnState {
         }
     }
 
-    pub(super) fn restore_statement_deadline(&self, deadline: i64) {
+    pub(crate) fn restore_statement_deadline(&self, deadline: i64) {
         super::query::restore_statement_deadline(if self.statement_timeout_consumed {
             0
         } else {

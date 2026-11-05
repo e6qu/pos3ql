@@ -2848,12 +2848,16 @@ mod deadline_ownership_tests {
                 crate::sql::exec::PlpgsqlTransactionContext::Atomic,
             );
             assert_eq!(txn.suspended_statement_deadline(), Some(0));
-            txn.enter_statement_timeout(60_000);
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 60_000,
+            });
             assert_eq!(statement_deadline(), 0);
             txn.clear();
             txn.restore_statement_deadline(i64::MIN);
             assert_eq!(statement_deadline(), 0);
-            txn.enter_statement_timeout(0);
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
             restore_statement_deadline(i64::MAX);
             txn.catch_query_cancellation(0);
             assert_eq!(statement_deadline(), i64::MAX);
@@ -2867,10 +2871,14 @@ mod deadline_ownership_tests {
                 crate::sql::exec::PlpgsqlTransactionContext::Atomic,
             );
             disarm_timeout();
-            txn.enter_statement_timeout(0);
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
             assert_eq!(statement_deadline(), i64::MAX);
             txn.release_suspended_statement();
-            txn.enter_statement_timeout(0);
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
             assert_eq!(statement_deadline(), 0);
         });
     }

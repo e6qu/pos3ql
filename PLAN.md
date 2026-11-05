@@ -71,7 +71,10 @@ bodies, complex query plans, SQL cursors and results already sent to the client.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep cancellation state with the command through input binding, cache waits,
-procedural handlers and internal commits. An empty or `NULL`-only loop must
+procedural handlers and internal commits. Protocol deadlines now belong to the
+connection between Parse, Bind, Describe and Execute, and COPY retains its timer
+while waiting for client data. Keep native interleaving and recovery coverage
+while adding saved procedural positions. An empty or `NULL`-only loop must
 observe its deadline. Exercise timer ownership with explicit timestamps under
 Miri isolation, and exercise the real clock in native runtime tests. A caught timeout must not be delivered again or replay
 the timed-out loop when its handler waits; a user-raised cancellation must not

@@ -13,6 +13,58 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CoverageBuildFailureTest(unittest.TestCase):
+    def test_external_coverage_builds_runs_and_reports_the_same_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for directory in ["tools", "src", "commands", "tests/external", "target/release"]:
+                (root / directory).mkdir(parents=True, exist_ok=True)
+            (root / "src/lib.rs").write_text("// fixture\n")
+            shutil.copyfile(ROOT / "tools/coverage.sh", root / "tools/coverage.sh")
+            stale = root / "target/release/pos3ql"
+            stale.write_text("#!/bin/sh\nexit 99\n")
+            stale.chmod(0o755)
+            (root / "tests/external/run.sh").write_text('exec "$POS3QL_BIN"\n')
+            cargo = root / "commands/cargo"
+            cargo.write_text("""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ['CARGO_CALLS']).open('a') as calls:
+    calls.write(json.dumps(args) + '\\n')
+if args == ['llvm-cov', 'show-env', '--sh']:
+    print('export LLVM_PROFILE_FILE=target/fixture.profraw')
+elif args == ['build', '--profile', 'coverage', '--locked']:
+    binary = Path('target/coverage/pos3ql')
+    binary.parent.mkdir(parents=True)
+    binary.write_text('#!/bin/sh\\nprintf profile > "$LLVM_PROFILE_FILE"\\nprintf "PASS: instrumented coverage server\\\\n"\\n')
+    binary.chmod(0o755)
+elif args[:4] == ['llvm-cov', 'report', '--profile', 'coverage']:
+    assert Path('target/fixture.profraw').read_text() == 'profile'
+    Path(args[args.index('--output-path') + 1]).write_text('TN:fixture')
+else:
+    raise SystemExit(58)
+""")
+            cargo.chmod(0o755)
+            llvm_cov = root / "commands/cargo-llvm-cov"
+            llvm_cov.write_text("#!/bin/sh\nexit 59\n")
+            llvm_cov.chmod(0o755)
+            calls = root / "cargo-calls.jsonl"
+            output = root / "coverage.lcov"
+            environment = dict(os.environ,
+                PATH=str(root / "commands") + os.pathsep + os.environ["PATH"],
+                CARGO_CALLS=str(calls), COVERAGE_SHARD="run:probe",
+                COVERAGE_LCOV=str(output))
+            result = subprocess.run(["sh", str(root / "tools/coverage.sh")],
+                cwd=root, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(output.read_text(), "TN:fixture")
+            self.assertIn("PASS: instrumented coverage server", result.stdout)
+            self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()], [
+                ["llvm-cov", "show-env", "--sh"],
+                ["build", "--profile", "coverage", "--locked"],
+                ["llvm-cov", "report", "--profile", "coverage", "--lcov", "--output-path", str(output)],
+            ])
+
     def test_library_debugger_keeps_selection_stack_parallelism_and_failed_status(self):
         for test_status in [0, 139]:
             with self.subTest(test_status=test_status), tempfile.TemporaryDirectory() as temporary:
@@ -44,11 +96,12 @@ from pathlib import Path
 args = sys.argv[1:]
 if args == ['llvm-cov', 'show-env', '--sh']:
     print('export LLVM_PROFILE_FILE=fixture.profraw')
-elif args == ['test', '--locked', '--lib', '--release', '--no-run', '--message-format=json-render-diagnostics']:
+elif args == ['test', '--locked', '--lib', '--profile', 'coverage', '--no-run', '--message-format=json-render-diagnostics']:
     print(json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'pos3ql', 'kind': ['lib']},
         'profile': {'test': True}, 'executable': os.environ['NATIVE_TEST']}))
     print(json.dumps({'reason': 'build-finished', 'success': True}))
 elif args[:2] == ['llvm-cov', 'report']:
+    assert args[2:4] == ['--profile', 'coverage']
     Path(os.environ['COVERAGE_LCOV']).write_text('TN:fixture')
 else:
     raise SystemExit(58)
@@ -117,7 +170,7 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                     "        sys.exit(37)\n"
                     "    print('export LLVM_PROFILE_FILE=probe.profraw')\n"
                     "    sys.exit(0)\n"
-                    "if sys.argv[1:] == ['build', '--release', '--locked']:\n"
+                    "if sys.argv[1:] in (['build', '--release', '--locked'], ['build', '--profile', 'coverage', '--locked']):\n"
                     "    print('deliberate compiler failure', file=sys.stderr)\n"
                     "    print('final compiler diagnostic', file=sys.stderr)\n"
                     "    sys.exit(37)\n"
@@ -155,7 +208,8 @@ raise SystemExit(subprocess.run(command, check=False).returncode)
                 actual = [json.loads(line) for line in calls.read_text().splitlines()]
                 expected = [["build", "--release", "--locked"]]
                 if shard == "run:probe":
-                    expected.insert(0, ["llvm-cov", "show-env", "--sh"])
+                    expected = [["llvm-cov", "show-env", "--sh"],
+                        ["build", "--profile", "coverage", "--locked"]]
                 if failure == "environment":
                     expected.pop()
                 self.assertEqual(actual, expected)

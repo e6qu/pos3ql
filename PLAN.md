@@ -119,6 +119,9 @@ presence alone is not support. Preserve values, declared types, null handling,
 errors, argument effects and permission checks. Keep the real SQLAlchemy,
 Alembic, psycopg2 and other client comparisons, all four full workflows, and
 native Linux amd64/arm64 and macOS arm64 coverage on the finished revision.
+Keep library, server and report instrumentation on the same explicit coverage
+profile. Verify build and execution timings within the existing job limits;
+compilation exhaustion must not be mistaken for a stalled SQL test.
 
 ### Share fixed memory and disk capacity according to demand
 

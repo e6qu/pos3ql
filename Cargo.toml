@@ -36,3 +36,9 @@ checkpoint-profile = []
 
 [profile.release]
 panic = "abort"
+
+# Instrumented builds need line coverage, without full release optimization
+# dominating the fixed CI budget. Production release settings remain separate.
+[profile.coverage]
+inherits = "release"
+opt-level = 1

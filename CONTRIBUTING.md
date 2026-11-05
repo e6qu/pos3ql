@@ -93,6 +93,11 @@ the same test selection and ordinary test parallelism. A crash still fails
 the job; the debugger does not retry or resume it. GDB launches the executable
 directly: rebuilding thousands of test filters as one shell argument exceeds
 Linux's argument-size limit before the tests start.
+Coverage builds, library execution, server execution and reports all select the
+`coverage` Cargo profile. It inherits release behavior with optimization level
+1, keeping instrumentation compilation inside the fixed job budget. Production
+release builds and their correctness/performance gates keep release settings.
+The 70% merged coverage floor and all test selections remain unchanged.
 A historical crash reproduction records its source revision, compiler/coverage
 versions, original test partition, stack limit, ordinary test parallelism and
 process outcome. Its artifact describes that failed revision. Finish current-head
@@ -171,6 +176,12 @@ at the existing statement capacity. Include a shadowed counter, a caught error
 and a nonlocal exit; verify locals and `FOUND`, and prove inactive frames release
 references before temporary memory is reused. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
+Repeat queries and nested results on every iteration at unchanged capacity;
+short loops cannot prove that discarded work is reclaimed. Function comparisons
+must cover output names in `FROM`, nulls, whole and nested named rows, and field
+constraints that call helpers with side effects. Keep extended fixtures within
+their configured catalog limits by releasing completed definitions between
+transactions; retain every assertion and the original capacities.
 Coverage library partitions stream compiler output and each test's progress
 through the native allocation-error reporter. Use those timestamps to locate
 deadline overruns; buffered output must not hide the last running test.

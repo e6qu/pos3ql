@@ -76,22 +76,14 @@ Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
-Keep cancellation state with the command through input binding, cache waits,
-procedural handlers and internal commits. Protocol deadlines now belong to the
-connection between Parse, Bind, Describe and Execute, and COPY retains its timer
-while waiting for client data. Keep native interleaving and recovery coverage
-while adding saved procedural positions. Preserve timeout checks before
-buffered replies and protocol control messages, including recovery when Sync
-itself delivers the timeout. Keep publication receipts protected from deadlines
-restored by any command-entry mode. COPY start, row and completion paths
-now bind the owning session explicitly; preserve settings rollback inside row
-and statement trigger handlers, including interleaved text/binary streams. Bind
-identity, name resolution, rendering and the original statement/transaction
-clock at the same resumed-message boundary. An empty or `NULL`-only loop must
-observe its deadline. Exercise timer ownership with explicit timestamps under
-Miri isolation, and exercise the real clock in native runtime tests. A caught timeout must not be delivered again or replay
-the timed-out loop when its handler waits; a user-raised cancellation must not
-disable a future timeout.
+Keep the original command deadline, settings, identity, snapshot and clocks
+while binding inputs, waiting, running handlers or crossing internal commits.
+Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-request-path),
+including buffered replies, error recovery and protected commit receipts.
+A caught timeout must not be delivered again or replay completed work when its
+handler waits; a user-raised cancellation must not disable a future timeout.
+Keep loop-frame memory bounded by active nesting while saving branch, loop and
+handler positions. Frame reuse alone does not retain execution across waits.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait
 must not publish that prefix twice. Static `SELECT INTO` and dynamic `EXECUTE
 INTO` retain PostgreSQL's different row-consumption rules.

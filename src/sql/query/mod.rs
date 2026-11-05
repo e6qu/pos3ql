@@ -1,14 +1,10 @@
 //! SELECT execution: one pipeline for single tables and joins.
 //!
-//! Shape: resolve the FROM clause into a scope → enumerate source rows
-//! (nested-loop joins, LEFT emitting a null row) → WHERE → then either
-//! stream straight to the wire, or materialize projected rows as tagged
-//! byte strings in the statement arena for GROUP BY / DISTINCT / ORDER BY.
-//! ORDER BY keys ride along as hidden columns after the visible ones, so
-//! arbitrary key expressions order both plain and joined queries.
-//!
-//! Subqueries are uncorrelated and pre-evaluated once per statement; their
-//! results are injected into evaluation by node identity (EvalHooks).
+//! Binds FROM sources, chooses the supported scan or join path, filters rows,
+//! then streams results or materializes them for grouping, windows and sorting.
+//! Hidden ORDER BY values travel with projected rows. SQL scans prepare
+//! uncorrelated subqueries once and correlated subqueries per outer row;
+//! procedural expressions evaluate only the subqueries they reach.
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::{Responder, ResultFmt};

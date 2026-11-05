@@ -156,6 +156,15 @@ or an explicit `BEGIN`, still prevents that command with `25001`. Query analysis
 pins the data snapshot; preparing a transaction-setting utility does not. Errors
 roll back implicit work, while an explicit failed block remains failed until a
 transaction-exit command such as `ROLLBACK`.
+The connection retains its original command deadline between Parse, Bind,
+Describe and Execute. Idle time does not renew that timer: the next supported
+message checks it before producing buffered rows or replies, including Flush,
+Close and Sync. An expired Sync still completes error recovery with
+ReadyForQuery. COPY also rebinds its owning session, identity, search path,
+rendering settings and original statement/transaction timestamps at start,
+each row and completion. Another connection cannot lend it settings or reset
+its clock. Once durable publication starts, timer restoration cannot cancel
+the required commit receipt.
 Standalone utilities with an immediate commit boundary, such as `CREATE DATABASE`,
 complete durable publication before their Execute response. A storage wait resumes
 that publication without executing the utility again. Prepared resolution retains
@@ -194,6 +203,18 @@ If restarting would lose their data writes
 or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
+
+Numeric `FOR` loops reserve reusable local-variable frames before running a
+call's local initializers. The reservation follows maximum simultaneous loop
+nesting, rather than iteration count or the number of separate loops in the
+source. Layout checks every branch and reserves only the largest local scope
+needed at each depth; shadowed counters reuse their existing local slot.
+Entering a loop copies its current scope into that depth's frame; leaving
+copies back assignments while restoring the shadowed counter. Returning
+the frame clears references into completed temporary work. These frames remain
+inside the existing statement arena; `54000` names insufficient capacity.
+This prevents repeated inner-loop entry from consuming fresh local buffers.
+It does not yet save a function's execution position across a storage wait.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind
 and remote savepoint mirroring with explicit SQL savepoints. Every admission,

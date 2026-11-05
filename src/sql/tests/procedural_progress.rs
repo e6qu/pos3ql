@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn numeric_loop_frames_reuse_memory_and_restore_shadowed_locals_after_errors() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("reused-numeric-frames-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql = include_str!("../../../tests/external/differential/243_numeric_loop_frames.sql");
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(
+            data_rows(&output),
+            ["32767|outside|1|t", "outside|5", "returned:1:1"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn expired_procedural_blocks_stop_before_empty_and_scalar_only_control_flow() {
     struct RestoreDeadline(i64);
     impl Drop for RestoreDeadline {

@@ -791,7 +791,9 @@ pub(crate) use describe::{
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
 
+mod numeric_loops;
 mod projected;
+use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
     encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
@@ -3950,7 +3952,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         ..invocation
     };
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::default();
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
     initialize_trigger_locals(
         context,
         invocation,
@@ -18028,6 +18030,7 @@ impl<'a> PlpgsqlSetResult<'a> {
 /// Per-function execution state, deliberately distinct from local variables
 /// and transaction state. Nested trigger functions receive a fresh value.
 struct TriggerExecutionStatus<'a> {
+    numeric_frames: NumericLoopFrames<'a>,
     found: Option<bool>,
     row_count: i64,
     set_result: Option<*mut PlpgsqlSetResult<'a>>,
@@ -18037,9 +18040,14 @@ struct TriggerExecutionStatus<'a> {
     set_output_shadow_depth: [u8; MAX_ROUTINE_OUTPUT_COLUMNS],
 }
 
-impl<'a> Default for TriggerExecutionStatus<'a> {
-    fn default() -> Self {
-        Self {
+impl<'a> TriggerExecutionStatus<'a> {
+    fn new(
+        arena: &'a Arena,
+        block: TriggerBlock<'a>,
+        locals: &[TriggerLocalDecl<'a>],
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            numeric_frames: NumericLoopFrames::new(arena, block, locals)?,
             found: Some(false),
             row_count: 0,
             set_result: None,
@@ -18047,11 +18055,8 @@ impl<'a> Default for TriggerExecutionStatus<'a> {
             set_output_count: 0,
             set_output_values: [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS],
             set_output_shadow_depth: [0; MAX_ROUTINE_OUTPUT_COLUMNS],
-        }
+        })
     }
-}
-
-impl<'a> TriggerExecutionStatus<'a> {
     fn collect_set_rows(&mut self, result: &mut PlpgsqlSetResult<'a>) {
         self.set_result = Some(result);
     }
@@ -21224,7 +21229,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::default();
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21301,7 +21306,7 @@ pub(crate) fn execute_event_trigger<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::default();
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21455,7 +21460,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::default();
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21626,7 +21631,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::default();
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21797,6 +21802,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
+    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21810,7 +21816,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         local_values,
     )?;
     let mut result = PlpgsqlSetResult::for_routine(routine);
-    let mut status = TriggerExecutionStatus::default();
     status.collect_set_rows(&mut result);
     let mut output_local_indices = [0usize; MAX_ROUTINE_OUTPUT_COLUMNS];
     for (index, output) in output_columns.iter().enumerate() {
@@ -28653,10 +28658,16 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     let existing = locals.iter().position(|local| local.name == program.target);
                     let target = existing.unwrap_or(locals.len());
                     let count = locals.len() + usize::from(existing.is_none());
-                    let loop_locals = context
-                        .arena
-                        .alloc_slice_with(count, |index| {
-                            if index == target {
+                    let frame = status.numeric_frames.take()?;
+                    let result = (|| {
+                        let loop_locals = frame.locals.get_mut(..count).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "PL/pgSQL numeric loop local capacity exhausted"
+                            )
+                        })?;
+                        for (index, local) in loop_locals.iter_mut().enumerate() {
+                            *local = if index == target {
                                 TriggerLocalDecl {
                                     name: program.target,
                                     ctype: ColType::Int4,
@@ -28664,67 +28675,75 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                                 }
                             } else {
                                 locals[index]
-                            }
-                        })
-                        .map_err(|_| super::query::arena_full_pub())?;
-                    let loop_values = allocate_plpgsql_local_values(context.arena, count)?;
-                    loop_values[..locals.len()].copy_from_slice(&local_values[..locals.len()]);
-                    let prior_target = loop_values[target];
-                    status.shadow_output_local(target)?;
-                    let mut iterated = false;
-                    let result = (|| {
-                        let mut value = lower;
-                        while if reverse {
-                            value >= upper
-                        } else {
-                            value <= upper
-                        } {
-                            iterated = true;
-                            loop_values[target] = Datum::Int4(value);
-                            match execute_trigger_block(
-                                context,
-                                definition,
-                                invocation,
-                                old,
-                                new,
-                                before,
-                                transition_relations,
-                                loop_locals,
-                                loop_values,
-                                program.block,
-                                status,
-                                exception,
-                            )? {
-                                Some(TriggerFlow::Return(result)) => {
-                                    return Ok(Some(TriggerFlow::Return(result)));
-                                }
-                                Some(TriggerFlow::Exit(0)) => break,
-                                Some(TriggerFlow::Continue(0)) | None => {}
-                                Some(TriggerFlow::Exit(unwind)) => {
-                                    return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                                }
-                                Some(TriggerFlow::Continue(unwind)) => {
-                                    return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                                }
-                            }
-                            let Some(next) = (if reverse {
-                                value.checked_sub(step)
-                            } else {
-                                value.checked_add(step)
-                            }) else {
-                                break;
                             };
-                            value = next;
                         }
-                        Ok(None)
+                        let loop_values = frame.values.get_mut(..count).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "PL/pgSQL numeric loop value capacity exhausted"
+                            )
+                        })?;
+                        loop_values.fill(Datum::Null);
+                        loop_values[..locals.len()].copy_from_slice(&local_values[..locals.len()]);
+                        let prior_target = loop_values[target];
+                        status.shadow_output_local(target)?;
+                        let mut iterated = false;
+                        let result = (|| {
+                            let mut value = lower;
+                            while if reverse {
+                                value >= upper
+                            } else {
+                                value <= upper
+                            } {
+                                iterated = true;
+                                loop_values[target] = Datum::Int4(value);
+                                match execute_trigger_block(
+                                    context,
+                                    definition,
+                                    invocation,
+                                    old,
+                                    new,
+                                    before,
+                                    transition_relations,
+                                    loop_locals,
+                                    loop_values,
+                                    program.block,
+                                    status,
+                                    exception,
+                                )? {
+                                    Some(TriggerFlow::Return(result)) => {
+                                        return Ok(Some(TriggerFlow::Return(result)));
+                                    }
+                                    Some(TriggerFlow::Exit(0)) => break,
+                                    Some(TriggerFlow::Continue(0)) | None => {}
+                                    Some(TriggerFlow::Exit(unwind)) => {
+                                        return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                                    }
+                                    Some(TriggerFlow::Continue(unwind)) => {
+                                        return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                                    }
+                                }
+                                let Some(next) = (if reverse {
+                                    value.checked_sub(step)
+                                } else {
+                                    value.checked_add(step)
+                                }) else {
+                                    break;
+                                };
+                                value = next;
+                            }
+                            Ok(None)
+                        })();
+                        // Other locals retain assignments, including before an error or nonlocal exit.
+                        loop_values[target] = prior_target;
+                        local_values[..locals.len()].copy_from_slice(&loop_values[..locals.len()]);
+                        status.unshadow_output_local(target);
+                        if result.is_ok() {
+                            status.set_found(iterated);
+                        }
+                        result
                     })();
-                    // Other locals retain assignments, including before an error or nonlocal exit.
-                    loop_values[target] = prior_target;
-                    local_values[..locals.len()].copy_from_slice(&loop_values[..locals.len()]);
-                    status.unshadow_output_local(target);
-                    if result.is_ok() {
-                        status.set_found(iterated);
-                    }
+                    status.numeric_frames.restore(frame);
                     return result;
                 }
                 let target = trigger_local_index(locals, program.target)?;
@@ -30265,7 +30284,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         };
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-        let mut status = TriggerExecutionStatus::default();
+        let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals)?;
         initialize_trigger_locals(
             &mut context,
             invocation,

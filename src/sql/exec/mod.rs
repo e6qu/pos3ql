@@ -23178,7 +23178,8 @@ fn eval_procedural_expression<'a>(
     };
     let txid = context.txn.txid;
     let prepared = match site {
-        Some(site) => Some(
+        Some(site) => Some((
+            site,
             engine
                 .prepare_plpgsql_inputs(
                     row.invocation.input_plan_key(site)?,
@@ -23198,17 +23199,21 @@ fn eval_procedural_expression<'a>(
                         "PL/pgSQL type input exceeds the send buffer"
                     )
                 })??,
-        ),
+        )),
         None => None,
     };
-    let expression = match (site, prepared.as_ref()) {
-        (Some(site), Some(prepared)) => super::parser::parse_expression_with_type_inputs(
-            site.text,
-            prepared.bindings,
-            arena,
-            |parser| super::type_inputs::validate_restored(parser, &engine.storage, txid),
-        )?,
-        _ => expression,
+    // Empty substitutions reuse the compiled expression; reparsing it on
+    // every loop entry would consume fresh statement memory.
+    let expression = match prepared.as_ref() {
+        Some((site, prepared)) if !prepared.bindings.is_empty() => {
+            super::parser::parse_expression_with_type_inputs(
+                site.text,
+                prepared.bindings,
+                arena,
+                |parser| super::type_inputs::validate_restored(parser, &engine.storage, txid),
+            )?
+        }
+        Some(_) | None => expression,
     };
     let snapshot = engine.storage.read_snapshot();
     let mut execute = || {
@@ -23243,11 +23248,11 @@ fn eval_procedural_expression<'a>(
                 )
             })?
     };
-    match (site, prepared) {
-        (Some(site), Some(prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
+    match prepared {
+        Some((site, prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
             super::type_inputs::with_source(prepared.source, site.text, prepared.bindings, execute)
         }),
-        _ => execute(),
+        None => execute(),
     }
 }
 

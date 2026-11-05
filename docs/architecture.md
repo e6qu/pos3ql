@@ -214,6 +214,9 @@ copies back assignments while restoring the shadowed counter. Returning
 the frame clears references into completed temporary work. These frames remain
 inside the existing statement arena; `54000` names insufficient capacity.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
+Input admission also releases parser/dependency scratch when no checked values
+or planner candidates need retaining. Expressions with no input substitutions
+reuse their compiled source while keeping the normal input-owner scope.
 It does not yet save a function's execution position across a storage wait.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind

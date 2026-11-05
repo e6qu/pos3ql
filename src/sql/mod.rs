@@ -16301,6 +16301,7 @@ impl Engine {
             replayed,
             Some(type_input_plans::Lookup::Ready(_, _) | type_input_plans::Lookup::Failed(_, _))
         );
+        let parse_mark = arena.mark();
         let parsed = if replay_complete {
             None
         } else {
@@ -16342,6 +16343,10 @@ impl Engine {
                 };
                 if captured.is_empty() {
                     sqlprep.routine_inputs.retire_unused_site(key);
+                    drop(parsed);
+                    // No checked values or planner candidates escape this
+                    // admission; its parser and dependency scratch are dead.
+                    unsafe { arena.rewind_to(parse_mark) };
                     return Ok(Ok(PreparedTypeInputs {
                         owner: key.owner,
                         source,

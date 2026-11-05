@@ -19,6 +19,8 @@ as final rows, audit writes and sequence counts. A rollback-and-replay attempt
 can return the expected result while showing the constraint the wrong data.
 Caught errors must also restore schema, journal, settings and deferred work;
 test cursor creation separately from the motion of an older cursor.
+Open foreign connections inside nested exception blocks too: a savepoint list
+captured only at command admission misses boundaries created within that command.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

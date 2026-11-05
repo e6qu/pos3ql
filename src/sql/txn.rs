@@ -98,6 +98,7 @@ pub(crate) fn establish_savepoint(
     }
     storage.set_cumulative_transaction_nest_level(txn.txid, index + 2);
     guc.savepoint();
+    txn.publish_foreign_statement_context(storage)?;
     Ok(index)
 }
 
@@ -113,6 +114,7 @@ pub(crate) fn release_savepoint(
     storage.set_cumulative_transaction_nest_level(txn.txid, index + 1);
     txn.release_savepoints_from(index);
     guc.release_savepoints_from(index);
+    txn.publish_foreign_statement_context(storage)?;
     Ok(())
 }
 
@@ -1309,6 +1311,19 @@ impl TxnState {
 
     pub(crate) fn savepoint_names(&self) -> impl Iterator<Item = StackStr<63>> + '_ {
         self.savepoints.iter().map(|savepoint| savepoint.name)
+    }
+
+    pub(crate) fn publish_foreign_statement_context(
+        &self,
+        storage: &Storage,
+    ) -> Result<(), SqlError> {
+        // A remote connection can first open inside a procedural block, after
+        // command admission. Its savepoint stack must include that block.
+        storage.set_foreign_statement_context(
+            self.txid,
+            self.isolation == TransactionIsolation::Serializable,
+            self.savepoint_names(),
+        )
     }
 
     /// The ReadyForQuery status byte: idle / in transaction / failed.

@@ -3483,7 +3483,7 @@ impl Engine {
             return Ok(false);
         };
         foreign::rollback_to_savepoint(&self.storage, txn.txid, name.as_str())?;
-        self.rollback_to_savepoint(txn, index, guc, None);
+        self.rollback_to_savepoint(txn, index, guc, None)?;
         txn::release_savepoint(&self.storage, txn, guc, index)?;
         Ok(true)
     }
@@ -5658,11 +5658,7 @@ impl Engine {
     ) -> Result<CommandSnapshot, SqlError> {
         self.check_publication_health()?;
         self.storage.validate_transaction_isolation(txn.isolation)?;
-        self.storage.set_foreign_statement_context(
-            txn.txid,
-            txn.isolation == TransactionIsolation::Serializable,
-            txn.savepoint_names(),
-        )?;
+        txn.publish_foreign_statement_context(&self.storage)?;
         let resumed = if resume_statement {
             txn.resume_statement()
         } else {
@@ -8658,7 +8654,7 @@ impl Engine {
         index: usize,
         guc: &GucState,
         cursors: Option<&mut cursor::CursorPool>,
-    ) {
+    ) -> Result<(), SqlError> {
         let sp = txn.savepoint_at(index);
         for i in (sp.touched_mark..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[i];
@@ -8695,6 +8691,7 @@ impl Engine {
             guc.session_identity().refresh(&self.storage, txn.txid),
         );
         guc.publish_rollback_settings(txn);
+        txn.publish_foreign_statement_context(&self.storage)
     }
 
     /// Publishes every committed journal record accumulated since the prior
@@ -21166,7 +21163,9 @@ impl Engine {
                 if let Err(error) = foreign::rollback_to_savepoint(&self.storage, txn.txid, name) {
                     return Ok(Err(error));
                 }
-                self.rollback_to_savepoint(txn, index, guc, Some(cursors));
+                if let Err(error) = self.rollback_to_savepoint(txn, index, guc, Some(cursors)) {
+                    return Ok(Err(error));
+                }
                 responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }

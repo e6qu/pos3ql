@@ -43,6 +43,8 @@ identities now have passing allocation, recovery, native-platform and PostgreSQL
 comparison coverage. The [architecture](docs/architecture.md#the-request-path)
 and [compatibility guide](docs/postgresql-18-compatibility.md) own those current
 contracts. Keep that coverage while completing the following execution work.
+Preserve remote savepoint boundaries when the first foreign connection opens
+inside a procedural block, including after nested release or rollback.
 
 Data-change triggers still reject reached domain-array literal checks with
 `0A000`. For example, an `AFTER INSERT` trigger that evaluates

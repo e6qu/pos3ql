@@ -25823,7 +25823,7 @@ fn rollback_trigger_subtransaction(
         ..
     } = &mut context.host
     {
-        engine.rollback_to_savepoint(context.txn, boundary.index, guc, Some(cursors));
+        engine.rollback_to_savepoint(context.txn, boundary.index, guc, Some(cursors))?;
         let identity = boundary.identity.refresh(&engine.storage, context.txn.txid);
         super::eval::funcs::system::set_current_user(identity);
         engine.publish_session_context(guc, context.txn, identity.as_str())?;

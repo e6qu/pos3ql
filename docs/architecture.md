@@ -196,7 +196,10 @@ it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind
-and remote savepoint mirroring with explicit SQL savepoints. Engine-owned
+and remote savepoint mirroring with explicit SQL savepoints. Every admission,
+release and rollback refreshes the savepoint list used by a newly opened foreign
+connection. A connection first used inside a failed block must undo that block's
+remote writes too. Engine-owned
 scopes also undo catalog changes and staged journal records. Cursor creation
 marks preserve older cursor positions while releasing new, unfinished and failed
 cursor openings. Atomic row-trigger scopes have no catalog or journal owner;

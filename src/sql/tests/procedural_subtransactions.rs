@@ -1,6 +1,125 @@
 use super::*;
 
 #[test]
+fn foreign_connection_context_tracks_savepoints_changed_inside_one_command() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("foreign-procedural-savepoints-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let begin = match mode {
+            crate::config::TransactionMode::Mvcc => {
+                "BEGIN ISOLATION LEVEL SERIALIZABLE; SAVEPOINT outside"
+            }
+            crate::config::TransactionMode::Locking => {
+                "BEGIN ISOLATION LEVEL READ COMMITTED; SAVEPOINT outside"
+            }
+        };
+        session.success(&mut engine, begin, true);
+        let check = |storage: &Storage, transaction: &TxnState, expected: &[&str]| {
+            let context = storage.foreign_statement_context_for(transaction.txid);
+            assert!(
+                context
+                    .savepoints()
+                    .iter()
+                    .map(|name| name.as_str())
+                    .eq(expected.iter().copied())
+            );
+            assert_eq!(
+                context.is_serializable(),
+                transaction.isolation == TransactionIsolation::Serializable
+            );
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            check(&engine.storage, &session.transaction, &["outside"]);
+            let wal = engine.wal.stage_mark(session.transaction.txid);
+            let outer = txn::establish_savepoint(
+                &engine.storage,
+                &mut session.transaction,
+                &session.guc,
+                "__trigger_exception__",
+                wal,
+                None,
+            )
+            .unwrap();
+            check(
+                &engine.storage,
+                &session.transaction,
+                &["outside", "__trigger_exception__"],
+            );
+            let wal = engine.wal.stage_mark(session.transaction.txid);
+            let inner = txn::establish_savepoint(
+                &engine.storage,
+                &mut session.transaction,
+                &session.guc,
+                "__trigger_exception__",
+                wal,
+                None,
+            )
+            .unwrap();
+            check(
+                &engine.storage,
+                &session.transaction,
+                &["outside", "__trigger_exception__", "__trigger_exception__"],
+            );
+            txn::release_savepoint(
+                &engine.storage,
+                &mut session.transaction,
+                &session.guc,
+                inner,
+            )
+            .unwrap();
+            check(
+                &engine.storage,
+                &session.transaction,
+                &["outside", "__trigger_exception__"],
+            );
+            let wal = engine.wal.stage_mark(session.transaction.txid);
+            txn::establish_savepoint(
+                &engine.storage,
+                &mut session.transaction,
+                &session.guc,
+                "discarded",
+                wal,
+                None,
+            )
+            .unwrap();
+            engine
+                .rollback_to_savepoint(
+                    &mut session.transaction,
+                    outer,
+                    &session.guc,
+                    Some(&mut session.cursors),
+                )
+                .unwrap();
+            check(
+                &engine.storage,
+                &session.transaction,
+                &["outside", "__trigger_exception__"],
+            );
+            txn::release_savepoint(
+                &engine.storage,
+                &mut session.transaction,
+                &session.guc,
+                outer,
+            )
+            .unwrap();
+            check(&engine.storage, &session.transaction, &["outside"]);
+        });
+        session.success(&mut engine, "SAVEPOINT extra; SAVEPOINT deeper", true);
+        session.success(&mut engine, "ROLLBACK TO outside", true);
+        check(&engine.storage, &session.transaction, &["outside"]);
+        session.success(&mut engine, "RELEASE outside", true);
+        check(&engine.storage, &session.transaction, &[]);
+        session.success(&mut engine, "COMMIT", true);
+    }
+}
+
+#[test]
 fn caught_procedural_errors_restore_session_authorization_inside_the_effective_owner_scope() {
     let fixture =
         include_str!("../../../tests/external/differential/240_procedural_identity_rollback.sql");

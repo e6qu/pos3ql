@@ -8,9 +8,6 @@ Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.
 
-The active procedural-ownership PR is diagnosing a record-loop statement-memory
-failure under unchanged limits. It remains active work, not a blocked defect.
-
 Pending CI, uncollected measurements and reproducible failures being repaired
 belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;

@@ -18361,6 +18361,8 @@ impl ConfiguredTransactionSession {
     }
 
     fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        let _ = query::take_arena_full_location();
+        let _ = crate::mem::arena::take_last_allocation_failure();
         let status = self.execute_status(engine, sql, fixed_memory);
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
@@ -18370,8 +18372,10 @@ impl ConfiguredTransactionSession {
         let output = self.execute(engine, sql, fixed_memory);
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{sql}: {}",
-            String::from_utf8_lossy(&output)
+            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}",
+            String::from_utf8_lossy(&output),
+            query::take_arena_full_location(),
+            crate::mem::arena::take_last_allocation_failure(),
         );
         output
     }

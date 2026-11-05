@@ -106,12 +106,22 @@ pub(crate) struct ArenaMark {
 // move between threads. Allocation references stay within their arena borrow.
 unsafe impl Send for Arena {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArenaFull {
     pub what: &'static str,
     pub requested: usize,
     pub remaining: usize,
     pub capacity: usize,
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+thread_local! {
+    static LAST_ALLOCATION_FAILURE: Cell<Option<(ArenaFull, bool)>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+pub(crate) fn take_last_allocation_failure() -> Option<(ArenaFull, bool)> {
+    LAST_ALLOCATION_FAILURE.with(|failure| failure.take())
 }
 
 impl fmt::Display for ArenaFull {
@@ -597,12 +607,16 @@ impl Arena {
     }
 
     fn full(&self, requested: usize) -> ArenaFull {
-        ArenaFull {
+        let error = ArenaFull {
             what: self.what,
             requested,
             remaining: self.allocation_limit().saturating_sub(self.offset.get()),
             capacity: self.capacity,
-        }
+        };
+        #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+        LAST_ALLOCATION_FAILURE
+            .with(|failure| failure.set(Some((error, self.region_active.get()))));
+        error
     }
 
     fn allocation_limit(&self) -> usize {

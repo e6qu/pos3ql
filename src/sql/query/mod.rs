@@ -13061,7 +13061,23 @@ pub fn first_from_match<'a>(
     Ok(found)
 }
 
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+thread_local! {
+    static LAST_ARENA_FAILURE: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+pub(super) fn take_arena_full_location() -> Option<(&'static str, u32)> {
+    LAST_ARENA_FAILURE.with(|failure| failure.take())
+}
+
+#[track_caller]
 fn arena_full() -> SqlError {
+    #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+    {
+        let caller = core::panic::Location::caller();
+        LAST_ARENA_FAILURE.with(|failure| failure.set(Some((caller.file(), caller.line()))));
+    }
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "query result exceeds the statement arena"
@@ -13069,6 +13085,7 @@ fn arena_full() -> SqlError {
 }
 
 /// Public view-DML rewriting uses this for arena-exhaustion.
+#[track_caller]
 pub fn arena_full_pub() -> SqlError {
     arena_full()
 }

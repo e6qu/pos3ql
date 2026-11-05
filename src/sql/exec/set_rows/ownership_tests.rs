@@ -79,3 +79,49 @@ fn set_result_exhaustion_preserves_rows_and_admits_a_later_small_append() {
         assert_eq!(pool.lease::<u8>(128).unwrap().capacity(), 128);
     });
 }
+
+#[test]
+fn output_contract_owns_only_actual_columns_and_survives_definition_reuse() {
+    let mut budget = Budget::new(1 << 18);
+    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 512, 4).unwrap();
+    let scratch = Arena::new(&mut budget, "set contract conversion", 1 << 16).unwrap();
+    let output = Arena::new(&mut budget, "set contract output", 1 << 16).unwrap();
+    let mut routine = crate::storage::RoutineDef::EMPTY;
+    routine.kind = crate::storage::RoutineKind::TableFunction;
+    routine.result_column_count = 2;
+    routine.result_columns[0] = RoutineArgumentDef {
+        name: SqlName::parse("number").unwrap(),
+        ctype: ColType::Int4,
+        user_type: None,
+    };
+    routine.result_columns[1] = RoutineArgumentDef {
+        name: SqlName::parse("label").unwrap(),
+        ctype: ColType::Text,
+        user_type: None,
+    };
+    crate::mem::guard::forbid_alloc(|| {
+        let mut result = PlpgsqlSetResult::for_routine(&routine, &pool).unwrap();
+        routine.result_columns.fill(RoutineArgumentDef::EMPTY);
+        let Contract::Columns(columns) = &result.contract else {
+            panic!("table function contract")
+        };
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name.as_str(), "number");
+        assert_eq!(columns[1].name.as_str(), "label");
+        result
+            .append(&[Datum::Text("7"), Datum::Text("retained")], &scratch)
+            .unwrap();
+        assert_eq!(scratch.used(), 0);
+        let rows = result.rows(&output).unwrap();
+        drop(result);
+        assert_eq!(pool.lease::<u8>(512).unwrap().capacity(), 512);
+        assert_eq!(
+            decode_projected_col_record(rows[0], 0, &output).unwrap(),
+            Datum::Int4(7)
+        );
+        assert_eq!(
+            decode_projected_col_record(rows[0], 1, &output).unwrap(),
+            Datum::Text("retained")
+        );
+    });
+}

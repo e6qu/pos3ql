@@ -1096,7 +1096,6 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     source,
                     storage,
                     txid,
-                    arena,
                     slot,
                     &input_oids[..args.len()],
                 )?;
@@ -1474,7 +1473,9 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 }; crate::storage::MAX_ROUTINE_ARGUMENTS];
                 for (index, column) in columns.iter().enumerate() {
                     decoded[index] = crate::sql::types::RecordField {
-                        name: column.name.as_str(),
+                        name: arena
+                            .alloc_str(column.name.as_str())
+                            .map_err(|_| arena_full())?,
                         type_oid: storage
                             .routine_type_oid(column.ctype, column.user_type, txid)
                             .ok_or_else(|| {
@@ -3119,7 +3120,6 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     tref,
                     storage,
                     txid,
-                    arena,
                     slot,
                     &input_oids[..table_function_input_count(tref)],
                 )?,
@@ -3616,7 +3616,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             );
         }
         names.len()
-    } else if let Some((_, routine)) = routine {
+    } else if let Some((_, ref routine)) = routine {
         if let Some(creation) = routine_composite_result(routine, storage, txid)? {
             let target = crate::storage::TypeDefinitionTarget::by_creation(
                 storage,
@@ -4119,14 +4119,13 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     Ok((selection, argument_type_oids))
 }
 
-fn capture_table_func_routine<'a>(
-    tref: &TableRef<'a>,
+fn capture_table_func_routine(
+    tref: &TableRef<'_>,
     storage: &Storage,
     txid: u32,
-    arena: &'a Arena,
     slot: usize,
     argument_type_oids: &[i32],
-) -> Result<&'a mut RoutineDef, SqlError> {
+) -> Result<RoutineDef, SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
     let args = &args[..table_function_input_count(tref)];
     storage.require_routine_execute(slot, txid)?;
@@ -4148,7 +4147,7 @@ fn capture_table_func_routine<'a>(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
-    arena.alloc(routine).map_err(|_| arena_full())
+    Ok(routine)
 }
 
 fn routine_composite_result(
@@ -4386,7 +4385,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             tref,
                             storage,
                             txid,
-                            arena,
                             slot,
                             &input_oids[..table_function_input_count(tref)],
                         )?,
@@ -5789,7 +5787,10 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Ok(&*rows);
             }
         }
-        if let Some((routine_slot, routine)) = selected {
+        if let Some((routine_slot, mut declaration)) = selected {
+            // The selected definition is temporary; only actual SQL text and
+            // output names may become part of arena-owned results.
+            let routine = &mut declaration;
             let catalog = super::StorageCatalog {
                 storage,
                 routine_workspace: arena,
@@ -5927,12 +5928,18 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     .type_inputs()
                     .detached_bindings(crate::storage::StoredInputSection::RoutineBody, arena)?
             };
+            let body = arena
+                .alloc_str(routine.body.as_str())
+                .map_err(|_| arena_full())?;
+            let name = arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| arena_full())?;
             let program = super::parse_stored_routine_function_program(
                 routine.body_kind,
-                routine.body.as_str(),
+                body,
                 arena,
                 scalar_result == Some(ColType::Void),
-                routine.name.as_str(),
+                name,
                 routine.arguments(),
                 inputs,
                 |parser| {

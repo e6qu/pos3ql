@@ -74,13 +74,9 @@ input by bypassing its constraint or by replaying already completed changes.
 
 Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.
-Keep scalar function calls in `FROM` on the scalar invocation contract: their
-named output fields form one row, including a null result. Preserve argument
-effects, output aliases, lateral references and ordinality while resuming calls.
-Preserve named-row result conversion as a separate retained expression after
-the body finishes, including constraints that call functions with side effects.
-Run extended fixtures within unchanged catalog capacity; transaction boundaries
-must release completed definitions before their slots are reused.
+Preserve the reference-backed function result and conversion contracts in the
+[architecture](docs/architecture.md#the-request-path), including once-only input
+and constraint-helper effects.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep the original command deadline, settings, identity, snapshot and clocks
@@ -89,31 +85,16 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Keep loop-frame memory bounded by active nesting while saving branch, loop and
-handler positions. Preserve scoped reclamation of discarded query work, including
-after nested function handoffs, without losing row counts or repeating effects.
-Branches, numeric/query/array loops and handlers now use a bounded execution
-frame stack, with indexed block/statement positions and each active scope. Keep
-the PostgreSQL comparison for labelled exits, nested diagnostics, rethrow and
-early returns. These arena-borrowed frames still need an owner that survives
-returning to the connection scheduler; their value payloads and enclosing row
-operation do not yet resume across waits. Preserve the position test that frees
-the original parse storage and resolves the same source again.
-Materialized query and array loop inputs now own encoded values in the fixed
-shared work pool. Keep field names/types, array bounds, empty-query assignment
-and once-only effects while releasing source scratch. Local variables, handler
-diagnostics and the enclosing write still need complete saved owners.
-Set-function results now own their encoded row prefix and actual output metadata
-in shared work memory. Keep append failure atomic, preserve rows emitted before
-a caught error, and reclaim `RETURN NEXT` scratch on each iteration. Output
-bindings reserve actual width before local initialization. Qualify these changes
-alongside loop-input ownership; the new record-loop regression currently reports
-statement-memory exhaustion and must be diagnosed and fixed before completion.
-Preserve PostgreSQL's error and hint when no procedural CASE branch matches and
-there is no ELSE; matched branches and an explicit ELSE must still succeed.
-A caught `RETURN QUERY` error keeps its completed result prefix; a private wait
-must not publish that prefix twice. Static `SELECT INTO` and dynamic `EXECUTE
-INTO` retain PostgreSQL's different row-consumption rules.
+Finish the saved owners for local variables, handler diagnostics and the
+enclosing write. The indexed control frames still borrow statement memory and
+cannot yet survive returning to the connection scheduler. Keep the bounded
+loop scopes, owned loop/result bytes, actual-width output reservations and
+scoped scratch described in the architecture. Qualify every reference fixture
+under unchanged capacities; repair the current record-loop memory regression
+before completing this work. A caught `RETURN QUERY` error keeps its completed
+result prefix; a private wait must not publish that prefix twice.
+Preserve PostgreSQL's different row-consumption rules for static `SELECT INTO`
+and dynamic `EXECUTE INTO`.
 
 Simple table, constant `VALUES` and one-row cursor expressions already defer
 work until fetching. Extend that behavior to remaining plans without issuing
@@ -137,9 +118,8 @@ presence alone is not support. Preserve values, declared types, null handling,
 errors, argument effects and permission checks. Keep the real SQLAlchemy,
 Alembic, psycopg2 and other client comparisons, all four full workflows, and
 native Linux amd64/arm64 and macOS arm64 coverage on the finished revision.
-Keep library, server and report instrumentation on the same explicit coverage
-profile. Verify build and execution timings within the existing job limits;
-compilation exhaustion must not be mistaken for a stalled SQL test.
+Keep the explicit coverage profile and measure build and execution separately
+within unchanged job limits. Run final qualification on the finished revision.
 
 ### Share fixed memory and disk capacity according to demand
 

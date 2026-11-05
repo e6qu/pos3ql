@@ -230,6 +230,10 @@ released before the loop body. Each iteration decodes its selected value into
 statement memory; record field names/types, nulls and array bounds survive.
 Finishing a loop, leaving it early or raising an error returns its input lease.
 Exhaustion names the shared work settings with `54000`.
+Table-function lookup keeps its selected definition as a temporary value;
+statement memory retains only actual SQL text and output names needed by parsed
+queries or returned records. Repeated schema and execution probes do not retain
+the definition's maximum-width argument, result and configuration arrays.
 Set-function result collectors own encoded rows and actual output-column
 metadata in that same shared pool. A row becomes visible to the collector only
 after conversion, capacity admission and encoding finish. A failed append keeps

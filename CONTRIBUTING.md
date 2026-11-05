@@ -78,6 +78,12 @@ the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
+The configured SQL-session test harness records the most recent query-memory
+error's source location and the arena's requested, remaining and capacity bytes
+without allocating. Failed success assertions include those values, whether a
+temporary region was active, and wire output. Distinguish genuine exhaustion
+from an allocation blocked by a temporary borrow before changing a limit. This diagnostic is test-only and keeps client errors unchanged.
+
 Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a
 `formatting-<revision>` artifact containing the correction. Apply that patch

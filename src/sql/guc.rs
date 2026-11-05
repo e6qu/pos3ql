@@ -142,6 +142,23 @@ pub fn active_render() -> Option<RenderContext> {
     ACTIVE_RENDER.with(|active| *active.borrow())
 }
 
+pub(crate) fn with_active_state<T>(
+    apply: impl FnOnce(&GucState) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "procedural subtransaction has no active session configuration"
+            ));
+        }
+        // EvalScope keeps the connection-owned state live. This boundary
+        // borrows no transaction through ACTIVE_TXN while its executor owns it.
+        apply(unsafe { &*pointer })
+    })
+}
+
 pub(crate) fn active_random() -> Result<f64, SqlError> {
     ACTIVE_GUC.with(|active| {
         let pointer = active.get();
@@ -1981,6 +1998,30 @@ impl GucState {
         state.session_overrides = savepoint.current_overrides;
         state.transaction.session_overrides = savepoint.session_overrides;
         state.transaction.savepoint_count = index + 1;
+    }
+
+    pub(crate) fn publish_rollback_settings(&self, txn: &super::txn::TxnState) {
+        for &name in super::SETTING_NAMES {
+            if let Some(value) = transaction_setting_owned(txn, name) {
+                let reset = self.transaction_reset_owned(name).unwrap_or(value);
+                crate::sql::eval::funcs::system::update_session_setting(
+                    name,
+                    value,
+                    reset,
+                    txn.setting_source(name).unwrap_or("default"),
+                );
+            } else if let Some(value) = self.get_owned(name) {
+                let reset = self.reset_owned(name).unwrap_or(value);
+                crate::sql::eval::funcs::system::update_session_setting(
+                    name,
+                    value,
+                    reset,
+                    self.source(name),
+                );
+            }
+        }
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
+        crate::sql::timezone::set_session(self.timezone());
     }
 
     pub fn set_config(

@@ -195,6 +195,15 @@ or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
 
+Procedural exception scopes share savepoint admission, transaction-log rewind
+and remote savepoint mirroring with explicit SQL savepoints. Engine-owned
+scopes also undo catalog changes and staged journal records. Cursor creation
+marks preserve older cursor positions while releasing new, unfinished and failed
+cursor openings. Atomic row-trigger scopes have no catalog or journal owner;
+their supported row changes, constraints, settings and deferred events rewind
+through the same transaction-state marks. This cleanup is separate from the
+unfinished retained execution needed to keep work through a private wait.
+
 SQL `SET` parses SQL syntax; `set_config` and saved settings take decoded values.
 For example, `set_config('search_path', 'orders,public', false)` preserves that
 spelling, while `SET search_path TO orders, public` stores a formatted SQL list.

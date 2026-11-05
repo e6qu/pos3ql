@@ -25,6 +25,7 @@ mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod prepared_object_capacity;
 mod procedural_expression_calls;
+mod procedural_subtransactions;
 mod query_execution;
 mod routine_calls;
 mod routine_selection;

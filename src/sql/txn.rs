@@ -35,6 +35,7 @@ pub struct Savepoint {
     pub wal_mark: usize,
     /// Shared table/row lock acquisition clock at savepoint creation.
     pub lock_mark: u64,
+    pub(crate) cursor_mark: Option<super::cursor::CursorCreationMark>,
     /// Pending-notification and pending-listen-op lengths (and the notification
     /// payload-buffer offset) at savepoint time, so ROLLBACK TO discards the
     /// notifications/registrations a rolled-back subtransaction produced, as
@@ -80,6 +81,40 @@ pub(crate) struct StatementMark {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransactionEffectMark([usize; 15]);
+
+pub(crate) fn establish_savepoint(
+    storage: &Storage,
+    txn: &mut TxnState,
+    guc: &super::guc::GucState,
+    name: &str,
+    wal_mark: usize,
+    cursor_mark: Option<super::cursor::CursorCreationMark>,
+) -> Result<usize, SqlError> {
+    txn.savepoint(name, wal_mark, storage.lock_mark(), cursor_mark)?;
+    let index = txn.savepoint_index(name).expect("new savepoint is present");
+    if let Err(error) = super::foreign::savepoint(storage, txn.txid, name) {
+        txn.release_savepoints_from(index);
+        return Err(error);
+    }
+    storage.set_cumulative_transaction_nest_level(txn.txid, index + 2);
+    guc.savepoint();
+    Ok(index)
+}
+
+pub(crate) fn release_savepoint(
+    storage: &Storage,
+    txn: &mut TxnState,
+    guc: &super::guc::GucState,
+    index: usize,
+) -> Result<(), SqlError> {
+    let savepoint = txn.savepoint_at(index);
+    super::foreign::release_savepoint(storage, txn.txid, savepoint.name.as_str())?;
+    storage.finish_cumulative_subtransactions(txn.txid, index + 2, true);
+    storage.set_cumulative_transaction_nest_level(txn.txid, index + 1);
+    txn.release_savepoints_from(index);
+    guc.release_savepoints_from(index);
+    Ok(())
+}
 
 pub const DEFAULT_MAX_SAVEPOINTS: usize = 16;
 pub const DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS: usize = 64;
@@ -2459,11 +2494,12 @@ impl TxnState {
 
     /// Establishes a savepoint at the current undo position. A duplicate name
     /// is allowed (PostgreSQL shadows the older one).
-    pub fn savepoint(
+    pub(crate) fn savepoint(
         &mut self,
         name: &str,
         wal_mark: usize,
         lock_mark: u64,
+        cursor_mark: Option<super::cursor::CursorCreationMark>,
     ) -> Result<(), SqlError> {
         let sp = Savepoint {
             name: {
@@ -2479,6 +2515,7 @@ impl TxnState {
             statistics_mark: self.statistics_undo.len(),
             wal_mark,
             lock_mark,
+            cursor_mark,
             notify_mark: self.pending_notifies.len(),
             notify_payload_mark: self.notify_payloads.mark(),
             listen_mark: self.pending_listen_ops.len(),
@@ -2580,6 +2617,32 @@ impl TxnState {
         while self.savepoints.len() > index + 1 {
             self.savepoints.pop();
         }
+    }
+
+    pub(crate) fn rewind_to_savepoint(&mut self, index: usize, boundary: &Savepoint) {
+        self.rewind_touched(boundary.touched_mark);
+        self.rewind_truncates(boundary.truncate_mark);
+        self.rewind_ddl(boundary.ddl_mark);
+        self.rewind_statistics(boundary.statistics_mark);
+        self.rewind_subscription_advances(boundary.subscription_advance_mark);
+        self.rewind_constraints(
+            boundary.constraint_obligation_mark,
+            boundary.constraint_completion_mark,
+            boundary.constraint_mode_mark,
+            boundary.constraint_rename_mark,
+            boundary.deferred_trigger_mark,
+            boundary.deferred_trigger_completion_mark,
+            boundary.deferred_trigger_bytes_mark,
+        );
+        self.rewind_notifications(
+            boundary.notify_mark,
+            boundary.notify_payload_mark,
+            boundary.listen_mark,
+        );
+        self.rollback_savepoints_after(index);
+        self.read_only = boundary.read_only;
+        self.restore_read_only_source(boundary.read_only_source);
+        self.failed = boundary.failed;
     }
 
     /// Truncates the undo logs back to the given marks, returning the removed

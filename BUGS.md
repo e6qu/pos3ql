@@ -14,10 +14,11 @@ current behavior belongs in the [owning guides](docs/README.md). Verify catalog
 identities, comments and physical flags before and after maintenance and cold
 recovery; command completion alone cannot expose duplicate or detached index
 metadata. Preserve failing-thread stacks with native-crash repairs.
-Exercise constraint-index DDL before a rebuild and preserve retired-index owners
-through table-owner changes and recovery.
-Verify same-lifetime key/index name aliases separately from real collisions,
-and exercise maintenance whose requested index state already holds.
+When testing a trigger wait, compare the rows visible to its constraint as well
+as final rows, audit writes and sequence counts. A rollback-and-replay attempt
+can return the expected result while showing the constraint the wrong data.
+Caught errors must also restore schema, journal, settings and deferred work;
+test cursor creation separately from the motion of an older cursor.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

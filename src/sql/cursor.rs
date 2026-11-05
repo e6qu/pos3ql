@@ -51,6 +51,9 @@ pub(crate) struct CursorOpenAttempt {
     generation: core::num::NonZeroU64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CursorCreationMark(core::num::NonZeroU64);
+
 impl CursorOpenAttempt {
     pub(crate) const fn index(self) -> usize {
         self.index
@@ -336,6 +339,23 @@ pub(crate) fn description_columns<'a>(
 }
 
 impl CursorPool {
+    pub(crate) fn creation_mark(&self) -> CursorCreationMark {
+        CursorCreationMark(
+            core::num::NonZeroU64::new(self.next_plan_generation)
+                .expect("cursor identities never wrap"),
+        )
+    }
+
+    pub(crate) fn rollback_creations(&mut self, mark: CursorCreationMark) {
+        for index in 0..self.slots.len() {
+            if self.slots[index]
+                .plan_generation
+                .is_some_and(|generation| generation >= mark.0)
+            {
+                self.abandon(index);
+            }
+        }
+    }
     pub fn budget_bytes(config: &Config) -> usize {
         let row_capacity = cursor_row_capacity(config);
         config
@@ -580,6 +600,7 @@ impl CursorPool {
     pub(crate) fn plan_owner(&self, at: usize) -> Result<super::type_input_plans::Owner, SqlError> {
         self.slots
             .get(at)
+            .filter(|slot| !slot.failed)
             .and_then(|slot| slot.plan_generation)
             .map(|generation| super::type_input_plans::Owner::Cursor(generation.get()))
             .ok_or_else(|| {
@@ -592,8 +613,10 @@ impl CursorPool {
 
     pub(crate) fn contains_plan_owner(&self, generation: u64) -> bool {
         self.slots.iter().any(|slot| {
-            slot.plan_generation
-                .is_some_and(|current| current.get() == generation)
+            !slot.failed
+                && slot
+                    .plan_generation
+                    .is_some_and(|current| current.get() == generation)
         })
     }
 
@@ -752,7 +775,8 @@ impl CursorPool {
             }
             slot.failed = true;
             slot.query.clear();
-            slot.plan_generation = None;
+            // The plan is released, but rollback still needs this cursor's
+            // creation identity to remove names opened after its savepoint.
             slot.open_site = None;
         }
     }
@@ -1051,6 +1075,61 @@ impl CursorPool {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn savepoint_creation_marks_release_failed_and_unfinished_cursors_without_reusing_owners() {
+        let mut config = Config::default_dev();
+        config.max_cursors = 3;
+        config.cursor_bytes = 64;
+        config.cursor_query_bytes = 1024;
+        let mut budget = Budget::new(CursorPool::budget_bytes(&config));
+        let mut pool = CursorPool::new(&config, &mut budget).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let outer = pool.creation_mark();
+            let old = pool
+                .open("old", "SELECT 1", CursorScroll::Default, false, false, 1)
+                .unwrap();
+            let owner = pool.plan_owner(old).unwrap();
+            let (description, _) = pool.result_buffers(old);
+            crate::pg::respond::Responder::new(description)
+                .row_description(&[])
+                .unwrap();
+            pool.seal(old).unwrap();
+            let inner = pool.creation_mark();
+            let failed = pool
+                .open("failed", "SELECT 2", CursorScroll::Default, false, false, 1)
+                .unwrap();
+            let (description, _) = pool.result_buffers(failed);
+            crate::pg::respond::Responder::new(description)
+                .row_description(&[])
+                .unwrap();
+            pool.seal(failed).unwrap();
+            pool.fail("failed");
+            let waiting = pool
+                .open(
+                    "waiting",
+                    "SELECT 3",
+                    CursorScroll::Default,
+                    false,
+                    false,
+                    1,
+                )
+                .unwrap();
+            pool.rollback_creations(inner);
+            assert!(!pool.exists("failed"));
+            assert!(pool.plan_owner(waiting).is_err());
+            assert_eq!(pool.plan_owner(old).unwrap(), owner);
+            assert!(pool.exists("old"));
+            pool.rollback_creations(inner);
+            let replacement = pool
+                .open("failed", "SELECT 4", CursorScroll::Default, false, false, 1)
+                .unwrap();
+            assert_ne!(pool.plan_owner(replacement).unwrap(), owner);
+            pool.rollback_creations(outer);
+            assert!(!pool.exists("old"));
+            assert!(pool.plan_owner(replacement).is_err());
+        });
+    }
 
     #[test]
     fn cursor_open_attempts_resume_only_their_qualified_source_and_keep_bound_queries() {

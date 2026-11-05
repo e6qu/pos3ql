@@ -77,6 +77,8 @@ bodies, complex query plans, SQL cursors and results already sent to the client.
 Preserve the reference-backed function result and conversion contracts in the
 [architecture](docs/architecture.md#the-request-path), including once-only input
 and constraint-helper effects.
+Preserve independent input and result widths; an input-argument limit must not
+truncate or crash a wider table-function result.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep the original command deadline, settings, identity, snapshot and clocks

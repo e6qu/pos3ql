@@ -78,6 +78,10 @@ returning one value produces one row, including a null value; a set-returning
 function produces the rows it returns. For example,
 `SELECT total FROM calculate_order(42)` can select its declared `OUT total`
 column without expanding a record expression in the select list.
+The 100-input-argument limit does not limit a table function's result width.
+For example, a function returning columns `c0` through `c100` can expose its
+last field with `SELECT (wide_function_rows()).c100`, or both ends with
+`SELECT c0,c100 FROM wide_function_rows()`.
 A SQL function returning a named row type can select its fields or return one
 complete row value. Its field constraints run when the result is converted;
 calling a constraint helper does not rerun the completed function body.

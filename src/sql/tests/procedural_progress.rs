@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn wide_table_function_records_use_output_width_in_select_lists_and_from() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("wide-function-results-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/249_wide_function_results.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["100", "0|100"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn owned_set_results_reclaim_conversion_scratch_and_preserve_caught_prefixes() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

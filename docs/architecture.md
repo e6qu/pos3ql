@@ -234,6 +234,9 @@ Table-function lookup keeps its selected definition as a temporary value;
 statement memory retains only actual SQL text and output names needed by parsed
 queries or returned records. Repeated schema and execution probes do not retain
 the definition's maximum-width argument, result and configuration arrays.
+Functions producing record values in a result list decode the declared output
+width into an actual-sized field slice; the input-argument limit does not size
+that result buffer.
 Set-function result collectors own encoded rows and actual output-column
 metadata in that same shared pool. A row becomes visible to the collector only
 after conversion, capacity admission and encoding finish. A failed append keeps

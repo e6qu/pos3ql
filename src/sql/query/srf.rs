@@ -1466,11 +1466,13 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             .map_err(|_| arena_full())?;
         if let Some(columns) = routine.record_result_columns() {
             for (value, encoded) in values.iter_mut().zip(rows) {
-                let mut decoded = [crate::sql::types::RecordField {
-                    name: "",
-                    type_oid: 0,
-                    value: Datum::Null,
-                }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let decoded = arena
+                    .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
+                        name: "",
+                        type_oid: 0,
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
                 for (index, column) in columns.iter().enumerate() {
                     decoded[index] = crate::sql::types::RecordField {
                         name: arena
@@ -1489,10 +1491,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         )?,
                     };
                 }
-                let fields = arena
-                    .alloc_slice_copy(&decoded[..columns.len()])
-                    .map_err(|_| arena_full())?;
-                *value = Datum::Record(fields);
+                *value = Datum::Record(&*decoded);
             }
         } else {
             for (value, encoded) in values.iter_mut().zip(rows) {

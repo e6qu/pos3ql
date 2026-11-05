@@ -1384,9 +1384,9 @@ mod tests {
                     assert_eq!(
                         result.unwrap_err().sqlstate,
                         if attempt == 0 {
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION
+                            crate::sql::eval::SqlState::known(sqlstate::INTERNAL_ROUTINE_INVOCATION)
                         } else {
-                            sqlstate::SERIALIZATION_FAILURE
+                            crate::sql::eval::SqlState::known(sqlstate::SERIALIZATION_FAILURE)
                         }
                     );
                 });

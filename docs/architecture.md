@@ -214,6 +214,13 @@ copies back assignments while restoring the shadowed counter. Returning
 the frame clears references into completed temporary work. These frames remain
 inside the existing statement arena; `54000` names insufficient capacity.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
+Branches, loops and exception handlers use an explicit execution frame stack,
+reserved to the maximum lexical nesting before local initialization. Each frame
+owns its next statement, loop input or range, and handler diagnostic/savepoint
+state. Child blocks do not recursively call the interpreter. Leaving a scope
+restores shadowed counters, copies assignments back and releases its references.
+The frames still borrow statement memory; they do not yet survive returning
+to the connection scheduler during a storage wait.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal

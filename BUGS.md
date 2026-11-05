@@ -13,7 +13,8 @@ belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 current behavior belongs in the [owning guides](docs/README.md). Preserve
 regression coverage when changing ownership or execution: successful results
 alone cannot prove that effects ran once, constraints saw the right rows, or
-temporary references were released safely.
+temporary references were released safely. Handler and loop comparisons also
+check diagnostics, shadowed variables, exits and early returns.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn procedural_control_frames_preserve_nested_loops_handlers_and_returns() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-control-frames-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/246_procedural_control_frames.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "inner|23514",
+                "outer|22012",
+                "rethrow|22012",
+                "summary|outside:237:22012:true",
+                "1",
+                "10|3,4",
+                "done:1",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn discarded_procedural_queries_reuse_memory_and_preserve_counts_and_effects() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

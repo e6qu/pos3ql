@@ -95,7 +95,8 @@ directly: rebuilding thousands of test filters as one shell argument exceeds
 Linux's argument-size limit before the tests start.
 Coverage builds, library execution, server execution and reports all select the
 `coverage` Cargo profile. It inherits release behavior with optimization level
-1, keeping instrumentation compilation inside the fixed job budget. Production
+1, reducing instrumented compilation cost within the fixed job budget. Verify
+both build and execution timings on the checked revision. Production
 release builds and their correctness/performance gates keep release settings.
 The 70% merged coverage floor and all test selections remain unchanged.
 A historical crash reproduction records its source revision, compiler/coverage

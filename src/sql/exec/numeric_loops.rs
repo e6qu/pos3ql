@@ -121,7 +121,7 @@ fn numeric_depth(block: TriggerBlock<'_>) -> usize {
 }
 
 // Both layout passes visit the same exhaustive set of lexical block edges.
-fn visit_nested_blocks<'a>(
+pub(super) fn visit_nested_blocks<'a>(
     block: TriggerBlock<'a>,
     mut visit: impl FnMut(TriggerBlock<'a>, Option<SqlName>),
 ) {

@@ -541,6 +541,7 @@ impl SubscriptionApply {
         columns: &[crate::storage::SqlName],
     ) -> Result<crate::sql::exec::CopySetup, SqlError> {
         self.with_context(engine, |worker, engine| {
+            worker.txn.begin_statement_clock();
             let setup = engine.subscription_copy_setup(schema, table, columns, worker.txn.txid)?;
             worker.copy_transition_scratch.clear();
             worker.trigger_response.clear();
@@ -549,7 +550,7 @@ impl SubscriptionApply {
             engine.subscription_copy_start(
                 &setup,
                 &mut worker.txn,
-                worker.guc.seq_session(),
+                &worker.guc,
                 &worker.arena,
                 &mut responder,
                 &mut worker.trigger_scratch,
@@ -574,7 +575,7 @@ impl SubscriptionApply {
                     line,
                     crate::sql::CopyRowContext::for_subscription_worker(
                         &mut worker.txn,
-                        worker.guc.seq_session(),
+                        &worker.guc,
                         &worker.arena,
                         &mut responder,
                         &mut worker.trigger_scratch,
@@ -603,7 +604,7 @@ impl SubscriptionApply {
                     row,
                     crate::sql::CopyRowContext::for_subscription_worker(
                         &mut worker.txn,
-                        worker.guc.seq_session(),
+                        &worker.guc,
                         &worker.arena,
                         &mut responder,
                         &mut worker.trigger_scratch,

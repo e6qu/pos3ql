@@ -207,6 +207,17 @@ their supported row changes, constraints, settings and deferred events rewind
 through the same transaction-state marks. This cleanup is separate from the
 unfinished retained execution needed to keep work through a private wait.
 
+Internal waits and routine handoffs carry a typed execution marker, separate
+from their diagnostic code. Parsing a SQLSTATE from SQL or a remote error never
+creates that marker. For example, an application raising `PZ001` returns or
+catches its error normally; it cannot park a connection. Exception handlers
+exclude actual engine controls, rather than reserving application error codes.
+Domain CHECK evaluation also preserves whether an error came from running the
+expression or from a false result. Input-validation functions report the latter
+as invalid data; they propagate expression errors, cancellation, exhaustion and
+engine handoffs. Copying an error preserves that origin, while SQL handlers
+still compare its ordinary five-character code.
+
 SQL `SET` parses SQL syntax; `set_config` and saved settings take decoded values.
 For example, `set_config('search_path', 'orders,public', false)` preserves that
 spelling, while `SET search_path TO orders, public` stores a formatted SQL list.

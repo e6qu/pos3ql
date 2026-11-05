@@ -21,6 +21,27 @@ Caught errors must also restore schema, journal, settings and deferred work;
 test cursor creation separately from the motion of an older cursor.
 Open foreign connections inside nested exception blocks too: a savepoint list
 captured only at command admission misses boundaries created within that command.
+Check procedural deadlines with empty and scalar-only blocks as well as scans.
+Distinguish a consumed timeout from a user-raised cancellation, and keep the
+original timer through binding, storage waits and internal commits. Keep clock
+transition proofs deterministic; ownership tests must not require Miri to read
+the host wall clock or disable isolation. Test interleaved protocol messages and
+COPY rows: a different connection must neither inherit nor renew their timers.
+Streamed COPY must bind its own session settings at start, each row and completion
+before a trigger can establish or rewind an exception boundary. Rebind SQL
+identity, search path and rendering as well as configuration pointers; another
+connection may have changed the worker context between COPY messages. Preserve
+COPY's original statement and transaction timestamps as well. Check
+deadlines before buffered replies and protocol control messages too; an expired
+Sync still owes ReadyForQuery, and an interrupted simple Query must be consumed.
+Once commit publication has started, restoring a saved timer must not cancel its
+durability receipt. Cover all command-entry modes at that boundary.
+Application error codes must not construct private execution controls. Exercise
+uncaught, exact, category and `OTHERS` handling, including functions returning
+rows; an application error must neither park a connection nor end its results.
+Input-validation helpers must not turn waits, cancellation, exhausted capacity
+or exceptions inside domain checks into invalid-data results. Distinguish a
+false check from a check that raises the same `23514` error itself.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

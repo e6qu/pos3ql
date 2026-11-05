@@ -612,6 +612,18 @@ struct PreparedTypeInputs<'a> {
     bindings: &'a [type_inputs::Binding<'a>],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum StatementTimeoutEntry {
+    Command { timeout_ms: u64 },
+    Captured { deadline: i64 },
+    Nested,
+}
+
+pub(crate) struct RootInputAdmission<'a> {
+    pub(crate) encoded: &'a [u8],
+    pub(crate) deadline: i64,
+}
+
 struct TypeInputPlanSource<'a, 'c> {
     key: Option<type_input_plans::Key>,
     reserved: Option<type_input_plans::PlanId>,
@@ -637,7 +649,7 @@ pub struct Engine {
     /// A COPY FROM STDIN the last statement started: the connection takes
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
-    pending_copy: Option<exec::CopySetup>,
+    pending_copy: Option<(exec::CopySetup, i64)>,
     wal_upload: bool,
     commit_progress: CommitProgressMode,
     inflight_publication: Option<InflightPublication>,
@@ -720,7 +732,7 @@ pub(crate) struct CursorStatementContext<'a, 'response> {
 /// Mutable session state used while ingesting one streamed COPY row.
 pub struct CopyRowContext<'a, 'response> {
     txn: &'a mut TxnState,
-    seq_session: &'a guc::SeqSession,
+    guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
     dml_scratch: CopyDmlScratch<'a>,
@@ -755,14 +767,14 @@ impl<'a> SubscriptionCopyWorkspace<'a> {
 impl<'a, 'response> CopyRowContext<'a, 'response> {
     pub(crate) fn new(
         txn: &'a mut TxnState,
-        seq_session: &'a guc::SeqSession,
+        guc: &'a GucState,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         transition_rows: &'a mut exec::CopyTransitionRows,
     ) -> Self {
         Self {
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             dml_scratch: CopyDmlScratch::ActiveWorkspace,
@@ -772,7 +784,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
 
     pub(crate) fn for_subscription_worker(
         txn: &'a mut TxnState,
-        seq_session: &'a guc::SeqSession,
+        guc: &'a GucState,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         dml_scratch: &'a mut exec::DmlScratch,
@@ -780,7 +792,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
     ) -> Self {
         Self {
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             dml_scratch: CopyDmlScratch::SubscriptionWorker(dml_scratch),
@@ -7065,7 +7077,7 @@ impl Engine {
             {
                 return Ok(());
             }
-            query::arm_timeout(0);
+            query::disarm_timeout();
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "commit is waiting for object storage"
@@ -7076,7 +7088,7 @@ impl Engine {
             && staged.barrier == txn::CommitBarrier::Journal
             && staged.lsn > self.durable_lsn
         {
-            query::arm_timeout(0);
+            query::disarm_timeout();
             return Err(sql_err!(
                 sqlstate::INTERNAL_IO_WAIT,
                 "commit is waiting for object storage"
@@ -10398,11 +10410,10 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &SqlPreparedPool,
         arena: &Arena,
-        guc: &GucState,
         context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
         if let Some(wait) = &txn.cache_capacity_wait {
-            query::restore_statement_deadline(wait.deadline);
+            txn.restore_statement_deadline(wait.deadline);
             query::check_timeout()?;
             if let Some((epoch, error)) = &self.cache_capacity_failure
                 && Some(*epoch) != wait.failure_epoch
@@ -10462,11 +10473,6 @@ impl Engine {
                     || checkpointer.merge_work_pending(&self.storage)
             });
         if active && txn.cache_capacity_wait.is_none() {
-            if let Some(deadline) = txn.suspended_statement_deadline() {
-                query::restore_statement_deadline(deadline);
-            } else {
-                query::arm_timeout(guc.statement_timeout_ms());
-            }
             query::check_timeout()?;
             // Old maintenance failures belong to their original requests. A
             // new waiter observes only failures raised after it starts waiting.
@@ -10485,7 +10491,7 @@ impl Engine {
 
     /// The COPY FROM the last statement started, if any; the connection
     /// takes it and enters copy-in mode.
-    pub fn take_pending_copy(&mut self) -> Option<exec::CopySetup> {
+    pub fn take_pending_copy(&mut self) -> Option<(exec::CopySetup, i64)> {
         self.pending_copy.take()
     }
 
@@ -10575,6 +10581,26 @@ impl Engine {
         }
     }
 
+    /// A streamed COPY can resume after another connection has used the worker.
+    /// Restore its SQL identity, name resolution and formatting before triggers.
+    fn enter_copy_session(
+        &self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<guc::EvalScope, SqlError> {
+        let scope = guc::enter_eval_scope(guc, txn);
+        datetime::restore_statement_clock(setup.clock);
+        guc.refresh_identities(&self.storage, txn.txid);
+        eval::funcs::system::set_session_user(guc.session_identity());
+        eval::funcs::system::set_current_user(guc.current_identity());
+        self.publish_session_context(guc, txn, guc.current_role().as_str())?;
+        timezone::set_session(guc.timezone());
+        responder.set_render(guc.render());
+        Ok(scope)
+    }
+
     /// One complete COPY data line (no trailing newline).
     pub fn copy_row_line(
         &mut self,
@@ -10582,6 +10608,9 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _settings =
+            self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
+        query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
@@ -10591,7 +10620,7 @@ impl Engine {
         exec::copy_row(
             &mut self.storage,
             context.txn,
-            context.seq_session,
+            context.guc.seq_session(),
             setup,
             line,
             context.arena,
@@ -10619,6 +10648,9 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let _settings =
+            self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
+        query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
         let scratch = match context.dml_scratch {
@@ -10628,7 +10660,7 @@ impl Engine {
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
-            context.seq_session,
+            context.guc.seq_session(),
             setup,
             row,
             context.arena,
@@ -10642,16 +10674,17 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             &mut self.dml_scratch,
@@ -10662,17 +10695,18 @@ impl Engine {
         &mut self,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         Self::copy_start_with_scratch(
             &mut self.storage,
             setup,
             txn,
-            seq_session,
+            guc,
             arena,
             responder,
             scratch,
@@ -10683,12 +10717,20 @@ impl Engine {
         storage: &mut Storage,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
-        seq_session: &guc::SeqSession,
+        guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
         scratch: &mut exec::DmlScratch,
     ) -> Result<(), SqlError> {
-        exec::copy_statement_begin(storage, txn, setup, seq_session, arena, responder, scratch)
+        exec::copy_statement_begin(
+            storage,
+            txn,
+            setup,
+            guc.seq_session(),
+            arena,
+            responder,
+            scratch,
+        )
     }
 
     pub(crate) fn subscription_copy_setup(
@@ -10718,6 +10760,7 @@ impl Engine {
         inserted: &exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         let _active_cursors = cursors
             .as_ref()
@@ -10781,6 +10824,7 @@ impl Engine {
         responder: &mut Responder,
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
+        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
             return self.finish_pending_transaction(txn, guc);
@@ -11415,7 +11459,7 @@ impl Engine {
             return Ok(());
         }
         txn.begin_statement_clock();
-        query::restore_statement_deadline(
+        txn.restore_statement_deadline(
             txn.suspended_statement_deadline()
                 .expect("admission retains its deadline"),
         );
@@ -11452,6 +11496,10 @@ impl Engine {
                 .routine_inputs
                 .retire_invalid_cursors(|generation| cursors.contains_plan_owner(generation));
         }
+        let _deadline_scope = query::enter_deadline_scope();
+        txn.enter_statement_timeout(StatementTimeoutEntry::Command {
+            timeout_ms: guc.statement_timeout_ms(),
+        });
         let result = (|| {
             self.dml_scratch.clear();
             self.bind_query_connection(conn_id);
@@ -11574,6 +11622,12 @@ impl Engine {
                 let (statement, source_start, source_end, has_type_inputs) =
                     statement.as_ref().expect("parsed query statement");
                 let source = &text[*source_start..*source_end];
+                if statement_index != resume_statement {
+                    txn.enter_statement_timeout(StatementTimeoutEntry::Command {
+                        timeout_ms: guc.statement_timeout_ms(),
+                    });
+                }
+                let mut statement_deadline = query::statement_deadline();
                 let mut source_bindings = &[][..];
                 let statement = if *has_type_inputs {
                     let bound_inputs = match self.admit_type_input_source(
@@ -11589,6 +11643,7 @@ impl Engine {
                         responder,
                         conn_id,
                         lock_timeout_expired,
+                        StatementTimeoutEntry::Nested,
                     )? {
                         Ok(inputs) => inputs,
                         Err(error)
@@ -11617,13 +11672,14 @@ impl Engine {
                             return Ok(ExecutionStatus::Complete);
                         }
                     };
-                    if bound_inputs.is_empty() {
+                    statement_deadline = bound_inputs.deadline;
+                    if bound_inputs.encoded.is_empty() {
                         statement
                     } else {
                         let parsed = (|| -> Result<_, SqlError> {
                             let mut parser = Parser::new(source, arena)
                                 .map_err(|error| parse_error_to_sql(&error))?;
-                            source_bindings = type_inputs::decode(bound_inputs, arena)?;
+                            source_bindings = type_inputs::decode(bound_inputs.encoded, arena)?;
                             parser.set_type_inputs(source_bindings);
                             let statement = parser
                                 .next_stmt()
@@ -11658,6 +11714,9 @@ impl Engine {
                 } else {
                     statement
                 };
+                txn.enter_statement_timeout(StatementTimeoutEntry::Captured {
+                    deadline: statement_deadline,
+                });
                 if self.pending_copy.take().is_some() {
                     // COPY FROM STDIN takes over the connection; a
                     // statement after it in the same string has nowhere
@@ -11709,7 +11768,6 @@ impl Engine {
                     txn,
                     sqlprep,
                     arena,
-                    guc,
                     routine_transaction_context,
                 ) {
                     Ok(true) => {
@@ -11763,6 +11821,7 @@ impl Engine {
                                     guc,
                                     routine_transaction_context,
                                     responder,
+                                    StatementTimeoutEntry::Nested,
                                 )
                             },
                         )
@@ -11992,6 +12051,7 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        let _deadline_scope = query::enter_deadline_scope();
         let workspace = self.work.for_connection(conn_id);
         self.select_query_workspace(workspace);
         let bound_inputs = match self.admit_type_input_source(
@@ -12005,6 +12065,9 @@ impl Engine {
             responder,
             conn_id,
             lock_timeout_expired,
+            StatementTimeoutEntry::Command {
+                timeout_ms: guc.statement_timeout_ms(),
+            },
         )? {
             Ok(inputs) => inputs,
             Err(error) => {
@@ -12046,7 +12109,10 @@ impl Engine {
                 responder,
                 conn_id,
                 lock_timeout_expired,
-                bound_inputs,
+                bound_inputs.encoded,
+                StatementTimeoutEntry::Captured {
+                    deadline: bound_inputs.deadline,
+                },
             )
         });
         if !matches!(result, Ok(ExtendedExecutionStatus::Blocked { .. })) {
@@ -12070,7 +12136,10 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
         bound_inputs: &[u8],
+        timeout_entry: StatementTimeoutEntry,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        let _deadline_scope = query::enter_deadline_scope();
+        txn.enter_statement_timeout(timeout_entry);
         if !type_input_plans::has_active_plan() {
             sqlprep
                 .routine_inputs
@@ -12235,7 +12304,6 @@ impl Engine {
                                 txn,
                                 sqlprep,
                                 arena,
-                                guc,
                                 routine_transaction_context,
                             )
                         } {
@@ -12298,6 +12366,7 @@ impl Engine {
                                             guc,
                                             routine_transaction_context,
                                             responder,
+                                            StatementTimeoutEntry::Nested,
                                         )
                                     };
                                     let executed =
@@ -12551,11 +12620,9 @@ impl Engine {
         let _atomic_reads = self.atomic_block_read_scope();
         self.bind_query_connection(conn_id);
         txn.begin_statement_clock();
-        if let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
-        }
+        txn.enter_statement_timeout(StatementTimeoutEntry::Command {
+            timeout_ms: guc.statement_timeout_ms(),
+        });
         let outcome = (|| {
             if let Err(error) = self
                 .check_writer_fence()
@@ -12709,7 +12776,8 @@ impl Engine {
         responder: &mut Responder,
         conn_id: i32,
         lock_timeout_expired: bool,
-    ) -> Result<Result<&'a [u8], SqlError>, WireFull> {
+        timeout_entry: StatementTimeoutEntry,
+    ) -> Result<Result<RootInputAdmission<'a>, SqlError>, WireFull> {
         if !type_input_plans::has_active_plan() {
             sqlprep
                 .routine_inputs
@@ -12729,12 +12797,15 @@ impl Engine {
             Ok(owner) => owner,
             Err(error) => return Ok(Err(error)),
         };
+        let _deadline_scope = query::enter_deadline_scope();
+        let mut admission_deadline = None;
         let result = type_input_plans::with_owner(owner, || {
             type_inputs::with_source(source, text, &[], || {
                 let mut progress = None;
                 let previous = match sqlprep.request_type_inputs(source, text) {
                     Ok(Some((bytes, saved))) => {
                         progress = Some(saved);
+                        admission_deadline = Some(saved.deadline);
                         if saved.complete {
                             return Ok(arena
                                 .alloc_slice_copy(bytes)
@@ -12753,6 +12824,13 @@ impl Engine {
                     Ok(None) => &[],
                     Err(error) => return Ok(Err(error)),
                 };
+                txn.begin_statement_clock();
+                if let Some(saved) = progress {
+                    txn.restore_statement_deadline(saved.deadline);
+                } else {
+                    txn.enter_statement_timeout(timeout_entry);
+                }
+                admission_deadline = Some(query::statement_deadline());
                 let mut parser = match Parser::new(text, arena) {
                     Ok(parser) => parser,
                     Err(error) => return Ok(Err(parse_error_to_sql(&error))),
@@ -12795,6 +12873,7 @@ impl Engine {
                     next: 0,
                     waiting: None,
                     complete: false,
+                    deadline: admission_deadline.expect("input admission owns its deadline"),
                     mark: txn
                         .statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark()),
                 });
@@ -12804,12 +12883,7 @@ impl Engine {
                         "active type input lost its transaction"
                     )));
                 }
-                txn.begin_statement_clock();
-                if let Some(deadline) = txn.suspended_statement_deadline() {
-                    query::restore_statement_deadline(deadline);
-                } else {
-                    query::arm_timeout(guc.statement_timeout_ms());
-                }
+
                 let candidates = parser.type_input_candidates();
                 let bindings =
                     match arena.alloc_slice_with(candidates.len(), |_| type_inputs::Binding {
@@ -12992,8 +13066,12 @@ impl Engine {
                 Ok(encoded)
             })
         });
-        query::disarm_timeout();
-        result
+        result.map(|result| {
+            result.map(|encoded| RootInputAdmission {
+                encoded,
+                deadline: admission_deadline.expect("successful input admission owns its deadline"),
+            })
+        })
     }
 
     pub(crate) fn begin_extended_parse(
@@ -13045,11 +13123,6 @@ impl Engine {
         eval::funcs::system::set_current_user(guc.current_identity());
         self.publish_session_context(guc, txn, guc.current_role().as_str())?;
         timezone::set_session(guc.timezone());
-        if let Some(deadline) = txn.suspended_statement_deadline() {
-            query::restore_statement_deadline(deadline);
-        } else {
-            query::arm_timeout(guc.statement_timeout_ms());
-        }
         if lock_timeout_expired {
             return Err(sql_err!(
                 sqlstate::LOCK_NOT_AVAILABLE,
@@ -18466,7 +18539,9 @@ impl Engine {
         guc: &GucState,
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
+        timeout_entry: StatementTimeoutEntry,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        txn.enter_statement_timeout(timeout_entry);
         let sequence_scope = sequence::enter_statement(
             arena,
             guc.seq_session(),
@@ -18824,13 +18899,6 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         if reset_workspace {
             self.dml_scratch.clear();
-            if txn.staged_commit().is_some() {
-                query::arm_timeout(0);
-            } else if let Some(deadline) = txn.suspended_statement_deadline() {
-                query::restore_statement_deadline(deadline);
-            } else {
-                query::arm_timeout(guc.statement_timeout_ms());
-            }
         }
         // Nested SQL shares its caller's deadline, including after a wait.
         if let Err(error) = query::check_timeout() {
@@ -18903,7 +18971,6 @@ impl Engine {
             return Ok(Err(error));
         }
         let statement_clock = datetime::statement_clock();
-        let statement_deadline = query::statement_deadline();
         // Publish the session zone for the same span, so a cast that has to
         // supply one (`'12:00'::timetz`) sees what the client set.
         timezone::set_session(guc.timezone());
@@ -19008,7 +19075,7 @@ impl Engine {
             txn.suspend_statement(
                 Some(lease),
                 statement_clock,
-                statement_deadline,
+                query::statement_deadline(),
                 routine_transaction_context,
             );
         }
@@ -20688,6 +20755,7 @@ impl Engine {
                                     guc,
                                     exec::PlpgsqlTransactionContext::Atomic,
                                     responder,
+                                    StatementTimeoutEntry::Nested,
                                 )
                             };
                             let result = result?;
@@ -21301,14 +21369,12 @@ impl Engine {
                     if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
                         return Ok(Err(error));
                     }
-                    if let Err(error) =
-                        self.copy_start(&setup, txn, guc.seq_session(), arena, responder)
-                    {
+                    if let Err(error) = self.copy_start(&setup, txn, guc, arena, responder) {
                         return Ok(Err(error));
                     }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
                     setup.retain_snapshot(snapshot_lease.take());
-                    self.pending_copy = Some(setup);
+                    self.pending_copy = Some((setup, query::statement_deadline()));
                     Ok(Ok(()))
                 }
             }
@@ -21484,6 +21550,7 @@ impl Engine {
                                         guc,
                                         exec::PlpgsqlTransactionContext::Atomic,
                                         responder,
+                                        StatementTimeoutEntry::Nested,
                                     )
                                 })
                             }
@@ -21951,6 +22018,7 @@ impl Engine {
                     guc,
                     exec::PlpgsqlTransactionContext::Atomic,
                     responder,
+                    StatementTimeoutEntry::Nested,
                 )
             });
             let result = match result {
@@ -22310,6 +22378,7 @@ impl Engine {
                     guc,
                     exec::PlpgsqlTransactionContext::Atomic,
                     responder,
+                    StatementTimeoutEntry::Nested,
                 )
             })?;
             if let Err(error) = result {
@@ -22481,6 +22550,7 @@ impl Engine {
                 guc,
                 exec::PlpgsqlTransactionContext::Atomic,
                 responder,
+                StatementTimeoutEntry::Nested,
             )
         })
     }

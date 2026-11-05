@@ -25,6 +25,7 @@ mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod prepared_object_capacity;
 mod procedural_expression_calls;
+mod procedural_progress;
 mod procedural_subtransactions;
 mod query_execution;
 mod routine_calls;
@@ -171,7 +172,7 @@ fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_re
             &mut copier,
             "BEGIN; COPY catalog_invoices FROM STDIN",
         );
-        let setup = engine.take_pending_copy().expect("unrelated invoice COPY");
+        let (setup, _deadline) = engine.take_pending_copy().expect("unrelated invoice COPY");
         for (sql, tag) in [
             (
                 "ALTER DOMAIN catalog_customer_id RENAME TO catalog_account_id",
@@ -230,7 +231,7 @@ fn catalog_publication_unrelated_type_changes_preserve_streamed_copy_and_cold_re
             &mut budget,
             &setup,
             &mut copier,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"23",
             &mut transition,
@@ -842,7 +843,7 @@ fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_cop
             &mut copier,
             "BEGIN; COPY rewrite_reader_invoices FROM STDIN",
         );
-        let setup = engine
+        let (setup, _deadline) = engine
             .take_pending_copy()
             .expect("unrelated COPY keeps its snapshot");
         run_txn(
@@ -895,7 +896,7 @@ fn statement_row_rewrite_preserves_selected_bytes_without_blocking_unrelated_cop
             &mut budget,
             &setup,
             &mut copier,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"23",
             &mut transition,
@@ -1013,7 +1014,7 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
                 "BEGIN; COPY statement_copy_source FROM STDIN"
             },
         );
-        let setup = engine
+        let (setup, _deadline) = engine
             .take_pending_copy()
             .expect("COPY setup retains its original table");
         if binary {
@@ -1022,7 +1023,7 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
                 &mut transition,
@@ -1034,7 +1035,7 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 b"7",
                 &mut transition,
@@ -1069,7 +1070,7 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 &[0, 1, 0, 0, 0, 4, 0, 0, 0, 8],
                 &mut transition,
@@ -1080,7 +1081,7 @@ fn statement_row_copy_chunks_reject_a_definition_changed_after_copy_begin() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 b"8",
                 &mut transition,
@@ -18148,7 +18149,7 @@ fn copy_line(
     budget: &mut Budget,
     setup: &crate::sql::exec::CopySetup,
     txn: &mut TxnState,
-    seq_session: &crate::sql::guc::SeqSession,
+    guc: &GucState,
     arena: &Arena,
     line: &[u8],
     inserted: &mut crate::sql::exec::CopyTransitionRows,
@@ -18158,7 +18159,7 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, seq_session, arena, &mut responder, inserted),
+        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
     )
 }
 
@@ -18171,7 +18172,7 @@ fn copy_binary_row(
     budget: &mut Budget,
     setup: &crate::sql::exec::CopySetup,
     txn: &mut TxnState,
-    seq_session: &crate::sql::guc::SeqSession,
+    guc: &GucState,
     arena: &Arena,
     row: &[u8],
     inserted: &mut crate::sql::exec::CopyTransitionRows,
@@ -18181,7 +18182,7 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, seq_session, arena, &mut responder, inserted),
+        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
     )
 }
 
@@ -23586,7 +23587,7 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
             )
             .unwrap();
     }
-    let copy = engine
+    let (copy, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     arena.reset();
@@ -23596,7 +23597,7 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
             &mut budget,
             &copy,
             &mut transaction,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"4\trls_client\tcopy",
             &mut copy_transition,
@@ -32343,7 +32344,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
     let mut pool = test_pool(&mut budget);
     let mut cursors = test_cursors(&mut budget);
     let guc = GucState::new();
-    let setup = {
+    let (setup, _deadline) = {
         let mut responder = Responder::new(&mut send);
         engine
             .execute_simple(
@@ -32370,7 +32371,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"1",
         &mut copy_transition,
@@ -32381,7 +32382,7 @@ fn copy_from_partitioned_parent_routes_each_streamed_row() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"20",
         &mut copy_transition,
@@ -32461,7 +32462,7 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
             1,
         )
         .unwrap();
-    let left_setup = engine.take_pending_copy().expect("left COPY starts");
+    let (left_setup, _deadline) = engine.take_pending_copy().expect("left COPY starts");
     engine
         .execute_simple(
             "COPY copy_right FROM STDIN",
@@ -32474,14 +32475,14 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
             2,
         )
         .unwrap();
-    let right_setup = engine.take_pending_copy().expect("right COPY starts");
+    let (right_setup, _deadline) = engine.take_pending_copy().expect("right COPY starts");
 
     copy_line(
         &mut engine,
         &mut budget,
         &left_setup,
         &mut left_txn,
-        left_guc.seq_session(),
+        &left_guc,
         &left_arena,
         b"1",
         &mut left_inserted,
@@ -32492,7 +32493,7 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
         &mut budget,
         &right_setup,
         &mut right_txn,
-        right_guc.seq_session(),
+        &right_guc,
         &right_arena,
         b"10",
         &mut right_inserted,
@@ -32503,7 +32504,7 @@ fn interleaved_streamed_copies_keep_transition_rows_connection_private() {
         &mut budget,
         &left_setup,
         &mut left_txn,
-        left_guc.seq_session(),
+        &left_guc,
         &left_arena,
         b"2",
         &mut left_inserted,
@@ -37286,7 +37287,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters text streaming mode");
     arena.reset();
@@ -37295,7 +37296,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         &mut budget,
         &setup,
         &mut transaction,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"2 days 03:04:05.6",
         &mut copy_transition,
@@ -37328,7 +37329,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters binary streaming mode");
     let mut binary_row = Vec::new();
@@ -37342,7 +37343,7 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         &mut budget,
         &setup,
         &mut transaction,
-        guc.seq_session(),
+        &guc,
         &arena,
         &binary_row,
         &mut copy_transition,
@@ -39412,7 +39413,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
             1,
         )
         .unwrap();
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     copy_line(
@@ -39420,7 +39421,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"1",
         &mut copy_transition,
@@ -39431,7 +39432,7 @@ fn streamed_copy_validates_immediate_deferrable_constraints_at_copy_done() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"1",
         &mut copy_transition,
@@ -59233,7 +59234,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters binary streaming mode");
     arena.reset();
@@ -59262,7 +59263,7 @@ fn composite_domain_arrays_keep_the_domain_binary_boundary() {
         &mut budget,
         &setup,
         &mut transaction,
-        guc.seq_session(),
+        &guc,
         &arena,
         &input_row,
         &mut copy_transition,
@@ -83655,7 +83656,7 @@ fn metadata_alter_commits_updates_while_unrelated_copy_retains_snapshot() {
         "{}",
         String::from_utf8_lossy(&response)
     );
-    let setup = engine.take_pending_copy().unwrap();
+    let (setup, _deadline) = engine.take_pending_copy().unwrap();
     let snapshot = engine.storage.oldest_snapshot().unwrap();
     let response = run_txn_bytes(&mut engine, &mut budget, &mut writer, "COMMIT");
     assert!(
@@ -83827,7 +83828,7 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 "COPY copy_snapshot_input FROM STDIN"
             },
         );
-        let setup = engine.take_pending_copy().expect("streaming COPY setup");
+        let (setup, _deadline) = engine.take_pending_copy().expect("streaming COPY setup");
         let snapshot = engine.storage.commit_snapshot();
         assert_eq!(engine.storage.oldest_snapshot(), Some(snapshot));
         run_txn(
@@ -83844,7 +83845,7 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 &[0, 1, 0, 0, 0, 4, 0, 0, 0, 7],
                 &mut transition,
@@ -83856,7 +83857,7 @@ fn statement_snapshot_leases_cover_streaming_copy_completion_and_abort() {
                 &mut budget,
                 &setup,
                 &mut transaction,
-                guc.seq_session(),
+                &guc,
                 &arena,
                 b"7",
                 &mut transition,
@@ -89423,7 +89424,7 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     arena.reset();
@@ -89432,7 +89433,7 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"5",
         &mut copy_transition,
@@ -89495,7 +89496,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     assert!(matches!(
@@ -89522,7 +89523,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"DEFAULT,loaded",
         &mut copy_transition,
@@ -89534,7 +89535,7 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         &mut budget,
         &setup,
         &mut txn,
-        guc.seq_session(),
+        &guc,
         &arena,
         b"not-an-integer,rejected",
         &mut copy_transition,
@@ -89606,7 +89607,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters streaming mode");
     arena.reset();
@@ -89616,7 +89617,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"skip",
             &mut copy_transition,
@@ -89631,7 +89632,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"\\N",
             &mut copy_transition,
@@ -89647,7 +89648,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             b"keep",
             &mut copy_transition,
@@ -89683,7 +89684,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("binary COPY enters streaming mode");
     let binary_row = [
@@ -89698,7 +89699,7 @@ fn copy_from_where_filters_text_and_binary_rows_before_constraints_or_counting()
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             &binary_row,
             &mut copy_transition,
@@ -89768,7 +89769,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
             )
             .unwrap();
     }
-    let setup = engine
+    let (setup, _deadline) = engine
         .take_pending_copy()
         .expect("COPY enters binary streaming mode");
     arena.reset();
@@ -89783,7 +89784,7 @@ fn binary_copy_rows_reject_malformed_frames_without_panicking() {
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             frame,
             &mut copy_transition,
@@ -89837,7 +89838,7 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
             )
             .unwrap();
     }
-    let setup = engine.take_pending_copy().expect("COPY enters binary mode");
+    let (setup, _deadline) = engine.take_pending_copy().expect("COPY enters binary mode");
     let mut array = Vec::new();
     array.extend_from_slice(&1_i32.to_be_bytes());
     array.extend_from_slice(&1_i32.to_be_bytes());
@@ -89855,7 +89856,7 @@ fn binary_copy_enforces_not_null_domain_array_elements() {
             &mut budget,
             &setup,
             &mut txn,
-            guc.seq_session(),
+            &guc,
             &arena,
             &row,
             &mut copy_transition,
@@ -96134,14 +96135,14 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
             },
             true,
         );
-        let setup = engine.take_pending_copy().unwrap();
+        let (setup, _deadline) = engine.take_pending_copy().unwrap();
         let mut retained = Vec::with_capacity(1);
         crate::mem::guard::forbid_alloc(|| {
             engine
                 .copy_start(
                     &setup,
                     &mut reader.transaction,
-                    reader.guc.seq_session(),
+                    &reader.guc,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96154,7 +96155,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let mut responder = Responder::new(&mut send);
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
-                    reader.guc.seq_session(),
+                    &reader.guc,
                     &arena,
                     &mut responder,
                     &mut transition,

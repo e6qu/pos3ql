@@ -2385,6 +2385,14 @@ pub(crate) struct StatementClock {
     transaction: i64,
 }
 
+/// Captures an unarmed clock too, without reading the wall clock.
+pub(crate) fn stored_statement_clock() -> StatementClock {
+    StatementClock {
+        statement: STATEMENT_START.with(Cell::get),
+        transaction: TRANSACTION_START.with(Cell::get),
+    }
+}
+
 pub(crate) fn statement_clock() -> StatementClock {
     StatementClock {
         statement: statement_micros(),
@@ -2811,5 +2819,143 @@ mod tests {
         assert_eq!(utc, plus2);
         let z = parse_timestamp("2024-01-01T12:00:00Z", true).unwrap();
         assert_eq!(utc, z);
+    }
+}
+
+#[cfg(test)]
+mod deadline_ownership_tests {
+    use super::StatementClock;
+    use crate::sql::eval::sqlstate;
+    use crate::sql::query::{
+        check_timeout_at, consume_expired_timeout, disarm_timeout, restore_statement_deadline,
+        statement_deadline,
+    };
+
+    #[test]
+    fn consumed_timeouts_survive_saved_deadlines_and_internal_transaction_cleanup() {
+        struct Restore(i64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore_statement_deadline(self.0);
+            }
+        }
+        let _restore = Restore(statement_deadline());
+        let mut budget = crate::mem::Budget::new(crate::sql::txn::TxnState::budget_bytes(1));
+        let mut txn = crate::sql::txn::TxnState::new(&mut budget, 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            restore_statement_deadline(i64::MIN);
+            txn.catch_query_cancellation(0);
+            assert_eq!(statement_deadline(), 0);
+            txn.suspend_statement(
+                None,
+                StatementClock {
+                    statement: 1,
+                    transaction: 1,
+                },
+                i64::MIN,
+                crate::sql::exec::PlpgsqlTransactionContext::Atomic,
+            );
+            assert_eq!(txn.suspended_statement_deadline(), Some(0));
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 60_000,
+            });
+            assert_eq!(statement_deadline(), 0);
+            txn.clear();
+            txn.restore_statement_deadline(i64::MIN);
+            assert_eq!(statement_deadline(), 0);
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
+            restore_statement_deadline(i64::MAX);
+            txn.catch_query_cancellation(0);
+            assert_eq!(statement_deadline(), i64::MAX);
+            txn.suspend_statement(
+                None,
+                StatementClock {
+                    statement: 1,
+                    transaction: 1,
+                },
+                i64::MAX,
+                crate::sql::exec::PlpgsqlTransactionContext::Atomic,
+            );
+            disarm_timeout();
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
+            assert_eq!(statement_deadline(), i64::MAX);
+            txn.release_suspended_statement();
+            txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                timeout_ms: 0,
+            });
+            assert_eq!(statement_deadline(), 0);
+            txn.mode = crate::sql::txn::TxnMode::Implicit;
+            txn.txid = 1;
+            txn.stage_commit(
+                1,
+                crate::sql::txn::CommitTarget::Ordinary,
+                crate::sql::txn::CommitBarrier::Journal,
+            );
+            txn.restore_statement_deadline(i64::MIN);
+            assert_eq!(statement_deadline(), 0);
+            for entry in [
+                crate::sql::StatementTimeoutEntry::Command { timeout_ms: 60_000 },
+                crate::sql::StatementTimeoutEntry::Captured { deadline: i64::MIN },
+                crate::sql::StatementTimeoutEntry::Nested,
+            ] {
+                restore_statement_deadline(i64::MIN);
+                txn.enter_statement_timeout(entry);
+                check_timeout_at(0).unwrap();
+                assert_eq!(statement_deadline(), 0);
+            }
+            assert_eq!(txn.take_staged_commit().unwrap().lsn, 1);
+        });
+    }
+
+    #[test]
+    fn caught_timeouts_release_only_expired_deadlines_and_preserve_future_timeouts() {
+        struct Restore(i64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                restore_statement_deadline(self.0);
+            }
+        }
+        let _restore = Restore(statement_deadline());
+        crate::mem::guard::forbid_alloc(|| {
+            restore_statement_deadline(i64::MIN);
+            assert_eq!(
+                check_timeout_at(0).unwrap_err().sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+            assert!(consume_expired_timeout(0));
+            assert_eq!(statement_deadline(), 0);
+            check_timeout_at(0).unwrap();
+            restore_statement_deadline(i64::MAX);
+            assert!(!consume_expired_timeout(0));
+            assert_eq!(statement_deadline(), i64::MAX);
+            check_timeout_at(0).unwrap();
+            disarm_timeout();
+            assert!(!consume_expired_timeout(0));
+            assert_eq!(statement_deadline(), 0);
+            let outer = crate::sql::query::enter_deadline_scope();
+            restore_statement_deadline(i64::MAX);
+            {
+                let _inner = crate::sql::query::enter_deadline_scope();
+                restore_statement_deadline(i64::MIN);
+            }
+            assert_eq!(statement_deadline(), i64::MAX);
+            drop(outer);
+            assert_eq!(statement_deadline(), 0);
+            let original = super::stored_statement_clock();
+            {
+                let _callback = crate::sql::eval::funcs::system::retain_session_evaluation();
+                super::restore_statement_clock(StatementClock {
+                    statement: 11,
+                    transaction: 12,
+                });
+            }
+            let restored = super::stored_statement_clock();
+            assert_eq!(restored.statement, original.statement);
+            assert_eq!(restored.transaction, original.transaction);
+        });
     }
 }

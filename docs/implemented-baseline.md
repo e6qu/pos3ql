@@ -481,6 +481,28 @@ includes matching examples and raw results.
 An `EXCEPTION WHEN OTHERS` handler excludes query cancellation and assertion
 failures. Catch those deliberately with `WHEN query_canceled` or
 `WHEN assert_failure`; a broad handler does not keep cancelled work running.
+Procedural dispatch checks deadlines at block entry and before each instruction,
+including empty loop bodies. A matched cancellation handler consumes an expired
+timeout while preserving a future timer after a user-raised cancellation.
+A command keeps its original deadline through input preparation and cache waits;
+nested SQL does not start a new timer. Extended-protocol Parse, Bind, Describe
+and Execute share the connection's timer until Execute or Sync finishes. For
+example, pausing a client between Bind and Execute does not buy the query more
+time. An expired timer is delivered on the next message, including Flush,
+Close or Sync; buffered portal rows cannot bypass that check. Another connection
+uses its own deadline. COPY retains its original timer
+between data messages: an expired incoming row fails with `57014`; finishing an
+empty stream does not itself require a row check. The
+[PostgreSQL probe](https://github.com/e6qu/pos3ql/tree/02d030e49e5a483d567ffb205dd01c4b9faad857/tests/external/reference/2026-11-05-procedural-deadlines)
+records these boundaries; native tests also interleave connections. COPY binds
+the owning session at start, each row and completion, so trigger handlers can
+restore settings after an error even when other connections run between chunks.
+It also restores the stream's SQL user, search path and formatting before firing
+those triggers. COPY keeps its original statement and transaction timestamps
+across chunks; a background callback restores the frontend's clocks when it
+returns.
+Its completed control effects must not be replayed after a wait; retained handler
+positions remain part of the execution work in [PLAN.md](../PLAN.md).
 
 A caught block is a subtransaction: its database changes are undone while the
 enclosing transaction continues. For example, a handler after a failed

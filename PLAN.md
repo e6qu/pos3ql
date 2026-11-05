@@ -60,6 +60,12 @@ operation without executing earlier rows or trigger statements again. Keep the
 original selected definitions, settings, statement snapshot and deadline.
 Cancellation or a real error must release retained owners and use the ordinary
 transaction rollback rules. A private wait must not be caught as a user error.
+Preserve typed control ownership: an application raising the same diagnostic
+code must still return or catch its own error normally, including in functions
+returning rows and category handlers.
+Keep input-validation functions on the same boundary: a domain check returning
+false is invalid input; an exception or private wait inside that check must
+propagate, including through arrays and composite fields.
 Cover row and statement triggers, nested calls, all firing times, partitioned
 writes, deferred triggers, COPY and replication apply. Compare visible rows,
 audit writes, sequence values and errors with PostgreSQL in both transaction
@@ -70,6 +76,22 @@ Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
+Keep cancellation state with the command through input binding, cache waits,
+procedural handlers and internal commits. Protocol deadlines now belong to the
+connection between Parse, Bind, Describe and Execute, and COPY retains its timer
+while waiting for client data. Keep native interleaving and recovery coverage
+while adding saved procedural positions. Preserve timeout checks before
+buffered replies and protocol control messages, including recovery when Sync
+itself delivers the timeout. Keep publication receipts protected from deadlines
+restored by any command-entry mode. COPY start, row and completion paths
+now bind the owning session explicitly; preserve settings rollback inside row
+and statement trigger handlers, including interleaved text/binary streams. Bind
+identity, name resolution, rendering and the original statement/transaction
+clock at the same resumed-message boundary. An empty or `NULL`-only loop must
+observe its deadline. Exercise timer ownership with explicit timestamps under
+Miri isolation, and exercise the real clock in native runtime tests. A caught timeout must not be delivered again or replay
+the timed-out loop when its handler waits; a user-raised cancellation must not
+disable a future timeout.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait
 must not publish that prefix twice. Static `SELECT INTO` and dynamic `EXECUTE
 INTO` retain PostgreSQL's different row-consumption rules.

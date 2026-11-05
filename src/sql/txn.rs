@@ -339,6 +339,9 @@ pub struct TxnState {
     /// An error occurred inside an explicit block: everything until
     /// COMMIT/ROLLBACK fails with 25P02.
     pub failed: bool,
+    // One SQL command can commit several transactions. A caught cancellation
+    // stays consumed until the command ends, including across those commits.
+    statement_timeout_consumed: bool,
     pub txid: u32,
     /// The isolation level promised to this transaction. READ COMMITTED takes
     /// a fresh durable-LSN snapshot per statement; REPEATABLE READ pins the
@@ -1049,6 +1052,7 @@ impl TxnState {
             catalog_history: None,
             mode: TxnMode::Idle,
             failed: false,
+            statement_timeout_consumed: false,
             txid: 0,
             isolation: TransactionIsolation::ReadCommitted,
             read_only: false,
@@ -1502,7 +1506,8 @@ impl TxnState {
     }
 
     pub(crate) fn suspended_statement_deadline(&self) -> Option<i64> {
-        self.commit_admission
+        let deadline = self
+            .commit_admission
             .as_ref()
             .map(|admission| admission.deadline)
             .or_else(|| {
@@ -1510,7 +1515,49 @@ impl TxnState {
                     .as_ref()
                     .map(|suspended| suspended.deadline)
             })
-            .or_else(|| self.cache_capacity_wait.as_ref().map(|wait| wait.deadline))
+            .or_else(|| self.cache_capacity_wait.as_ref().map(|wait| wait.deadline));
+        if self.statement_timeout_consumed {
+            deadline.map(|_| 0)
+        } else {
+            deadline
+        }
+    }
+
+    pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
+        if self.staged_commit.is_some() {
+            super::query::disarm_timeout();
+            return;
+        }
+        let timeout_ms = match entry {
+            super::StatementTimeoutEntry::Command { timeout_ms } => timeout_ms,
+            super::StatementTimeoutEntry::Captured { deadline } => {
+                self.restore_statement_deadline(deadline);
+                return;
+            }
+            super::StatementTimeoutEntry::Nested => return,
+        };
+        if let Some(deadline) = self.suspended_statement_deadline() {
+            self.restore_statement_deadline(deadline);
+        } else if let Some(command) = &self.concurrent_index {
+            self.restore_statement_deadline(command.deadline);
+        } else {
+            self.statement_timeout_consumed = false;
+            super::query::arm_timeout(timeout_ms);
+        }
+    }
+
+    pub(crate) fn restore_statement_deadline(&self, deadline: i64) {
+        super::query::restore_statement_deadline(
+            if self.statement_timeout_consumed || self.staged_commit.is_some() {
+                0
+            } else {
+                deadline
+            },
+        );
+    }
+
+    pub(super) fn catch_query_cancellation(&mut self, now: i64) {
+        self.statement_timeout_consumed |= super::query::consume_expired_timeout(now);
     }
 
     pub(super) fn suspended_statement_context(

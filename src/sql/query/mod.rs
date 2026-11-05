@@ -847,7 +847,7 @@ pub(crate) const MAX_OPTIMIZED_JOIN_TABLES: usize = u64::BITS as usize;
 use core::cell::{Cell, RefCell};
 std::thread_local! {
     /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
-    /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
+    /// 0 means unarmed. The worker lends this timer to the active invocation.
     static DEADLINE: Cell<i64> = const { Cell::new(0) };
 }
 
@@ -860,6 +860,21 @@ pub fn arm_timeout(timeout_ms: u64) {
         super::datetime::now_micros().saturating_add(timeout_ms as i64 * 1000)
     };
     DEADLINE.with(|d| d.set(dl));
+}
+
+/// The worker lends its timer to one connection or embedded invocation. Nested
+/// execution restores the caller's timer, including on errors and unwinding.
+#[must_use = "keep the timer scope alive until the invocation finishes"]
+pub(crate) struct DeadlineScope(i64);
+
+pub(crate) fn enter_deadline_scope() -> DeadlineScope {
+    DeadlineScope(statement_deadline())
+}
+
+impl Drop for DeadlineScope {
+    fn drop(&mut self) {
+        restore_statement_deadline(self.0);
+    }
 }
 
 pub(crate) fn statement_deadline() -> i64 {
@@ -875,16 +890,35 @@ pub fn disarm_timeout() {
     DEADLINE.with(|d| d.set(0));
 }
 
+pub(crate) fn consume_expired_timeout(now: i64) -> bool {
+    DEADLINE.with(|deadline| {
+        let at = deadline.get();
+        if at != 0 && now >= at {
+            deadline.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// Errors 57014 if the armed statement deadline has passed. Every scan
 /// boundary reads the deadline: amortization can turn an expired statement
 /// into a successful partial result when a small outer scan owns a huge inner
 /// nested loop.
 pub fn check_timeout() -> Result<(), SqlError> {
+    if statement_deadline() == 0 {
+        return Ok(());
+    }
+    check_timeout_at(super::datetime::now_micros())
+}
+
+pub(super) fn check_timeout_at(now: i64) -> Result<(), SqlError> {
     let dl = DEADLINE.with(|d| d.get());
     if dl == 0 {
         return Ok(());
     }
-    if super::datetime::now_micros() >= dl {
+    if now >= dl {
         return Err(sql_err!(
             sqlstate::QUERY_CANCELED,
             "canceling statement due to statement timeout"

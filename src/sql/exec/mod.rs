@@ -17787,7 +17787,7 @@ struct TriggerExceptionHandler<'a> {
 enum TriggerExceptionCondition {
     Others,
     SqlState(crate::sql::eval::SqlState),
-    SqlStateClass(&'static str),
+    SqlStateClass([u8; 2]),
 }
 
 #[derive(Clone, Copy)]
@@ -19946,16 +19946,20 @@ fn parse_trigger_exception_condition(text: &str) -> Result<TriggerExceptionCondi
     let state = if let Some(state) = trigger_condition_sqlstate(text) {
         state
     } else if text.eq_ignore_ascii_case("data_exception") {
-        return Ok(TriggerExceptionCondition::SqlStateClass("22"));
+        return Ok(TriggerExceptionCondition::SqlStateClass(*b"22"));
     } else if text.eq_ignore_ascii_case("integrity_constraint_violation") {
-        return Ok(TriggerExceptionCondition::SqlStateClass("23"));
+        return Ok(TriggerExceptionCondition::SqlStateClass(*b"23"));
     } else {
         let Some((state, _)) = parse_trigger_raise_sqlstate(text)? else {
             return Err(unsupported_trigger_body());
         };
         state
     };
-    Ok(TriggerExceptionCondition::SqlState(state))
+    if state.as_str().ends_with("000") {
+        Ok(TriggerExceptionCondition::SqlStateClass(state.category()))
+    } else {
+        Ok(TriggerExceptionCondition::SqlState(state))
+    }
 }
 
 /// Parses an explicit `SQLSTATE 'code'` into the validated value used by the
@@ -22101,7 +22105,20 @@ mod trigger_program_tests {
                     &error
                 ));
                 assert!(!trigger_exception_matches(
-                    TriggerExceptionCondition::SqlStateClass("PZ"),
+                    TriggerExceptionCondition::SqlStateClass(*b"PZ"),
+                    &error
+                ));
+            }
+            for (condition, code) in [
+                ("SQLSTATE 'PZ000'", "PZ999"),
+                ("SQLSTATE '22000'", "22012"),
+                ("SQLSTATE '23000'", "23514"),
+            ] {
+                let condition = parse_trigger_exception_condition(condition).unwrap();
+                let error = sql_err!(code, "application category member");
+                assert!(trigger_exception_matches(condition, &error));
+                assert!(trigger_exception_matches(
+                    TriggerExceptionCondition::Others,
                     &error
                 ));
             }
@@ -23035,13 +23052,15 @@ impl<'a> ProceduralQueryRows<'a> {
     fn complete(rows: &'a [&'a [u8]], result: Result<(), SqlError>) -> Result<Self, SqlError> {
         match result {
             Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::INTERNAL_ROUTINE_INVOCATION
-                        | sqlstate::INTERNAL_LOCK_WAIT
-                        | sqlstate::INTERNAL_IO_WAIT
-                        | sqlstate::QUERY_CANCELED
-                ) =>
+                if error.sqlstate == sqlstate::QUERY_CANCELED
+                    || matches!(
+                        error.sqlstate.internal_control(),
+                        Some(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION
+                                | sqlstate::INTERNAL_LOCK_WAIT
+                                | sqlstate::INTERNAL_IO_WAIT
+                        )
+                    ) =>
             {
                 Err(error)
             }
@@ -25883,7 +25902,7 @@ fn rollback_atomic_trigger_subtransaction(
 }
 
 fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlError) -> bool {
-    if error.sqlstate.starts_with("PZ") {
+    if error.sqlstate.internal_control().is_some() {
         return false;
     }
     match condition {
@@ -25892,7 +25911,7 @@ fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlEr
             sqlstate::QUERY_CANCELED | sqlstate::ASSERT_FAILURE
         ),
         TriggerExceptionCondition::SqlState(state) => error.sqlstate == state,
-        TriggerExceptionCondition::SqlStateClass(class) => error.sqlstate.starts_with(class),
+        TriggerExceptionCondition::SqlStateClass(class) => error.sqlstate.category() == class,
     }
 }
 
@@ -26651,7 +26670,9 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    super::query::check_timeout()?;
     for statement in block.statements {
+        super::query::check_timeout()?;
         let (statement, input_plan) = {
             let transition = TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
@@ -28199,6 +28220,12 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         }) else {
                             return Err(error);
                         };
+                        if error.sqlstate == sqlstate::QUERY_CANCELED {
+                            context
+                                .txn
+                                .catch_query_cancellation(super::datetime::now_micros());
+                            super::sequence::record_caught_cancellation(context.seq_session());
+                        }
                         let diagnostic = crate::sql::eval::take_diagnostic();
                         let message = context
                             .arena
@@ -28234,7 +28261,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             context: context_text,
                         };
                         let invocation = invocation.with_exception(caught);
-                        if let Some(flow) = execute_trigger_block(
+                        let handled = execute_trigger_block(
                             context,
                             definition,
                             invocation,
@@ -28247,7 +28274,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             handler.block,
                             status,
                             Some(&caught),
-                        )? {
+                        );
+                        if let Some(flow) = handled? {
                             return Ok(Some(flow));
                         }
                     }
@@ -29255,17 +29283,19 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 || completed
                     && result.as_ref().is_err_and(|error| {
                         matches!(
-                            error.sqlstate.as_str(),
-                            sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT
+                            error.sqlstate.internal_control(),
+                            Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
                         )
                     });
             let result = (|| {
                 if result.as_ref().is_err_and(|error| {
                     matches!(
-                        error.sqlstate.as_str(),
-                        sqlstate::INTERNAL_IO_WAIT
-                            | sqlstate::INTERNAL_LOCK_WAIT
-                            | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        error.sqlstate.internal_control(),
+                        Some(
+                            sqlstate::INTERNAL_IO_WAIT
+                                | sqlstate::INTERNAL_LOCK_WAIT
+                                | sqlstate::INTERNAL_ROUTINE_INVOCATION
+                        )
                     )
                 }) {
                     return if completed {
@@ -57483,6 +57513,7 @@ pub fn cluster(
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 pub struct CopySetup {
+    pub(super) clock: super::datetime::StatementClock,
     snapshot_lease: Mutex<Option<crate::storage::StatementSnapshotLease>>,
     definitions: crate::storage::TableDefinitionImages,
     pub table_index: usize,
@@ -58056,6 +58087,7 @@ pub fn copy_begin(
         }
     }
     Ok(CopySetup {
+        clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
         definitions,
         table_index,
@@ -58205,6 +58237,7 @@ pub(crate) fn subscription_copy_setup(
         targets[index] = local;
     }
     Ok(CopySetup {
+        clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
         definitions,
         table_index,

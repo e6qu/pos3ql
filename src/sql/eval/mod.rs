@@ -78,35 +78,121 @@ pub fn take_diagnostic() -> Option<Diagnostic> {
     PENDING_DIAGNOSTIC.with(|d| d.borrow_mut().take())
 }
 
+#[cfg(test)]
+mod control_identity_tests;
+
 /// A PostgreSQL SQLSTATE that has already passed the protocol's five-byte
 /// grammar. Keeping this separate from arbitrary text prevents a dynamic
 /// diagnostic from reaching a wire response or handler unvalidated.
+#[derive(Clone, Copy)]
+pub struct SqlState([u8; 5], ErrorOrigin);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SqlState(StackStr<5>);
+enum ErrorOrigin {
+    Sql,
+    InputExpression,
+    Control(InternalControl),
+}
+
+impl PartialEq for SqlState {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.internal_control() == other.internal_control()
+    }
+}
+
+impl Eq for SqlState {}
+
+/// Engine handoffs carry provenance; an application can raise any valid code
+/// with the same spelling without creating an engine pause or completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InternalControl {
+    LockWait,
+    IoWait,
+    RoutineInvocation,
+    QueryConsumerComplete,
+}
+
+impl InternalControl {
+    pub(crate) const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::LockWait => "PZ001",
+            Self::IoWait => "PZ002",
+            Self::RoutineInvocation => "PZ003",
+            Self::QueryConsumerComplete => "PZ004",
+        }
+    }
+}
+
+impl From<&'static str> for SqlState {
+    fn from(code: &'static str) -> Self {
+        Self::parse(code).expect("engine SQLSTATE constants must be valid")
+    }
+}
+
+impl From<InternalControl> for SqlState {
+    fn from(control: InternalControl) -> Self {
+        let mut state = Self::from(control.diagnostic_code());
+        state.1 = ErrorOrigin::Control(control);
+        state
+    }
+}
+
+impl PartialEq<InternalControl> for SqlState {
+    fn eq(&self, control: &InternalControl) -> bool {
+        self.internal_control() == Some(*control)
+    }
+}
+
+impl PartialEq<SqlState> for InternalControl {
+    fn eq(&self, state: &SqlState) -> bool {
+        state.internal_control() == Some(*self)
+    }
+}
 
 impl SqlState {
     /// Constructs a code used by the engine itself. Constants are audited at
     /// the call site, while client-provided values must use [`Self::parse`].
-    pub(crate) fn known(code: &'static str) -> Self {
-        assert!(
-            Self::is_valid(code),
-            "engine SQLSTATE constants must be valid"
-        );
-        Self(StackStr::from_str(code))
+    pub(crate) fn known(code: impl Into<Self>) -> Self {
+        code.into()
+    }
+
+    pub(crate) fn internal_control(self) -> Option<InternalControl> {
+        match self.1 {
+            ErrorOrigin::Control(control) => Some(control),
+            ErrorOrigin::Sql | ErrorOrigin::InputExpression => None,
+        }
+    }
+
+    fn can_report_input_failure(self) -> bool {
+        self.1 == ErrorOrigin::Sql
+            && (self.category() == *b"22"
+                || self == sqlstate::NOT_NULL_VIOLATION
+                || self == sqlstate::CHECK_VIOLATION)
     }
 
     /// Parses the PostgreSQL SQLSTATE grammar: five upper-case ASCII letters
     /// or digits.
     pub fn parse(code: &str) -> Option<Self> {
-        Self::is_valid(code).then(|| Self(StackStr::from_str(code)))
+        Self::is_valid(code).then(|| {
+            Self(
+                code.as_bytes()
+                    .try_into()
+                    .expect("validated SQLSTATE width"),
+                ErrorOrigin::Sql,
+            )
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        core::str::from_utf8(&self.0).expect("validated ASCII SQLSTATE")
+    }
+
+    pub(crate) const fn category(self) -> [u8; 2] {
+        [self.0[0], self.0[1]]
     }
 
     pub fn starts_with(self, prefix: &str) -> bool {
-        self.0.as_str().starts_with(prefix)
+        self.as_str().starts_with(prefix)
     }
 
     pub fn is_successful_completion(self) -> bool {
@@ -121,21 +207,31 @@ impl SqlState {
     }
 }
 
+impl core::fmt::Debug for SqlState {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_tuple("SqlState")
+            .field(&self.as_str())
+            .field(&self.1)
+            .finish()
+    }
+}
+
 impl AsRef<str> for SqlState {
     fn as_ref(&self) -> &str {
-        self.0.as_str()
+        self.as_str()
     }
 }
 
 impl core::fmt::Display for SqlState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.as_str())
     }
 }
 
 impl PartialEq<&str> for SqlState {
     fn eq(&self, other: &&str) -> bool {
-        self.0.as_str() == *other
+        self.as_str() == *other
     }
 }
 
@@ -144,6 +240,17 @@ pub struct SqlError {
     /// Five-character SQLSTATE per PostgreSQL's errcodes table.
     pub sqlstate: SqlState,
     pub message: StackStr<192>,
+}
+
+impl SqlError {
+    /// An exception while evaluating a domain CHECK is a hard error, even if
+    /// its code also describes bad input. A false CHECK remains reportable.
+    pub(crate) fn input_expression_failure(mut self) -> Self {
+        if self.sqlstate.internal_control().is_none() {
+            self.sqlstate.1 = ErrorOrigin::InputExpression;
+        }
+        self
+    }
 }
 
 #[macro_export]
@@ -279,14 +386,16 @@ pub mod sqlstate {
     pub const DEADLOCK_DETECTED: &str = "40P01";
     /// Private control-flow sentinel. The wire layer must park the connection
     /// and must never serialize this as an ErrorResponse.
-    pub(crate) const INTERNAL_LOCK_WAIT: &str = "PZ001";
+    pub(crate) const INTERNAL_LOCK_WAIT: super::InternalControl = super::InternalControl::LockWait;
     /// A non-blocking block fetch is in progress; the statement must park and
     /// retry when the reactor completes the fetch.
-    pub(crate) const INTERNAL_IO_WAIT: &str = "PZ002";
+    pub(crate) const INTERNAL_IO_WAIT: super::InternalControl = super::InternalControl::IoWait;
     /// Evaluation yielded a scalar routine which must run after the caller
     /// releases its immutable storage borrow.
-    pub(crate) const INTERNAL_ROUTINE_INVOCATION: &str = "PZ003";
-    pub(crate) const INTERNAL_QUERY_CONSUMER_COMPLETE: &str = "PZ004";
+    pub(crate) const INTERNAL_ROUTINE_INVOCATION: super::InternalControl =
+        super::InternalControl::RoutineInvocation;
+    pub(crate) const INTERNAL_QUERY_CONSUMER_COMPLETE: super::InternalControl =
+        super::InternalControl::QueryConsumerComplete;
     pub const NAME_TOO_LONG: &str = "42622";
     pub const NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
     pub const SERIALIZATION_FAILURE: &str = "40001";
@@ -9264,8 +9373,9 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, SqlError> {
 }
 
 /// Runs a type's text-input boundary without throwing its input error.  An
-/// unknown type is still an error: only failure of a resolved input function
-/// is data returned by `pg_input_is_valid` / `pg_input_error_info`.
+/// unknown type is still an error. Only data failures become results from
+/// `pg_input_is_valid` / `pg_input_error_info`; controls and exceptions while
+/// evaluating domain CHECK expressions remain errors.
 pub(crate) struct InputError<'a> {
     pub(crate) sqlstate: SqlState,
     pub(crate) message: &'a str,
@@ -9287,6 +9397,7 @@ pub(crate) fn input_error<'a>(
         match catalog.cast_user_type(base_name, Datum::Text(input), arena, hooks.sequences) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
+            Err(error) if !error.sqlstate.can_report_input_failure() => return Err(error),
             Err(error) => {
                 let message = if error.message.is_truncated()
                     && catalog.enum_creation_of_name(base_name).is_some()
@@ -9318,6 +9429,9 @@ pub(crate) fn input_error<'a>(
     parsed
         .err()
         .map(|error| {
+            if !error.sqlstate.can_report_input_failure() {
+                return Err(error);
+            }
             Ok(InputError {
                 sqlstate: error.sqlstate,
                 message: arena

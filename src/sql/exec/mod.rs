@@ -17816,7 +17816,13 @@ struct TriggerCaseBranch<'a> {
 struct TriggerCase<'a> {
     operand: Option<&'a Expr<'a>>,
     branches: &'a [TriggerCaseBranch<'a>],
-    otherwise: Option<TriggerBlock<'a>>,
+    otherwise: TriggerCaseElse<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum TriggerCaseElse<'a> {
+    Block(TriggerBlock<'a>),
+    RaiseNotFound,
 }
 
 #[derive(Clone, Copy)]
@@ -20013,6 +20019,8 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::CHECK_VIOLATION
     } else if text.eq_ignore_ascii_case("division_by_zero") {
         sqlstate::DIVISION_BY_ZERO
+    } else if text.eq_ignore_ascii_case("case_not_found") {
+        sqlstate::CASE_NOT_FOUND
     } else if text.eq_ignore_ascii_case("cardinality_violation") {
         sqlstate::CARDINALITY_VIOLATION
     } else if text.eq_ignore_ascii_case("invalid_transaction_termination") {
@@ -20592,14 +20600,14 @@ fn parse_trigger_block<'a>(
                         break TriggerStatement::Case(TriggerCase {
                             operand,
                             branches: branches.as_slice(),
-                            otherwise: Some(otherwise),
+                            otherwise: TriggerCaseElse::Block(otherwise),
                         });
                     }
                     TriggerBlockEnd::EndCase => {
                         break TriggerStatement::Case(TriggerCase {
                             operand,
                             branches: branches.as_slice(),
-                            otherwise: None,
+                            otherwise: TriggerCaseElse::RaiseNotFound,
                         });
                     }
                     _ => return Err(unsupported_trigger_body()),
@@ -20997,7 +21005,7 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
                     for branch in statement.branches {
                         validate_block(branch.block, locals, shadowed)?;
                     }
-                    if let Some(otherwise) = statement.otherwise {
+                    if let TriggerCaseElse::Block(otherwise) = statement.otherwise {
                         validate_block(otherwise, locals, shadowed)?;
                     }
                 }
@@ -28865,9 +28873,19 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     break;
                 }
             }
-            Ok(selected
-                .or(program.otherwise)
-                .map_or_else(control_flow::Step::complete, control_flow::Step::branch))
+            if let Some(block) = selected {
+                return Ok(control_flow::Step::branch(block));
+            }
+            match program.otherwise {
+                TriggerCaseElse::Block(block) => Ok(control_flow::Step::branch(block)),
+                TriggerCaseElse::RaiseNotFound => {
+                    super::eval::stash_diagnostic(
+                        None,
+                        Some(StackStr::from_str("CASE statement is missing ELSE part.")),
+                    );
+                    Err(sql_err!(sqlstate::CASE_NOT_FOUND, "case not found"))
+                }
+            }
         }
     };
     match input_plan {

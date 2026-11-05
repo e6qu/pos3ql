@@ -43,6 +43,27 @@ DO $$BEGIN
         INSERT INTO control_frame_results VALUES('rethrow',SQLSTATE);
     END;
 END$$;
+DO $$DECLARE diagnostic_hint text; BEGIN
+    BEGIN
+        CASE WHEN false THEN NULL; END CASE;
+    EXCEPTION WHEN case_not_found THEN
+        GET STACKED DIAGNOSTICS diagnostic_hint = PG_EXCEPTION_HINT;
+        INSERT INTO control_frame_results VALUES('case_searched',SQLSTATE||':'||SQLERRM||':'||diagnostic_hint);
+    END;
+    BEGIN
+        CASE nextval('control_frame_calls') WHEN -1 THEN NULL; WHEN -2 THEN NULL; END CASE;
+    EXCEPTION WHEN case_not_found THEN
+        INSERT INTO control_frame_results VALUES('case_simple',SQLSTATE);
+    END;
+    BEGIN
+        CASE NULL::integer WHEN NULL::integer THEN NULL; END CASE;
+    EXCEPTION WHEN case_not_found THEN
+        INSERT INTO control_frame_results VALUES('case_null',SQLSTATE);
+    END;
+    CASE WHEN false THEN NULL; ELSE NULL; END CASE;
+    INSERT INTO control_frame_results VALUES('case_else','ok');
+    CASE 1 WHEN 1 THEN INSERT INTO control_frame_results VALUES('case_match','ok'); END CASE;
+END$$;
 SELECT label,value FROM control_frame_results ORDER BY label;
 SELECT currval('control_frame_calls');
 DROP SEQUENCE control_frame_calls;

@@ -183,6 +183,11 @@ after undoing earlier row changes would give constraints the wrong data.
 Event triggers use the engine's procedural execution context and retain each
 statement's checked inputs across calls.
 
+An unmatched procedural `CASE` without `ELSE` raises `20000` (`case_not_found`).
+For example, `DO $$BEGIN CASE WHEN false THEN NULL; END CASE; END$$` fails with
+`case not found` and the hint `CASE statement is missing ELSE part.`. An explicit
+`ELSE` runs normally, and a simple `CASE` evaluates its operand once.
+
 Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
 reject client text and binary input with `0A000`, matching PostgreSQL. Reports
 can display their generated values. Copying non-null statistics values into

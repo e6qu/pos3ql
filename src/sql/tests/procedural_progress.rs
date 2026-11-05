@@ -16,16 +16,34 @@ fn procedural_control_frames_preserve_nested_loops_handlers_and_returns() {
         assert_eq!(
             data_rows(&session.success(&mut engine, sql, true)),
             [
+                "case_else|ok",
+                "case_match|ok",
+                "case_null|20000",
+                "case_searched|20000:case not found:CASE statement is missing ELSE part.",
+                "case_simple|20000",
                 "inner|23514",
                 "outer|22012",
                 "rethrow|22012",
                 "summary|outside:237:22012:true",
-                "1",
+                "2",
                 "10|3,4",
                 "done:1",
             ],
             "{mode:?}"
         );
+        for statement in [
+            "DO $$BEGIN CASE WHEN false THEN NULL; END CASE; END$$",
+            "DO $$BEGIN CASE 1 WHEN 2 THEN NULL; END CASE; END$$",
+            "DO $$BEGIN CASE NULL::integer WHEN NULL::integer THEN NULL; END CASE; END$$",
+        ] {
+            let output = session.execute(&mut engine, statement, true);
+            assert_eq!(error_sqlstates(&output), ["20000"], "{mode:?}: {statement}");
+            let hint = b"HCASE statement is missing ELSE part.\0";
+            assert!(
+                output.windows(hint.len()).any(|field| field == hint),
+                "{mode:?}: {output:?}"
+            );
+        }
     }
 }
 

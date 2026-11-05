@@ -48,12 +48,9 @@ pub use operators::{
 use operators::{compare_text_collated, logic, range_mismatch, unary};
 pub(crate) use operators::{hash_key_catalog, hash_key_collated_catalog, hash_key_identified};
 
-/// DETAIL/HINT lines for the next emitted error or notice. `SqlError` is
-/// constructed at ~60 sites and stays two fields; the rare errors that carry
-/// PostgreSQL DETAIL/HINT (DROP ... CASCADE dependency reports) stash them
-/// here, and the wire responder consumes them with the next diagnostic it
-/// writes. The engine is single-threaded per process; the responder clears
-/// the slot on every emission, so a stale detail cannot outlive its error.
+/// DETAIL/HINT for the next error or notice stay separate from `SqlError`.
+/// Exception handlers and the wire responder consume this worker-local slot
+/// when taking ownership of the diagnostic.
 pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 
 #[derive(Clone, Copy)]
@@ -293,6 +290,7 @@ pub mod sqlstate {
     pub const DATATYPE_MISMATCH: &str = "42804";
     pub const CANNOT_COERCE: &str = "42846";
     pub const DIVISION_BY_ZERO: &str = "22012";
+    pub const CASE_NOT_FOUND: &str = "20000";
     pub const NUMERIC_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
     pub const INVALID_XML_DOCUMENT: &str = "2200M";

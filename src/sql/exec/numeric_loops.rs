@@ -141,7 +141,7 @@ pub(super) fn visit_nested_blocks<'a>(
                 for branch in program.branches {
                     visit(branch.block, None);
                 }
-                if let Some(block) = program.otherwise {
+                if let TriggerCaseElse::Block(block) = program.otherwise {
                     visit(block, None);
                 }
             }

@@ -1,3 +1,4 @@
+BEGIN;
 CREATE SEQUENCE from_call_numbers;
 CREATE FUNCTION from_record(input integer, OUT n integer, OUT label text)
 LANGUAGE sql AS $$SELECT input,'row:'||input FROM generate_series(1,2)$$;
@@ -14,6 +15,10 @@ SELECT * FROM ROWS FROM(from_record(3),from_procedure(9)) WITH ORDINALITY;
 SELECT source.n,result.n,result.label
 FROM (VALUES(2),(4)) AS source(n),LATERAL from_record(source.n) AS result
 ORDER BY source.n;
+DROP FUNCTION from_procedure(integer);
+DROP FUNCTION from_record(integer);
+COMMIT;
+BEGIN;
 CREATE FUNCTION from_strict(input integer, effect bigint, OUT n integer, OUT label text)
 LANGUAGE sql STRICT AS $$SELECT input,'ran'::text$$;
 SELECT n,label FROM from_strict(NULL,nextval('from_call_numbers'));
@@ -28,6 +33,13 @@ SELECT count(*) FROM from_single_set(NULL);
 CREATE FUNCTION from_empty(OUT n integer, OUT label text)
 LANGUAGE sql AS $$SELECT 1,'empty'::text WHERE false$$;
 SELECT n,label FROM from_empty();
+DROP FUNCTION from_empty();
+DROP FUNCTION from_single_set(integer);
+DROP FUNCTION from_single(integer);
+DROP FUNCTION from_strict(integer,bigint);
+DROP SEQUENCE from_call_numbers;
+COMMIT;
+BEGIN;
 CREATE TYPE from_pair AS (n integer,label text);
 CREATE FUNCTION from_named(input integer) RETURNS from_pair
 LANGUAGE sql STRICT AS $$SELECT input,'named:'||input$$;
@@ -69,10 +81,4 @@ DROP FUNCTION from_named_empty();
 DROP FUNCTION from_named_value(integer);
 DROP FUNCTION from_named(integer);
 DROP TYPE from_pair;
-DROP FUNCTION from_empty();
-DROP FUNCTION from_single_set(integer);
-DROP FUNCTION from_single(integer);
-DROP FUNCTION from_strict(integer,bigint);
-DROP FUNCTION from_procedure(integer);
-DROP FUNCTION from_record(integer);
-DROP SEQUENCE from_call_numbers;
+COMMIT;

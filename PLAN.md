@@ -79,6 +79,8 @@ named output fields form one row, including a null result. Preserve argument
 effects, output aliases, lateral references and ordinality while resuming calls.
 Preserve named-row result conversion as a separate retained expression after
 the body finishes, including constraints that call functions with side effects.
+Run extended fixtures within unchanged catalog capacity; transaction boundaries
+must release completed definitions before their slots are reused.
 Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep the original command deadline, settings, identity, snapshot and clocks

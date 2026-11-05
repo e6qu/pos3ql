@@ -18,6 +18,8 @@ Function regressions must distinguish how many columns a call returns from how
 many rows it returns; selecting output names in `FROM` exercises both contracts.
 Include named rows returned as separate fields, whole values and nested values,
 and verify that constraint helpers run once during result conversion.
+Keep fixture catalog use within the configured limit without removing assertions
+or enlarging the capacity to fit a growing test script.
 Memory regressions must repeat queries and nested calls at unchanged capacity,
 including nested results on every iteration;
 successful short loops cannot establish that discarded work is reclaimed.

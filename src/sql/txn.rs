@@ -1544,8 +1544,8 @@ impl TxnState {
         });
     }
 
-    pub(super) fn catch_query_cancellation(&mut self) {
-        self.statement_timeout_consumed |= super::query::consume_expired_timeout();
+    pub(super) fn catch_query_cancellation(&mut self, now: i64) {
+        self.statement_timeout_consumed |= super::query::consume_expired_timeout(now);
     }
 
     pub(super) fn suspended_statement_context(

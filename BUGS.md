@@ -23,7 +23,9 @@ Open foreign connections inside nested exception blocks too: a savepoint list
 captured only at command admission misses boundaries created within that command.
 Check procedural deadlines with empty and scalar-only blocks as well as scans.
 Distinguish a consumed timeout from a user-raised cancellation, and keep the
-original timer through binding, storage waits and internal commits.
+original timer through binding, storage waits and internal commits. Keep clock
+transition proofs deterministic; ownership tests must not require Miri to read
+the host wall clock or disable isolation.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

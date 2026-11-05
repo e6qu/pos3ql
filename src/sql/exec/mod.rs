@@ -28202,7 +28202,9 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                             return Err(error);
                         };
                         if error.sqlstate == sqlstate::QUERY_CANCELED {
-                            context.txn.catch_query_cancellation();
+                            context
+                                .txn
+                                .catch_query_cancellation(super::datetime::now_micros());
                             super::sequence::record_caught_cancellation(context.seq_session());
                         }
                         let diagnostic = crate::sql::eval::take_diagnostic();

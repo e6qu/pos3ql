@@ -8,9 +8,8 @@ DO $$DECLARE seen integer := 0; total integer := 0; count integer; BEGIN
         IF FOUND THEN seen := seen+1; END IF;
         GET DIAGNOSTICS count=ROW_COUNT;
         total := total+count;
-        IF i%128=0 THEN
-            PERFORM nextval('perform_loop_calls'),perform_loop_text();
-        END IF;
+        PERFORM perform_loop_text();
+        IF i%128=0 THEN PERFORM nextval('perform_loop_calls'); END IF;
     END LOOP;
     INSERT INTO perform_loop_result VALUES(seen,total,currval('perform_loop_calls'));
 END$$;

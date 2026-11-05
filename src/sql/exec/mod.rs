@@ -27964,8 +27964,40 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(None)
             }),
             TriggerStatement::Perform(query) => execute_trigger_statement(|| {
-                let scratch_mark = context.arena.mark();
-                let row_count = (|| {
+                // Only the count escapes. The region reclaims query front
+                // storage and nested invocation receipts together.
+                let row_count = context.arena.with_remaining_region(|arena| {
+                    let host = match &mut context.host {
+                        PlpgsqlExecHost::Atomic {
+                            storage,
+                            scratch,
+                            seq_session,
+                        } => PlpgsqlExecHost::Atomic {
+                            storage,
+                            scratch: *scratch,
+                            seq_session,
+                        },
+                        PlpgsqlExecHost::Routine {
+                            engine,
+                            guc,
+                            sqlprep,
+                            cursors,
+                            transaction_context,
+                        } => PlpgsqlExecHost::Routine {
+                            engine,
+                            guc,
+                            sqlprep,
+                            cursors,
+                            transaction_context: *transaction_context,
+                        },
+                    };
+                    let mut context = TriggerExecContext {
+                        host,
+                        txn: context.txn,
+                        arena,
+                        params: context.params,
+                        responder: context.responder,
+                    };
                     let query = match transition_relations {
                         Some(relations) => super::query::bind_materialized_relations(
                             query,
@@ -27991,7 +28023,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     let arena = context.arena;
                     let params = context.params;
                     let txid = context.txn.txid;
-                    execute_procedural_query(context, |storage, sequence| {
+                    execute_procedural_query(&mut context, |storage, sequence| {
                         let mut row_count = 0u64;
                         super::query::select_into_rows(
                             storage,
@@ -28013,11 +28045,8 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                         )?;
                         Ok(row_count)
                     })
-                })();
-                // PERFORM exports only its count. Invocation state has dropped;
-                // inputs, locals and active handlers precede this scratch mark.
-                unsafe { context.arena.rewind_to(scratch_mark) };
-                status.set_rows(row_count?)?;
+                });
+                status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
 
                 Ok(None)
             }),

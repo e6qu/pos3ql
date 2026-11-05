@@ -118,13 +118,14 @@ jobs:
               environment.write(f"RUST_MIN_STACK={stack}\n")
           PY
 
-      - name: Function and HTTP fixture contracts
+      - name: Function, procedural rollback and HTTP fixture contracts
         shell: bash
         run: |
           native_test_binary=$(python3 tools/native-test-artifact.py verify \
             "$RUNNER_TEMP/native-test-artifact" "$GITHUB_SHA" "$NATIVE_TARGET")
           python3 tools/test_command.py "$native_test_binary" \
-            routine_calls:: object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing \
+            routine_calls:: procedural_subtransactions:: \
+            object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing \
             --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries

@@ -25752,7 +25752,101 @@ fn execute_plpgsql_dynamic_explain(
     })
 }
 
-fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
+struct TriggerSubtransaction {
+    index: usize,
+    identity: crate::storage::SessionIdentity,
+}
+
+fn begin_trigger_subtransaction(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+) -> Result<TriggerSubtransaction, SqlError> {
+    let identity = super::eval::funcs::system::current_identity();
+    let index = match &mut context.host {
+        PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            cursors,
+            ..
+        } => {
+            let wal = engine.wal.stage_mark(context.txn.txid);
+            super::txn::establish_savepoint(
+                &engine.storage,
+                context.txn,
+                guc,
+                "__trigger_exception__",
+                wal,
+                Some(cursors.creation_mark()),
+            )?
+        }
+        PlpgsqlExecHost::Atomic { storage, .. } => super::guc::with_active_state(|guc| {
+            super::txn::establish_savepoint(
+                storage,
+                context.txn,
+                guc,
+                "__trigger_exception__",
+                0,
+                None,
+            )
+        })?,
+    };
+    Ok(TriggerSubtransaction { index, identity })
+}
+
+fn release_trigger_subtransaction(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    boundary: &TriggerSubtransaction,
+) -> Result<(), SqlError> {
+    match &mut context.host {
+        PlpgsqlExecHost::Routine { engine, guc, .. } => {
+            super::txn::release_savepoint(&engine.storage, context.txn, guc, boundary.index)
+        }
+        PlpgsqlExecHost::Atomic { storage, .. } => super::guc::with_active_state(|guc| {
+            super::txn::release_savepoint(storage, context.txn, guc, boundary.index)
+        }),
+    }
+}
+
+fn rollback_trigger_subtransaction(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    boundary: &TriggerSubtransaction,
+) -> Result<(), SqlError> {
+    let savepoint = context.txn.savepoint_at(boundary.index);
+    super::foreign::rollback_to_savepoint(
+        context.storage(),
+        context.txn.txid,
+        savepoint.name.as_str(),
+    )?;
+    if let PlpgsqlExecHost::Routine {
+        engine,
+        guc,
+        cursors,
+        ..
+    } = &mut context.host
+    {
+        engine.rollback_to_savepoint(context.txn, boundary.index, guc, Some(cursors))?;
+        let identity = boundary.identity.refresh(&engine.storage, context.txn.txid);
+        super::eval::funcs::system::set_current_user(identity);
+        engine.publish_session_context(guc, context.txn, identity.as_str())?;
+    } else {
+        rollback_atomic_trigger_subtransaction(context, boundary.index);
+        super::guc::with_active_state(|guc| {
+            guc.rollback_to_savepoint(boundary.index);
+            super::eval::funcs::system::set_session_user(
+                guc.session_identity()
+                    .refresh(context.storage(), context.txn.txid),
+            );
+            guc.publish_rollback_settings(context.txn);
+            Ok(())
+        })?;
+        super::eval::funcs::system::set_current_user(boundary.identity);
+    }
+    release_trigger_subtransaction(context, boundary)
+}
+
+fn rollback_atomic_trigger_subtransaction(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    index: usize,
+) {
     let savepoint = context.txn.savepoint_at(index);
     let txid = context.txn.txid;
     for at in (savepoint.touched_mark..context.txn.touched().len()).rev() {
@@ -25771,22 +25865,21 @@ fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>,
                 .rollback_extended_statistics_data(statistics as usize, txid),
         }
     }
-    context.txn.rewind_touched(savepoint.touched_mark);
-    context.txn.rewind_truncates(savepoint.truncate_mark);
-    context.txn.rewind_statistics(savepoint.statistics_mark);
-    context
-        .txn
-        .rewind_subscription_advances(savepoint.subscription_advance_mark);
-    context.txn.rewind_notifications(
-        savepoint.notify_mark,
-        savepoint.notify_payload_mark,
-        savepoint.listen_mark,
+    assert_eq!(
+        savepoint.ddl_mark,
+        context.txn.ddl().len(),
+        "atomic trigger cannot own catalog edits"
     );
+    context
+        .storage()
+        .finish_cumulative_subtransactions(txid, index + 2, false);
+    context
+        .storage()
+        .set_cumulative_transaction_nest_level(txid, index + 2);
+    context.txn.rewind_to_savepoint(index, &savepoint);
     context
         .storage_mut()
         .rollback_locks_to(txid, savepoint.lock_mark);
-    context.txn.release_savepoints_from(index);
-    context.txn.failed = savepoint.failed;
 }
 
 fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlError) -> bool {
@@ -28074,13 +28167,7 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(None)
             }),
             TriggerStatement::Exception(exception_block) => execute_trigger_statement(|| {
-                context
-                    .txn
-                    .savepoint("__trigger_exception__", 0, context.storage().lock_mark())?;
-                let index = context
-                    .txn
-                    .savepoint_index("__trigger_exception__")
-                    .expect("new trigger savepoint is present");
+                let boundary = begin_trigger_subtransaction(context)?;
                 match execute_trigger_block(
                     context,
                     definition,
@@ -28096,13 +28183,13 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                     exception,
                 ) {
                     Ok(flow) => {
-                        context.txn.release_savepoints_from(index);
+                        release_trigger_subtransaction(context, &boundary)?;
                         if flow.is_some() {
                             return Ok(flow);
                         }
                     }
                     Err(error) => {
-                        rollback_trigger_subtransaction(context, index);
+                        rollback_trigger_subtransaction(context, &boundary)?;
                         let Some(handler) = exception_block.handlers.iter().find(|handler| {
                             handler
                                 .conditions

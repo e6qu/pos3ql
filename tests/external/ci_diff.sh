@@ -558,6 +558,22 @@ else
   bad "foreign mutation transaction behavior"
   printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_mutation" "$foreign_mutation_reference"
 fi
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+  -v ON_ERROR_STOP=1 -f "$EXT/foreign-procedural-subtransactions.sql" \
+  > "$WORK/foreign_subtransaction_reference.out" 2>&1
+foreign_subtransaction_reference_status=$?
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+  -v ON_ERROR_STOP=1 -f "$EXT/foreign-procedural-subtransactions.sql" \
+  > "$WORK/foreign_subtransaction_pos3ql.out" 2>&1
+foreign_subtransaction_pos3ql_status=$?
+if [[ $foreign_subtransaction_reference_status -eq 0 && $foreign_subtransaction_pos3ql_status -eq 0 ]] \
+  && diff -u "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out" \
+  && [[ "$(cat "$WORK/foreign_subtransaction_reference.out")" == $'1002|kept handler\n0' ]]; then
+  ok "procedural catches mirror first-use and nested foreign savepoints"
+else
+  bad "foreign procedural subtransaction cleanup"
+  cat "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out"
+fi
 cat > "$WORK/foreign_merge.sql" <<'SQL'
 BEGIN;
 SAVEPOINT outer_foreign_merge;

@@ -1202,7 +1202,7 @@ impl SubscriptionApply {
                     &mut self.txn,
                     &self.guc,
                     subxid,
-                ) {
+                )? {
                     return Err(Self::protocol_error(
                         "subscription STREAM ABORT targets an unknown subtransaction",
                     ));

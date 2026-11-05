@@ -3467,12 +3467,8 @@ impl Engine {
         if txn.savepoint_index(name.as_str()).is_some() {
             return Ok(());
         }
-        txn.savepoint(
-            name.as_str(),
-            self.wal.stage_mark(txn.txid),
-            self.storage.lock_mark(),
-        )?;
-        guc.savepoint();
+        let wal_mark = self.wal.stage_mark(txn.txid);
+        txn::establish_savepoint(&self.storage, txn, guc, name.as_str(), wal_mark, None)?;
         Ok(())
     }
 
@@ -3481,15 +3477,15 @@ impl Engine {
         txn: &mut TxnState,
         guc: &GucState,
         xid: u32,
-    ) -> bool {
+    ) -> Result<bool, SqlError> {
         let name = crate::stack_format!(63, "pgoutput_{xid}");
         let Some(index) = txn.savepoint_index(name.as_str()) else {
-            return false;
+            return Ok(false);
         };
-        self.rollback_to_savepoint(txn, index, guc);
-        txn.release_savepoints_from(index);
-        guc.release_savepoints_from(index);
-        true
+        foreign::rollback_to_savepoint(&self.storage, txn.txid, name.as_str())?;
+        self.rollback_to_savepoint(txn, index, guc, None)?;
+        txn::release_savepoint(&self.storage, txn, guc, index)?;
+        Ok(true)
     }
 
     pub(crate) fn apply_subscription_truncate(
@@ -5662,11 +5658,7 @@ impl Engine {
     ) -> Result<CommandSnapshot, SqlError> {
         self.check_publication_health()?;
         self.storage.validate_transaction_isolation(txn.isolation)?;
-        self.storage.set_foreign_statement_context(
-            txn.txid,
-            txn.isolation == TransactionIsolation::Serializable,
-            txn.savepoint_names(),
-        )?;
+        txn.publish_foreign_statement_context(&self.storage)?;
         let resumed = if resume_statement {
             txn.resume_statement()
         } else {
@@ -8656,7 +8648,13 @@ impl Engine {
     /// performed after it (reverse-replayed), discards the journal tail, and
     /// restores the pre-savepoint failed state — leaving the transaction (and
     /// the savepoint) open for reuse.
-    fn rollback_to_savepoint(&mut self, txn: &mut TxnState, index: usize, guc: &GucState) {
+    fn rollback_to_savepoint(
+        &mut self,
+        txn: &mut TxnState,
+        index: usize,
+        guc: &GucState,
+        cursors: Option<&mut cursor::CursorPool>,
+    ) -> Result<(), SqlError> {
         let sp = txn.savepoint_at(index);
         for i in (sp.touched_mark..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[i];
@@ -8680,28 +8678,20 @@ impl Engine {
             .finish_cumulative_subtransactions(txn.txid, index + 2, false);
         self.storage
             .set_cumulative_transaction_nest_level(txn.txid, index + 2);
-        txn.rewind_touched(sp.touched_mark);
-        txn.rewind_truncates(sp.truncate_mark);
-        txn.rewind_ddl(sp.ddl_mark);
-        txn.rewind_statistics(sp.statistics_mark);
-        txn.rewind_subscription_advances(sp.subscription_advance_mark);
-        txn.rewind_constraints(
-            sp.constraint_obligation_mark,
-            sp.constraint_completion_mark,
-            sp.constraint_mode_mark,
-            sp.constraint_rename_mark,
-            sp.deferred_trigger_mark,
-            sp.deferred_trigger_completion_mark,
-            sp.deferred_trigger_bytes_mark,
-        );
-        txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
+        txn.rewind_to_savepoint(index, &sp);
         self.storage.rollback_locks_to(txn.txid, sp.lock_mark);
-        txn.rollback_savepoints_after(index);
+        if let Some(mark) = sp.cursor_mark {
+            cursors
+                .expect("a cursor savepoint belongs to its frontend pool")
+                .rollback_creations(mark);
+        }
         self.wal.truncate_stage(txn.txid, sp.wal_mark);
         guc.rollback_to_savepoint(index);
-        txn.read_only = sp.read_only;
-        txn.restore_read_only_source(sp.read_only_source);
-        txn.failed = sp.failed;
+        eval::funcs::system::set_session_user(
+            guc.session_identity().refresh(&self.storage, txn.txid),
+        );
+        guc.publish_rollback_settings(txn);
+        txn.publish_foreign_statement_context(&self.storage)
     }
 
     /// Publishes every committed journal record accumulated since the prior
@@ -21121,22 +21111,16 @@ impl Engine {
                     )));
                 }
                 let mark = self.wal.stage_mark(txn.txid);
-                if let Err(e) = txn.savepoint(name, mark, self.storage.lock_mark()) {
+                if let Err(e) = txn::establish_savepoint(
+                    &self.storage,
+                    txn,
+                    guc,
+                    name,
+                    mark,
+                    Some(cursors.creation_mark()),
+                ) {
                     return Ok(Err(e));
                 }
-                if let Err(error) = foreign::savepoint(&self.storage, txn.txid, name) {
-                    let index = txn
-                        .savepoint_index(name)
-                        .expect("savepoint was inserted before remote mirroring");
-                    txn.release_savepoints_from(index);
-                    return Ok(Err(error));
-                }
-                let index = txn
-                    .savepoint_index(name)
-                    .expect("savepoint was retained after remote mirroring");
-                self.storage
-                    .set_cumulative_transaction_nest_level(txn.txid, index + 2);
-                guc.savepoint();
                 responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
             }
@@ -21149,17 +21133,9 @@ impl Engine {
                 }
                 match txn.savepoint_index(name) {
                     Some(index) => {
-                        if let Err(error) =
-                            foreign::release_savepoint(&self.storage, txn.txid, name)
-                        {
+                        if let Err(error) = txn::release_savepoint(&self.storage, txn, guc, index) {
                             return Ok(Err(error));
                         }
-                        self.storage
-                            .finish_cumulative_subtransactions(txn.txid, index + 2, true);
-                        self.storage
-                            .set_cumulative_transaction_nest_level(txn.txid, index + 1);
-                        txn.release_savepoints_from(index);
-                        guc.release_savepoints_from(index);
                         responder.command_complete("RELEASE")?;
                         Ok(Ok(()))
                     }
@@ -21187,7 +21163,9 @@ impl Engine {
                 if let Err(error) = foreign::rollback_to_savepoint(&self.storage, txn.txid, name) {
                     return Ok(Err(error));
                 }
-                self.rollback_to_savepoint(txn, index, guc);
+                if let Err(error) = self.rollback_to_savepoint(txn, index, guc, Some(cursors)) {
+                    return Ok(Err(error));
+                }
                 responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }

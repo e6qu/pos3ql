@@ -391,6 +391,22 @@ error returns to the client. A code ending in `000` in an exception handler
 matches its two-character category. Internal storage waits use a separate typed
 marker and cannot be caught by SQL handlers.
 
+`pg_input_is_valid` and `pg_input_error_info` report invalid values, while
+exceptions raised during a domain CHECK still fail the statement. For example:
+
+```sql
+CREATE DOMAIN positive_count AS integer CHECK(VALUE>0);
+SELECT pg_input_is_valid('-1','positive_count'); -- false
+CREATE DOMAIN broken_check AS integer CHECK(VALUE/(VALUE-VALUE)>0);
+SELECT pg_input_is_valid('1','broken_check'); -- error 22012: division by zero
+```
+
+The same distinction applies inside domain arrays and composite fields.
+Cancellation, resource exhaustion and internal waits also propagate instead of
+becoming an invalid-input result. This follows PostgreSQL's
+[input-checking contract](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-INFO-VALIDITY)
+and [domain CHECK error boundary](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/domains.c#L118).
+
 Each cursor reserves `cursor_bytes` for typed rows, `cursor_query_bytes` for its
 query, copied parameters and their
 declared types (a `NULL` date parameter still has the date type),

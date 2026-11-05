@@ -122,3 +122,83 @@ fn custom_sqlstates_remain_application_errors_through_handlers_and_routine_calls
         assert_eq!(error_sqlstates(&output), ["PZ004"]);
     }
 }
+
+#[test]
+fn input_validation_reports_bad_data_but_propagates_domain_expression_errors() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("input-error-provenance-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE DOMAIN positive_input AS integer CHECK(VALUE>0)",
+            true,
+        );
+        for (sql, expected) in [
+            ("SELECT pg_input_is_valid('1','positive_input')", "t"),
+            ("SELECT pg_input_is_valid('-1','positive_input')", "f"),
+            ("SELECT pg_input_is_valid('bad','positive_input')", "f"),
+            (
+                "SELECT sql_error_code FROM pg_input_error_info('-1','positive_input')",
+                "23514",
+            ),
+            (
+                "SELECT sql_error_code FROM pg_input_error_info('bad','positive_input')",
+                "22P02",
+            ),
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, sql, true)),
+                [expected],
+                "{mode:?}: {sql}"
+            );
+        }
+        session.success(
+            &mut engine,
+            "CREATE DOMAIN broken_input AS integer CHECK(VALUE/(VALUE-VALUE)>0)",
+            true,
+        );
+        for sql in [
+            "SELECT pg_input_is_valid('1','broken_input')",
+            "SELECT sql_error_code FROM pg_input_error_info('1','broken_input')",
+        ] {
+            let output = session.execute(&mut engine, sql, true);
+            assert_eq!(error_sqlstates(&output), ["22012"], "{mode:?}: {sql}");
+        }
+        session.success(&mut engine, "CREATE FUNCTION input_check(value integer) RETURNS boolean LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION USING ERRCODE=current_setting('application_name'), MESSAGE='input expression failed'; END$$", true);
+        session.success(
+            &mut engine,
+            "CREATE DOMAIN checked_input AS integer CHECK(input_check(VALUE))",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "CREATE TYPE input_record AS (value checked_input)",
+            true,
+        );
+        for code in [
+            "PZ001", "PZ002", "PZ003", "PZ004", "PZ999", "22012", "23514", "57014",
+        ] {
+            session.success(&mut engine, &format!("SET application_name='{code}'"), true);
+            for (input, type_name) in [
+                ("1", "checked_input"),
+                ("{1}", "checked_input[]"),
+                ("(1)", "input_record"),
+            ] {
+                for sql in [
+                    format!("SELECT pg_input_is_valid('{input}','{type_name}')"),
+                    format!("SELECT sql_error_code FROM pg_input_error_info('{input}','{type_name}')"),
+                ] {
+                    let output = session.execute(&mut engine, &sql, true);
+                    assert_eq!(error_sqlstates(&output), [code], "{mode:?}: {sql}");
+                    assert!(session.transaction.suspended_statement_context().is_none());
+                }
+            }
+        }
+    }
+}

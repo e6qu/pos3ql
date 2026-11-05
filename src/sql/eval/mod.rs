@@ -84,8 +84,23 @@ mod control_identity_tests;
 /// A PostgreSQL SQLSTATE that has already passed the protocol's five-byte
 /// grammar. Keeping this separate from arbitrary text prevents a dynamic
 /// diagnostic from reaching a wire response or handler unvalidated.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SqlState([u8; 5], Option<InternalControl>);
+#[derive(Clone, Copy)]
+pub struct SqlState([u8; 5], ErrorOrigin);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorOrigin {
+    Sql,
+    InputExpression,
+    Control(InternalControl),
+}
+
+impl PartialEq for SqlState {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.internal_control() == other.internal_control()
+    }
+}
+
+impl Eq for SqlState {}
 
 /// Engine handoffs carry provenance; an application can raise any valid code
 /// with the same spelling without creating an engine pause or completion.
@@ -117,20 +132,20 @@ impl From<&'static str> for SqlState {
 impl From<InternalControl> for SqlState {
     fn from(control: InternalControl) -> Self {
         let mut state = Self::from(control.diagnostic_code());
-        state.1 = Some(control);
+        state.1 = ErrorOrigin::Control(control);
         state
     }
 }
 
 impl PartialEq<InternalControl> for SqlState {
     fn eq(&self, control: &InternalControl) -> bool {
-        self.1 == Some(*control)
+        self.internal_control() == Some(*control)
     }
 }
 
 impl PartialEq<SqlState> for InternalControl {
     fn eq(&self, state: &SqlState) -> bool {
-        state.1 == Some(*self)
+        state.internal_control() == Some(*self)
     }
 }
 
@@ -142,7 +157,17 @@ impl SqlState {
     }
 
     pub(crate) fn internal_control(self) -> Option<InternalControl> {
-        self.1
+        match self.1 {
+            ErrorOrigin::Control(control) => Some(control),
+            ErrorOrigin::Sql | ErrorOrigin::InputExpression => None,
+        }
+    }
+
+    fn can_report_input_failure(self) -> bool {
+        self.1 == ErrorOrigin::Sql
+            && (self.category() == *b"22"
+                || self == sqlstate::NOT_NULL_VIOLATION
+                || self == sqlstate::CHECK_VIOLATION)
     }
 
     /// Parses the PostgreSQL SQLSTATE grammar: five upper-case ASCII letters
@@ -153,7 +178,7 @@ impl SqlState {
                 code.as_bytes()
                     .try_into()
                     .expect("validated SQLSTATE width"),
-                None,
+                ErrorOrigin::Sql,
             )
         })
     }
@@ -215,6 +240,17 @@ pub struct SqlError {
     /// Five-character SQLSTATE per PostgreSQL's errcodes table.
     pub sqlstate: SqlState,
     pub message: StackStr<192>,
+}
+
+impl SqlError {
+    /// An exception while evaluating a domain CHECK is a hard error, even if
+    /// its code also describes bad input. A false CHECK remains reportable.
+    pub(crate) fn input_expression_failure(mut self) -> Self {
+        if self.sqlstate.internal_control().is_none() {
+            self.sqlstate.1 = ErrorOrigin::InputExpression;
+        }
+        self
+    }
 }
 
 #[macro_export]
@@ -9337,8 +9373,9 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, SqlError> {
 }
 
 /// Runs a type's text-input boundary without throwing its input error.  An
-/// unknown type is still an error: only failure of a resolved input function
-/// is data returned by `pg_input_is_valid` / `pg_input_error_info`.
+/// unknown type is still an error. Only data failures become results from
+/// `pg_input_is_valid` / `pg_input_error_info`; controls and exceptions while
+/// evaluating domain CHECK expressions remain errors.
 pub(crate) struct InputError<'a> {
     pub(crate) sqlstate: SqlState,
     pub(crate) message: &'a str,
@@ -9360,6 +9397,7 @@ pub(crate) fn input_error<'a>(
         match catalog.cast_user_type(base_name, Datum::Text(input), arena, hooks.sequences) {
             Ok(Some(_)) => return Ok(None),
             Ok(None) => None,
+            Err(error) if !error.sqlstate.can_report_input_failure() => return Err(error),
             Err(error) => {
                 let message = if error.message.is_truncated()
                     && catalog.enum_creation_of_name(base_name).is_some()
@@ -9391,6 +9429,9 @@ pub(crate) fn input_error<'a>(
     parsed
         .err()
         .map(|error| {
+            if !error.sqlstate.can_report_input_failure() {
+                return Err(error);
+            }
             Ok(InputError {
                 sqlstate: error.sqlstate,
                 message: arena

@@ -39,6 +39,9 @@ durability receipt. Cover all command-entry modes at that boundary.
 Application error codes must not construct private execution controls. Exercise
 uncaught, exact, category and `OTHERS` handling, including functions returning
 rows; an application error must neither park a connection nor end its results.
+Input-validation helpers must not turn waits, cancellation, exhausted capacity
+or exceptions inside domain checks into invalid-data results. Distinguish a
+false check from a check that raises the same `23514` error itself.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

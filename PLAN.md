@@ -63,6 +63,9 @@ transaction rollback rules. A private wait must not be caught as a user error.
 Preserve typed control ownership: an application raising the same diagnostic
 code must still return or catch its own error normally, including in functions
 returning rows and category handlers.
+Keep input-validation functions on the same boundary: a domain check returning
+false is invalid input; an exception or private wait inside that check must
+propagate, including through arrays and composite fields.
 Cover row and statement triggers, nested calls, all firing times, partitioned
 writes, deferred triggers, COPY and replication apply. Compare visible rows,
 audit writes, sequence values and errors with PostgreSQL in both transaction

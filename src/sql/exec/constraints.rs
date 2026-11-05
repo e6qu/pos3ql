@@ -247,7 +247,8 @@ pub(crate) fn validate_domain_check<'a>(
     )?;
     let expression = crate::sql::parser::parse_expr(source, arena)?;
     if matches!(
-        eval_full(expression, arena, params, &context, &hooks)?,
+        eval_full(expression, arena, params, &context, &hooks)
+            .map_err(SqlError::input_expression_failure)?,
         Datum::Bool(false)
     ) {
         return Err(sql_err!(

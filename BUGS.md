@@ -16,6 +16,8 @@ alone cannot prove that effects ran once, constraints saw the right rows, or
 temporary references were released safely.
 Function regressions must distinguish how many columns a call returns from how
 many rows it returns; selecting output names in `FROM` exercises both contracts.
+Memory regressions must repeat queries and nested calls at unchanged capacity;
+successful short loops cannot establish that discarded work is reclaimed.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

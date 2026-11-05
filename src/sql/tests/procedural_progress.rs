@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn discarded_procedural_queries_reuse_memory_and_preserve_counts_and_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("perform-loop-memory-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql = include_str!("../../../tests/external/differential/245_perform_loop_memory.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["2048|2048|32"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn scalar_functions_in_from_preserve_out_columns_cardinality_and_effects() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

@@ -26593,6 +26593,9 @@ fn prepare_static_plpgsql_statement<'a>(
                 "PL/pgSQL type input exceeds the send buffer"
             )
         })??;
+    if prepared.bindings.is_empty() {
+        return Ok((statement, Some((site, prepared))));
+    }
     let statement = match statement {
         TriggerStatement::Perform(_)
         | TriggerStatement::ReturnQuery(_)
@@ -27961,54 +27964,60 @@ fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
                 Ok(None)
             }),
             TriggerStatement::Perform(query) => execute_trigger_statement(|| {
-                let query = match transition_relations {
-                    Some(relations) => super::query::bind_materialized_relations(
-                        query,
-                        relations,
-                        context.storage(),
-                        context.txn.txid,
-                        context.arena,
-                    )?,
-                    None => query,
-                };
-                let transition = TriggerTransition {
-                    definition: crate::storage::RelationDefinition::from_definition(definition),
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let arena = context.arena;
-                let params = context.params;
-                let txid = context.txn.txid;
-                let row_count = execute_procedural_query(context, |storage, sequence| {
-                    let mut row_count = 0u64;
-                    super::query::select_into_rows(
-                        storage,
-                        txid,
-                        query,
-                        arena,
-                        params,
-                        Some(&scope),
-                        Some(sequence),
-                        &mut |_| {
-                            row_count = row_count.checked_add(1).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "PL/pgSQL query returned too many rows"
-                                )
-                            })?;
-                            Ok(())
-                        },
-                    )?;
-                    Ok(row_count)
-                })?;
-                status.set_rows(row_count)?;
+                let scratch_mark = context.arena.mark();
+                let row_count = (|| {
+                    let query = match transition_relations {
+                        Some(relations) => super::query::bind_materialized_relations(
+                            query,
+                            relations,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                        )?,
+                        None => query,
+                    };
+                    let transition = TriggerTransition {
+                        definition: crate::storage::RelationDefinition::from_definition(definition),
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let arena = context.arena;
+                    let params = context.params;
+                    let txid = context.txn.txid;
+                    execute_procedural_query(context, |storage, sequence| {
+                        let mut row_count = 0u64;
+                        super::query::select_into_rows(
+                            storage,
+                            txid,
+                            query,
+                            arena,
+                            params,
+                            Some(&scope),
+                            Some(sequence),
+                            &mut |_| {
+                                row_count = row_count.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        )?;
+                        Ok(row_count)
+                    })
+                })();
+                // PERFORM exports only its count. Invocation state has dropped;
+                // inputs, locals and active handlers precede this scratch mark.
+                unsafe { context.arena.rewind_to(scratch_mark) };
+                status.set_rows(row_count?)?;
 
                 Ok(None)
             }),

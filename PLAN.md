@@ -86,7 +86,9 @@ including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
 Keep loop-frame memory bounded by active nesting while saving branch, loop and
-handler positions. Frame reuse alone does not retain execution across waits.
+handler positions. Preserve reclamation of discarded query work, including
+after nested function handoffs, without losing row counts or repeating effects.
+Frame reuse alone does not retain execution across waits.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait
 must not publish that prefix twice. Static `SELECT INTO` and dynamic `EXECUTE
 INTO` retain PostgreSQL's different row-consumption rules.

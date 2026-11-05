@@ -192,7 +192,9 @@ fn input_validation_reports_bad_data_but_propagates_domain_expression_errors() {
             ] {
                 for sql in [
                     format!("SELECT pg_input_is_valid('{input}','{type_name}')"),
-                    format!("SELECT sql_error_code FROM pg_input_error_info('{input}','{type_name}')"),
+                    format!(
+                        "SELECT sql_error_code FROM pg_input_error_info('{input}','{type_name}')"
+                    ),
                 ] {
                     let output = session.execute(&mut engine, &sql, true);
                     assert_eq!(error_sqlstates(&output), [code], "{mode:?}: {sql}");

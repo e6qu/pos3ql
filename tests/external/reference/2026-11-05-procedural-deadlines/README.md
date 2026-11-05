@@ -1,7 +1,7 @@
 # PostgreSQL procedural and protocol deadlines
 
 [reference.zip](reference.zip), SHA-256
-`cbffeb2d6d0c71d0cdfd2decbab49842a27d38c721a4b86a1c40ff3e7b776350`,
+`7b74c029b4436340675237e41a768cc3d58e2a0365dd97ead029da685da90e4b`,
 records PostgreSQL 18.6 deadline behavior on macOS arm64. The archive retains
 exact SQL and wire messages, scripts, server commands, binary hashes, raw
 results and provenance. Extract it and run `python3 verify-deadlines.py .` to
@@ -21,7 +21,8 @@ completion returns `57014`. Text and binary streams also exercise before/after
 row and statement triggers: exception handlers restore `application_name` and
 produce eight audit rows for two copied rows. A second client runs with another
 role and search path between COPY data and completion; the trigger still sees
-its own user and schema. This does not measure production throughput or
+its own user and schema. Each of the two COPY commands also keeps one statement
+timestamp and one transaction timestamp across all four trigger firings. This does not measure production throughput or
 qualify pos3ql. Its native, allocation, Miri and full final-head checks remain
 required.
 

@@ -278,6 +278,7 @@ pub(crate) struct SessionEvaluationScope {
     current_user: crate::storage::SessionIdentity,
     database: crate::util::StackStr<64>,
     timezone: crate::sql::timezone::Timezone,
+    clock: crate::sql::datetime::StatementClock,
 }
 
 pub(crate) fn retain_session_evaluation() -> SessionEvaluationScope {
@@ -288,6 +289,7 @@ pub(crate) fn retain_session_evaluation() -> SessionEvaluationScope {
         current_user: current_identity(),
         database: CURRENT_DATABASE.with(|value| *value.borrow()),
         timezone: crate::sql::timezone::session(),
+        clock: crate::sql::datetime::stored_statement_clock(),
     }
 }
 
@@ -299,6 +301,7 @@ impl Drop for SessionEvaluationScope {
         set_current_user(self.current_user);
         set_current_database(self.database.as_str());
         crate::sql::timezone::set_session(self.timezone);
+        crate::sql::datetime::restore_statement_clock(self.clock);
     }
 }
 

@@ -541,6 +541,7 @@ impl SubscriptionApply {
         columns: &[crate::storage::SqlName],
     ) -> Result<crate::sql::exec::CopySetup, SqlError> {
         self.with_context(engine, |worker, engine| {
+            worker.txn.begin_statement_clock();
             let setup = engine.subscription_copy_setup(schema, table, columns, worker.txn.txid)?;
             worker.copy_transition_scratch.clear();
             worker.trigger_response.clear();

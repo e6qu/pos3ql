@@ -847,7 +847,7 @@ pub(crate) const MAX_OPTIMIZED_JOIN_TABLES: usize = u64::BITS as usize;
 use core::cell::{Cell, RefCell};
 std::thread_local! {
     /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
-    /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
+    /// 0 means unarmed. The worker lends this timer to the active invocation.
     static DEADLINE: Cell<i64> = const { Cell::new(0) };
 }
 

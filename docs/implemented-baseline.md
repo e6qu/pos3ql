@@ -493,12 +493,14 @@ Close or Sync; buffered portal rows cannot bypass that check. Another connection
 uses its own deadline. COPY retains its original timer
 between data messages: an expired incoming row fails with `57014`; finishing an
 empty stream does not itself require a row check. The
-[PostgreSQL probe](../tests/external/reference/2026-11-05-procedural-deadlines/README.md)
+[PostgreSQL probe](https://github.com/e6qu/pos3ql/tree/02d030e49e5a483d567ffb205dd01c4b9faad857/tests/external/reference/2026-11-05-procedural-deadlines)
 records these boundaries; native tests also interleave connections. COPY binds
 the owning session at start, each row and completion, so trigger handlers can
 restore settings after an error even when other connections run between chunks.
 It also restores the stream's SQL user, search path and formatting before firing
-those triggers.
+those triggers. COPY keeps its original statement and transaction timestamps
+across chunks; a background callback restores the frontend's clocks when it
+returns.
 Its completed control effects must not be replayed after a wait; retained handler
 positions remain part of the execution work in [PLAN.md](../PLAN.md).
 

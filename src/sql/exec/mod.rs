@@ -57492,6 +57492,7 @@ pub fn cluster(
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 pub struct CopySetup {
+    pub(super) clock: super::datetime::StatementClock,
     snapshot_lease: Mutex<Option<crate::storage::StatementSnapshotLease>>,
     definitions: crate::storage::TableDefinitionImages,
     pub table_index: usize,
@@ -58065,6 +58066,7 @@ pub fn copy_begin(
         }
     }
     Ok(CopySetup {
+        clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
         definitions,
         table_index,
@@ -58214,6 +58216,7 @@ pub(crate) fn subscription_copy_setup(
         targets[index] = local;
     }
     Ok(CopySetup {
+        clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
         definitions,
         table_index,

@@ -6276,12 +6276,12 @@ mod tests {
                 .guc
                 .set_config("application_name", Some("other-owner"), false)
                 .unwrap();
-            let setup = b"CREATE ROLE copy_other; CREATE SCHEMA copy_elsewhere; CREATE TABLE session_copy(id integer); CREATE TABLE session_copy_audit(timing text, level text, owner text); \
+            let setup = b"CREATE ROLE copy_other; CREATE SCHEMA copy_elsewhere; CREATE TABLE session_copy(id integer); CREATE TABLE session_copy_audit(timing text, level text, owner text, stamp timestamptz, txstamp timestamptz); \
                 CREATE FUNCTION session_copy_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
                   BEGIN PERFORM set_config('application_name','rolled-back',false); PERFORM 1/0; \
                   EXCEPTION WHEN division_by_zero THEN \
                     IF current_setting('application_name') <> 'copy-owner' OR current_user <> 'postgres' OR current_schema() <> 'public' THEN RAISE EXCEPTION 'wrong COPY owner'; END IF; \
-                    INSERT INTO session_copy_audit VALUES(TG_WHEN,TG_LEVEL,current_setting('application_name')); \
+                    INSERT INTO session_copy_audit VALUES(TG_WHEN,TG_LEVEL,current_setting('application_name'),statement_timestamp(),transaction_timestamp()); \
                   END; RETURN NEW; END$$; \
                 CREATE TRIGGER session_copy_bs BEFORE INSERT ON session_copy FOR EACH STATEMENT EXECUTE FUNCTION session_copy_trigger(); \
                 CREATE TRIGGER session_copy_br BEFORE INSERT ON session_copy FOR EACH ROW EXECUTE FUNCTION session_copy_trigger(); \
@@ -6336,16 +6336,44 @@ mod tests {
                     "other-owner"
                 );
             }
-            message(&mut conn, &mut engine, wire::FMSG_QUERY, b"SELECT count(*) FROM session_copy_audit WHERE owner='copy-owner'; SELECT count(*) FROM session_copy\0");
-            for value in *b"82" {
-                let row = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, value];
-                assert!(
-                    conn.send
-                        .readable()
-                        .windows(row.len())
-                        .any(|found| found == row)
-                );
-            }
+            message(&mut conn, &mut engine, wire::FMSG_QUERY, b"SELECT count(*),count(DISTINCT stamp),count(DISTINCT txstamp) FROM session_copy_audit WHERE owner='copy-owner'; SELECT count(*) FROM session_copy\0");
+            let audits = [
+                wire::MSG_DATA_ROW,
+                0,
+                0,
+                0,
+                21,
+                0,
+                3,
+                0,
+                0,
+                0,
+                1,
+                b'8',
+                0,
+                0,
+                0,
+                1,
+                b'2',
+                0,
+                0,
+                0,
+                1,
+                b'2',
+            ];
+            let rows = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, b'2'];
+            assert!(
+                conn.send
+                    .readable()
+                    .windows(audits.len())
+                    .any(|found| found == audits)
+            );
+            assert!(
+                conn.send
+                    .readable()
+                    .windows(rows.len())
+                    .any(|found| found == rows)
+            );
         }
     }
 

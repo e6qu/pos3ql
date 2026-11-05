@@ -2385,6 +2385,14 @@ pub(crate) struct StatementClock {
     transaction: i64,
 }
 
+/// Captures an unarmed clock too, without reading the wall clock.
+pub(crate) fn stored_statement_clock() -> StatementClock {
+    StatementClock {
+        statement: STATEMENT_START.with(Cell::get),
+        transaction: TRANSACTION_START.with(Cell::get),
+    }
+}
+
 pub(crate) fn statement_clock() -> StatementClock {
     StatementClock {
         statement: statement_micros(),
@@ -2937,6 +2945,17 @@ mod deadline_ownership_tests {
             assert_eq!(statement_deadline(), i64::MAX);
             drop(outer);
             assert_eq!(statement_deadline(), 0);
+            let original = super::stored_statement_clock();
+            {
+                let _callback = crate::sql::eval::funcs::system::retain_session_evaluation();
+                super::restore_statement_clock(StatementClock {
+                    statement: 11,
+                    transaction: 12,
+                });
+            }
+            let restored = super::stored_statement_clock();
+            assert_eq!(restored.statement, original.statement);
+            assert_eq!(restored.transaction, original.transaction);
         });
     }
 }

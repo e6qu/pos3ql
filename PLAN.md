@@ -80,7 +80,8 @@ itself delivers the timeout. Keep publication receipts protected from deadlines
 restored by any command-entry mode. COPY start, row and completion paths
 now bind the owning session explicitly; preserve settings rollback inside row
 and statement trigger handlers, including interleaved text/binary streams. Bind
-identity, name resolution and rendering at the same resumed-message boundary. An empty or `NULL`-only loop must
+identity, name resolution, rendering and the original statement/transaction
+clock at the same resumed-message boundary. An empty or `NULL`-only loop must
 observe its deadline. Exercise timer ownership with explicit timestamps under
 Miri isolation, and exercise the real clock in native runtime tests. A caught timeout must not be delivered again or replay
 the timed-out loop when its handler waits; a user-raised cancellation must not

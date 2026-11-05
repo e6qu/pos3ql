@@ -10,11 +10,7 @@ with their fixing code, tests and retained reference evidence.
 Pending CI, uncollected measurements and reproducible failures being repaired
 belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
-current behavior belongs in the [owning guides](docs/README.md). Preserve
-regression coverage when changing ownership or execution: successful results
-alone cannot prove that effects ran once, constraints saw the right rows, or
-temporary references were released safely. The active procedural comparisons
-include CASE errors and hints, handler diagnostics, shadowed counters and exits.
+current behavior belongs in the [owning guides](docs/README.md).
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -207,3 +207,4 @@ storage::type_references::tests::bound_type_origin_never_reuses_an_exhausted_ide
 sql::exec::control_flow::ownership_tests::lexical_frame_capacity_covers_every_branch_and_fails_before_execution
 sql::exec::control_flow::ownership_tests::numeric_positions_restore_parent_values_and_release_all_scope_references
 sql::exec::control_flow::ownership_tests::handler_diagnostics_and_statement_positions_survive_nested_frame_changes
+sql::exec::control_flow::ownership_tests::positions_resolve_the_same_source_after_original_parse_storage_is_released

@@ -216,8 +216,10 @@ inside the existing statement arena; `54000` names insufficient capacity.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
 Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
-owns its next statement, loop input or range, and handler diagnostic/savepoint
-state. Child blocks do not recursively call the interpreter. Leaving a scope
+stores a block index and next-statement offset in its compiled program. Loop
+conditions and handler syntax resolve through that program; loop values and
+handler diagnostic/savepoint state stay with the active frame. Child blocks do
+not recursively call the interpreter. Leaving a scope
 restores shadowed counters, copies assignments back and releases its references.
 The frames still borrow statement memory; they do not yet survive returning
 to the connection scheduler during a storage wait.

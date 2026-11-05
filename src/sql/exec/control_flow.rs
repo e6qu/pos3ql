@@ -6,7 +6,7 @@ use numeric_loops::NumericLoopWorkspace;
 
 pub(super) enum Step<'a> {
     Complete(Option<TriggerFlow<'a>>),
-    Enter(Frame<'a>),
+    Enter(FrameEntry<'a>),
 }
 
 impl<'a> Step<'a> {
@@ -15,54 +15,73 @@ impl<'a> Step<'a> {
     }
 
     pub(super) fn branch(block: TriggerBlock<'a>) -> Self {
-        Self::Enter(Frame::new(block, Continuation::Once))
+        Self::Enter(FrameEntry::new(block, Continuation::Once))
     }
 
     pub(super) fn while_loop(program: TriggerWhile<'a>) -> Self {
-        Self::Enter(Frame::new(
-            program.block,
-            Continuation::While(program.condition),
-        ))
+        Self::Enter(FrameEntry::new(program.block, Continuation::While))
     }
 
     pub(super) fn plain_loop(block: TriggerBlock<'a>) -> Self {
-        Self::Enter(Frame::new(block, Continuation::Loop))
+        Self::Enter(FrameEntry::new(block, Continuation::Loop))
     }
 
     pub(super) fn protected(
         program: TriggerException<'a>,
         boundary: TriggerSubtransaction,
     ) -> Self {
-        Self::Enter(Frame::new(
+        Self::Enter(FrameEntry::new(
             program.protected,
             Continuation::Protected {
                 boundary,
-                handlers: program.handlers,
                 releasing: false,
             },
         ))
     }
 }
 
-pub(super) struct Frame<'a> {
+pub(super) struct FrameEntry<'a> {
     block: TriggerBlock<'a>,
-    next: usize,
     continuation: Continuation<'a>,
 }
 
-impl<'a> Frame<'a> {
+impl<'a> FrameEntry<'a> {
     fn new(block: TriggerBlock<'a>, continuation: Continuation<'a>) -> Self {
         Self {
             block,
-            next: 0,
             continuation,
         }
     }
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockIndex(usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatementIndex {
+    block: BlockIndex,
+    statement: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameSource {
+    Root,
+    Handler,
+    Statement(StatementIndex),
+}
+
+struct Frame<'a> {
+    block: BlockIndex,
+    next: usize,
+    source: FrameSource,
+    continuation: Continuation<'a>,
+}
+
+impl Frame<'_> {
     fn is_loop(&self) -> bool {
         matches!(
             self.continuation,
-            Continuation::While(_)
+            Continuation::While
                 | Continuation::Loop
                 | Continuation::Numeric(_)
                 | Continuation::Rows { .. }
@@ -83,7 +102,7 @@ struct NumericLoop<'a> {
 
 enum Continuation<'a> {
     Once,
-    While(&'a Expr<'a>),
+    While,
     Loop,
     Numeric(NumericLoop<'a>),
     Rows {
@@ -93,7 +112,6 @@ enum Continuation<'a> {
     },
     Protected {
         boundary: TriggerSubtransaction,
-        handlers: &'a [TriggerExceptionHandler<'a>],
         releasing: bool,
     },
     Handler(TriggerExceptionDiagnostic<'a>),
@@ -103,36 +121,96 @@ enum Continuation<'a> {
 /// A frame owns its next statement and loop/handler state; entering a child does
 /// not keep another Rust interpreter invocation on the call stack.
 pub(super) struct ControlFrames<'a> {
+    blocks: &'a [TriggerBlock<'a>],
     slots: OwnedArenaSlice<'a, Option<Frame<'a>>>,
     active: usize,
 }
 
 impl<'a> ControlFrames<'a> {
     pub(super) fn new(arena: &'a Arena, block: TriggerBlock<'a>) -> Result<Self, SqlError> {
-        fn depth(block: TriggerBlock<'_>) -> usize {
-            let mut children = 0;
-            numeric_loops::visit_nested_blocks(block, |block, _| {
-                children = children.max(depth(block))
+        fn layout(block: TriggerBlock<'_>) -> (usize, usize) {
+            let mut count = 1;
+            let mut depth = 1;
+            numeric_loops::visit_nested_blocks(block, |child, _| {
+                let (child_count, child_depth) = layout(child);
+                count += child_count;
+                depth = depth.max(child_depth + 1);
             });
-            children + 1
+            (count, depth)
         }
+        fn compile<'a>(block: TriggerBlock<'a>, blocks: &mut [TriggerBlock<'a>], next: &mut usize) {
+            blocks[*next] = block;
+            *next += 1;
+            numeric_loops::visit_nested_blocks(block, |child, _| compile(child, blocks, next));
+        }
+        let (count, depth) = layout(block);
+        let blocks = arena
+            .alloc_slice_with(count, |_| TriggerBlock { statements: &[] })
+            .map_err(|_| frame_full())?;
+        let mut next = 0;
+        compile(block, blocks, &mut next);
+        assert_eq!(next, count);
         Ok(Self {
+            blocks,
             slots: arena
-                .alloc_owned_slice_with(depth(block), |_| None)
+                .alloc_owned_slice_with(depth, |_| None)
                 .map_err(|_| frame_full())?,
             active: 0,
         })
     }
 
-    fn push(&mut self, frame: Frame<'a>) {
-        // Every active frame corresponds to one lexical block edge in depth().
+    fn block(&self, index: BlockIndex) -> TriggerBlock<'a> {
+        self.blocks[index.0]
+    }
+
+    fn index(&self, block: TriggerBlock<'a>) -> BlockIndex {
+        BlockIndex(
+            self.blocks
+                .iter()
+                .position(|candidate| core::ptr::eq(candidate.statements, block.statements))
+                .expect("entered block belongs to the compiled procedural program"),
+        )
+    }
+
+    fn push(&mut self, entry: FrameEntry<'a>, source: FrameSource) {
+        // Each active frame corresponds to one lexical edge in layout().
         assert!(
             self.active < self.slots.len(),
             "procedural lexical frame capacity"
         );
         assert!(self.slots[self.active].is_none());
-        self.slots[self.active] = Some(frame);
+        self.slots[self.active] = Some(Frame {
+            block: self.index(entry.block),
+            next: 0,
+            source,
+            continuation: entry.continuation,
+        });
         self.active += 1;
+    }
+
+    fn start(&mut self, block: TriggerBlock<'a>) {
+        assert_eq!(self.active, 0);
+        self.push(
+            FrameEntry::new(block, Continuation::Once),
+            FrameSource::Root,
+        );
+    }
+
+    fn enter(&mut self, entry: FrameEntry<'a>) {
+        let parent = self.last_mut();
+        let source = FrameSource::Statement(StatementIndex {
+            block: parent.block,
+            statement: parent.next,
+        });
+        parent.next += 1;
+        self.push(entry, source);
+    }
+
+    fn source_statement(&self, source: FrameSource) -> TriggerStatement<'a> {
+        let FrameSource::Statement(source) = source else {
+            unreachable!("frame has no enclosing statement")
+        };
+        self.block(source.block).statements[source.statement]
     }
 
     fn pop(&mut self) -> Frame<'a> {
@@ -251,7 +329,10 @@ pub(super) fn start_numeric_loop<'a>(
                 ..empty_plpgsql_local()
             }
         } else {
-            locals[index]
+            TriggerLocalDecl {
+                initial: None,
+                ..locals[index]
+            }
         };
     }
     workspace.values[..count].fill(Datum::Null);
@@ -262,7 +343,7 @@ pub(super) fn start_numeric_loop<'a>(
         return Err(error);
     }
     workspace.values[target] = Datum::Int4(lower);
-    Ok(Step::Enter(Frame::new(
+    Ok(Step::Enter(FrameEntry::new(
         program.block,
         Continuation::Numeric(NumericLoop {
             workspace,
@@ -292,7 +373,7 @@ pub(super) fn start_row_loop<'a>(
     };
     assign_trigger_local(context, locals, values, program.target, value)?;
     status.assign_output_local(target, values[target]);
-    Ok(Step::Enter(Frame::new(
+    Ok(Step::Enter(FrameEntry::new(
         program.block,
         Continuation::Rows {
             target: program.target,
@@ -325,7 +406,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         .take()
         .expect("one procedural frame owner");
     assert_eq!(frames.active, 0);
-    frames.push(Frame::new(block, Continuation::Once));
+    frames.start(block);
     let mut outcome = Ok(None);
     let mut pending_error = None;
     while frames.active != 0 {
@@ -338,8 +419,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
             }
             super::super::query::check_timeout()?;
             if let Some(statement) = frames
-                .last()
-                .block
+                .block(frames.last().block)
                 .statements
                 .get(frames.last().next)
                 .copied()
@@ -365,7 +445,13 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 Continuation::Loop => {
                     frames.last_mut().next = 0;
                 }
-                Continuation::While(condition) => {
+                Continuation::While => {
+                    let TriggerStatement::While(program) =
+                        frames.source_statement(frames.last().source)
+                    else {
+                        unreachable!("while frame source")
+                    };
+                    let condition = program.condition;
                     let (scope, scope_values) = frames.scope(locals, values);
                     if trigger_condition(
                         context,
@@ -454,8 +540,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         })();
         match action {
             Ok(Some(Step::Enter(frame))) => {
-                frames.last_mut().next += 1;
-                frames.push(frame);
+                frames.enter(frame);
             }
             Ok(Some(Step::Complete(None))) => frames.last_mut().next += 1,
             Ok(None) => {}
@@ -464,7 +549,8 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     if frames.last().is_loop() {
                         match flow {
                             TriggerFlow::Continue(0) => {
-                                frames.last_mut().next = frames.last().block.statements.len();
+                                frames.last_mut().next =
+                                    frames.block(frames.last().block).statements.len();
                                 break;
                             }
                             TriggerFlow::Exit(0) => {
@@ -502,13 +588,17 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     let frame = frames.pop();
                     if let Continuation::Protected {
                         ref boundary,
-                        handlers,
                         releasing: false,
                     } = frame.continuation
                     {
                         match rollback_trigger_subtransaction(context, boundary) {
                             Ok(()) => {
-                                handler = handlers.iter().find(|handler| {
+                                let TriggerStatement::Exception(program) =
+                                    frames.source_statement(frame.source)
+                                else {
+                                    unreachable!("exception frame source")
+                                };
+                                handler = program.handlers.iter().find(|handler| {
                                     handler.conditions.iter().copied().any(|condition| {
                                         trigger_exception_matches(condition, &error)
                                     })
@@ -527,9 +617,10 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     break;
                 };
                 match catch_diagnostic(context, invocation, &error) {
-                    Ok(caught) => {
-                        frames.push(Frame::new(handler.block, Continuation::Handler(caught)))
-                    }
+                    Ok(caught) => frames.push(
+                        FrameEntry::new(handler.block, Continuation::Handler(caught)),
+                        FrameSource::Handler,
+                    ),
                     Err(error) => pending_error = Some(error),
                 }
             }

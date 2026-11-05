@@ -66,6 +66,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         TriggerLocalDecl {
             name: SqlName::parse("n").unwrap(),
             ctype: ColType::Int4,
+            initial: Some(parse.alloc(Expr::Int(0)).unwrap()),
             ..empty_plpgsql_local()
         },
     ];
@@ -80,21 +81,22 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         let mut frames = status.control_frames.take().unwrap();
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
-            frames.push(Frame::new(program.body, Continuation::Once));
+            frames.start(program.body);
             let Step::Enter(frame) =
                 start_numeric_loop(outer, 1, 2, 1, false, &locals, &values, &mut status).unwrap()
             else {
                 panic!("numeric frame")
             };
-            frames.push(frame);
+            frames.enter(frame);
             let (scope, current) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
+            assert!(scope.iter().all(|local| local.initial.is_none()));
             let Step::Enter(frame) =
                 start_numeric_loop(inner, 1, 2, 1, false, scope, current, &mut status).unwrap()
             else {
                 panic!("nested frame")
             };
-            frames.push(frame);
+            frames.enter(frame);
             let (scope, current) = frames.scope(&locals, &mut values);
             assert_eq!(scope.len(), 3);
             assert_eq!(scope[2].name.as_str(), "j");
@@ -139,21 +141,77 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         hint: None,
         context: "handler",
     };
+    let TriggerStatement::Exception(protected) = program.body.statements[0] else {
+        panic!("protected block")
+    };
+    let handler = protected.handlers[0].block;
+    let TriggerStatement::If(branches) = handler.statements[0] else {
+        panic!("handler branch")
+    };
     crate::mem::guard::forbid_alloc(|| {
         let mut frames = ControlFrames::new(&arena, program.body).unwrap();
-        frames.push(Frame::new(program.body, Continuation::Once));
+        frames.start(program.body);
         frames.last_mut().next = 1;
-        frames.push(Frame::new(program.body, Continuation::Handler(diagnostic)));
-        frames.last_mut().next = 2;
-        frames.push(Frame::new(program.body, Continuation::Once));
+        frames.push(
+            FrameEntry::new(handler, Continuation::Handler(diagnostic)),
+            FrameSource::Handler,
+        );
+        frames.enter(FrameEntry::new(
+            branches.branches[0].block,
+            Continuation::Once,
+        ));
         assert_eq!(frames.diagnostic().unwrap().message, "division by zero");
-        frames.pop();
-        assert_eq!(frames.last().next, 2);
+        let child = frames.pop();
+        assert!(matches!(
+            frames.source_statement(child.source),
+            TriggerStatement::If(_)
+        ));
+        assert_eq!(frames.last().next, 1);
         assert_eq!(frames.diagnostic().unwrap().sqlstate, "22012");
         frames.pop();
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
         assert!(frames.slots.iter().all(Option::is_none));
+    });
+}
+
+#[test]
+fn positions_resolve_the_same_source_after_original_parse_storage_is_released() {
+    const SOURCE: &str = "BEGIN WHILE true LOOP NULL; END LOOP; END";
+    let saved = {
+        let mut budget = Budget::new(1 << 18);
+        let parse = Arena::new(&mut budget, "original procedural source", 1 << 16).unwrap();
+        let arena = Arena::new(&mut budget, "original procedural positions", 1 << 16).unwrap();
+        let program = parse_plpgsql_program(SOURCE, &parse, PlpgsqlProgramKind::Anonymous).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut frames = ControlFrames::new(&arena, program.body).unwrap();
+            let TriggerStatement::While(while_program) = program.body.statements[0] else {
+                panic!("while program")
+            };
+            frames.start(program.body);
+            frames.enter(FrameEntry::new(while_program.block, Continuation::While));
+            frames.last_mut().next = 1;
+            let frame = frames.pop();
+            let position = (frame.block, frame.next, frame.source);
+            frames.pop();
+            position
+        })
+    };
+    let mut budget = Budget::new(1 << 18);
+    let parse = Arena::new(&mut budget, "restored procedural source", 1 << 16).unwrap();
+    let arena = Arena::new(&mut budget, "restored procedural positions", 1 << 16).unwrap();
+    let program = parse_plpgsql_program(SOURCE, &parse, PlpgsqlProgramKind::Anonymous).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let frames = ControlFrames::new(&arena, program.body).unwrap();
+        assert_eq!(saved.1, frames.block(saved.0).statements.len());
+        assert!(matches!(
+            frames.block(saved.0).statements[0],
+            TriggerStatement::Null
+        ));
+        let TriggerStatement::While(program) = frames.source_statement(saved.2) else {
+            panic!("restored while position")
+        };
+        assert!(matches!(program.condition, Expr::Bool(true)));
     });
 }

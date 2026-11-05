@@ -93,10 +93,12 @@ Keep loop-frame memory bounded by active nesting while saving branch, loop and
 handler positions. Preserve scoped reclamation of discarded query work, including
 after nested function handoffs, without losing row counts or repeating effects.
 Branches, numeric/query/array loops and handlers now use a bounded execution
-frame stack, with each frame owning its next statement and active scope. Keep
+frame stack, with indexed block/statement positions and each active scope. Keep
 the PostgreSQL comparison for labelled exits, nested diagnostics, rethrow and
 early returns. These arena-borrowed frames still need an owner that survives
-returning to the connection scheduler; they do not yet resume across waits.
+returning to the connection scheduler; their value payloads and enclosing row
+operation do not yet resume across waits. Preserve the position test that frees
+the original parse storage and resolves the same source again.
 Preserve PostgreSQL's error and hint when no procedural CASE branch matches and
 there is no ELSE; matched branches and an explicit ELSE must still succeed.
 A caught `RETURN QUERY` error keeps its completed result prefix; a private wait

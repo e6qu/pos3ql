@@ -183,6 +183,9 @@ must cover output names in `FROM`, nulls, whole and nested named rows, and field
 constraints that call helpers with side effects. Keep extended fixtures within
 their configured catalog limits by releasing completed definitions between
 transactions; retain every assertion and the original capacities.
+Test indexed execution positions after releasing their original parsing
+storage. Resumption must retain the selected source, definitions and types;
+reparsing a replacement definition must not redirect unfinished work.
 Coverage library partitions stream compiler output and each test's progress
 through the native allocation-error reporter. Use those timestamps to locate
 deadline overruns; buffered output must not hide the last running test.

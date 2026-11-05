@@ -486,8 +486,8 @@ A caught block is a subtransaction: its database changes are undone while the
 enclosing transaction continues. For example, a handler after a failed
 `ALTER TABLE orders ADD COLUMN note text` sees the original table. Row changes,
 schema edits, staged journal records, settings and queued deferred triggers use
-the same savepoint boundary. Local variables and issued sequence values retain
-their effects. Cursors opened inside the failed scope close; older cursors keep
+the same savepoint boundary. The handler regains its login identity while preserving an enclosing function's
+owner permissions. Local variables and issued sequence values retain their effects. Cursors opened inside the failed scope close; older cursors keep
 their advanced position, and closing a cursor is not undone.
 [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/main/tests/external/reference/2026-11-05-procedural-subtransactions)
 cover these distinctions, including row and statement triggers.

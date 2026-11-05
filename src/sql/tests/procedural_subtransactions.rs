@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn caught_procedural_errors_restore_session_authorization_inside_the_effective_owner_scope() {
+    let fixture =
+        include_str!("../../../tests/external/differential/240_procedural_identity_rollback.sql");
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-identity-rollback-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, fixture, true)),
+            ["t", "t|t", "t", "t|t|t"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn caught_trigger_errors_keep_transition_values_and_remove_aborted_deferred_events() {
     let fixture = include_str!(
         "../../../tests/external/differential/239_trigger_subtransaction_visibility.sql"

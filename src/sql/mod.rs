@@ -8691,6 +8691,9 @@ impl Engine {
         }
         self.wal.truncate_stage(txn.txid, sp.wal_mark);
         guc.rollback_to_savepoint(index);
+        eval::funcs::system::set_session_user(
+            guc.session_identity().refresh(&self.storage, txn.txid),
+        );
         guc.publish_rollback_settings(txn);
     }
 

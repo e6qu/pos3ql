@@ -1,17 +1,18 @@
 # PostgreSQL procedural error cleanup
 
 [reference.zip](reference.zip), SHA-256
-`83b89da46da75a3225b89e61f5800e276e4494d7d4e17bef10d7e8ac9a4a2bed`,
-records PostgreSQL 18.6 results for differential fixtures 236–239 and the foreign-write error-cleanup oracle.
+`ceae7707c7fdc55b58870fd5049b220402984d87321e6e890e55c026212037cb`,
+records PostgreSQL 18.6 results for differential fixtures 236–240 and the foreign-write error-cleanup oracle.
 
 For example, a function can add a column and then catch a deliberate error.
 Its handler must see the original table, its earlier settings and its updated
 local variables. A rolled-back cursor opening releases its name; moving an
 older cursor keeps its new position. Failed trigger writes must leave no queued
 deferred trigger, while changes to `NEW` and the statement's transition rows
-remain available to the handler.
+remain available to the handler. Identity checks include session authorization
+and a function executing with its owner's permissions.
 
-The archive retains exact SQL, all 33 result rows, three deliberate errors
+The archive retains exact SQL, all 37 result rows, three deliberate errors
 (`22012`, `22012`, `55000`), commands, runner, PostgreSQL binary hashes and
 provenance. Extract it and run
 `python3 verify-procedural-subtransactions.py .` to verify file hashes, inputs,

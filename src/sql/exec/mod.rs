@@ -25831,6 +25831,10 @@ fn rollback_trigger_subtransaction(
         rollback_atomic_trigger_subtransaction(context, boundary.index);
         super::guc::with_active_state(|guc| {
             guc.rollback_to_savepoint(boundary.index);
+            super::eval::funcs::system::set_session_user(
+                guc.session_identity()
+                    .refresh(context.storage(), context.txn.txid),
+            );
             guc.publish_rollback_settings(context.txn);
             Ok(())
         })?;

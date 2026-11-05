@@ -10410,7 +10410,6 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &SqlPreparedPool,
         arena: &Arena,
-        guc: &GucState,
         context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
         if let Some(wait) = &txn.cache_capacity_wait {
@@ -11765,7 +11764,6 @@ impl Engine {
                     txn,
                     sqlprep,
                     arena,
-                    guc,
                     routine_transaction_context,
                 ) {
                     Ok(true) => {
@@ -12302,7 +12300,6 @@ impl Engine {
                                 txn,
                                 sqlprep,
                                 arena,
-                                guc,
                                 routine_transaction_context,
                             )
                         } {

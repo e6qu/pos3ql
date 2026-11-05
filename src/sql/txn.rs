@@ -1524,6 +1524,10 @@ impl TxnState {
     }
 
     pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
+        if self.staged_commit.is_some() {
+            super::query::disarm_timeout();
+            return;
+        }
         let timeout_ms = match entry {
             super::StatementTimeoutEntry::Command { timeout_ms } => timeout_ms,
             super::StatementTimeoutEntry::Captured { deadline } => {
@@ -1532,9 +1536,7 @@ impl TxnState {
             }
             super::StatementTimeoutEntry::Nested => return,
         };
-        if self.staged_commit.is_some() {
-            super::query::disarm_timeout();
-        } else if let Some(deadline) = self.suspended_statement_deadline() {
+        if let Some(deadline) = self.suspended_statement_deadline() {
             self.restore_statement_deadline(deadline);
         } else if let Some(command) = &self.concurrent_index {
             self.restore_statement_deadline(command.deadline);
@@ -1545,11 +1547,13 @@ impl TxnState {
     }
 
     pub(crate) fn restore_statement_deadline(&self, deadline: i64) {
-        super::query::restore_statement_deadline(if self.statement_timeout_consumed {
-            0
-        } else {
-            deadline
-        });
+        super::query::restore_statement_deadline(
+            if self.statement_timeout_consumed || self.staged_commit.is_some() {
+                0
+            } else {
+                deadline
+            },
+        );
     }
 
     pub(super) fn catch_query_cancellation(&mut self, now: i64) {

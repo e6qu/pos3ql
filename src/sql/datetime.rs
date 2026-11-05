@@ -2880,6 +2880,26 @@ mod deadline_ownership_tests {
                 timeout_ms: 0,
             });
             assert_eq!(statement_deadline(), 0);
+            txn.mode = crate::sql::txn::TxnMode::Implicit;
+            txn.txid = 1;
+            txn.stage_commit(
+                1,
+                crate::sql::txn::CommitTarget::Ordinary,
+                crate::sql::txn::CommitBarrier::Journal,
+            );
+            txn.restore_statement_deadline(i64::MIN);
+            assert_eq!(statement_deadline(), 0);
+            for entry in [
+                crate::sql::StatementTimeoutEntry::Command { timeout_ms: 60_000 },
+                crate::sql::StatementTimeoutEntry::Captured { deadline: i64::MIN },
+                crate::sql::StatementTimeoutEntry::Nested,
+            ] {
+                restore_statement_deadline(i64::MIN);
+                txn.enter_statement_timeout(entry);
+                check_timeout_at(0).unwrap();
+                assert_eq!(statement_deadline(), 0);
+            }
+            assert_eq!(txn.take_staged_commit().unwrap().lsn, 1);
         });
     }
 
@@ -2907,6 +2927,15 @@ mod deadline_ownership_tests {
             check_timeout_at(0).unwrap();
             disarm_timeout();
             assert!(!consume_expired_timeout(0));
+            assert_eq!(statement_deadline(), 0);
+            let outer = crate::sql::query::enter_deadline_scope();
+            restore_statement_deadline(i64::MAX);
+            {
+                let _inner = crate::sql::query::enter_deadline_scope();
+                restore_statement_deadline(i64::MIN);
+            }
+            assert_eq!(statement_deadline(), i64::MAX);
+            drop(outer);
             assert_eq!(statement_deadline(), 0);
         });
     }

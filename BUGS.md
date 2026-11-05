@@ -30,7 +30,11 @@ COPY rows: a different connection must neither inherit nor renew their timers.
 Streamed COPY must bind its own session settings at start, each row and completion
 before a trigger can establish or rewind an exception boundary. Rebind SQL
 identity, search path and rendering as well as configuration pointers; another
-connection may have changed the worker context between COPY messages.
+connection may have changed the worker context between COPY messages. Check
+deadlines before buffered replies and protocol control messages too; an expired
+Sync still owes ReadyForQuery, and an interrupted simple Query must be consumed.
+Once commit publication has started, restoring a saved timer must not cancel its
+durability receipt. Cover all command-entry modes at that boundary.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

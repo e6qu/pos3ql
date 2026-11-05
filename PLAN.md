@@ -74,7 +74,10 @@ Keep cancellation state with the command through input binding, cache waits,
 procedural handlers and internal commits. Protocol deadlines now belong to the
 connection between Parse, Bind, Describe and Execute, and COPY retains its timer
 while waiting for client data. Keep native interleaving and recovery coverage
-while adding saved procedural positions. COPY start, row and completion paths
+while adding saved procedural positions. Preserve timeout checks before
+buffered replies and protocol control messages, including recovery when Sync
+itself delivers the timeout. Keep publication receipts protected from deadlines
+restored by any command-entry mode. COPY start, row and completion paths
 now bind the owning session explicitly; preserve settings rollback inside row
 and statement trigger handlers, including interleaved text/binary streams. Bind
 identity, name resolution and rendering at the same resumed-message boundary. An empty or `NULL`-only loop must

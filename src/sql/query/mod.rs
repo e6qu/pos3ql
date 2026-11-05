@@ -864,6 +864,7 @@ pub fn arm_timeout(timeout_ms: u64) {
 
 /// The worker lends its timer to one connection or embedded invocation. Nested
 /// execution restores the caller's timer, including on errors and unwinding.
+#[must_use = "keep the timer scope alive until the invocation finishes"]
 pub(crate) struct DeadlineScope(i64);
 
 pub(crate) fn enter_deadline_scope() -> DeadlineScope {

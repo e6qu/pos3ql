@@ -1909,6 +1909,22 @@ impl Conn {
         step
     }
 
+    fn finish_query_cycle(&mut self) -> Step {
+        self.phase = Phase::Ready;
+        self.command_deadline = None;
+        self.finish_lock_wait();
+        if self.txn.mode == crate::sql::txn::TxnMode::Idle {
+            for portal in &mut self.portals {
+                portal.active = false;
+            }
+        }
+        self.release_closed_statement_plans();
+        match Responder::new(&mut self.send).ready_for_query(self.txn.status_byte()) {
+            Ok(()) => Step::Continue,
+            Err(WireFull) => Step::Close,
+        }
+    }
+
     fn process_message(&mut self, engine: &mut Engine) -> Step {
         let data = self.recv.readable();
         if data.len() < 5 {
@@ -1958,123 +1974,130 @@ impl Conn {
         }
 
         if self.phase == Phase::SkipToSync {
+            self.command_deadline = None;
             let is_sync = msg_type == wire::FMSG_SYNC;
             self.recv.consume(total);
-            if is_sync {
-                self.phase = Phase::Ready;
-                if self.txn.mode == crate::sql::txn::TxnMode::Idle {
-                    for portal in &mut self.portals {
-                        portal.active = false;
-                    }
-                }
-                self.release_closed_statement_plans();
-                let status = self.txn.status_byte();
-                let mut responder = Responder::new(&mut self.send);
-                if responder.ready_for_query(status).is_err() {
-                    return Step::Close;
-                }
-            }
-            return Step::Continue;
+            return if is_sync {
+                self.finish_query_cycle()
+            } else {
+                Step::Continue
+            };
         }
 
+        engine.bind_query_connection(self.id);
         let _deadline_scope = crate::sql::query::enter_deadline_scope();
-        if matches!(
+        if let Some(deadline) = self.command_deadline {
+            self.txn.restore_statement_deadline(deadline);
+        } else if matches!(
             msg_type,
             wire::FMSG_PARSE | wire::FMSG_BIND | wire::FMSG_DESCRIBE | wire::FMSG_EXECUTE
         ) {
-            if let Some(deadline) = self.command_deadline {
-                self.txn.restore_statement_deadline(deadline);
-            } else {
-                self.txn
-                    .enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
-                        timeout_ms: self.guc.statement_timeout_ms(),
-                    });
-                self.command_deadline = Some(crate::sql::query::statement_deadline());
-            }
+            self.txn
+                .enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command {
+                    timeout_ms: self.guc.statement_timeout_ms(),
+                });
+            self.command_deadline = Some(crate::sql::query::statement_deadline());
         } else {
             crate::sql::query::disarm_timeout();
         }
-        let step = match msg_type {
-            wire::FMSG_QUERY => self.handle_query(engine, total),
-            wire::FMSG_TERMINATE => Step::Close,
-            wire::FMSG_SYNC => {
-                let lock_timeout_expired = self.lock_timeout_expired();
-                let result = if self.txn.is_implicit() {
-                    engine
-                        .check_commit_admission_wait(&mut self.txn, &self.guc, lock_timeout_expired)
-                        .and_then(|()| {
-                            let mut responder = Responder::new(&mut self.send);
-                            engine.commit_txn_with_triggers(
+        let timeout_error = match msg_type {
+            wire::FMSG_QUERY
+            | wire::FMSG_SYNC
+            | wire::FMSG_FLUSH
+            | wire::FMSG_PARSE
+            | wire::FMSG_BIND
+            | wire::FMSG_DESCRIBE
+            | wire::FMSG_EXECUTE
+            | wire::FMSG_CLOSE
+            | wire::FMSG_FUNCTION_CALL => crate::sql::query::check_timeout().err(),
+            _ => None,
+        };
+        let interrupted_query = msg_type == wire::FMSG_QUERY && timeout_error.is_some();
+        let step = if let Some(error) = timeout_error {
+            ext_err(
+                &mut self.send,
+                &mut self.phase,
+                error.sqlstate,
+                error.message.as_str(),
+            )
+        } else {
+            match msg_type {
+                wire::FMSG_QUERY => self.handle_query(engine, total),
+                wire::FMSG_TERMINATE => Step::Close,
+                wire::FMSG_SYNC => {
+                    let lock_timeout_expired = self.lock_timeout_expired();
+                    let result = if self.txn.is_implicit() {
+                        engine
+                            .check_commit_admission_wait(
                                 &mut self.txn,
                                 &self.guc,
-                                crate::sql::txn::CommitTarget::Ordinary,
-                                Some(crate::sql::CursorCommitContext {
-                                    cursors: &mut self.cursors,
-                                    plans: &mut self.sqlprep,
-                                    arena: &self.arena,
-                                }),
-                                &self.arena,
-                                &mut responder,
+                                lock_timeout_expired,
                             )
-                        })
-                } else {
-                    Ok(())
-                };
-                if let Err(error) = result {
-                    if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
-                        && (self.txn.staged_commit().is_some()
-                            || self.txn.commit_admission().is_some())
-                    {
-                        let wait = if self.txn.staged_commit().is_some()
-                            || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            .and_then(|()| {
+                                let mut responder = Responder::new(&mut self.send);
+                                engine.commit_txn_with_triggers(
+                                    &mut self.txn,
+                                    &self.guc,
+                                    crate::sql::txn::CommitTarget::Ordinary,
+                                    Some(crate::sql::CursorCommitContext {
+                                        cursors: &mut self.cursors,
+                                        plans: &mut self.sqlprep,
+                                        arena: &self.arena,
+                                    }),
+                                    &self.arena,
+                                    &mut responder,
+                                )
+                            })
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = result {
+                        if (error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+                            && (self.txn.staged_commit().is_some()
+                                || self.txn.commit_admission().is_some())
                         {
-                            crate::sql::StatementWait::ObjectIo
-                        } else {
-                            crate::sql::StatementWait::Lock
-                        };
-                        self.park(wait, engine.statement_wait_generation(wait, self.id));
-                        engine.park_backend_statement(self.id, wait);
-                        return Step::Parked;
+                            let wait = if self.txn.staged_commit().is_some()
+                                || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                            {
+                                crate::sql::StatementWait::ObjectIo
+                            } else {
+                                crate::sql::StatementWait::Lock
+                            };
+                            self.park(wait, engine.statement_wait_generation(wait, self.id));
+                            engine.park_backend_statement(self.id, wait);
+                            return Step::Parked;
+                        }
+                        self.cursors.on_rollback();
+                        if Responder::new(&mut self.send)
+                            .error(error.sqlstate, error.message.as_str())
+                            .is_err()
+                        {
+                            return Step::Close;
+                        }
                     }
-                    self.cursors.on_rollback();
-                    if Responder::new(&mut self.send)
-                        .error(error.sqlstate, error.message.as_str())
-                        .is_err()
-                    {
-                        return Step::Close;
-                    }
+                    self.finish_query_cycle()
                 }
-                self.finish_lock_wait();
-                if self.txn.mode == crate::sql::txn::TxnMode::Idle {
-                    for portal in &mut self.portals {
-                        portal.active = false;
-                    }
+                wire::FMSG_FLUSH => Step::Continue,
+                wire::FMSG_PARSE => self.handle_parse(engine, total),
+                wire::FMSG_BIND => self.handle_bind(engine, total),
+                wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
+                wire::FMSG_EXECUTE => self.handle_execute(engine, total),
+                wire::FMSG_CLOSE => self.handle_close(total),
+                wire::FMSG_FUNCTION_CALL => self.handle_function_call(engine, total),
+                _ => {
+                    let mut responder = Responder::new(&mut self.send);
+                    let _ = responder.error(
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "unknown frontend message type",
+                    );
+                    Step::Close
                 }
-                self.release_closed_statement_plans();
-                let status = self.txn.status_byte();
-                match Responder::new(&mut self.send).ready_for_query(status) {
-                    Ok(()) => Step::Continue,
-                    Err(WireFull) => Step::Close,
-                }
-            }
-            wire::FMSG_FLUSH => Step::Continue,
-            wire::FMSG_PARSE => self.handle_parse(engine, total),
-            wire::FMSG_BIND => self.handle_bind(engine, total),
-            wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
-            wire::FMSG_EXECUTE => self.handle_execute(engine, total),
-            wire::FMSG_CLOSE => self.handle_close(total),
-            wire::FMSG_FUNCTION_CALL => self.handle_function_call(engine, total),
-            _ => {
-                let mut responder = Responder::new(&mut self.send);
-                let _ = responder.error(
-                    sqlstate::PROTOCOL_VIOLATION,
-                    "unknown frontend message type",
-                );
-                Step::Close
             }
         };
-        if !matches!(step, Step::Close | Step::Parked) && msg_type != wire::FMSG_QUERY {
+        if !matches!(step, Step::Close | Step::Parked)
+            && (msg_type != wire::FMSG_QUERY || interrupted_query)
+        {
             self.recv.consume(total);
         }
         if msg_type == wire::FMSG_BIND && !matches!(step, Step::Parked) {
@@ -2082,17 +2105,8 @@ impl Conn {
             self.abandon_pending_bind();
             self.finish_lock_wait();
         }
-        if matches!(step, Step::Continue)
-            && self.phase == Phase::SkipToSync
-            && matches!(
-                msg_type,
-                wire::FMSG_PARSE
-                    | wire::FMSG_BIND
-                    | wire::FMSG_DESCRIBE
-                    | wire::FMSG_EXECUTE
-                    | wire::FMSG_CLOSE
-            )
-        {
+        if matches!(step, Step::Continue) && self.phase == Phase::SkipToSync {
+            self.command_deadline = None;
             crate::sql::query::disarm_timeout();
             crate::sql::sequence::finish_statement(self.guc.seq_session());
             self.sqlprep.clear_request_type_inputs();
@@ -2104,6 +2118,15 @@ impl Conn {
             }
             self.finish_lock_wait();
             engine.finish_backend_statement(&self.txn, self.id);
+        }
+        if matches!(step, Step::Continue)
+            && self.phase == Phase::SkipToSync
+            && matches!(
+                msg_type,
+                wire::FMSG_SYNC | wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL
+            )
+        {
+            return self.finish_query_cycle();
         }
         if !matches!(step, Step::Parked)
             && (matches!(
@@ -6080,6 +6103,91 @@ mod tests {
                 ));
                 message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Ss\0");
             }
+            for (kind, payload) in [
+                (wire::FMSG_PARSE, &b"t\0SELECT 8\0\0\0"[..]),
+                (wire::FMSG_BIND, &b"p\0s\0\0\0\0\0\0\0"[..]),
+                (wire::FMSG_DESCRIBE, &b"Ss\0"[..]),
+                (wire::FMSG_EXECUTE, &b"missing\0\0\0\0\0"[..]),
+                (wire::FMSG_FLUSH, &b""[..]),
+                (wire::FMSG_CLOSE, &b"Ss\0"[..]),
+                (wire::FMSG_SYNC, &b""[..]),
+                (wire::FMSG_QUERY, &b"SELECT 99\0"[..]),
+            ] {
+                message(
+                    &mut conn,
+                    &mut engine,
+                    wire::FMSG_PARSE,
+                    b"s\0SELECT 7\0\0\0",
+                );
+                conn.command_deadline = Some(i64::MIN);
+                message(&mut conn, &mut engine, kind, payload);
+                assert!(has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_ERROR_RESPONSE
+                ));
+                assert!(
+                    conn.send
+                        .readable()
+                        .windows(5)
+                        .any(|value| value == b"57014")
+                );
+                assert!(!has_backend_message(
+                    conn.send.readable(),
+                    wire::MSG_DATA_ROW
+                ));
+                assert_eq!(conn.command_deadline, None);
+                if matches!(kind, wire::FMSG_SYNC | wire::FMSG_QUERY) {
+                    assert_eq!(conn.phase, Phase::Ready);
+                    assert!(conn.portals.iter().all(|portal| !portal.active));
+                    assert!(has_backend_message(
+                        conn.send.readable(),
+                        wire::MSG_READY_FOR_QUERY
+                    ));
+                } else {
+                    assert_eq!(conn.phase, Phase::SkipToSync);
+                    message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
+                }
+                message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Ss\0");
+            }
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_PARSE,
+                b"paged\0VALUES(1),(2)\0\0\0",
+            );
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_BIND,
+                b"pp\0paged\0\0\0\0\0\0\0",
+            );
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"pp\0\0\0\0\x01",
+            );
+            assert!(has_backend_message(
+                conn.send.readable(),
+                wire::MSG_DATA_ROW
+            ));
+            conn.command_deadline = Some(i64::MIN);
+            message(
+                &mut conn,
+                &mut engine,
+                wire::FMSG_EXECUTE,
+                b"pp\0\0\0\0\x01",
+            );
+            assert!(has_backend_message(
+                conn.send.readable(),
+                wire::MSG_ERROR_RESPONSE
+            ));
+            assert!(!has_backend_message(
+                conn.send.readable(),
+                wire::MSG_DATA_ROW
+            ));
+            message(&mut conn, &mut engine, wire::FMSG_SYNC, &[]);
+            message(&mut conn, &mut engine, wire::FMSG_CLOSE, b"Spaged\0");
             message(
                 &mut conn,
                 &mut engine,
@@ -6229,7 +6337,7 @@ mod tests {
                 );
             }
             message(&mut conn, &mut engine, wire::FMSG_QUERY, b"SELECT count(*) FROM session_copy_audit WHERE owner='copy-owner'; SELECT count(*) FROM session_copy\0");
-            for value in [b'8', b'2'] {
+            for value in *b"82" {
                 let row = [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, value];
                 assert!(
                     conn.send

@@ -488,7 +488,9 @@ A command keeps its original deadline through input preparation and cache waits;
 nested SQL does not start a new timer. Extended-protocol Parse, Bind, Describe
 and Execute share the connection's timer until Execute or Sync finishes. For
 example, pausing a client between Bind and Execute does not buy the query more
-time. Another connection uses its own deadline. COPY retains its original timer
+time. An expired timer is delivered on the next message, including Flush,
+Close or Sync; buffered portal rows cannot bypass that check. Another connection
+uses its own deadline. COPY retains its original timer
 between data messages: an expired incoming row fails with `57014`; finishing an
 empty stream does not itself require a row check. The
 [PostgreSQL probe](../tests/external/reference/2026-11-05-procedural-deadlines/README.md)

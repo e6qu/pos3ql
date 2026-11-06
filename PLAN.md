@@ -150,8 +150,11 @@ presence alone is not support. Preserve values, declared types, null handling,
 errors, argument effects and permission checks. Keep the real SQLAlchemy,
 Alembic, psycopg2 and other client comparisons, all four full workflows, and
 native Linux amd64/arm64 and macOS arm64 coverage on the finished revision.
-Keep the explicit coverage profile and measure build and execution separately
-within unchanged job limits. Run final qualification on the finished revision.
+Keep the explicit coverage and native CI profiles and measure build and execution
+separately within unchanged job limits. Preserve assertions and all native targets
+while bounding compiler concurrency and debug-data work. Cancelled builds and
+skipped execution jobs are incomplete qualification. Run final qualification on
+the finished revision.
 
 ### Share fixed memory and disk capacity according to demand
 

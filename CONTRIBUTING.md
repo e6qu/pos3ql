@@ -78,6 +78,14 @@ the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
+The Linux arm64 and macOS arm64 jobs build every target with `native-ci` and one
+Cargo worker. That profile retains debug assertions, overflow checks and
+source-line backtraces while omitting full variable/type debug data. Native lint
+uses the same profile. Cargo progress and timing reports identify unfinished
+build work; native test artifacts still require a completed build of the checked
+revision. Keep the 15-minute build limit and require both native execution jobs;
+a cancelled producer and its skipped tests do not qualify as passing CI.
+
 The configured SQL-session test harness records the most recent query-memory
 error's source location and the arena's requested, remaining and capacity bytes
 without allocating. Failed success assertions include those values, whether a

@@ -17,6 +17,7 @@ rewritten assignment inputs, quoted procedural names, typed trigger context
 and PostgreSQL stacked-diagnostic values. Output-parameter initializer indexing
 and named `undefined_column` handlers are covered by the active regressions,
 alongside quoted cursor names and consistent lexical variable bindings.
+The trigger audit uses the PostgreSQL-verified SQL fixture directly.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

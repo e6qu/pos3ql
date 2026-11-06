@@ -104,8 +104,9 @@ including variable JSON subscripts. Preserve quoted names and SQL case folding
 for declarations, targets, record fields, cursor names and runtime variables.
 Keep lexical shadowing consistent for values, declared types and domain
 identities in expressions, captured cursors and detached write inputs.
-Qualify every reference fixture
-under unchanged capacities. A caught `RETURN QUERY` error keeps its completed
+Qualify every reference fixture under unchanged capacities. Native trigger
+audits and live PostgreSQL comparisons use the same SQL file.
+A caught `RETURN QUERY` error keeps its completed
 result prefix; a private wait must not publish that prefix twice.
 Preserve PostgreSQL's different row-consumption rules for static `SELECT INTO`
 and dynamic `EXECUTE INTO`.

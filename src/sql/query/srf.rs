@@ -4079,7 +4079,7 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     } else {
         tref.table
     };
-    let selection = if let Some(oid) = super::input_progress::selected_target() {
+    let selection = if let Some(oid) = super::input_progress::selected_target()? {
         storage.routine_slot_by_oid(oid, txid).map_or(
             crate::storage::RoutineCallSelection::Absent,
             crate::storage::RoutineCallSelection::Stored,

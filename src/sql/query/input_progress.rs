@@ -5,8 +5,11 @@ use crate::storage::{
     RoutineDef, RoutineParameterMode, StoredQueryDependency, StoredQueryDependencyView,
 };
 
+pub(crate) type InputSite<'a> = InputPosition<&'a str>;
+type OwnedInputSite = InputPosition<crate::mem::arena::ArenaSliceHandle<u8>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputSite<'a> {
+pub(crate) enum InputPosition<Name> {
     Argument {
         routine: i32,
         parameter: usize,
@@ -15,7 +18,7 @@ pub(crate) enum InputSite<'a> {
         target: i32,
     },
     Call {
-        name: &'a str,
+        name: Name,
         kind: crate::sql::ast::CallKind,
         bound_oid: Option<i32>,
         arity: usize,
@@ -98,15 +101,11 @@ pub(crate) fn expression_site<'a>(expression: &Expr<'a>) -> InputSite<'a> {
     }
 }
 
-fn copy_bytes<'a>(bytes: &[u8], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
-    arena
-        .alloc_persistent_slice_with(bytes.len(), |index| bytes[index])
-        .map(|bytes| &*bytes)
-        .map_err(|_| full())
-}
-
-impl InputSite<'_> {
-    fn retain(self, arena: &Arena) -> Result<InputSite<'_>, SqlError> {
+impl<Name> InputPosition<Name> {
+    fn map_name<Output>(
+        self,
+        copy: impl FnOnce(Name) -> Result<Output, SqlError>,
+    ) -> Result<InputPosition<Output>, SqlError> {
         Ok(match self {
             Self::Argument {
                 routine,
@@ -114,7 +113,7 @@ impl InputSite<'_> {
                 written,
                 source,
                 target,
-            } => InputSite::Argument {
+            } => InputPosition::Argument {
                 routine,
                 parameter,
                 written,
@@ -127,22 +126,21 @@ impl InputSite<'_> {
                 bound_oid,
                 arity,
                 variadic,
-            } => InputSite::Call {
-                name: core::str::from_utf8(copy_bytes(name.as_bytes(), arena)?)
-                    .expect("copied SQL identifier is UTF-8"),
+            } => InputPosition::Call {
+                name: copy(name)?,
                 kind,
                 bound_oid,
                 arity,
                 variadic,
             },
-            Self::Query(kind) => InputSite::Query(kind),
-            Self::Expression(kind) => InputSite::Expression(kind),
-            Self::Definition(oid) => InputSite::Definition(oid),
+            Self::Query(kind) => InputPosition::Query(kind),
+            Self::Expression(kind) => InputPosition::Expression(kind),
+            Self::Definition(oid) => InputPosition::Definition(oid),
             Self::CastDefinition {
                 source,
                 target,
                 context,
-            } => InputSite::CastDefinition {
+            } => InputPosition::CastDefinition {
                 source,
                 target,
                 context,
@@ -151,7 +149,7 @@ impl InputSite<'_> {
                 routine,
                 parameter,
                 written,
-            } => InputSite::Classification {
+            } => InputPosition::Classification {
                 routine,
                 parameter,
                 written,
@@ -264,59 +262,12 @@ impl<'a> InputDefinition<'a> {
     pub(super) fn dependencies(self) -> StoredQueryDependencyView<'a> {
         StoredQueryDependencyView::new(self.dependencies)
     }
-
-    fn retain(self, arena: &Arena) -> Result<InputDefinition<'_>, SqlError> {
-        let signature = RoutineCallContract {
-            oid: self.signature.oid,
-            result: self.signature.result,
-            arguments: arena
-                .alloc_persistent_slice_with(self.signature.arguments.len(), |index| {
-                    self.signature.arguments[index]
-                })
-                .map_err(|_| full())?,
-            parameters: arena
-                .alloc_persistent_slice_with(self.signature.parameters.len(), |index| {
-                    self.signature.parameters[index]
-                })
-                .map_err(|_| full())?,
-            result_columns: arena
-                .alloc_persistent_slice_with(self.signature.result_columns.len(), |index| {
-                    self.signature.result_columns[index]
-                })
-                .map_err(|_| full())?,
-        };
-        let defaults = arena
-            .alloc_persistent_slice_with(self.defaults.len(), |_| ParameterDefault {
-                mode: 0,
-                sql: None,
-            })
-            .map_err(|_| full())?;
-        for (output, source) in defaults.iter_mut().zip(self.defaults) {
-            output.mode = source.mode;
-            output.sql = source
-                .sql
-                .map(|sql| {
-                    core::str::from_utf8(copy_bytes(sql.as_bytes(), arena)?).map_err(|_| changed())
-                })
-                .transpose()?;
-        }
-        Ok(InputDefinition {
-            signature,
-            defaults,
-            strict: self.strict,
-            dependencies: arena
-                .alloc_persistent_slice_with(self.dependencies.len(), |index| {
-                    self.dependencies[index]
-                })
-                .map_err(|_| full())?,
-        })
-    }
 }
 
 #[derive(Clone, Copy)]
 enum InputValue<'a> {
     Evaluated(&'a Datum<'a>),
-    Encoded(&'a [u8]),
+    Retained(crate::mem::arena::ArenaSliceHandle<u8>),
 }
 
 #[derive(Clone, Copy)]
@@ -340,36 +291,57 @@ struct InputFrame<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum AttemptFrame<'statement, 'query> {
-    // retain is the only constructor: saved values are encoded statement bytes.
-    Saved(&'statement InputFrame<'statement>),
+enum AttemptFrame<'query> {
+    Saved(crate::mem::arena::ArenaHandle<saved::OwnedInputFrame>),
     Temporary(&'query Cell<InputFrame<'query>>),
 }
 
-impl<'statement: 'query, 'query> AttemptFrame<'statement, 'query> {
-    fn frame(self) -> InputFrame<'query> {
+impl<'query> AttemptFrame<'query> {
+    fn frame(self, source: &Arena, output: &'query Arena) -> Result<InputFrame<'query>, SqlError> {
         match self {
-            Self::Saved(frame) => *frame,
-            Self::Temporary(frame) => frame.get(),
+            Self::Saved(handle) => source
+                .retained(handle)
+                .ok_or_else(changed)?
+                .load(source, output),
+            Self::Temporary(frame) => Ok(frame.get()),
+        }
+    }
+
+    fn definition_oid(self, source: &Arena) -> Result<Option<i32>, SqlError> {
+        match self {
+            Self::Saved(handle) => source
+                .retained(handle)
+                .ok_or_else(changed)?
+                .definition_oid(source),
+            Self::Temporary(frame) => Ok(definition_oid(frame.get())),
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct SavedInputs<'a> {
+struct SavedInputs {
     ordinal: usize,
-    frames: &'a [&'a InputFrame<'a>],
+    frames:
+        crate::mem::arena::ArenaSliceHandle<crate::mem::arena::ArenaHandle<saved::OwnedInputFrame>>,
 }
 
+mod saved;
+
 #[derive(Clone, Copy)]
-struct CastSelection<'a> {
+struct CastSelection {
     source: i32,
     target: i32,
     context: super::super::eval::DefinedCastContext,
-    cast: Option<&'a super::super::eval::BoundCast>,
+    cast: Option<crate::mem::arena::ArenaHandle<super::super::eval::BoundCast>>,
 }
 
-impl CastSelection<'_> {
+impl CastSelection {
+    fn value(self, arena: &Arena) -> Result<Option<super::super::eval::BoundCast>, SqlError> {
+        self.cast
+            .map(|handle| arena.retained(handle).ok_or_else(changed))
+            .transpose()
+    }
+
     fn key(self) -> (i32, i32, u8) {
         use super::super::eval::DefinedCastContext;
         (
@@ -387,9 +359,9 @@ impl CastSelection<'_> {
 pub(super) struct RoutineInputs<'a> {
     arena: &'a Arena,
     next: Cell<usize>,
-    saved: RefCell<ArenaList<'a, SavedInputs<'a>>>,
+    saved: RefCell<ArenaList<'a, SavedInputs>>,
     evaluations: RefCell<ArenaList<'a, (i32, super::super::eval::ExpressionEvaluation)>>,
-    cast_selections: RefCell<ArenaList<'a, CastSelection<'a>>>,
+    cast_selections: RefCell<ArenaList<'a, CastSelection>>,
 }
 
 impl<'a> RoutineInputs<'a> {
@@ -412,7 +384,7 @@ struct InputAttempt<'statement, 'query> {
     invocation: &'query Cell<usize>,
     arena: &'query Arena,
     next: Cell<usize>,
-    frames: RefCell<ArenaList<'query, AttemptFrame<'statement, 'query>>>,
+    frames: RefCell<ArenaList<'query, AttemptFrame<'query>>>,
 }
 
 impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
@@ -486,7 +458,7 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
             .get(ordinal)
             .copied()
             .ok_or_else(changed)?
-            .frame();
+            .frame(self.registry.arena, self.arena)?;
         if frame.site != site {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
@@ -541,8 +513,13 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
                 self.invocation.set(next_invocation);
                 self.registry.next.set(next_call);
                 return match value {
-                    InputValue::Encoded(encoded) => {
-                        let encoded = output.alloc_slice_copy(encoded).map_err(|_| full())?;
+                    InputValue::Retained(handle) => {
+                        let bytes = self
+                            .registry
+                            .arena
+                            .retained_slice_mut(handle)
+                            .map_err(|_| changed())?;
+                        let encoded = output.alloc_slice_copy(&bytes).map_err(|_| full())?;
                         super::super::exec::decode_projected_col_record(encoded, 0, output)
                     }
                     InputValue::Evaluated(value) => {
@@ -633,71 +610,21 @@ impl<'statement: 'query, 'query> InputAttempt<'statement, 'query> {
 
     fn retain(&self, ordinal: usize) -> Result<(), SqlError> {
         let arena = self.registry.arena;
-        let mut copied = ArenaList::new(arena);
+        // The parent front may be lent to the current query. Build this
+        // directory entirely in retained storage before publishing the entry.
+        let mut copied = ArenaList::new_persistent(arena);
         for frame in self.frames.borrow().borrowed_slice() {
             let saved = match *frame {
-                AttemptFrame::Saved(frame) => frame,
+                AttemptFrame::Saved(handle) => handle,
                 AttemptFrame::Temporary(frame) => {
-                    let frame = frame.get();
-                    let state = match frame.state {
-                        InputState::Pending => InputState::Pending,
-                        InputState::Value {
-                            value,
-                            next_input,
-                            next_invocation,
-                            next_call,
-                            replay,
-                        } => InputState::Value {
-                            value: InputValue::Encoded(match value {
-                                InputValue::Evaluated(value) => {
-                                    super::super::exec::encode_projected_persistent_pub(
-                                        &[*value],
-                                        arena,
-                                    )?
-                                }
-                                InputValue::Encoded(encoded) => copy_bytes(encoded, arena)?,
-                            }),
-                            next_input,
-                            next_invocation,
-                            next_call,
-                            replay: replay
-                                .map(|cursor| {
-                                    arena
-                                        .alloc_persistent_slice_with(1, |_| *cursor)
-                                        .map(|saved| &saved[0])
-                                        .map_err(|_| full())
-                                })
-                                .transpose()?,
-                        },
-                        InputState::Definition(definition) => {
-                            let definition = definition.retain(arena)?;
-                            InputState::Definition(
-                                &arena
-                                    .alloc_persistent_slice_with(1, |_| definition)
-                                    .map_err(|_| full())?[0],
-                            )
-                        }
-                        InputState::CastDefinition(definition) => {
-                            InputState::CastDefinition(match definition {
-                                Some(definition) => Some(
-                                    &arena
-                                        .alloc_persistent_slice_with(1, |_| *definition)
-                                        .map_err(|_| full())?[0],
-                                ),
-                                None => None,
-                            })
-                        }
-                    };
-                    let site = frame.site.retain(arena)?;
-                    &arena
-                        .alloc_persistent_slice_with(1, |_| InputFrame { site, state })
-                        .map_err(|_| full())?[0]
+                    let saved = saved::OwnedInputFrame::capture(frame.get(), arena)?;
+                    arena.retain(saved).map_err(|_| full())?
                 }
             };
             copied.push(saved).map_err(|_| full())?;
         }
         let frames = arena
-            .alloc_persistent_slice_with(copied.len(), |index| copied.borrowed_slice()[index])
+            .retain_slice_with(copied.len(), |index| copied.borrowed_slice()[index])
             .map_err(|_| full())?;
         let saved = SavedInputs { ordinal, frames };
         let mut entries = self.registry.saved.borrow_mut();
@@ -771,8 +698,10 @@ fn definition_oid(frame: InputFrame<'_>) -> Option<i32> {
     }
 }
 
-pub(super) fn selected_target() -> Option<i32> {
-    let active = AVAILABLE_INPUT.with(Cell::get)?;
+pub(super) fn selected_target() -> Result<Option<i32>, SqlError> {
+    let Some(active) = AVAILABLE_INPUT.with(Cell::get) else {
+        return Ok(None);
+    };
     // AvailableScope keeps the stack-owned attempt live during this lookup.
     let attempt = unsafe { &*(active as *const InputAttempt<'_, '_>) };
     attempt
@@ -780,7 +709,10 @@ pub(super) fn selected_target() -> Option<i32> {
         .borrow()
         .borrowed_slice()
         .get(attempt.next.get())
-        .and_then(|frame| definition_oid(frame.frame()))
+        .copied()
+        .map(|frame| frame.definition_oid(attempt.registry.arena))
+        .transpose()
+        .map(Option::flatten)
 }
 
 pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPosition, SqlError> {
@@ -821,15 +753,33 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
     registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
     CURRENT_CALL.with(|current| current.set(Some(ordinal)));
     let target = if ACTIVE_INPUT.with(Cell::get).is_some() {
-        selected_target()
+        selected_target()?
     } else {
         let saved = registry.saved.borrow();
-        saved
+        match saved
             .borrowed_slice()
             .binary_search_by_key(&ordinal, |entry| entry.ordinal)
-            .ok()
-            .and_then(|index| saved.borrowed_slice()[index].frames.first())
-            .and_then(|frame| definition_oid(**frame))
+        {
+            Ok(index) => {
+                let frames = registry
+                    .arena
+                    .retained_slice_mut(saved.borrowed_slice()[index].frames)
+                    .map_err(|_| changed())?;
+                frames
+                    .first()
+                    .copied()
+                    .map(|handle| {
+                        registry
+                            .arena
+                            .retained(handle)
+                            .ok_or_else(changed)?
+                            .definition_oid(registry.arena)
+                    })
+                    .transpose()?
+                    .flatten()
+            }
+            Err(_) => None,
+        }
     };
     position.target = target;
     Ok(position)
@@ -964,7 +914,11 @@ pub(crate) fn call<T>(
             .borrowed_slice()
             .binary_search_by_key(&ordinal, |entry| entry.ordinal)
         {
-            for frame in saved.borrowed_slice()[index].frames {
+            let retained = registry
+                .arena
+                .retained_slice_mut(saved.borrowed_slice()[index].frames)
+                .map_err(|_| changed())?;
+            for frame in retained.iter().copied() {
                 frames
                     .push(AttemptFrame::Saved(frame))
                     .map_err(|_| full())?;
@@ -1048,24 +1002,19 @@ pub(super) fn cast_selection(
             .borrowed_slice()
             .binary_search_by_key(&key, |entry| entry.key())
         {
-            return Ok(entries.borrowed_slice()[index].cast.copied());
+            return entries.borrowed_slice()[index].value(arena);
         }
     }
     let selected = select()?;
     let cast = selected
-        .map(|cast| {
-            arena
-                .alloc_persistent_slice_with(1, |_| cast)
-                .map(|cast| &cast[0])
-                .map_err(|_| full())
-        })
+        .map(|cast| arena.retain(cast).map_err(|_| full()))
         .transpose()?;
     let mut entries = invocations.inputs.cast_selections.borrow_mut();
     let index = match entries
         .borrowed_slice()
         .binary_search_by_key(&key, |entry| entry.key())
     {
-        Ok(index) => return Ok(entries.borrowed_slice()[index].cast.copied()),
+        Ok(index) => return entries.borrowed_slice()[index].value(arena),
         Err(index) => index,
     };
     entries
@@ -1113,6 +1062,275 @@ fn changed() -> SqlError {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn saved_input_images_keep_values_names_defaults_and_types_after_arena_move() {
+        let mut budget = Budget::new(64 << 10);
+        let original = Arena::new(&mut budget, "saved input images", 32 << 10).unwrap();
+        let mut output = Arena::new(&mut budget, "saved input views", 16 << 10).unwrap();
+        let wrong = Arena::new(&mut budget, "other input images", 16 << 10).unwrap();
+        let (value, definition, cast) = crate::mem::guard::forbid_alloc(|| {
+            original
+                .with_remaining_region(|scratch| {
+                    let text = scratch.alloc_str("saved input").unwrap();
+                    let field = scratch.alloc_str("payload").unwrap();
+                    let fields = scratch
+                        .alloc_slice_copy(&[crate::sql::types::RecordField {
+                            name: field,
+                            type_oid: crate::sql::types::oid::TEXT,
+                            value: Datum::Text(text),
+                        }])
+                        .unwrap();
+                    let datum = scratch.alloc(Datum::Record(fields)).unwrap();
+                    let value = saved::OwnedInputFrame::capture(
+                        InputFrame {
+                            site: InputSite::Call {
+                                name: scratch.alloc_str("selected_name").unwrap(),
+                                kind: crate::sql::ast::CallKind::Routine,
+                                bound_oid: Some(42),
+                                arity: 1,
+                                variadic: false,
+                            },
+                            state: InputState::Value {
+                                value: InputValue::Evaluated(datum),
+                                next_input: 8,
+                                next_invocation: 9,
+                                next_call: 10,
+                                replay: Some(
+                                    scratch
+                                        .alloc(crate::sql::sequence::StatementReplayCursor::EMPTY)
+                                        .unwrap(),
+                                ),
+                            },
+                        },
+                        &original,
+                    )
+                    .unwrap();
+                    let arguments = scratch
+                        .alloc_slice_copy(&[crate::storage::RoutineArgumentDef {
+                            name: crate::storage::SqlName::parse("argument").unwrap(),
+                            ctype: ColType::Int4,
+                            user_type: None,
+                        }])
+                        .unwrap();
+                    let defaults = scratch
+                        .alloc_slice_copy(&[ParameterDefault {
+                            mode: crate::storage::RoutineParameterMode::In { default: None }.code(),
+                            sql: Some(scratch.alloc_str("SELECT 7").unwrap()),
+                        }])
+                        .unwrap();
+                    let definition = scratch
+                        .alloc(InputDefinition {
+                            signature: RoutineCallContract {
+                                oid: 42,
+                                arguments,
+                                parameters: arguments,
+                                result_columns: &[],
+                                result: RoutineCallResult::Scalar(
+                                    crate::storage::RoutineResult::builtin(ColType::Int4),
+                                ),
+                            },
+                            defaults,
+                            strict: true,
+                            dependencies: &[],
+                        })
+                        .unwrap();
+                    let definition = saved::OwnedInputFrame::capture(
+                        InputFrame {
+                            site: InputSite::Definition(42),
+                            state: InputState::Definition(definition),
+                        },
+                        &original,
+                    )
+                    .unwrap();
+                    let cast = scratch.alloc(captured_cast(111)).unwrap();
+                    let cast = saved::OwnedInputFrame::capture(
+                        InputFrame {
+                            site: InputSite::CastDefinition {
+                                source: 23,
+                                target: 25,
+                                context: crate::sql::eval::DefinedCastContext::Explicit,
+                            },
+                            state: InputState::CastDefinition(Some(cast)),
+                        },
+                        &original,
+                    )
+                    .unwrap();
+                    (value, definition, cast)
+                })
+                .unwrap()
+        });
+        let mut moved = original;
+        crate::mem::guard::forbid_alloc(|| {
+            moved.recycle_front();
+            for _ in 0..4 {
+                output.reset();
+                let frame = value.load(&moved, &output).unwrap();
+                assert!(matches!(
+                    frame.site,
+                    InputSite::Call {
+                        name: "selected_name",
+                        bound_oid: Some(42),
+                        ..
+                    }
+                ));
+                let InputState::Value {
+                    value: InputValue::Retained(handle),
+                    next_input: 8,
+                    next_invocation: 9,
+                    next_call: 10,
+                    replay,
+                } = frame.state
+                else {
+                    panic!("saved input state")
+                };
+                assert!(replay.unwrap().is_empty());
+                let bytes = moved.retained_slice_mut(handle).unwrap();
+                let bytes = output.alloc_slice_copy(&bytes).unwrap();
+                let Datum::Record(fields) =
+                    crate::sql::exec::decode_projected_col_record(bytes, 0, &output).unwrap()
+                else {
+                    panic!("saved record input")
+                };
+                assert_eq!(fields[0].name, "payload");
+                assert_eq!(fields[0].value, Datum::Text("saved input"));
+                let InputState::Definition(selected) =
+                    definition.load(&moved, &output).unwrap().state
+                else {
+                    panic!("saved definition")
+                };
+                assert!(selected.strict);
+                assert_eq!(selected.signature.arguments[0].ctype, ColType::Int4);
+                assert_eq!(selected.defaults[0].sql, Some("SELECT 7"));
+                assert_eq!(definition.definition_oid(&moved).unwrap(), Some(42));
+                let InputState::CastDefinition(Some(selected)) =
+                    cast.load(&moved, &output).unwrap().state
+                else {
+                    panic!("saved cast")
+                };
+                assert_eq!(
+                    selected.definition.method,
+                    crate::storage::CastMethod::Function(111)
+                );
+            }
+            assert_eq!(
+                definition.definition_oid(&wrong).unwrap_err().sqlstate,
+                "40001"
+            );
+            moved.reset();
+            assert_eq!(
+                definition.definition_oid(&moved).unwrap_err().sqlstate,
+                "40001"
+            );
+            assert!(value.load(&moved, &output).is_err());
+        });
+    }
+
+    #[test]
+    fn input_suspension_uses_retained_storage_while_the_parent_front_is_lent() {
+        let mut budget = Budget::new(16 << 10);
+        let statement = Arena::new(&mut budget, "parent input owner", 16 << 10).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
+            &invocations,
+            &statement,
+        )));
+        crate::mem::guard::forbid_alloc(|| {
+            let error = statement
+                .with_remaining_region(|work| {
+                    call(work, || {
+                        let _input = enter();
+                        value(InputSite::Query(InputQuery::Scalar), work, || {
+                            Ok(Datum::Int4(7))
+                        })?;
+                        Err::<(), _>(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "input handoff"
+                        ))
+                    })
+                    .unwrap_err()
+                })
+                .unwrap();
+            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ROUTINE_INVOCATION);
+            let retained = statement.used();
+            for _ in 0..8 {
+                invocations.begin_attempt();
+                statement
+                    .with_remaining_region(|work| {
+                        let result = call(work, || {
+                            let _input = enter();
+                            value(InputSite::Query(InputQuery::Scalar), work, || {
+                                panic!("completed input must not execute again")
+                            })
+                        })
+                        .unwrap();
+                        assert_eq!(result, Datum::Int4(7));
+                    })
+                    .unwrap();
+                assert_eq!(statement.used(), retained);
+            }
+        });
+    }
+
+    #[test]
+    fn saved_input_capacity_and_foreign_selection_errors_preserve_scope_authority() {
+        let mut budget = Budget::new(8193);
+        let source = Arena::new(&mut budget, "selected input", 4096).unwrap();
+        let other = Arena::new(&mut budget, "other input", 4096).unwrap();
+        let tiny = Arena::new(&mut budget, "tiny input", 1).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let datum = Datum::Text("cannot fit");
+            assert_eq!(
+                saved::OwnedInputFrame::capture(
+                    InputFrame {
+                        site: InputSite::Expression(InputNode::Value),
+                        state: InputState::Value {
+                            value: InputValue::Evaluated(&datum),
+                            next_input: 1,
+                            next_invocation: 0,
+                            next_call: 0,
+                            replay: None
+                        },
+                    },
+                    &tiny
+                )
+                .err()
+                .unwrap()
+                .sqlstate,
+                "54000"
+            );
+            let frame = source
+                .retain(
+                    saved::OwnedInputFrame::capture(
+                        InputFrame {
+                            site: InputSite::Expression(InputNode::Value),
+                            state: InputState::Pending,
+                        },
+                        &source,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let invocations = RoutineInvocationState::new(&other);
+            let mut frames = ArenaList::new(&other);
+            frames.push(AttemptFrame::Saved(frame)).unwrap();
+            let attempt = InputAttempt {
+                registry: &invocations.inputs,
+                invocation: &invocations.next,
+                arena: &other,
+                next: Cell::new(0),
+                frames: RefCell::new(frames),
+            };
+            let before = AVAILABLE_INPUT.with(Cell::get);
+            {
+                let _available = AvailableScope(AVAILABLE_INPUT.with(|slot| {
+                    slot.replace(Some(&attempt as *const InputAttempt<'_, '_> as *const ()))
+                }));
+                assert_eq!(selected_target().unwrap_err().sqlstate, "40001");
+            }
+            assert_eq!(AVAILABLE_INPUT.with(Cell::get), before);
+        });
+    }
 
     #[test]
     fn retained_input_values_advance_typed_journals_past_arguments_and_completed_bodies() {

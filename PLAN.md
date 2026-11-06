@@ -94,6 +94,10 @@ copy into execution memory while completing the other invocation phases.
 Completed scalar and row results also own encoded values and effect receipts
 through checked handles. Preserve random-access call positions, empty results,
 nested record types and the old directory when a larger directory cannot fit.
+Saved input frames now keep checked handles for values, names, defaults, selected
+types, casts and effect receipts. Preserve their input/call positions, stable
+selection errors and retained-only publication while query scratch borrows the
+parent arena. The input registry's directories still borrow their owning arena.
 Runtime local metadata no longer holds initializer-expression references; retain its
 resolved types and once-only declaration-order initialization. Input parameters
 seed the parameter prefix; unseeded OUT slots start as NULL before declaration

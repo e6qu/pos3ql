@@ -15,6 +15,8 @@ current behavior and limits belong in the [owning guides](docs/README.md).
 Fixing tests and retained PostgreSQL reference evidence own the exact SQL cases,
 including parameter/local/output scopes, constant targets, cursor behavior and
 pending-call argument/type ownership and completed-result ownership.
+Saved-input images and publication while query scratch borrows the parent arena
+have allocation and ownership regressions in the active PR.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

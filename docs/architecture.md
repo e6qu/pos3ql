@@ -206,6 +206,13 @@ after its body memory is reused. Reading a saved result copies it into the
 consumer's arena; table results also rebuild their row directory there. Both
 copies count against statement memory. Directory growth reserves its replacement
 before publishing it; exhaustion keeps every previous result readable.
+Unfinished input frames retain checked handles for values, call names, defaults,
+type signatures, selected casts, dependencies and effect receipts. A new attempt
+rebuilds temporary metadata views; an already encoded value is copied only when
+the consumer reads it. Stale input selections return `40001` before choosing a
+replacement function or cast. Publishing a suspension uses the arena's retained
+tail, including while a row scan borrows its temporary front. The registry's
+directories still borrow the owning arena and are part of the remaining work.
 Nested SQL queries, including a `ts_rewrite` rule query, have their own input
 scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested

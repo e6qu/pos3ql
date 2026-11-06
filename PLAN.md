@@ -104,6 +104,9 @@ including variable JSON subscripts. Preserve quoted names and SQL case folding
 for declarations, targets, record fields, cursor names and runtime variables.
 Keep lexical shadowing consistent for values, declared types and domain
 identities in expressions, captured cursors and detached write inputs.
+Retain each binding's nesting depth through handler and numeric-loop entry
+and exit. Preserve constant-target checks before body effects and distinguish
+reading an existing cursor name from assigning a generated one.
 Qualify every reference fixture under unchanged capacities. Native trigger
 audits and live PostgreSQL comparisons use the same SQL file.
 A caught `RETURN QUERY` error keeps its completed

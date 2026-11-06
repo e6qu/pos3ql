@@ -3951,6 +3951,15 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         context.storage(),
         context.txn.txid,
         context.arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
     )?;
     let invocation = invocation.with_input_sites(program.input_sites);
     let transition_relations =
@@ -3986,7 +3995,6 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         Some(TriggerFlow::Return(result)) => match result {
             TriggerReturnValue::Null if before => Ok(false),
@@ -17103,8 +17111,22 @@ enum PlpgsqlRecordShape {
     Table(u16),
 }
 
+/// Ordering follows lexical nesting, independently of handler-buffer slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PlpgsqlScope {
+    Invocation,
+    Frame(core::num::NonZeroUsize),
+}
+
+impl PlpgsqlScope {
+    fn frame(depth: usize) -> Self {
+        Self::Frame(core::num::NonZeroUsize::new(depth).expect("active procedural frame"))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TriggerLocalDecl {
+    scope: PlpgsqlScope,
     name: SqlName,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
@@ -17114,9 +17136,8 @@ struct TriggerLocalDecl {
     not_null: bool,
 }
 
-/// PostgreSQL's immutable per-firing trigger variables.  The parser keeps
-/// these names out of the local namespace, and every execution scope carries
-/// this value explicitly, including nested trigger SQL snapshots.
+/// Per-firing context stays distinct from lexical local bindings, including
+/// in detached scopes used by nested trigger writes.
 #[derive(Clone, Copy)]
 struct TriggerInvocation<'a> {
     program_kind: PlpgsqlProgramKind,
@@ -17139,7 +17160,7 @@ struct TriggerInvocation<'a> {
     argv: Datum<'a>,
     event: &'a str,
     tag: &'a str,
-    exception: Option<TriggerExceptionVariables<'a>>,
+    exception: Option<TriggerExceptionBinding<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -17482,8 +17503,12 @@ impl<'a> TriggerInvocation<'a> {
         Ok(super::type_input_plans::Key { owner, source })
     }
 
-    fn with_exception(mut self, exception: TriggerExceptionVariables<'a>) -> Self {
-        self.exception = Some(exception);
+    fn with_exception(
+        mut self,
+        values: TriggerExceptionVariables<'a>,
+        scope: PlpgsqlScope,
+    ) -> Self {
+        self.exception = Some(TriggerExceptionBinding { values, scope });
         self
     }
 
@@ -17826,6 +17851,7 @@ enum TriggerCaseElse<'a> {
 #[derive(Clone, Copy)]
 enum TriggerForSource<'a> {
     Numeric {
+        counter_keyword: Option<&'a str>,
         lower: &'a Expr<'a>,
         upper: &'a Expr<'a>,
         step: &'a Expr<'a>,
@@ -17922,6 +17948,12 @@ enum TriggerFlow<'a> {
 struct TriggerExceptionVariables<'a> {
     sqlstate_text: &'a str,
     message: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct TriggerExceptionBinding<'a> {
+    values: TriggerExceptionVariables<'a>,
+    scope: PlpgsqlScope,
 }
 
 #[derive(Clone, Copy)]
@@ -18784,7 +18816,17 @@ fn parse_plpgsql_identifier_prefix(
         .map_err(|_| super::query::arena_full_pub())?
 }
 
-fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlError> {
+#[derive(Debug)]
+struct PlpgsqlIdentifier<'source> {
+    name: SqlName,
+    quoted: bool,
+    spelling: &'source str,
+}
+
+fn parse_plpgsql_identifier<'source>(
+    source: &'source str,
+    arena: &Arena,
+) -> Result<PlpgsqlIdentifier<'source>, SqlError> {
     arena
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
@@ -18792,8 +18834,9 @@ fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlE
             let token = lexer
                 .next_token()
                 .map_err(|error| super::parse_error_to_sql(&error.into()))?;
-            let name = match token {
-                Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
+            let (name, quoted) = match token {
+                Tok::Ident(name) => (SqlName::parse(name)?, false),
+                Tok::QuotedIdent(name) => (SqlName::parse(name)?, true),
                 _ => {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -18801,6 +18844,7 @@ fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlE
                     ));
                 }
             };
+            let spelling = &source[lexer.token_start()..lexer.token_end()];
             if !matches!(
                 lexer
                     .next_token()
@@ -18812,7 +18856,11 @@ fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlE
                     "expected one PL/pgSQL identifier"
                 ));
             }
-            Ok(name)
+            Ok(PlpgsqlIdentifier {
+                name,
+                quoted,
+                spelling,
+            })
         })
         .map_err(|_| super::query::arena_full_pub())?
 }
@@ -18931,7 +18979,7 @@ fn parse_trigger_select_into<'a>(
         if count == targets.len() || target.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?;
+        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?.name;
         count += 1;
     }
     if count == 0 {
@@ -19061,7 +19109,7 @@ fn parse_plpgsql_into_targets<'a>(
         if count == targets.len() || target.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?;
+        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?.name;
         count += 1;
     }
     if count == 0 {
@@ -19408,7 +19456,7 @@ fn parse_trigger_get_diagnostics<'a>(
         let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
-        let target = parse_plpgsql_identifier(target.trim(), arena)?;
+        let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
@@ -19458,7 +19506,7 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
         let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
-        let target = parse_plpgsql_identifier(target.trim(), arena)?;
+        let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
@@ -19672,11 +19720,11 @@ fn parse_trigger_for_header<'a>(
             using_at.map(|at| &command[at + "using".len()..]),
             arena,
         )?;
-        return Ok(Some((target, TriggerForSource::DynamicQuery(query))));
+        return Ok(Some((target.name, TriggerForSource::DynamicQuery(query))));
     }
     if strip_trigger_keyword(source, "select").is_some() {
         return Ok(Some((
-            target,
+            target.name,
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
@@ -19705,8 +19753,10 @@ fn parse_trigger_for_header<'a>(
             .map_err(|_| super::query::arena_full_pub())?,
     };
     Ok(Some((
-        target,
+        target.name,
         TriggerForSource::Numeric {
+            counter_keyword: (!target.quoted && target.name.as_str() == "sqlstate")
+                .then_some(target.spelling),
             lower: parse_plpgsql_expression(lower, arena)?,
             upper: parse_plpgsql_expression(upper, arena)?,
             step,
@@ -19731,14 +19781,14 @@ fn parse_trigger_foreach_header<'a>(
     let target_source = body[..in_at].trim();
     let (target, slice) = match trigger_top_level_keyword(target_source, "slice") {
         Some(at) => {
-            let target = parse_plpgsql_identifier(target_source[..at].trim(), arena)?;
+            let target = parse_plpgsql_identifier(target_source[..at].trim(), arena)?.name;
             let slice = target_source[at + 5..].trim();
             let slice = slice
                 .parse::<u8>()
                 .map_err(|_| unsupported_trigger_body())?;
             (target, NonZeroU8::new(slice))
         }
-        None => (parse_plpgsql_identifier(target_source, arena)?, None),
+        None => (parse_plpgsql_identifier(target_source, arena)?.name, None),
     };
     let array = strip_trigger_keyword(body[in_at + 2..].trim(), "array")
         .ok_or_else(unsupported_trigger_body)?
@@ -19781,7 +19831,7 @@ fn trigger_loop_label<'s>(
     arena: &Arena,
 ) -> Result<(Option<SqlName>, &'s str), SqlError> {
     match trigger_label_prefix(segment) {
-        Some((label, header)) => Ok((Some(parse_plpgsql_identifier(label, arena)?), header)),
+        Some((label, header)) => Ok((Some(parse_plpgsql_identifier(label, arena)?.name), header)),
         None => Ok((None, segment)),
     }
 }
@@ -19832,7 +19882,10 @@ fn parse_trigger_loop_control<'a>(
         } else {
             return Err(unsupported_trigger_body());
         };
-        (Some(parse_plpgsql_identifier(label, arena)?), condition)
+        (
+            Some(parse_plpgsql_identifier(label, arena)?.name),
+            condition,
+        )
     };
     let unwind = match label {
         Some(label) => loop_labels
@@ -19862,7 +19915,7 @@ fn loop_control_for_label<'a>(
     loop_labels: &[Option<SqlName>],
     arena: &Arena,
 ) -> Result<TriggerLoopControl<'a>, SqlError> {
-    let label = parse_plpgsql_identifier(label, arena)?;
+    let label = parse_plpgsql_identifier(label, arena)?.name;
     let unwind = loop_labels
         .iter()
         .rev()
@@ -19968,6 +20021,8 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::DIVISION_BY_ZERO
     } else if text.eq_ignore_ascii_case("undefined_column") {
         sqlstate::UNDEFINED_COLUMN
+    } else if text.eq_ignore_ascii_case("error_in_assignment") {
+        sqlstate::ERROR_IN_ASSIGNMENT
     } else if text.eq_ignore_ascii_case("case_not_found") {
         sqlstate::CASE_NOT_FOUND
     } else if text.eq_ignore_ascii_case("cardinality_violation") {
@@ -20133,7 +20188,7 @@ fn parse_plpgsql_cursor_close(statement: &str, arena: &Arena) -> Result<Option<S
         return Ok(None);
     };
     let body = body.trim();
-    Ok(Some(parse_plpgsql_identifier(body, arena)?))
+    Ok(Some(parse_plpgsql_identifier(body, arena)?.name))
 }
 
 fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> crate::sql::eval::SqlState {
@@ -20827,9 +20882,11 @@ fn resolve_plpgsql_program_locals<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<TriggerProgram<'a>, SqlError> {
     let resolved = arena
         .alloc_slice_with(program.locals.len(), |_| TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: SqlName::EMPTY,
             ctype: ColType::Bool,
             user_type: None,
@@ -20864,6 +20921,7 @@ fn resolve_plpgsql_program_locals<'a>(
             ));
         }
         resolved[index] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: local.name,
             ctype,
             user_type,
@@ -20882,34 +20940,48 @@ fn resolve_plpgsql_program_locals<'a>(
         body: program.body,
         input_sites: program.input_sites,
     };
-    validate_plpgsql_constant_assignments(&program)?;
+    validate_plpgsql_constant_assignments(&program, has_parameter)?;
     Ok(program)
 }
 
-fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result<(), SqlError> {
-    struct LoopLocal<'a> {
+fn validate_plpgsql_constant_assignments(
+    program: &TriggerProgram<'_>,
+    has_parameter: &dyn Fn(SqlName) -> bool,
+) -> Result<(), SqlError> {
+    struct ScopedLocal<'a> {
         name: SqlName,
-        parent: Option<&'a LoopLocal<'a>>,
+        constant: bool,
+        parent: Option<&'a ScopedLocal<'a>>,
+    }
+    fn binding_constant(
+        target: SqlName,
+        locals: &[TriggerLocalDecl],
+        mut shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &dyn Fn(SqlName) -> bool,
+    ) -> Option<bool> {
+        while let Some(local) = shadowed {
+            if local.name == target {
+                return Some(local.constant);
+            }
+            shadowed = local.parent;
+        }
+        locals
+            .iter()
+            .find(|local| local.name == target)
+            .map(|local| local.constant)
+            .or_else(|| has_parameter(target).then_some(false))
     }
     fn reject(
         target: SqlName,
         locals: &[TriggerLocalDecl],
-        mut shadowed: Option<&LoopLocal<'_>>,
+        shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &dyn Fn(SqlName) -> bool,
     ) -> Result<(), SqlError> {
-        while let Some(local) = shadowed {
-            if local.name == target {
-                return Ok(());
-            }
-            shadowed = local.parent;
-        }
-        if let Some(local) = locals
-            .iter()
-            .find(|local| local.name == target && local.constant)
-        {
+        if binding_constant(target, locals, shadowed, has_parameter) == Some(true) {
             return Err(sql_err!(
                 sqlstate::ERROR_IN_ASSIGNMENT,
                 "variable \"{}\" is declared CONSTANT",
-                local.name.as_str()
+                target.as_str()
             ));
         }
         Ok(())
@@ -20917,76 +20989,121 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
     fn validate_block(
         current: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
-        shadowed: Option<&LoopLocal<'_>>,
+        shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &dyn Fn(SqlName) -> bool,
     ) -> Result<(), SqlError> {
         for statement in current.statements {
             match *statement {
                 TriggerStatement::LocalAssign(assignment) => {
-                    reject(assignment.name, locals, shadowed)?
+                    reject(assignment.name, locals, shadowed, has_parameter)?
                 }
                 TriggerStatement::SelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed)?;
+                        reject(*target, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::DynamicSelectInto(statement) => {
                     for target in statement.targets {
-                        reject(*target, locals, shadowed)?;
+                        reject(*target, locals, shadowed, has_parameter)?;
+                    }
+                }
+                TriggerStatement::CursorMotion(statement) => {
+                    for target in statement.targets {
+                        reject(*target, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::GetDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed)?;
+                        reject(assignment.target, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::GetStackedDiagnostics(statement) => {
                     for assignment in statement.assignments {
-                        reject(assignment.target, locals, shadowed)?;
+                        reject(assignment.target, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::For(statement) => {
-                    if matches!(statement.source, TriggerForSource::Numeric { .. }) {
-                        let local = LoopLocal {
+                    if let TriggerForSource::Numeric {
+                        counter_keyword, ..
+                    } = statement.source
+                    {
+                        if let Some(keyword) = counter_keyword
+                            && binding_constant(statement.target, locals, shadowed, has_parameter)
+                                .is_none()
+                        {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "syntax error at or near \"{}\"",
+                                keyword
+                            ));
+                        }
+                        let local = ScopedLocal {
                             name: statement.target,
+                            constant: false,
                             parent: shadowed,
                         };
-                        validate_block(statement.block, locals, Some(&local))?;
+                        validate_block(statement.block, locals, Some(&local), has_parameter)?;
                     } else {
-                        reject(statement.target, locals, shadowed)?;
-                        validate_block(statement.block, locals, shadowed)?;
+                        reject(statement.target, locals, shadowed, has_parameter)?;
+                        validate_block(statement.block, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::While(statement) => {
-                    validate_block(statement.block, locals, shadowed)?
+                    validate_block(statement.block, locals, shadowed, has_parameter)?
                 }
                 TriggerStatement::Loop(block_value) => {
-                    validate_block(block_value, locals, shadowed)?
+                    validate_block(block_value, locals, shadowed, has_parameter)?
                 }
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::Case(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed)?;
+                        validate_block(branch.block, locals, shadowed, has_parameter)?;
                     }
                     if let TriggerCaseElse::Block(otherwise) = statement.otherwise {
-                        validate_block(otherwise, locals, shadowed)?;
+                        validate_block(otherwise, locals, shadowed, has_parameter)?;
                     }
                 }
                 TriggerStatement::Exception(statement) => {
-                    validate_block(statement.protected, locals, shadowed)?;
+                    validate_block(statement.protected, locals, shadowed, has_parameter)?;
+                    let state = ScopedLocal {
+                        name: SqlName::parse("sqlstate").expect("static diagnostic name"),
+                        constant: true,
+                        parent: shadowed,
+                    };
+                    let message = ScopedLocal {
+                        name: SqlName::parse("sqlerrm").expect("static diagnostic name"),
+                        constant: true,
+                        parent: Some(&state),
+                    };
                     for handler in statement.handlers {
-                        validate_block(handler.block, locals, shadowed)?;
+                        validate_block(handler.block, locals, Some(&message), has_parameter)?;
                     }
                 }
-                _ => {}
+                TriggerStatement::Null
+                | TriggerStatement::TransactionControl(_)
+                | TriggerStatement::Assign(_)
+                | TriggerStatement::DynamicQuery(_)
+                | TriggerStatement::Utility { .. }
+                | TriggerStatement::Dml { .. }
+                | TriggerStatement::CursorOpen(_)
+                | TriggerStatement::CursorClose(_)
+                | TriggerStatement::Perform(_)
+                | TriggerStatement::Assert(_)
+                | TriggerStatement::Raise(_)
+                | TriggerStatement::LoopControl(_)
+                | TriggerStatement::ReturnNext(_)
+                | TriggerStatement::ReturnQuery(_)
+                | TriggerStatement::ReturnDynamicQuery(_)
+                | TriggerStatement::Return(_) => {}
             }
         }
         Ok(())
     }
-    validate_block(program.body, program.locals, None)
+    validate_block(program.body, program.locals, None, has_parameter)
 }
 
 fn resolve_plpgsql_column_type(
@@ -21191,6 +21308,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &engine.storage,
         txn.txid,
         arena,
+        &|_| false,
     )?;
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::anonymous()?.with_input_sites(program.input_sites);
@@ -21235,7 +21353,6 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21268,6 +21385,15 @@ pub(crate) fn execute_event_trigger<'a>(
         &engine.storage,
         txn.txid,
         arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
     )?;
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?
@@ -21313,7 +21439,6 @@ pub(crate) fn execute_event_trigger<'a>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21360,6 +21485,15 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &engine.storage,
         txn.txid,
         arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
     )?;
     let declaration_capacity = routine
         .parameters()
@@ -21396,6 +21530,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             ));
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -21467,7 +21602,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => {}
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21517,6 +21651,15 @@ pub(crate) fn execute_plpgsql_function<'a>(
         &engine.storage,
         txn.txid,
         arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
     )?;
     let declaration_capacity = routine
         .arguments()
@@ -21543,6 +21686,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
             continue;
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -21568,6 +21712,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
             continue;
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -21637,7 +21782,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
         None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Text("")),
@@ -21687,6 +21831,15 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &engine.storage,
         txn.txid,
         arena,
+        &|name| {
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.name == name)
+                || routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .any(|column| column.name == name)
+        },
     )?;
     let declaration_capacity = routine
         .arguments()
@@ -21705,6 +21858,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             continue;
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -21732,6 +21886,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             continue;
         }
         declarations[declaration_count] = TriggerLocalDecl {
+            scope: PlpgsqlScope::Invocation,
             name: output.name,
             ctype: output.ctype,
             user_type: output.user_type,
@@ -21828,7 +21983,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         local_values,
         program.body,
         &mut status,
-        None,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => status
             .set_result
@@ -22285,20 +22439,21 @@ fn plpgsql_variable<'a>(
     found: Option<bool>,
     name: &str,
 ) -> Option<PlpgsqlVariable<'a>> {
-    // A handler introduces SQLSTATE/SQLERRM inside the declaration scope.
+    let local = locals.iter().position(|local| local.name.as_str() == name);
     if let Some(variable) = TriggerExceptionVariable::parse(name)
         && let Some(exception) = invocation.exception
+        && local.is_none_or(|index| locals[index].scope <= exception.scope)
     {
         return Some(PlpgsqlVariable {
             value: Datum::Text(match variable {
-                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
-                TriggerExceptionVariable::Sqlerrm => exception.message,
+                TriggerExceptionVariable::Sqlstate => exception.values.sqlstate_text,
+                TriggerExceptionVariable::Sqlerrm => exception.values.message,
             }),
             ctype: ColType::Text,
             user_type: None,
         });
     }
-    if let Some(index) = locals.iter().position(|local| local.name.as_str() == name) {
+    if let Some(index) = local {
         return Some(PlpgsqlVariable {
             value: values[index],
             ctype: locals[index].ctype,
@@ -25915,6 +26070,7 @@ fn allocate_plpgsql_local_values<'a>(
 
 fn empty_plpgsql_local() -> TriggerLocalDecl {
     TriggerLocalDecl {
+        scope: PlpgsqlScope::Invocation,
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         user_type: None,
@@ -26669,6 +26825,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     statement: TriggerStatement<'a>,
+    child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<&diagnostics::CaughtDiagnostic>,
 ) -> Result<control_flow::Step<'a>, SqlError> {
@@ -27005,6 +27162,14 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                             statement.variable.as_str()
                         ));
                     }
+                    let assign_name = local_values[local].is_null();
+                    if assign_name && locals[local].constant {
+                        return Err(sql_err!(
+                            sqlstate::ERROR_IN_ASSIGNMENT,
+                            "variable \"{}\" is declared CONSTANT",
+                            statement.variable.as_str()
+                        ));
+                    }
                     let generated;
                     let name = match local_values[local] {
                         Datum::Text(name) => name,
@@ -27139,14 +27304,16 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                         })
                     })?;
                     *completed = true;
-                    assign_trigger_local(
-                        context,
-                        locals,
-                        local_values,
-                        statement.variable,
-                        Datum::Text(name),
-                    )?;
-                    status.assign_output_local(local, local_values[local]);
+                    if assign_name {
+                        assign_trigger_local(
+                            context,
+                            locals,
+                            local_values,
+                            statement.variable,
+                            Datum::Text(name),
+                        )?;
+                        status.assign_output_local(local, local_values[local]);
+                    }
 
                     Ok(())
                 },
@@ -28481,6 +28648,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::For(program) => {
             if let TriggerForSource::Numeric {
+                counter_keyword: _,
                 lower,
                 upper,
                 step,
@@ -28527,6 +28695,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     upper,
                     step,
                     reverse,
+                    child_scope,
                     locals,
                     local_values,
                     status,
@@ -29957,6 +30126,15 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             context.storage(),
             context.txn.txid,
             context.arena,
+            &|name| {
+                routine
+                    .parameters()
+                    .iter()
+                    .any(|parameter| parameter.name == name)
+                    || routine.result_columns[..routine.result_column_count]
+                        .iter()
+                        .any(|column| column.name == name)
+            },
         )?;
         let invocation = invocation.with_input_sites(program.input_sites);
         let transition_relations =
@@ -29994,7 +30172,6 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             local_values,
             program.body,
             &mut status,
-            None,
         )? {
             Some(TriggerFlow::Return(_)) => {}
             None => {
@@ -36410,6 +36587,14 @@ pub(crate) fn validate_routine_body(
     let parameters = &declaration.parameters;
     let result_columns = &declaration.result_columns;
     let result_column_count = declaration.result_column_count;
+    let has_parameter = |name| {
+        parameters[..routine.arguments.len()]
+            .iter()
+            .any(|parameter| parameter.name == name)
+            || result_columns[..result_column_count]
+                .iter()
+                .any(|column| column.name == name)
+    };
     let body_text = match routine.body {
         super::ast::RoutineBody::String(body)
         | super::ast::RoutineBody::Return(body)
@@ -36459,7 +36644,13 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::Function
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(
+                    program,
+                    storage,
+                    txn.txid,
+                    arena,
+                    &has_parameter,
+                )?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
@@ -36507,7 +36698,13 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::OutputFunction
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(
+                    program,
+                    storage,
+                    txn.txid,
+                    arena,
+                    &has_parameter,
+                )?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
                         .then_some(result_column_count)
@@ -36570,7 +36767,7 @@ pub(crate) fn validate_routine_body(
                 ));
             }
             let program = parse_trigger_program(body_text, arena)?;
-            resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+            resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
         }
         crate::storage::RoutineKind::EventTrigger => {
             if body_kind != crate::storage::RoutineBodyKind::String {
@@ -36580,7 +36777,7 @@ pub(crate) fn validate_routine_body(
                 ));
             }
             let program = parse_event_trigger_program(body_text, arena)?;
-            resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+            resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
         }
         crate::storage::RoutineKind::Procedure => {
             if body_kind == crate::storage::RoutineBodyKind::Return {
@@ -36598,7 +36795,13 @@ pub(crate) fn validate_routine_body(
                 }
                 let program =
                     parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure)?;
-                let program = resolve_plpgsql_program_locals(program, storage, txn.txid, arena)?;
+                let program = resolve_plpgsql_program_locals(
+                    program,
+                    storage,
+                    txn.txid,
+                    arena,
+                    &has_parameter,
+                )?;
                 validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],

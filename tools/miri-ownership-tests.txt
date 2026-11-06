@@ -221,3 +221,4 @@ storage::type_reference_moves::tests::type_publication_workspace_exact_startup_b
 storage::type_references::tests::bound_type_origin_never_reuses_an_exhausted_identifier
 sql::exec::control_flow::ownership_tests::quoted_cursor_names_use_tokens_in_open_fetch_move_and_close
 sql::exec::control_flow::ownership_tests::lexical_variable_values_types_and_domains_select_one_binding
+sql::exec::control_flow::ownership_tests::constant_validation_uses_the_innermost_handler_or_counter_binding

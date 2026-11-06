@@ -81,24 +81,44 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
             frames.start(program.body);
-            let Step::Enter(frame) =
-                start_numeric_loop(outer, 1, 2, 1, false, &locals, &values, &mut status).unwrap()
-            else {
+            let Step::Enter(frame) = start_numeric_loop(
+                outer,
+                1,
+                2,
+                1,
+                false,
+                PlpgsqlScope::frame(2),
+                &locals,
+                &values,
+                &mut status,
+            )
+            .unwrap() else {
                 panic!("numeric frame")
             };
             frames.enter(frame);
             let (scope, current) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
             assert_eq!(scope[1].name.as_str(), "n");
-            let Step::Enter(frame) =
-                start_numeric_loop(inner, 1, 2, 1, false, scope, current, &mut status).unwrap()
-            else {
+            assert_eq!(scope[0].scope, PlpgsqlScope::frame(2));
+            let Step::Enter(frame) = start_numeric_loop(
+                inner,
+                1,
+                2,
+                1,
+                false,
+                PlpgsqlScope::frame(3),
+                scope,
+                current,
+                &mut status,
+            )
+            .unwrap() else {
                 panic!("nested frame")
             };
             frames.enter(frame);
             let (scope, current) = frames.scope(&locals, &mut values);
             assert_eq!(scope.len(), 3);
             assert_eq!(scope[2].name.as_str(), "j");
+            assert_eq!(scope[2].scope, PlpgsqlScope::frame(3));
             current[1] = Datum::Int4(41);
             status.set_found(false);
             let inner = frames.pop();
@@ -165,6 +185,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             frames
                 .diagnostic()
                 .unwrap()
+                .0
                 .variables(&arena, &arena)
                 .unwrap()
                 .message,
@@ -176,7 +197,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             TriggerStatement::If(_)
         ));
         assert_eq!(frames.last().next, 1);
-        assert_eq!(frames.diagnostic().unwrap().sqlstate, "22012");
+        assert_eq!(frames.diagnostic().unwrap().0.sqlstate, "22012");
         let handler = frames.pop();
         let Continuation::Handler(diagnostic) = handler.continuation else {
             panic!("handler");
@@ -272,10 +293,17 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
         )
         .unwrap()
         .with_input_sites(program.input_sites);
-        let bound = bind_exception_variables(invocation, Some(&caught), statement, &arena).unwrap();
+        let bound = bind_exception_variables(
+            invocation,
+            Some((caught, PlpgsqlScope::frame(2))),
+            statement,
+            &arena,
+        )
+        .unwrap();
         let variables = bound
             .exception
-            .expect("lowering preserves handler name dependencies");
+            .expect("lowering preserves handler name dependencies")
+            .values;
         assert_eq!(variables.message, "caught");
         assert_eq!(variables.sqlstate_text, "P0001");
         buffers.release(&arena, caught);
@@ -288,18 +316,29 @@ fn procedural_identifier_sources_keep_quoted_names_without_retaining_lexer_scrat
     let mut budget = Budget::new(1 << 16);
     let arena = Arena::new(&mut budget, "procedural name tokens", 1 << 16).unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        for (source, expected) in [
-            ("MixedCase", "mixedcase"),
-            ("\"MixedCase\"", "MixedCase"),
-            ("\"spaced name\"", "spaced name"),
-            ("\"doubled\"\"quote\"", "doubled\"quote"),
-            ("/* before */ MiXeD -- after", "mixed"),
+        for (source, expected, quoted, spelling) in [
+            ("MixedCase", "mixedcase", false, "MixedCase"),
+            ("\"MixedCase\"", "MixedCase", true, "\"MixedCase\""),
+            ("\"spaced name\"", "spaced name", true, "\"spaced name\""),
+            (
+                "\"doubled\"\"quote\"",
+                "doubled\"quote",
+                true,
+                "\"doubled\"\"quote\"",
+            ),
+            ("/* before */ MiXeD -- after", "mixed", false, "MiXeD"),
+            (
+                "/* before */ \"SQLSTATE\" -- after",
+                "SQLSTATE",
+                true,
+                "\"SQLSTATE\"",
+            ),
         ] {
             let before = arena.used();
-            assert_eq!(
-                parse_plpgsql_identifier(source, &arena).unwrap().as_str(),
-                expected
-            );
+            let parsed = parse_plpgsql_identifier(source, &arena).unwrap();
+            assert_eq!(parsed.name.as_str(), expected);
+            assert_eq!(parsed.quoted, quoted);
+            assert_eq!(parsed.spelling, spelling);
             assert_eq!(arena.used(), before);
         }
         for source in ["a b", "name.field", "1", "\"unterminated"] {
@@ -398,10 +437,13 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
                 assert_eq!(domain.name.as_str(), "state_domain");
             }
         }
-        invocation.exception = Some(TriggerExceptionVariables {
-            sqlstate_text: "P0001",
-            message: "caught",
-        });
+        invocation = invocation.with_exception(
+            TriggerExceptionVariables {
+                sqlstate_text: "P0001",
+                message: "caught",
+            },
+            PlpgsqlScope::frame(2),
+        );
         for (name, expected) in [("sqlstate", "P0001"), ("sqlerrm", "caught")] {
             let selected =
                 plpgsql_variable(&locals, &values, invocation, Some(false), name).unwrap();
@@ -409,9 +451,94 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
             assert_eq!(selected.ctype, ColType::Text);
             assert!(selected.user_type.is_none());
         }
+        // A counter inside the handler shadows its implicit variables; a
+        // handler inside that counter restores the implicit text binding.
+        locals[2].scope = PlpgsqlScope::frame(3);
+        locals[2].user_type = None;
+        let counter =
+            plpgsql_variable(&locals, &values, invocation, Some(false), "sqlstate").unwrap();
+        assert_eq!(counter.value, Datum::Int4(7));
+        assert_eq!(counter.ctype, ColType::Int4);
+        invocation.exception.as_mut().unwrap().scope = PlpgsqlScope::frame(4);
+        let handler =
+            plpgsql_variable(&locals, &values, invocation, Some(false), "sqlstate").unwrap();
+        assert_eq!(handler.value, Datum::Text("P0001"));
+        assert_eq!(handler.ctype, ColType::Text);
         assert!(plpgsql_variable(&locals, &values, invocation, Some(false), "TG_NAME").is_none());
         let selected = plpgsql_variable(&[], &[], invocation, Some(false), "tg_name").unwrap();
         assert_eq!(selected.value, Datum::Text("actual trigger"));
         assert_eq!(selected.ctype, ColType::Name);
+    });
+}
+
+#[test]
+fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
+    let mut budget = Budget::new(1 << 18);
+    let arena = Arena::new(&mut budget, "lexical constant checks", 1 << 17).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for (source, expected) in [
+            (
+                "DECLARE sqlstate integer; BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN sqlstate := 1; END; END",
+                Some("22005"),
+            ),
+            (
+                "DECLARE c refcursor; BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN FETCH c INTO sqlstate; END; END",
+                Some("22005"),
+            ),
+            (
+                "DECLARE x constant integer := 1; c refcursor; BEGIN FETCH c INTO x; END",
+                Some("22005"),
+            ),
+            (
+                "DECLARE sqlstate integer; BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN FOR sqlstate IN 1..2 LOOP sqlstate := 1; END LOOP; END; END",
+                None,
+            ),
+            (
+                "DECLARE sqlstate integer; BEGIN FOR sqlstate IN 1..2 LOOP BEGIN NULL; EXCEPTION WHEN OTHERS THEN sqlstate := 1; END; END LOOP; END",
+                Some("22005"),
+            ),
+            (
+                "BEGIN FOR SQLSTATE IN 1..2 LOOP NULL; END LOOP; END",
+                Some("42601"),
+            ),
+            (
+                "BEGIN FOR \"sqlstate\" IN 1..2 LOOP NULL; END LOOP; END",
+                None,
+            ),
+            (
+                "DECLARE c constant refcursor := 'c'; BEGIN OPEN c FOR SELECT 1; CLOSE c; END",
+                None,
+            ),
+        ] {
+            arena
+                .with_remaining_region(|scratch| {
+                    let parsed =
+                        parse_plpgsql_program(source, scratch, PlpgsqlProgramKind::Anonymous)
+                            .unwrap();
+                    // This pass uses names and mutability, independently of catalog types.
+                    let locals = scratch
+                        .alloc_slice_with(parsed.locals.len(), |index| TriggerLocalDecl {
+                            name: parsed.locals[index].name,
+                            constant: parsed.locals[index].constant,
+                            ..empty_plpgsql_local()
+                        })
+                        .unwrap();
+                    let initializers = scratch
+                        .alloc_slice_with(parsed.locals.len(), |index| parsed.locals[index].initial)
+                        .unwrap();
+                    let program = TriggerProgram {
+                        locals,
+                        initializers,
+                        body: parsed.body,
+                        input_sites: parsed.input_sites,
+                    };
+                    let result = validate_plpgsql_constant_assignments(&program, &|_| false);
+                    match expected {
+                        Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
+                        None => result.unwrap(),
+                    }
+                })
+                .unwrap();
+        }
     });
 }

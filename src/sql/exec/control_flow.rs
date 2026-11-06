@@ -254,13 +254,14 @@ impl<'a> ControlFrames<'a> {
         (locals, values)
     }
 
-    fn diagnostic(&self) -> Option<CaughtDiagnostic> {
+    fn diagnostic(&self) -> Option<(CaughtDiagnostic, PlpgsqlScope)> {
         self.slots[..self.active]
             .iter()
+            .enumerate()
             .rev()
-            .flatten()
-            .find_map(|frame| match frame.continuation {
-                Continuation::Handler(caught) => Some(caught),
+            .filter_map(|(depth, frame)| frame.as_ref().map(|frame| (depth, frame)))
+            .find_map(|(depth, frame)| match frame.continuation {
+                Continuation::Handler(caught) => Some((caught, PlpgsqlScope::frame(depth + 1))),
                 _ => None,
             })
     }
@@ -309,6 +310,7 @@ pub(super) fn start_numeric_loop<'a>(
     upper: i32,
     step: i32,
     reverse: bool,
+    counter_scope: PlpgsqlScope,
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
@@ -332,6 +334,7 @@ pub(super) fn start_numeric_loop<'a>(
     for (index, local) in workspace.locals[..count].iter_mut().enumerate() {
         *local = if index == target {
             TriggerLocalDecl {
+                scope: counter_scope,
                 name: program.target,
                 ctype: ColType::Int4,
                 ..empty_plpgsql_local()
@@ -418,7 +421,6 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     values: &mut [Datum<'a>],
     block: TriggerBlock<'a>,
     status: &mut TriggerExecutionStatus<'a>,
-    exception: Option<&CaughtDiagnostic>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
     let mut frames = status
         .control_frames
@@ -430,7 +432,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     let mut pending_error = None;
     while frames.active != 0 {
         let caught = frames.diagnostic();
-        let exception = caught.as_ref().or(exception);
+        let exception = caught.as_ref().map(|(diagnostic, _)| diagnostic);
         let action = (|| {
             if let Some(error) = pending_error.take() {
                 return Err(error);
@@ -443,7 +445,8 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 .copied()
             {
                 let invocation =
-                    bind_exception_variables(invocation, exception, statement, context.arena)?;
+                    bind_exception_variables(invocation, caught, statement, context.arena)?;
+                let child_scope = PlpgsqlScope::frame(frames.active + 1);
                 let (scope, scope_values) = frames.scope(locals, values);
                 return execute_trigger_step(
                     context,
@@ -456,6 +459,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     scope,
                     scope_values,
                     statement,
+                    child_scope,
                     status,
                     exception,
                 )
@@ -474,7 +478,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     let condition = program.condition;
                     let invocation = bind_exception_variables(
                         invocation,
-                        exception,
+                        caught,
                         TriggerStatement::While(program),
                         context.arena,
                     )?;
@@ -666,12 +670,12 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
 // sites that can resolve the handler variables need independent copies.
 fn bind_exception_variables<'a>(
     invocation: TriggerInvocation<'a>,
-    diagnostic: Option<&CaughtDiagnostic>,
+    diagnostic: Option<(CaughtDiagnostic, PlpgsqlScope)>,
     statement: TriggerStatement<'a>,
     arena: &'a Arena,
 ) -> Result<TriggerInvocation<'a>, SqlError> {
     use super::super::plpgsql_inputs::Kind;
-    let Some(diagnostic) = diagnostic else {
+    let Some((diagnostic, scope)) = diagnostic else {
         return Ok(invocation);
     };
     let site = |kind, key| {
@@ -757,7 +761,7 @@ fn bind_exception_variables<'a>(
         ) => false,
     };
     if needed {
-        Ok(invocation.with_exception(diagnostic.variables(arena, arena)?))
+        Ok(invocation.with_exception(diagnostic.variables(arena, arena)?, scope))
     } else {
         Ok(invocation)
     }

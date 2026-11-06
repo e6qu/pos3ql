@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn diagnostic_counters_and_handlers_preserve_the_innermost_binding() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("diagnostic-counter-scopes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/257_diagnostic_counter_scopes.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["1:integer|2:integer|3:integer|4:integer|P0001:caught:7:8:P0001:text:5:integer"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn constant_targets_fail_before_body_effects_and_named_constant_cursors_open() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-constant-targets-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let parse = Arena::new(&mut budget, "constant-target fixture statements", 1 << 16).unwrap();
+        let sql = include_str!(
+            "../../../tests/external/differential/258_procedural_constant_targets.sql"
+        );
+        let mut parser = crate::sql::parser::Parser::new(sql, &parse).unwrap();
+        let mut start = 0;
+        let mut rows = Vec::new();
+        let mut errors = Vec::new();
+        while parser.next_stmt().unwrap().is_some() {
+            let end = parser.source_position();
+            let output = session.execute(&mut engine, &sql[start..end], true);
+            start = end;
+            rows.extend(data_rows(&output));
+            errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
+        }
+        assert_eq!(rows, ["0", "c", "1", "22005"], "{mode:?}");
+        assert_eq!(
+            errors,
+            ["22005", "22005", "22005", "42601", "22005", "22005"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn quoted_cursors_and_shadowed_variables_keep_postgresql_values_and_types() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

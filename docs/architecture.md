@@ -233,6 +233,16 @@ types and domain identities share one lookup rule, including captured cursor
 inputs and detached conflict-update inputs. The
 [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-name-bindings/README.md)
 records those cases. Quoted `"NEW"` is distinct from the trigger record `new`.
+A numeric loop inside a handler can introduce its own integer `SQLSTATE`
+counter; leaving that loop restores the handler's text error code. A handler
+inside that loop introduces its own error code. Each binding records how
+deeply its block or loop is nested. Reusing an error buffer does not change
+which variable a name selects. Constant-target
+validation follows the same nesting before the body runs, including `FETCH`
+targets. Opening a constant cursor with an existing name reads that variable;
+opening a NULL constant fails when a generated name would need assignment.
+The [scope reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-lexical-scopes/README.md)
+records values, types and creation/runtime errors.
 Trigger names and relation/schema names have PostgreSQL type `name`; `TG_RELID`
 is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
 a PostgreSQL trigger variable and raises an undefined-column error.

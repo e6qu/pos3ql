@@ -104,6 +104,8 @@ owners, nested callback restoration, original selected types and effect position
 empty and wide results, and failure-preserving directory growth. Keep immutable
 argument/result images inside unchanged statement capacity. The 4,096-row set
 result and repeated-loop tests must pass with the original 4 MiB arena.
+Nested SQL/procedural result calls must release their row images between calls
+and preserve exactly one sequence increment and audit write per invocation.
 Qualify every reference fixture in both transaction modes. Native trigger audits
 and live PostgreSQL comparisons must use the same SQL file.
 A caught `RETURN QUERY` error keeps its completed

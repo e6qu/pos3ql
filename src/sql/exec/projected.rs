@@ -44,6 +44,23 @@ pub(crate) fn encode_projected_persistent_pub<'a>(
     Ok(&*out)
 }
 
+/// Packs rows before transferring them out of a scoped body workspace.
+pub(crate) fn pack_projected_rows<'a>(
+    rows: &[&[u8]],
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let output = arena
+        .alloc_slice_with(projected_rows_len(rows)?, |_| 0u8)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine rows exceed statement memory"
+            )
+        })?;
+    pack_projected_rows_into(rows, output)?;
+    Ok(output)
+}
+
 pub(crate) fn projected_rows_len(rows: &[&[u8]]) -> Result<usize, SqlError> {
     let full = || {
         sql_err!(

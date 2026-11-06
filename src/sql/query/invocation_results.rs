@@ -7,6 +7,7 @@ use crate::mem::arena::FrozenArenaSliceHandle;
 pub(crate) struct ResultBytes(FrozenArenaSliceHandle<u8>);
 
 impl ResultBytes {
+    #[cfg(test)]
     pub(super) fn capture_scalar(value: Datum<'_>, arena: &Arena) -> Result<Self, SqlError> {
         let length = super::super::exec::projected_row_len(&[value])?;
         let handle = arena
@@ -22,6 +23,7 @@ impl ResultBytes {
         ))
     }
 
+    #[cfg(test)]
     pub(super) fn capture_rows(rows: &[&[u8]], arena: &Arena) -> Result<Self, SqlError> {
         let length = super::super::exec::projected_rows_len(rows)?;
         let handle = arena
@@ -81,12 +83,17 @@ pub(crate) enum OwnedRoutineResult {
 }
 
 impl OwnedRoutineResult {
-    pub(crate) fn capture_scalar(value: Datum<'_>, arena: &Arena) -> Result<Self, SqlError> {
-        ResultBytes::capture_scalar(value, arena).map(Self::Scalar)
+    pub(crate) fn from_scalar_image(image: FrozenArenaSliceHandle<u8>) -> Self {
+        Self::Scalar(ResultBytes(image))
     }
 
-    pub(crate) fn capture_rows(rows: &[&[u8]], arena: &Arena) -> Result<Self, SqlError> {
-        ResultBytes::capture_rows(rows, arena).map(Self::Rows)
+    pub(crate) fn from_row_image(image: FrozenArenaSliceHandle<u8>) -> Self {
+        Self::Rows(ResultBytes(image))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_scalar(value: Datum<'_>, arena: &Arena) -> Result<Self, SqlError> {
+        ResultBytes::capture_scalar(value, arena).map(Self::Scalar)
     }
 
     pub(super) fn validate(self, arena: &Arena) -> Result<(), SqlError> {

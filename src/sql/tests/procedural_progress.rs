@@ -281,6 +281,33 @@ fn owned_set_results_reclaim_conversion_scratch_and_preserve_caught_prefixes() {
 }
 
 #[test]
+fn nested_callback_results_reclaim_row_images_and_preserve_once_only_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-callback-results-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/260_nested_callback_results.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "4096:384:384|4096:384:384",
+                "2|3|2",
+                "4096:384:384",
+                "3|6|3"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn loop_input_exhaustion_rolls_back_writes_and_releases_shared_capacity() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

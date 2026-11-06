@@ -205,8 +205,11 @@ Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,
 a function returning `ROW('saved text')` keeps the field's name, type and text
-after its body memory is reused. A body captures one immutable result image in
-the parent's retained storage before releasing its scratch. Scalar consumers
+after its body memory is reused. A body encodes its result in temporary memory;
+as that workspace closes, the arena moves it directly into one immutable
+retained image. This also works when the parent is another temporary arena.
+The move handles overlapping bytes before writing the retained header, and
+keeps no intermediate image in the parent's temporary front. Scalar consumers
 copy their value into their own arena. Table queries with an explicit owner
 rebuild row pointers that refer directly to the saved payload. A nested query
 using the active callback copies its row image into its own arena before the
@@ -215,6 +218,9 @@ queries avoid another full payload copy. Directory growth reserves its
 replacement before publishing it; exhaustion keeps every previous result
 readable. All reservations stay
 inside the existing statement capacity and report `54000` if they do not fit.
+The [nested-result reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-nested-callback-results/README.md)
+records summaries of 4,096-row results through nested SQL/procedural calls,
+including exactly one sequence increment and audit write per invocation.
 Unfinished input frames retain checked handles for values, call names, defaults,
 type signatures, selected casts, dependencies and effect receipts. A new attempt
 rebuilds temporary metadata views; an already encoded value is copied only when

@@ -15596,7 +15596,7 @@ impl Engine {
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
-                    let retained = arena.with_remaining_region(|scratch| {
+                    let retained = arena.with_remaining_retained_bytes(|scratch| {
                         let encoded_arguments = pending.arguments(arena)?;
                         let arguments = scratch
                             .alloc_slice_with(pending.argument_count, |_| Datum::Null)
@@ -15623,7 +15623,7 @@ impl Engine {
                         } else {
                             large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
                         }?;
-                        query::OwnedRoutineResult::capture_scalar(value, arena)
+                        exec::encode_projected_pub(&[value], scratch)
                     });
                     let retained = match retained {
                         Ok(Ok(retained)) => retained,
@@ -15636,7 +15636,10 @@ impl Engine {
                             )));
                         }
                     };
-                    return Ok(invocations.complete(retained, arena));
+                    return Ok(invocations.complete(
+                        query::OwnedRoutineResult::from_scalar_image(retained),
+                        arena,
+                    ));
                 }
             };
             let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
@@ -15675,9 +15678,9 @@ impl Engine {
                 Wire(WireFull),
             }
             let set_returning = routine.kind.is_set_returning();
-            let executed = arena.with_remaining_region(|scratch| {
-                // Publish immutable result bytes in the parent's retained tail
-                // before the body's temporary region is released.
+            let executed = arena.with_remaining_retained_bytes(|scratch| {
+                // Transfer the encoded output directly into retained storage
+                // when the body ends, including inside another borrowed body.
                 if set_returning {
                     let rows = self
                         .execute_pending_table_routine(
@@ -15686,7 +15689,7 @@ impl Engine {
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
-                    query::OwnedRoutineResult::capture_rows(rows, arena).map_err(BodyError::Sql)
+                    exec::pack_projected_rows(rows, scratch).map_err(BodyError::Sql)
                 } else {
                     let value = self
                         .execute_pending_scalar_routine(
@@ -15695,7 +15698,7 @@ impl Engine {
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
-                    query::OwnedRoutineResult::capture_scalar(value, arena).map_err(BodyError::Sql)
+                    exec::encode_projected_pub(&[value], scratch).map_err(BodyError::Sql)
                 }
             });
             let executed = match executed {
@@ -15722,6 +15725,11 @@ impl Engine {
                 Ok(retained) => retained,
                 Err(BodyError::Sql(error)) => return Ok(Err(error)),
                 Err(BodyError::Wire(error)) => return Err(error),
+            };
+            let retained = if set_returning {
+                query::OwnedRoutineResult::from_row_image(retained)
+            } else {
+                query::OwnedRoutineResult::from_scalar_image(retained)
             };
             Ok(invocations.complete(retained, arena))
         });

@@ -236,3 +236,5 @@ sql::exec::control_flow::ownership_tests::lexical_variable_values_types_and_doma
 sql::exec::control_flow::ownership_tests::constant_validation_uses_the_innermost_handler_or_counter_binding
 sql::query::routine_contract_tests::invocation_callback_scopes_restore_outer_owners_after_nested_and_failed_calls
 sql::query::invocation_results::ownership_tests::callback_result_copies_remain_readable_after_both_source_owners_are_dropped
+mem::arena::retained_slice::tests::retained_region_transfers_move_overlapping_payload_before_initializing_headers
+mem::arena::retained_slice::tests::retained_region_transfers_publish_into_borrowed_parents_without_pinning_body_scratch

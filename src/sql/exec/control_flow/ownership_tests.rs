@@ -314,3 +314,104 @@ fn procedural_identifier_sources_keep_quoted_names_without_retaining_lexer_scrat
         }
     });
 }
+
+#[test]
+fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
+    let mut budget = Budget::new(1 << 16);
+    let arena = Arena::new(&mut budget, "quoted cursor tokens", 1 << 16).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for _ in 0..32 {
+            let before = arena.used();
+            arena
+                .with_remaining_region(|scratch| {
+                    let open = parse_plpgsql_cursor_open(
+                        "OPEN \"cursor \"\" name\" FOR SELECT 1",
+                        scratch,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(open.variable.as_str(), "cursor \" name");
+                    for source in [
+                        "FETCH NEXT FROM \"cursor \"\" name\" INTO \"output value\"",
+                        "MOVE NEXT FROM \"cursor \"\" name\"",
+                    ] {
+                        let motion = parse_plpgsql_cursor_motion(source, scratch)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(motion.variable, open.variable);
+                        if !motion.move_only {
+                            assert_eq!(motion.targets[0].as_str(), "output value");
+                        }
+                    }
+                    assert_eq!(
+                        parse_plpgsql_cursor_close("CLOSE \"cursor \"\" name\"", scratch).unwrap(),
+                        Some(open.variable),
+                    );
+                })
+                .unwrap();
+            assert_eq!(arena.used(), before);
+        }
+    });
+}
+
+#[test]
+fn lexical_variable_values_types_and_domains_select_one_binding() {
+    let owner = super::super::super::type_input_plans::Owner::Transient {
+        generation: 1,
+        statement: 0,
+    };
+    let mut invocation =
+        super::super::super::type_input_plans::with_owner(owner, TriggerInvocation::anonymous)
+            .unwrap();
+    invocation.program_kind = PlpgsqlProgramKind::Trigger;
+    invocation.name = "actual trigger";
+    let mut locals = ["tg_name", "found", "sqlstate", "sqlerrm"].map(|name| TriggerLocalDecl {
+        name: SqlName::parse(name).unwrap(),
+        ctype: ColType::Int4,
+        ..empty_plpgsql_local()
+    });
+    locals[2].user_type = Some(crate::storage::UserTypeName::declaration(
+        SqlName::parse("public").unwrap(),
+        SqlName::parse("state_domain").unwrap(),
+    ));
+    let values = [
+        Datum::Int4(1),
+        Datum::Int4(42),
+        Datum::Int4(7),
+        Datum::Int4(8),
+    ];
+    crate::mem::guard::forbid_alloc(|| {
+        for (index, local) in locals.iter().enumerate() {
+            let selected = plpgsql_variable(
+                &locals,
+                &values,
+                invocation,
+                Some(false),
+                local.name.as_str(),
+            )
+            .unwrap();
+            assert_eq!(selected.value, values[index]);
+            assert_eq!(selected.ctype, ColType::Int4);
+            assert_eq!(selected.user_type.is_some(), index == 2);
+            if let Some(domain) = selected.user_type {
+                assert_eq!(domain.schema.as_str(), "public");
+                assert_eq!(domain.name.as_str(), "state_domain");
+            }
+        }
+        invocation.exception = Some(TriggerExceptionVariables {
+            sqlstate_text: "P0001",
+            message: "caught",
+        });
+        for (name, expected) in [("sqlstate", "P0001"), ("sqlerrm", "caught")] {
+            let selected =
+                plpgsql_variable(&locals, &values, invocation, Some(false), name).unwrap();
+            assert_eq!(selected.value, Datum::Text(expected));
+            assert_eq!(selected.ctype, ColType::Text);
+            assert!(selected.user_type.is_none());
+        }
+        assert!(plpgsql_variable(&locals, &values, invocation, Some(false), "TG_NAME").is_none());
+        let selected = plpgsql_variable(&[], &[], invocation, Some(false), "tg_name").unwrap();
+        assert_eq!(selected.value, Datum::Text("actual trigger"));
+        assert_eq!(selected.ctype, ColType::Name);
+    });
+}

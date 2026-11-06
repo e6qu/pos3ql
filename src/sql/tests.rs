@@ -44874,21 +44874,23 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
 }
 
 #[test]
-fn trigger_context_names_cannot_be_shadowed_by_locals() {
+fn trigger_context_names_can_be_shadowed_by_locals() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE trigger_context_shadow_target (id integer PRIMARY KEY);
          CREATE FUNCTION trigger_context_shadow_function() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE TG_NAME text; BEGIN RETURN NEW; END';
+           'DECLARE TG_NAME text := ''local''; BEGIN NEW.id := length(TG_NAME); RETURN NEW; END';
          CREATE TRIGGER trigger_context_shadow_name BEFORE INSERT
            ON trigger_context_shadow_target FOR EACH ROW
            EXECUTE FUNCTION trigger_context_shadow_function();
-         INSERT INTO trigger_context_shadow_target VALUES (1);",
+         INSERT INTO trigger_context_shadow_target VALUES (1);
+         SELECT id FROM trigger_context_shadow_target;",
     );
-    assert!(
-        String::from_utf8_lossy(&output).contains("42P13"),
+    assert_eq!(
+        data_rows(&output),
+        ["5"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -45332,17 +45334,19 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
         String::from_utf8_lossy(&output)
     );
 
-    let invalid = run_with(
+    let shadowed = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FUNCTION trigger_diagnostic_scope_invalid() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE sqlstate text;
-            BEGIN RETURN NEW; END';",
+        "CREATE FUNCTION trigger_diagnostic_scope_local() RETURNS text LANGUAGE plpgsql AS
+           'DECLARE sqlstate text := ''local'';
+            BEGIN RETURN sqlstate; END';
+         SELECT trigger_diagnostic_scope_local();",
     );
-    assert!(
-        String::from_utf8_lossy(&invalid).contains("conflicts with a runtime variable"),
+    assert_eq!(
+        data_rows(&shadowed),
+        ["local"],
         "{}",
-        String::from_utf8_lossy(&invalid)
+        String::from_utf8_lossy(&shadowed)
     );
 }
 

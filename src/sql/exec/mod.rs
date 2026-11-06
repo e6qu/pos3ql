@@ -18096,8 +18096,7 @@ where
     'stored: 'value,
 {
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        (table.eq_ignore_ascii_case("old") || table.eq_ignore_ascii_case("new"))
-            .then_some(ColType::Record)
+        (table == "old" || table == "new").then_some(ColType::Record)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
@@ -18108,9 +18107,9 @@ where
                 name
             ));
         };
-        let (transition, values) = if qualifier.eq_ignore_ascii_case("old") {
+        let (transition, values) = if qualifier == "old" {
             ("OLD", self.old)
-        } else if qualifier.eq_ignore_ascii_case("new") {
+        } else if qualifier == "new" {
             ("NEW", self.new)
         } else {
             return Err(sql_err!(
@@ -18141,9 +18140,9 @@ where
         table: &str,
         arena: &'value Arena,
     ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
-        let values = if table.eq_ignore_ascii_case("old") {
+        let values = if table == "old" {
             self.old
-        } else if table.eq_ignore_ascii_case("new") {
+        } else if table == "new" {
             self.new
         } else {
             return Err(sql_err!(
@@ -18153,11 +18152,7 @@ where
             ));
         };
         let Some(values) = values else {
-            let transition = if table.eq_ignore_ascii_case("old") {
-                "OLD"
-            } else {
-                "NEW"
-            };
+            let transition = if table == "old" { "OLD" } else { "NEW" };
             return Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "record \"{}\" is not assigned yet",
@@ -18187,14 +18182,14 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
             .map(|column| self.definition.columns()[column].ctype)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
             .map(|column| self.definition.columns()[column].collation)
@@ -18206,7 +18201,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
+        matches!(qualifier, Some("old" | "new"))
             .then(|| self.definition.column_index(name))
             .flatten()
             .and_then(|column| self.definition.columns()[column].user_type)
@@ -18240,8 +18235,8 @@ fn validate_trigger_when(
             return;
         }
         let transition = match qualifier {
-            Some(qualifier) if qualifier.eq_ignore_ascii_case("old") => Some(false),
-            Some(qualifier) if qualifier.eq_ignore_ascii_case("new") => Some(true),
+            Some("old") => Some(false),
+            Some("new") => Some(true),
             Some(qualifier) => {
                 reference_error = Some(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
@@ -18250,8 +18245,8 @@ fn validate_trigger_when(
                 ));
                 return;
             }
-            None if name.eq_ignore_ascii_case("old") => Some(false),
-            None if name.eq_ignore_ascii_case("new") => Some(true),
+            None if name == "old" => Some(false),
+            None if name == "new" => Some(true),
             None => {
                 reference_error = Some(sql_err!(
                     sqlstate::AMBIGUOUS_COLUMN,
@@ -18278,10 +18273,7 @@ fn validate_trigger_when(
                 "DELETE trigger's WHEN condition cannot reference NEW values"
             ));
         } else if let Some(definition) = definition {
-            if !name.eq_ignore_ascii_case("old")
-                && !name.eq_ignore_ascii_case("new")
-                && definition.column_index(name).is_none()
-            {
+            if name != "old" && name != "new" && definition.column_index(name).is_none() {
                 reference_error = Some(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" does not exist",
@@ -18289,7 +18281,7 @@ fn validate_trigger_when(
                 ));
             } else if is_new
                 && matches!(timing, TriggerTiming::Before)
-                && (name.eq_ignore_ascii_case("new")
+                && (name == "new"
                     || definition
                         .column_index(name)
                         .is_some_and(|column| definition.columns()[column].default.is_generated()))
@@ -18339,8 +18331,7 @@ struct TriggerDmlScope<'t, 'r, 'v, 'd> {
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
@@ -18350,8 +18341,7 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.col_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.col_type(None, name)
@@ -18361,8 +18351,7 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.collation(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.collation(None, name)
@@ -18376,8 +18365,7 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.column_user_type(None, name)
@@ -18403,8 +18391,7 @@ where
     'v: 'value,
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
@@ -18414,8 +18401,7 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.col_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.col_type(None, name)
@@ -18425,8 +18411,7 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.collation(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.collation(None, name)
@@ -18440,8 +18425,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.column_user_type(None, name)
@@ -18645,7 +18629,7 @@ fn parse_trigger_assignment<'a>(
     let expression = parse_plpgsql_expression(expression, arena)?;
     let (qualifier, column, expression) =
         parse_plpgsql_assignment_target(target, expression, arena)?;
-    if !qualifier.is_some_and(|record| record.eq_ignore_ascii_case("new")) {
+    if qualifier != Some("new") {
         return Ok(None);
     }
     Ok(Some(TriggerAssignment {
@@ -18774,6 +18758,32 @@ fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+/// Return the normalized name and the lexer-owned boundary after it.
+fn parse_plpgsql_identifier_prefix(
+    source: &str,
+    arena: &Arena,
+) -> Result<(SqlName, usize), SqlError> {
+    arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(source, scratch);
+            let token = lexer
+                .next_token()
+                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let name = match token {
+                Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "expected a PL/pgSQL identifier"
+                    ));
+                }
+            };
+            Ok((name, lexer.token_end()))
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
 fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlError> {
     arena
         .with_remaining_region(|scratch| {
@@ -18810,7 +18820,6 @@ fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlE
 fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
-    program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
     let assignment = trigger_assignment_operator(statement);
     let default = trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7));
@@ -18834,34 +18843,7 @@ fn parse_trigger_local<'a>(
     } else {
         (statement.trim(), None)
     };
-    let (name, split) = arena
-        .with_remaining_region(|scratch| {
-            use crate::sql::lexer::{Lexer, Tok};
-            let mut lexer = Lexer::new(declaration, scratch);
-            let token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
-            let name = match token {
-                Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "expected a PL/pgSQL variable name"
-                    ));
-                }
-            };
-            Ok((name, lexer.token_end()))
-        })
-        .map_err(|_| super::query::arena_full_pub())??;
-    if plpgsql_context_field(program_kind, name.as_str()).is_some()
-        || TriggerExceptionVariable::parse(name.as_str()).is_some()
-    {
-        return Err(sql_err!(
-            sqlstate::INVALID_FUNCTION_DEFINITION,
-            "PL/pgSQL local \"{}\" conflicts with a runtime variable",
-            name.as_str()
-        ));
-    }
+    let (name, split) = parse_plpgsql_identifier_prefix(declaration, arena)?;
     let mut declaration = declaration[split..].trim();
     let constant = strip_trigger_keyword(declaration, "constant").is_some();
     if let Some(rest) = strip_trigger_keyword(declaration, "constant") {
@@ -20016,10 +19998,7 @@ fn parse_plpgsql_cursor_open<'a>(
         return Ok(None);
     };
     let body = body.trim();
-    let Some(split) = body.find(char::is_whitespace) else {
-        return Err(unsupported_trigger_body());
-    };
-    let variable = parse_plpgsql_identifier(body[..split].trim(), arena)?;
+    let (variable, split) = parse_plpgsql_identifier_prefix(body, arena)?;
     let body = body[split..].trim();
     let Some(for_at) = trigger_top_level_keyword(body, "for") else {
         return Err(unsupported_trigger_body());
@@ -20076,14 +20055,35 @@ fn parse_plpgsql_cursor_motion<'a>(
         return Err(unsupported_trigger_body());
     }
     let motion_and_variable = into_at.map_or(body, |at| body[..at].trim());
-    let Some(variable_text) = motion_and_variable.split_ascii_whitespace().next_back() else {
-        return Err(unsupported_trigger_body());
-    };
-    let variable = parse_plpgsql_identifier(variable_text, arena)?;
-    let variable_at = motion_and_variable
-        .len()
-        .checked_sub(variable_text.len())
-        .ok_or_else(unsupported_trigger_body)?;
+    let (variable, variable_at) = arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(motion_and_variable, scratch);
+            let mut last = None;
+            loop {
+                let token = lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                if matches!(token, Tok::Eof) {
+                    break;
+                }
+                last = Some((
+                    match token {
+                        Tok::Ident(name) | Tok::QuotedIdent(name) => Some(SqlName::parse(name)?),
+                        _ => None,
+                    },
+                    lexer.token_start(),
+                ));
+            }
+            match last {
+                Some((Some(name), start)) => Ok((name, start)),
+                _ => Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "expected a PL/pgSQL cursor variable"
+                )),
+            }
+        })
+        .map_err(|_| super::query::arena_full_pub())??;
     let mut motion_source = motion_and_variable[..variable_at].trim_end();
     for introducer in ["from", "in"] {
         if motion_source
@@ -20133,9 +20133,6 @@ fn parse_plpgsql_cursor_close(statement: &str, arena: &Arena) -> Result<Option<S
         return Ok(None);
     };
     let body = body.trim();
-    if body.is_empty() || body.contains(char::is_whitespace) {
-        return Err(unsupported_trigger_body());
-    }
     Ok(Some(parse_plpgsql_identifier(body, arena)?))
 }
 
@@ -20756,7 +20753,7 @@ fn parse_plpgsql_program_inner<'a>(
         let segments = split_trigger_statements(declaration_source, arena)?;
         let mut locals = ProgramList::new(arena);
         for declaration in segments.iter().copied() {
-            let local = parse_trigger_local(declaration, arena, program_kind)?;
+            let local = parse_trigger_local(declaration, arena)?;
             if locals
                 .as_slice()
                 .iter()
@@ -22274,6 +22271,54 @@ fn detached_trigger_row<'a>(
     Ok(row)
 }
 
+/// Value, declared type and domain identity must select the same lexical binding.
+struct PlpgsqlVariable<'a> {
+    value: Datum<'a>,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+}
+
+fn plpgsql_variable<'a>(
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'a>],
+    invocation: TriggerInvocation<'a>,
+    found: Option<bool>,
+    name: &str,
+) -> Option<PlpgsqlVariable<'a>> {
+    // A handler introduces SQLSTATE/SQLERRM inside the declaration scope.
+    if let Some(variable) = TriggerExceptionVariable::parse(name)
+        && let Some(exception) = invocation.exception
+    {
+        return Some(PlpgsqlVariable {
+            value: Datum::Text(match variable {
+                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
+                TriggerExceptionVariable::Sqlerrm => exception.message,
+            }),
+            ctype: ColType::Text,
+            user_type: None,
+        });
+    }
+    if let Some(index) = locals.iter().position(|local| local.name.as_str() == name) {
+        return Some(PlpgsqlVariable {
+            value: values[index],
+            ctype: locals[index].ctype,
+            user_type: locals[index].user_type,
+        });
+    }
+    if let Some(field) = plpgsql_context_field(invocation.program_kind, name) {
+        return Some(PlpgsqlVariable {
+            value: invocation.value(field),
+            ctype: field.ctype(),
+            user_type: None,
+        });
+    }
+    TriggerStatusVariable::parse(name).map(|_| PlpgsqlVariable {
+        value: found.map(Datum::Bool).unwrap_or(Datum::Null),
+        ctype: ColType::Bool,
+        user_type: None,
+    })
+}
+
 struct TriggerLocalScope<'t, 'a> {
     locals: &'t [TriggerLocalDecl],
     values: &'t [Datum<'a>],
@@ -22283,6 +22328,10 @@ struct TriggerLocalScope<'t, 'a> {
 }
 
 impl<'a> TriggerLocalScope<'_, 'a> {
+    fn variable(&self, name: &str) -> Option<PlpgsqlVariable<'a>> {
+        plpgsql_variable(self.locals, self.values, self.invocation, self.found, name)
+    }
+
     fn local_index(&self, name: &str) -> Option<usize> {
         self.locals
             .iter()
@@ -22313,48 +22362,46 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             "tg_tag",
         ];
         let context_names = || {
-            context_names.iter().copied().filter(|name| {
-                TriggerStatusVariable::parse(name).is_some()
-                    || (TriggerExceptionVariable::parse(name).is_some()
-                        && self.invocation.exception.is_some())
-                    || plpgsql_context_field(self.invocation.program_kind, name).is_some()
-            })
+            context_names
+                .iter()
+                .copied()
+                .filter(|name| self.local_index(name).is_none() && self.variable(name).is_some())
         };
         let captured = arena
-            .alloc_slice_with(self.locals.len() + context_names().count(), |index| {
-                if let Some(local) = self.locals.get(index) {
-                    super::cursor::CursorLocal {
-                        name: local.name,
-                        type_oid: 0,
-                        value: self.values[index],
-                    }
-                } else {
-                    let name = context_names()
-                        .nth(index - self.locals.len())
-                        .expect("counted context name");
-                    super::cursor::CursorLocal {
-                        name: SqlName::parse(name).expect("static context name"),
-                        type_oid: self
-                            .col_type(None, name)
-                            .expect("declared context type")
-                            .oid(),
-                        value: Datum::Null,
-                    }
+            .alloc_slice_with(self.locals.len() + context_names().count(), |_| {
+                super::cursor::CursorLocal {
+                    name: SqlName::EMPTY,
+                    type_oid: 0,
+                    value: Datum::Null,
                 }
             })
             .map_err(|_| super::query::arena_full_pub())?;
-        for (local, declaration) in captured.iter_mut().zip(self.locals) {
-            local.type_oid = storage
-                .routine_type_oid(declaration.ctype, declaration.user_type, txid)
+        for (index, captured) in captured.iter_mut().enumerate() {
+            let name = self
+                .locals
+                .get(index)
+                .map(|local| local.name)
+                .unwrap_or_else(|| {
+                    SqlName::parse(
+                        context_names()
+                            .nth(index - self.locals.len())
+                            .expect("counted context name"),
+                    )
+                    .expect("static context name")
+                });
+            let variable = self
+                .variable(name.as_str())
+                .expect("declared cursor variable");
+            captured.name = name;
+            captured.value = variable.value;
+            captured.type_oid = storage
+                .routine_type_oid(variable.ctype, variable.user_type, txid)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
                         "captured local type no longer exists"
                     )
                 })?;
-        }
-        for local in &mut captured[self.locals.len()..] {
-            local.value = self.lookup(None, local.name.as_str())?;
         }
         Ok(captured)
     }
@@ -22365,31 +22412,13 @@ where
     'stored: 'value,
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
         }
         if qualifier.is_none()
-            && let Some(field) = plpgsql_context_field(self.invocation.program_kind, name)
+            && let Some(variable) = self.variable(name)
         {
-            return Ok(self.invocation.value(field));
-        }
-        if qualifier.is_none()
-            && let Some(index) = self.local_index(name)
-        {
-            return Ok(self.values[index]);
-        }
-        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
-            return Ok(self.found.map(Datum::Bool).unwrap_or(Datum::Null));
-        }
-        if qualifier.is_none()
-            && let Some(variable) = TriggerExceptionVariable::parse(name)
-            && let Some(exception) = self.invocation.exception
-        {
-            return Ok(Datum::Text(match variable {
-                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
-                TriggerExceptionVariable::Sqlerrm => exception.message,
-            }));
+            return Ok(variable.value);
         }
         if let Some(qualifier) = qualifier
             && let Some(index) = self.local_index(qualifier)
@@ -22421,28 +22450,13 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             return self.transition.col_type(qualifier, name);
         }
-        if qualifier.is_none()
-            && let Some(field) = plpgsql_context_field(self.invocation.program_kind, name)
-        {
-            return Some(field.ctype());
-        }
-        if qualifier.is_none() && TriggerStatusVariable::parse(name).is_some() {
-            return Some(ColType::Bool);
-        }
-        if qualifier.is_none()
-            && TriggerExceptionVariable::parse(name).is_some()
-            && self.invocation.exception.is_some()
-        {
-            return Some(ColType::Text);
-        }
         (qualifier.is_none())
-            .then(|| self.local_index(name))
+            .then(|| self.variable(name))
             .flatten()
-            .map(|index| self.locals[index].ctype)
+            .map(|variable| variable.ctype)
             .or_else(|| {
                 qualifier
                     .and_then(|qualifier| self.local_index(qualifier))
@@ -22458,31 +22472,22 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             return self.transition.collation(qualifier, name);
         }
-        if qualifier.is_none() {
-            let local_type = self.local_index(name).map(|index| self.locals[index].ctype);
-            let runtime_type = plpgsql_context_field(self.invocation.program_kind, name)
-                .map(TriggerContextField::ctype)
-                .or_else(|| TriggerStatusVariable::parse(name).map(|_| ColType::Bool))
-                .or_else(|| {
-                    (TriggerExceptionVariable::parse(name).is_some()
-                        && self.invocation.exception.is_some())
-                    .then_some(ColType::Text)
-                });
-            if let Some(ctype) = local_type.or(runtime_type) {
-                return if ctype.is_collatable() {
-                    if self.invocation.input_collation == crate::sql::ast::Collation::None {
-                        crate::sql::ast::Collation::Default
-                    } else {
-                        self.invocation.input_collation
-                    }
+        if qualifier.is_none()
+            && let Some(variable) = self.variable(name)
+        {
+            let ctype = variable.ctype;
+            return if ctype.is_collatable() {
+                if self.invocation.input_collation == crate::sql::ast::Collation::None {
+                    crate::sql::ast::Collation::Default
                 } else {
-                    crate::sql::ast::Collation::None
-                };
-            }
+                    self.invocation.input_collation
+                }
+            } else {
+                crate::sql::ast::Collation::None
+            };
         }
         self.transition.collation(qualifier, name)
     }
@@ -22503,7 +22508,7 @@ where
             .and_then(|index| match self.values[index] {
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                     .iter()
-                    .find(|candidate| candidate.name.eq_ignore_ascii_case(field))
+                    .find(|candidate| candidate.name == field)
                     .and_then(|candidate| ColType::from_oid(candidate.type_oid)),
                 _ => None,
             })
@@ -22518,21 +22523,11 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
-        {
+        if matches!(qualifier, Some("old" | "new")) {
             return self.transition.column_user_type(qualifier, name);
         }
         if qualifier.is_none() {
-            if let Some(index) = self.local_index(name) {
-                return self.locals[index].user_type;
-            }
-            if plpgsql_context_field(self.invocation.program_kind, name).is_some()
-                || TriggerStatusVariable::parse(name).is_some()
-                || (TriggerExceptionVariable::parse(name).is_some()
-                    && self.invocation.exception.is_some())
-            {
-                return None;
-            }
+            return self.variable(name).and_then(|variable| variable.user_type);
         }
         self.transition.column_user_type(qualifier, name)
     }
@@ -22652,15 +22647,14 @@ pub(crate) struct TriggerDmlSnapshot<'a> {
     locals: &'a [TriggerLocalDecl],
     values: &'a [Datum<'a>],
     invocation: TriggerInvocation<'a>,
+    found: Option<bool>,
     old: Option<&'a [Datum<'a>]>,
     new: Option<&'a [Datum<'a>]>,
 }
 
-impl TriggerDmlSnapshot<'_> {
-    fn local_index(&self, name: &str) -> Option<usize> {
-        self.locals
-            .iter()
-            .position(|local| local.name.as_str() == name)
+impl<'a> TriggerDmlSnapshot<'a> {
+    fn variable(&self, name: &str) -> Option<PlpgsqlVariable<'a>> {
+        plpgsql_variable(self.locals, self.values, self.invocation, self.found, name)
     }
 }
 
@@ -22670,9 +22664,9 @@ where
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if let Some(qualifier) = qualifier {
-            let (record, values) = if qualifier.eq_ignore_ascii_case("old") {
+            let (record, values) = if qualifier == "old" {
                 ("OLD", self.old)
-            } else if qualifier.eq_ignore_ascii_case("new") {
+            } else if qualifier == "new" {
                 ("NEW", self.new)
             } else {
                 return Err(sql_err!(
@@ -22697,19 +22691,8 @@ where
             };
             return Ok(values[column]);
         }
-        if let Some(index) = self.local_index(name) {
-            return Ok(self.values[index]);
-        }
-        if let Some(field) = plpgsql_context_field(self.invocation.program_kind, name) {
-            return Ok(self.invocation.value(field));
-        }
-        if let Some(variable) = TriggerExceptionVariable::parse(name)
-            && let Some(exception) = self.invocation.exception
-        {
-            return Ok(Datum::Text(match variable {
-                TriggerExceptionVariable::Sqlstate => exception.sqlstate_text,
-                TriggerExceptionVariable::Sqlerrm => exception.message,
-            }));
+        if let Some(variable) = self.variable(name) {
+            return Ok(variable.value);
         }
         Err(sql_err!(
             sqlstate::UNDEFINED_COLUMN,
@@ -22720,39 +22703,17 @@ where
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if qualifier.is_none() {
-            return self
-                .local_index(name)
-                .map(|index| self.locals[index].ctype)
-                .or_else(|| {
-                    plpgsql_context_field(self.invocation.program_kind, name)
-                        .map(TriggerContextField::ctype)
-                })
-                .or_else(|| {
-                    (TriggerExceptionVariable::parse(name).is_some()
-                        && self.invocation.exception.is_some())
-                    .then_some(ColType::Text)
-                });
+            return self.variable(name).map(|variable| variable.ctype);
         }
         self.definition
             .column_index(name)
-            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .filter(|_| matches!(qualifier, Some("old" | "new")))
             .map(|column| self.definition.columns()[column].ctype)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if qualifier.is_none() {
-            let ctype = self
-                .local_index(name)
-                .map(|index| self.locals[index].ctype)
-                .or_else(|| {
-                    plpgsql_context_field(self.invocation.program_kind, name)
-                        .map(TriggerContextField::ctype)
-                })
-                .or_else(|| {
-                    (TriggerExceptionVariable::parse(name).is_some()
-                        && self.invocation.exception.is_some())
-                    .then_some(ColType::Text)
-                });
+            let ctype = self.variable(name).map(|variable| variable.ctype);
             if let Some(ctype) = ctype {
                 return if ctype.is_collatable() {
                     if self.invocation.input_collation == crate::sql::ast::Collation::None {
@@ -22767,7 +22728,7 @@ where
         }
         self.definition
             .column_index(name)
-            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .filter(|_| matches!(qualifier, Some("old" | "new")))
             .map(|column| self.definition.columns()[column].collation)
             .unwrap_or(crate::sql::ast::Collation::None)
     }
@@ -22777,27 +22738,21 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if qualifier.is_none()
-            && let Some(index) = self.local_index(name)
-        {
-            return self.locals[index].user_type;
+        if qualifier.is_none() {
+            return self.variable(name).and_then(|variable| variable.user_type);
         }
         self.definition
             .column_index(name)
-            .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
+            .filter(|_| matches!(qualifier, Some("old" | "new")))
             .and_then(|column| self.definition.columns()[column].user_type)
     }
 }
 
-fn snapshot_trigger_dml_scope<'a, Definition0: crate::storage::DefinitionBacking>(
-    definition: &crate::storage::TableDefinition<Definition0>,
-    locals: &[TriggerLocalDecl],
-    local_values: &[Datum<'a>],
-    invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: Option<&[Datum<'a>]>,
+fn snapshot_trigger_dml_scope<'a>(
+    scope: &TriggerLocalScope<'_, 'a>,
     arena: &'a Arena,
 ) -> Result<&'a TriggerDmlSnapshot<'a>, SqlError> {
+    let definition = scope.transition.definition;
     let columns = arena
         .alloc_interned_slice(definition.columns())
         .map_err(|_| super::query::arena_full_pub())?;
@@ -22808,13 +22763,13 @@ fn snapshot_trigger_dml_scope<'a, Definition0: crate::storage::DefinitionBacking
         columns,
     };
     let locals = arena
-        .alloc_slice_copy(locals)
+        .alloc_slice_copy(scope.locals)
         .map_err(|_| super::query::arena_full_pub())?;
     let values = arena
-        .alloc_slice_with(local_values.len(), |_| Datum::Null)
+        .alloc_slice_with(scope.values.len(), |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
     for (index, value) in values.iter_mut().enumerate() {
-        *value = detached_trigger_datum(local_values[index], arena)?;
+        *value = detached_trigger_datum(scope.values[index], arena)?;
     }
     let copy_record = |record: Option<&[Datum<'a>]>| -> Result<Option<&'a [Datum<'a>]>, SqlError> {
         let Some(record) = record else {
@@ -22828,14 +22783,15 @@ fn snapshot_trigger_dml_scope<'a, Definition0: crate::storage::DefinitionBacking
         }
         Ok(Some(&*copy))
     };
-    let old = copy_record(old)?;
-    let new = copy_record(new)?;
+    let old = copy_record(scope.transition.old)?;
+    let new = copy_record(scope.transition.new)?;
     arena
         .alloc(TriggerDmlSnapshot {
             definition,
             locals: &*locals,
             values: &*values,
-            invocation,
+            invocation: scope.invocation,
+            found: scope.found,
             old,
             new,
         })
@@ -28283,15 +28239,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => None,
             };
             let conflict_scope = match statement.on_conflict {
-                Some(_) => Some(snapshot_trigger_dml_scope(
-                    definition,
-                    locals,
-                    &local_values[..locals.len()],
-                    invocation,
-                    old,
-                    new.as_deref(),
-                    context.arena,
-                )?),
+                Some(_) => Some(snapshot_trigger_dml_scope(&scope, context.arena)?),
                 None => None,
             };
             let arena = context.arena;

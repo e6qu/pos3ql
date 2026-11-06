@@ -15,7 +15,8 @@ current behavior belongs in the [owning guides](docs/README.md), including
 retained caught-error ownership, initializer-free runtime local metadata,
 rewritten assignment inputs, quoted procedural names, typed trigger context
 and PostgreSQL stacked-diagnostic values. Output-parameter initializer indexing
-and named `undefined_column` handlers are covered by the active regressions.
+and named `undefined_column` handlers are covered by the active regressions,
+alongside quoted cursor names and consistent lexical variable bindings.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

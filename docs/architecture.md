@@ -224,6 +224,15 @@ Procedural declarations and target names cross the SQL lexer before lookup.
 Unquoted `MixedCase` becomes `mixedcase`; quoted `"MixedCase"` remains distinct.
 Local variables, record fields and built-in handler/status/context names compare
 those normalized names exactly, so `SQLERRM` and `"SQLERRM"` are different.
+Quoted cursor names use the same token boundaries for `OPEN`, `FETCH`, `MOVE`
+and `CLOSE`, including spaces and doubled quotes. Local declarations can shadow
+context variables: `DECLARE found integer := 42` makes both its value and
+`pg_typeof(found)` use that integer. Inside an exception handler, its implicit
+`SQLSTATE` and `SQLERRM` bindings shadow outer declarations. Values, declared
+types and domain identities share one lookup rule, including captured cursor
+inputs and detached conflict-update inputs. The
+[PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-name-bindings/README.md)
+records those cases. Quoted `"NEW"` is distinct from the trigger record `new`.
 Trigger names and relation/schema names have PostgreSQL type `name`; `TG_RELID`
 is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
 a PostgreSQL trigger variable and raises an undefined-column error.

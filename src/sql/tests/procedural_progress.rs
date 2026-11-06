@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn quoted_cursors_and_shadowed_variables_keep_postgresql_values_and_types() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-name-bindings-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/255_procedural_name_bindings.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "first:second",
+                "7:integer:42:integer:P0001:caught",
+                "local:42:integer:outer state:outer message:42P01",
+                "42P01:text:42",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn trigger_context_types_and_unavailable_names_match_postgresql() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

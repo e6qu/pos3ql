@@ -1351,20 +1351,18 @@ thread_local! {
 /// Installs the statement-owned routine invocation log while its query work
 /// arena is scanned. Scan callbacks do not own an engine reference, so this
 /// scoped bridge carries the already-borrowed context without duplicating it.
-pub(crate) struct RoutineInvocationScope<'scope>(
-    Option<(*const (), *const ())>,
-    core::marker::PhantomData<(&'scope RoutineInvocationState, &'scope Arena)>,
-);
+struct RoutineInvocationScope(Option<(*const (), *const ())>);
 
-impl Drop for RoutineInvocationScope<'_> {
+impl Drop for RoutineInvocationScope {
     fn drop(&mut self) {
         ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.set(self.0));
     }
 }
 
-pub(crate) fn enter_routine_invocation_scope<'scope>(
-    context: Option<RoutineInvocationContext<'scope, 'scope>>,
-) -> RoutineInvocationScope<'scope> {
+pub(crate) fn with_routine_invocation_scope<R>(
+    context: Option<RoutineInvocationContext<'_, '_>>,
+    execute: impl FnOnce() -> R,
+) -> R {
     let current = match context {
         Some(context) => Some((
             context.invocations as *const RoutineInvocationState as *const (),
@@ -1373,20 +1371,26 @@ pub(crate) fn enter_routine_invocation_scope<'scope>(
         None => ACTIVE_ROUTINE_INVOCATIONS.with(Cell::get),
     };
     let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
-    RoutineInvocationScope(prior, core::marker::PhantomData)
+    // Keep the guard private: a caller cannot forget it and leave dangling TLS.
+    let _scope = RoutineInvocationScope(prior);
+    execute()
 }
 
-pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationState, &'a Arena)> {
+pub(crate) fn with_active_routine_invocations<R>(
+    read: impl for<'scope> FnOnce(Option<(&'scope RoutineInvocationState, &'scope Arena)>) -> R,
+) -> R {
     ACTIVE_ROUTINE_INVOCATIONS.with(|active| {
-        let (invocations, arena) = active.get()?;
-        // The only writer is `enter_routine_invocation_scope`; its guard stays
-        // live for the synchronous scan and restores any enclosing execution.
-        Some(unsafe {
+        let Some((invocations, arena)) = active.get() else {
+            return read(None);
+        };
+        // The installing guard pins both owners. The higher-ranked callback
+        // prevents either reference escaping after that scope ends.
+        read(Some(unsafe {
             (
                 &*(invocations as *const RoutineInvocationState),
                 &*(arena as *const Arena),
             )
-        })
+        }))
     })
 }
 
@@ -1570,14 +1574,14 @@ impl RoutineInvocationState {
             .map_err(invocation_results::directory_error)
     }
 
-    pub(crate) fn resolve_rows<'a>(
+    pub(crate) fn resolve_rows(
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         source_position: Option<usize>,
         input_collation: super::ast::Collation,
-    ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
+    ) -> Result<Option<invocation_results::ResultBytes>, SqlError> {
         self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
@@ -1591,7 +1595,7 @@ impl RoutineInvocationState {
                 ));
             };
             super::sequence::restore_replay_cursor(saved.replay)?;
-            return Ok(Some(rows.rows(statement_arena, statement_arena)?));
+            return Ok(Some(rows));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -3216,24 +3220,21 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )?;
-        if self.invocations.is_some()
-            || active_routine_invocations().is_some()
-            || routine.language == crate::storage::RoutineLanguage::PlPgSql
-        {
-            if let Some(invocations) = self.invocations {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    self.statement_arena
-                        .expect("routine invocation state has statement arena"),
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
-            if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(
+        if let Some(invocations) = self.invocations {
+            return invocations.resolve(
+                routine,
+                arguments,
+                self.statement_arena
+                    .expect("routine invocation state has statement arena"),
+                arena,
+                source_position,
+                input_collation,
+                access,
+            );
+        }
+        if let Some(result) = with_active_routine_invocations(|context| {
+            context.map(|(invocations, statement_arena)| {
+                invocations.resolve(
                     routine,
                     arguments,
                     statement_arena,
@@ -3241,8 +3242,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     source_position,
                     input_collation,
                     access,
-                );
-            }
+                )
+            })
+        }) {
+            return result;
+        }
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "PL/pgSQL functions require a resumable query executor"
@@ -3279,29 +3284,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
             },
         )?;
         if routine_program_requires_mutable_execution(&function_program) {
-            if let Some(invocations) = self.invocations {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    self.statement_arena
-                        .expect("routine invocation state has statement arena"),
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
-            if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    statement_arena,
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a resumable query executor"

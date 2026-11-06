@@ -5885,38 +5885,46 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
                 .transpose()?;
             if invocations.is_some()
-                || super::active_routine_invocations().is_some()
+                || super::with_active_routine_invocations(|context| context.is_some())
                 || routine.language == crate::storage::RoutineLanguage::PlPgSql
             {
-                let (invocations, statement_arena) = match (invocations, statement_arena) {
-                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "PL/pgSQL table functions require a resumable query executor"
-                        )
-                    })?,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine invocation state is missing its statement arena"
-                        ));
-                    }
+                let resolve = |invocations: &super::RoutineInvocationState,
+                               statement_arena: &Arena| {
+                    invocations
+                        .resolve_rows(
+                            routine,
+                            &routine_params[..routine.argument_count],
+                            statement_arena,
+                            tref.func_source_position.get(),
+                            input_collation,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "pending PL/pgSQL table routine did not suspend query execution"
+                            )
+                        })
                 };
-                return invocations
-                    .resolve_rows(
-                        routine,
-                        &routine_params[..routine.argument_count],
-                        statement_arena,
-                        tref.func_source_position.get(),
-                        input_collation,
-                    )?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "pending PL/pgSQL table routine did not suspend query execution"
-                        )
-                    });
+                return match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => {
+                        resolve(invocations, statement_arena)?.rows(statement_arena, arena)
+                    }
+                    (None, None) => super::with_active_routine_invocations(|context| {
+                        let (invocations, statement_arena) = context.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "PL/pgSQL table functions require a resumable query executor"
+                            )
+                        })?;
+                        // An inherited callback owner cannot lend bytes beyond
+                        // its scope. This query owns its independent row image.
+                        resolve(invocations, statement_arena)?.copied_rows(statement_arena, arena)
+                    }),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    )),
+                };
             }
             let dependencies =
                 storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
@@ -5946,35 +5954,43 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 },
             )?;
             if super::routine_program_requires_mutable_execution(&program) {
-                let (invocations, statement_arena) = match (invocations, statement_arena) {
-                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "data-modifying SQL table functions require a resumable query executor"
-                        )
-                    })?,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine invocation state is missing its statement arena"
-                        ));
-                    }
+                let resolve = |invocations: &super::RoutineInvocationState,
+                               statement_arena: &Arena| {
+                    invocations
+                        .resolve_rows(
+                            routine,
+                            &routine_params[..routine.argument_count],
+                            statement_arena,
+                            tref.func_source_position.get(),
+                            input_collation,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "pending SQL table routine did not suspend query execution"
+                            )
+                        })
                 };
-                return invocations
-                    .resolve_rows(
-                        routine,
-                        &routine_params[..routine.argument_count],
-                        statement_arena,
-                        tref.func_source_position.get(),
-                        input_collation,
-                    )?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "pending SQL table routine did not suspend query execution"
-                        )
-                    });
+                return match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => {
+                        resolve(invocations, statement_arena)?.rows(statement_arena, arena)
+                    }
+                    (None, None) => super::with_active_routine_invocations(|context| {
+                        let (invocations, statement_arena) = context.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "data-modifying SQL table functions require a resumable query executor"
+                            )
+                        })?;
+                        // An inherited callback owner cannot lend bytes beyond
+                        // its scope. This query owns its independent row image.
+                        resolve(invocations, statement_arena)?.copied_rows(statement_arena, arena)
+                    }),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    )),
+                };
             }
             for query in program.preceding {
                 let super::RoutinePrelude::Statement(statement) = query else {

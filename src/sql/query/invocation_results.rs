@@ -62,6 +62,15 @@ impl ResultBytes {
         let bytes = source.retained_slice(self.0).map_err(|_| inactive())?;
         super::super::exec::unpack_projected_rows(bytes, output)
     }
+
+    pub(super) fn copied_rows<'out>(
+        self,
+        source: &Arena,
+        output: &'out Arena,
+    ) -> Result<&'out [&'out [u8]], SqlError> {
+        let bytes = self.copy(source, output)?;
+        super::super::exec::unpack_projected_rows(bytes, output)
+    }
 }
 
 /// Completed calls preserve result shape independently of the stored bytes.
@@ -133,6 +142,48 @@ fn inactive() -> SqlError {
 mod ownership_tests {
     use super::*;
     use crate::mem::Budget;
+
+    #[test]
+    fn callback_result_copies_remain_readable_after_both_source_owners_are_dropped() {
+        let mut budget = Budget::new(16 << 10);
+        let source = Arena::new(&mut budget, "callback source", 4096).unwrap();
+        let owner = Arena::new(&mut budget, "callback result owner", 4096).unwrap();
+        let output = Arena::new(&mut budget, "independent callback result", 8192).unwrap();
+        let invocations = RoutineInvocationState::new(&owner);
+        let (scalar, rows) = crate::mem::guard::forbid_alloc(|| {
+            let value = Datum::Text(source.alloc_str("independent text").unwrap());
+            let scalar = ResultBytes::capture_scalar(value, &owner).unwrap();
+            let encoded =
+                super::super::super::exec::encode_projected_pub(&[value], &source).unwrap();
+            let rows = ResultBytes::capture_rows(&[encoded], &owner).unwrap();
+            let copied = with_routine_invocation_scope(
+                Some(RoutineInvocationContext::new(&invocations, &owner)),
+                || {
+                    with_active_routine_invocations(|context| {
+                        let (calls, arena) = context.unwrap();
+                        calls.require_arena(arena).unwrap();
+                        (
+                            scalar.scalar(arena, &output).unwrap(),
+                            rows.copied_rows(arena, &output).unwrap(),
+                        )
+                    })
+                },
+            );
+            drop(source);
+            drop(owner);
+            copied
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(scalar, Datum::Text("independent text"));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                super::super::super::exec::decode_projected_col_record(rows[0], 0, &output)
+                    .unwrap(),
+                scalar
+            );
+            with_active_routine_invocations(|context| assert!(context.is_none()));
+        });
+    }
 
     #[test]
     fn table_result_views_reserve_only_the_row_directory_and_share_frozen_payload() {

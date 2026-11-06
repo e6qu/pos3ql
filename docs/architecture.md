@@ -196,6 +196,9 @@ arena or recycling its temporary front; reset or a different arena rejects
 them with an internal error before reading their bytes. Arguments become
 immutable before publication. Execution reads their stored bytes directly;
 even an older mutable handle cannot reopen that allocation for writing.
+Callback lookup exposes the invocation log only inside a scoped closure. Its
+installer keeps the restoring guard private and restores the previous owner on
+success, errors or unwinding.
 This owns the call's inputs. The running body and enclosing write still need
 complete ownership across a scheduler return.
 Completed scalar values and table-source rows keep their encoded bytes in
@@ -204,10 +207,13 @@ receipts, rather than references to returned values or row slices. For example,
 a function returning `ROW('saved text')` keeps the field's name, type and text
 after its body memory is reused. A body captures one immutable result image in
 the parent's retained storage before releasing its scratch. Scalar consumers
-copy their value into their own arena; table consumers rebuild row pointers
-that refer directly to the saved payload. This avoids another full copy of a
-large table result. Directory growth reserves its replacement before publishing
-it; exhaustion keeps every previous result readable. All reservations stay
+copy their value into their own arena. Table queries with an explicit owner
+rebuild row pointers that refer directly to the saved payload. A nested query
+using the active callback copies its row image into its own arena before the
+callback ends; no reference to the callback owner can escape. Ordinary table
+queries avoid another full payload copy. Directory growth reserves its
+replacement before publishing it; exhaustion keeps every previous result
+readable. All reservations stay
 inside the existing statement capacity and report `54000` if they do not fit.
 Unfinished input frames retain checked handles for values, call names, defaults,
 type signatures, selected casts, dependencies and effect receipts. A new attempt

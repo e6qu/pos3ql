@@ -666,32 +666,34 @@ pub(super) fn evaluation(
     if IN_BODY.with(Cell::get) {
         return Ok(current);
     }
-    let Some((invocations, arena)) = active_routine_invocations() else {
-        return Ok(current);
-    };
-    invocations.require_arena(arena)?;
-    let mut entries = invocations.inputs.evaluations.borrow_mut();
-    let position = entries
-        .with_slice(arena, |values| {
-            values.binary_search_by_key(&oid, |entry| entry.0)
-        })
-        .map_err(|_| changed())?;
-    match position {
-        Ok(index) => Ok(entries
-            .get(arena, index)
-            .map_err(|_| changed())?
-            .ok_or_else(changed)?
-            .1),
-        Err(index) => {
-            entries
-                .push(arena, (oid, current))
-                .map_err(directory_error)?;
-            entries
-                .with_mut_slice(arena, |values| values[index..].rotate_right(1))
-                .map_err(|_| changed())?;
-            Ok(current)
+    with_active_routine_invocations(|context| {
+        let Some((invocations, arena)) = context else {
+            return Ok(current);
+        };
+        invocations.require_arena(arena)?;
+        let mut entries = invocations.inputs.evaluations.borrow_mut();
+        let position = entries
+            .with_slice(arena, |values| {
+                values.binary_search_by_key(&oid, |entry| entry.0)
+            })
+            .map_err(|_| changed())?;
+        match position {
+            Ok(index) => Ok(entries
+                .get(arena, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?
+                .1),
+            Err(index) => {
+                entries
+                    .push(arena, (oid, current))
+                    .map_err(directory_error)?;
+                entries
+                    .with_mut_slice(arena, |values| values[index..].rotate_right(1))
+                    .map_err(|_| changed())?;
+                Ok(current)
+            }
         }
-    }
+    })
 }
 
 pub(crate) struct ExpressionPosition {
@@ -761,49 +763,51 @@ pub(crate) fn enter_expression(expression: &Expr<'_>) -> Result<ExpressionPositi
     if !matches!(expression, Expr::Call { .. }) {
         return Ok(position);
     }
-    let Some((invocations, statement_arena)) = active_routine_invocations() else {
-        return Ok(position);
-    };
-    invocations.require_arena(statement_arena)?;
-    let registry = &invocations.inputs;
-    let ordinal = registry.next.get();
-    registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
-    CURRENT_CALL.with(|current| current.set(Some(ordinal)));
-    let target = if ACTIVE_INPUT.with(Cell::get).is_some() {
-        selected_target()?
-    } else {
-        let saved = registry
-            .saved
-            .borrow()
-            .with_slice(statement_arena, |values| {
-                values
-                    .binary_search_by_key(&ordinal, |entry| entry.ordinal)
-                    .ok()
-                    .map(|index| values[index])
-            })
-            .map_err(|_| changed())?;
-        match saved {
-            Some(saved) => {
-                let frames = statement_arena
-                    .retained_slice_mut(saved.frames)
-                    .map_err(|_| changed())?;
-                frames
-                    .first()
-                    .copied()
-                    .map(|handle| {
-                        statement_arena
-                            .retained(handle)
-                            .ok_or_else(changed)?
-                            .definition_oid(statement_arena)
-                    })
-                    .transpose()?
-                    .flatten()
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return Ok(position);
+        };
+        invocations.require_arena(statement_arena)?;
+        let registry = &invocations.inputs;
+        let ordinal = registry.next.get();
+        registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
+        CURRENT_CALL.with(|current| current.set(Some(ordinal)));
+        let target = if ACTIVE_INPUT.with(Cell::get).is_some() {
+            selected_target()?
+        } else {
+            let saved = registry
+                .saved
+                .borrow()
+                .with_slice(statement_arena, |values| {
+                    values
+                        .binary_search_by_key(&ordinal, |entry| entry.ordinal)
+                        .ok()
+                        .map(|index| values[index])
+                })
+                .map_err(|_| changed())?;
+            match saved {
+                Some(saved) => {
+                    let frames = statement_arena
+                        .retained_slice_mut(saved.frames)
+                        .map_err(|_| changed())?;
+                    frames
+                        .first()
+                        .copied()
+                        .map(|handle| {
+                            statement_arena
+                                .retained(handle)
+                                .ok_or_else(changed)?
+                                .definition_oid(statement_arena)
+                        })
+                        .transpose()?
+                        .flatten()
+                }
+                None => None,
             }
-            None => None,
-        }
-    };
-    position.target = target;
-    Ok(position)
+        };
+        position.target = target;
+        Ok(position)
+    })
 }
 
 pub(crate) fn invocation_site() -> Option<super::InvocationSite> {
@@ -916,60 +920,61 @@ pub(crate) fn call<T>(
     if ACTIVE_INPUT.with(Cell::get).is_some() {
         return execute();
     }
-    let Some((invocations, statement_arena)) = active_routine_invocations() else {
-        return execute();
-    };
-    invocations.require_arena(statement_arena)?;
-    let registry = &invocations.inputs;
-    let ordinal = match CURRENT_CALL.with(Cell::get) {
-        Some(ordinal) => ordinal,
-        None => {
-            let ordinal = registry.next.get();
-            registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
-            ordinal
-        }
-    };
-    let mut frames = ArenaList::new(arena);
-    let saved = registry
-        .saved
-        .borrow()
-        .with_slice(statement_arena, |values| {
-            values
-                .binary_search_by_key(&ordinal, |entry| entry.ordinal)
-                .ok()
-                .map(|index| values[index])
-        })
-        .map_err(|_| changed())?;
-    if let Some(saved) = saved {
-        let retained = statement_arena
-            .retained_slice_mut(saved.frames)
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return execute();
+        };
+        invocations.require_arena(statement_arena)?;
+        let registry = &invocations.inputs;
+        let ordinal = match CURRENT_CALL.with(Cell::get) {
+            Some(ordinal) => ordinal,
+            None => {
+                let ordinal = registry.next.get();
+                registry.next.set(ordinal.checked_add(1).ok_or_else(full)?);
+                ordinal
+            }
+        };
+        let mut frames = ArenaList::new(arena);
+        let saved = registry
+            .saved
+            .borrow()
+            .with_slice(statement_arena, |values| {
+                values
+                    .binary_search_by_key(&ordinal, |entry| entry.ordinal)
+                    .ok()
+                    .map(|index| values[index])
+            })
             .map_err(|_| changed())?;
-        for frame in retained.iter().copied() {
-            frames
-                .push(AttemptFrame::Saved(frame))
-                .map_err(|_| full())?;
+        if let Some(saved) = saved {
+            let retained = statement_arena
+                .retained_slice_mut(saved.frames)
+                .map_err(|_| changed())?;
+            for frame in retained.iter().copied() {
+                frames
+                    .push(AttemptFrame::Saved(frame))
+                    .map_err(|_| full())?;
+            }
         }
-    }
-    let attempt = InputAttempt {
-        registry,
-        owner: statement_arena,
-        invocation: &invocations.next,
-        arena,
-        next: Cell::new(0),
-        frames: RefCell::new(frames),
-    };
-    let _available =
-        AvailableScope(AVAILABLE_INPUT.with(|active| {
+        let attempt = InputAttempt {
+            registry,
+            owner: statement_arena,
+            invocation: &invocations.next,
+            arena,
+            next: Cell::new(0),
+            frames: RefCell::new(frames),
+        };
+        let _available = AvailableScope(AVAILABLE_INPUT.with(|active| {
             active.replace(Some(&attempt as *const InputAttempt<'_, '_> as *const ()))
         }));
-    let result = execute();
-    if result
-        .as_ref()
-        .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
-    {
-        attempt.retain(ordinal)?;
-    }
-    result
+        let result = execute();
+        if result
+            .as_ref()
+            .is_err_and(|error| error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+        {
+            attempt.retain(ordinal)?;
+        }
+        result
+    })
 }
 
 pub(crate) fn value<'a>(
@@ -1012,67 +1017,69 @@ pub(super) fn cast_selection(
     if IN_BODY.with(Cell::get) {
         return select();
     }
-    let Some((invocations, arena)) = active_routine_invocations() else {
-        return select();
-    };
-    invocations.require_arena(arena)?;
-    let key = CastSelection {
-        source,
-        target,
-        context,
-        cast: None,
-    }
-    .key();
-    let existing = invocations
-        .inputs
-        .cast_selections
-        .borrow()
-        .with_slice(arena, |values| {
-            values
-                .binary_search_by_key(&key, |entry| entry.key())
-                .ok()
-                .map(|index| values[index])
-        })
-        .map_err(|_| changed())?;
-    if let Some(existing) = existing {
-        return existing.value(arena);
-    }
-    let selected = select()?;
-    let cast = selected
-        .map(|cast| arena.retain(cast).map_err(|_| full()))
-        .transpose()?;
-    let mut entries = invocations.inputs.cast_selections.borrow_mut();
-    let position = entries
-        .with_slice(arena, |values| {
-            values.binary_search_by_key(&key, |entry| entry.key())
-        })
-        .map_err(|_| changed())?;
-    match position {
-        Ok(index) => {
-            return entries
-                .get(arena, index)
-                .map_err(|_| changed())?
-                .ok_or_else(changed)?
-                .value(arena);
+    with_active_routine_invocations(|context| {
+        let Some((invocations, arena)) = context else {
+            return select();
+        };
+        invocations.require_arena(arena)?;
+        let key = CastSelection {
+            source,
+            target,
+            context,
+            cast: None,
         }
-        Err(index) => {
-            entries
-                .push(
-                    arena,
-                    CastSelection {
-                        source,
-                        target,
-                        context,
-                        cast,
-                    },
-                )
-                .map_err(directory_error)?;
-            entries
-                .with_mut_slice(arena, |values| values[index..].rotate_right(1))
-                .map_err(|_| changed())?;
+        .key();
+        let existing = invocations
+            .inputs
+            .cast_selections
+            .borrow()
+            .with_slice(arena, |values| {
+                values
+                    .binary_search_by_key(&key, |entry| entry.key())
+                    .ok()
+                    .map(|index| values[index])
+            })
+            .map_err(|_| changed())?;
+        if let Some(existing) = existing {
+            return existing.value(arena);
         }
-    }
-    Ok(selected)
+        let selected = select()?;
+        let cast = selected
+            .map(|cast| arena.retain(cast).map_err(|_| full()))
+            .transpose()?;
+        let mut entries = invocations.inputs.cast_selections.borrow_mut();
+        let position = entries
+            .with_slice(arena, |values| {
+                values.binary_search_by_key(&key, |entry| entry.key())
+            })
+            .map_err(|_| changed())?;
+        match position {
+            Ok(index) => {
+                return entries
+                    .get(arena, index)
+                    .map_err(|_| changed())?
+                    .ok_or_else(changed)?
+                    .value(arena);
+            }
+            Err(index) => {
+                entries
+                    .push(
+                        arena,
+                        CastSelection {
+                            source,
+                            target,
+                            context,
+                            cast,
+                        },
+                    )
+                    .map_err(directory_error)?;
+                entries
+                    .with_mut_slice(arena, |values| values[index..].rotate_right(1))
+                    .map_err(|_| changed())?;
+            }
+        }
+        Ok(selected)
+    })
 }
 
 pub(super) fn cast_definition(
@@ -1124,92 +1131,95 @@ mod tests {
         let wrong = Arena::new(&mut budget, "foreign invocation owner", 16 << 10).unwrap();
         let invocations = RoutineInvocationState::new(&original);
         crate::mem::guard::forbid_alloc(|| {
-            let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-                &invocations,
-                &original,
-            )));
-            let result = call(&work, || {
-                let _input = enter();
-                let text = work.alloc_str("saved input").unwrap();
-                value(InputSite::Query(InputQuery::Scalar), &work, || {
-                    Ok(Datum::Text(text))
-                })?;
-                Err::<(), _>(sql_err!(
-                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                    "input handoff"
-                ))
-            });
-            assert_eq!(
-                result.unwrap_err().sqlstate,
-                sqlstate::INTERNAL_ROUTINE_INVOCATION
-            );
-            invocations
-                .complete(
-                    OwnedRoutineResult::capture_scalar(Datum::Int4(42), &original).unwrap(),
-                    &original,
-                )
-                .unwrap();
-            evaluation(77, crate::sql::eval::ExpressionEvaluation::Runtime).unwrap();
-            cast_selection(
-                23,
-                25,
-                crate::sql::eval::DefinedCastContext::Explicit,
-                || Ok(Some(captured_cast(99))),
+            with_routine_invocation_scope(
+                Some(RoutineInvocationContext::new(&invocations, &original)),
+                || {
+                    let result = call(&work, || {
+                        let _input = enter();
+                        let text = work.alloc_str("saved input").unwrap();
+                        value(InputSite::Query(InputQuery::Scalar), &work, || {
+                            Ok(Datum::Text(text))
+                        })?;
+                        Err::<(), _>(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "input handoff"
+                        ))
+                    });
+                    assert_eq!(
+                        result.unwrap_err().sqlstate,
+                        sqlstate::INTERNAL_ROUTINE_INVOCATION
+                    );
+                    invocations
+                        .complete(
+                            OwnedRoutineResult::capture_scalar(Datum::Int4(42), &original).unwrap(),
+                            &original,
+                        )
+                        .unwrap();
+                    evaluation(77, crate::sql::eval::ExpressionEvaluation::Runtime).unwrap();
+                    cast_selection(
+                        23,
+                        25,
+                        crate::sql::eval::DefinedCastContext::Explicit,
+                        || Ok(Some(captured_cast(99))),
+                    )
+                    .unwrap();
+                },
             )
-            .unwrap();
         });
         let (mut moved, invocations) = (original, invocations);
         crate::mem::guard::forbid_alloc(|| {
             moved.recycle_front();
             let retained = moved.used();
             {
-                let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-                    &invocations,
-                    &moved,
-                )));
-                for _ in 0..8 {
-                    work.reset();
-                    invocations.begin_attempt();
-                    let result = call(&work, || {
-                        let _input = enter();
-                        value(InputSite::Query(InputQuery::Scalar), &work, || {
-                            panic!("saved input must not run again")
-                        })
-                    })
-                    .unwrap();
-                    assert_eq!(result, Datum::Text("saved input"));
-                    assert_eq!(
-                        invocations
-                            .resolve_intrinsic(42, &[], &moved, &work)
-                            .unwrap(),
-                        Datum::Int4(42)
-                    );
-                    assert!(
-                        evaluation(77, crate::sql::eval::ExpressionEvaluation::Immutable).unwrap()
-                            == crate::sql::eval::ExpressionEvaluation::Runtime
-                    );
-                    assert_eq!(
-                        cast_selection(
-                            23,
-                            25,
-                            crate::sql::eval::DefinedCastContext::Explicit,
-                            || panic!("selected cast must not change")
-                        )
-                        .unwrap()
-                        .unwrap()
-                        .definition
-                        .method,
-                        crate::storage::CastMethod::Function(99)
-                    );
-                    assert_eq!(moved.used(), retained);
-                }
-                assert_eq!(
-                    invocations
-                        .resolve_intrinsic(42, &[], &wrong, &work)
-                        .unwrap_err()
-                        .sqlstate,
-                    "XX000"
-                );
+                with_routine_invocation_scope(
+                    Some(RoutineInvocationContext::new(&invocations, &moved)),
+                    || {
+                        for _ in 0..8 {
+                            work.reset();
+                            invocations.begin_attempt();
+                            let result = call(&work, || {
+                                let _input = enter();
+                                value(InputSite::Query(InputQuery::Scalar), &work, || {
+                                    panic!("saved input must not run again")
+                                })
+                            })
+                            .unwrap();
+                            assert_eq!(result, Datum::Text("saved input"));
+                            assert_eq!(
+                                invocations
+                                    .resolve_intrinsic(42, &[], &moved, &work)
+                                    .unwrap(),
+                                Datum::Int4(42)
+                            );
+                            assert!(
+                                evaluation(77, crate::sql::eval::ExpressionEvaluation::Immutable)
+                                    .unwrap()
+                                    == crate::sql::eval::ExpressionEvaluation::Runtime
+                            );
+                            assert_eq!(
+                                cast_selection(
+                                    23,
+                                    25,
+                                    crate::sql::eval::DefinedCastContext::Explicit,
+                                    || panic!("selected cast must not change")
+                                )
+                                .unwrap()
+                                .unwrap()
+                                .definition
+                                .method,
+                                crate::storage::CastMethod::Function(99)
+                            );
+                            assert_eq!(moved.used(), retained);
+                        }
+                        assert_eq!(
+                            invocations
+                                .resolve_intrinsic(42, &[], &wrong, &work)
+                                .unwrap_err()
+                                .sqlstate,
+                            "XX000"
+                        );
+                    },
+                )
             }
             let retained = OwnedRoutineResult::capture_scalar(Datum::Null, &moved).unwrap();
             moved.reset();
@@ -1388,45 +1398,46 @@ mod tests {
         let mut budget = Budget::new(16 << 10);
         let statement = Arena::new(&mut budget, "parent input owner", 16 << 10).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        crate::mem::guard::forbid_alloc(|| {
-            let error = statement
-                .with_remaining_region(|work| {
-                    call(work, || {
-                        let _input = enter();
-                        value(InputSite::Query(InputQuery::Scalar), work, || {
-                            Ok(Datum::Int4(7))
-                        })?;
-                        Err::<(), _>(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "input handoff"
-                        ))
-                    })
-                    .unwrap_err()
-                })
-                .unwrap();
-            assert_eq!(error.sqlstate, sqlstate::INTERNAL_ROUTINE_INVOCATION);
-            let retained = statement.used();
-            for _ in 0..8 {
-                invocations.begin_attempt();
-                statement
-                    .with_remaining_region(|work| {
-                        let result = call(work, || {
-                            let _input = enter();
-                            value(InputSite::Query(InputQuery::Scalar), work, || {
-                                panic!("completed input must not execute again")
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                crate::mem::guard::forbid_alloc(|| {
+                    let error = statement
+                        .with_remaining_region(|work| {
+                            call(work, || {
+                                let _input = enter();
+                                value(InputSite::Query(InputQuery::Scalar), work, || {
+                                    Ok(Datum::Int4(7))
+                                })?;
+                                Err::<(), _>(sql_err!(
+                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    "input handoff"
+                                ))
                             })
+                            .unwrap_err()
                         })
                         .unwrap();
-                        assert_eq!(result, Datum::Int4(7));
-                    })
-                    .unwrap();
-                assert_eq!(statement.used(), retained);
-            }
-        });
+                    assert_eq!(error.sqlstate, sqlstate::INTERNAL_ROUTINE_INVOCATION);
+                    let retained = statement.used();
+                    for _ in 0..8 {
+                        invocations.begin_attempt();
+                        statement
+                            .with_remaining_region(|work| {
+                                let result = call(work, || {
+                                    let _input = enter();
+                                    value(InputSite::Query(InputQuery::Scalar), work, || {
+                                        panic!("completed input must not execute again")
+                                    })
+                                })
+                                .unwrap();
+                                assert_eq!(result, Datum::Int4(7));
+                            })
+                            .unwrap();
+                        assert_eq!(statement.used(), retained);
+                    }
+                });
+            },
+        )
     }
 
     #[test]
@@ -1502,59 +1513,69 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             let scope = sequence::enter_statement(&statement, guc.seq_session(), false);
             let start = sequence::begin_replay_cursor().unwrap();
-            let _invocations = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-                &invocations,
-                &statement,
-            )));
-            let effect = |tag| {
-                let values = sequence::statement_effect(
-                    sequence::StatementEffectKind::StatisticsVoid,
-                    &[Datum::Int4(tag)],
-                    sequence::StatementEffectRetry::Restart,
-                    &statement,
-                    || {
-                        actions.set(actions.get() + 1);
-                        sequence::StatementEffectAttempt {
-                            result: Ok(statement.alloc_slice_copy(&[Datum::Int4(tag)]).unwrap()),
-                            rewound_state: false,
-                        }
-                    },
-                )?;
-                Ok::<_, SqlError>(values[0])
-            };
-            for attempt in 0..2 {
-                sequence::rewind_replay_cursor(start).unwrap();
-                work.reset();
-                invocations.begin_attempt();
-                let result = call(&work, || {
-                    let _inputs = enter();
-                    let argument =
-                        value(InputSite::Query(InputQuery::Scalar), &work, || effect(11))?;
-                    crate::sql::type_input_plans::with_owner(
-                        crate::sql::type_input_plans::Owner::Backend,
-                        || invocations.resolve_intrinsic(42, &[argument], &statement, &work),
-                    )
-                });
-                if attempt == 0 {
-                    assert_eq!(
-                        result.unwrap_err().sqlstate,
-                        sqlstate::INTERNAL_ROUTINE_INVOCATION
-                    );
-                    assert!(invocations.take_pending().is_some());
-                    let body = effect(22).unwrap();
-                    invocations
-                        .complete(
-                            OwnedRoutineResult::capture_scalar(body, &statement).unwrap(),
+            with_routine_invocation_scope(
+                Some(RoutineInvocationContext::new(&invocations, &statement)),
+                || {
+                    let effect = |tag| {
+                        let values = sequence::statement_effect(
+                            sequence::StatementEffectKind::StatisticsVoid,
+                            &[Datum::Int4(tag)],
+                            sequence::StatementEffectRetry::Restart,
                             &statement,
-                        )
-                        .unwrap();
-                } else {
-                    assert_eq!(result.unwrap(), Datum::Int4(22));
-                    assert_eq!(effect(33).unwrap(), Datum::Int4(33));
-                }
-            }
-            assert_eq!(actions.get(), 3);
-            scope.finish(guc.seq_session()).unwrap();
+                            || {
+                                actions.set(actions.get() + 1);
+                                sequence::StatementEffectAttempt {
+                                    result: Ok(statement
+                                        .alloc_slice_copy(&[Datum::Int4(tag)])
+                                        .unwrap()),
+                                    rewound_state: false,
+                                }
+                            },
+                        )?;
+                        Ok::<_, SqlError>(values[0])
+                    };
+                    for attempt in 0..2 {
+                        sequence::rewind_replay_cursor(start).unwrap();
+                        work.reset();
+                        invocations.begin_attempt();
+                        let result = call(&work, || {
+                            let _inputs = enter();
+                            let argument =
+                                value(InputSite::Query(InputQuery::Scalar), &work, || effect(11))?;
+                            crate::sql::type_input_plans::with_owner(
+                                crate::sql::type_input_plans::Owner::Backend,
+                                || {
+                                    invocations.resolve_intrinsic(
+                                        42,
+                                        &[argument],
+                                        &statement,
+                                        &work,
+                                    )
+                                },
+                            )
+                        });
+                        if attempt == 0 {
+                            assert_eq!(
+                                result.unwrap_err().sqlstate,
+                                sqlstate::INTERNAL_ROUTINE_INVOCATION
+                            );
+                            assert!(invocations.take_pending().is_some());
+                            let body = effect(22).unwrap();
+                            invocations
+                                .complete(
+                                    OwnedRoutineResult::capture_scalar(body, &statement).unwrap(),
+                                    &statement,
+                                )
+                                .unwrap();
+                        } else {
+                            assert_eq!(result.unwrap(), Datum::Int4(22));
+                            assert_eq!(effect(33).unwrap(), Datum::Int4(33));
+                        }
+                    }
+                    assert_eq!(actions.get(), 3);
+                    scope.finish(guc.seq_session()).unwrap();
+                },
+            )
         });
     }
 
@@ -1676,58 +1697,59 @@ mod tests {
         let statement = Arena::new(&mut budget, "cast input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "cast input work", 8192).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        let selections = Cell::new(0);
-        for attempt in 0..2 {
-            work.reset();
-            invocations.begin_attempt();
-            crate::mem::guard::forbid_alloc(|| {
-                let result = call(&work, || {
-                    let _input = enter();
-                    let selected = cast_definition(23, 25, Explicit, || {
-                        selections.set(selections.get() + 1);
-                        Ok(Some(captured_cast(if attempt == 0 { 111 } else { 222 })))
-                    })?
-                    .unwrap();
-                    assert_eq!(
-                        selected.definition.method,
-                        crate::storage::CastMethod::Function(111)
-                    );
-                    assert_eq!(selected.definition.created_at, 1);
-                    let absent = cast_definition(25, 23, Explicit, || {
-                        selections.set(selections.get() + 1);
-                        Ok(if attempt == 0 {
-                            None
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                let selections = Cell::new(0);
+                for attempt in 0..2 {
+                    work.reset();
+                    invocations.begin_attempt();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let result = call(&work, || {
+                            let _input = enter();
+                            let selected = cast_definition(23, 25, Explicit, || {
+                                selections.set(selections.get() + 1);
+                                Ok(Some(captured_cast(if attempt == 0 { 111 } else { 222 })))
+                            })?
+                            .unwrap();
+                            assert_eq!(
+                                selected.definition.method,
+                                crate::storage::CastMethod::Function(111)
+                            );
+                            assert_eq!(selected.definition.created_at, 1);
+                            let absent = cast_definition(25, 23, Explicit, || {
+                                selections.set(selections.get() + 1);
+                                Ok(if attempt == 0 {
+                                    None
+                                } else {
+                                    Some(captured_cast(333))
+                                })
+                            })?;
+                            assert!(absent.is_none());
+                            if attempt == 0 {
+                                Err(sql_err!(
+                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    "test cast suspension"
+                                ))
+                            } else {
+                                Ok(Datum::Int4(7))
+                            }
+                        });
+                        if attempt == 0 {
+                            assert_eq!(
+                                result.unwrap_err().sqlstate,
+                                sqlstate::INTERNAL_ROUTINE_INVOCATION
+                            );
                         } else {
-                            Some(captured_cast(333))
-                        })
-                    })?;
-                    assert!(absent.is_none());
-                    if attempt == 0 {
-                        Err(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "test cast suspension"
-                        ))
-                    } else {
-                        Ok(Datum::Int4(7))
-                    }
-                });
-                if attempt == 0 {
-                    assert_eq!(
-                        result.unwrap_err().sqlstate,
-                        sqlstate::INTERNAL_ROUTINE_INVOCATION
-                    );
-                } else {
-                    assert_eq!(result.unwrap(), Datum::Int4(7));
+                            assert_eq!(result.unwrap(), Datum::Int4(7));
+                        }
+                        assert_eq!(selections.get(), 2);
+                    });
                 }
-                assert_eq!(selections.get(), 2);
-            });
-        }
-        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
-        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+                assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+            },
+        )
     }
 
     #[test]
@@ -1738,40 +1760,48 @@ mod tests {
             let statement = Arena::new(&mut budget, "cast key statement", 16384).unwrap();
             let mut work = Arena::new(&mut budget, "cast key work", 8192).unwrap();
             let invocations = RoutineInvocationState::new(&statement);
-            let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-                &invocations,
-                &statement,
-            )));
-            for attempt in 0..2 {
-                work.reset();
-                invocations.begin_attempt();
-                crate::mem::guard::forbid_alloc(|| {
-                    let key = if attempt == 0 {
-                        (23, 25, Explicit)
-                    } else {
-                        changed_key
-                    };
-                    let result: Result<(), SqlError> = call(&work, || {
-                        let _input = enter();
-                        cast_definition(key.0, key.1, key.2, || {
-                            assert_eq!(attempt, 0, "changed keys must fail before selecting");
-                            Ok(Some(captured_cast(111)))
-                        })?;
-                        Err(sql_err!(
-                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                            "test cast suspension"
-                        ))
-                    });
-                    assert_eq!(
-                        result.unwrap_err().sqlstate,
-                        if attempt == 0 {
-                            crate::sql::eval::SqlState::known(sqlstate::INTERNAL_ROUTINE_INVOCATION)
-                        } else {
-                            crate::sql::eval::SqlState::known(sqlstate::SERIALIZATION_FAILURE)
-                        }
-                    );
-                });
-            }
+            with_routine_invocation_scope(
+                Some(RoutineInvocationContext::new(&invocations, &statement)),
+                || {
+                    for attempt in 0..2 {
+                        work.reset();
+                        invocations.begin_attempt();
+                        crate::mem::guard::forbid_alloc(|| {
+                            let key = if attempt == 0 {
+                                (23, 25, Explicit)
+                            } else {
+                                changed_key
+                            };
+                            let result: Result<(), SqlError> = call(&work, || {
+                                let _input = enter();
+                                cast_definition(key.0, key.1, key.2, || {
+                                    assert_eq!(
+                                        attempt, 0,
+                                        "changed keys must fail before selecting"
+                                    );
+                                    Ok(Some(captured_cast(111)))
+                                })?;
+                                Err(sql_err!(
+                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    "test cast suspension"
+                                ))
+                            });
+                            assert_eq!(
+                                result.unwrap_err().sqlstate,
+                                if attempt == 0 {
+                                    crate::sql::eval::SqlState::known(
+                                        sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    )
+                                } else {
+                                    crate::sql::eval::SqlState::known(
+                                        sqlstate::SERIALIZATION_FAILURE,
+                                    )
+                                }
+                            );
+                        });
+                    }
+                },
+            )
         }
     }
 
@@ -1781,21 +1811,85 @@ mod tests {
         let statement = Arena::new(&mut budget, "input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "input work", 8192).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        let effects = Cell::new(0);
-        for attempt in 0..2 {
-            work.reset();
-            invocations.begin_attempt();
-            crate::mem::guard::forbid_alloc(|| {
-                let result = call(&work, || {
-                    let _scope = enter();
-                    value(InputSite::Query(InputQuery::Scalar), &work, || {
-                        let first = value(
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                let effects = Cell::new(0);
+                for attempt in 0..2 {
+                    work.reset();
+                    invocations.begin_attempt();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let result = call(&work, || {
+                            let _scope = enter();
+                            value(InputSite::Query(InputQuery::Scalar), &work, || {
+                                let first = value(
+                                    InputSite::Call {
+                                        name: "input_effect",
+                                        kind: crate::sql::ast::CallKind::Routine,
+                                        bound_oid: None,
+                                        arity: 0,
+                                        variadic: false,
+                                    },
+                                    &work,
+                                    || {
+                                        effects.set(effects.get() + 1);
+                                        invocations.next.set(1);
+                                        Ok(Datum::Text(work.alloc_str("retained value").unwrap()))
+                                    },
+                                )?;
+                                assert_eq!(invocations.next.get(), 1);
+                                assert!(matches!(first, Datum::Text("retained value")));
+                                let second =
+                                    value(InputSite::Query(InputQuery::Exists), &work, || {
+                                        invocations.next.set(2);
+                                        if attempt == 0 {
+                                            Err(sql_err!(
+                                                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                                "test suspension"
+                                            ))
+                                        } else {
+                                            Ok(Datum::Int4(7))
+                                        }
+                                    })?;
+                                assert!(matches!(second, Datum::Int4(7)));
+                                Ok(first)
+                            })
+                        });
+                        if attempt == 0 {
+                            assert_eq!(
+                                result.unwrap_err().sqlstate,
+                                sqlstate::INTERNAL_ROUTINE_INVOCATION
+                            );
+                        } else {
+                            assert!(matches!(result.unwrap(), Datum::Text("retained value")));
+                        }
+                        assert_eq!(effects.get(), 1);
+                        assert_eq!(invocations.next.get(), 2);
+                    });
+                }
+                assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+            },
+        )
+    }
+
+    #[test]
+    fn retained_inputs_reject_a_syntax_node_replacing_an_ordinary_routine() {
+        let mut budget = Budget::new(32768);
+        let statement = Arena::new(&mut budget, "tagged input statement", 16384).unwrap();
+        let mut work = Arena::new(&mut budget, "tagged input work", 8192).unwrap();
+        let invocations = RoutineInvocationState::new(&statement);
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                let effects = Cell::new(0);
+                invocations.begin_attempt();
+                crate::mem::guard::forbid_alloc(|| {
+                    let suspended: Result<Datum<'_>, SqlError> = call(&work, || {
+                        let _scope = enter();
+                        value(
                             InputSite::Call {
-                                name: "input_effect",
+                                name: "__json_object_json",
                                 kind: crate::sql::ast::CallKind::Routine,
                                 bound_oid: None,
                                 arity: 0,
@@ -1805,108 +1899,47 @@ mod tests {
                             || {
                                 effects.set(effects.get() + 1);
                                 invocations.next.set(1);
-                                Ok(Datum::Text(work.alloc_str("retained value").unwrap()))
+                                Ok(Datum::Int4(7))
                             },
                         )?;
-                        assert_eq!(invocations.next.get(), 1);
-                        assert!(matches!(first, Datum::Text("retained value")));
-                        let second = value(InputSite::Query(InputQuery::Exists), &work, || {
-                            invocations.next.set(2);
-                            if attempt == 0 {
-                                Err(sql_err!(
-                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                                    "test suspension"
-                                ))
-                            } else {
-                                Ok(Datum::Int4(7))
-                            }
-                        })?;
-                        assert!(matches!(second, Datum::Int4(7)));
-                        Ok(first)
-                    })
-                });
-                if attempt == 0 {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "test suspension"
+                        ))
+                    });
                     assert_eq!(
-                        result.unwrap_err().sqlstate,
+                        suspended.unwrap_err().sqlstate,
                         sqlstate::INTERNAL_ROUTINE_INVOCATION
                     );
-                } else {
-                    assert!(matches!(result.unwrap(), Datum::Text("retained value")));
-                }
-                assert_eq!(effects.get(), 1);
-                assert_eq!(invocations.next.get(), 2);
-            });
-        }
-        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
-        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
-    }
-
-    #[test]
-    fn retained_inputs_reject_a_syntax_node_replacing_an_ordinary_routine() {
-        let mut budget = Budget::new(32768);
-        let statement = Arena::new(&mut budget, "tagged input statement", 16384).unwrap();
-        let mut work = Arena::new(&mut budget, "tagged input work", 8192).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        let effects = Cell::new(0);
-        invocations.begin_attempt();
-        crate::mem::guard::forbid_alloc(|| {
-            let suspended: Result<Datum<'_>, SqlError> = call(&work, || {
-                let _scope = enter();
-                value(
-                    InputSite::Call {
-                        name: "__json_object_json",
-                        kind: crate::sql::ast::CallKind::Routine,
-                        bound_oid: None,
-                        arity: 0,
-                        variadic: false,
-                    },
-                    &work,
-                    || {
-                        effects.set(effects.get() + 1);
-                        invocations.next.set(1);
-                        Ok(Datum::Int4(7))
-                    },
-                )?;
-                Err(sql_err!(
-                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                    "test suspension"
-                ))
-            });
-            assert_eq!(
-                suspended.unwrap_err().sqlstate,
-                sqlstate::INTERNAL_ROUTINE_INVOCATION
-            );
-        });
-        work.reset();
-        invocations.begin_attempt();
-        crate::mem::guard::forbid_alloc(|| {
-            let resumed = call(&work, || {
-                let _scope = enter();
-                value(
-                    InputSite::Call {
-                        name: "__json_object_json",
-                        kind: crate::sql::ast::CallKind::SqlSyntax,
-                        bound_oid: None,
-                        arity: 0,
-                        variadic: false,
-                    },
-                    &work,
-                    || {
-                        effects.set(effects.get() + 1);
-                        Ok(Datum::Int4(9))
-                    },
-                )
-            });
-            assert_eq!(
-                resumed.unwrap_err().sqlstate,
-                sqlstate::SERIALIZATION_FAILURE
-            );
-            assert_eq!(effects.get(), 1);
-        });
+                });
+                work.reset();
+                invocations.begin_attempt();
+                crate::mem::guard::forbid_alloc(|| {
+                    let resumed = call(&work, || {
+                        let _scope = enter();
+                        value(
+                            InputSite::Call {
+                                name: "__json_object_json",
+                                kind: crate::sql::ast::CallKind::SqlSyntax,
+                                bound_oid: None,
+                                arity: 0,
+                                variadic: false,
+                            },
+                            &work,
+                            || {
+                                effects.set(effects.get() + 1);
+                                Ok(Datum::Int4(9))
+                            },
+                        )
+                    });
+                    assert_eq!(
+                        resumed.unwrap_err().sqlstate,
+                        sqlstate::SERIALIZATION_FAILURE
+                    );
+                    assert_eq!(effects.get(), 1);
+                });
+            },
+        )
     }
 
     #[test]
@@ -1915,44 +1948,45 @@ mod tests {
         let statement = Arena::new(&mut budget, "nested input statement", 2048).unwrap();
         let work = Arena::new(&mut budget, "nested input scratch", 4096).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        crate::mem::guard::forbid_alloc(|| {
-            let output = call(&work, || {
-                let _inputs = enter();
-                let parent = ACTIVE_INPUT.with(Cell::get).unwrap();
-                let value = value(InputSite::Query(InputQuery::Scalar), &work, || {
-                    let _body = enter_body();
-                    let mark = work.mark();
-                    for row in 0..64 {
-                        let nested = call(&work, || {
-                            let _inputs = enter();
-                            value(InputSite::Expression(InputNode::Value), &work, || {
-                                Ok(Datum::Int4(row))
-                            })
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                crate::mem::guard::forbid_alloc(|| {
+                    let output = call(&work, || {
+                        let _inputs = enter();
+                        let parent = ACTIVE_INPUT.with(Cell::get).unwrap();
+                        let value = value(InputSite::Query(InputQuery::Scalar), &work, || {
+                            let _body = enter_body();
+                            let mark = work.mark();
+                            for row in 0..64 {
+                                let nested = call(&work, || {
+                                    let _inputs = enter();
+                                    value(InputSite::Expression(InputNode::Value), &work, || {
+                                        Ok(Datum::Int4(row))
+                                    })
+                                })?;
+                                assert!(matches!(nested, Datum::Int4(value) if value == row));
+                                assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                                // Only the copied integer escapes this nested row.
+                                unsafe { work.rewind_to(mark) };
+                            }
+                            Ok(Datum::Int4(64))
                         })?;
-                        assert!(matches!(nested, Datum::Int4(value) if value == row));
-                        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
-                        // Only the copied integer escapes this nested row.
-                        unsafe { work.rewind_to(mark) };
-                    }
-                    Ok(Datum::Int4(64))
-                })?;
-                assert_eq!(ACTIVE_INPUT.with(Cell::get), Some(parent));
-                let attempt = unsafe { &*(parent as *const InputAttempt<'_, '_>) };
-                assert_eq!(attempt.frames.borrow().len(), 1);
-                assert_eq!(attempt.next.get(), 1);
-                Ok(value)
-            })
-            .unwrap();
-            assert!(matches!(output, Datum::Int4(64)));
-            assert!(ACTIVE_INPUT.with(Cell::get).is_none());
-            assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
-            assert_eq!(invocations.inputs.saved.borrow().len(), 0);
-            assert_eq!(statement.used(), 0);
-        });
+                        assert_eq!(ACTIVE_INPUT.with(Cell::get), Some(parent));
+                        let attempt = unsafe { &*(parent as *const InputAttempt<'_, '_>) };
+                        assert_eq!(attempt.frames.borrow().len(), 1);
+                        assert_eq!(attempt.next.get(), 1);
+                        Ok(value)
+                    })
+                    .unwrap();
+                    assert!(matches!(output, Datum::Int4(64)));
+                    assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                    assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+                    assert_eq!(invocations.inputs.saved.borrow().len(), 0);
+                    assert_eq!(statement.used(), 0);
+                });
+            },
+        )
     }
 
     #[test]
@@ -1961,27 +1995,28 @@ mod tests {
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let mut work = Arena::new(&mut budget, "input work", 4096).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        invocations.begin_attempt();
-        let before = statement.used();
-        for row in 0..100 {
-            work.reset();
-            crate::mem::guard::forbid_alloc(|| {
-                let result = call(&work, || {
-                    let _scope = enter();
-                    value(InputSite::Query(InputQuery::Scalar), &work, || {
-                        Ok(Datum::Int4(row))
-                    })
-                })
-                .unwrap();
-                assert!(matches!(result, Datum::Int4(value) if value == row));
-                assert_eq!(statement.used(), before);
-                assert_eq!(invocations.inputs.saved.borrow().len(), 0);
-            });
-        }
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                invocations.begin_attempt();
+                let before = statement.used();
+                for row in 0..100 {
+                    work.reset();
+                    crate::mem::guard::forbid_alloc(|| {
+                        let result = call(&work, || {
+                            let _scope = enter();
+                            value(InputSite::Query(InputQuery::Scalar), &work, || {
+                                Ok(Datum::Int4(row))
+                            })
+                        })
+                        .unwrap();
+                        assert!(matches!(result, Datum::Int4(value) if value == row));
+                        assert_eq!(statement.used(), before);
+                        assert_eq!(invocations.inputs.saved.borrow().len(), 0);
+                    });
+                }
+            },
+        )
     }
 
     #[test]
@@ -1990,32 +2025,35 @@ mod tests {
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let work = Arena::new(&mut budget, "input work", 32768).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        crate::mem::guard::forbid_alloc(|| {
-            call(&work, || {
-                let _scope = enter();
-                for parameter in 0..crate::storage::MAX_ROUTINE_ARGUMENTS {
-                    let result = value(
-                        InputSite::Argument {
-                            routine: 42,
-                            parameter,
-                            written: Some(parameter),
-                            source: 23,
-                            target: 23,
-                        },
-                        &work,
-                        || Ok(Datum::Int4(parameter as i32)),
-                    )?;
-                    assert!(matches!(result, Datum::Int4(value) if value == parameter as i32));
-                }
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(statement.used(), 0);
-        });
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                crate::mem::guard::forbid_alloc(|| {
+                    call(&work, || {
+                        let _scope = enter();
+                        for parameter in 0..crate::storage::MAX_ROUTINE_ARGUMENTS {
+                            let result = value(
+                                InputSite::Argument {
+                                    routine: 42,
+                                    parameter,
+                                    written: Some(parameter),
+                                    source: 23,
+                                    target: 23,
+                                },
+                                &work,
+                                || Ok(Datum::Int4(parameter as i32)),
+                            )?;
+                            assert!(
+                                matches!(result, Datum::Int4(value) if value == parameter as i32)
+                            );
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(statement.used(), 0);
+                });
+            },
+        )
     }
 
     #[test]
@@ -2024,25 +2062,26 @@ mod tests {
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let work = Arena::new(&mut budget, "input work", 2048).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        crate::mem::guard::forbid_alloc(|| {
-            let raw = work.alloc_slice_copy(&[b'x'; 1024]).unwrap();
-            let text = core::str::from_utf8(raw).unwrap();
-            let result = call(&work, || {
-                let _scope = enter();
-                value(InputSite::Query(InputQuery::Scalar), &work, || {
-                    Ok(Datum::Text(text))
-                })
-            })
-            .unwrap();
-            assert!(
-                matches!(result, Datum::Text(value) if core::ptr::eq(value.as_ptr(), text.as_ptr()))
-            );
-            assert_eq!(statement.used(), 0);
-        });
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                crate::mem::guard::forbid_alloc(|| {
+                    let raw = work.alloc_slice_copy(&[b'x'; 1024]).unwrap();
+                    let text = core::str::from_utf8(raw).unwrap();
+                    let result = call(&work, || {
+                        let _scope = enter();
+                        value(InputSite::Query(InputQuery::Scalar), &work, || {
+                            Ok(Datum::Text(text))
+                        })
+                    })
+                    .unwrap();
+                    assert!(
+                        matches!(result, Datum::Text(value) if core::ptr::eq(value.as_ptr(), text.as_ptr()))
+                    );
+                    assert_eq!(statement.used(), 0);
+                });
+            },
+        )
     }
 
     #[test]
@@ -2051,73 +2090,74 @@ mod tests {
         let mut budget = Budget::new(4096);
         let statement = Arena::new(&mut budget, "input planning", 4096).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        crate::mem::guard::forbid_alloc(|| {
-            assert!(evaluation(42, Runtime).unwrap() == Runtime);
-            let context = crate::sql::eval::DefinedCastContext::Explicit;
-            assert_eq!(
-                cast_selection(23, 25, context, || Ok(Some(captured_cast(42))))
-                    .unwrap()
-                    .unwrap()
-                    .definition
-                    .method,
-                crate::storage::CastMethod::Function(42)
-            );
-            assert!(
-                cast_selection(25, 23, context, || Ok(None))
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(invocations.inputs.next.get(), 0);
-            let before = statement.used();
-            invocations.begin_attempt();
-            assert!(evaluation(42, Immutable).unwrap() == Runtime);
-            assert_eq!(
-                cast_selection(23, 25, context, || panic!(
-                    "outer planning must keep its cast"
-                ))
-                .unwrap()
-                .unwrap()
-                .definition
-                .method,
-                crate::storage::CastMethod::Function(42)
-            );
-            assert!(
-                cast_selection(25, 23, context, || panic!(
-                    "outer planning must keep builtin absence"
-                ))
-                .unwrap()
-                .is_none()
-            );
-            {
-                let _body = enter_body();
-                assert!(evaluation(42, Immutable).unwrap() == Immutable);
-                assert_eq!(
-                    cast_selection(23, 25, context, || Ok(Some(captured_cast(99))))
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                crate::mem::guard::forbid_alloc(|| {
+                    assert!(evaluation(42, Runtime).unwrap() == Runtime);
+                    let context = crate::sql::eval::DefinedCastContext::Explicit;
+                    assert_eq!(
+                        cast_selection(23, 25, context, || Ok(Some(captured_cast(42))))
+                            .unwrap()
+                            .unwrap()
+                            .definition
+                            .method,
+                        crate::storage::CastMethod::Function(42)
+                    );
+                    assert!(
+                        cast_selection(25, 23, context, || Ok(None))
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(invocations.inputs.next.get(), 0);
+                    let before = statement.used();
+                    invocations.begin_attempt();
+                    assert!(evaluation(42, Immutable).unwrap() == Runtime);
+                    assert_eq!(
+                        cast_selection(23, 25, context, || panic!(
+                            "outer planning must keep its cast"
+                        ))
                         .unwrap()
                         .unwrap()
                         .definition
                         .method,
-                    crate::storage::CastMethod::Function(99)
-                );
-            }
-            assert_eq!(
-                cast_selection(23, 25, context, || panic!(
-                    "body must not replace outer planning"
-                ))
-                .unwrap()
-                .unwrap()
-                .definition
-                .method,
-                crate::storage::CastMethod::Function(42)
-            );
-            assert!(evaluation(42, Immutable).unwrap() == Runtime);
-            assert_eq!(statement.used(), before);
-            assert_eq!(invocations.inputs.next.get(), 0);
-        });
+                        crate::storage::CastMethod::Function(42)
+                    );
+                    assert!(
+                        cast_selection(25, 23, context, || panic!(
+                            "outer planning must keep builtin absence"
+                        ))
+                        .unwrap()
+                        .is_none()
+                    );
+                    {
+                        let _body = enter_body();
+                        assert!(evaluation(42, Immutable).unwrap() == Immutable);
+                        assert_eq!(
+                            cast_selection(23, 25, context, || Ok(Some(captured_cast(99))))
+                                .unwrap()
+                                .unwrap()
+                                .definition
+                                .method,
+                            crate::storage::CastMethod::Function(99)
+                        );
+                    }
+                    assert_eq!(
+                        cast_selection(23, 25, context, || panic!(
+                            "body must not replace outer planning"
+                        ))
+                        .unwrap()
+                        .unwrap()
+                        .definition
+                        .method,
+                        crate::storage::CastMethod::Function(42)
+                    );
+                    assert!(evaluation(42, Immutable).unwrap() == Runtime);
+                    assert_eq!(statement.used(), before);
+                    assert_eq!(invocations.inputs.next.get(), 0);
+                });
+            },
+        )
     }
 
     #[test]
@@ -2126,35 +2166,36 @@ mod tests {
         let statement = Arena::new(&mut budget, "input statement", 1).unwrap();
         let work = Arena::new(&mut budget, "input work", 4096).unwrap();
         let invocations = RoutineInvocationState::new(&statement);
-        let _scope = enter_routine_invocation_scope(Some(RoutineInvocationContext::new(
-            &invocations,
-            &statement,
-        )));
-        let error = crate::mem::guard::forbid_alloc(|| {
-            call(&work, || {
-                let _scope = enter();
-                cast_definition(
-                    23,
-                    25,
-                    crate::sql::eval::DefinedCastContext::Explicit,
-                    || Ok(None),
-                )?;
-                value(InputSite::Query(InputQuery::Scalar), &work, || {
-                    Err(sql_err!(
-                        sqlstate::INTERNAL_ROUTINE_INVOCATION,
-                        "test suspension"
-                    ))
-                })
-            })
-            .unwrap_err()
-        });
-        assert_eq!(error.sqlstate, "54000");
-        assert_eq!(
-            error.message.as_str(),
-            "retained routine inputs exceed statement memory"
-        );
-        assert!(ACTIVE_INPUT.with(Cell::get).is_none());
-        assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&invocations, &statement)),
+            || {
+                let error = crate::mem::guard::forbid_alloc(|| {
+                    call(&work, || {
+                        let _scope = enter();
+                        cast_definition(
+                            23,
+                            25,
+                            crate::sql::eval::DefinedCastContext::Explicit,
+                            || Ok(None),
+                        )?;
+                        value(InputSite::Query(InputQuery::Scalar), &work, || {
+                            Err(sql_err!(
+                                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                "test suspension"
+                            ))
+                        })
+                    })
+                    .unwrap_err()
+                });
+                assert_eq!(error.sqlstate, "54000");
+                assert_eq!(
+                    error.message.as_str(),
+                    "retained routine inputs exceed statement memory"
+                );
+                assert!(ACTIVE_INPUT.with(Cell::get).is_none());
+                assert!(AVAILABLE_INPUT.with(Cell::get).is_none());
+            },
+        )
     }
 
     #[test]

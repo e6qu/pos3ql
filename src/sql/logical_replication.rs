@@ -87,14 +87,15 @@ pub(crate) fn dispatch<'a>(
         } else {
             oid
         };
-        let (invocations, statement_arena) = crate::sql::query::active_routine_invocations()
-            .ok_or_else(|| {
+        crate::sql::query::with_active_routine_invocations(|context| {
+            let (invocations, statement_arena) = context.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "pg_logical_emit_message requires a resumable query executor"
                 )
             })?;
-        invocations.resolve_intrinsic(oid, &values[..args.len()], statement_arena, arena)
+            invocations.resolve_intrinsic(oid, &values[..args.len()], statement_arena, arena)
+        })
     })())
 }
 

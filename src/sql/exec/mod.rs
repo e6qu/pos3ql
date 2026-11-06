@@ -803,9 +803,9 @@ mod projected;
 use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     compare_projected_prefix, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
-    pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
-    projected_rows_len, unpack_projected_rows,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows_into,
+    projected_row_len, projected_row_len_by, projected_row_width, projected_rows_len,
+    unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
@@ -23308,18 +23308,23 @@ fn eval_procedural_expression<'a>(
                 guc,
                 context.responder,
                 |storage, _work, sequences, invocations, _cursors| {
-                    let _scope = super::query::enter_routine_invocation_scope(Some(
-                        super::query::RoutineInvocationContext::new(invocations, arena),
-                    ));
-                    let catalog = super::query::storage_catalog(storage, arena, txid);
-                    let subqueries = super::query::ProceduralSubqueries { storage, txid };
-                    let hooks = EvalHooks {
-                        catalog: Some(&catalog),
-                        sequences: Some(sequences),
-                        subquery_executor: Some(&subqueries),
-                        ..NO_HOOKS
-                    };
-                    eval_full(expression, arena, params, row, &hooks)
+                    super::query::with_routine_invocation_scope(
+                        Some(super::query::RoutineInvocationContext::new(
+                            invocations,
+                            arena,
+                        )),
+                        || {
+                            let catalog = super::query::storage_catalog(storage, arena, txid);
+                            let subqueries = super::query::ProceduralSubqueries { storage, txid };
+                            let hooks = EvalHooks {
+                                catalog: Some(&catalog),
+                                sequences: Some(sequences),
+                                subquery_executor: Some(&subqueries),
+                                ..NO_HOOKS
+                            };
+                            eval_full(expression, arena, params, row, &hooks)
+                        },
+                    )
                 },
             )
             .map_err(|_| {

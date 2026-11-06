@@ -3,6 +3,58 @@ use crate::mem::budget::Budget;
 use crate::storage::{RoutineArgumentDef, RoutineDef, RoutineKind, RoutineResult};
 
 #[test]
+fn invocation_callback_scopes_restore_outer_owners_after_nested_and_failed_calls() {
+    let mut budget = Budget::new(2048);
+    let mut outer = Arena::new(&mut budget, "outer callback owner", 1024).unwrap();
+    let mut inner = Arena::new(&mut budget, "inner callback owner", 1024).unwrap();
+    let outer_calls = RoutineInvocationState::new(&outer);
+    let inner_calls = RoutineInvocationState::new(&inner);
+    crate::mem::guard::forbid_alloc(|| {
+        with_active_routine_invocations(|context| assert!(context.is_none()));
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&outer_calls, &outer)),
+            || {
+                with_routine_invocation_scope(None, || {
+                    with_active_routine_invocations(|context| {
+                        let (calls, arena) = context.unwrap();
+                        assert!(core::ptr::eq(calls, &outer_calls));
+                        assert!(core::ptr::eq(arena, &outer));
+                    });
+                });
+                let failed = with_routine_invocation_scope(
+                    Some(RoutineInvocationContext::new(&inner_calls, &inner)),
+                    || {
+                        with_active_routine_invocations(|context| {
+                            let (calls, arena) = context.unwrap();
+                            assert!(core::ptr::eq(calls, &inner_calls));
+                            assert!(core::ptr::eq(arena, &inner));
+                        });
+                        Err::<(), _>(sql_err!(sqlstate::DIVISION_BY_ZERO, "nested callback"))
+                    },
+                );
+                assert_eq!(failed.unwrap_err().sqlstate, "22012");
+                with_active_routine_invocations(|context| {
+                    let (calls, arena) = context.unwrap();
+                    calls.require_arena(arena).unwrap();
+                    assert!(core::ptr::eq(calls, &outer_calls));
+                });
+            },
+        );
+        outer.reset();
+        inner.reset();
+        with_active_routine_invocations(|context| assert!(context.is_none()));
+    });
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_routine_invocation_scope(
+            Some(RoutineInvocationContext::new(&outer_calls, &outer)),
+            || panic!("unwind an installed callback"),
+        );
+    }));
+    assert!(unwound.is_err());
+    with_active_routine_invocations(|context| assert!(context.is_none()));
+}
+
+#[test]
 fn bounded_consumer_stops_before_another_row_effect_and_keeps_unowned_errors() {
     crate::mem::guard::forbid_alloc(|| {
         for limit in [1, 2] {

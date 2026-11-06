@@ -101,7 +101,9 @@ types, casts and effect receipts. Preserve their input/call positions, stable
 selection errors and retained-only publication while query scratch borrows the
 parent arena. The invocation registry and its directories now keep checked
 identities and handles without borrowing the arena. Preserve whole-registry
-move/recycle/reset checks and the scoped borrows that pin active execution.
+move/recycle/reset checks and scoped callback access. No active-owner reference
+may escape a callback, and nested callbacks must restore the previous owner,
+including on errors and unwinding.
 Runtime local metadata no longer holds initializer-expression references; retain its
 resolved types and once-only declaration-order initialization. Input parameters
 seed the parameter prefix; unseeded OUT slots start as NULL before declaration

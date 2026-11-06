@@ -91,6 +91,9 @@ Carry saved control positions through scheduler returns together with live local
 values, declared types, selected source definitions, output bindings and the
 enclosing write. The separate loop-value owner must survive until those values
 are saved; preserving positions alone cannot resume a whole invocation.
+Keep saved output values independent of expression scratch, preserve the outer
+value through nested counters, and reuse capacity across repeated shadowing.
+Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
 Keep the original source image and kind when rebuilding syntax; reused parsing
 memory or a replacement function must not redirect saved positions. Preserve
 source-owner checks alongside the selected definitions and session settings.

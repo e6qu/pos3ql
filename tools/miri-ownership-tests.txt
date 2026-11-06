@@ -242,3 +242,6 @@ sql::exec::control_flow::ownership_tests::frame_layouts_outlive_syntax_and_rejec
 sql::exec::control_flow::ownership_tests::active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced
 sql::exec::control_flow::ownership_tests::row_loop_resources_release_once_on_pop_and_owner_drop
 sql::exec::control_flow::ownership_tests::resource_reservation_exhaustion_preserves_positions_and_allows_retry
+sql::exec::local_values::ownership_tests::saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled
+sql::exec::local_values::ownership_tests::saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes
+sql::exec::control_flow::ownership_tests::output_bindings_own_outer_values_through_nested_shadows_and_source_reuse

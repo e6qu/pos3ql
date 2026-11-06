@@ -20,15 +20,15 @@ impl<'syntax, 'values> Step<'syntax, 'values> {
     }
 
     pub(super) fn branch(block: TriggerBlock<'syntax>) -> Self {
-        Self::Enter(FrameEntry::new(block, Continuation::Once))
+        Self::Enter(FrameEntry::new(block, EntryState::Once))
     }
 
     pub(super) fn while_loop(program: TriggerWhile<'syntax>) -> Self {
-        Self::Enter(FrameEntry::new(program.block, Continuation::While))
+        Self::Enter(FrameEntry::new(program.block, EntryState::While))
     }
 
     pub(super) fn plain_loop(block: TriggerBlock<'syntax>) -> Self {
-        Self::Enter(FrameEntry::new(block, Continuation::Loop))
+        Self::Enter(FrameEntry::new(block, EntryState::Loop))
     }
 
     pub(super) fn protected(
@@ -37,28 +37,40 @@ impl<'syntax, 'values> Step<'syntax, 'values> {
     ) -> Self {
         Self::Enter(FrameEntry::new(
             program.protected,
-            Continuation::Protected {
-                boundary,
-                releasing: false,
-            },
+            EntryState::Protected(boundary),
         ))
     }
 }
 
 pub(super) struct FrameEntry<'syntax, 'values> {
     block: TriggerBlock<'syntax>,
-    continuation: Continuation,
-    resource: FrameResource<'values>,
+    state: EntryState<'values>,
 }
 
 impl<'syntax, 'values> FrameEntry<'syntax, 'values> {
-    fn new(block: TriggerBlock<'syntax>, continuation: Continuation) -> Self {
-        Self {
-            block,
-            continuation,
-            resource: FrameResource::Empty,
-        }
+    fn new(block: TriggerBlock<'syntax>, state: EntryState<'values>) -> Self {
+        Self { block, state }
     }
+}
+
+// Entry owns a loop's resource together with its position. Only the exhaustive
+// split at push can publish them into separate indexed storage.
+enum EntryState<'a> {
+    Once,
+    While,
+    Loop,
+    Numeric {
+        position: NumericLoop,
+        workspace: NumericLoopWorkspace<'a>,
+        prior_target: Datum<'a>,
+    },
+    Rows {
+        target: SqlName,
+        values: super::loop_rows::LoopRows,
+        index: usize,
+    },
+    Protected(TriggerSubtransaction),
+    Handler(CaughtDiagnostic),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,12 +245,46 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             self.resources[self.state.active],
             FrameResource::Empty
         ));
-        self.resources[self.state.active] = entry.resource;
+        let (continuation, resource) = match entry.state {
+            EntryState::Once => (Continuation::Once, FrameResource::Empty),
+            EntryState::While => (Continuation::While, FrameResource::Empty),
+            EntryState::Loop => (Continuation::Loop, FrameResource::Empty),
+            EntryState::Numeric {
+                position,
+                workspace,
+                prior_target,
+            } => (
+                Continuation::Numeric(position),
+                FrameResource::Numeric {
+                    workspace,
+                    prior_target,
+                },
+            ),
+            EntryState::Rows {
+                target,
+                values,
+                index,
+            } => (
+                Continuation::Rows { target, index },
+                FrameResource::Rows(values),
+            ),
+            EntryState::Protected(boundary) => (
+                Continuation::Protected {
+                    boundary,
+                    releasing: false,
+                },
+                FrameResource::Empty,
+            ),
+            EntryState::Handler(diagnostic) => {
+                (Continuation::Handler(diagnostic), FrameResource::Empty)
+            }
+        };
+        self.resources[self.state.active] = resource;
         self.slots[self.state.active] = Some(Frame {
             block: self.program.index(entry.block),
             next: 0,
             source,
-            continuation: entry.continuation,
+            continuation,
             resource: (),
         });
         self.state.active += 1;
@@ -246,10 +292,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
 
     fn start(&mut self, block: TriggerBlock<'_>) {
         assert_eq!(self.state.active, 0);
-        self.push(
-            FrameEntry::new(block, Continuation::Once),
-            FrameSource::Root,
-        );
+        self.push(FrameEntry::new(block, EntryState::Once), FrameSource::Root);
     }
 
     fn enter(&mut self, entry: FrameEntry<'_, 'a>) {
@@ -392,6 +435,7 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
+    arena: &Arena,
 ) -> Result<Step<'syntax, 'a>, SqlError> {
     if if reverse {
         lower < upper
@@ -426,36 +470,31 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
     workspace.values[..count].fill(Datum::Null);
     workspace.values[..locals.len()].copy_from_slice(&values[..locals.len()]);
     let prior_target = workspace.values[target];
-    if let Err(error) = status.shadow_output_local(target) {
+    if let Err(error) = status.shadow_output_local(target, prior_target, arena) {
         status.numeric_frames.restore(workspace);
         return Err(error);
     }
     workspace.values[target] = Datum::Int4(lower);
-    Ok(Step::Enter(FrameEntry {
-        block: program.block,
-        continuation: Continuation::Numeric(NumericLoop {
-            count,
-            target,
-            value: lower,
-            upper,
-            step,
-            reverse,
-        }),
-        resource: FrameResource::Numeric {
+    Ok(Step::Enter(FrameEntry::new(
+        program.block,
+        EntryState::Numeric {
+            position: NumericLoop {
+                count,
+                target,
+                value: lower,
+                upper,
+                step,
+                reverse,
+            },
             workspace,
             prior_target,
         },
-    }))
+    )))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "row loop entry preserves source cardinality and its complete local scope"
-)]
 pub(super) fn start_row_loop<'syntax, 'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     program: TriggerFor<'syntax>,
-    target: usize,
     rows: super::loop_rows::LoopRows,
     query_source: bool,
     locals: &[TriggerLocalDecl],
@@ -469,22 +508,20 @@ pub(super) fn start_row_loop<'syntax, 'a>(
         drop(rows);
         if let Some(empty) = empty {
             assign_trigger_local(context, locals, values, program.target, empty)?;
-            status.assign_output_local(target, values[target]);
         }
         status.set_found(false);
         return Ok(Step::complete());
     }
     let value = rows.value(0, context.arena)?;
     assign_trigger_local(context, locals, values, program.target, value)?;
-    status.assign_output_local(target, values[target]);
-    Ok(Step::Enter(FrameEntry {
-        block: program.block,
-        continuation: Continuation::Rows {
+    Ok(Step::Enter(FrameEntry::new(
+        program.block,
+        EntryState::Rows {
             target: program.target,
             index: 0,
+            values: rows,
         },
-        resource: FrameResource::Rows(rows),
-    }))
+    )))
 }
 
 #[expect(
@@ -627,9 +664,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     if index + 1 < rows.len() {
                         let value = rows.value(index + 1, context.arena)?;
                         let (scope, scope_values) = frames.scope(locals, values);
-                        let local = trigger_local_index(scope, target)?;
                         assign_trigger_local(context, scope, scope_values, target, value)?;
-                        status.assign_output_local(local, scope_values[local]);
                         let frame = frames.last_mut();
                         let Continuation::Rows { index, .. } = &mut frame.continuation else {
                             unreachable!("row-loop frame")
@@ -742,7 +777,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 };
                 match catch_diagnostic(context, invocation, &error, &mut frames.state.diagnostics) {
                     Ok(caught) => frames.push(
-                        FrameEntry::new(handler.block, Continuation::Handler(caught)),
+                        FrameEntry::new(handler.block, EntryState::Handler(caught)),
                         FrameSource::Handler,
                     ),
                     Err(error) => pending_error = Some(error),

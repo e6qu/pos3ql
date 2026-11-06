@@ -793,6 +793,7 @@ pub(crate) use describe::{describe_data_modification_columns, describe_returning
 
 mod control_flow;
 mod diagnostics;
+mod local_values;
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
@@ -17950,10 +17951,9 @@ struct TriggerExceptionBinding<'a> {
     scope: PlpgsqlScope,
 }
 
-#[derive(Clone, Copy)]
-struct OutputBinding<'a> {
+struct OutputBinding {
     local: usize,
-    value: Datum<'a>,
+    value: local_values::SavedValue,
     shadow_depth: u8,
 }
 
@@ -17966,7 +17966,7 @@ struct TriggerExecutionStatus<'a> {
     found: Option<bool>,
     row_count: i64,
     set_result: Option<PlpgsqlSetResult>,
-    outputs: &'a mut [OutputBinding<'a>],
+    outputs: crate::mem::arena::OwnedArenaSlice<'a, OutputBinding>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -17986,9 +17986,9 @@ impl<'a> TriggerExecutionStatus<'a> {
             row_count: 0,
             set_result: None,
             outputs: arena
-                .alloc_slice_with(output_count, |_| OutputBinding {
+                .alloc_owned_slice_with(output_count, |_| OutputBinding {
                     local: 0,
-                    value: Datum::Null,
+                    value: local_values::SavedValue::new(),
                     shadow_depth: 0,
                 })
                 .map_err(|_| {
@@ -18003,29 +18003,32 @@ impl<'a> TriggerExecutionStatus<'a> {
         self.set_result = Some(result);
     }
 
-    fn set_output_locals(&mut self, locals: &[usize], values: &[Datum<'a>]) {
+    fn set_output_locals(&mut self, locals: &[usize], local_count: usize) {
         assert_eq!(
             self.outputs.len(),
             locals.len(),
             "declared output-variable capacity"
         );
+        assert!(
+            locals.iter().all(|index| *index < local_count),
+            "output local position"
+        );
         for (output, local) in self.outputs.iter_mut().zip(locals.iter().copied()) {
             output.local = local;
-            output.value = values[local];
         }
     }
 
-    fn assign_output_local(&mut self, local: usize, value: Datum<'a>) {
-        for output in self.outputs.iter_mut() {
-            if output.local == local && output.shadow_depth == 0 {
-                output.value = value;
-            }
-        }
-    }
-
-    fn shadow_output_local(&mut self, local: usize) -> Result<(), SqlError> {
+    fn shadow_output_local(
+        &mut self,
+        local: usize,
+        value: Datum<'_>,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
         for output in self.outputs.iter_mut() {
             if output.local == local {
+                if output.shadow_depth == 0 {
+                    output.value.replace(value, arena)?;
+                }
                 output.shadow_depth = output.shadow_depth.checked_add(1).ok_or_else(|| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -21921,7 +21924,10 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &seeded[..seeded_count],
         local_values,
     )?;
-    status.set_output_locals(&output_local_indices[..output_columns.len()], local_values);
+    status.set_output_locals(
+        &output_local_indices[..output_columns.len()],
+        local_values.len(),
+    );
     let mut no_new = None;
     match execute_trigger_block(
         &mut context,
@@ -26816,8 +26822,8 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             Ok(None)
         }),
         TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
-            context
-                .arena
+            let output_source = context.arena;
+            output_source
                 .with_remaining_region(|arena| {
                     let host = context.host.reborrow();
                     let mut context = TriggerExecContext {
@@ -26860,16 +26866,19 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                                     .map_err(|_| super::query::arena_full_pub())?,
                             }
                         }
-                        None => arena
-                            .alloc_slice_with(status.outputs.len(), |index| {
-                                let output = &status.outputs[index];
-                                if output.shadow_depth == 0 {
+                        None => {
+                            let values = arena
+                                .alloc_slice_with(status.outputs.len(), |_| Datum::Null)
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            for (value, output) in values.iter_mut().zip(status.outputs.iter()) {
+                                *value = if output.shadow_depth == 0 {
                                     local_values[output.local]
                                 } else {
-                                    output.value
-                                }
-                            })
-                            .map_err(|_| super::query::arena_full_pub())?,
+                                    output.value.read(output_source, arena)?
+                                };
+                            }
+                            values
+                        }
                     };
                     status.emit_set_row(values, arena)?;
                     Ok(None)
@@ -27086,8 +27095,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             let value = eval_procedural_expression(context, assignment.expression, &scope)?;
             if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
-                let local = trigger_local_index(locals, assignment.name)?;
-                status.assign_output_local(local, local_values[local]);
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
                 status.found = match cast_to(value, ColType::Bool, context.arena)? {
                     Datum::Bool(value) => Some(value),
@@ -27271,7 +27278,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                             statement.variable,
                             Datum::Text(name),
                         )?;
-                        status.assign_output_local(local, local_values[local]);
                     }
 
                     Ok(())
@@ -27465,8 +27471,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                                 target,
                                 values[index],
                             )?;
-                            let assigned = trigger_local_index(locals, target)?;
-                            status.assign_output_local(assigned, local_values[assigned]);
                         }
                     }
                     status.set_rows(count as u64)?;
@@ -28644,6 +28648,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     locals,
                     local_values,
                     status,
+                    context.arena,
                 )
             } else {
                 let target = trigger_local_index(locals, program.target)?;
@@ -28832,7 +28837,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 control_flow::start_row_loop(
                     context,
                     program,
-                    target,
                     values,
                     query_source,
                     locals,
@@ -29187,7 +29191,6 @@ fn cursor_statement_effect<'s, 'a, 'b>(
             ));
         }
         local_values[local] = result[7 + at * 2];
-        status.assign_output_local(local, local_values[local]);
     }
     cursor_effect_result(result)?;
     Ok(None)

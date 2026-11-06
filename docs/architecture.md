@@ -257,6 +257,18 @@ copies back assignments while restoring the shadowed counter. Returning
 the frame clears references into completed temporary work. These frames remain
 inside the existing statement arena; `54000` names insufficient capacity.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
+When a loop counter shadows a named output, the outer output value is saved as
+typed bytes in a reusable statement-arena buffer. Nested counters keep the same
+saved value; leaving the outer counter restores normal output lookup. For
+example, `RETURN NEXT` inside `FOR answer IN 1..2` returns the function's text
+output `answer`, while expressions in that loop see its integer counter.
+Saved outputs retain record names/types, nulls and array bounds without borrowing
+the expression's scratch. Growing a buffer reserves its replacement before
+publication; failed sizing or reservation preserves the previous value.
+Repeated entries reuse capacity based on the largest value, rather than the
+number of assignments. `54000` names saved-value statement memory on exhaustion.
+The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-saved-output-scopes/README.md)
+records repeated and nested counters, caught errors and typed outputs.
 Runtime local declarations contain names, resolved types and flags, without
 references to initializer expressions. The compiled program owns those
 expressions separately; initialization seeds parameters first, then evaluates
@@ -304,7 +316,9 @@ original body and program kind use an immutable, checked source image. Parsed
 blocks belong to a separate compiled view. Mutable frame metadata uses checked
 arena handles and retains no references to syntax or loop-value buffers. Loop
 buffers and materialized rows have a separate, uniquely paired directory whose
-scoped owner releases its values. Binding a view checks the source, metadata
+scoped owner releases its values. An entry owns its control data and required
+resource in one enum before publishing them to their indexed slots.
+Binding a view checks the source, metadata
 arena and directory identity before entering the body. A replaced, foreign or reset source
 returns `40001`; source-image exhaustion names its statement-memory limit with
 `54000`. Rebuilding syntax from that image keeps the original body after parsing
@@ -332,7 +346,7 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-Numeric workspaces and local values still borrow statement memory;
+Numeric workspaces and ordinary local values still borrow statement memory;
 saved control positions, source images and diagnostics do not yet let the whole invocation survive
 returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in

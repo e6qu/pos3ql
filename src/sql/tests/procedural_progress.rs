@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn saved_output_scopes_reuse_values_and_preserve_nested_caught_and_typed_outputs() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("saved-output-scopes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!("../../../tests/external/differential/261_saved_output_scopes.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "1537|384|384|1|1536|1181952",
+                "initial|7",
+                "initial|7",
+                "NULL|7",
+                "outer|[-2:-1]={7,NULL}|-2|1",
+                "outer|[-2:-1]={7,NULL}|-2|2",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn parameter_names_and_shadowed_locals_preserve_input_and_output_scopes() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

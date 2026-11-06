@@ -70,6 +70,87 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
 }
 
 #[test]
+fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
+    let mut budget = Budget::new(128 << 10);
+    let source = Arena::new(&mut budget, "output binding source", 16 << 10).unwrap();
+    let parsing = Arena::new(&mut budget, "output binding syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "output binding state", 16 << 10).unwrap();
+    let mut temporary = Arena::new(&mut budget, "output binding value", 16 << 10).unwrap();
+    let output = Arena::new(&mut budget, "output binding copies", 16 << 10).unwrap();
+    let (_, code) = parse_owned_program(
+        "BEGIN NULL; END",
+        &parsing,
+        &source,
+        PlpgsqlProgramKind::Anonymous,
+    )
+    .unwrap();
+    let locals = [TriggerLocalDecl {
+        name: SqlName::parse("value").unwrap(),
+        ctype: ColType::Text,
+        ..empty_plpgsql_local()
+    }];
+    let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 1).unwrap();
+    status.set_output_locals(&[0], locals.len());
+    crate::mem::guard::forbid_alloc(|| {
+        let text = temporary.alloc_str("original output").unwrap();
+        status
+            .shadow_output_local(0, Datum::Text(text), &workspace)
+            .unwrap();
+        let used = workspace.used();
+        status
+            .shadow_output_local(0, Datum::Int4(7), &workspace)
+            .unwrap();
+        assert_eq!(workspace.used(), used);
+        assert_eq!(status.outputs[0].shadow_depth, 2);
+    });
+    temporary.reset();
+    crate::mem::guard::forbid_alloc(|| {
+        temporary.alloc_slice_with(2048, |_| 0xffu8).unwrap();
+        let first = status.outputs[0].value.read(&workspace, &output).unwrap();
+        assert_eq!(first, Datum::Text("original output"));
+        status.unshadow_output_local(0);
+        assert_eq!(status.outputs[0].shadow_depth, 1);
+        assert_eq!(
+            status.outputs[0].value.read(&workspace, &output).unwrap(),
+            first
+        );
+        status.unshadow_output_local(0);
+        let error = status
+            .shadow_output_local(0, Datum::Null, &source)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "XX000");
+        assert_eq!(status.outputs[0].shadow_depth, 0);
+        let used = workspace.used();
+        for _ in 0..u8::MAX {
+            status
+                .shadow_output_local(0, Datum::Null, &workspace)
+                .unwrap();
+        }
+        assert_eq!(
+            status
+                .shadow_output_local(0, Datum::Int4(9), &workspace)
+                .unwrap_err()
+                .sqlstate,
+            "54000"
+        );
+        assert_eq!(status.outputs[0].shadow_depth, u8::MAX);
+        assert!(
+            status.outputs[0]
+                .value
+                .read(&workspace, &output)
+                .unwrap()
+                .is_null()
+        );
+        assert_eq!(workspace.used(), used);
+        assert_eq!(first, Datum::Text("original output"));
+        for _ in 0..u8::MAX {
+            status.unshadow_output_local(0);
+        }
+        assert_eq!(status.outputs[0].shadow_depth, 0);
+    });
+}
+
+#[test]
 fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     let mut budget = Budget::new(1 << 18);
     let parse = Arena::new(&mut budget, "procedural numeric positions parsing", 1 << 16).unwrap();
@@ -119,6 +200,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 &locals,
                 &values,
                 &mut status,
+                &arena,
             )
             .unwrap() else {
                 panic!("numeric frame")
@@ -138,6 +220,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 scope,
                 current,
                 &mut status,
+                &arena,
             )
             .unwrap() else {
                 panic!("nested frame")
@@ -229,6 +312,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
                 &locals,
                 &values,
                 &mut status,
+                &workspace,
             )
             .unwrap() else {
                 panic!("numeric loop entry")
@@ -239,7 +323,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             let TriggerStatement::While(program) = program.block.statements[0] else {
                 panic!("while loop")
             };
-            frames.enter(FrameEntry::new(program.block, Continuation::While));
+            frames.enter(FrameEntry::new(program.block, EntryState::While));
             frames.last_mut().next = 1;
             assert_eq!(frames.state.active, 3);
             assert!(matches!(
@@ -426,14 +510,14 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                     },
                 )
                 .unwrap();
-                frames.enter(FrameEntry {
+                frames.enter(FrameEntry::new(
                     block,
-                    continuation: Continuation::Rows {
+                    EntryState::Rows {
                         target: SqlName::parse("x").unwrap(),
                         index: 0,
+                        values: rows,
                     },
-                    resource: FrameResource::Rows(rows),
-                });
+                ));
                 assert!(pool.lease::<u8>(4096).is_err());
                 if pop {
                     let exited = frames.pop();
@@ -484,12 +568,12 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             .capture(&arena, &error, None, "handler")
             .unwrap();
         frames.push(
-            FrameEntry::new(handler, Continuation::Handler(diagnostic)),
+            FrameEntry::new(handler, EntryState::Handler(diagnostic)),
             FrameSource::Handler,
         );
         frames.enter(FrameEntry::new(
             branches.branches[0].block,
-            Continuation::Once,
+            EntryState::Once,
         ));
         assert_eq!(
             frames
@@ -545,7 +629,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
             panic!("while program")
         };
         frames.start(program.body);
-        frames.enter(FrameEntry::new(while_program.block, Continuation::While));
+        frames.enter(FrameEntry::new(while_program.block, EntryState::While));
         frames.last_mut().next = 1;
         let frame = frames.pop();
         let position = (code.layout(), frame.block, frame.next, frame.source);

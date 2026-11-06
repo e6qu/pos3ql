@@ -91,6 +91,9 @@ Finish the saved owners for local values and the enclosing write. Pending calls
 now keep arguments and selected type contracts through checked,
 address-independent handles; preserve their stale-owner checks and explicit
 copy into execution memory while completing the other invocation phases.
+Completed scalar and row results also own encoded values and effect receipts
+through checked handles. Preserve random-access call positions, empty results,
+nested record types and the old directory when a larger directory cannot fit.
 Runtime local metadata no longer holds initializer-expression references; retain its
 resolved types and once-only declaration-order initialization. Input parameters
 seed the parameter prefix; unseeded OUT slots start as NULL before declaration

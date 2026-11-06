@@ -25,6 +25,8 @@ use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
 pub(super) mod input_progress;
+mod invocation_results;
+use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::RetainedSelect;
 
@@ -1324,22 +1326,13 @@ impl<'a> RoutineResultShape<'a> {
     }
 }
 
-/// A completed routine invocation is either a scalar expression value or the
-/// encoded rows of a table source. Keeping the two contracts distinct prevents
-/// a restart from ever interpreting one as the other.
-#[derive(Clone, Copy)]
-enum RoutineInvocationResult<'a> {
-    Scalar(Datum<'a>, super::sequence::StatementReplayCursor),
-    Rows(&'a [&'a [u8]], super::sequence::StatementReplayCursor),
-}
-
 pub(crate) struct RoutineInvocationState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     arena: &'a Arena,
-    results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
+    results: RefCell<RoutineResults>,
     inputs: input_progress::RoutineInputs<'a>,
 }
 
@@ -1456,7 +1449,7 @@ impl<'a> RoutineInvocationState<'a> {
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
             arena,
-            results: RefCell::new(ArenaList::new_persistent(arena)),
+            results: RefCell::new(RoutineResults::new()),
             inputs: input_progress::RoutineInputs::new(arena),
         }
     }
@@ -1485,7 +1478,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
             let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().as_slice()[ordinal]
+                self.results.borrow().get(self.arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1493,7 +1486,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
+            return Ok(Some(value.scalar(self.arena, query_arena)?));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1532,7 +1525,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
             let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().as_slice()[ordinal]
+                self.results.borrow().get(self.arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1540,7 +1533,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return super::exec::detach_routine_datum(value, query_arena);
+            return value.scalar(self.arena, query_arena);
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1563,20 +1556,15 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.replace(None)
     }
 
-    pub(crate) fn complete(&self, result: Datum<'a>) -> Result<(), SqlError> {
+    pub(crate) fn complete(&self, result: Datum<'_>) -> Result<(), SqlError> {
         let ordinal = self.completed.get();
-        self.results
-            .borrow_mut()
-            .push(RoutineInvocationResult::Scalar(
-                result,
+        self.results.borrow_mut().push(
+            self.arena,
+            RoutineInvocationResult::Scalar(
+                invocation_results::ResultBytes::capture_scalar(result, self.arena)?,
                 super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ))
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "mutable routine replay exceeds statement memory"
-                )
-            })?;
+            ),
+        )?;
         self.completed.set(ordinal + 1);
         Ok(())
     }
@@ -1593,7 +1581,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
             let RoutineInvocationResult::Rows(rows, replay) =
-                self.results.borrow().as_slice()[ordinal]
+                self.results.borrow().get(self.arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1601,7 +1589,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return Ok(Some(rows));
+            return Ok(Some(rows.rows(self.arena, statement_arena)?));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1629,20 +1617,15 @@ impl<'a> RoutineInvocationState<'a> {
         ))
     }
 
-    pub(crate) fn complete_rows(&self, rows: &'a [&'a [u8]]) -> Result<(), SqlError> {
+    pub(crate) fn complete_rows(&self, rows: &[&[u8]]) -> Result<(), SqlError> {
         let ordinal = self.completed.get();
-        self.results
-            .borrow_mut()
-            .push(RoutineInvocationResult::Rows(
-                rows,
+        self.results.borrow_mut().push(
+            self.arena,
+            RoutineInvocationResult::Rows(
+                invocation_results::ResultBytes::capture_rows(rows, self.arena)?,
                 super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ))
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "mutable routine replay exceeds statement memory"
-                )
-            })?;
+            ),
+        )?;
         self.completed.set(ordinal + 1);
         Ok(())
     }

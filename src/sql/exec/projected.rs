@@ -49,13 +49,25 @@ pub(crate) fn pack_projected_rows<'a>(
     rows: &[&[u8]],
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
+    let len = projected_rows_len(rows)?;
+    let output = arena.alloc_slice_with(len, |_| 0_u8).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine rows exceed statement memory"
+        )
+    })?;
+    pack_projected_rows_into(rows, output)?;
+    Ok(output)
+}
+
+pub(crate) fn projected_rows_len(rows: &[&[u8]]) -> Result<usize, SqlError> {
     let full = || {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "routine rows exceed statement memory"
         )
     };
-    let count = u64::try_from(rows.len()).map_err(|_| full())?;
+    u64::try_from(rows.len()).map_err(|_| full())?;
     let mut len = 8_usize;
     for row in rows {
         len = len
@@ -63,17 +75,33 @@ pub(crate) fn pack_projected_rows<'a>(
             .and_then(|len| len.checked_add(row.len()))
             .ok_or_else(full)?;
     }
-    let output = arena.alloc_slice_with(len, |_| 0_u8).map_err(|_| full())?;
+    Ok(len)
+}
+
+pub(crate) fn pack_projected_rows_into(rows: &[&[u8]], output: &mut [u8]) -> Result<(), SqlError> {
+    let len = projected_rows_len(rows)?;
+    if output.len() < len {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine rows exceed destination memory"
+        ));
+    }
+    let count = u64::try_from(rows.len()).expect("projected_rows_len checked row count");
     output[..8].copy_from_slice(&count.to_le_bytes());
     let mut at = 8;
     for row in rows {
-        let size = u64::try_from(row.len()).map_err(|_| full())?;
+        let size = u64::try_from(row.len()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine row exceeds addressable size"
+            )
+        })?;
         output[at..at + 8].copy_from_slice(&size.to_le_bytes());
         at += 8;
         output[at..at + row.len()].copy_from_slice(row);
         at += row.len();
     }
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn unpack_projected_rows<'a>(

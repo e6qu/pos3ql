@@ -198,6 +198,14 @@ encoded arguments into its own temporary memory. That extra live copy counts
 against the existing statement capacity and reports `54000` if it does not fit.
 This owns the call's inputs, while the enclosing invocation log, running body
 and write still need complete ownership across a scheduler return.
+Completed scalar values and table-source rows keep their encoded bytes in
+checked arena allocations too. Their result directory stores handles and effect
+receipts, rather than references to returned values or row slices. For example,
+a function returning `ROW('saved text')` keeps the field's name, type and text
+after its body memory is reused. Reading a saved result copies it into the
+consumer's arena; table results also rebuild their row directory there. Both
+copies count against statement memory. Directory growth reserves its replacement
+before publishing it; exhaustion keeps every previous result readable.
 Nested SQL queries, including a `ts_rewrite` rule query, have their own input
 scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested

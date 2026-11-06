@@ -245,3 +245,44 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
         );
     });
 }
+
+#[test]
+fn completed_invocations_keep_values_after_the_body_source_is_released() {
+    let mut budget = Budget::new(32 << 10);
+    let statement = Arena::new(&mut budget, "completed invocation log", 16 << 10).unwrap();
+    let mut work = Arena::new(&mut budget, "completed invocation body", 16 << 10).unwrap();
+    let invocations = RoutineInvocationState::new(&statement);
+    crate::mem::guard::forbid_alloc(|| {
+        work.with_remaining_region(|body| {
+            let name = body.alloc_str("body_value").unwrap();
+            let text = body.alloc_str("only the saved result owns this").unwrap();
+            let fields = body
+                .alloc_slice_copy(&[super::super::types::RecordField {
+                    name,
+                    type_oid: super::super::types::oid::TEXT,
+                    value: Datum::Text(text),
+                }])
+                .unwrap();
+            invocations.complete(Datum::Record(fields)).unwrap();
+        })
+        .unwrap();
+        for _ in 0..8 {
+            work.reset();
+            work.alloc_str("replacement body and parsing bytes")
+                .unwrap();
+            invocations.begin_attempt();
+            let Datum::Record(fields) = invocations
+                .resolve_intrinsic(42, &[], &statement, &work)
+                .unwrap()
+            else {
+                panic!("retained routine record");
+            };
+            assert_eq!(fields[0].name, "body_value");
+            assert_eq!(fields[0].type_oid, super::super::types::oid::TEXT);
+            assert_eq!(
+                fields[0].value,
+                Datum::Text("only the saved result owns this")
+            );
+        }
+    });
+}

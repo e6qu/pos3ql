@@ -137,6 +137,9 @@ errors. Keep live-call control ownership separate from shared cached plans and
 row payloads. Preserve shared-pool admission before initializer effects and
 return position, numeric-scope and output-binding capacity on failure or owner drop,
 independently of table count. Keep saved output bytes separate from their metadata.
+Keep file, generated and embedded test configurations explicit and complete;
+capacity regressions must reach their intended limit rather than an earlier
+missing-setting error.
 Existing checked-plan and stored-object tests remain required;
 [reference evidence](https://github.com/e6qu/pos3ql/blob/2303cd158bc419ef508089b87c13537f86c05210/tests/external/reference/2026-11-03-input-plans/README.md)
 retains the PostgreSQL observations and their provenance. Cold-recovery tests

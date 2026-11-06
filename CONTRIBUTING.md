@@ -92,6 +92,11 @@ the Rust code compiles and passes lint, with warnings treated as failures. Build
 matrices start only after both checks pass, so one compiler error does not
 launch dozens of copies of the same failing build.
 
+When adding a required configuration setting, update file samples, generators
+and embedded test configuration strings, including those outside `config.rs`.
+Capacity tests must reach the intended limit and print the actual error when
+its diagnostic differs; an earlier missing-setting error is not limit coverage.
+
 Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
 CI uses `gdb` to print every thread's stack if a native test crashes. It runs
 the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,

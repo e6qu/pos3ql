@@ -3,7 +3,7 @@
 No known defects are blocked by an external dependency or an intractable problem.
 
 Fix reproducible defects in the PR that finds them, including incidental defects
-and resource-ownership or admission failures in saved execution state.
+and resource-ownership, admission or configuration-fixture failures.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.

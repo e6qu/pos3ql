@@ -97,7 +97,9 @@ nested record types and the old directory when a larger directory cannot fit.
 Saved input frames now keep checked handles for values, names, defaults, selected
 types, casts and effect receipts. Preserve their input/call positions, stable
 selection errors and retained-only publication while query scratch borrows the
-parent arena. The input registry's directories still borrow their owning arena.
+parent arena. The invocation registry and its directories now keep checked
+identities and handles without borrowing the arena. Preserve whole-registry
+move/recycle/reset checks and the scoped borrows that pin active execution.
 Runtime local metadata no longer holds initializer-expression references; retain its
 resolved types and once-only declaration-order initialization. Input parameters
 seed the parameter prefix; unseeded OUT slots start as NULL before declaration

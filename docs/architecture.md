@@ -196,8 +196,8 @@ arena or recycling its temporary front; reset or a different arena rejects
 them with an internal error before reading their bytes. Execution copies the
 encoded arguments into its own temporary memory. That extra live copy counts
 against the existing statement capacity and reports `54000` if it does not fit.
-This owns the call's inputs, while the enclosing invocation log, running body
-and write still need complete ownership across a scheduler return.
+This owns the call's inputs. The running body and enclosing write still need
+complete ownership across a scheduler return.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,
@@ -211,8 +211,13 @@ type signatures, selected casts, dependencies and effect receipts. A new attempt
 rebuilds temporary metadata views; an already encoded value is copied only when
 the consumer reads it. Stale input selections return `40001` before choosing a
 replacement function or cast. Publishing a suspension uses the arena's retained
-tail, including while a row scan borrows its temporary front. The registry's
-directories still borrow the owning arena and are part of the remaining work.
+tail, including while a row scan borrows its temporary front. The invocation log
+and its sorted input directories store an arena identity and checked handles,
+with no borrowed metadata or values. Moving the log together with its arena
+preserves saved inputs, results and selected casts; resetting that arena rejects
+the old log. Temporary execution scopes borrow both owners so neither can move
+while a scan callback uses them. The result directory's published length is the
+completed-call count, avoiding a separate counter that could disagree.
 Nested SQL queries, including a `ts_rewrite` rule query, have their own input
 scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested

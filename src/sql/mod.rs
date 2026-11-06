@@ -15278,7 +15278,7 @@ impl Engine {
             &Storage,
             &Arena,
             &dyn SequenceAccess,
-            &query::RoutineInvocationState<'frame>,
+            &query::RoutineInvocationState,
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
@@ -15576,7 +15576,7 @@ impl Engine {
     fn complete_pending_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation,
-        invocations: &query::RoutineInvocationState<'a>,
+        invocations: &query::RoutineInvocationState,
         arena: &'a Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -15636,7 +15636,7 @@ impl Engine {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
                     };
-                    return Ok(invocations.complete(value));
+                    return Ok(invocations.complete(value, arena));
                 }
             };
             let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
@@ -15728,13 +15728,13 @@ impl Engine {
                     Ok(rows) => rows,
                     Err(error) => return Ok(Err(error)),
                 };
-                return Ok(invocations.complete_rows(rows));
+                return Ok(invocations.complete_rows(rows, arena));
             }
             let value = match exec::decode_projected_col_record(encoded, 0, arena) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
-            Ok(invocations.complete(value))
+            Ok(invocations.complete(value, arena))
         });
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
@@ -15761,7 +15761,7 @@ impl Engine {
         params: &[Datum],
         txn: &mut TxnState,
         guc: &GucState,
-        invocations: Option<&'statement query::RoutineInvocationState<'statement>>,
+        invocations: Option<&'statement query::RoutineInvocationState>,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let _routine_invocation_scope = query::enter_routine_invocation_scope(

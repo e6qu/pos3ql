@@ -61,67 +61,24 @@ pub(super) enum RoutineInvocationResult {
     Rows(ResultBytes, super::super::sequence::StatementReplayCursor),
 }
 
-pub(super) struct RoutineResults {
-    entries: Option<ArenaSliceHandle<RoutineInvocationResult>>,
-    len: usize,
+pub(super) type RoutineResults = crate::mem::arena::RetainedList<RoutineInvocationResult>;
+
+pub(super) fn directory_error(error: crate::mem::arena::RetainedListError) -> SqlError {
+    match error {
+        crate::mem::arena::RetainedListError::Capacity(_) => full(),
+        crate::mem::arena::RetainedListError::Storage(_) => inactive(),
+    }
 }
 
-impl RoutineResults {
-    pub(super) const fn new() -> Self {
-        Self {
-            entries: None,
-            len: 0,
-        }
-    }
-
-    pub(super) fn get(
-        &self,
-        arena: &Arena,
-        index: usize,
-    ) -> Result<RoutineInvocationResult, SqlError> {
-        if index >= self.len {
-            return Err(inactive());
-        }
-        let entries = arena
-            .retained_slice_mut(self.entries.ok_or_else(inactive)?)
-            .map_err(|_| inactive())?;
-        entries.get(index).copied().ok_or_else(inactive)
-    }
-
-    pub(super) fn push(
-        &mut self,
-        arena: &Arena,
-        value: RoutineInvocationResult,
-    ) -> Result<(), SqlError> {
-        let mut old = self
-            .entries
-            .map(|handle| arena.retained_slice_mut(handle))
-            .transpose()
-            .map_err(|_| inactive())?;
-        if let Some(entries) = old.as_mut()
-            && self.len < entries.len()
-        {
-            entries[self.len] = value;
-            self.len += 1;
-            return Ok(());
-        }
-        let capacity = self
-            .len
-            .checked_mul(2)
-            .map(|value| value.max(4))
-            .ok_or_else(full)?;
-        let handle = arena
-            .retain_slice_with(capacity, |_| value)
-            .map_err(|_| full())?;
-        let mut entries = arena.retained_slice_mut(handle).map_err(|_| inactive())?;
-        if let Some(old) = old.as_ref() {
-            entries[..self.len].copy_from_slice(&old[..self.len]);
-        }
-        entries[self.len] = value;
-        self.entries = Some(handle);
-        self.len += 1;
-        Ok(())
-    }
+pub(super) fn result_at(
+    results: &RoutineResults,
+    arena: &Arena,
+    index: usize,
+) -> Result<RoutineInvocationResult, SqlError> {
+    results
+        .get(arena, index)
+        .map_err(|_| inactive())?
+        .ok_or_else(inactive)
 }
 
 fn full() -> SqlError {
@@ -213,7 +170,7 @@ mod ownership_tests {
             moved.recycle_front();
             for index in [14, 0, 9, 2, 1, 3] {
                 output.reset();
-                match results.get(&moved, index).unwrap() {
+                match result_at(&results, &moved, index).unwrap() {
                     RoutineInvocationResult::Scalar(value, _) => {
                         let value = value.scalar(&moved, &output).unwrap();
                         if index == 0 {
@@ -252,7 +209,7 @@ mod ownership_tests {
                 }
             }
             assert!(results.get(&wrong, 0).is_err());
-            assert!(results.get(&moved, 15).is_err());
+            assert!(result_at(&results, &moved, 15).is_err());
             moved.reset();
             assert!(results.get(&moved, 0).is_err());
         });
@@ -274,13 +231,16 @@ mod ownership_tests {
                 super::super::super::sequence::StatementReplayCursor::EMPTY,
             );
             while results.push(&arena, value).is_ok() {}
-            let before = results.len;
+            let before = results.len();
             assert_eq!(before, 4);
-            assert_eq!(results.push(&arena, value).unwrap_err().sqlstate, "54000");
-            assert_eq!(results.len, before);
+            assert_eq!(
+                directory_error(results.push(&arena, value).unwrap_err()).sqlstate,
+                "54000"
+            );
+            assert_eq!(results.len(), before);
             for index in 0..before {
                 assert!(matches!(
-                    results.get(&arena, index).unwrap(),
+                    result_at(&results, &arena, index).unwrap(),
                     RoutineInvocationResult::Scalar(_, _)
                 ));
             }

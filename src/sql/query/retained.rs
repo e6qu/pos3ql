@@ -1452,7 +1452,7 @@ impl<'a> RetainedSelect<'a> {
         work: &'work Arena,
         params: &[Datum<'work>],
         sequence: Option<&dyn SequenceAccess>,
-        invocations: Option<&RoutineInvocationState<'frame>>,
+        invocations: Option<&RoutineInvocationState>,
         frame_arena: &'frame Arena,
     ) -> Result<bool, SqlError> {
         let Some(predicate) = self.predicate else {
@@ -1489,7 +1489,7 @@ impl<'a> RetainedSelect<'a> {
         work: &'work Arena,
         params: &[Datum<'work>],
         sequence: Option<&dyn SequenceAccess>,
-        invocations: Option<&RoutineInvocationState<'frame>>,
+        invocations: Option<&RoutineInvocationState>,
         frame_arena: &'frame Arena,
     ) -> Result<&'frame [Datum<'frame>], SqlError> {
         let catalog = StorageCatalog {

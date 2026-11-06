@@ -6,7 +6,7 @@
 //! uncorrelated subqueries once and correlated subqueries per outer row;
 //! procedural expressions evaluate only the subqueries they reach.
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::{Arena, ArenaIdentity, ArenaList};
 use crate::pg::respond::{Responder, ResultFmt};
 use crate::pg::wire::WireFull;
 use crate::sql_err;
@@ -1326,25 +1326,24 @@ impl<'a> RoutineResultShape<'a> {
     }
 }
 
-pub(crate) struct RoutineInvocationState<'a> {
+pub(crate) struct RoutineInvocationState {
     next: Cell<usize>,
-    completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
-    arena: &'a Arena,
+    owner: ArenaIdentity,
     results: RefCell<RoutineResults>,
-    inputs: input_progress::RoutineInputs<'a>,
+    inputs: input_progress::RoutineInputs,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RoutineInvocationContext<'scope, 'arena> {
-    invocations: &'scope RoutineInvocationState<'arena>,
+    invocations: &'scope RoutineInvocationState,
     statement_arena: &'arena Arena,
 }
 
 impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
     pub(crate) const fn new(
-        invocations: &'scope RoutineInvocationState<'arena>,
+        invocations: &'scope RoutineInvocationState,
         statement_arena: &'arena Arena,
     ) -> Self {
         Self {
@@ -1361,37 +1360,39 @@ thread_local! {
 /// Installs the statement-owned routine invocation log while its query work
 /// arena is scanned. Scan callbacks do not own an engine reference, so this
 /// scoped bridge carries the already-borrowed context without duplicating it.
-pub(crate) struct RoutineInvocationScope(Option<(*const (), *const ())>);
+pub(crate) struct RoutineInvocationScope<'scope>(
+    Option<(*const (), *const ())>,
+    core::marker::PhantomData<(&'scope RoutineInvocationState, &'scope Arena)>,
+);
 
-impl Drop for RoutineInvocationScope {
+impl Drop for RoutineInvocationScope<'_> {
     fn drop(&mut self) {
         ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.set(self.0));
     }
 }
 
-pub(crate) fn enter_routine_invocation_scope(
-    context: Option<RoutineInvocationContext<'_, '_>>,
-) -> RoutineInvocationScope {
+pub(crate) fn enter_routine_invocation_scope<'scope>(
+    context: Option<RoutineInvocationContext<'scope, 'scope>>,
+) -> RoutineInvocationScope<'scope> {
     let current = match context {
         Some(context) => Some((
-            context.invocations as *const RoutineInvocationState<'_> as *const (),
+            context.invocations as *const RoutineInvocationState as *const (),
             context.statement_arena as *const Arena as *const (),
         )),
         None => ACTIVE_ROUTINE_INVOCATIONS.with(Cell::get),
     };
     let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
-    RoutineInvocationScope(prior)
+    RoutineInvocationScope(prior, core::marker::PhantomData)
 }
 
-pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationState<'a>, &'a Arena)>
-{
+pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationState, &'a Arena)> {
     ACTIVE_ROUTINE_INVOCATIONS.with(|active| {
         let (invocations, arena) = active.get()?;
         // The only writer is `enter_routine_invocation_scope`; its guard stays
         // live for the synchronous scan and restores any enclosing execution.
         Some(unsafe {
             (
-                &*(invocations as *const RoutineInvocationState<'a>),
+                &*(invocations as *const RoutineInvocationState),
                 &*(arena as *const Arena),
             )
         })
@@ -1441,17 +1442,23 @@ pub(crate) fn protect_statement_effects() {
     });
 }
 
-impl<'a> RoutineInvocationState<'a> {
-    pub(crate) fn new(arena: &'a Arena) -> Self {
+impl RoutineInvocationState {
+    pub(crate) fn new(arena: &Arena) -> Self {
         Self {
             next: Cell::new(0),
-            completed: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
-            arena,
+            owner: arena.identity(),
             results: RefCell::new(RoutineResults::new()),
-            inputs: input_progress::RoutineInputs::new(arena),
+            inputs: input_progress::RoutineInputs::new(),
         }
+    }
+
+    pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
+        if self.owner != arena.identity() {
+            return Err(inactive_pending_call());
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_attempt(&self) {
@@ -1468,17 +1475,18 @@ impl<'a> RoutineInvocationState<'a> {
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         query_arena: &'query Arena,
         source_position: Option<InvocationSite>,
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
     ) -> Result<Option<Datum<'query>>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
+        if ordinal < self.results.borrow().len() {
             let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().get(self.arena, ordinal)?
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1486,7 +1494,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return Ok(Some(value.scalar(self.arena, query_arena)?));
+            return Ok(Some(value.scalar(statement_arena, query_arena)?));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1518,14 +1526,15 @@ impl<'a> RoutineInvocationState<'a> {
         &self,
         oid: i32,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         query_arena: &'query Arena,
     ) -> Result<Datum<'query>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
+        if ordinal < self.results.borrow().len() {
             let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().get(self.arena, ordinal)?
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1533,7 +1542,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return value.scalar(self.arena, query_arena);
+            return value.scalar(statement_arena, query_arena);
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1556,20 +1565,22 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.replace(None)
     }
 
-    pub(crate) fn complete(&self, result: Datum<'_>) -> Result<(), SqlError> {
-        let ordinal = self.completed.get();
-        self.results.borrow_mut().push(
-            self.arena,
-            RoutineInvocationResult::Scalar(
-                invocation_results::ResultBytes::capture_scalar(result, self.arena)?,
-                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ),
-        )?;
-        self.completed.set(ordinal + 1);
+    pub(crate) fn complete(&self, result: Datum<'_>, arena: &Arena) -> Result<(), SqlError> {
+        self.require_arena(arena)?;
+        self.results
+            .borrow_mut()
+            .push(
+                arena,
+                RoutineInvocationResult::Scalar(
+                    invocation_results::ResultBytes::capture_scalar(result, arena)?,
+                    super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?,
+                ),
+            )
+            .map_err(invocation_results::directory_error)?;
         Ok(())
     }
 
-    pub(crate) fn resolve_rows(
+    pub(crate) fn resolve_rows<'a>(
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
@@ -1577,11 +1588,12 @@ impl<'a> RoutineInvocationState<'a> {
         source_position: Option<usize>,
         input_collation: super::ast::Collation,
     ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
+        if ordinal < self.results.borrow().len() {
             let RoutineInvocationResult::Rows(rows, replay) =
-                self.results.borrow().get(self.arena, ordinal)?
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -1589,7 +1601,7 @@ impl<'a> RoutineInvocationState<'a> {
                 ));
             };
             super::sequence::restore_replay_cursor(replay)?;
-            return Ok(Some(rows.rows(self.arena, statement_arena)?));
+            return Ok(Some(rows.rows(statement_arena, statement_arena)?));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1617,16 +1629,18 @@ impl<'a> RoutineInvocationState<'a> {
         ))
     }
 
-    pub(crate) fn complete_rows(&self, rows: &[&[u8]]) -> Result<(), SqlError> {
-        let ordinal = self.completed.get();
-        self.results.borrow_mut().push(
-            self.arena,
-            RoutineInvocationResult::Rows(
-                invocation_results::ResultBytes::capture_rows(rows, self.arena)?,
-                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ),
-        )?;
-        self.completed.set(ordinal + 1);
+    pub(crate) fn complete_rows(&self, rows: &[&[u8]], arena: &Arena) -> Result<(), SqlError> {
+        self.require_arena(arena)?;
+        self.results
+            .borrow_mut()
+            .push(
+                arena,
+                RoutineInvocationResult::Rows(
+                    invocation_results::ResultBytes::capture_rows(rows, arena)?,
+                    super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?,
+                ),
+            )
+            .map_err(invocation_results::directory_error)?;
         Ok(())
     }
 }
@@ -2165,7 +2179,7 @@ pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> 
     storage: &'storage Storage,
     routine_workspace: &'workspace Arena,
     txid: u32,
-    invocations: Option<&'invocation RoutineInvocationState<'statement>>,
+    invocations: Option<&'invocation RoutineInvocationState>,
     statement_arena: Option<&'statement Arena>,
 }
 
@@ -8768,7 +8782,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
-    invocations: Option<&RoutineInvocationState<'statement>>,
+    invocations: Option<&RoutineInvocationState>,
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {
@@ -9425,7 +9439,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
-    invocations: Option<&RoutineInvocationState<'statement>>,
+    invocations: Option<&RoutineInvocationState>,
     statement_arena: Option<&'statement Arena>,
     responder: &mut Responder,
 ) -> Outcome {

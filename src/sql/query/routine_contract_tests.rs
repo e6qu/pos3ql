@@ -263,7 +263,9 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
                     value: Datum::Text(text),
                 }])
                 .unwrap();
-            invocations.complete(Datum::Record(fields)).unwrap();
+            invocations
+                .complete(Datum::Record(fields), &statement)
+                .unwrap();
         })
         .unwrap();
         for _ in 0..8 {

@@ -16,6 +16,11 @@ use super::budget::{Budget, BudgetError};
 
 mod retained_slice;
 pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle};
+mod retained_list;
+pub(crate) use retained_list::{RetainedList, RetainedListError};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArenaIdentity(u64);
 
 pub struct Arena {
     what: &'static str,
@@ -139,6 +144,10 @@ impl std::error::Error for ArenaFull {}
 const ARENA_ALIGN: usize = 16;
 
 impl Arena {
+    pub(crate) const fn identity(&self) -> ArenaIdentity {
+        ArenaIdentity(self.retention_identity)
+    }
+
     pub fn new(
         budget: &mut Budget,
         what: &'static str,

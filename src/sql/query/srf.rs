@@ -4226,7 +4226,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let produced = table_func_base_rows_outer(
@@ -4339,7 +4339,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<TableFunctionRows<'a>, SqlError> {
     let argument_catalog = super::storage_catalog(storage, arena, txid);
@@ -7118,7 +7118,7 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     const EMPTY_ROWS: &[&[u8]] = &[];

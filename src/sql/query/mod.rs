@@ -8775,7 +8775,7 @@ pub fn select_query<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn select_query_resumable<'a, 'statement>(
+pub(crate) fn select_query_resumable<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
@@ -8783,7 +8783,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
     invocations: Option<&RoutineInvocationState>,
-    statement_arena: Option<&'statement Arena>,
+    statement_arena: Option<&Arena>,
     responder: &mut Responder,
 ) -> Outcome {
     let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
@@ -9432,7 +9432,7 @@ pub fn constant_select<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn constant_select_resumable<'a, 'statement>(
+pub(crate) fn constant_select_resumable<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
@@ -9440,7 +9440,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
     invocations: Option<&RoutineInvocationState>,
-    statement_arena: Option<&'statement Arena>,
+    statement_arena: Option<&Arena>,
     responder: &mut Responder,
 ) -> Outcome {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];

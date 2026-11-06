@@ -275,14 +275,14 @@ impl CursorQuery {
         })
     }
 
-    pub(crate) fn evaluate_predicate<'frame>(
+    pub(crate) fn evaluate_predicate(
         &self,
         storage: &crate::storage::Storage,
         txid: u32,
         work: &Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
         invocations: &crate::sql::query::RoutineInvocationState,
-        frame: &'frame Arena,
+        frame: &Arena,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
         crate::sql::type_input_plans::with_owner(self.owner, || {

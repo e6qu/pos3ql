@@ -15265,9 +15265,9 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_retained_expression<'frame, T>(
+    fn execute_retained_expression<T>(
         &mut self,
-        frame: &'frame Arena,
+        frame: &Arena,
         source_snapshot: u32,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -15573,11 +15573,11 @@ impl Engine {
     /// Runs a suspended mutable function and records its typed result in the
     /// statement-owned invocation log before the enclosing expression restarts.
     #[allow(clippy::too_many_arguments)]
-    fn complete_pending_routine<'a>(
+    fn complete_pending_routine(
         &mut self,
         pending: query::PendingRoutineInvocation,
         invocations: &query::RoutineInvocationState,
-        arena: &'a Arena,
+        arena: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,

@@ -1445,7 +1445,7 @@ impl<'a> RetainedSelect<'a> {
         clippy::too_many_arguments,
         reason = "retained statement expression execution"
     )]
-    pub(crate) fn evaluate_statement_predicate<'work, 'frame>(
+    pub(crate) fn evaluate_statement_predicate<'work>(
         &'work self,
         storage: &'work Storage,
         txid: u32,
@@ -1453,7 +1453,7 @@ impl<'a> RetainedSelect<'a> {
         params: &[Datum<'work>],
         sequence: Option<&dyn SequenceAccess>,
         invocations: Option<&RoutineInvocationState>,
-        frame_arena: &'frame Arena,
+        frame_arena: &Arena,
     ) -> Result<bool, SqlError> {
         let Some(predicate) = self.predicate else {
             return Ok(true);

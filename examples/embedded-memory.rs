@@ -148,6 +148,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         "--statistics-bytes",
         "--statistics-leases",
         "--index-statistics-slots",
+        "--execution-control-bytes",
+        "--execution-control-leases",
     ];
     if arguments.len() != flags.len() * 2
         || flags
@@ -155,7 +157,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
             .enumerate()
             .any(|(index, flag)| arguments[index * 2] != *flag)
     {
-        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving|wide|replacement|statistics|statistics-wide --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N --statistics-bytes N --statistics-leases N --index-statistics-slots N".into());
+        return Err("usage: embedded-memory --tables N --row-overlay-slots N --row-work-bytes N --row-work-leases N --definition-image-slots N --mode mvcc|locking --row-history-slots N --workload empty|hot|even|moving|wide|replacement|statistics|statistics-wide --rows N --data-dir NEW_DIRECTORY --budget-limit-bytes N --table-metadata-bytes N --table-metadata-leases N --statistics-bytes N --statistics-leases N --index-statistics-slots N --execution-control-bytes N --execution-control-leases N".into());
     }
     let mut config = Config::default_dev();
     config.max_tables = arguments[1].parse()?;
@@ -175,6 +177,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.statistics_bytes = arguments[27].parse()?;
     config.statistics_leases = arguments[29].parse()?;
     config.index_statistics_slots = arguments[31].parse()?;
+    config.execution_control_bytes = arguments[33].parse()?;
+    config.execution_control_leases = arguments[35].parse()?;
     config.validate_runtime_resources()?;
     if config.max_tables == 0 {
         return Err("tables must be positive".into());
@@ -356,7 +360,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         .current_bytes
         .map_or("null".to_string(), |bytes| bytes.to_string());
     println!(
-        "{{\"rss_metric_version\":2,\"rss_unit\":\"bytes\",\"rss_peak_source\":\"{}\",\"rss_current_source\":{},\"getrusage_maxrss_source\":\"getrusage_rusage_self_ru_maxrss\",\"startup_current_rss_bytes\":{},\"final_current_rss_bytes\":{},\"startup_getrusage_maxrss_bytes\":{},\"final_getrusage_maxrss_bytes\":{},\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"table_metadata_bytes\":{},\"table_metadata_leases\":{},\"statistics_bytes\":{},\"statistics_leases\":{},\"index_statistics_slots\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
+        "{{\"rss_metric_version\":2,\"rss_unit\":\"bytes\",\"rss_peak_source\":\"{}\",\"rss_current_source\":{},\"getrusage_maxrss_source\":\"getrusage_rusage_self_ru_maxrss\",\"startup_current_rss_bytes\":{},\"final_current_rss_bytes\":{},\"startup_getrusage_maxrss_bytes\":{},\"final_getrusage_maxrss_bytes\":{},\"os\":\"{}\",\"arch\":\"{}\",\"mode\":\"{}\",\"workload\":\"{}\",\"rows\":{},\"max_tables\":{},\"row_overlay_slots\":{},\"row_work_bytes\":{},\"row_work_leases\":{},\"definition_image_slots\":{},\"table_metadata_bytes\":{},\"table_metadata_leases\":{},\"statistics_bytes\":{},\"statistics_leases\":{},\"index_statistics_slots\":{},\"execution_control_bytes\":{},\"execution_control_leases\":{},\"max_connections\":1,\"query_workspace_slots\":1,\"max_prepared_transactions\":0,\"max_subscriptions\":1,\"max_ddl_per_transaction\":16,\"max_catalog_versions_per_object\":2,\"memtable_bytes\":{},\"work_arena_bytes\":{},\"sql_arena_bytes\":{},\"catalog_history_bytes\":{},\"row_history_slots\":{},\"max_row_versions_per_row\":{},\"large_object_pages\":{},\"startup_stack_bytes\":{},\"planned_engine_bytes\":{},\"drawn_engine_bytes\":{},\"planned_session_ceiling_bytes\":{},\"drawn_session_bytes\":{},\"startup_peak_rss_bytes\":{},\"final_peak_rss_bytes\":{},\"startup_microseconds\":{},\"workload_microseconds\":{}}}",
         startup_memory.peak_source,
         current_source,
         startup_current,
@@ -378,6 +382,8 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
         config.statistics_bytes,
         config.statistics_leases,
         config.index_statistics_slots,
+        config.execution_control_bytes,
+        config.execution_control_leases,
         config.memtable_bytes,
         config.work_arena_bytes,
         config.sql_arena_bytes,

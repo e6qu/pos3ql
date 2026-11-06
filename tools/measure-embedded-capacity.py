@@ -94,6 +94,8 @@ def main():
             "row_overlay_slots": 8192,
             "row_work_bytes": 8 * 1024**2,
             "row_work_leases": 128,
+            "execution_control_bytes": 256 * 1024,
+            "execution_control_leases": 256,
             "definition_image_slots": 256,
             "table_metadata_bytes": 64 * 1024**2,
             "table_metadata_leases": 8192,
@@ -131,6 +133,8 @@ def main():
                     arguments.extend(["--statistics-bytes", str(environment["statistics_bytes"]),
                                       "--statistics-leases", str(environment["statistics_leases"]),
                                       "--index-statistics-slots", str(environment["index_statistics_slots"])])
+                    arguments.extend(["--execution-control-bytes", str(environment["execution_control_bytes"]),
+                                      "--execution-control-leases", str(environment["execution_control_leases"])])
                     try:
                         with (output / f"{label}.stdout").open("w") as stdout, (output / f"{label}.budget.log").open("w") as stderr:
                             command(arguments, stdout=stdout, stderr=stderr)
@@ -157,6 +161,7 @@ def main():
                         raise RuntimeError(f"{label}: incomplete session component evidence")
                     draws.append({"mode": mode, "max_tables": tables, "workload": workload, "components": components})
         fixed_components = ["engine:row_overlay_slots", "engine:row work pool", "engine:row work free ranges",
+                            "engine:execution control pool", "engine:execution control free ranges",
                             "engine:table definition image owner", "engine:table definition image occupancy", "engine:table definition images",
                             "engine:table metadata pool", "engine:table metadata free ranges",
                             "engine:statistics pool", "engine:statistics free ranges", "engine:index_cumulative_statistics"]

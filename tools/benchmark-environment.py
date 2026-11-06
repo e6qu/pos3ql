@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--row-overlay-slots", type=int, required=True)
     parser.add_argument("--row-work-bytes", type=int, required=True)
     parser.add_argument("--row-work-leases", type=int, required=True)
+    parser.add_argument("--execution-control-bytes", type=int, required=True)
+    parser.add_argument("--execution-control-leases", type=int, required=True)
     parser.add_argument("--definition-image-slots", type=int, required=True)
     parser.add_argument("--table-metadata-bytes", type=int, required=True)
     parser.add_argument("--table-metadata-leases", type=int, required=True)
@@ -83,7 +85,8 @@ def main():
     parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
     parser.add_argument("--checkpoint-duration-seconds", type=float, default=0.0)
     args = parser.parse_args()
-    if min(args.row_overlay_slots, args.row_work_bytes, args.row_work_leases, args.definition_image_slots,
+    if min(args.row_overlay_slots, args.row_work_bytes, args.row_work_leases, args.execution_control_bytes,
+           args.execution_control_leases, args.definition_image_slots,
            args.table_metadata_bytes, args.table_metadata_leases, args.statistics_bytes,
            args.statistics_leases, args.index_statistics_slots) <= 0:
         parser.error("shared capacities must be positive")
@@ -134,6 +137,8 @@ def main():
             "row_overlay_slots": args.row_overlay_slots,
             "row_work_bytes": args.row_work_bytes,
             "row_work_leases": args.row_work_leases,
+            "execution_control_bytes": args.execution_control_bytes,
+            "execution_control_leases": args.execution_control_leases,
             "definition_image_slots": args.definition_image_slots,
             "table_metadata_bytes": args.table_metadata_bytes,
             "table_metadata_leases": args.table_metadata_leases,

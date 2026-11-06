@@ -38,6 +38,8 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 "row_overlay_slots": 200,
                 "row_work_bytes": 8388608,
                 "row_work_leases": 128,
+                "execution_control_bytes": 262144,
+                "execution_control_leases": 256,
                 "definition_image_slots": 256,
                 "table_metadata_bytes": 67108864,
                 "table_metadata_leases": 8192,

@@ -15,6 +15,8 @@ fn excessive_shared_resource_estimates_saturate_and_fail_named_startup() {
     for resource in [
         "row_work_bytes",
         "row_work_leases",
+        "execution_control_bytes",
+        "execution_control_leases",
         "definition_image_slots",
         "row_overlay_slots",
     ] {
@@ -22,6 +24,8 @@ fn excessive_shared_resource_estimates_saturate_and_fail_named_startup() {
         match resource {
             "row_work_bytes" => config.row_work_bytes = usize::MAX & !63,
             "row_work_leases" => config.row_work_leases = usize::MAX,
+            "execution_control_bytes" => config.execution_control_bytes = usize::MAX & !63,
+            "execution_control_leases" => config.execution_control_leases = usize::MAX,
             "definition_image_slots" => config.definition_image_slots = usize::MAX,
             "row_overlay_slots" => config.row_overlay_slots = usize::MAX,
             _ => unreachable!(),
@@ -152,6 +156,21 @@ fn valid_shared_capacity_changes_preserve_exact_component_costs() {
     ) - crate::mem::lease_pool::LeasePool::budget_bytes(
         config.row_work_bytes,
         config.row_work_leases,
+    );
+    assert_eq!(Storage::extra_budget_bytes(&larger) - storage, controls);
+    assert_eq!(Engine::extra_budget_bytes(&larger) - engine, controls);
+    larger = config.clone();
+    larger.execution_control_bytes += 64;
+    assert_eq!(Storage::extra_budget_bytes(&larger) - storage, 64);
+    assert_eq!(Engine::extra_budget_bytes(&larger) - engine, 64);
+    larger = config.clone();
+    larger.execution_control_leases += 1;
+    let controls = crate::mem::lease_pool::LeasePool::budget_bytes(
+        larger.execution_control_bytes,
+        larger.execution_control_leases,
+    ) - crate::mem::lease_pool::LeasePool::budget_bytes(
+        config.execution_control_bytes,
+        config.execution_control_leases,
     );
     assert_eq!(Storage::extra_budget_bytes(&larger) - storage, controls);
     assert_eq!(Engine::extra_budget_bytes(&larger) - engine, controls);

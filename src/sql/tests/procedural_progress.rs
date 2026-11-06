@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn control_capacity_is_admitted_before_procedural_initializer_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("control-admission-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64;
+        config.execution_control_leases = 1;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(&mut engine, "CREATE SEQUENCE control_admission_calls", true);
+        session.success(&mut engine, "CREATE FUNCTION denied_control() RETURNS integer LANGUAGE plpgsql AS $$DECLARE v integer := nextval('control_admission_calls'); BEGIN RETURN v; END$$", true);
+        let error = session.execute(&mut engine, "SELECT denied_control()", true);
+        assert_eq!(error_sqlstates(&error), ["54000"]);
+        assert!(String::from_utf8_lossy(&error).contains("execution_control_bytes"));
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('control_admission_calls')",
+                true
+            )),
+            ["1"]
+        );
+    }
+}
+
+#[test]
 fn saved_output_scopes_reuse_values_and_preserve_nested_caught_and_typed_outputs() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

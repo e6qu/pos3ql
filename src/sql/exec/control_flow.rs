@@ -2,7 +2,7 @@
 
 use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
 use super::*;
-use crate::mem::arena::{ArenaSliceHandle, ArenaSliceMut, OwnedArenaSlice};
+use crate::mem::arena::{ArenaIdentity, OwnedArenaSlice};
 
 mod program;
 use numeric_loops::NumericLoopWorkspace;
@@ -151,10 +151,11 @@ enum Continuation {
 /// not keep another Rust interpreter invocation on the call stack.
 pub(super) struct ControlFrames {
     source: ProgramSource,
-    slots: ArenaSliceHandle<Option<Frame<()>>>,
+    slots: MutableSlice<Option<Frame<()>>>,
     active: usize,
     diagnostics: DiagnosticBuffers,
     resource_identity: Option<usize>,
+    workspace: ArenaIdentity,
 }
 
 impl ControlFrames {
@@ -162,16 +163,20 @@ impl ControlFrames {
         arena: &Arena,
         layout: ProgramLayout,
         source: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
         layout.source.require(source)?;
+        let mut slots = pool.lease(layout.depth).map_err(execution_full)?;
+        for _ in 0..layout.depth {
+            slots.push_reserved(None).map_err(execution_full)?;
+        }
         Ok(Self {
             source: layout.source,
-            slots: arena
-                .retain_slice_with(layout.depth, |_| None)
-                .map_err(|_| frame_full())?,
+            slots,
             active: 0,
             diagnostics: DiagnosticBuffers::new(arena, layout.handlers)?,
             resource_identity: None,
+            workspace: arena.identity(),
         })
     }
 
@@ -182,6 +187,13 @@ impl ControlFrames {
         source.require(arena)
     }
 
+    fn require_workspace(&self, arena: &Arena) -> Result<(), SqlError> {
+        if self.workspace != arena.identity() {
+            return Err(program::changed());
+        }
+        Ok(())
+    }
+
     pub(super) fn reserve_resources<'a>(
         &mut self,
         arena: &'a Arena,
@@ -189,15 +201,13 @@ impl ControlFrames {
         if self.resource_identity.is_some() {
             return Err(program::changed());
         }
-        let count = arena
-            .retained_slice_mut(self.slots)
-            .map_err(|_| program::changed())?
-            .len();
+        self.require_workspace(arena)?;
+        let count = self.slots.len();
         let resources = arena
             .alloc_owned_slice_with(count, |_| FrameResource::Empty)
             .map_err(|_| frame_full())?;
         // This address identifies a nonempty, uniquely reserved tail directory;
-        // it is never dereferenced. Reset also invalidates the checked slots.
+        // it is never dereferenced. Workspace identity rejects a later reset.
         self.resource_identity = Some(resources.as_ptr() as usize);
         Ok(resources)
     }
@@ -205,22 +215,23 @@ impl ControlFrames {
     fn execution<'scope, 'syntax, 'values>(
         &'scope mut self,
         source: &Arena,
-        workspace: &'scope Arena,
+        workspace: &Arena,
         program: CompiledProgram<'syntax>,
         resources: &'scope mut [FrameResource<'values>],
     ) -> Result<FrameExecution<'scope, 'syntax, 'values>, SqlError> {
         self.require_source(source, program.source())?;
+        self.require_workspace(workspace)?;
         if self.resource_identity != Some(resources.as_ptr() as usize) {
             return Err(program::changed());
         }
-        let slots = workspace
-            .retained_slice_mut(self.slots)
-            .map_err(|_| program::changed())?;
-        assert_eq!(slots.len(), resources.len(), "procedural resource capacity");
+        assert_eq!(
+            self.slots.len(),
+            resources.len(),
+            "procedural resource capacity"
+        );
         Ok(FrameExecution {
             state: self,
             program,
-            slots,
             resources,
         })
     }
@@ -229,7 +240,6 @@ impl ControlFrames {
 struct FrameExecution<'scope, 'syntax, 'values> {
     state: &'scope mut ControlFrames,
     program: CompiledProgram<'syntax>,
-    slots: ArenaSliceMut<'scope, Option<Frame<()>>>,
     resources: &'scope mut [FrameResource<'values>],
 }
 
@@ -237,10 +247,10 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     fn push(&mut self, entry: FrameEntry<'_, 'a>, source: FrameSource) {
         // Each active frame corresponds to one lexical edge in layout().
         assert!(
-            self.state.active < self.slots.len(),
+            self.state.active < self.state.slots.len(),
             "procedural lexical frame capacity"
         );
-        assert!(self.slots[self.state.active].is_none());
+        assert!(self.state.slots[self.state.active].is_none());
         assert!(matches!(
             self.resources[self.state.active],
             FrameResource::Empty
@@ -280,7 +290,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             }
         };
         self.resources[self.state.active] = resource;
-        self.slots[self.state.active] = Some(Frame {
+        self.state.slots[self.state.active] = Some(Frame {
             block: self.program.index(entry.block),
             next: 0,
             source,
@@ -314,7 +324,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
 
     fn pop(&mut self) -> Frame<FrameResource<'a>> {
         self.state.active -= 1;
-        let position = self.slots[self.state.active]
+        let position = self.state.slots[self.state.active]
             .take()
             .expect("active procedural frame");
         Frame {
@@ -330,13 +340,13 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     }
 
     fn last(&self) -> &Frame<()> {
-        self.slots[self.state.active - 1]
+        self.state.slots[self.state.active - 1]
             .as_ref()
             .expect("active procedural frame")
     }
 
     fn last_mut(&mut self) -> &mut Frame<()> {
-        self.slots[self.state.active - 1]
+        self.state.slots[self.state.active - 1]
             .as_mut()
             .expect("active procedural frame")
     }
@@ -346,7 +356,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         locals: &'s [TriggerLocalDecl],
         values: &'s mut [Datum<'a>],
     ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
-        for (frame, resource) in self.slots[..self.state.active]
+        for (frame, resource) in self.state.slots[..self.state.active]
             .iter()
             .zip(&mut self.resources[..self.state.active])
             .rev()
@@ -369,7 +379,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     }
 
     fn diagnostic(&self) -> Option<(CaughtDiagnostic, PlpgsqlScope)> {
-        self.slots[..self.state.active]
+        self.state.slots[..self.state.active]
             .iter()
             .enumerate()
             .rev()
@@ -418,6 +428,14 @@ fn frame_full() -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "PL/pgSQL execution frames exceed statement memory"
+    )
+}
+
+fn execution_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "PL/pgSQL execution control: {}",
+        error
     )
 }
 
@@ -791,7 +809,6 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         let frame = frames.pop();
         frames.finish(context.arena, frame, locals, values, status, false);
     }
-    drop(frames);
     status.control_frames = Some(retained);
     status.control_resources = Some(resources);
     outcome

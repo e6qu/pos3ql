@@ -11,7 +11,71 @@ fn parse_owned_program<'a>(
 }
 
 #[test]
+fn shared_control_capacity_preserves_live_positions_and_returns_after_owner_drop() {
+    let mut budget = Budget::new(64 << 10);
+    let source = Arena::new(&mut budget, "shared control source", 16 << 10).unwrap();
+    let parsing = Arena::new(&mut budget, "shared control syntax", 16 << 10).unwrap();
+    let arena = Arena::new(&mut budget, "shared control workspace", 16 << 10).unwrap();
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let (program, code) = parse_owned_program(
+        "BEGIN LOOP NULL; END LOOP; END",
+        &parsing,
+        &source,
+        PlpgsqlProgramKind::Anonymous,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut retained = ControlFrames::new(&arena, code.layout(), &source, &pool).unwrap();
+        let mut resources = retained.reserve_resources(&arena).unwrap();
+        {
+            let mut frames = retained
+                .execution(&source, &arena, code, &mut resources)
+                .unwrap();
+            frames.start(program.body);
+            frames.last_mut().next = 1;
+        }
+        let free = pool.lease::<u8>(4096).err().unwrap().free_bytes;
+        let held = pool.lease::<u8>(free).unwrap();
+        let error = ControlFrames::new(&arena, code.layout(), &source, &pool)
+            .err()
+            .unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_bytes"));
+        assert!(error.message.as_str().contains("execution_control_leases"));
+        assert_eq!(retained.active, 1);
+        assert_eq!(retained.slots[0].as_ref().unwrap().next, 1);
+        drop(held);
+        let second = ControlFrames::new(&arena, code.layout(), &source, &pool).unwrap();
+        assert_eq!(second.active, 0);
+        assert_eq!(second.slots.len(), 2);
+        drop(second);
+        let mut frames = retained
+            .execution(&source, &arena, code, &mut resources)
+            .unwrap();
+        assert_eq!(frames.last().next, 1);
+        frames.pop();
+        drop(resources);
+        drop(retained);
+        assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+    });
+}
+
+#[test]
 fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(1 << 18);
     let mut parse = Arena::new(&mut budget, "procedural positions parsing", 1 << 16).unwrap();
     let mut arena = Arena::new(&mut budget, "procedural positions", 1 << 16).unwrap();
@@ -36,20 +100,10 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
         let (_, code) =
             parse_owned_program(source, &parse, &arena, PlpgsqlProgramKind::Anonymous).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let frames = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
-            assert_eq!(
-                arena.retained_slice_mut(frames.slots).unwrap().len(),
-                depth,
-                "{source}"
-            );
+            let frames = ControlFrames::new(&arena, code.layout(), &arena, &pool).unwrap();
+            assert_eq!(frames.slots.len(), depth, "{source}");
             assert_eq!(frames.active, 0);
-            assert!(
-                arena
-                    .retained_slice_mut(frames.slots)
-                    .unwrap()
-                    .iter()
-                    .all(Option::is_none)
-            );
+            assert!(frames.slots.iter().all(Option::is_none));
         });
     }
     let small = Arena::new(&mut budget, "procedural exhausted positions", 1).unwrap();
@@ -61,9 +115,8 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let error = ControlFrames::new(&small, code.layout(), &arena)
-            .err()
-            .unwrap();
+        let mut frames = ControlFrames::new(&small, code.layout(), &arena, &pool).unwrap();
+        let error = frames.reserve_resources(&small).err().unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("PL/pgSQL execution frames"));
     });
@@ -71,6 +124,14 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
 
 #[test]
 fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(128 << 10);
     let source = Arena::new(&mut budget, "output binding source", 16 << 10).unwrap();
     let parsing = Arena::new(&mut budget, "output binding syntax", 16 << 10).unwrap();
@@ -89,7 +150,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
         ctype: ColType::Text,
         ..empty_plpgsql_local()
     }];
-    let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 1).unwrap();
+    let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 1, &pool).unwrap();
     status.set_output_locals(&[0], locals.len());
     crate::mem::guard::forbid_alloc(|| {
         let text = temporary.alloc_str("original output").unwrap();
@@ -152,6 +213,14 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
 
 #[test]
 fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(1 << 18);
     let parse = Arena::new(&mut budget, "procedural numeric positions parsing", 1 << 16).unwrap();
     let arena = Arena::new(&mut budget, "procedural numeric positions", 1 << 16).unwrap();
@@ -181,7 +250,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, code, &locals, 0).unwrap();
+        let mut status = TriggerExecutionStatus::new(&arena, code, &locals, 0, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
         let mut resources = status.control_resources.take().unwrap();
         let mut frames = retained
@@ -242,7 +311,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
-            assert!(frames.slots.iter().all(Option::is_none));
+            assert!(frames.state.slots.iter().all(Option::is_none));
             let workspace = status.numeric_frames.take().unwrap();
             assert!(
                 workspace
@@ -253,7 +322,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }
-        drop(frames);
         status.control_frames = Some(retained);
         status.control_resources = Some(resources);
     });
@@ -261,6 +329,14 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
 
 #[test]
 fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     const SOURCE: &str = "BEGIN FOR x IN 1..3 LOOP WHILE true LOOP NULL; END LOOP; END LOOP; END";
     let mut budget = Budget::new(256 << 10);
     let original = Arena::new(&mut budget, "active procedural source", 64 << 10).unwrap();
@@ -282,7 +358,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     let source = ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Anonymous, &original).unwrap();
     let (mut status, retained, mut resources, mut values) = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&original, &parsing).unwrap();
-        let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 0).unwrap();
+        let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 0, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
         let mut resources = status.control_resources.take().unwrap();
         assert_eq!(
@@ -326,10 +402,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             frames.enter(FrameEntry::new(program.block, EntryState::While));
             frames.last_mut().next = 1;
             assert_eq!(frames.state.active, 3);
-            assert!(matches!(
-                workspace.retained_slice_mut(frames.state.slots),
-                Err(crate::mem::arena::ArenaSliceError::Borrowed)
-            ));
+            assert!(pool.lease::<u8>(16 << 10).is_err());
         }
         (status, retained, resources, values)
     });
@@ -397,7 +470,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
         );
         let root = frames.pop();
         frames.finish(&workspace, root, &locals, &mut values, &mut status, true);
-        assert!(frames.slots.iter().all(Option::is_none));
+        assert!(frames.state.slots.iter().all(Option::is_none));
         assert!(
             frames
                 .resources
@@ -409,17 +482,17 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     let mut owner_budget = Budget::new(8192);
     let mut owner = Arena::new(&mut owner_budget, "reset procedural metadata", 8192).unwrap();
     let (_, code) = source.parse(&moved_source, &parsing).unwrap();
-    let mut reset = ControlFrames::new(&owner, code.layout(), &moved_source).unwrap();
+    let mut reset = ControlFrames::new(&owner, code.layout(), &moved_source, &pool).unwrap();
     let mut reset_resources = reset.reserve_resources(&owner).unwrap();
     reset
         .execution(&moved_source, &owner, code, &mut reset_resources)
         .unwrap();
     drop(reset_resources);
     owner.reset();
-    assert!(matches!(
-        owner.retained_slice_mut(reset.slots),
-        Err(crate::mem::arena::ArenaSliceError::Stale)
-    ));
+    assert_eq!(
+        reset.require_workspace(&owner).unwrap_err().sqlstate,
+        "40001"
+    );
     // Preserve the unique paired owners just as normal execution does.
     status.control_frames = Some(moved);
     status.control_resources = Some(resources);
@@ -427,6 +500,14 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
 
 #[test]
 fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(36 << 10);
     let source = Arena::new(&mut budget, "reservation source", 16 << 10).unwrap();
     let parsing = Arena::new(&mut budget, "reservation syntax", 16 << 10).unwrap();
@@ -439,7 +520,7 @@ fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let mut retained = ControlFrames::new(&arena, code.layout(), &source).unwrap();
+        let mut retained = ControlFrames::new(&arena, code.layout(), &source, &pool).unwrap();
         let mark = arena.mark();
         arena
             .alloc_slice_with(arena.capacity() - arena.used(), |_| 0xffu8)
@@ -454,13 +535,7 @@ fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
         assert_eq!(arena.used(), used);
         assert!(retained.resource_identity.is_none());
         assert_eq!(retained.active, 0);
-        assert!(
-            arena
-                .retained_slice_mut(retained.slots)
-                .unwrap()
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(retained.slots.iter().all(Option::is_none));
         // Only unreferenced byte scratch follows this mark.
         unsafe { arena.rewind_to(mark) };
         let mut resources = retained.reserve_resources(&arena).unwrap();
@@ -475,6 +550,14 @@ fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
 
 #[test]
 fn row_loop_resources_release_once_on_pop_and_owner_drop() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     use crate::mem::lease_pool::Purpose;
 
     let mut budget = Budget::new(128 << 10);
@@ -495,7 +578,8 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
     for pop in [true, false] {
         workspace.reset();
         crate::mem::guard::forbid_alloc(|| {
-            let mut retained = ControlFrames::new(&workspace, code.layout(), &source).unwrap();
+            let mut retained =
+                ControlFrames::new(&workspace, code.layout(), &source, &pool).unwrap();
             let mut resources = retained.reserve_resources(&workspace).unwrap();
             {
                 let mut frames = retained
@@ -536,6 +620,14 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
 
 #[test]
 fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(1 << 18);
     let parse = Arena::new(&mut budget, "procedural handler positions parsing", 1 << 16).unwrap();
     let arena = Arena::new(&mut budget, "procedural handler positions", 1 << 16).unwrap();
@@ -554,7 +646,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         panic!("handler branch")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut retained = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
+        let mut retained = ControlFrames::new(&arena, code.layout(), &arena, &pool).unwrap();
         let mut resources = retained.reserve_resources(&arena).unwrap();
         let mut frames = retained
             .execution(&arena, &arena, code, &mut resources)
@@ -600,12 +692,20 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
-        assert!(frames.slots.iter().all(Option::is_none));
+        assert!(frames.state.slots.iter().all(Option::is_none));
     });
 }
 
 #[test]
 fn positions_resolve_the_same_source_after_original_parse_storage_is_released() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     const SOURCE: &str = "BEGIN WHILE true LOOP NULL; END LOOP; END";
     let mut budget = Budget::new(1 << 18);
     let original = Arena::new(&mut budget, "owned procedural source", 1 << 16).unwrap();
@@ -620,7 +720,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     parsing.reset();
     let saved = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&original, &parsing).unwrap();
-        let mut retained = ControlFrames::new(&workspace, code.layout(), &original).unwrap();
+        let mut retained = ControlFrames::new(&workspace, code.layout(), &original, &pool).unwrap();
         let mut resources = retained.reserve_resources(&workspace).unwrap();
         let mut frames = retained
             .execution(&original, &workspace, code, &mut resources)
@@ -650,7 +750,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
         )
         .unwrap();
         let (_, new_code) = replaced.parse(&replacement, &replacement_parsing).unwrap();
-        let mut retained = ControlFrames::new(&workspace, saved.0, &moved).unwrap();
+        let mut retained = ControlFrames::new(&workspace, saved.0, &moved, &pool).unwrap();
         let mut resources = retained.reserve_resources(&workspace).unwrap();
         assert_eq!(
             retained
@@ -661,13 +761,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
             "40001"
         );
         assert_eq!(retained.active, 0);
-        assert!(
-            workspace
-                .retained_slice_mut(retained.slots)
-                .unwrap()
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(retained.slots.iter().all(Option::is_none));
         let frames = retained
             .execution(&moved, &workspace, code, &mut resources)
             .unwrap();
@@ -685,6 +779,14 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
 
 #[test]
 fn frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images() {
+    let mut control_budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut control_budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
     let mut budget = Budget::new(64 << 10);
     let mut tiny_budget = Budget::new(1);
     let tiny = Arena::new(&mut tiny_budget, "exhausted procedural source", 1).unwrap();
@@ -700,7 +802,7 @@ fn frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images() {
     .unwrap();
     let retained = {
         let (_, code) = source.parse(&original, &parsing).unwrap();
-        ControlFrames::new(&workspace, code.layout(), &original).unwrap()
+        ControlFrames::new(&workspace, code.layout(), &original, &pool).unwrap()
     };
     parsing.reset();
     let mut moved = original;
@@ -736,13 +838,7 @@ fn frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images() {
             "40001"
         );
         assert_eq!(retained.active, 0);
-        assert!(
-            workspace
-                .retained_slice_mut(retained.slots)
-                .unwrap()
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(retained.slots.iter().all(Option::is_none));
     });
 }
 

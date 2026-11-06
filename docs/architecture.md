@@ -313,13 +313,14 @@ Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
 stores a block index and next-statement offset in its compiled program. The
 original body and program kind use an immutable, checked source image. Parsed
-blocks belong to a separate compiled view. Mutable frame metadata uses checked
-arena handles and retains no references to syntax or loop-value buffers. Loop
+blocks belong to a separate compiled view. Mutable frame metadata owns a range
+in the shared execution control pool and retains no references to syntax or
+loop-value buffers. Loop
 buffers and materialized rows have a separate, uniquely paired directory whose
 scoped owner releases its values. An entry owns its control data and required
 resource in one enum before publishing them to their indexed slots.
-Binding a view checks the source, metadata
-arena and directory identity before entering the body. A replaced, foreign or reset source
+Binding a view checks the source, workspace
+and directory identity before entering the body. A replaced, foreign or reset source
 returns `40001`; source-image exhaustion names its statement-memory limit with
 `54000`. Rebuilding syntax from that image keeps the original body after parsing
 scratch is reused. This preserves source text, not the invocation's selected
@@ -653,6 +654,18 @@ named error reports requested bytes, total free bytes, the largest free extent
 and remaining lease descriptors. For example,
 an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
+
+`execution_control_bytes` reserves one shared pool for the branch, loop and
+handler positions of running procedural calls. `execution_control_leases` bounds
+simultaneously owned ranges; each active function, procedure or trigger reserves
+one range for its maximum lexical nesting before local initialization. Empty
+tables and cached plans do not receive private control ranges. Dropping the
+call returns its range, including after errors. A full pool returns `54000`
+naming both settings before body initializers can have effects. The byte limit
+must be a positive multiple of 64; startup accounting includes its backing and
+lease/free-range records. Both settings are explicit in configuration files.
+Values, source images and diagnostic buffers retain their separate statement
+or foreground-work ownership; this pool alone does not resume a whole invocation.
 
 `table_metadata_bytes` reserves one shared backing pool for actual-length table
 columns, physical column-number records, constraints, pending edit mappings and

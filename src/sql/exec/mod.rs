@@ -3964,7 +3964,13 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         ..invocation
     };
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        program.locals,
+        0,
+        &context.storage().execution_control,
+    )?;
     initialize_trigger_locals(
         context,
         invocation,
@@ -17975,8 +17981,9 @@ impl<'a> TriggerExecutionStatus<'a> {
         program: CompiledProgram<'_>,
         locals: &[TriggerLocalDecl],
         output_count: usize,
+        pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let mut control_frames = ControlFrames::new(arena, program.layout(), arena)?;
+        let mut control_frames = ControlFrames::new(arena, program.layout(), arena, pool)?;
         let control_resources = control_frames.reserve_resources(arena)?;
         Ok(Self {
             numeric_frames: NumericLoopFrames::new(arena, program.root(), locals)?,
@@ -21320,7 +21327,13 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        program.locals,
+        0,
+        &context.storage().execution_control,
+    )?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21404,7 +21417,13 @@ pub(crate) fn execute_event_trigger<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        program.locals,
+        0,
+        &context.storage().execution_control,
+    )?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21554,7 +21573,13 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, code, locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        locals,
+        0,
+        &context.storage().execution_control,
+    )?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21722,7 +21747,13 @@ pub(crate) fn execute_plpgsql_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, code, locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        locals,
+        0,
+        &context.storage().execution_control,
+    )?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21889,8 +21920,13 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status =
-        TriggerExecutionStatus::new(context.arena, code, locals, output_columns.len())?;
+    let mut status = TriggerExecutionStatus::new(
+        context.arena,
+        code,
+        locals,
+        output_columns.len(),
+        &context.storage().execution_control,
+    )?;
     status.collect_set_rows(PlpgsqlSetResult::for_routine(
         routine,
         &context.storage().row_work,
@@ -30085,7 +30121,13 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         };
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-        let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
+        let mut status = TriggerExecutionStatus::new(
+            context.arena,
+            code,
+            program.locals,
+            0,
+            &context.storage().execution_control,
+        )?;
         initialize_trigger_locals(
             &mut context,
             invocation,

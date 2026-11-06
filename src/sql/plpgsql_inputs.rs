@@ -107,9 +107,7 @@ pub(super) fn references_exception_variables(text: &str, arena: &Arena) -> Resul
             use super::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(text, scratch);
             loop {
-                match lexer.next_token().map_err(|error| {
-                    sql_err!(error.kind.sqlstate(), "{}", error.message.as_str())
-                })? {
+                match lexer.next_token().map_err(|error| super::parse_error_to_sql(&error.into()))? {
                     Tok::Ident("sqlstate" | "sqlerrm")
                     | Tok::QuotedIdent("sqlstate" | "sqlerrm") => return Ok(true),
                     Tok::Eof => return Ok(false),

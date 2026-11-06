@@ -351,7 +351,10 @@ only under Miri; native builds retain their full test set. This avoids spending
 interpreter time constructing test descriptions that the ownership gate never
 runs. Miri without that feature keeps the broader test harness available.
 Keep ownership cases beside their runtime modules and shared helpers outside
-native fixture modules. List every selected case by its complete Rust name in
+native fixture modules. Tests constructing an anonymous invocation must install an explicit SQL plan
+owner through `type_input_plans::with_owner`, as the command executor does.
+Keep missing production ownership an error.
+List every selected case by its complete Rust name in
 `tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
 The script checks that every listed proof passes, with none missing, failed or
 ignored. Preserve the full proof set when reducing interpreter startup work.

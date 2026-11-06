@@ -17159,7 +17159,6 @@ enum TriggerContextField {
     Relname,
     TableName,
     TableSchema,
-    Tablespace,
     Nargs,
     Argv,
     Event,
@@ -17168,31 +17167,29 @@ enum TriggerContextField {
 
 impl TriggerContextField {
     fn parse(name: &str) -> Option<Self> {
-        if name.eq_ignore_ascii_case("tg_name") {
+        if name == "tg_name" {
             Some(Self::Name)
-        } else if name.eq_ignore_ascii_case("tg_when") {
+        } else if name == "tg_when" {
             Some(Self::When)
-        } else if name.eq_ignore_ascii_case("tg_level") {
+        } else if name == "tg_level" {
             Some(Self::Level)
-        } else if name.eq_ignore_ascii_case("tg_op") {
+        } else if name == "tg_op" {
             Some(Self::Operation)
-        } else if name.eq_ignore_ascii_case("tg_relid") {
+        } else if name == "tg_relid" {
             Some(Self::Relid)
-        } else if name.eq_ignore_ascii_case("tg_relname") {
+        } else if name == "tg_relname" {
             Some(Self::Relname)
-        } else if name.eq_ignore_ascii_case("tg_table_name") {
+        } else if name == "tg_table_name" {
             Some(Self::TableName)
-        } else if name.eq_ignore_ascii_case("tg_table_schema") {
+        } else if name == "tg_table_schema" {
             Some(Self::TableSchema)
-        } else if name.eq_ignore_ascii_case("tg_tablespace") {
-            Some(Self::Tablespace)
-        } else if name.eq_ignore_ascii_case("tg_nargs") {
+        } else if name == "tg_nargs" {
             Some(Self::Nargs)
-        } else if name.eq_ignore_ascii_case("tg_argv") {
+        } else if name == "tg_argv" {
             Some(Self::Argv)
-        } else if name.eq_ignore_ascii_case("tg_event") {
+        } else if name == "tg_event" {
             Some(Self::Event)
-        } else if name.eq_ignore_ascii_case("tg_tag") {
+        } else if name == "tg_tag" {
             Some(Self::Tag)
         } else {
             None
@@ -17201,18 +17198,11 @@ impl TriggerContextField {
 
     const fn ctype(self) -> ColType {
         match self {
-            Self::Relid | Self::Nargs => ColType::Int4,
+            Self::Relid => ColType::Oid,
+            Self::Nargs => ColType::Int4,
+            Self::Name | Self::Relname | Self::TableName | Self::TableSchema => ColType::Name,
             Self::Argv => ColType::Array(ArrElem::Text),
-            Self::Name
-            | Self::When
-            | Self::Level
-            | Self::Operation
-            | Self::Relname
-            | Self::TableName
-            | Self::TableSchema
-            | Self::Tablespace
-            | Self::Event
-            | Self::Tag => ColType::Text,
+            Self::When | Self::Level | Self::Operation | Self::Event | Self::Tag => ColType::Text,
         }
     }
 }
@@ -17538,11 +17528,10 @@ impl<'a> TriggerInvocation<'a> {
             TriggerContextField::When => Datum::Text(self.when),
             TriggerContextField::Level => Datum::Text(self.level),
             TriggerContextField::Operation => Datum::Text(self.operation),
-            TriggerContextField::Relid => Datum::Int4(self.relid),
+            TriggerContextField::Relid => Datum::Oid(self.relid as u32),
             TriggerContextField::Relname => Datum::Text(self.table_name),
             TriggerContextField::TableName => Datum::Text(self.table_name),
             TriggerContextField::TableSchema => Datum::Text(self.table_schema),
-            TriggerContextField::Tablespace => Datum::Null,
             TriggerContextField::Nargs => Datum::Int4(self.nargs),
             TriggerContextField::Argv => self.argv,
             TriggerContextField::Event => Datum::Text(self.event),
@@ -18071,7 +18060,7 @@ enum TriggerStatusVariable {
 
 impl TriggerStatusVariable {
     fn parse(name: &str) -> Option<Self> {
-        name.eq_ignore_ascii_case("found").then_some(Self::Found)
+        (name == "found").then_some(Self::Found)
     }
 }
 
@@ -18083,9 +18072,9 @@ enum TriggerExceptionVariable {
 
 impl TriggerExceptionVariable {
     fn parse(name: &str) -> Option<Self> {
-        if name.eq_ignore_ascii_case("sqlstate") {
+        if name == "sqlstate" {
             Some(Self::Sqlstate)
-        } else if name.eq_ignore_ascii_case("sqlerrm") {
+        } else if name == "sqlerrm" {
             Some(Self::Sqlerrm)
         } else {
             None
@@ -18785,6 +18774,39 @@ fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+fn parse_plpgsql_identifier(source: &str, arena: &Arena) -> Result<SqlName, SqlError> {
+    arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(source, scratch);
+            let token = lexer
+                .next_token()
+                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let name = match token {
+                Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "expected a PL/pgSQL identifier"
+                    ));
+                }
+            };
+            if !matches!(
+                lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?,
+                Tok::Eof
+            ) {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "expected one PL/pgSQL identifier"
+                ));
+            }
+            Ok(name)
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
 fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
@@ -18812,10 +18834,25 @@ fn parse_trigger_local<'a>(
     } else {
         (statement.trim(), None)
     };
-    let Some(split) = declaration.find(char::is_whitespace) else {
-        return Err(unsupported_trigger_body());
-    };
-    let name = SqlName::parse(declaration[..split].trim())?;
+    let (name, split) = arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(declaration, scratch);
+            let token = lexer
+                .next_token()
+                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let name = match token {
+                Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "expected a PL/pgSQL variable name"
+                    ));
+                }
+            };
+            Ok((name, lexer.token_end()))
+        })
+        .map_err(|_| super::query::arena_full_pub())??;
     if plpgsql_context_field(program_kind, name.as_str()).is_some()
         || TriggerExceptionVariable::parse(name.as_str()).is_some()
     {
@@ -18912,7 +18949,7 @@ fn parse_trigger_select_into<'a>(
         if count == targets.len() || target.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        targets[count] = SqlName::parse(target.trim())?;
+        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?;
         count += 1;
     }
     if count == 0 {
@@ -19042,7 +19079,7 @@ fn parse_plpgsql_into_targets<'a>(
         if count == targets.len() || target.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        targets[count] = SqlName::parse(target.trim())?;
+        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?;
         count += 1;
     }
     if count == 0 {
@@ -19389,8 +19426,8 @@ fn parse_trigger_get_diagnostics<'a>(
         let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
-        let target = SqlName::parse(target.trim())?;
-        if target.as_str().contains('.') || item.trim().is_empty() {
+        let target = parse_plpgsql_identifier(target.trim(), arena)?;
+        if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
         if assignments[..index]
@@ -19439,8 +19476,8 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
         let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
             return Err(unsupported_trigger_body());
         };
-        let target = SqlName::parse(target.trim())?;
-        if target.as_str().contains('.') || item.trim().is_empty() {
+        let target = parse_plpgsql_identifier(target.trim(), arena)?;
+        if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
         if assignments[..index]
@@ -19641,7 +19678,7 @@ fn parse_trigger_for_header<'a>(
     let Some(in_at) = trigger_top_level_keyword(body, "in") else {
         return Err(unsupported_trigger_body());
     };
-    let target = SqlName::parse(body[..in_at].trim())?;
+    let target = parse_plpgsql_identifier(body[..in_at].trim(), arena)?;
     let mut source = body[in_at + 2..].trim();
     if source.is_empty() {
         return Err(unsupported_trigger_body());
@@ -19712,14 +19749,14 @@ fn parse_trigger_foreach_header<'a>(
     let target_source = body[..in_at].trim();
     let (target, slice) = match trigger_top_level_keyword(target_source, "slice") {
         Some(at) => {
-            let target = SqlName::parse(target_source[..at].trim())?;
+            let target = parse_plpgsql_identifier(target_source[..at].trim(), arena)?;
             let slice = target_source[at + 5..].trim();
             let slice = slice
                 .parse::<u8>()
                 .map_err(|_| unsupported_trigger_body())?;
             (target, NonZeroU8::new(slice))
         }
-        None => (SqlName::parse(target_source)?, None),
+        None => (parse_plpgsql_identifier(target_source, arena)?, None),
     };
     let array = strip_trigger_keyword(body[in_at + 2..].trim(), "array")
         .ok_or_else(unsupported_trigger_body)?
@@ -19757,9 +19794,12 @@ fn is_trigger_loop_header(segment: &str) -> bool {
     segment.trim().eq_ignore_ascii_case("loop")
 }
 
-fn trigger_loop_label(segment: &str) -> Result<(Option<SqlName>, &str), SqlError> {
+fn trigger_loop_label<'s>(
+    segment: &'s str,
+    arena: &Arena,
+) -> Result<(Option<SqlName>, &'s str), SqlError> {
     match trigger_label_prefix(segment) {
-        Some((label, header)) => Ok((Some(SqlName::parse(label)?), header)),
+        Some((label, header)) => Ok((Some(parse_plpgsql_identifier(label, arena)?), header)),
         None => Ok((None, segment)),
     }
 }
@@ -19791,6 +19831,7 @@ fn parse_trigger_loop_control<'a>(
                 tail,
                 None,
                 loop_labels,
+                arena,
             )?));
         };
         let label = tail[..space].trim();
@@ -19809,7 +19850,7 @@ fn parse_trigger_loop_control<'a>(
         } else {
             return Err(unsupported_trigger_body());
         };
-        (Some(SqlName::parse(label)?), condition)
+        (Some(parse_plpgsql_identifier(label, arena)?), condition)
     };
     let unwind = match label {
         Some(label) => loop_labels
@@ -19837,8 +19878,9 @@ fn loop_control_for_label<'a>(
     label: &str,
     condition: Option<&'a Expr<'a>>,
     loop_labels: &[Option<SqlName>],
+    arena: &Arena,
 ) -> Result<TriggerLoopControl<'a>, SqlError> {
-    let label = SqlName::parse(label)?;
+    let label = parse_plpgsql_identifier(label, arena)?;
     let unwind = loop_labels
         .iter()
         .rev()
@@ -19975,7 +20017,7 @@ fn parse_plpgsql_cursor_open<'a>(
     let Some(split) = body.find(char::is_whitespace) else {
         return Err(unsupported_trigger_body());
     };
-    let variable = SqlName::parse(body[..split].trim())?;
+    let variable = parse_plpgsql_identifier(body[..split].trim(), arena)?;
     let body = body[split..].trim();
     let Some(for_at) = trigger_top_level_keyword(body, "for") else {
         return Err(unsupported_trigger_body());
@@ -20035,7 +20077,7 @@ fn parse_plpgsql_cursor_motion<'a>(
     let Some(variable_text) = motion_and_variable.split_ascii_whitespace().next_back() else {
         return Err(unsupported_trigger_body());
     };
-    let variable = SqlName::parse(variable_text)?;
+    let variable = parse_plpgsql_identifier(variable_text, arena)?;
     let variable_at = motion_and_variable
         .len()
         .checked_sub(variable_text.len())
@@ -20084,7 +20126,7 @@ fn parse_plpgsql_cursor_motion<'a>(
     }))
 }
 
-fn parse_plpgsql_cursor_close(statement: &str) -> Result<Option<SqlName>, SqlError> {
+fn parse_plpgsql_cursor_close(statement: &str, arena: &Arena) -> Result<Option<SqlName>, SqlError> {
     let Some(body) = strip_trigger_keyword(statement, "close") else {
         return Ok(None);
     };
@@ -20092,7 +20134,7 @@ fn parse_plpgsql_cursor_close(statement: &str) -> Result<Option<SqlName>, SqlErr
     if body.is_empty() || body.contains(char::is_whitespace) {
         return Err(unsupported_trigger_body());
     }
-    Ok(Some(SqlName::parse(body)?))
+    Ok(Some(parse_plpgsql_identifier(body, arena)?))
 }
 
 fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> crate::sql::eval::SqlState {
@@ -20189,7 +20231,7 @@ fn parse_trigger_statement<'a>(
     if let Some(motion) = parse_plpgsql_cursor_motion(segment, arena)? {
         return Ok(TriggerStatement::CursorMotion(motion));
     }
-    if let Some(variable) = parse_plpgsql_cursor_close(segment)? {
+    if let Some(variable) = parse_plpgsql_cursor_close(segment, arena)? {
         return Ok(TriggerStatement::CursorClose(variable));
     }
     if let Some(dynamic) = parse_trigger_dynamic_execute(segment, arena)? {
@@ -20417,7 +20459,7 @@ fn parse_trigger_block<'a>(
             return Err(unsupported_trigger_body());
         }
         *at += 1;
-        let (loop_label, loop_header) = trigger_loop_label(segment)?;
+        let (loop_label, loop_header) = trigger_loop_label(segment, arena)?;
         if loop_depth == loop_labels.len()
             && (strip_trigger_keyword(loop_header, "for").is_some()
                 || strip_trigger_keyword(loop_header, "while").is_some()
@@ -22237,7 +22279,7 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     fn local_index(&self, name: &str) -> Option<usize> {
         self.locals
             .iter()
-            .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
+            .position(|local| local.name.as_str() == name)
     }
 
     fn cursor_locals(
@@ -22258,7 +22300,6 @@ impl<'a> TriggerLocalScope<'_, 'a> {
             "tg_relname",
             "tg_table_name",
             "tg_table_schema",
-            "tg_tablespace",
             "tg_nargs",
             "tg_argv",
             "tg_event",
@@ -22358,7 +22399,7 @@ where
             };
             return fields
                 .iter()
-                .find(|field| field.name.eq_ignore_ascii_case(name))
+                .find(|field| field.name == name)
                 .map(|field| field.value)
                 .ok_or_else(|| {
                     sql_err!(
@@ -22401,7 +22442,7 @@ where
                     .and_then(|index| match self.values[index] {
                         Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                             .iter()
-                            .find(|field| field.name.eq_ignore_ascii_case(name))
+                            .find(|field| field.name == name)
                             .and_then(|field| ColType::from_oid(field.type_oid)),
                         _ => None,
                     })
@@ -22612,7 +22653,7 @@ impl TriggerDmlSnapshot<'_> {
     fn local_index(&self, name: &str) -> Option<usize> {
         self.locals
             .iter()
-            .position(|local| local.name.as_str().eq_ignore_ascii_case(name))
+            .position(|local| local.name.as_str() == name)
     }
 }
 

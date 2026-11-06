@@ -263,9 +263,15 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
                 "handler",
             )
             .unwrap();
-        let invocation = TriggerInvocation::anonymous()
-            .unwrap()
-            .with_input_sites(program.input_sites);
+        let invocation = crate::sql::type_input_plans::with_owner(
+            crate::sql::type_input_plans::Owner::Transient {
+                generation: 1,
+                statement: 0,
+            },
+            TriggerInvocation::anonymous,
+        )
+        .unwrap()
+        .with_input_sites(program.input_sites);
         let bound = bind_exception_variables(invocation, Some(&caught), statement, &arena).unwrap();
         let variables = bound
             .exception
@@ -274,5 +280,37 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
         assert_eq!(variables.sqlstate_text, "P0001");
         buffers.release(&arena, caught);
         assert_eq!(variables.message, "caught");
+    });
+}
+
+#[test]
+fn procedural_identifier_sources_keep_quoted_names_without_retaining_lexer_scratch() {
+    let mut budget = Budget::new(1 << 16);
+    let arena = Arena::new(&mut budget, "procedural name tokens", 1 << 16).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        for (source, expected) in [
+            ("MixedCase", "mixedcase"),
+            ("\"MixedCase\"", "MixedCase"),
+            ("\"spaced name\"", "spaced name"),
+            ("\"doubled\"\"quote\"", "doubled\"quote"),
+            ("/* before */ MiXeD -- after", "mixed"),
+        ] {
+            let before = arena.used();
+            assert_eq!(
+                parse_plpgsql_identifier(source, &arena).unwrap().as_str(),
+                expected
+            );
+            assert_eq!(arena.used(), before);
+        }
+        for source in ["a b", "name.field", "1", "\"unterminated"] {
+            let before = arena.used();
+            assert_eq!(
+                parse_plpgsql_identifier(source, &arena)
+                    .unwrap_err()
+                    .sqlstate,
+                "42601"
+            );
+            assert_eq!(arena.used(), before);
+        }
     });
 }

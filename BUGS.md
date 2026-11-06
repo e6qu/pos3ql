@@ -13,7 +13,8 @@ belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
 current behavior belongs in the [owning guides](docs/README.md), including
 retained caught-error ownership, initializer-free runtime local metadata,
-rewritten assignment inputs and PostgreSQL stacked-diagnostic values.
+rewritten assignment inputs, quoted procedural names, typed trigger context
+and PostgreSQL stacked-diagnostic values.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

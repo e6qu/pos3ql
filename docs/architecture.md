@@ -220,6 +220,13 @@ expressions separately; initialization seeds parameters first, then evaluates
 local defaults once in declaration order. For example, a later local can use
 an earlier constant initialized by `nextval`, and a loop counter must restore
 the initialized local that it shadows.
+Procedural declarations and target names cross the SQL lexer before lookup.
+Unquoted `MixedCase` becomes `mixedcase`; quoted `"MixedCase"` remains distinct.
+Local variables, record fields and built-in handler/status/context names compare
+those normalized names exactly, so `SQLERRM` and `"SQLERRM"` are different.
+Trigger names and relation/schema names have PostgreSQL type `name`; `TG_RELID`
+is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
+a PostgreSQL trigger variable and raises an undefined-column error.
 Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
 stores a block index and next-statement offset in its compiled program. Loop

@@ -98,9 +98,9 @@ reusable caught-error buffers and scoped scratch described in the architecture.
 A function that saves the first error message must keep it after later catches
 reuse their handler storage; nested handlers and rethrow retain the outer error.
 Keep handler variables available in rewritten local and NEW-row assignments,
-including variable JSON subscripts. Qualify every reference fixture
-under unchanged capacities; repair the current record-loop memory regression
-before completing this work. A caught `RETURN QUERY` error keeps its completed
+including variable JSON subscripts. Preserve quoted names and SQL case folding
+for declarations, targets, record fields and runtime variables. Qualify every reference fixture
+under unchanged capacities. A caught `RETURN QUERY` error keeps its completed
 result prefix; a private wait must not publish that prefix twice.
 Preserve PostgreSQL's different row-consumption rules for static `SELECT INTO`
 and dynamic `EXECUTE INTO`.

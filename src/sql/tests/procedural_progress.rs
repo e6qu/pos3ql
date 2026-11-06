@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn trigger_context_types_and_unavailable_names_match_postgresql() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("trigger-context-types-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/254_trigger_context_types.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "name:oid:name:name:name:integer:text[]:text:text:text:true:NULL:42703",
+                "name:oid:name:name:name:integer:text[]:text:text:text:false:first:42703"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn procedural_identifiers_preserve_quoted_case_and_fold_unquoted_names() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-identifier-case-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/253_procedural_identifier_case.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "error-case:status-case",
+                "lower:quoted:space",
+                "3",
+                "case_trigger:context-case",
+                "lower:quoted"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn procedural_locals_initialize_once_in_order_after_seeded_parameters() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -175,21 +226,8 @@ fn owned_loop_inputs_preserve_records_empty_rows_and_once_only_effects() {
         let sql = include_str!("../../../tests/external/differential/247_owned_loop_rows.sql");
         // Notices survive a later error and identify the failing source without
         // changing the PostgreSQL reference fixture or its expected rows.
-        let mut diagnostic_sql = sql.to_owned();
-        for (source, stage) in [
-            ("FOR r IN SELECT input.n", "static record"),
-            ("FOR r IN EXECUTE", "dynamic record"),
-            ("FOR r IN SELECT 99", "empty record"),
-            ("FOR r IN SELECT source.n", "function record"),
-            ("FOREACH item IN ARRAY", "empty array"),
-        ] {
-            diagnostic_sql = diagnostic_sql.replace(
-                source,
-                &format!("RAISE NOTICE 'loop input stage: {stage}'; {source}"),
-            );
-        }
         assert_eq!(
-            data_rows(&session.success(&mut engine, &diagnostic_sql, true)),
+            data_rows(&session.success(&mut engine, sql, true)),
             [
                 "array_empty|42|12|f",
                 "dynamic|four|7|t",

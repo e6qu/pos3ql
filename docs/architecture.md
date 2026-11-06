@@ -299,8 +299,16 @@ is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
 a PostgreSQL trigger variable and raises an undefined-column error.
 Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
-stores a block index and next-statement offset in its compiled program. Loop
-conditions and handler syntax resolve through that program; loop values and
+stores a block index and next-statement offset in its compiled program. The
+original body and program kind use an immutable, checked source image. Parsed
+blocks belong to a separate compiled view; mutable frame metadata retains its
+source identity instead of references to parsing storage. Binding a view checks
+that identity before entering the body. A replaced, foreign or reset source
+returns `40001`; source-image exhaustion names its statement-memory limit with
+`54000`. Rebuilding syntax from that image keeps the original body after parsing
+scratch is reused. This preserves source text, not the invocation's selected
+definitions or session settings; those still need retained owners. Loop
+conditions and handler syntax resolve through the bound view; loop values and
 handler diagnostic/savepoint state stay with the active frame. Child blocks do
 not recursively call the interpreter. Leaving a scope
 restores shadowed counters, copies assignments back and releases its references.
@@ -319,8 +327,8 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-The control frames and local variables still borrow temporary statement memory;
-retaining diagnostics alone does not yet let the whole invocation survive
+Numeric workspaces and local values still borrow temporary statement memory;
+source images and diagnostics alone do not yet let the whole invocation survive
 returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.

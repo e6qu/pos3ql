@@ -29,6 +29,14 @@ impl<T> Clone for FrozenArenaSliceHandle<T> {
     }
 }
 
+impl<T> PartialEq for FrozenArenaSliceHandle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.identity == other.0.identity && self.0.offset == other.0.offset
+    }
+}
+
+impl<T> Eq for FrozenArenaSliceHandle<T> {}
+
 struct SliceHeader {
     len: usize,
     borrowed: Cell<bool>,

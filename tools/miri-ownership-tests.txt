@@ -238,3 +238,4 @@ sql::query::routine_contract_tests::invocation_callback_scopes_restore_outer_own
 sql::query::invocation_results::ownership_tests::callback_result_copies_remain_readable_after_both_source_owners_are_dropped
 mem::arena::retained_slice::tests::retained_region_transfers_move_overlapping_payload_before_initializing_headers
 mem::arena::retained_slice::tests::retained_region_transfers_publish_into_borrowed_parents_without_pinning_body_scratch
+sql::exec::control_flow::ownership_tests::frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images

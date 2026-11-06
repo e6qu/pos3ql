@@ -797,7 +797,7 @@ mod loop_rows;
 mod numeric_loops;
 mod set_rows;
 
-use control_flow::{ControlFrames, execute_trigger_block};
+use control_flow::{CompiledProgram, ControlFrames, ProgramSource, execute_trigger_block};
 use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
@@ -3939,17 +3939,9 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         &routine,
         context.arena,
     )?;
-    let source = context
-        .arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger body exceeds the statement arena"
-            )
-        })?;
-    let program = resolve_plpgsql_program_locals(
-        parse_trigger_program(source, context.arena)?,
+    let (program, code) = compile_plpgsql_execution(
+        routine.body.as_str(),
+        PlpgsqlProgramKind::Trigger,
         context.storage(),
         context.txn.txid,
         context.arena,
@@ -3971,7 +3963,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         ..invocation
     };
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
     initialize_trigger_locals(
         context,
         invocation,
@@ -3995,7 +3987,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         transition_relations,
         program.locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         Some(TriggerFlow::Return(result)) => match result {
@@ -17978,13 +17970,14 @@ struct TriggerExecutionStatus<'a> {
 impl<'a> TriggerExecutionStatus<'a> {
     fn new(
         arena: &'a Arena,
-        block: TriggerBlock<'a>,
+        program: CompiledProgram<'_>,
         locals: &[TriggerLocalDecl],
         output_count: usize,
     ) -> Result<Self, SqlError> {
+        let control_frames = ControlFrames::new(arena, program.layout(), arena)?;
         Ok(Self {
-            numeric_frames: NumericLoopFrames::new(arena, block, locals)?,
-            control_frames: Some(ControlFrames::new(arena, block)?),
+            numeric_frames: NumericLoopFrames::new(arena, program.root(), locals)?,
+            control_frames: Some(control_frames),
             found: Some(false),
             row_count: 0,
             set_result: None,
@@ -20946,6 +20939,20 @@ fn resolve_plpgsql_program_locals<'a>(
     Ok(program)
 }
 
+fn compile_plpgsql_execution<'a>(
+    source: &str,
+    kind: PlpgsqlProgramKind,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    has_parameter: &dyn Fn(SqlName) -> bool,
+) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    let source = ProgramSource::capture(source, kind, arena)?;
+    let (parsed, code) = source.parse(arena, arena)?;
+    let program = resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)?;
+    Ok((program, code))
+}
+
 fn validate_plpgsql_constant_assignments(
     program: &TriggerProgram<'_>,
     has_parameter: &dyn Fn(SqlName) -> bool,
@@ -21282,8 +21289,9 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
-    let program = resolve_plpgsql_program_locals(
-        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Anonymous)?,
+    let (program, code) = compile_plpgsql_execution(
+        source,
+        PlpgsqlProgramKind::Anonymous,
         &engine.storage,
         txn.txid,
         arena,
@@ -21305,7 +21313,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21330,7 +21338,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         None,
         program.locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
@@ -21356,11 +21364,9 @@ pub(crate) fn execute_event_trigger<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
-    let source = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let program = resolve_plpgsql_program_locals(
-        parse_event_trigger_program(source, arena)?,
+    let (program, code) = compile_plpgsql_execution(
+        routine.body.as_str(),
+        PlpgsqlProgramKind::EventTrigger,
         &engine.storage,
         txn.txid,
         arena,
@@ -21391,7 +21397,7 @@ pub(crate) fn execute_event_trigger<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21416,7 +21422,7 @@ pub(crate) fn execute_event_trigger<'a>(
         None,
         program.locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
@@ -21456,11 +21462,9 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         )),
         input_collation,
     )?;
-    let source = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let program = resolve_plpgsql_program_locals(
-        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Procedure)?,
+    let (program, code) = compile_plpgsql_execution(
+        routine.body.as_str(),
+        PlpgsqlProgramKind::Procedure,
         &engine.storage,
         txn.txid,
         arena,
@@ -21543,7 +21547,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, code, locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21568,7 +21572,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         None,
         locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => {}
@@ -21610,12 +21614,10 @@ pub(crate) fn execute_plpgsql_function<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<Datum<'a>, SqlError> {
-    let source = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| super::query::arena_full_pub())?;
     let program_kind = plpgsql_function_program_kind(routine);
-    let program = resolve_plpgsql_program_locals(
-        parse_plpgsql_program(source, arena, program_kind)?,
+    let (program, code) = compile_plpgsql_execution(
+        routine.body.as_str(),
+        program_kind,
         &engine.storage,
         txn.txid,
         arena,
@@ -21713,7 +21715,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         responder,
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
-    let mut status = TriggerExecutionStatus::new(context.arena, program.body, locals, 0)?;
+    let mut status = TriggerExecutionStatus::new(context.arena, code, locals, 0)?;
     initialize_trigger_locals(
         &mut context,
         invocation,
@@ -21738,7 +21740,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None,
         locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
@@ -21781,11 +21783,9 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let source = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| super::query::arena_full_pub())?;
-    let program = resolve_plpgsql_program_locals(
-        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::SetFunction)?,
+    let (program, code) = compile_plpgsql_execution(
+        routine.body.as_str(),
+        PlpgsqlProgramKind::SetFunction,
         &engine.storage,
         txn.txid,
         arena,
@@ -21883,7 +21883,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status =
-        TriggerExecutionStatus::new(context.arena, program.body, locals, output_columns.len())?;
+        TriggerExecutionStatus::new(context.arena, code, locals, output_columns.len())?;
     status.collect_set_rows(PlpgsqlSetResult::for_routine(
         routine,
         &context.storage().row_work,
@@ -21929,7 +21929,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         None,
         locals,
         local_values,
-        program.body,
+        code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => status
@@ -30052,17 +30052,9 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             &routine,
             context.arena,
         )?;
-        let source = {
-            let body = routine.body.as_str();
-            context.arena.alloc_str(body).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "trigger body exceeds the statement arena"
-                )
-            })?
-        };
-        let program = resolve_plpgsql_program_locals(
-            parse_trigger_program(source, context.arena)?,
+        let (program, code) = compile_plpgsql_execution(
+            routine.body.as_str(),
+            PlpgsqlProgramKind::Trigger,
             context.storage(),
             context.txn.txid,
             context.arena,
@@ -30085,8 +30077,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         };
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
-        let mut status =
-            TriggerExecutionStatus::new(context.arena, program.body, program.locals, 0)?;
+        let mut status = TriggerExecutionStatus::new(context.arena, code, program.locals, 0)?;
         initialize_trigger_locals(
             &mut context,
             invocation,
@@ -30110,7 +30101,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             transition_relations,
             program.locals,
             local_values,
-            program.body,
+            code,
             &mut status,
         )? {
             Some(TriggerFlow::Return(_)) => {}

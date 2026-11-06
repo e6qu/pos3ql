@@ -89,6 +89,9 @@ A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
 Finish saving local values, declared types, selected source definitions, control
 positions, output bindings and the enclosing write across scheduler returns.
+Keep the original source image and kind when rebuilding syntax; reused parsing
+memory or a replacement function must not redirect saved positions. Preserve
+source-owner checks alongside the selected definitions and session settings.
 Preserve once-only declaration initialization after input/output parameter slots
 are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
 reads and assignments use the innermost binding, while returning outputs uses

@@ -17,7 +17,7 @@ pub(super) struct NumericLoopFrames<'a> {
 impl<'a> NumericLoopFrames<'a> {
     pub(super) fn new(
         arena: &'a Arena,
-        block: TriggerBlock<'a>,
+        block: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
     ) -> Result<Self, SqlError> {
         let depth = numeric_depth(block);

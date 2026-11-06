@@ -3,7 +3,11 @@
 use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
 use super::*;
 use crate::mem::arena::OwnedArenaSlice;
-use numeric_loops::{BlockEdge, NumericLoopWorkspace};
+
+mod program;
+use numeric_loops::NumericLoopWorkspace;
+use program::ProgramLayout;
+pub(super) use program::{CompiledProgram, ProgramSource};
 
 pub(super) enum Step<'a> {
     Complete(Option<TriggerFlow<'a>>),
@@ -122,80 +126,73 @@ enum Continuation<'a> {
 /// A frame owns its next statement and loop/handler state; entering a child does
 /// not keep another Rust interpreter invocation on the call stack.
 pub(super) struct ControlFrames<'a> {
-    blocks: &'a [TriggerBlock<'a>],
+    source: ProgramSource,
     slots: OwnedArenaSlice<'a, Option<Frame<'a>>>,
     active: usize,
     diagnostics: DiagnosticBuffers,
 }
 
 impl<'a> ControlFrames<'a> {
-    pub(super) fn new(arena: &'a Arena, block: TriggerBlock<'a>) -> Result<Self, SqlError> {
-        fn layout(block: TriggerBlock<'_>) -> (usize, usize, usize) {
-            let mut count = 1;
-            let mut depth = 1;
-            let mut handlers = 0;
-            numeric_loops::visit_nested_blocks(block, |child, edge| {
-                let (child_count, child_depth, child_handlers) = layout(child);
-                count += child_count;
-                depth = depth.max(child_depth + 1);
-                handlers =
-                    handlers.max(child_handlers + usize::from(matches!(edge, BlockEdge::Handler)));
-            });
-            (count, depth, handlers)
-        }
-        fn compile<'a>(block: TriggerBlock<'a>, blocks: &mut [TriggerBlock<'a>], next: &mut usize) {
-            blocks[*next] = block;
-            *next += 1;
-            numeric_loops::visit_nested_blocks(block, |child, _| compile(child, blocks, next));
-        }
-        let (count, depth, handlers) = layout(block);
-        let blocks = arena
-            .alloc_slice_with(count, |_| TriggerBlock { statements: &[] })
-            .map_err(|_| frame_full())?;
-        let mut next = 0;
-        compile(block, blocks, &mut next);
-        assert_eq!(next, count);
+    pub(super) fn new(
+        arena: &'a Arena,
+        layout: ProgramLayout,
+        source: &Arena,
+    ) -> Result<Self, SqlError> {
+        layout.source.require(source)?;
         Ok(Self {
-            blocks,
+            source: layout.source,
             slots: arena
-                .alloc_owned_slice_with(depth, |_| None)
+                .alloc_owned_slice_with(layout.depth, |_| None)
                 .map_err(|_| frame_full())?,
             active: 0,
-            diagnostics: DiagnosticBuffers::new(arena, handlers)?,
+            diagnostics: DiagnosticBuffers::new(arena, layout.handlers)?,
         })
     }
 
-    fn block(&self, index: BlockIndex) -> TriggerBlock<'a> {
-        self.blocks[index.0]
+    fn require_source(&self, arena: &Arena, source: ProgramSource) -> Result<(), SqlError> {
+        if self.source != source {
+            return Err(program::changed());
+        }
+        source.require(arena)
     }
 
-    fn index(&self, block: TriggerBlock<'a>) -> BlockIndex {
-        BlockIndex(
-            self.blocks
-                .iter()
-                .position(|candidate| core::ptr::eq(candidate.statements, block.statements))
-                .expect("entered block belongs to the compiled procedural program"),
-        )
+    fn execution<'scope>(
+        &'scope mut self,
+        arena: &Arena,
+        program: CompiledProgram<'a>,
+    ) -> Result<FrameExecution<'scope, 'a>, SqlError> {
+        self.require_source(arena, program.source())?;
+        Ok(FrameExecution {
+            state: self,
+            program,
+        })
     }
+}
 
+struct FrameExecution<'scope, 'a> {
+    state: &'scope mut ControlFrames<'a>,
+    program: CompiledProgram<'a>,
+}
+
+impl<'a> FrameExecution<'_, 'a> {
     fn push(&mut self, entry: FrameEntry<'a>, source: FrameSource) {
         // Each active frame corresponds to one lexical edge in layout().
         assert!(
-            self.active < self.slots.len(),
+            self.state.active < self.state.slots.len(),
             "procedural lexical frame capacity"
         );
-        assert!(self.slots[self.active].is_none());
-        self.slots[self.active] = Some(Frame {
-            block: self.index(entry.block),
+        assert!(self.state.slots[self.state.active].is_none());
+        self.state.slots[self.state.active] = Some(Frame {
+            block: self.program.index(entry.block),
             next: 0,
             source,
             continuation: entry.continuation,
         });
-        self.active += 1;
+        self.state.active += 1;
     }
 
     fn start(&mut self, block: TriggerBlock<'a>) {
-        assert_eq!(self.active, 0);
+        assert_eq!(self.state.active, 0);
         self.push(
             FrameEntry::new(block, Continuation::Once),
             FrameSource::Root,
@@ -216,24 +213,24 @@ impl<'a> ControlFrames<'a> {
         let FrameSource::Statement(source) = source else {
             unreachable!("frame has no enclosing statement")
         };
-        self.block(source.block).statements[source.statement]
+        self.program.block(source.block).statements[source.statement]
     }
 
     fn pop(&mut self) -> Frame<'a> {
-        self.active -= 1;
-        self.slots[self.active]
+        self.state.active -= 1;
+        self.state.slots[self.state.active]
             .take()
             .expect("active procedural frame")
     }
 
     fn last(&self) -> &Frame<'a> {
-        self.slots[self.active - 1]
+        self.state.slots[self.state.active - 1]
             .as_ref()
             .expect("active procedural frame")
     }
 
     fn last_mut(&mut self) -> &mut Frame<'a> {
-        self.slots[self.active - 1]
+        self.state.slots[self.state.active - 1]
             .as_mut()
             .expect("active procedural frame")
     }
@@ -243,7 +240,11 @@ impl<'a> ControlFrames<'a> {
         locals: &'s [TriggerLocalDecl],
         values: &'s mut [Datum<'a>],
     ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
-        for frame in self.slots[..self.active].iter_mut().rev().flatten() {
+        for frame in self.state.slots[..self.state.active]
+            .iter_mut()
+            .rev()
+            .flatten()
+        {
             if let Continuation::Numeric(scope) = &mut frame.continuation {
                 return (
                     &scope.workspace.locals[..scope.count],
@@ -255,7 +256,7 @@ impl<'a> ControlFrames<'a> {
     }
 
     fn diagnostic(&self) -> Option<(CaughtDiagnostic, PlpgsqlScope)> {
-        self.slots[..self.active]
+        self.state.slots[..self.state.active]
             .iter()
             .enumerate()
             .rev()
@@ -287,7 +288,7 @@ impl<'a> ControlFrames<'a> {
                 }
             }
             Continuation::Rows { .. } if success => status.set_found(true),
-            Continuation::Handler(diagnostic) => self.diagnostics.release(arena, diagnostic),
+            Continuation::Handler(diagnostic) => self.state.diagnostics.release(arena, diagnostic),
             _ => {}
         }
     }
@@ -421,18 +422,19 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
-    block: TriggerBlock<'a>,
+    program: CompiledProgram<'a>,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
-    let mut frames = status
+    let mut retained = status
         .control_frames
         .take()
         .expect("one procedural frame owner");
-    assert_eq!(frames.active, 0);
-    frames.start(block);
+    let mut frames = retained.execution(context.arena, program)?;
+    assert_eq!(frames.state.active, 0);
+    frames.start(program.root());
     let mut outcome = Ok(None);
     let mut pending_error = None;
-    while frames.active != 0 {
+    while frames.state.active != 0 {
         let caught = frames.diagnostic();
         let exception = caught.as_ref().map(|(diagnostic, _)| diagnostic);
         let action = (|| {
@@ -441,6 +443,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
             }
             super::super::query::check_timeout()?;
             if let Some(statement) = frames
+                .program
                 .block(frames.last().block)
                 .statements
                 .get(frames.last().next)
@@ -448,7 +451,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
             {
                 let invocation =
                     bind_exception_variables(invocation, caught, statement, context.arena)?;
-                let child_scope = PlpgsqlScope::frame(frames.active + 1);
+                let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
                 let (scope, scope_values) = frames.scope(locals, values);
                 return execute_trigger_step(
                     context,
@@ -577,12 +580,12 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
             Ok(Some(Step::Complete(None))) => frames.last_mut().next += 1,
             Ok(None) => {}
             Ok(Some(Step::Complete(Some(mut flow)))) => {
-                while frames.active != 0 {
+                while frames.state.active != 0 {
                     if frames.last().is_loop() {
                         match flow {
                             TriggerFlow::Continue(0) => {
                                 frames.last_mut().next =
-                                    frames.block(frames.last().block).statements.len();
+                                    frames.program.block(frames.last().block).statements.len();
                                 break;
                             }
                             TriggerFlow::Exit(0) => {
@@ -609,14 +612,14 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     }
                     let frame = frames.pop();
                     frames.finish(context.arena, frame, locals, values, status, true);
-                    if frames.active == 0 {
+                    if frames.state.active == 0 {
                         outcome = Ok(Some(flow));
                     }
                 }
             }
             Err(mut error) => {
                 let mut handler = None;
-                while frames.active != 0 {
+                while frames.state.active != 0 {
                     let frame = frames.pop();
                     if let Continuation::Protected {
                         ref boundary,
@@ -648,7 +651,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     outcome = Err(error);
                     break;
                 };
-                match catch_diagnostic(context, invocation, &error, &mut frames.diagnostics) {
+                match catch_diagnostic(context, invocation, &error, &mut frames.state.diagnostics) {
                     Ok(caught) => frames.push(
                         FrameEntry::new(handler.block, Continuation::Handler(caught)),
                         FrameSource::Handler,
@@ -660,11 +663,11 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     }
     // Capacity/error exits release every lexical owner before the caller can
     // rewind statement memory. Transaction rollback remains the caller's job.
-    while frames.active != 0 {
+    while frames.state.active != 0 {
         let frame = frames.pop();
         frames.finish(context.arena, frame, locals, values, status, false);
     }
-    status.control_frames = Some(frames);
+    status.control_frames = Some(retained);
     outcome
 }
 

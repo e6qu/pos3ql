@@ -1,6 +1,15 @@
 use super::*;
 use crate::mem::budget::Budget;
 
+fn parse_owned_program<'a>(
+    text: &str,
+    parsing: &'a Arena,
+    source: &'a Arena,
+    kind: PlpgsqlProgramKind,
+) -> Result<(ParsedTriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    ProgramSource::capture(text, kind, source)?.parse(source, parsing)
+}
+
 #[test]
 fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
     let mut budget = Budget::new(1 << 18);
@@ -24,23 +33,27 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
     ] {
         parse.reset();
         arena.reset();
-        let program = parse_plpgsql_program(source, &parse, PlpgsqlProgramKind::Anonymous).unwrap();
+        let (_, code) =
+            parse_owned_program(source, &parse, &arena, PlpgsqlProgramKind::Anonymous).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let frames = ControlFrames::new(&arena, program.body).unwrap();
+            let frames = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
             assert_eq!(frames.slots.len(), depth, "{source}");
             assert_eq!(frames.active, 0);
             assert!(frames.slots.iter().all(Option::is_none));
         });
     }
     let small = Arena::new(&mut budget, "procedural exhausted positions", 1).unwrap();
-    let program = parse_plpgsql_program(
+    let (_, code) = parse_owned_program(
         "BEGIN LOOP NULL; END LOOP; END",
         &parse,
+        &arena,
         PlpgsqlProgramKind::Anonymous,
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let error = ControlFrames::new(&small, program.body).err().unwrap();
+        let error = ControlFrames::new(&small, code.layout(), &arena)
+            .err()
+            .unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("PL/pgSQL execution frames"));
     });
@@ -51,9 +64,10 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     let mut budget = Budget::new(1 << 18);
     let parse = Arena::new(&mut budget, "procedural numeric positions parsing", 1 << 16).unwrap();
     let arena = Arena::new(&mut budget, "procedural numeric positions", 1 << 16).unwrap();
-    let program = parse_plpgsql_program(
+    let (program, code) = parse_owned_program(
         "BEGIN FOR x IN 1..2 LOOP FOR j IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
         &parse,
+        &arena,
         PlpgsqlProgramKind::Anonymous,
     )
     .unwrap();
@@ -76,8 +90,9 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, program.body, &locals, 0).unwrap();
-        let mut frames = status.control_frames.take().unwrap();
+        let mut status = TriggerExecutionStatus::new(&arena, code, &locals, 0).unwrap();
+        let mut retained = status.control_frames.take().unwrap();
+        let mut frames = retained.execution(&arena, code).unwrap();
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
             frames.start(program.body);
@@ -131,7 +146,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
-            assert!(frames.slots.iter().all(Option::is_none));
+            assert!(frames.state.slots.iter().all(Option::is_none));
             let workspace = status.numeric_frames.take().unwrap();
             assert!(
                 workspace
@@ -142,7 +157,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }
-        status.control_frames = Some(frames);
+        status.control_frames = Some(retained);
     });
 }
 
@@ -151,9 +166,10 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
     let mut budget = Budget::new(1 << 18);
     let parse = Arena::new(&mut budget, "procedural handler positions parsing", 1 << 16).unwrap();
     let arena = Arena::new(&mut budget, "procedural handler positions", 1 << 16).unwrap();
-    let program = parse_plpgsql_program(
+    let (program, code) = parse_owned_program(
         "BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN IF true THEN NULL; END IF; END; END",
         &parse,
+        &arena,
         PlpgsqlProgramKind::Anonymous,
     )
     .unwrap();
@@ -165,11 +181,13 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         panic!("handler branch")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut frames = ControlFrames::new(&arena, program.body).unwrap();
+        let mut retained = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
+        let mut frames = retained.execution(&arena, code).unwrap();
         frames.start(program.body);
         frames.last_mut().next = 1;
         let error = sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero");
         let diagnostic = frames
+            .state
             .diagnostics
             .capture(&arena, &error, None, "handler")
             .unwrap();
@@ -202,51 +220,135 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         let Continuation::Handler(diagnostic) = handler.continuation else {
             panic!("handler");
         };
-        frames.diagnostics.release(&arena, diagnostic);
+        frames.state.diagnostics.release(&arena, diagnostic);
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
-        assert!(frames.slots.iter().all(Option::is_none));
+        assert!(frames.state.slots.iter().all(Option::is_none));
     });
 }
 
 #[test]
 fn positions_resolve_the_same_source_after_original_parse_storage_is_released() {
     const SOURCE: &str = "BEGIN WHILE true LOOP NULL; END LOOP; END";
-    let saved = {
-        let mut budget = Budget::new(1 << 18);
-        let parse = Arena::new(&mut budget, "original procedural source", 1 << 16).unwrap();
-        let arena = Arena::new(&mut budget, "original procedural positions", 1 << 16).unwrap();
-        let program = parse_plpgsql_program(SOURCE, &parse, PlpgsqlProgramKind::Anonymous).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let mut frames = ControlFrames::new(&arena, program.body).unwrap();
-            let TriggerStatement::While(while_program) = program.body.statements[0] else {
-                panic!("while program")
-            };
-            frames.start(program.body);
-            frames.enter(FrameEntry::new(while_program.block, Continuation::While));
-            frames.last_mut().next = 1;
-            let frame = frames.pop();
-            let position = (frame.block, frame.next, frame.source);
-            frames.pop();
-            position
-        })
-    };
     let mut budget = Budget::new(1 << 18);
-    let parse = Arena::new(&mut budget, "restored procedural source", 1 << 16).unwrap();
-    let arena = Arena::new(&mut budget, "restored procedural positions", 1 << 16).unwrap();
-    let program = parse_plpgsql_program(SOURCE, &parse, PlpgsqlProgramKind::Anonymous).unwrap();
+    let original = Arena::new(&mut budget, "owned procedural source", 1 << 16).unwrap();
+    let mut parsing = Arena::new(&mut budget, "recycled procedural syntax", 1 << 16).unwrap();
+    let workspace = Arena::new(&mut budget, "procedural positions", 1 << 16).unwrap();
+    let replacement = Arena::new(&mut budget, "replacement procedural source", 1 << 16).unwrap();
+    let replacement_parsing = Arena::new(&mut budget, "replacement syntax", 1 << 16).unwrap();
+    let source = crate::mem::guard::forbid_alloc(|| {
+        let text = parsing.alloc_str(SOURCE).unwrap();
+        ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &original).unwrap()
+    });
+    parsing.reset();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = source.parse(&original, &parsing).unwrap();
+        let mut retained = ControlFrames::new(&workspace, code.layout(), &original).unwrap();
+        let mut frames = retained.execution(&original, code).unwrap();
+        let TriggerStatement::While(while_program) = program.body.statements[0] else {
+            panic!("while program")
+        };
+        frames.start(program.body);
+        frames.enter(FrameEntry::new(while_program.block, Continuation::While));
+        frames.last_mut().next = 1;
+        let frame = frames.pop();
+        let position = (code.layout(), frame.block, frame.next, frame.source);
+        frames.pop();
+        position
+    });
+    parsing.reset();
+    let mut moved = original;
     crate::mem::guard::forbid_alloc(|| {
-        let frames = ControlFrames::new(&arena, program.body).unwrap();
-        assert_eq!(saved.1, frames.block(saved.0).statements.len());
+        moved.recycle_front();
+        moved.alloc_str("replacement front source").unwrap();
+        parsing.alloc_str("replacement parsing scratch").unwrap();
+        let (_, code) = source.parse(&moved, &parsing).unwrap();
+        let replaced = ProgramSource::capture(
+            "BEGIN WHILE false LOOP NULL; END LOOP; END",
+            PlpgsqlProgramKind::Anonymous,
+            &replacement,
+        )
+        .unwrap();
+        let (_, new_code) = replaced.parse(&replacement, &replacement_parsing).unwrap();
+        let mut retained = ControlFrames::new(&workspace, saved.0, &moved).unwrap();
+        assert_eq!(
+            retained
+                .execution(&replacement, new_code)
+                .err()
+                .unwrap()
+                .sqlstate,
+            "40001"
+        );
+        assert_eq!(retained.active, 0);
+        assert!(retained.slots.iter().all(Option::is_none));
+        let frames = retained.execution(&moved, code).unwrap();
+        assert_eq!(saved.2, frames.program.block(saved.1).statements.len());
         assert!(matches!(
-            frames.block(saved.0).statements[0],
+            frames.program.block(saved.1).statements[0],
             TriggerStatement::Null
         ));
-        let TriggerStatement::While(program) = frames.source_statement(saved.2) else {
+        let TriggerStatement::While(program) = frames.source_statement(saved.3) else {
             panic!("restored while position")
         };
         assert!(matches!(program.condition, Expr::Bool(true)));
+    });
+}
+
+#[test]
+fn frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images() {
+    let mut budget = Budget::new(64 << 10);
+    let mut tiny_budget = Budget::new(1);
+    let tiny = Arena::new(&mut tiny_budget, "exhausted procedural source", 1).unwrap();
+    let original = Arena::new(&mut budget, "independent procedural source", 16 << 10).unwrap();
+    let mut parsing = Arena::new(&mut budget, "independent procedural syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "independent procedural frames", 16 << 10).unwrap();
+    let other = Arena::new(&mut budget, "foreign procedural source", 16 << 10).unwrap();
+    let source = ProgramSource::capture(
+        "BEGIN LOOP NULL; END LOOP; END",
+        PlpgsqlProgramKind::Anonymous,
+        &original,
+    )
+    .unwrap();
+    let retained = {
+        let (_, code) = source.parse(&original, &parsing).unwrap();
+        ControlFrames::new(&workspace, code.layout(), &original).unwrap()
+    };
+    parsing.reset();
+    let mut moved = original;
+    crate::mem::guard::forbid_alloc(|| {
+        moved.recycle_front();
+        let error = ProgramSource::capture("BEGIN NULL; END", PlpgsqlProgramKind::Anonymous, &tiny)
+            .err()
+            .unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(
+            error.message.as_str(),
+            "PL/pgSQL source image exceeds statement memory"
+        );
+        retained.require_source(&moved, source).unwrap();
+        assert_eq!(
+            retained
+                .require_source(&other, source)
+                .unwrap_err()
+                .sqlstate,
+            "40001"
+        );
+        assert_eq!(retained.active, 0);
+        moved.reset();
+        assert_eq!(
+            retained
+                .require_source(&moved, source)
+                .unwrap_err()
+                .sqlstate,
+            "40001"
+        );
+        assert_eq!(
+            source.parse(&moved, &parsing).err().unwrap().sqlstate,
+            "40001"
+        );
+        assert_eq!(retained.active, 0);
+        assert!(retained.slots.iter().all(Option::is_none));
     });
 }
 

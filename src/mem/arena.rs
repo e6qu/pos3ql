@@ -15,7 +15,9 @@ use std::alloc::Layout;
 use super::budget::{Budget, BudgetError};
 
 mod retained_slice;
-pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle, FrozenArenaSliceHandle};
+pub(crate) use retained_slice::{
+    ArenaSliceError, ArenaSliceHandle, ArenaSliceMut, FrozenArenaSliceHandle,
+};
 mod retained_list;
 pub(crate) use retained_list::{RetainedList, RetainedListError};
 

@@ -342,6 +342,54 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
 }
 
 #[test]
+fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
+    let mut budget = Budget::new(36 << 10);
+    let source = Arena::new(&mut budget, "reservation source", 16 << 10).unwrap();
+    let parsing = Arena::new(&mut budget, "reservation syntax", 16 << 10).unwrap();
+    let arena = Arena::new(&mut budget, "reservation positions", 4 << 10).unwrap();
+    let (program, code) = parse_owned_program(
+        "BEGIN LOOP NULL; END LOOP; END",
+        &parsing,
+        &source,
+        PlpgsqlProgramKind::Anonymous,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut retained = ControlFrames::new(&arena, code.layout(), &source).unwrap();
+        let mark = arena.mark();
+        arena
+            .alloc_slice_with(arena.capacity() - arena.used(), |_| 0xffu8)
+            .unwrap();
+        let used = arena.used();
+        let error = retained.reserve_resources(&arena).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(
+            error.message.as_str(),
+            "PL/pgSQL execution frames exceed statement memory"
+        );
+        assert_eq!(arena.used(), used);
+        assert!(retained.resource_identity.is_none());
+        assert_eq!(retained.active, 0);
+        assert!(
+            arena
+                .retained_slice_mut(retained.slots)
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        // Only unreferenced byte scratch follows this mark.
+        unsafe { arena.rewind_to(mark) };
+        let mut resources = retained.reserve_resources(&arena).unwrap();
+        let mut frames = retained
+            .execution(&source, &arena, code, &mut resources)
+            .unwrap();
+        frames.start(program.body);
+        assert_eq!(frames.state.active, 1);
+        frames.pop();
+    });
+}
+
+#[test]
 fn row_loop_resources_release_once_on_pop_and_owner_drop() {
     use crate::mem::lease_pool::Purpose;
 

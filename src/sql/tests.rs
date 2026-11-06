@@ -44829,14 +44829,14 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
          CREATE TABLE trigger_context_audit (
            name text, timing text, level text, operation text, relid integer,
            table_name text, table_schema text, nargs integer, first_argument text, second_argument text,
-           relation_name text, has_tablespace boolean
+           relation_name text, context_types text
          );
          CREATE FUNCTION trigger_context_function() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN
               INSERT INTO trigger_context_audit VALUES
                 (TG_NAME, TG_WHEN, TG_LEVEL, TG_OP, TG_RELID, TG_TABLE_NAME,
                  TG_TABLE_SCHEMA, TG_NARGS, TG_ARGV[0], TG_ARGV[1], TG_RELNAME,
-                 TG_TABLESPACE IS NOT NULL);
+                 pg_typeof(TG_NAME)::text || ':' || pg_typeof(TG_RELID)::text);
               RETURN NEW;
             END';
          CREATE TABLE trigger_context_conflict (value text PRIMARY KEY);
@@ -44856,7 +44856,7 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
          INSERT INTO trigger_context_schema.trigger_context_target VALUES (1);
          SELECT name, timing, level, operation, relid = relation.oid,
                 table_name, table_schema, nargs, first_argument, second_argument,
-                relation_name, has_tablespace
+                relation_name, context_types
            FROM trigger_context_audit
            CROSS JOIN pg_class relation
           WHERE relation.relname = 'trigger_context_target';
@@ -44865,7 +44865,7 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
     assert_eq!(
         data_rows(&output),
         [
-            "trigger_context_name|BEFORE|ROW|INSERT|t|trigger_context_target|trigger_context_schema|2|first|second|trigger_context_target|f",
+            "trigger_context_name|BEFORE|ROW|INSERT|t|trigger_context_target|trigger_context_schema|2|first|second|trigger_context_target|name:oid",
             "nested"
         ],
         "{}",

@@ -89,7 +89,9 @@ A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
 Finish the saved owners for local values and the enclosing write. Runtime
 local metadata no longer holds initializer-expression references; retain its
-resolved types and once-only declaration-order initialization. Handler
+resolved types and once-only declaration-order initialization. Input parameters
+seed the parameter prefix; unseeded OUT slots start as NULL before declaration
+initializers run. Preserve both scalar and set-returning output contracts. Handler
 diagnostics now use retained, address-independent handles; preserve their
 recycling, generation and reset checks while completing the invocation owner. The indexed control frames still borrow statement memory and
 cannot yet survive returning to the connection scheduler. Keep the bounded

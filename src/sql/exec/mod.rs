@@ -19984,6 +19984,8 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::CHECK_VIOLATION
     } else if text.eq_ignore_ascii_case("division_by_zero") {
         sqlstate::DIVISION_BY_ZERO
+    } else if text.eq_ignore_ascii_case("undefined_column") {
+        sqlstate::UNDEFINED_COLUMN
     } else if text.eq_ignore_ascii_case("case_not_found") {
         sqlstate::CASE_NOT_FOUND
     } else if text.eq_ignore_ascii_case("cardinality_violation") {
@@ -22138,6 +22140,11 @@ mod trigger_program_tests {
                     "DECLARE selected integer; BEGIN SELECT 1 INTO STRICT selected; EXCEPTION WHEN too_many_rows THEN NULL; END",
                     PlpgsqlProgramKind::Procedure,
                     sqlstate::TOO_MANY_ROWS,
+                ),
+                (
+                    "BEGIN PERFORM TG_TABLESPACE; EXCEPTION WHEN undefined_column THEN NULL; END",
+                    PlpgsqlProgramKind::Trigger,
+                    sqlstate::UNDEFINED_COLUMN,
                 ),
             ] {
                 let program = parse_plpgsql_program(source, &arena, kind).unwrap();
@@ -25971,18 +25978,23 @@ fn initialize_trigger_locals<'a>(
     seeded: &[Datum<'a>],
     values: &mut [Datum<'a>],
 ) -> Result<(), SqlError> {
-    assert_eq!(
-        locals.len(),
-        seeded.len() + initializers.len(),
-        "local initialization layout"
-    );
+    // Parameters, including unseeded OUT slots, precede declared locals.
+    // Initializers describe only the declaration tail, not every unseeded slot.
+    let declaration_start = locals
+        .len()
+        .checked_sub(initializers.len())
+        .expect("local initialization layout");
+    assert!(seeded.len() <= declaration_start, "local parameter layout");
     for (index, local) in locals.iter().enumerate() {
         if let Some(value) = seeded.get(index).copied() {
             values[index] = coerce_plpgsql_local(context, *local, value)?;
             continue;
         }
         values[index] = Datum::Null;
-        let Some(initial) = initializers[index - seeded.len()] else {
+        if index < declaration_start {
+            continue;
+        }
+        let Some(initial) = initializers[index - declaration_start] else {
             if local.not_null {
                 return Err(sql_err!(
                     sqlstate::NULL_VALUE_NOT_ALLOWED,

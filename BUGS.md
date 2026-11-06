@@ -14,7 +14,8 @@ belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 current behavior belongs in the [owning guides](docs/README.md), including
 retained caught-error ownership, initializer-free runtime local metadata,
 rewritten assignment inputs, quoted procedural names, typed trigger context
-and PostgreSQL stacked-diagnostic values.
+and PostgreSQL stacked-diagnostic values. Output-parameter initializer indexing
+and named `undefined_column` handlers are covered by the active regressions.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

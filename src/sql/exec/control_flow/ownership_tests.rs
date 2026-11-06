@@ -551,7 +551,7 @@ fn resource_reservation_exhaustion_preserves_positions_and_allows_retry() {
 #[test]
 fn row_loop_resources_release_once_on_pop_and_owner_drop() {
     let mut control_budget = Budget::new(32 << 10);
-    let pool = LeasePool::new(
+    let control_pool = LeasePool::new(
         &mut control_budget,
         crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
         16 << 10,
@@ -564,7 +564,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
     let source = Arena::new(&mut budget, "row position source", 32 << 10).unwrap();
     let parsing = Arena::new(&mut budget, "row position syntax", 32 << 10).unwrap();
     let mut workspace = Arena::new(&mut budget, "row position resources", 32 << 10).unwrap();
-    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 4096, 4).unwrap();
+    let row_pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 4096, 4).unwrap();
     let (program, code) = parse_owned_program(
         "BEGIN LOOP NULL; END LOOP; END",
         &parsing,
@@ -579,7 +579,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
         workspace.reset();
         crate::mem::guard::forbid_alloc(|| {
             let mut retained =
-                ControlFrames::new(&workspace, code.layout(), &source, &pool).unwrap();
+                ControlFrames::new(&workspace, code.layout(), &source, &control_pool).unwrap();
             let mut resources = retained.reserve_resources(&workspace).unwrap();
             {
                 let mut frames = retained
@@ -587,7 +587,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                     .unwrap();
                 frames.start(program.body);
                 let rows = super::super::loop_rows::LoopRows::capture(
-                    &pool,
+                    &row_pool,
                     TriggerForRows {
                         values: &[Datum::Text("owned row")],
                         empty: Datum::Null,
@@ -602,18 +602,18 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                         values: rows,
                     },
                 ));
-                assert!(pool.lease::<u8>(4096).is_err());
+                assert!(row_pool.lease::<u8>(4096).is_err());
                 if pop {
                     let exited = frames.pop();
                     assert!(matches!(frames.resources[1], FrameResource::Empty));
-                    assert!(pool.lease::<u8>(4096).is_err());
+                    assert!(row_pool.lease::<u8>(4096).is_err());
                     drop(exited);
-                    assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+                    assert_eq!(row_pool.lease::<u8>(4096).unwrap().capacity(), 4096);
                     frames.pop();
                 }
             }
             drop(resources);
-            assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+            assert_eq!(row_pool.lease::<u8>(4096).unwrap().capacity(), 4096);
         });
     }
 }

@@ -50,6 +50,15 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
     });
     moved.reset();
     crate::mem::guard::forbid_alloc(|| {
+        let used = moved.used();
+        assert_eq!(
+            saved
+                .replace(Datum::Bytea(&[0; 2048]), &moved)
+                .unwrap_err()
+                .sqlstate,
+            "XX000"
+        );
+        assert_eq!(moved.used(), used);
         let Datum::Record(fields) = value else {
             panic!("saved record")
         };
@@ -113,6 +122,14 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
         let before = small.used();
         let large = source.alloc_slice_with(1024, |_| b'x').unwrap();
         let text = core::str::from_utf8(large).unwrap();
+        let foreign_used = foreign.used();
+        assert_eq!(
+            kept.replace(Datum::Text(text), &foreign)
+                .unwrap_err()
+                .sqlstate,
+            "XX000"
+        );
+        assert_eq!(foreign.used(), foreign_used);
         let error = kept.replace(Datum::Text(text), &small).unwrap_err();
         assert_eq!(error.sqlstate, "54000");
         assert_eq!(
@@ -135,6 +152,13 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
         );
         assert_eq!(small.used(), before);
         let guard = small.retained_slice_mut(kept.bytes.unwrap()).unwrap();
+        assert_eq!(
+            kept.replace(Datum::Text(text), &small)
+                .unwrap_err()
+                .sqlstate,
+            "XX000"
+        );
+        assert_eq!(small.used(), before);
         assert_eq!(
             kept.replace(Datum::Int4(4), &small).unwrap_err().sqlstate,
             "XX000"

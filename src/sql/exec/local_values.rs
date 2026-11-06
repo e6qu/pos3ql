@@ -19,6 +19,10 @@ impl SavedValue {
     }
 
     pub(super) fn replace(&mut self, value: Datum<'_>, arena: &Arena) -> Result<(), SqlError> {
+        if let Some(handle) = self.bytes {
+            // Growth must validate the old owner before reserving elsewhere.
+            drop(arena.retained_slice_mut(handle).map_err(|_| inactive())?);
+        }
         // Validate the complete value before changing a previously saved image.
         let length = projected_row_len(&[value])?;
         let (handle, capacity) = if length > self.capacity {

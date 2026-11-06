@@ -15592,8 +15592,8 @@ impl Engine {
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
-                    let encoded = arena.with_remaining_bytes(|scratch| {
-                        let encoded_arguments = pending.arguments(arena, scratch)?;
+                    let retained = arena.with_remaining_region(|scratch| {
+                        let encoded_arguments = pending.arguments(arena)?;
                         let arguments = scratch
                             .alloc_slice_with(pending.argument_count, |_| Datum::Null)
                             .map_err(|_| eval::arena_full())?;
@@ -15619,10 +15619,10 @@ impl Engine {
                         } else {
                             large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
                         }?;
-                        exec::encode_projected_pub(&[value], scratch)
+                        query::OwnedRoutineResult::capture_scalar(value, arena)
                     });
-                    let encoded = match encoded {
-                        Ok(Ok(encoded)) => encoded,
+                    let retained = match retained {
+                        Ok(Ok(retained)) => retained,
                         Ok(Err(error)) => return Ok(Err(error)),
                         Err(error) => {
                             return Ok(Err(sql_err!(
@@ -15632,11 +15632,7 @@ impl Engine {
                             )));
                         }
                     };
-                    let value = match exec::decode_projected_col_record(encoded, 0, arena) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    return Ok(invocations.complete(value, arena));
+                    return Ok(invocations.complete(retained, arena));
                 }
             };
             let Some(slot) = self.storage.routine_slot_by_oid(contract.oid, txn.txid) else {
@@ -15675,9 +15671,9 @@ impl Engine {
                 Wire(WireFull),
             }
             let set_returning = routine.kind.is_set_returning();
-            let executed = arena.with_remaining_bytes(|scratch| {
-                // Only encoded results survive the body, for owning statement
-                // arenas and borrowed row arenas alike.
+            let executed = arena.with_remaining_region(|scratch| {
+                // Publish immutable result bytes in the parent's retained tail
+                // before the body's temporary region is released.
                 if set_returning {
                     let rows = self
                         .execute_pending_table_routine(
@@ -15686,7 +15682,7 @@ impl Engine {
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
-                    exec::pack_projected_rows(rows, scratch).map_err(BodyError::Sql)
+                    query::OwnedRoutineResult::capture_rows(rows, arena).map_err(BodyError::Sql)
                 } else {
                     let value = self
                         .execute_pending_scalar_routine(
@@ -15695,7 +15691,7 @@ impl Engine {
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
-                    exec::encode_projected_pub(&[value], scratch).map_err(BodyError::Sql)
+                    query::OwnedRoutineResult::capture_scalar(value, arena).map_err(BodyError::Sql)
                 }
             });
             let executed = match executed {
@@ -15718,23 +15714,12 @@ impl Engine {
             {
                 return Ok(Err(error));
             }
-            let encoded = match executed {
-                Ok(encoded) => encoded,
+            let retained = match executed {
+                Ok(retained) => retained,
                 Err(BodyError::Sql(error)) => return Ok(Err(error)),
                 Err(BodyError::Wire(error)) => return Err(error),
             };
-            if set_returning {
-                let rows = match exec::unpack_projected_rows(encoded, arena) {
-                    Ok(rows) => rows,
-                    Err(error) => return Ok(Err(error)),
-                };
-                return Ok(invocations.complete_rows(rows, arena));
-            }
-            let value = match exec::decode_projected_col_record(encoded, 0, arena) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-            Ok(invocations.complete(value, arena))
+            Ok(invocations.complete(retained, arena))
         });
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
@@ -16934,7 +16919,7 @@ impl Engine {
     fn execute_pending_scalar_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation,
-        input_arena: &Arena,
+        input_arena: &'a Arena,
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
@@ -16992,7 +16977,7 @@ impl Engine {
             return Ok(Err(error));
         }
         timezone::set_session(guc.timezone());
-        let encoded_arguments = match pending.arguments(input_arena, arena) {
+        let encoded_arguments = match pending.arguments(input_arena) {
             Ok(arguments) => arguments,
             Err(error) => return Ok(Err(error)),
         };
@@ -17128,7 +17113,7 @@ impl Engine {
     fn execute_pending_table_routine<'a>(
         &mut self,
         pending: query::PendingRoutineInvocation,
-        input_arena: &Arena,
+        input_arena: &'a Arena,
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
@@ -17175,7 +17160,7 @@ impl Engine {
             return Ok(Err(error));
         }
         timezone::set_session(guc.timezone());
-        let encoded_arguments = match pending.arguments(input_arena, arena) {
+        let encoded_arguments = match pending.arguments(input_arena) {
             Ok(arguments) => arguments,
             Err(error) => return Ok(Err(error)),
         };

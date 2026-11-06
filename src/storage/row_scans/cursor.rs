@@ -75,6 +75,10 @@ fn state_error(error: ArenaSliceError) -> SqlError {
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "query cursor state is already in use"
         ),
+        ArenaSliceError::Frozen => sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "query cursor state unexpectedly became immutable"
+        ),
     }
 }
 

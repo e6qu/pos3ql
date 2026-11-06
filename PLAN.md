@@ -89,11 +89,13 @@ A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
 Finish the saved owners for local values and the enclosing write. Pending calls
 now keep arguments and selected type contracts through checked,
-address-independent handles; preserve their stale-owner checks and explicit
-copy into execution memory while completing the other invocation phases.
+address-independent handles; preserve their stale-owner checks and immutable
+argument views while completing the other invocation phases.
 Completed scalar and row results also own encoded values and effect receipts
 through checked handles. Preserve random-access call positions, empty results,
 nested record types and the old directory when a larger directory cannot fit.
+Capture each result before releasing body scratch and share immutable table
+payloads; keep the original 4 MiB, 4,096-row regression without extra live copies.
 Saved input frames now keep checked handles for values, names, defaults, selected
 types, casts and effect receipts. Preserve their input/call positions, stable
 selection errors and retained-only publication while query scratch borrows the

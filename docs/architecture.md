@@ -193,19 +193,22 @@ and large-object calls use the same explicit handoff classification.
 The pending call stores checked handles for its encoded arguments and selected
 argument, parameter and result types. Those handles survive moving the owning
 arena or recycling its temporary front; reset or a different arena rejects
-them with an internal error before reading their bytes. Execution copies the
-encoded arguments into its own temporary memory. That extra live copy counts
-against the existing statement capacity and reports `54000` if it does not fit.
+them with an internal error before reading their bytes. Arguments become
+immutable before publication. Execution reads their stored bytes directly;
+even an older mutable handle cannot reopen that allocation for writing.
 This owns the call's inputs. The running body and enclosing write still need
 complete ownership across a scheduler return.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,
 a function returning `ROW('saved text')` keeps the field's name, type and text
-after its body memory is reused. Reading a saved result copies it into the
-consumer's arena; table results also rebuild their row directory there. Both
-copies count against statement memory. Directory growth reserves its replacement
-before publishing it; exhaustion keeps every previous result readable.
+after its body memory is reused. A body captures one immutable result image in
+the parent's retained storage before releasing its scratch. Scalar consumers
+copy their value into their own arena; table consumers rebuild row pointers
+that refer directly to the saved payload. This avoids another full copy of a
+large table result. Directory growth reserves its replacement before publishing
+it; exhaustion keeps every previous result readable. All reservations stay
+inside the existing statement capacity and report `54000` if they do not fit.
 Unfinished input frames retain checked handles for values, call names, defaults,
 type signatures, selected casts, dependencies and effect receipts. A new attempt
 rebuilds temporary metadata views; an already encoded value is copied only when

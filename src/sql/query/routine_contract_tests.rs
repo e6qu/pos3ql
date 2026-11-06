@@ -155,7 +155,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
             moved.recycle_front();
             output.reset();
             moved.alloc_str("replacement parsing scratch").unwrap();
-            let encoded = pending.arguments(&moved, &output).unwrap();
+            let encoded = pending.arguments(&moved).unwrap();
             let Datum::Record(fields) =
                 super::super::exec::decode_projected_col_record(encoded, 0, &output).unwrap()
             else {
@@ -181,15 +181,9 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                 Some(InvocationSite::Expression(17))
             );
         }
-        assert_eq!(
-            pending.arguments(&wrong, &output).unwrap_err().sqlstate,
-            "XX000"
-        );
+        assert_eq!(pending.arguments(&wrong).unwrap_err().sqlstate, "XX000");
         moved.reset();
-        assert_eq!(
-            pending.arguments(&moved, &output).unwrap_err().sqlstate,
-            "XX000"
-        );
+        assert_eq!(pending.arguments(&moved).unwrap_err().sqlstate, "XX000");
         let PendingRoutineTarget::Stored(contract) = pending.target else {
             unreachable!();
         };
@@ -204,13 +198,19 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
     let mut output = Arena::new(&mut budget, "pending argument view", 2048).unwrap();
     let tiny = Arena::new(&mut budget, "tiny pending argument view", 1).unwrap();
     crate::mem::guard::forbid_alloc(|| {
+        let values = [Datum::Text("saved argument")];
+        let length = super::super::exec::projected_row_len(&values).unwrap();
+        let mutable = source.retain_slice_with(length, |_| 0u8).unwrap();
+        let mut borrowed = source.retained_slice_mut(mutable).unwrap();
+        super::super::exec::encode_projected_into(&values, &mut borrowed).unwrap();
+        assert!(matches!(
+            source.freeze_retained_slice(mutable),
+            Err(crate::mem::arena::ArenaSliceError::Borrowed)
+        ));
+        drop(borrowed);
         let pending = PendingRoutineInvocation {
             target: PendingRoutineTarget::Intrinsic(42),
-            arguments: PendingRoutineInvocation::capture_arguments(
-                &[Datum::Text("saved argument")],
-                &source,
-            )
-            .unwrap(),
+            arguments: source.freeze_retained_slice(mutable).unwrap(),
             argument_count: 1,
             source_position: None,
             input_collation: super::super::ast::Collation::None,
@@ -220,18 +220,16 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
                 statement: 0,
             },
         };
-        assert_eq!(
-            pending.arguments(&source, &tiny).unwrap_err().sqlstate,
-            "54000"
-        );
-        let borrowed = source.retained_slice_mut(pending.arguments).unwrap();
-        assert_eq!(
-            pending.arguments(&source, &output).unwrap_err().sqlstate,
-            "XX000"
-        );
-        drop(borrowed);
+        assert!(matches!(
+            source.retained_slice_mut(mutable),
+            Err(crate::mem::arena::ArenaSliceError::Frozen)
+        ));
         output.reset();
-        let encoded = pending.arguments(&source, &output).unwrap();
+        let encoded = pending.arguments(&source).unwrap();
+        assert_eq!(
+            encoded.as_ptr(),
+            pending.arguments(&source).unwrap().as_ptr()
+        );
         assert_eq!(
             super::super::exec::decode_projected_col_record(encoded, 0, &output).unwrap(),
             Datum::Text("saved argument")
@@ -264,7 +262,10 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
                 }])
                 .unwrap();
             invocations
-                .complete(Datum::Record(fields), &statement)
+                .complete(
+                    OwnedRoutineResult::capture_scalar(Datum::Record(fields), &statement).unwrap(),
+                    &statement,
+                )
                 .unwrap();
         })
         .unwrap();

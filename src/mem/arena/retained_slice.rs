@@ -19,9 +19,20 @@ impl<T> Clone for ArenaSliceHandle<T> {
     }
 }
 
+pub(crate) struct FrozenArenaSliceHandle<T>(ArenaSliceHandle<T>);
+
+impl<T> Copy for FrozenArenaSliceHandle<T> {}
+
+impl<T> Clone for FrozenArenaSliceHandle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 struct SliceHeader {
     len: usize,
     borrowed: Cell<bool>,
+    frozen: Cell<bool>,
 }
 
 fn slice_layout<T>(len: usize) -> Result<(Layout, usize), std::alloc::LayoutError> {
@@ -32,6 +43,7 @@ fn slice_layout<T>(len: usize) -> Result<(Layout, usize), std::alloc::LayoutErro
 pub(crate) enum ArenaSliceError {
     Stale,
     Borrowed,
+    Frozen,
 }
 
 pub(crate) struct ArenaSliceMut<'arena, T> {
@@ -94,6 +106,7 @@ impl Arena {
             base.cast::<SliceHeader>().write(SliceHeader {
                 len,
                 borrowed: Cell::new(false),
+                frozen: Cell::new(false),
             });
             let data = base.add(data_offset).cast::<T>();
             for at in 0..len {
@@ -112,13 +125,13 @@ impl Arena {
         &'arena self,
         handle: ArenaSliceHandle<T>,
     ) -> Result<ArenaSliceMut<'arena, T>, ArenaSliceError> {
-        if handle.identity != self.retention_identity {
-            return Err(ArenaSliceError::Stale);
-        }
+        let header = self.retained_slice_header(handle)?;
         // Matching non-reused identity proves this typed header and its whole
         // initialized payload are still in this arena's persistent tail.
         let base = unsafe { self.base.add(handle.offset) };
-        let header = unsafe { &*base.cast::<SliceHeader>() };
+        if header.frozen.get() {
+            return Err(ArenaSliceError::Frozen);
+        }
         if header.borrowed.replace(true) {
             return Err(ArenaSliceError::Borrowed);
         }
@@ -131,11 +144,91 @@ impl Arena {
             value: PhantomData,
         })
     }
+
+    fn retained_slice_header<T>(
+        &self,
+        handle: ArenaSliceHandle<T>,
+    ) -> Result<&SliceHeader, ArenaSliceError> {
+        if handle.identity != self.retention_identity {
+            return Err(ArenaSliceError::Stale);
+        }
+        // A matching, non-reused identity proves the typed allocation still exists.
+        Ok(unsafe { &*self.base.add(handle.offset).cast::<SliceHeader>() })
+    }
+
+    pub(crate) fn freeze_retained_slice<T: Copy>(
+        &self,
+        handle: ArenaSliceHandle<T>,
+    ) -> Result<FrozenArenaSliceHandle<T>, ArenaSliceError> {
+        let header = self.retained_slice_header(handle)?;
+        if header.borrowed.get() {
+            return Err(ArenaSliceError::Borrowed);
+        }
+        if header.frozen.replace(true) {
+            return Err(ArenaSliceError::Frozen);
+        }
+        Ok(FrozenArenaSliceHandle(handle))
+    }
+
+    pub(crate) fn retained_slice<'arena, T: Copy + 'arena>(
+        &'arena self,
+        handle: FrozenArenaSliceHandle<T>,
+    ) -> Result<&'arena [T], ArenaSliceError> {
+        let header = self.retained_slice_header(handle.0)?;
+        // Freezing is irreversible. All mutable aliases check the same header
+        // before exposing payload bytes, so these shared views cannot be changed.
+        assert!(header.frozen.get());
+        let data_offset =
+            core::mem::size_of::<SliceHeader>().next_multiple_of(core::mem::align_of::<T>());
+        let data = unsafe { self.base.add(handle.0.offset + data_offset).cast::<T>() };
+        Ok(unsafe { core::slice::from_raw_parts(data, header.len) })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_retained_slices_share_views_and_permanently_reject_mutable_aliases() {
+        let mut budget = Budget::new(1024);
+        let original = Arena::new(&mut budget, "frozen bytes", 512).unwrap();
+        let other = Arena::new(&mut budget, "other frozen bytes", 512).unwrap();
+        let mutable = original.retain_slice_with(4, |index| index as u64).unwrap();
+        let mut borrowed = original.retained_slice_mut(mutable).unwrap();
+        borrowed[1] = 42;
+        assert!(matches!(
+            original.freeze_retained_slice(mutable),
+            Err(ArenaSliceError::Borrowed)
+        ));
+        drop(borrowed);
+        let frozen = original.freeze_retained_slice(mutable).unwrap();
+        let mut moved = original;
+        crate::mem::guard::forbid_alloc(|| {
+            moved.recycle_front();
+            let first = moved.retained_slice(frozen).unwrap();
+            let second = moved.retained_slice(frozen).unwrap();
+            assert_eq!(first, &[0, 42, 2, 3]);
+            assert_eq!(first.as_ptr(), second.as_ptr());
+            assert!(matches!(
+                moved.retained_slice_mut(mutable),
+                Err(ArenaSliceError::Frozen)
+            ));
+            assert!(matches!(
+                moved.freeze_retained_slice(mutable),
+                Err(ArenaSliceError::Frozen)
+            ));
+            assert!(matches!(
+                other.retained_slice(frozen),
+                Err(ArenaSliceError::Stale)
+            ));
+            moved.reset();
+            assert!(matches!(
+                moved.retained_slice(frozen),
+                Err(ArenaSliceError::Stale)
+            ));
+        });
+    }
 
     #[test]
     fn arena_retained_slices_reject_aliases_and_survive_moves_and_front_rewinds() {

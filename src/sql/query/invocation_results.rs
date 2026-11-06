@@ -1,10 +1,10 @@
 //! Completed calls own encoded values and replay receipts, without arena borrows.
 
 use super::*;
-use crate::mem::arena::ArenaSliceHandle;
+use crate::mem::arena::FrozenArenaSliceHandle;
 
 #[derive(Clone, Copy)]
-pub(super) struct ResultBytes(ArenaSliceHandle<u8>);
+pub(crate) struct ResultBytes(FrozenArenaSliceHandle<u8>);
 
 impl ResultBytes {
     pub(super) fn capture_scalar(value: Datum<'_>, arena: &Arena) -> Result<Self, SqlError> {
@@ -14,7 +14,12 @@ impl ResultBytes {
             .map_err(|_| full())?;
         let mut bytes = arena.retained_slice_mut(handle).map_err(|_| inactive())?;
         super::super::exec::encode_projected_into(&[value], &mut bytes)?;
-        Ok(Self(handle))
+        drop(bytes);
+        Ok(Self(
+            arena
+                .freeze_retained_slice(handle)
+                .map_err(|_| inactive())?,
+        ))
     }
 
     pub(super) fn capture_rows(rows: &[&[u8]], arena: &Arena) -> Result<Self, SqlError> {
@@ -24,13 +29,18 @@ impl ResultBytes {
             .map_err(|_| full())?;
         let mut bytes = arena.retained_slice_mut(handle).map_err(|_| inactive())?;
         super::super::exec::pack_projected_rows_into(rows, &mut bytes)?;
-        Ok(Self(handle))
+        drop(bytes);
+        Ok(Self(
+            arena
+                .freeze_retained_slice(handle)
+                .map_err(|_| inactive())?,
+        ))
     }
 
     fn copy<'out>(self, source: &Arena, output: &'out Arena) -> Result<&'out [u8], SqlError> {
-        let bytes = source.retained_slice_mut(self.0).map_err(|_| inactive())?;
+        let bytes = source.retained_slice(self.0).map_err(|_| inactive())?;
         output
-            .alloc_slice_copy(&bytes)
+            .alloc_slice_copy(bytes)
             .map(|bytes| &*bytes)
             .map_err(|_| full())
     }
@@ -46,19 +56,43 @@ impl ResultBytes {
 
     pub(super) fn rows<'out>(
         self,
-        source: &Arena,
+        source: &'out Arena,
         output: &'out Arena,
     ) -> Result<&'out [&'out [u8]], SqlError> {
-        let bytes = self.copy(source, output)?;
+        let bytes = source.retained_slice(self.0).map_err(|_| inactive())?;
         super::super::exec::unpack_projected_rows(bytes, output)
     }
 }
 
-/// Scalar and table-source results keep distinct contracts even after encoding.
+/// Completed calls preserve result shape independently of the stored bytes.
 #[derive(Clone, Copy)]
-pub(super) enum RoutineInvocationResult {
-    Scalar(ResultBytes, super::super::sequence::StatementReplayCursor),
-    Rows(ResultBytes, super::super::sequence::StatementReplayCursor),
+pub(crate) enum OwnedRoutineResult {
+    Scalar(ResultBytes),
+    Rows(ResultBytes),
+}
+
+impl OwnedRoutineResult {
+    pub(crate) fn capture_scalar(value: Datum<'_>, arena: &Arena) -> Result<Self, SqlError> {
+        ResultBytes::capture_scalar(value, arena).map(Self::Scalar)
+    }
+
+    pub(crate) fn capture_rows(rows: &[&[u8]], arena: &Arena) -> Result<Self, SqlError> {
+        ResultBytes::capture_rows(rows, arena).map(Self::Rows)
+    }
+
+    pub(super) fn validate(self, arena: &Arena) -> Result<(), SqlError> {
+        let (Self::Scalar(bytes) | Self::Rows(bytes)) = self;
+        arena
+            .retained_slice(bytes.0)
+            .map(|_| ())
+            .map_err(|_| inactive())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RoutineInvocationResult {
+    pub(super) value: OwnedRoutineResult,
+    pub(super) replay: super::super::sequence::StatementReplayCursor,
 }
 
 pub(super) type RoutineResults = crate::mem::arena::RetainedList<RoutineInvocationResult>;
@@ -101,6 +135,37 @@ mod ownership_tests {
     use crate::mem::Budget;
 
     #[test]
+    fn table_result_views_reserve_only_the_row_directory_and_share_frozen_payload() {
+        let mut budget = Budget::new(64 << 10);
+        let source = Arena::new(&mut budget, "table result source", 4096).unwrap();
+        let row = super::super::super::exec::encode_projected_pub(
+            &[Datum::Text("saved table payload")],
+            &source,
+        )
+        .unwrap();
+        let rows = [row; 64];
+        let packed = super::super::super::exec::projected_rows_len(&rows).unwrap();
+        let directory = rows.len() * core::mem::size_of::<&[u8]>();
+        let capacity = Arena::retained_slice_capacity::<u8>(packed).unwrap() + directory;
+        let owner = Arena::new(&mut budget, "one retained table payload", capacity).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let value = ResultBytes::capture_rows(&rows, &owner).unwrap();
+            let retained = owner.used();
+            let bytes = owner.retained_slice(value.0).unwrap();
+            let restored = value.rows(&owner, &owner).unwrap();
+            assert_eq!(owner.used() - retained, directory);
+            assert_eq!(restored.len(), 64);
+            assert!(restored[0].as_ptr() >= bytes.as_ptr());
+            assert!(restored[63].as_ptr() < bytes.as_ptr().wrapping_add(bytes.len()));
+            assert_eq!(
+                super::super::super::exec::decode_projected_col_record(restored[63], 0, &owner)
+                    .unwrap(),
+                Datum::Text("saved table payload")
+            );
+        });
+    }
+
+    #[test]
     fn completed_results_own_nested_values_and_rows_after_source_release_and_arena_move() {
         let mut budget = Budget::new(64 << 10);
         let original = Arena::new(&mut budget, "completed calls", 32 << 10).unwrap();
@@ -122,11 +187,13 @@ mod ownership_tests {
                     results
                         .push(
                             &original,
-                            RoutineInvocationResult::Scalar(
-                                ResultBytes::capture_scalar(Datum::Record(fields), &original)
-                                    .unwrap(),
-                                super::super::super::sequence::StatementReplayCursor::EMPTY,
-                            ),
+                            RoutineInvocationResult {
+                                value: OwnedRoutineResult::Scalar(
+                                    ResultBytes::capture_scalar(Datum::Record(fields), &original)
+                                        .unwrap(),
+                                ),
+                                replay: super::super::super::sequence::StatementReplayCursor::EMPTY,
+                            },
                         )
                         .unwrap();
                     let first = super::super::super::exec::encode_projected_pub(
@@ -141,10 +208,13 @@ mod ownership_tests {
                         results
                             .push(
                                 &original,
-                                RoutineInvocationResult::Rows(
-                                    ResultBytes::capture_rows(rows, &original).unwrap(),
-                                    super::super::super::sequence::StatementReplayCursor::EMPTY,
-                                ),
+                                RoutineInvocationResult {
+                                    value: OwnedRoutineResult::Rows(
+                                        ResultBytes::capture_rows(rows, &original).unwrap(),
+                                    ),
+                                    replay:
+                                        super::super::super::sequence::StatementReplayCursor::EMPTY,
+                                },
                             )
                             .unwrap();
                     }
@@ -154,11 +224,14 @@ mod ownership_tests {
                         results
                             .push(
                                 &original,
-                                RoutineInvocationResult::Scalar(
-                                    ResultBytes::capture_scalar(Datum::Int4(number), &original)
-                                        .unwrap(),
-                                    super::super::super::sequence::StatementReplayCursor::EMPTY,
-                                ),
+                                RoutineInvocationResult {
+                                    value: OwnedRoutineResult::Scalar(
+                                        ResultBytes::capture_scalar(Datum::Int4(number), &original)
+                                            .unwrap(),
+                                    ),
+                                    replay:
+                                        super::super::super::sequence::StatementReplayCursor::EMPTY,
+                                },
                             )
                             .unwrap();
                     }
@@ -170,8 +243,8 @@ mod ownership_tests {
             moved.recycle_front();
             for index in [14, 0, 9, 2, 1, 3] {
                 output.reset();
-                match result_at(&results, &moved, index).unwrap() {
-                    RoutineInvocationResult::Scalar(value, _) => {
+                match result_at(&results, &moved, index).unwrap().value {
+                    OwnedRoutineResult::Scalar(value) => {
                         let value = value.scalar(&moved, &output).unwrap();
                         if index == 0 {
                             let Datum::Record(fields) = value else {
@@ -183,7 +256,7 @@ mod ownership_tests {
                             assert_eq!(value, Datum::Int4(index as i32 - 3));
                         }
                     }
-                    RoutineInvocationResult::Rows(value, _) => {
+                    OwnedRoutineResult::Rows(value) => {
                         let rows = value.rows(&moved, &output).unwrap();
                         assert_eq!(rows.len(), if index == 1 { 2 } else { 0 });
                         if index == 1 {
@@ -226,10 +299,12 @@ mod ownership_tests {
         let arena = Arena::new(&mut budget, "completed result capacity", capacity).unwrap();
         let mut results = RoutineResults::new();
         crate::mem::guard::forbid_alloc(|| {
-            let value = RoutineInvocationResult::Scalar(
-                ResultBytes::capture_scalar(Datum::Int4(42), &arena).unwrap(),
-                super::super::super::sequence::StatementReplayCursor::EMPTY,
-            );
+            let value = RoutineInvocationResult {
+                value: OwnedRoutineResult::Scalar(
+                    ResultBytes::capture_scalar(Datum::Int4(42), &arena).unwrap(),
+                ),
+                replay: super::super::super::sequence::StatementReplayCursor::EMPTY,
+            };
             while results.push(&arena, value).is_ok() {}
             let before = results.len();
             assert_eq!(before, 4);
@@ -241,7 +316,10 @@ mod ownership_tests {
             for index in 0..before {
                 assert!(matches!(
                     result_at(&results, &arena, index).unwrap(),
-                    RoutineInvocationResult::Scalar(_, _)
+                    RoutineInvocationResult {
+                        value: OwnedRoutineResult::Scalar(_),
+                        ..
+                    }
                 ));
             }
         });

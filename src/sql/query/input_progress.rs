@@ -1143,7 +1143,12 @@ mod tests {
                 result.unwrap_err().sqlstate,
                 sqlstate::INTERNAL_ROUTINE_INVOCATION
             );
-            invocations.complete(Datum::Int4(42), &original).unwrap();
+            invocations
+                .complete(
+                    OwnedRoutineResult::capture_scalar(Datum::Int4(42), &original).unwrap(),
+                    &original,
+                )
+                .unwrap();
             evaluation(77, crate::sql::eval::ExpressionEvaluation::Runtime).unwrap();
             cast_selection(
                 23,
@@ -1206,12 +1211,10 @@ mod tests {
                     "XX000"
                 );
             }
+            let retained = OwnedRoutineResult::capture_scalar(Datum::Null, &moved).unwrap();
             moved.reset();
             assert_eq!(
-                invocations
-                    .complete(Datum::Null, &moved)
-                    .unwrap_err()
-                    .sqlstate,
+                invocations.complete(retained, &moved).unwrap_err().sqlstate,
                 "XX000"
             );
         });
@@ -1539,7 +1542,12 @@ mod tests {
                     );
                     assert!(invocations.take_pending().is_some());
                     let body = effect(22).unwrap();
-                    invocations.complete(body, &statement).unwrap();
+                    invocations
+                        .complete(
+                            OwnedRoutineResult::capture_scalar(body, &statement).unwrap(),
+                            &statement,
+                        )
+                        .unwrap();
                 } else {
                     assert_eq!(result.unwrap(), Datum::Int4(22));
                     assert_eq!(effect(33).unwrap(), Datum::Int4(33));
@@ -2187,7 +2195,7 @@ mod tests {
                     Some(super::super::InvocationSite::Expression(0))
                 );
                 let value = crate::sql::exec::decode_projected_col_record(
-                    pending.arguments(&statement, &work).unwrap(),
+                    pending.arguments(&statement).unwrap(),
                     0,
                     &work,
                 )

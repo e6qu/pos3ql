@@ -26,6 +26,7 @@ use super::types::{ColDesc, ColType, Datum};
 
 pub(super) mod input_progress;
 mod invocation_results;
+pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::RetainedSelect;
@@ -935,7 +936,7 @@ pub(crate) enum InvocationSite {
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation {
     pub target: PendingRoutineTarget,
-    arguments: crate::mem::arena::ArenaSliceHandle<u8>,
+    arguments: crate::mem::arena::FrozenArenaSliceHandle<u8>,
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
     pub input_collation: super::ast::Collation,
@@ -953,7 +954,7 @@ impl PendingRoutineInvocation {
     fn capture_arguments(
         values: &[Datum<'_>],
         arena: &Arena,
-    ) -> Result<crate::mem::arena::ArenaSliceHandle<u8>, SqlError> {
+    ) -> Result<crate::mem::arena::FrozenArenaSliceHandle<u8>, SqlError> {
         let length = super::exec::projected_row_len(values)?;
         let handle = arena.retain_slice_with(length, |_| 0u8).map_err(|_| {
             sql_err!(
@@ -965,26 +966,16 @@ impl PendingRoutineInvocation {
             .retained_slice_mut(handle)
             .map_err(|_| inactive_pending_call())?;
         super::exec::encode_projected_into(values, &mut bytes)?;
-        Ok(handle)
+        drop(bytes);
+        arena
+            .freeze_retained_slice(handle)
+            .map_err(|_| inactive_pending_call())
     }
 
-    pub(crate) fn arguments<'out>(
-        &self,
-        source: &Arena,
-        destination: &'out Arena,
-    ) -> Result<&'out [u8], SqlError> {
-        let bytes = source
-            .retained_slice_mut(self.arguments)
-            .map_err(|_| inactive_pending_call())?;
-        destination
-            .alloc_slice_copy(&bytes)
-            .map(|bytes| &*bytes)
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pending routine arguments exceed execution memory"
-                )
-            })
+    pub(crate) fn arguments<'out>(&self, source: &'out Arena) -> Result<&'out [u8], SqlError> {
+        source
+            .retained_slice(self.arguments)
+            .map_err(|_| inactive_pending_call())
     }
 }
 
@@ -1485,15 +1476,15 @@ impl RoutineInvocationState {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.results.borrow().len() {
-            let RoutineInvocationResult::Scalar(value, replay) =
-                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
-            else {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Scalar(value) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a table source to a scalar expression"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
+            super::sequence::restore_replay_cursor(saved.replay)?;
             return Ok(Some(value.scalar(statement_arena, query_arena)?));
         }
         self.pending_replay
@@ -1533,15 +1524,15 @@ impl RoutineInvocationState {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.results.borrow().len() {
-            let RoutineInvocationResult::Scalar(value, replay) =
-                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
-            else {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Scalar(value) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "intrinsic invocation changed result shape"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
+            super::sequence::restore_replay_cursor(saved.replay)?;
             return value.scalar(statement_arena, query_arena);
         }
         self.pending_replay
@@ -1565,19 +1556,18 @@ impl RoutineInvocationState {
         self.pending.replace(None)
     }
 
-    pub(crate) fn complete(&self, result: Datum<'_>, arena: &Arena) -> Result<(), SqlError> {
+    pub(crate) fn complete(
+        &self,
+        value: OwnedRoutineResult,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
         self.require_arena(arena)?;
+        value.validate(arena)?;
+        let replay = super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?;
         self.results
             .borrow_mut()
-            .push(
-                arena,
-                RoutineInvocationResult::Scalar(
-                    invocation_results::ResultBytes::capture_scalar(result, arena)?,
-                    super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?,
-                ),
-            )
-            .map_err(invocation_results::directory_error)?;
-        Ok(())
+            .push(arena, RoutineInvocationResult { value, replay })
+            .map_err(invocation_results::directory_error)
     }
 
     pub(crate) fn resolve_rows<'a>(
@@ -1592,15 +1582,15 @@ impl RoutineInvocationState {
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
         if ordinal < self.results.borrow().len() {
-            let RoutineInvocationResult::Rows(rows, replay) =
-                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?
-            else {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Rows(rows) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a scalar expression to a table source"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
+            super::sequence::restore_replay_cursor(saved.replay)?;
             return Ok(Some(rows.rows(statement_arena, statement_arena)?));
         }
         self.pending_replay
@@ -1627,21 +1617,6 @@ impl RoutineInvocationState {
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable SQL routine invocation is pending"
         ))
-    }
-
-    pub(crate) fn complete_rows(&self, rows: &[&[u8]], arena: &Arena) -> Result<(), SqlError> {
-        self.require_arena(arena)?;
-        self.results
-            .borrow_mut()
-            .push(
-                arena,
-                RoutineInvocationResult::Rows(
-                    invocation_results::ResultBytes::capture_rows(rows, arena)?,
-                    super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?,
-                ),
-            )
-            .map_err(invocation_results::directory_error)?;
-        Ok(())
     }
 }
 const SUBQUERY_DEPTH: u32 = 4;

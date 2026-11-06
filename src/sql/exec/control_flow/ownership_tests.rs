@@ -546,7 +546,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
                 .all(|resource| matches!(resource, FrameResource::Empty))
         );
     });
-    // Resetting the metadata owner rejects the handle even while source lives.
+    // Resetting the workspace rejects later bindings while the source lives.
     let mut owner_budget = Budget::new(8192);
     let mut owner = Arena::new(&mut owner_budget, "reset procedural metadata", 8192).unwrap();
     let (_, code) = source.parse(&moved_source, &parsing).unwrap();

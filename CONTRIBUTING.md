@@ -183,7 +183,9 @@ at the existing statement capacity. Include a shadowed counter, a caught error
 and a nonlocal exit; verify locals and `FOUND`, and prove inactive frames release
 references before temporary memory is reused. Exhaust the separate control pool,
 prove no declaration initializer ran, and verify capacity returns after owners
-drop while other active calls keep their positions. Keep deadline ownership proofs
+drop while other active calls keep their positions. Cover both frame-byte and
+output-binding lease exhaustion. Bind the original source arena explicitly when
+rebuilding syntax in a separate execution workspace. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
 Repeat queries and nested results on every iteration at unchanged capacity;
 short loops cannot prove that discarded work is reclaimed. Function comparisons

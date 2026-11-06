@@ -660,8 +660,8 @@ reserving a maximum array for every potential table.
 handler positions and output-binding metadata of running procedural calls.
 `execution_control_leases` bounds simultaneously owned ranges; each active
 function, procedure or trigger reserves one range for its maximum lexical
-nesting and, when it has named outputs, another for their bindings before local
-initialization. Empty
+nesting. Set-returning functions with named outputs reserve another range for
+their output bindings before local initialization. Empty
 tables and cached plans do not receive private control ranges. Dropping the
 call returns those ranges, including after errors. A full pool returns `54000`
 naming both settings before body initializers can have effects. The byte limit

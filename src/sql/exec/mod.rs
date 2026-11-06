@@ -3970,6 +3970,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
             new: new.as_deref(),
         },
         program.locals,
+        program.initializers,
         &[],
         local_values,
     )?;
@@ -17007,7 +17008,7 @@ fn plpgsql_function_program_kind(routine: &crate::storage::RoutineDef) -> Plpgsq
 fn plpgsql_output_value<'a>(
     engine: &super::Engine,
     routine: &crate::storage::RoutineDef,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     txid: u32,
     arena: &'a Arena,
@@ -17103,12 +17104,11 @@ enum PlpgsqlRecordShape {
 }
 
 #[derive(Clone, Copy)]
-struct TriggerLocalDecl<'a> {
+struct TriggerLocalDecl {
     name: SqlName,
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
     type_mod: i32,
-    initial: Option<&'a Expr<'a>>,
     record_shape: Option<PlpgsqlRecordShape>,
     constant: bool,
     not_null: bool,
@@ -17907,7 +17907,8 @@ impl<'a, T: Copy + 'a> ProgramList<'a, T> {
 
 #[derive(Clone, Copy)]
 struct TriggerProgram<'a> {
-    locals: &'a [TriggerLocalDecl<'a>],
+    locals: &'a [TriggerLocalDecl],
+    initializers: &'a [Option<&'a Expr<'a>>],
     body: TriggerBlock<'a>,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
 }
@@ -17955,7 +17956,7 @@ impl<'a> TriggerExecutionStatus<'a> {
     fn new(
         arena: &'a Arena,
         block: TriggerBlock<'a>,
-        locals: &[TriggerLocalDecl<'a>],
+        locals: &[TriggerLocalDecl],
         output_count: usize,
     ) -> Result<Self, SqlError> {
         Ok(Self {
@@ -20792,7 +20793,6 @@ fn resolve_plpgsql_program_locals<'a>(
             ctype: ColType::Bool,
             user_type: None,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -20827,14 +20827,17 @@ fn resolve_plpgsql_program_locals<'a>(
             ctype,
             user_type,
             type_mod,
-            initial: local.initial,
             record_shape,
             constant: local.constant,
             not_null: local.not_null,
         };
     }
+    let initializers = arena
+        .alloc_slice_with(program.locals.len(), |index| program.locals[index].initial)
+        .map_err(|_| super::query::arena_full_pub())?;
     let program = TriggerProgram {
         locals: resolved,
+        initializers,
         body: program.body,
         input_sites: program.input_sites,
     };
@@ -20849,7 +20852,7 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
     }
     fn reject(
         target: SqlName,
-        locals: &[TriggerLocalDecl<'_>],
+        locals: &[TriggerLocalDecl],
         mut shadowed: Option<&LoopLocal<'_>>,
     ) -> Result<(), SqlError> {
         while let Some(local) = shadowed {
@@ -20872,7 +20875,7 @@ fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result
     }
     fn validate_block(
         current: TriggerBlock<'_>,
-        locals: &[TriggerLocalDecl<'_>],
+        locals: &[TriggerLocalDecl],
         shadowed: Option<&LoopLocal<'_>>,
     ) -> Result<(), SqlError> {
         for statement in current.statements {
@@ -21174,6 +21177,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
             new: None,
         },
         program.locals,
+        program.initializers,
         &[],
         local_values,
     )?;
@@ -21251,6 +21255,7 @@ pub(crate) fn execute_event_trigger<'a>(
             new: None,
         },
         program.locals,
+        program.initializers,
         &[],
         local_values,
     )?;
@@ -21341,7 +21346,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         if TriggerExceptionVariable::parse(parameter.name.as_str()).is_some()
             || declarations[..declaration_count]
                 .iter()
-                .any(|prior: &TriggerLocalDecl<'_>| prior.name == parameter.name)
+                .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
         {
             return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -21354,7 +21359,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             ctype: parameter.ctype,
             user_type: parameter.user_type,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -21405,6 +21409,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             new: None,
         },
         locals,
+        program.initializers,
         &seeded[..seeded_count],
         local_values,
     )?;
@@ -21501,7 +21506,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
             ctype: parameter.ctype,
             user_type: parameter.user_type,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -21527,7 +21531,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
             ctype: parameter.ctype,
             user_type: parameter.user_type,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -21576,6 +21579,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
             new: None,
         },
         locals,
+        program.initializers,
         &seeded[..seeded_count],
         local_values,
     )?;
@@ -21664,7 +21668,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             ctype: parameter.ctype,
             user_type: parameter.user_type,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -21692,7 +21695,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             ctype: output.ctype,
             user_type: output.user_type,
             type_mod: -1,
-            initial: None,
             record_shape: None,
             constant: false,
             not_null: false,
@@ -21767,6 +21769,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             new: None,
         },
         locals,
+        program.initializers,
         &seeded[..seeded_count],
         local_values,
     )?;
@@ -22223,7 +22226,7 @@ fn detached_trigger_row<'a>(
 }
 
 struct TriggerLocalScope<'t, 'a> {
-    locals: &'t [TriggerLocalDecl<'a>],
+    locals: &'t [TriggerLocalDecl],
     values: &'t [Datum<'a>],
     found: Option<bool>,
     invocation: TriggerInvocation<'a>,
@@ -22598,7 +22601,7 @@ fn detached_trigger_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datu
 #[derive(Clone, Copy)]
 pub(crate) struct TriggerDmlSnapshot<'a> {
     definition: crate::storage::RelationDefinition<'a>,
-    locals: &'a [TriggerLocalDecl<'a>],
+    locals: &'a [TriggerLocalDecl],
     values: &'a [Datum<'a>],
     invocation: TriggerInvocation<'a>,
     old: Option<&'a [Datum<'a>]>,
@@ -22740,7 +22743,7 @@ where
 
 fn snapshot_trigger_dml_scope<'a, Definition0: crate::storage::DefinitionBacking>(
     definition: &crate::storage::TableDefinition<Definition0>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     local_values: &[Datum<'a>],
     invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
@@ -25906,13 +25909,12 @@ fn allocate_plpgsql_local_values<'a>(
         .map_err(|_| super::query::arena_full_pub())
 }
 
-fn empty_plpgsql_local<'a>() -> TriggerLocalDecl<'a> {
+fn empty_plpgsql_local() -> TriggerLocalDecl {
     TriggerLocalDecl {
         name: SqlName::EMPTY,
         ctype: ColType::Bool,
         user_type: None,
         type_mod: -1,
-        initial: None,
         record_shape: None,
         constant: false,
         not_null: false,
@@ -25923,17 +25925,23 @@ fn initialize_trigger_locals<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     invocation: TriggerInvocation<'a>,
     transition: TriggerTransition<'_, '_, 'a>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
+    initializers: &[Option<&'a Expr<'a>>],
     seeded: &[Datum<'a>],
     values: &mut [Datum<'a>],
 ) -> Result<(), SqlError> {
+    assert_eq!(
+        locals.len(),
+        seeded.len() + initializers.len(),
+        "local initialization layout"
+    );
     for (index, local) in locals.iter().enumerate() {
         if let Some(value) = seeded.get(index).copied() {
             values[index] = coerce_plpgsql_local(context, *local, value)?;
             continue;
         }
         values[index] = Datum::Null;
-        let Some(initial) = local.initial else {
+        let Some(initial) = initializers[index - seeded.len()] else {
             if local.not_null {
                 return Err(sql_err!(
                     sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -25956,7 +25964,7 @@ fn initialize_trigger_locals<'a>(
     Ok(())
 }
 
-fn trigger_local_index(locals: &[TriggerLocalDecl<'_>], name: SqlName) -> Result<usize, SqlError> {
+fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usize, SqlError> {
     locals
         .iter()
         .position(|local| local.name == name)
@@ -25971,7 +25979,7 @@ fn trigger_local_index(locals: &[TriggerLocalDecl<'_>], name: SqlName) -> Result
 
 fn coerce_plpgsql_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    local: TriggerLocalDecl<'a>,
+    local: TriggerLocalDecl,
     value: Datum<'a>,
 ) -> Result<Datum<'a>, SqlError> {
     let sequences = crate::sql::sequence::SeqEval::new(
@@ -26083,7 +26091,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
 
 fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
     target: SqlName,
     value: Datum<'a>,
@@ -26192,7 +26200,7 @@ fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
     invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     found: Option<bool>,
 ) -> Result<bool, SqlError> {
@@ -26649,7 +26657,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     new: &mut Option<&mut [Datum<'a>]>,
     before: bool,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     statement: TriggerStatement<'a>,
     status: &mut TriggerExecutionStatus<'a>,
@@ -29969,6 +29977,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
                 new: None,
             },
             program.locals,
+            program.initializers,
             &[],
             local_values,
         )?;

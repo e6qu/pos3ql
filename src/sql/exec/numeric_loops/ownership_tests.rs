@@ -2,9 +2,9 @@ use super::*;
 use crate::mem::budget::Budget;
 
 fn layout_locals<'a>(
-    program: &ParsedTriggerProgram<'a>,
+    program: &ParsedTriggerProgram<'_>,
     arena: &'a Arena,
-) -> &'a [TriggerLocalDecl<'a>] {
+) -> &'a [TriggerLocalDecl] {
     // Capacity uses names only; native execution supplies resolved types.
     arena
         .alloc_slice_with(program.locals.len(), |index| TriggerLocalDecl {
@@ -37,7 +37,7 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
                 let inner = frames.take().unwrap();
                 let temporary = arena.alloc_str("temporary loop text").unwrap();
                 inner.values[0] = Datum::Text(temporary);
-                inner.locals[0].initial = Some(arena.alloc(Expr::Str(temporary)).unwrap());
+                inner.locals[0].name = SqlName::parse("temporary_name").unwrap();
                 assert_eq!(frames.take().err().unwrap().sqlstate, "54000");
                 frames.restore(inner);
                 assert_eq!(outer.values[0], Datum::Int4(41));
@@ -47,7 +47,12 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
             unsafe { arena.rewind_to(mark) };
             let outer = frames.take().unwrap();
             assert!(outer.values.iter().all(Datum::is_null));
-            assert!(outer.locals.iter().all(|local| local.initial.is_none()));
+            assert!(
+                outer
+                    .locals
+                    .iter()
+                    .all(|local| local.name == SqlName::EMPTY)
+            );
             let inner = frames.take().unwrap();
             assert!(inner.values.iter().all(Datum::is_null));
             frames.restore(inner);

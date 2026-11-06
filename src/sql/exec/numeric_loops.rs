@@ -5,7 +5,7 @@ use crate::mem::arena::OwnedArenaSlice;
 
 pub(super) struct NumericLoopWorkspace<'a> {
     depth: usize,
-    pub(super) locals: &'a mut [TriggerLocalDecl<'a>],
+    pub(super) locals: &'a mut [TriggerLocalDecl],
     pub(super) values: &'a mut [Datum<'a>],
 }
 
@@ -18,7 +18,7 @@ impl<'a> NumericLoopFrames<'a> {
     pub(super) fn new(
         arena: &'a Arena,
         block: TriggerBlock<'a>,
-        locals: &[TriggerLocalDecl<'a>],
+        locals: &[TriggerLocalDecl],
     ) -> Result<Self, SqlError> {
         let depth = numeric_depth(block);
         let counts = arena
@@ -81,7 +81,7 @@ impl CounterName<'_> {
 
 fn frame_layout(
     block: TriggerBlock<'_>,
-    locals: &[TriggerLocalDecl<'_>],
+    locals: &[TriggerLocalDecl],
     counters: Option<&CounterName<'_>>,
     count: usize,
     depth: usize,

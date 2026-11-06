@@ -214,6 +214,12 @@ copies back assignments while restoring the shadowed counter. Returning
 the frame clears references into completed temporary work. These frames remain
 inside the existing statement arena; `54000` names insufficient capacity.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
+Runtime local declarations contain names, resolved types and flags, without
+references to initializer expressions. The compiled program owns those
+expressions separately; initialization seeds parameters first, then evaluates
+local defaults once in declaration order. For example, a later local can use
+an earlier constant initialized by `nextval`, and a loop counter must restore
+the initialized local that it shadows.
 Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
 stores a block index and next-statement offset in its compiled program. Loop

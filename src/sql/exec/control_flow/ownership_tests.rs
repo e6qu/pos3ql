@@ -66,7 +66,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         TriggerLocalDecl {
             name: SqlName::parse("n").unwrap(),
             ctype: ColType::Int4,
-            initial: Some(parse.alloc(Expr::Int(0)).unwrap()),
             ..empty_plpgsql_local()
         },
     ];
@@ -90,7 +89,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             frames.enter(frame);
             let (scope, current) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
-            assert!(scope.iter().all(|local| local.initial.is_none()));
+            assert_eq!(scope[1].name.as_str(), "n");
             let Step::Enter(frame) =
                 start_numeric_loop(inner, 1, 2, 1, false, scope, current, &mut status).unwrap()
             else {
@@ -114,7 +113,12 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(matches!(frames.pop().continuation, Continuation::Once));
             assert!(frames.slots.iter().all(Option::is_none));
             let workspace = status.numeric_frames.take().unwrap();
-            assert!(workspace.locals.iter().all(|local| local.initial.is_none()));
+            assert!(
+                workspace
+                    .locals
+                    .iter()
+                    .all(|local| local.name == SqlName::EMPTY)
+            );
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }

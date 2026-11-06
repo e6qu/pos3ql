@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn procedural_locals_initialize_once_in_order_after_seeded_parameters() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("local-initializer-layout-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql =
+            include_str!("../../../tests/external/differential/252_local_initializer_layout.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["17|1:ok:true", "28|2:ok:true", "2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn lowered_assignments_bind_handler_variables_in_values_and_subscripts() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

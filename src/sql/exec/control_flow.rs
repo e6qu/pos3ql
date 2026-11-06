@@ -240,9 +240,9 @@ impl<'a> ControlFrames<'a> {
 
     fn scope<'s>(
         &'s mut self,
-        locals: &'s [TriggerLocalDecl<'a>],
+        locals: &'s [TriggerLocalDecl],
         values: &'s mut [Datum<'a>],
-    ) -> (&'s [TriggerLocalDecl<'a>], &'s mut [Datum<'a>]) {
+    ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
         for frame in self.slots[..self.active].iter_mut().rev().flatten() {
             if let Continuation::Numeric(scope) = &mut frame.continuation {
                 return (
@@ -269,7 +269,7 @@ impl<'a> ControlFrames<'a> {
         &mut self,
         arena: &Arena,
         frame: Frame<'a>,
-        locals: &[TriggerLocalDecl<'a>],
+        locals: &[TriggerLocalDecl],
         values: &mut [Datum<'a>],
         status: &mut TriggerExecutionStatus<'a>,
         success: bool,
@@ -309,7 +309,7 @@ pub(super) fn start_numeric_loop<'a>(
     upper: i32,
     step: i32,
     reverse: bool,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'a>, SqlError> {
@@ -337,10 +337,7 @@ pub(super) fn start_numeric_loop<'a>(
                 ..empty_plpgsql_local()
             }
         } else {
-            TriggerLocalDecl {
-                initial: None,
-                ..locals[index]
-            }
+            locals[index]
         };
     }
     workspace.values[..count].fill(Datum::Null);
@@ -376,7 +373,7 @@ pub(super) fn start_row_loop<'a>(
     target: usize,
     rows: super::loop_rows::LoopRows,
     query_source: bool,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Step<'a>, SqlError> {
@@ -417,7 +414,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     new: &mut Option<&mut [Datum<'a>]>,
     before: bool,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
-    locals: &[TriggerLocalDecl<'a>],
+    locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
     block: TriggerBlock<'a>,
     status: &mut TriggerExecutionStatus<'a>,
@@ -766,9 +763,9 @@ fn bind_exception_variables<'a>(
     }
 }
 
-fn catch_diagnostic<'a>(
-    context: &mut TriggerExecContext<'_, 'a, '_>,
-    invocation: TriggerInvocation<'a>,
+fn catch_diagnostic(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
     error: &SqlError,
     buffers: &mut DiagnosticBuffers,
 ) -> Result<CaughtDiagnostic, SqlError> {

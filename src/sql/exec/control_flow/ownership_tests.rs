@@ -11,6 +11,61 @@ fn parse_owned_program<'a>(
 }
 
 #[test]
+fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop() {
+    let mut budget = Budget::new(64 << 10);
+    let parsing = Arena::new(&mut budget, "output admission syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "output admission workspace", 16 << 10).unwrap();
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        2,
+    )
+    .unwrap();
+    let (_, code) = parse_owned_program(
+        "BEGIN NULL; END",
+        &parsing,
+        &workspace,
+        PlpgsqlProgramKind::Anonymous,
+    )
+    .unwrap();
+    let locals = [TriggerLocalDecl {
+        name: SqlName::parse("value").unwrap(),
+        ctype: ColType::Text,
+        ..empty_plpgsql_local()
+    }];
+    crate::mem::guard::forbid_alloc(|| {
+        let error = TriggerExecutionStatus::new(&workspace, &parsing, code, &locals, 1, &pool)
+            .err()
+            .unwrap();
+        assert_eq!(error.sqlstate, "40001");
+        assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+        let held = pool.lease::<u8>(64).unwrap();
+        let error = TriggerExecutionStatus::new(&workspace, &workspace, code, &locals, 1, &pool)
+            .err()
+            .unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_leases"));
+        drop(held);
+        assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &workspace, code, &locals, 1, &pool).unwrap();
+        status.set_output_locals(&[0], locals.len());
+        status
+            .shadow_output_local(0, Datum::Text("owned output"), &workspace)
+            .unwrap();
+        assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
+        assert_eq!(
+            status.outputs[0].value.read(&workspace, &parsing).unwrap(),
+            Datum::Text("owned output")
+        );
+        drop(status);
+        assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+    });
+}
+
+#[test]
 fn shared_control_capacity_preserves_live_positions_and_returns_after_owner_drop() {
     let mut budget = Budget::new(64 << 10);
     let source = Arena::new(&mut budget, "shared control source", 16 << 10).unwrap();
@@ -141,7 +196,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
     let (_, code) = parse_owned_program(
         "BEGIN NULL; END",
         &parsing,
-        &source,
+        &workspace,
         PlpgsqlProgramKind::Anonymous,
     )
     .unwrap();
@@ -150,7 +205,8 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
         ctype: ColType::Text,
         ..empty_plpgsql_local()
     }];
-    let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 1, &pool).unwrap();
+    let mut status =
+        TriggerExecutionStatus::new(&workspace, &workspace, code, &locals, 1, &pool).unwrap();
     status.set_output_locals(&[0], locals.len());
     crate::mem::guard::forbid_alloc(|| {
         let text = temporary.alloc_str("original output").unwrap();
@@ -163,6 +219,16 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
             .unwrap();
         assert_eq!(workspace.used(), used);
         assert_eq!(status.outputs[0].shadow_depth, 2);
+        let foreign_used = source.used();
+        assert_eq!(
+            status
+                .shadow_output_local(0, Datum::Int4(9), &source)
+                .unwrap_err()
+                .sqlstate,
+            "XX000"
+        );
+        assert_eq!(status.outputs[0].shadow_depth, 2);
+        assert_eq!(source.used(), foreign_used);
     });
     temporary.reset();
     crate::mem::guard::forbid_alloc(|| {
@@ -250,7 +316,8 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, code, &locals, 0, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&arena, &arena, code, &locals, 0, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
         let mut resources = status.control_resources.take().unwrap();
         let mut frames = retained
@@ -358,7 +425,8 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     let source = ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Anonymous, &original).unwrap();
     let (mut status, retained, mut resources, mut values) = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&original, &parsing).unwrap();
-        let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 0, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &original, code, &locals, 0, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
         let mut resources = status.control_resources.take().unwrap();
         assert_eq!(

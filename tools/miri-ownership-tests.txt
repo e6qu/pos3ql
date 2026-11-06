@@ -246,3 +246,4 @@ sql::exec::local_values::ownership_tests::saved_values_keep_typed_nested_data_af
 sql::exec::local_values::ownership_tests::saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes
 sql::exec::control_flow::ownership_tests::output_bindings_own_outer_values_through_nested_shadows_and_source_reuse
 sql::exec::control_flow::ownership_tests::shared_control_capacity_preserves_live_positions_and_returns_after_owner_drop
+sql::exec::control_flow::ownership_tests::output_binding_admission_returns_control_leases_after_failure_and_owner_drop

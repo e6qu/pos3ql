@@ -31,6 +31,43 @@ fn control_capacity_is_admitted_before_procedural_initializer_effects() {
 }
 
 #[test]
+fn output_control_admission_precedes_initializers_and_releases_failed_calls() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("output-control-admission-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 4096;
+        config.execution_control_leases = 1;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(&mut engine, "CREATE SEQUENCE output_admission_calls", true);
+        session.success(&mut engine, "CREATE FUNCTION denied_output() RETURNS TABLE(answer integer) LANGUAGE plpgsql AS $$DECLARE v integer := nextval('output_admission_calls'); BEGIN answer := v; RETURN NEXT; END$$", true);
+        session.success(&mut engine, "CREATE FUNCTION admitted_control() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 7; END$$", true);
+        for _ in 0..2 {
+            let error = session.execute(&mut engine, "SELECT * FROM denied_output()", true);
+            assert_eq!(error_sqlstates(&error), ["54000"]);
+            assert!(String::from_utf8_lossy(&error).contains("execution_control_leases"));
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT admitted_control()", true)),
+                ["7"]
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('output_admission_calls')",
+                true
+            )),
+            ["1"]
+        );
+    }
+}
+
+#[test]
 fn saved_output_scopes_reuse_values_and_preserve_nested_caught_and_typed_outputs() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

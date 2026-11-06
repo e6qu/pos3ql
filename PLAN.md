@@ -135,7 +135,8 @@ errors, cancellation, rollback and connection closure. Prove no heap growth,
 no stale arena handles, fair progress for another connection and named capacity
 errors. Keep live-call control ownership separate from shared cached plans and
 row payloads. Preserve shared-pool admission before initializer effects and
-return capacity on failure or owner drop, independently of table count.
+return position and output-binding capacity on failure or owner drop,
+independently of table count. Keep saved output bytes separate from their metadata.
 Existing checked-plan and stored-object tests remain required;
 [reference evidence](https://github.com/e6qu/pos3ql/blob/2303cd158bc419ef508089b87c13537f86c05210/tests/external/reference/2026-11-03-input-plans/README.md)
 retains the PostgreSQL observations and their provenance. Cold-recovery tests

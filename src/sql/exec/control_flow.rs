@@ -431,7 +431,7 @@ fn frame_full() -> SqlError {
     )
 }
 
-fn execution_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+pub(super) fn execution_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "PL/pgSQL execution control: {}",

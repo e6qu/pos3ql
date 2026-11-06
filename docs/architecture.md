@@ -315,7 +315,8 @@ stores a block index and next-statement offset in its compiled program. The
 original body and program kind use an immutable, checked source image. Parsed
 blocks belong to a separate compiled view. Mutable frame metadata owns a range
 in the shared execution control pool and retains no references to syntax or
-loop-value buffers. Loop
+loop-value buffers. Output-binding metadata owns a separate range in that pool;
+its saved values remain checked statement-memory images. Loop
 buffers and materialized rows have a separate, uniquely paired directory whose
 scoped owner releases its values. An entry owns its control data and required
 resource in one enum before publishing them to their indexed slots.
@@ -656,11 +657,13 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves one shared pool for the branch, loop and
-handler positions of running procedural calls. `execution_control_leases` bounds
-simultaneously owned ranges; each active function, procedure or trigger reserves
-one range for its maximum lexical nesting before local initialization. Empty
+handler positions and output-binding metadata of running procedural calls.
+`execution_control_leases` bounds simultaneously owned ranges; each active
+function, procedure or trigger reserves one range for its maximum lexical
+nesting and, when it has named outputs, another for their bindings before local
+initialization. Empty
 tables and cached plans do not receive private control ranges. Dropping the
-call returns its range, including after errors. A full pool returns `54000`
+call returns those ranges, including after errors. A full pool returns `54000`
 naming both settings before body initializers can have effects. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.

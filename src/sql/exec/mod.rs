@@ -3966,6 +3966,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
+        context.arena,
         code,
         program.locals,
         0,
@@ -17972,19 +17973,32 @@ struct TriggerExecutionStatus<'a> {
     found: Option<bool>,
     row_count: i64,
     set_result: Option<PlpgsqlSetResult>,
-    outputs: crate::mem::arena::OwnedArenaSlice<'a, OutputBinding>,
+    outputs: MutableSlice<OutputBinding>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
     fn new(
         arena: &'a Arena,
+        source: &Arena,
         program: CompiledProgram<'_>,
         locals: &[TriggerLocalDecl],
         output_count: usize,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let mut control_frames = ControlFrames::new(arena, program.layout(), arena, pool)?;
+        let mut control_frames = ControlFrames::new(arena, program.layout(), source, pool)?;
         let control_resources = control_frames.reserve_resources(arena)?;
+        let mut outputs = pool
+            .lease(output_count)
+            .map_err(control_flow::execution_full)?;
+        for _ in 0..output_count {
+            outputs
+                .push_reserved(OutputBinding {
+                    local: 0,
+                    value: local_values::SavedValue::new(),
+                    shadow_depth: 0,
+                })
+                .map_err(control_flow::execution_full)?;
+        }
         Ok(Self {
             numeric_frames: NumericLoopFrames::new(arena, program.root(), locals)?,
             control_frames: Some(control_frames),
@@ -17992,18 +18006,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             found: Some(false),
             row_count: 0,
             set_result: None,
-            outputs: arena
-                .alloc_owned_slice_with(output_count, |_| OutputBinding {
-                    local: 0,
-                    value: local_values::SavedValue::new(),
-                    shadow_depth: 0,
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL output-variable bindings exceed statement memory"
-                    )
-                })?,
+            outputs,
         })
     }
     fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
@@ -18035,6 +18038,8 @@ impl<'a> TriggerExecutionStatus<'a> {
             if output.local == local {
                 if output.shadow_depth == 0 {
                     output.value.replace(value, arena)?;
+                } else {
+                    output.value.require_owner(arena)?;
                 }
                 output.shadow_depth = output.shadow_depth.checked_add(1).ok_or_else(|| {
                     sql_err!(
@@ -21329,6 +21334,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
+        context.arena,
         code,
         program.locals,
         0,
@@ -21418,6 +21424,7 @@ pub(crate) fn execute_event_trigger<'a>(
     };
     let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
+        context.arena,
         context.arena,
         code,
         program.locals,
@@ -21574,6 +21581,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
+        context.arena,
         context.arena,
         code,
         locals,
@@ -21749,6 +21757,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
+        context.arena,
         code,
         locals,
         0,
@@ -21921,6 +21930,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     };
     let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
+        context.arena,
         context.arena,
         code,
         locals,
@@ -30122,6 +30132,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         let mut no_new = None;
         let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
         let mut status = TriggerExecutionStatus::new(
+            context.arena,
             context.arena,
             code,
             program.locals,

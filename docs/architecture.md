@@ -221,7 +221,10 @@ conditions and handler syntax resolve through that program; loop values and
 handler diagnostic/savepoint state stay with the active frame. Child blocks do
 not recursively call the interpreter. Leaving a scope
 restores shadowed counters, copies assignments back and releases its references.
-Caught error text uses a reusable, checked buffer for each simultaneously
+Caught error text and buffer descriptors use checked, address-independent
+handles in retained statement memory. Moving the arena or recycling its
+temporary front preserves those handles; a full reset invalidates them.
+Caught error text uses a reusable buffer for each simultaneously
 active handler depth. Buffer payloads grow geometrically within the statement
 arena; repeated catches reuse their storage. Leaving a handler invalidates its
 view. Nested handlers keep the outer error available; SQLSTATE/SQLERRM and
@@ -233,8 +236,9 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-The frames and diagnostic buffers still borrow statement memory; they do not
-yet survive returning to the connection scheduler during a storage wait.
+The control frames and local variables still borrow temporary statement memory;
+retaining diagnostics alone does not yet let the whole invocation survive
+returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.
 Source query work and nested invocation receipts use one scoped arena and are

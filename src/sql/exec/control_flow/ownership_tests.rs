@@ -103,12 +103,12 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             current[1] = Datum::Int4(41);
             status.set_found(false);
             let inner = frames.pop();
-            frames.finish(inner, &locals, &mut values, &mut status, success);
+            frames.finish(&arena, inner, &locals, &mut values, &mut status, success);
             let (_, current) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
             assert_eq!(current[1], Datum::Int4(41));
             let outer = frames.pop();
-            frames.finish(outer, &locals, &mut values, &mut status, success);
+            frames.finish(&arena, outer, &locals, &mut values, &mut status, success);
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
@@ -145,7 +145,10 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         frames.start(program.body);
         frames.last_mut().next = 1;
         let error = sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero");
-        let diagnostic = frames.diagnostics.capture(&error, None, "handler").unwrap();
+        let diagnostic = frames
+            .diagnostics
+            .capture(&arena, &error, None, "handler")
+            .unwrap();
         frames.push(
             FrameEntry::new(handler, Continuation::Handler(diagnostic)),
             FrameSource::Handler,
@@ -158,7 +161,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             frames
                 .diagnostic()
                 .unwrap()
-                .variables(&arena)
+                .variables(&arena, &arena)
                 .unwrap()
                 .message,
             "division by zero"
@@ -174,7 +177,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         let Continuation::Handler(diagnostic) = handler.continuation else {
             panic!("handler");
         };
-        frames.diagnostics.release(diagnostic);
+        frames.diagnostics.release(&arena, diagnostic);
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
@@ -250,6 +253,7 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
         let mut buffers = DiagnosticBuffers::new(&arena, 1).unwrap();
         let caught = buffers
             .capture(
+                &arena,
                 &sql_err!(sqlstate::RAISE_EXCEPTION, "caught"),
                 None,
                 "handler",
@@ -264,7 +268,7 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
             .expect("lowering preserves handler name dependencies");
         assert_eq!(variables.message, "caught");
         assert_eq!(variables.sqlstate_text, "P0001");
-        buffers.release(caught);
+        buffers.release(&arena, caught);
         assert_eq!(variables.message, "caught");
     });
 }

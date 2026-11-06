@@ -31,23 +31,22 @@ struct Span {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CaughtDiagnostic<'a> {
+pub(super) struct CaughtDiagnostic {
     pub(super) sqlstate: crate::sql::eval::SqlState,
-    arena: &'a Arena,
     bytes: ArenaSliceHandle<u8>,
     generation: u64,
     slot: usize,
     spans: [Option<Span>; 5],
 }
 
-impl CaughtDiagnostic<'_> {
+impl CaughtDiagnostic {
     fn read<R>(
         self,
+        arena: &Arena,
         field: Field,
         copy: impl for<'text> FnOnce(&'text str) -> Result<R, SqlError>,
     ) -> Result<Option<R>, SqlError> {
-        let bytes = self
-            .arena
+        let bytes = arena
             .retained_slice_mut(self.bytes)
             .map_err(|_| inactive())?;
         let generation = u64::from_le_bytes(bytes[..8].try_into().expect("diagnostic generation"));
@@ -66,19 +65,21 @@ impl CaughtDiagnostic<'_> {
 
     pub(super) fn text<'out>(
         self,
+        source: &Arena,
         field: Field,
-        arena: &'out Arena,
+        destination: &'out Arena,
     ) -> Result<Option<&'out str>, SqlError> {
-        self.read(field, |text| {
-            arena.alloc_str(text).map_err(|_| memory_full())
+        self.read(source, field, |text| {
+            destination.alloc_str(text).map_err(|_| memory_full())
         })
     }
 
     pub(super) fn stack<const N: usize>(
         self,
+        source: &Arena,
         field: Field,
     ) -> Result<Option<StackStr<N>>, SqlError> {
-        self.read(field, |text| {
+        self.read(source, field, |text| {
             let result = StackStr::from_str(text);
             if result.is_truncated() {
                 return Err(sql_err!(
@@ -93,14 +94,15 @@ impl CaughtDiagnostic<'_> {
 
     pub(super) fn variables<'out>(
         self,
-        arena: &'out Arena,
+        source: &Arena,
+        destination: &'out Arena,
     ) -> Result<TriggerExceptionVariables<'out>, SqlError> {
         Ok(TriggerExceptionVariables {
             sqlstate_text: self
-                .text(Field::Sqlstate, arena)?
+                .text(source, Field::Sqlstate, destination)?
                 .expect("caught error has SQLSTATE"),
             message: self
-                .text(Field::Message, arena)?
+                .text(source, Field::Message, destination)?
                 .expect("caught error has a message"),
         })
     }
@@ -113,35 +115,43 @@ struct Buffer {
     generation: u64,
 }
 
-pub(super) struct DiagnosticBuffers<'a> {
-    arena: &'a Arena,
-    slots: &'a mut [Buffer],
+// Both this owner and its active views are independent of arena addresses.
+// Payload and descriptor handles survive front recycling; reset invalidates them.
+pub(super) struct DiagnosticBuffers {
+    slots: Option<ArenaSliceHandle<Buffer>>,
     active: usize,
 }
 
-impl<'a> DiagnosticBuffers<'a> {
-    pub(super) fn new(arena: &'a Arena, count: usize) -> Result<Self, SqlError> {
-        Ok(Self {
-            arena,
-            slots: arena
-                .alloc_slice_with(count, |_| Buffer {
-                    bytes: None,
-                    capacity: 0,
-                    generation: 0,
-                })
-                .map_err(|_| memory_full())?,
-            active: 0,
-        })
+impl DiagnosticBuffers {
+    pub(super) fn new(arena: &Arena, count: usize) -> Result<Self, SqlError> {
+        let slots = if count == 0 {
+            None
+        } else {
+            Some(
+                arena
+                    .retain_slice_with(count, |_| Buffer {
+                        bytes: None,
+                        capacity: 0,
+                        generation: 0,
+                    })
+                    .map_err(|_| memory_full())?,
+            )
+        };
+        Ok(Self { slots, active: 0 })
     }
 
     pub(super) fn capture(
         &mut self,
+        arena: &Arena,
         error: &SqlError,
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
         context: &str,
-    ) -> Result<CaughtDiagnostic<'a>, SqlError> {
+    ) -> Result<CaughtDiagnostic, SqlError> {
         let slot_index = self.active;
-        let slot = self.slots.get_mut(slot_index).ok_or_else(memory_full)?;
+        let mut slots = arena
+            .retained_slice_mut(self.slots.ok_or_else(memory_full)?)
+            .map_err(|_| inactive())?;
+        let slot = slots.get_mut(slot_index).ok_or_else(memory_full)?;
         let generation = slot.generation.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -164,18 +174,14 @@ impl<'a> DiagnosticBuffers<'a> {
             // Geometric payload growth bounds storage by the largest error
             // seen at this depth, rather than by the number of catches.
             let capacity = length.checked_next_power_of_two().ok_or_else(memory_full)?;
-            let bytes = self
-                .arena
+            let bytes = arena
                 .retain_slice_with(capacity, |_| 0u8)
                 .map_err(|_| memory_full())?;
             slot.bytes = Some(bytes);
             slot.capacity = capacity;
         }
         let handle = slot.bytes.expect("nonempty diagnostic buffer");
-        let mut bytes = self
-            .arena
-            .retained_slice_mut(handle)
-            .map_err(|_| inactive())?;
+        let mut bytes = arena.retained_slice_mut(handle).map_err(|_| inactive())?;
         bytes[..8].fill(0);
         let mut spans = [None; 5];
         let mut position = 8;
@@ -194,7 +200,6 @@ impl<'a> DiagnosticBuffers<'a> {
         self.active += 1;
         Ok(CaughtDiagnostic {
             sqlstate: error.sqlstate,
-            arena: self.arena,
             bytes: handle,
             generation,
             slot: slot_index,
@@ -202,12 +207,23 @@ impl<'a> DiagnosticBuffers<'a> {
         })
     }
 
-    pub(super) fn release(&mut self, diagnostic: CaughtDiagnostic<'_>) {
+    pub(super) fn release(&mut self, arena: &Arena, diagnostic: CaughtDiagnostic) {
         assert_eq!(self.active, diagnostic.slot + 1, "diagnostic scope order");
-        self.arena
+        let slots = arena
+            .retained_slice_mut(self.slots.expect("active diagnostic slots"))
+            .expect("active diagnostic owner");
+        assert_eq!(
+            slots[diagnostic.slot].generation, diagnostic.generation,
+            "active diagnostic generation"
+        );
+        let mut bytes = arena
             .retained_slice_mut(diagnostic.bytes)
-            .expect("active diagnostic handle")[..8]
-            .fill(0);
+            .expect("active diagnostic handle");
+        assert_eq!(
+            u64::from_le_bytes(bytes[..8].try_into().expect("diagnostic generation")),
+            diagnostic.generation
+        );
+        bytes[..8].fill(0);
         self.active -= 1;
     }
 }

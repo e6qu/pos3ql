@@ -1813,9 +1813,12 @@ mod tests {
                     pending.source_position,
                     Some(super::super::InvocationSite::Expression(0))
                 );
-                let value =
-                    crate::sql::exec::decode_projected_col_record(pending.arguments, 0, &work)
-                        .unwrap();
+                let value = crate::sql::exec::decode_projected_col_record(
+                    pending.arguments(&statement, &work).unwrap(),
+                    0,
+                    &work,
+                )
+                .unwrap();
                 assert!(matches!(value, Datum::Text("retained argument")));
                 let outer = type_input_plans::owner().ok();
                 type_input_plans::with_owner(pending.plan_owner, || {

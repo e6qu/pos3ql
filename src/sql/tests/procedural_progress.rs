@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn parameter_names_and_shadowed_locals_preserve_input_and_output_scopes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-parameter-scopes-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let sql = include_str!(
+            "../../../tests/external/differential/259_procedural_parameter_scopes.sql"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            [
+                "7:integer:8:P0001:parameter handler:1:integer:7:8",
+                "42",
+                "7:8",
+                "7|output",
+                "NULL",
+                "NULL",
+                "7",
+                "dynamic:1:integer:after:text",
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn diagnostic_counters_and_handlers_preserve_the_innermost_binding() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

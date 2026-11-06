@@ -13,7 +13,8 @@ belong to the active PR and [PLAN.md](PLAN.md). They are not blocked defects.
 [CONTRIBUTING.md](CONTRIBUTING.md) owns verification and failure diagnostics;
 current behavior and limits belong in the [owning guides](docs/README.md).
 Fixing tests and retained PostgreSQL reference evidence own the exact SQL cases,
-including lexical scope, constant targets and cursor behavior.
+including parameter/local/output scopes, constant targets, cursor behavior and
+pending-call argument/type ownership.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

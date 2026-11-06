@@ -468,6 +468,31 @@ fn lexical_variable_values_types_and_domains_select_one_binding() {
         let selected = plpgsql_variable(&[], &[], invocation, Some(false), "tg_name").unwrap();
         assert_eq!(selected.value, Datum::Text("actual trigger"));
         assert_eq!(selected.ctype, ColType::Name);
+
+        let same_name = SqlName::parse("value").unwrap();
+        let declarations = [
+            TriggerLocalDecl {
+                name: same_name,
+                ctype: ColType::Int4,
+                ..empty_plpgsql_local()
+            },
+            TriggerLocalDecl {
+                name: same_name,
+                ctype: ColType::Text,
+                ..empty_plpgsql_local()
+            },
+        ];
+        let selected = plpgsql_variable(
+            &declarations,
+            &[Datum::Int4(7), Datum::Text("body local")],
+            invocation,
+            Some(false),
+            "value",
+        )
+        .unwrap();
+        assert_eq!(selected.value, Datum::Text("body local"));
+        assert_eq!(selected.ctype, ColType::Text);
+        assert_eq!(trigger_local_index(&declarations, same_name).unwrap(), 1);
     });
 }
 

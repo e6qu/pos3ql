@@ -931,9 +931,9 @@ pub(crate) enum InvocationSite {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PendingRoutineInvocation<'a> {
-    pub target: PendingRoutineTarget<'a>,
-    pub arguments: &'a [u8],
+pub(crate) struct PendingRoutineInvocation {
+    pub target: PendingRoutineTarget,
+    arguments: crate::mem::arena::ArenaSliceHandle<u8>,
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
     pub input_collation: super::ast::Collation,
@@ -942,9 +942,55 @@ pub(crate) struct PendingRoutineInvocation<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum PendingRoutineTarget<'a> {
-    Stored(&'a RoutineCallContract<'a>),
+pub(crate) enum PendingRoutineTarget {
+    Stored(crate::mem::arena::ArenaHandle<OwnedRoutineCallContract>),
     Intrinsic(i32),
+}
+
+impl PendingRoutineInvocation {
+    fn capture_arguments(
+        values: &[Datum<'_>],
+        arena: &Arena,
+    ) -> Result<crate::mem::arena::ArenaSliceHandle<u8>, SqlError> {
+        let length = super::exec::projected_row_len(values)?;
+        let handle = arena.retain_slice_with(length, |_| 0u8).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending routine arguments exceed statement memory"
+            )
+        })?;
+        let mut bytes = arena
+            .retained_slice_mut(handle)
+            .map_err(|_| inactive_pending_call())?;
+        super::exec::encode_projected_into(values, &mut bytes)?;
+        Ok(handle)
+    }
+
+    pub(crate) fn arguments<'out>(
+        &self,
+        source: &Arena,
+        destination: &'out Arena,
+    ) -> Result<&'out [u8], SqlError> {
+        let bytes = source
+            .retained_slice_mut(self.arguments)
+            .map_err(|_| inactive_pending_call())?;
+        destination
+            .alloc_slice_copy(&bytes)
+            .map(|bytes| &*bytes)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pending routine arguments exceed execution memory"
+                )
+            })
+    }
+}
+
+pub(super) fn inactive_pending_call() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "pending routine call storage is inactive"
+    )
 }
 
 pub(super) fn require_routine_call_access(
@@ -1018,20 +1064,21 @@ enum RoutineCallResult {
 /// Keep the selected SQL types after values have erased domains and
 /// polymorphic bindings. The body is resolved when execution starts, matching
 /// PostgreSQL when evaluating an input replaces that body's definition.
+type RoutineCallContract<'a> = RoutineSignature<&'a [crate::storage::RoutineArgumentDef]>;
+type OwnedRoutineCallContract =
+    RoutineSignature<crate::mem::arena::ArenaSliceHandle<crate::storage::RoutineArgumentDef>>;
+
 #[derive(Clone, Copy)]
-pub(crate) struct RoutineCallContract<'a> {
+pub(crate) struct RoutineSignature<Arguments> {
     pub oid: i32,
-    arguments: &'a [crate::storage::RoutineArgumentDef],
-    parameters: &'a [crate::storage::RoutineArgumentDef],
+    arguments: Arguments,
+    parameters: Arguments,
     result: RoutineCallResult,
-    result_columns: &'a [crate::storage::RoutineArgumentDef],
+    result_columns: Arguments,
 }
 
-impl<'a> RoutineCallContract<'a> {
-    fn capture(
-        routine: &crate::storage::RoutineDef,
-        arena: &'a Arena,
-    ) -> Result<&'a Self, SqlError> {
+impl OwnedRoutineCallContract {
+    fn capture(routine: &crate::storage::RoutineDef, arena: &Arena) -> Result<Self, SqlError> {
         let full = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1052,18 +1099,17 @@ impl<'a> RoutineCallContract<'a> {
                 ));
             }
         };
-        let captured = Self::copy_signature(
+        Self::copy_signature(
             routine,
             result,
             |values| {
                 arena
-                    .alloc_persistent_slice_with(values.len(), |index| values[index])
-                    .map(|values| &*values)
+                    .retain_slice_with(values.len(), |index| values[index])
                     .map_err(|_| full())
             },
             |parameters| {
                 arena
-                    .alloc_persistent_slice_with(parameters.len(), |index| {
+                    .retain_slice_with(parameters.len(), |index| {
                         let parameter = &parameters[index];
                         crate::storage::RoutineArgumentDef {
                             name: parameter.name,
@@ -1071,26 +1117,44 @@ impl<'a> RoutineCallContract<'a> {
                             user_type: parameter.user_type,
                         }
                     })
-                    .map(|values| &*values)
                     .map_err(|_| full())
             },
-        )?;
-        let retained = arena
-            .alloc_persistent_slice_with(1, |_| captured)
-            .map_err(|_| full())?;
-        Ok(&retained[0])
+        )
     }
 
+    pub(crate) fn bind(
+        &self,
+        routine: &mut crate::storage::RoutineDef,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        let arguments = arena
+            .retained_slice_mut(self.arguments)
+            .map_err(|_| inactive_pending_call())?;
+        let parameters = arena
+            .retained_slice_mut(self.parameters)
+            .map_err(|_| inactive_pending_call())?;
+        let result_columns = arena
+            .retained_slice_mut(self.result_columns)
+            .map_err(|_| inactive_pending_call())?;
+        RoutineCallContract {
+            oid: self.oid,
+            arguments: &arguments,
+            parameters: &parameters,
+            result: self.result,
+            result_columns: &result_columns,
+        }
+        .bind(routine)
+    }
+}
+
+impl<Arguments> RoutineSignature<Arguments> {
     fn copy_signature(
         routine: &crate::storage::RoutineDef,
         result: RoutineCallResult,
-        mut copy: impl FnMut(
-            &[crate::storage::RoutineArgumentDef],
-        ) -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        mut copy: impl FnMut(&[crate::storage::RoutineArgumentDef]) -> Result<Arguments, SqlError>,
         copy_parameters: impl FnOnce(
             &[crate::storage::RoutineParameterDef],
-        )
-            -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        ) -> Result<Arguments, SqlError>,
     ) -> Result<Self, SqlError> {
         Ok(Self {
             oid: crate::storage::routine_oid(routine),
@@ -1100,7 +1164,9 @@ impl<'a> RoutineCallContract<'a> {
             result_columns: copy(&routine.result_columns[..routine.result_column_count])?,
         })
     }
+}
 
+impl RoutineCallContract<'_> {
     pub(crate) fn bind(&self, routine: &mut crate::storage::RoutineDef) -> Result<(), SqlError> {
         if crate::storage::routine_oid(routine) != self.oid
             || routine.argument_count != self.arguments.len()
@@ -1270,7 +1336,7 @@ enum RoutineInvocationResult<'a> {
 pub(crate) struct RoutineInvocationState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
-    pending: Cell<Option<PendingRoutineInvocation<'a>>>,
+    pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     arena: &'a Arena,
     results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
@@ -1436,11 +1502,17 @@ impl<'a> RoutineInvocationState<'a> {
             source_position,
             input_collation,
             access,
-            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
-                routine,
-                statement_arena,
-            )?),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            target: PendingRoutineTarget::Stored(
+                statement_arena
+                    .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending routine type contract exceeds statement memory"
+                        )
+                    })?,
+            ),
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -1478,7 +1550,7 @@ impl<'a> RoutineInvocationState<'a> {
             input_collation: super::ast::Collation::None,
             access: super::eval::RoutineCallAccess::Caller,
             target: PendingRoutineTarget::Intrinsic(oid),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -1487,7 +1559,7 @@ impl<'a> RoutineInvocationState<'a> {
         ))
     }
 
-    pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation<'a>> {
+    pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation> {
         self.pending.replace(None)
     }
 
@@ -1538,11 +1610,17 @@ impl<'a> RoutineInvocationState<'a> {
             source_position: source_position.map(InvocationSite::Expression),
             input_collation,
             access: super::eval::RoutineCallAccess::Caller,
-            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
-                routine,
-                statement_arena,
-            )?),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            target: PendingRoutineTarget::Stored(
+                statement_arena
+                    .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending routine type contract exceeds statement memory"
+                        )
+                    })?,
+            ),
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(

@@ -323,7 +323,9 @@ pub(super) fn start_numeric_loop<'a>(
         status.set_found(false);
         return Ok(Step::complete());
     }
-    let existing = locals.iter().position(|local| local.name == program.target);
+    let existing = locals
+        .iter()
+        .rposition(|local| local.name == program.target);
     let target = existing.unwrap_or(locals.len());
     let count = locals.len() + usize::from(existing.is_none());
     let workspace = status.numeric_frames.take()?;

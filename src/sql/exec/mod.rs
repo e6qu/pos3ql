@@ -21243,40 +21243,17 @@ fn parse_event_trigger_program<'a>(
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::EventTrigger)
 }
 
-fn validate_plpgsql_routine_namespace(
-    program: &TriggerProgram<'_>,
-    parameters: &[RoutineParameterDef],
-) -> Result<(), SqlError> {
+fn validate_plpgsql_parameter_names(parameters: &[RoutineParameterDef]) -> Result<(), SqlError> {
     for (index, parameter) in parameters.iter().enumerate() {
         let name = parameter.name.as_str();
-        if name.is_empty() {
-            continue;
-        }
-        if parameters[..index]
-            .iter()
-            .any(|prior| prior.name == parameter.name)
+        if !name.is_empty()
+            && parameters[..index]
+                .iter()
+                .any(|prior| prior.name == parameter.name)
         {
             return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
                 "parameter name \"{}\" used more than once",
-                name
-            ));
-        }
-        if TriggerExceptionVariable::parse(name).is_some() {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "routine parameter \"{}\" conflicts with a PL/pgSQL diagnostic variable",
-                name
-            ));
-        }
-        if program
-            .locals
-            .iter()
-            .any(|local| local.name == parameter.name)
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_COLUMN,
-                "duplicate declaration of PL/pgSQL variable \"{}\"",
                 name
             ));
         }
@@ -21518,10 +21495,9 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         if parameter.name.as_str().is_empty() {
             continue;
         }
-        if TriggerExceptionVariable::parse(parameter.name.as_str()).is_some()
-            || declarations[..declaration_count]
-                .iter()
-                .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
+        if declarations[..declaration_count]
+            .iter()
+            .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
         {
             return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
@@ -21544,16 +21520,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     }
     let seeded_count = declaration_count;
     for local in program.locals {
-        if declarations[..declaration_count]
-            .iter()
-            .any(|prior| prior.name == local.name)
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_COLUMN,
-                "duplicate declaration of PL/pgSQL variable \"{}\"",
-                local.name.as_str()
-            ));
-        }
         declarations[declaration_count] = *local;
         declaration_count += 1;
     }
@@ -21724,16 +21690,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
         declaration_count += 1;
     }
     for local in program.locals {
-        if declarations[..declaration_count]
-            .iter()
-            .any(|prior| prior.name == local.name)
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_COLUMN,
-                "duplicate declaration of PL/pgSQL variable \"{}\"",
-                local.name.as_str()
-            ));
-        }
         declarations[declaration_count] = *local;
         declaration_count += 1;
     }
@@ -21898,16 +21854,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declaration_count += 1;
     }
     for local in program.locals {
-        if declarations[..declaration_count]
-            .iter()
-            .any(|prior| prior.name == local.name)
-        {
-            return Err(sql_err!(
-                sqlstate::DUPLICATE_COLUMN,
-                "duplicate declaration of PL/pgSQL variable \"{}\"",
-                local.name.as_str()
-            ));
-        }
         declarations[declaration_count] = *local;
         declaration_count += 1;
     }
@@ -22439,7 +22385,8 @@ fn plpgsql_variable<'a>(
     found: Option<bool>,
     name: &str,
 ) -> Option<PlpgsqlVariable<'a>> {
-    let local = locals.iter().position(|local| local.name.as_str() == name);
+    // Parameter slots precede body declarations; the innermost name wins.
+    let local = locals.iter().rposition(|local| local.name.as_str() == name);
     if let Some(variable) = TriggerExceptionVariable::parse(name)
         && let Some(exception) = invocation.exception
         && local.is_none_or(|index| locals[index].scope <= exception.scope)
@@ -22490,7 +22437,7 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     fn local_index(&self, name: &str) -> Option<usize> {
         self.locals
             .iter()
-            .position(|local| local.name.as_str() == name)
+            .rposition(|local| local.name.as_str() == name)
     }
 
     fn cursor_locals(
@@ -26132,7 +26079,7 @@ fn initialize_trigger_locals<'a>(
 fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usize, SqlError> {
     locals
         .iter()
-        .position(|local| local.name == name)
+        .rposition(|local| local.name == name)
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
@@ -27590,14 +27537,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
             let mut targets = [0usize; MAX_COLUMNS];
             for (index, target) in statement.targets.iter().enumerate() {
-                let Some(local) = locals.iter().position(|local| local.name == *target) else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "PL/pgSQL local \"{}\" does not exist",
-                        target.as_str()
-                    ));
-                };
-                targets[index] = local;
+                targets[index] = trigger_local_index(locals, *target)?;
             }
             let query = match transition_relations {
                 Some(relations) => super::query::bind_materialized_relations(
@@ -27746,14 +27686,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         TriggerStatement::DynamicSelectInto(statement) => execute_trigger_statement(|| {
             let mut targets = [0usize; MAX_COLUMNS];
             for (index, target) in statement.targets.iter().enumerate() {
-                let Some(local) = locals.iter().position(|local| local.name == *target) else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "PL/pgSQL local \"{}\" does not exist",
-                        target.as_str()
-                    ));
-                };
-                targets[index] = local;
+                targets[index] = trigger_local_index(locals, *target)?;
             }
             let transition = TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
@@ -36644,17 +36577,8 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::Function
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program = resolve_plpgsql_program_locals(
-                    program,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &has_parameter,
-                )?;
-                validate_plpgsql_routine_namespace(
-                    &program,
-                    &parameters[..routine.arguments.len()],
-                )?;
+                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+                validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
                 let returns_void = matches!(
                     kind,
@@ -36698,13 +36622,7 @@ pub(crate) fn validate_routine_body(
                     PlpgsqlProgramKind::OutputFunction
                 };
                 let program = parse_plpgsql_program(body_text, arena, program_kind)?;
-                let program = resolve_plpgsql_program_locals(
-                    program,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &has_parameter,
-                )?;
+                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
                         .then_some(result_column_count)
@@ -36729,7 +36647,7 @@ pub(crate) fn validate_routine_body(
                         namespace_count += 1;
                     }
                 }
-                validate_plpgsql_routine_namespace(&program, &namespace[..namespace_count])?;
+                validate_plpgsql_parameter_names(&namespace[..namespace_count])?;
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
             } else {
@@ -36795,17 +36713,8 @@ pub(crate) fn validate_routine_body(
                 }
                 let program =
                     parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure)?;
-                let program = resolve_plpgsql_program_locals(
-                    program,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &has_parameter,
-                )?;
-                validate_plpgsql_routine_namespace(
-                    &program,
-                    &parameters[..routine.arguments.len()],
-                )?;
+                resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
+                validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,

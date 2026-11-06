@@ -15575,7 +15575,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn complete_pending_routine<'a>(
         &mut self,
-        pending: query::PendingRoutineInvocation<'a>,
+        pending: query::PendingRoutineInvocation,
         invocations: &query::RoutineInvocationState<'a>,
         arena: &'a Arena,
         txn: &mut TxnState,
@@ -15587,15 +15587,19 @@ impl Engine {
         let outcome = type_input_plans::with_owner(pending.plan_owner, || {
             query::protect_statement_effects();
             let contract = match pending.target {
-                query::PendingRoutineTarget::Stored(contract) => contract,
+                query::PendingRoutineTarget::Stored(handle) => match arena.retained(handle) {
+                    Some(contract) => contract,
+                    None => return Ok(Err(query::inactive_pending_call())),
+                },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
                     let encoded = arena.with_remaining_bytes(|scratch| {
+                        let encoded_arguments = pending.arguments(arena, scratch)?;
                         let arguments = scratch
                             .alloc_slice_with(pending.argument_count, |_| Datum::Null)
                             .map_err(|_| eval::arena_full())?;
                         for (index, argument) in arguments.iter_mut().enumerate() {
                             *argument = exec::decode_projected_col_record(
-                                pending.arguments,
+                                encoded_arguments,
                                 index,
                                 scratch,
                             )?;
@@ -15643,7 +15647,7 @@ impl Engine {
                 )));
             };
             let mut routine = self.storage.routine_for(slot, txn.txid);
-            if let Err(error) = contract.bind(&mut routine) {
+            if let Err(error) = contract.bind(&mut routine, arena) {
                 return Ok(Err(error));
             }
             let track = match guc.track_functions() {
@@ -15677,7 +15681,8 @@ impl Engine {
                 if set_returning {
                     let rows = self
                         .execute_pending_table_routine(
-                            pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                            pending, arena, slot, &routine, scratch, txn, sqlprep, cursors, guc,
+                            responder,
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
@@ -15685,7 +15690,8 @@ impl Engine {
                 } else {
                     let value = self
                         .execute_pending_scalar_routine(
-                            pending, slot, &routine, scratch, txn, sqlprep, cursors, guc, responder,
+                            pending, arena, slot, &routine, scratch, txn, sqlprep, cursors, guc,
+                            responder,
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
@@ -16927,7 +16933,8 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute_pending_scalar_routine<'a>(
         &mut self,
-        pending: query::PendingRoutineInvocation<'a>,
+        pending: query::PendingRoutineInvocation,
+        input_arena: &Arena,
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
@@ -16985,6 +16992,10 @@ impl Engine {
             return Ok(Err(error));
         }
         timezone::set_session(guc.timezone());
+        let encoded_arguments = match pending.arguments(input_arena, arena) {
+            Ok(arguments) => arguments,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if pending.argument_count > arguments.len() {
             return Ok(Err(sql_err!(
@@ -16997,7 +17008,7 @@ impl Engine {
             .enumerate()
             .take(pending.argument_count)
         {
-            *argument = match exec::decode_projected_col_record(pending.arguments, index, arena) {
+            *argument = match exec::decode_projected_col_record(encoded_arguments, index, arena) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
@@ -17116,7 +17127,8 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute_pending_table_routine<'a>(
         &mut self,
-        pending: query::PendingRoutineInvocation<'a>,
+        pending: query::PendingRoutineInvocation,
+        input_arena: &Arena,
         slot: usize,
         routine: &crate::storage::RoutineDef,
         arena: &'a Arena,
@@ -17163,6 +17175,10 @@ impl Engine {
             return Ok(Err(error));
         }
         timezone::set_session(guc.timezone());
+        let encoded_arguments = match pending.arguments(input_arena, arena) {
+            Ok(arguments) => arguments,
+            Err(error) => return Ok(Err(error)),
+        };
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if pending.argument_count > arguments.len() {
@@ -17176,7 +17192,7 @@ impl Engine {
                 .enumerate()
                 .take(pending.argument_count)
             {
-                *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
+                *argument = match exec::decode_projected_col_record(encoded_arguments, index, arena)
                 {
                     Ok(value) => value,
                     Err(error) => return Ok(Err(error)),
@@ -17290,7 +17306,7 @@ impl Engine {
                     .take(pending.argument_count)
                 {
                     *argument =
-                        match exec::decode_projected_col_record(pending.arguments, index, arena) {
+                        match exec::decode_projected_col_record(encoded_arguments, index, arena) {
                             Ok(value) => value,
                             Err(error) => return Ok(Err(error)),
                         };

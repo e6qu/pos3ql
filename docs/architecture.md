@@ -190,6 +190,14 @@ current_setting('application_name') || '.', false))` appends one dot when the
 input finishes across those function handoffs. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+The pending call stores checked handles for its encoded arguments and selected
+argument, parameter and result types. Those handles survive moving the owning
+arena or recycling its temporary front; reset or a different arena rejects
+them with an internal error before reading their bytes. Execution copies the
+encoded arguments into its own temporary memory. That extra live copy counts
+against the existing statement capacity and reports `54000` if it does not fit.
+This owns the call's inputs, while the enclosing invocation log, running body
+and write still need complete ownership across a scheduler return.
 Nested SQL queries, including a `ts_rewrite` rule query, have their own input
 scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested
@@ -243,6 +251,14 @@ targets. Opening a constant cursor with an existing name reads that variable;
 opening a NULL constant fails when a generated name would need assignment.
 The [scope reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-lexical-scopes/README.md)
 records values, types and creation/runtime errors.
+Function and procedure parameters occupy an outer scope. A declaration such as
+`DECLARE value text := 'local'` can shadow an integer parameter named `value`;
+reads and assignments then select the text local. Output parameters retain
+their own slots, so changing a shadowing local does not change the returned
+output. Parameters can also use the names `SQLSTATE` and `SQLERRM`; an error
+handler temporarily introduces its own text variables. The
+[parameter reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-parameter-scopes/README.md)
+checks scalar, set-returning and procedure outputs, types and cursor capture.
 Trigger names and relation/schema names have PostgreSQL type `name`; `TG_RELID`
 is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
 a PostgreSQL trigger variable and raises an undefined-column error.

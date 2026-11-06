@@ -87,8 +87,11 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Finish the saved owners for local values and the enclosing write. Runtime
-local metadata no longer holds initializer-expression references; retain its
+Finish the saved owners for local values and the enclosing write. Pending calls
+now keep arguments and selected type contracts through checked,
+address-independent handles; preserve their stale-owner checks and explicit
+copy into execution memory while completing the other invocation phases.
+Runtime local metadata no longer holds initializer-expression references; retain its
 resolved types and once-only declaration-order initialization. Input parameters
 seed the parameter prefix; unseeded OUT slots start as NULL before declaration
 initializers run. Preserve both scalar and set-returning output contracts. Handler
@@ -107,6 +110,9 @@ identities in expressions, captured cursors and detached write inputs.
 Retain each binding's nesting depth through handler and numeric-loop entry
 and exit. Preserve constant-target checks before body effects and distinguish
 reading an existing cursor name from assigning a generated one.
+Keep parameter, body-local and output slots distinct when their names match;
+unqualified reads and assignments select the innermost binding while returning
+outputs selects their original parameter slots.
 Qualify every reference fixture under unchanged capacities. Native trigger
 audits and live PostgreSQL comparisons use the same SQL file.
 A caught `RETURN QUERY` error keeps its completed

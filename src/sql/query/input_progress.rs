@@ -1017,8 +1017,8 @@ pub(super) fn cast_selection(
     if IN_BODY.with(Cell::get) {
         return select();
     }
-    with_active_routine_invocations(|context| {
-        let Some((invocations, arena)) = context else {
+    with_active_routine_invocations(|active_context| {
+        let Some((invocations, arena)) = active_context else {
             return select();
         };
         invocations.require_arena(arena)?;

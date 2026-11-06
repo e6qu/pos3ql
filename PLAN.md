@@ -87,47 +87,25 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Finish the saved owners for local values and the enclosing write. Pending calls
-now keep arguments and selected type contracts through checked,
-address-independent handles; preserve their stale-owner checks and immutable
-argument views while completing the other invocation phases.
-Completed scalar and row results also own encoded values and effect receipts
-through checked handles. Preserve random-access call positions, empty results,
-nested record types and the old directory when a larger directory cannot fit.
-Capture each result before releasing body scratch and share immutable table
-payloads; keep the original 4 MiB, 4,096-row regression without extra live copies.
-Saved input frames now keep checked handles for values, names, defaults, selected
-types, casts and effect receipts. Preserve their input/call positions, stable
-selection errors and retained-only publication while query scratch borrows the
-parent arena. The invocation registry and its directories now keep checked
-identities and handles without borrowing the arena. Preserve whole-registry
-move/recycle/reset checks and scoped callback access. No active-owner reference
-may escape a callback, and nested callbacks must restore the previous owner,
-including on errors and unwinding.
-Runtime local metadata no longer holds initializer-expression references; retain its
-resolved types and once-only declaration-order initialization. Input parameters
-seed the parameter prefix; unseeded OUT slots start as NULL before declaration
-initializers run. Preserve both scalar and set-returning output contracts. Handler
-diagnostics now use retained, address-independent handles; preserve their
-recycling, generation and reset checks while completing the invocation owner. The indexed control frames still borrow statement memory and
-cannot yet survive returning to the connection scheduler. Keep the bounded
-loop scopes, owned loop/result bytes, actual-width output reservations,
-reusable caught-error buffers and scoped scratch described in the architecture.
-A function that saves the first error message must keep it after later catches
-reuse their handler storage; nested handlers and rethrow retain the outer error.
-Keep handler variables available in rewritten local and NEW-row assignments,
-including variable JSON subscripts. Preserve quoted names and SQL case folding
-for declarations, targets, record fields, cursor names and runtime variables.
-Keep lexical shadowing consistent for values, declared types and domain
-identities in expressions, captured cursors and detached write inputs.
-Retain each binding's nesting depth through handler and numeric-loop entry
-and exit. Preserve constant-target checks before body effects and distinguish
-reading an existing cursor name from assigning a generated one.
-Keep parameter, body-local and output slots distinct when their names match;
-unqualified reads and assignments select the innermost binding while returning
-outputs selects their original parameter slots.
-Qualify every reference fixture under unchanged capacities. Native trigger
-audits and live PostgreSQL comparisons use the same SQL file.
+Finish saving local values, declared types, selected source definitions, control
+positions, output bindings and the enclosing write across scheduler returns.
+Preserve once-only declaration initialization after input/output parameter slots
+are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
+reads and assignments use the innermost binding, while returning outputs uses
+the original output slots. Preserve quoted names and reject constant assignment
+and FETCH targets before effects. Keep named constant cursors readable at OPEN.
+Saved diagnostics must survive later catches, nesting and rethrow. Preserve
+handler variables in rewritten local and NEW-row assignments, including JSON
+subscripts. Keep trigger context types and undefined-name errors compatible.
+
+Retain current input, call, diagnostic and result ownership checks described in
+the [architecture](docs/architecture.md#the-request-path): moved/reset/foreign
+owners, nested callback restoration, original selected types and effect positions,
+empty and wide results, and failure-preserving directory growth. Keep immutable
+argument/result images inside unchanged statement capacity. The 4,096-row set
+result and repeated-loop tests must pass with the original 4 MiB arena.
+Qualify every reference fixture in both transaction modes. Native trigger audits
+and live PostgreSQL comparisons must use the same SQL file.
 A caught `RETURN QUERY` error keeps its completed
 result prefix; a private wait must not publish that prefix twice.
 Preserve PostgreSQL's different row-consumption rules for static `SELECT INTO`
@@ -209,8 +187,7 @@ in the [performance guide](docs/performance.md). Keep controller state within
 startup budgets and prove capacity conservation, no runtime heap growth and safe
 release after errors.
 Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
-compare future measurements at identical explicit capacities. Add populated
-multi-session and pinned-reader measurements before claiming an embedded minimum.
+compare future measurements at identical explicit capacities.
 
 ### Adapt batching, admission and future layout to the workload
 

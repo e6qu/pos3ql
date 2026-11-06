@@ -17960,7 +17960,9 @@ struct OutputBinding<'a> {
 /// Per-function state, separate from locals and transaction state.
 struct TriggerExecutionStatus<'a> {
     numeric_frames: NumericLoopFrames<'a>,
-    control_frames: Option<ControlFrames<'a>>,
+    control_frames: Option<ControlFrames>,
+    control_resources:
+        Option<crate::mem::arena::OwnedArenaSlice<'a, control_flow::FrameResource<'a>>>,
     found: Option<bool>,
     row_count: i64,
     set_result: Option<PlpgsqlSetResult>,
@@ -17974,10 +17976,12 @@ impl<'a> TriggerExecutionStatus<'a> {
         locals: &[TriggerLocalDecl],
         output_count: usize,
     ) -> Result<Self, SqlError> {
-        let control_frames = ControlFrames::new(arena, program.layout(), arena)?;
+        let mut control_frames = ControlFrames::new(arena, program.layout(), arena)?;
+        let control_resources = control_frames.reserve_resources(arena)?;
         Ok(Self {
             numeric_frames: NumericLoopFrames::new(arena, program.root(), locals)?,
             control_frames: Some(control_frames),
+            control_resources: Some(control_resources),
             found: Some(false),
             row_count: 0,
             set_result: None,
@@ -25869,6 +25873,7 @@ fn execute_plpgsql_dynamic_explain(
     })
 }
 
+#[derive(Clone, Copy)]
 struct TriggerSubtransaction {
     index: usize,
     identity: crate::storage::SessionIdentity,
@@ -26782,7 +26787,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<&diagnostics::CaughtDiagnostic>,
-) -> Result<control_flow::Step<'a>, SqlError> {
+) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     super::query::check_timeout()?;
     let (statement, input_plan) = {
         let transition = TriggerTransition {
@@ -29267,7 +29272,7 @@ fn cursor_effect_result(output: &[Datum<'_>]) -> Result<(), SqlError> {
 #[inline(never)]
 fn execute_trigger_statement<'a>(
     execute: impl FnOnce() -> Result<Option<TriggerFlow<'a>>, SqlError>,
-) -> Result<control_flow::Step<'a>, SqlError> {
+) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     execute().map(control_flow::Step::Complete)
 }
 

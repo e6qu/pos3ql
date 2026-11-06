@@ -124,7 +124,7 @@ impl<'a> CompiledProgram<'a> {
         self.blocks[index.0]
     }
 
-    pub(super) fn index(&self, block: TriggerBlock<'a>) -> BlockIndex {
+    pub(super) fn index(&self, block: TriggerBlock<'_>) -> BlockIndex {
         BlockIndex(
             self.blocks
                 .iter()

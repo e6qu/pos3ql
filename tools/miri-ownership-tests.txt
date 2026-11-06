@@ -239,3 +239,5 @@ sql::query::invocation_results::ownership_tests::callback_result_copies_remain_r
 mem::arena::retained_slice::tests::retained_region_transfers_move_overlapping_payload_before_initializing_headers
 mem::arena::retained_slice::tests::retained_region_transfers_publish_into_borrowed_parents_without_pinning_body_scratch
 sql::exec::control_flow::ownership_tests::frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images
+sql::exec::control_flow::ownership_tests::active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced
+sql::exec::control_flow::ownership_tests::row_loop_resources_release_once_on_pop_and_owner_drop

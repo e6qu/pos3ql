@@ -2,37 +2,37 @@
 
 use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
 use super::*;
-use crate::mem::arena::OwnedArenaSlice;
+use crate::mem::arena::{ArenaSliceHandle, ArenaSliceMut, OwnedArenaSlice};
 
 mod program;
 use numeric_loops::NumericLoopWorkspace;
 use program::ProgramLayout;
 pub(super) use program::{CompiledProgram, ProgramSource};
 
-pub(super) enum Step<'a> {
-    Complete(Option<TriggerFlow<'a>>),
-    Enter(FrameEntry<'a>),
+pub(super) enum Step<'syntax, 'values> {
+    Complete(Option<TriggerFlow<'values>>),
+    Enter(FrameEntry<'syntax, 'values>),
 }
 
-impl<'a> Step<'a> {
+impl<'syntax, 'values> Step<'syntax, 'values> {
     pub(super) fn complete() -> Self {
         Self::Complete(None)
     }
 
-    pub(super) fn branch(block: TriggerBlock<'a>) -> Self {
+    pub(super) fn branch(block: TriggerBlock<'syntax>) -> Self {
         Self::Enter(FrameEntry::new(block, Continuation::Once))
     }
 
-    pub(super) fn while_loop(program: TriggerWhile<'a>) -> Self {
+    pub(super) fn while_loop(program: TriggerWhile<'syntax>) -> Self {
         Self::Enter(FrameEntry::new(program.block, Continuation::While))
     }
 
-    pub(super) fn plain_loop(block: TriggerBlock<'a>) -> Self {
+    pub(super) fn plain_loop(block: TriggerBlock<'syntax>) -> Self {
         Self::Enter(FrameEntry::new(block, Continuation::Loop))
     }
 
     pub(super) fn protected(
-        program: TriggerException<'a>,
+        program: TriggerException<'syntax>,
         boundary: TriggerSubtransaction,
     ) -> Self {
         Self::Enter(FrameEntry::new(
@@ -45,16 +45,18 @@ impl<'a> Step<'a> {
     }
 }
 
-pub(super) struct FrameEntry<'a> {
-    block: TriggerBlock<'a>,
-    continuation: Continuation<'a>,
+pub(super) struct FrameEntry<'syntax, 'values> {
+    block: TriggerBlock<'syntax>,
+    continuation: Continuation,
+    resource: FrameResource<'values>,
 }
 
-impl<'a> FrameEntry<'a> {
-    fn new(block: TriggerBlock<'a>, continuation: Continuation<'a>) -> Self {
+impl<'syntax, 'values> FrameEntry<'syntax, 'values> {
+    fn new(block: TriggerBlock<'syntax>, continuation: Continuation) -> Self {
         Self {
             block,
             continuation,
+            resource: FrameResource::Empty,
         }
     }
 }
@@ -75,14 +77,16 @@ enum FrameSource {
     Statement(StatementIndex),
 }
 
-struct Frame<'a> {
+#[derive(Clone, Copy)]
+struct Frame<Resource> {
     block: BlockIndex,
     next: usize,
     source: FrameSource,
-    continuation: Continuation<'a>,
+    continuation: Continuation,
+    resource: Resource,
 }
 
-impl Frame<'_> {
+impl<Resource> Frame<Resource> {
     fn is_loop(&self) -> bool {
         matches!(
             self.continuation,
@@ -94,25 +98,33 @@ impl Frame<'_> {
     }
 }
 
-struct NumericLoop<'a> {
-    workspace: NumericLoopWorkspace<'a>,
+#[derive(Clone, Copy)]
+struct NumericLoop {
     count: usize,
     target: usize,
-    prior_target: Datum<'a>,
     value: i32,
     upper: i32,
     step: i32,
     reverse: bool,
 }
 
-enum Continuation<'a> {
+pub(super) enum FrameResource<'a> {
+    Empty,
+    Numeric {
+        workspace: NumericLoopWorkspace<'a>,
+        prior_target: Datum<'a>,
+    },
+    Rows(super::loop_rows::LoopRows),
+}
+
+#[derive(Clone, Copy)]
+enum Continuation {
     Once,
     While,
     Loop,
-    Numeric(NumericLoop<'a>),
+    Numeric(NumericLoop),
     Rows {
         target: SqlName,
-        values: super::loop_rows::LoopRows,
         index: usize,
     },
     Protected {
@@ -125,16 +137,17 @@ enum Continuation<'a> {
 /// The lexical maximum is reserved before local initializers can have effects.
 /// A frame owns its next statement and loop/handler state; entering a child does
 /// not keep another Rust interpreter invocation on the call stack.
-pub(super) struct ControlFrames<'a> {
+pub(super) struct ControlFrames {
     source: ProgramSource,
-    slots: OwnedArenaSlice<'a, Option<Frame<'a>>>,
+    slots: ArenaSliceHandle<Option<Frame<()>>>,
     active: usize,
     diagnostics: DiagnosticBuffers,
+    resource_identity: Option<usize>,
 }
 
-impl<'a> ControlFrames<'a> {
+impl ControlFrames {
     pub(super) fn new(
-        arena: &'a Arena,
+        arena: &Arena,
         layout: ProgramLayout,
         source: &Arena,
     ) -> Result<Self, SqlError> {
@@ -142,10 +155,11 @@ impl<'a> ControlFrames<'a> {
         Ok(Self {
             source: layout.source,
             slots: arena
-                .alloc_owned_slice_with(layout.depth, |_| None)
+                .retain_slice_with(layout.depth, |_| None)
                 .map_err(|_| frame_full())?,
             active: 0,
             diagnostics: DiagnosticBuffers::new(arena, layout.handlers)?,
+            resource_identity: None,
         })
     }
 
@@ -156,42 +170,81 @@ impl<'a> ControlFrames<'a> {
         source.require(arena)
     }
 
-    fn execution<'scope>(
+    pub(super) fn reserve_resources<'a>(
+        &mut self,
+        arena: &'a Arena,
+    ) -> Result<OwnedArenaSlice<'a, FrameResource<'a>>, SqlError> {
+        if self.resource_identity.is_some() {
+            return Err(program::changed());
+        }
+        let count = arena
+            .retained_slice_mut(self.slots)
+            .map_err(|_| program::changed())?
+            .len();
+        let resources = arena
+            .alloc_owned_slice_with(count, |_| FrameResource::Empty)
+            .map_err(|_| frame_full())?;
+        // This address identifies a nonempty, uniquely reserved tail directory;
+        // it is never dereferenced. Reset also invalidates the checked slots.
+        self.resource_identity = Some(resources.as_ptr() as usize);
+        Ok(resources)
+    }
+
+    fn execution<'scope, 'syntax, 'values>(
         &'scope mut self,
-        arena: &Arena,
-        program: CompiledProgram<'a>,
-    ) -> Result<FrameExecution<'scope, 'a>, SqlError> {
-        self.require_source(arena, program.source())?;
+        source: &Arena,
+        workspace: &'scope Arena,
+        program: CompiledProgram<'syntax>,
+        resources: &'scope mut [FrameResource<'values>],
+    ) -> Result<FrameExecution<'scope, 'syntax, 'values>, SqlError> {
+        self.require_source(source, program.source())?;
+        if self.resource_identity != Some(resources.as_ptr() as usize) {
+            return Err(program::changed());
+        }
+        let slots = workspace
+            .retained_slice_mut(self.slots)
+            .map_err(|_| program::changed())?;
+        assert_eq!(slots.len(), resources.len(), "procedural resource capacity");
         Ok(FrameExecution {
             state: self,
             program,
+            slots,
+            resources,
         })
     }
 }
 
-struct FrameExecution<'scope, 'a> {
-    state: &'scope mut ControlFrames<'a>,
-    program: CompiledProgram<'a>,
+struct FrameExecution<'scope, 'syntax, 'values> {
+    state: &'scope mut ControlFrames,
+    program: CompiledProgram<'syntax>,
+    slots: ArenaSliceMut<'scope, Option<Frame<()>>>,
+    resources: &'scope mut [FrameResource<'values>],
 }
 
-impl<'a> FrameExecution<'_, 'a> {
-    fn push(&mut self, entry: FrameEntry<'a>, source: FrameSource) {
+impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
+    fn push(&mut self, entry: FrameEntry<'_, 'a>, source: FrameSource) {
         // Each active frame corresponds to one lexical edge in layout().
         assert!(
-            self.state.active < self.state.slots.len(),
+            self.state.active < self.slots.len(),
             "procedural lexical frame capacity"
         );
-        assert!(self.state.slots[self.state.active].is_none());
-        self.state.slots[self.state.active] = Some(Frame {
+        assert!(self.slots[self.state.active].is_none());
+        assert!(matches!(
+            self.resources[self.state.active],
+            FrameResource::Empty
+        ));
+        self.resources[self.state.active] = entry.resource;
+        self.slots[self.state.active] = Some(Frame {
             block: self.program.index(entry.block),
             next: 0,
             source,
             continuation: entry.continuation,
+            resource: (),
         });
         self.state.active += 1;
     }
 
-    fn start(&mut self, block: TriggerBlock<'a>) {
+    fn start(&mut self, block: TriggerBlock<'_>) {
         assert_eq!(self.state.active, 0);
         self.push(
             FrameEntry::new(block, Continuation::Once),
@@ -199,7 +252,7 @@ impl<'a> FrameExecution<'_, 'a> {
         );
     }
 
-    fn enter(&mut self, entry: FrameEntry<'a>) {
+    fn enter(&mut self, entry: FrameEntry<'_, 'a>) {
         let parent = self.last_mut();
         let source = FrameSource::Statement(StatementIndex {
             block: parent.block,
@@ -209,28 +262,38 @@ impl<'a> FrameExecution<'_, 'a> {
         self.push(entry, source);
     }
 
-    fn source_statement(&self, source: FrameSource) -> TriggerStatement<'a> {
+    fn source_statement(&self, source: FrameSource) -> TriggerStatement<'syntax> {
         let FrameSource::Statement(source) = source else {
             unreachable!("frame has no enclosing statement")
         };
         self.program.block(source.block).statements[source.statement]
     }
 
-    fn pop(&mut self) -> Frame<'a> {
+    fn pop(&mut self) -> Frame<FrameResource<'a>> {
         self.state.active -= 1;
-        self.state.slots[self.state.active]
+        let position = self.slots[self.state.active]
             .take()
-            .expect("active procedural frame")
+            .expect("active procedural frame");
+        Frame {
+            block: position.block,
+            next: position.next,
+            source: position.source,
+            continuation: position.continuation,
+            resource: core::mem::replace(
+                &mut self.resources[self.state.active],
+                FrameResource::Empty,
+            ),
+        }
     }
 
-    fn last(&self) -> &Frame<'a> {
-        self.state.slots[self.state.active - 1]
+    fn last(&self) -> &Frame<()> {
+        self.slots[self.state.active - 1]
             .as_ref()
             .expect("active procedural frame")
     }
 
-    fn last_mut(&mut self) -> &mut Frame<'a> {
-        self.state.slots[self.state.active - 1]
+    fn last_mut(&mut self) -> &mut Frame<()> {
+        self.slots[self.state.active - 1]
             .as_mut()
             .expect("active procedural frame")
     }
@@ -240,15 +303,22 @@ impl<'a> FrameExecution<'_, 'a> {
         locals: &'s [TriggerLocalDecl],
         values: &'s mut [Datum<'a>],
     ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
-        for frame in self.state.slots[..self.state.active]
-            .iter_mut()
+        for (frame, resource) in self.slots[..self.state.active]
+            .iter()
+            .zip(&mut self.resources[..self.state.active])
             .rev()
-            .flatten()
         {
-            if let Continuation::Numeric(scope) = &mut frame.continuation {
+            if let Some(Frame {
+                continuation: Continuation::Numeric(scope),
+                ..
+            }) = frame
+            {
+                let FrameResource::Numeric { workspace, .. } = resource else {
+                    unreachable!("numeric frame resource")
+                };
                 return (
-                    &scope.workspace.locals[..scope.count],
-                    &mut scope.workspace.values[..scope.count],
+                    &workspace.locals[..scope.count],
+                    &mut workspace.values[..scope.count],
                 );
             }
         }
@@ -256,7 +326,7 @@ impl<'a> FrameExecution<'_, 'a> {
     }
 
     fn diagnostic(&self) -> Option<(CaughtDiagnostic, PlpgsqlScope)> {
-        self.state.slots[..self.state.active]
+        self.slots[..self.state.active]
             .iter()
             .enumerate()
             .rev()
@@ -270,7 +340,7 @@ impl<'a> FrameExecution<'_, 'a> {
     fn finish(
         &mut self,
         arena: &Arena,
-        frame: Frame<'a>,
+        frame: Frame<FrameResource<'a>>,
         locals: &[TriggerLocalDecl],
         values: &mut [Datum<'a>],
         status: &mut TriggerExecutionStatus<'a>,
@@ -278,11 +348,18 @@ impl<'a> FrameExecution<'_, 'a> {
     ) {
         match frame.continuation {
             Continuation::Numeric(scope) => {
+                let FrameResource::Numeric {
+                    workspace,
+                    prior_target,
+                } = frame.resource
+                else {
+                    unreachable!("numeric frame resource")
+                };
                 let (_, parent_values) = self.scope(locals, values);
-                scope.workspace.values[scope.target] = scope.prior_target;
-                parent_values.copy_from_slice(&scope.workspace.values[..parent_values.len()]);
+                workspace.values[scope.target] = prior_target;
+                parent_values.copy_from_slice(&workspace.values[..parent_values.len()]);
                 status.unshadow_output_local(scope.target);
-                status.numeric_frames.restore(scope.workspace);
+                status.numeric_frames.restore(workspace);
                 if success {
                     status.set_found(true);
                 }
@@ -305,8 +382,8 @@ fn frame_full() -> SqlError {
     clippy::too_many_arguments,
     reason = "numeric entry binds its evaluated range and lexical scope once"
 )]
-pub(super) fn start_numeric_loop<'a>(
-    program: TriggerFor<'a>,
+pub(super) fn start_numeric_loop<'syntax, 'a>(
+    program: TriggerFor<'syntax>,
     lower: i32,
     upper: i32,
     step: i32,
@@ -315,7 +392,7 @@ pub(super) fn start_numeric_loop<'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
-) -> Result<Step<'a>, SqlError> {
+) -> Result<Step<'syntax, 'a>, SqlError> {
     if if reverse {
         lower < upper
     } else {
@@ -354,35 +431,37 @@ pub(super) fn start_numeric_loop<'a>(
         return Err(error);
     }
     workspace.values[target] = Datum::Int4(lower);
-    Ok(Step::Enter(FrameEntry::new(
-        program.block,
-        Continuation::Numeric(NumericLoop {
-            workspace,
+    Ok(Step::Enter(FrameEntry {
+        block: program.block,
+        continuation: Continuation::Numeric(NumericLoop {
             count,
             target,
-            prior_target,
             value: lower,
             upper,
             step,
             reverse,
         }),
-    )))
+        resource: FrameResource::Numeric {
+            workspace,
+            prior_target,
+        },
+    }))
 }
 
 #[expect(
     clippy::too_many_arguments,
     reason = "row loop entry preserves source cardinality and its complete local scope"
 )]
-pub(super) fn start_row_loop<'a>(
+pub(super) fn start_row_loop<'syntax, 'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    program: TriggerFor<'a>,
+    program: TriggerFor<'syntax>,
     target: usize,
     rows: super::loop_rows::LoopRows,
     query_source: bool,
     locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
-) -> Result<Step<'a>, SqlError> {
+) -> Result<Step<'syntax, 'a>, SqlError> {
     if rows.is_empty() {
         let empty = query_source
             .then(|| rows.empty_query_row(context.arena))
@@ -398,14 +477,14 @@ pub(super) fn start_row_loop<'a>(
     let value = rows.value(0, context.arena)?;
     assign_trigger_local(context, locals, values, program.target, value)?;
     status.assign_output_local(target, values[target]);
-    Ok(Step::Enter(FrameEntry::new(
-        program.block,
-        Continuation::Rows {
+    Ok(Step::Enter(FrameEntry {
+        block: program.block,
+        continuation: Continuation::Rows {
             target: program.target,
-            values: rows,
             index: 0,
         },
-    )))
+        resource: FrameResource::Rows(rows),
+    }))
 }
 
 #[expect(
@@ -429,7 +508,11 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         .control_frames
         .take()
         .expect("one procedural frame owner");
-    let mut frames = retained.execution(context.arena, program)?;
+    let mut resources = status
+        .control_resources
+        .take()
+        .expect("one procedural resource owner");
+    let mut frames = retained.execution(context.arena, context.arena, program, &mut resources)?;
     assert_eq!(frames.state.active, 0);
     frames.start(program.root());
     let mut outcome = Ok(None);
@@ -523,18 +606,24 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                             unreachable!()
                         };
                         range.value = next;
-                        range.workspace.values[range.target] = Datum::Int4(next);
+                        let target = range.target;
                         frame.next = 0;
+                        let FrameResource::Numeric { workspace, .. } =
+                            &mut frames.resources[frames.state.active - 1]
+                        else {
+                            unreachable!("numeric frame resource")
+                        };
+                        workspace.values[target] = Datum::Int4(next);
                     } else {
                         let frame = frames.pop();
                         frames.finish(context.arena, frame, locals, values, status, true);
                     }
                 }
-                Continuation::Rows {
-                    target,
-                    values: ref rows,
-                    index,
-                } => {
+                Continuation::Rows { target, index } => {
+                    let FrameResource::Rows(rows) = &frames.resources[frames.state.active - 1]
+                    else {
+                        unreachable!("row frame resource")
+                    };
                     if index + 1 < rows.len() {
                         let value = rows.value(index + 1, context.arena)?;
                         let (scope, scope_values) = frames.scope(locals, values);
@@ -667,7 +756,9 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         let frame = frames.pop();
         frames.finish(context.arena, frame, locals, values, status, false);
     }
+    drop(frames);
     status.control_frames = Some(retained);
+    status.control_resources = Some(resources);
     outcome
 }
 

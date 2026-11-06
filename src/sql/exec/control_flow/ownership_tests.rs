@@ -37,9 +37,19 @@ fn lexical_frame_capacity_covers_every_branch_and_fails_before_execution() {
             parse_owned_program(source, &parse, &arena, PlpgsqlProgramKind::Anonymous).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let frames = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
-            assert_eq!(frames.slots.len(), depth, "{source}");
+            assert_eq!(
+                arena.retained_slice_mut(frames.slots).unwrap().len(),
+                depth,
+                "{source}"
+            );
             assert_eq!(frames.active, 0);
-            assert!(frames.slots.iter().all(Option::is_none));
+            assert!(
+                arena
+                    .retained_slice_mut(frames.slots)
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none)
+            );
         });
     }
     let small = Arena::new(&mut budget, "procedural exhausted positions", 1).unwrap();
@@ -92,7 +102,10 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     crate::mem::guard::forbid_alloc(|| {
         let mut status = TriggerExecutionStatus::new(&arena, code, &locals, 0).unwrap();
         let mut retained = status.control_frames.take().unwrap();
-        let mut frames = retained.execution(&arena, code).unwrap();
+        let mut resources = status.control_resources.take().unwrap();
+        let mut frames = retained
+            .execution(&arena, &arena, code, &mut resources)
+            .unwrap();
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
             frames.start(program.body);
@@ -146,7 +159,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
-            assert!(frames.state.slots.iter().all(Option::is_none));
+            assert!(frames.slots.iter().all(Option::is_none));
             let workspace = status.numeric_frames.take().unwrap();
             assert!(
                 workspace
@@ -157,8 +170,236 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }
+        drop(frames);
         status.control_frames = Some(retained);
+        status.control_resources = Some(resources);
     });
+}
+
+#[test]
+fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced() {
+    const SOURCE: &str = "BEGIN FOR x IN 1..3 LOOP WHILE true LOOP NULL; END LOOP; END LOOP; END";
+    let mut budget = Budget::new(256 << 10);
+    let original = Arena::new(&mut budget, "active procedural source", 64 << 10).unwrap();
+    let mut parsing = Arena::new(&mut budget, "active procedural syntax", 64 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "active procedural values", 64 << 10).unwrap();
+    let foreign = Arena::new(&mut budget, "foreign procedural positions", 64 << 10).unwrap();
+    let locals = [
+        TriggerLocalDecl {
+            name: SqlName::parse("x").unwrap(),
+            ctype: ColType::Text,
+            ..empty_plpgsql_local()
+        },
+        TriggerLocalDecl {
+            name: SqlName::parse("n").unwrap(),
+            ctype: ColType::Text,
+            ..empty_plpgsql_local()
+        },
+    ];
+    let source = ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Anonymous, &original).unwrap();
+    let (mut status, retained, mut resources, mut values) = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = source.parse(&original, &parsing).unwrap();
+        let mut status = TriggerExecutionStatus::new(&workspace, code, &locals, 0).unwrap();
+        let mut retained = status.control_frames.take().unwrap();
+        let mut resources = status.control_resources.take().unwrap();
+        assert_eq!(
+            retained
+                .reserve_resources(&workspace)
+                .err()
+                .unwrap()
+                .sqlstate,
+            "40001"
+        );
+        let mut values = [Datum::Text("outside counter"), Datum::Text("before")];
+        {
+            let mut frames = retained
+                .execution(&original, &workspace, code, &mut resources)
+                .unwrap();
+            frames.start(program.body);
+            let TriggerStatement::For(program) = program.body.statements[0] else {
+                panic!("numeric loop")
+            };
+            let Step::Enter(entry) = start_numeric_loop(
+                program,
+                1,
+                3,
+                1,
+                false,
+                PlpgsqlScope::frame(2),
+                &locals,
+                &values,
+                &mut status,
+            )
+            .unwrap() else {
+                panic!("numeric loop entry")
+            };
+            frames.enter(entry);
+            let (_, current) = frames.scope(&locals, &mut values);
+            current[1] = Datum::Text(workspace.alloc_str("changed once before waiting").unwrap());
+            let TriggerStatement::While(program) = program.block.statements[0] else {
+                panic!("while loop")
+            };
+            frames.enter(FrameEntry::new(program.block, Continuation::While));
+            frames.last_mut().next = 1;
+            assert_eq!(frames.state.active, 3);
+            assert!(matches!(
+                workspace.retained_slice_mut(frames.state.slots),
+                Err(crate::mem::arena::ArenaSliceError::Borrowed)
+            ));
+        }
+        (status, retained, resources, values)
+    });
+    // No syntax reference remains in either the control stack or loop values.
+    parsing.reset();
+    let mut moved_source = original;
+    let mut moved = retained;
+    crate::mem::guard::forbid_alloc(|| {
+        moved_source.recycle_front();
+        parsing.alloc_slice_with(1024, |_| 0xffu8).unwrap();
+        let (_, code) = source.parse(&moved_source, &parsing).unwrap();
+        assert_eq!(
+            moved
+                .execution(&moved_source, &foreign, code, &mut resources)
+                .err()
+                .unwrap()
+                .sqlstate,
+            "40001"
+        );
+        let mut replacement_resources = workspace
+            .alloc_owned_slice_with(resources.len(), |_| FrameResource::Empty)
+            .unwrap();
+        assert_eq!(
+            moved
+                .execution(&moved_source, &workspace, code, &mut replacement_resources)
+                .err()
+                .unwrap()
+                .sqlstate,
+            "40001"
+        );
+        let mut frames = moved
+            .execution(&moved_source, &workspace, code, &mut resources)
+            .unwrap();
+        assert_eq!(frames.state.active, 3);
+        assert_eq!(frames.last().next, 1);
+        let TriggerStatement::While(program) = frames.source_statement(frames.last().source) else {
+            panic!("rebuilt while loop")
+        };
+        assert!(matches!(program.condition, Expr::Bool(true)));
+        let (_, current) = frames.scope(&locals, &mut values);
+        assert_eq!(
+            current,
+            &[Datum::Int4(1), Datum::Text("changed once before waiting")]
+        );
+        let child = frames.pop();
+        frames.finish(&workspace, child, &locals, &mut values, &mut status, true);
+        assert!(matches!(
+            frames.last().continuation,
+            Continuation::Numeric(NumericLoop {
+                value: 1,
+                upper: 3,
+                step: 1,
+                reverse: false,
+                ..
+            })
+        ));
+        let numeric = frames.pop();
+        frames.finish(&workspace, numeric, &locals, &mut values, &mut status, true);
+        assert_eq!(
+            values,
+            [
+                Datum::Text("outside counter"),
+                Datum::Text("changed once before waiting")
+            ]
+        );
+        let root = frames.pop();
+        frames.finish(&workspace, root, &locals, &mut values, &mut status, true);
+        assert!(frames.slots.iter().all(Option::is_none));
+        assert!(
+            frames
+                .resources
+                .iter()
+                .all(|resource| matches!(resource, FrameResource::Empty))
+        );
+    });
+    // Resetting the metadata owner rejects the handle even while source lives.
+    let mut owner_budget = Budget::new(8192);
+    let mut owner = Arena::new(&mut owner_budget, "reset procedural metadata", 8192).unwrap();
+    let (_, code) = source.parse(&moved_source, &parsing).unwrap();
+    let mut reset = ControlFrames::new(&owner, code.layout(), &moved_source).unwrap();
+    let mut reset_resources = reset.reserve_resources(&owner).unwrap();
+    reset
+        .execution(&moved_source, &owner, code, &mut reset_resources)
+        .unwrap();
+    drop(reset_resources);
+    owner.reset();
+    assert!(matches!(
+        owner.retained_slice_mut(reset.slots),
+        Err(crate::mem::arena::ArenaSliceError::Stale)
+    ));
+    // Preserve the unique paired owners just as normal execution does.
+    status.control_frames = Some(moved);
+    status.control_resources = Some(resources);
+}
+
+#[test]
+fn row_loop_resources_release_once_on_pop_and_owner_drop() {
+    use crate::mem::lease_pool::Purpose;
+
+    let mut budget = Budget::new(128 << 10);
+    let source = Arena::new(&mut budget, "row position source", 32 << 10).unwrap();
+    let parsing = Arena::new(&mut budget, "row position syntax", 32 << 10).unwrap();
+    let mut workspace = Arena::new(&mut budget, "row position resources", 32 << 10).unwrap();
+    let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, 4096, 4).unwrap();
+    let (program, code) = parse_owned_program(
+        "BEGIN LOOP NULL; END LOOP; END",
+        &parsing,
+        &source,
+        PlpgsqlProgramKind::Anonymous,
+    )
+    .unwrap();
+    let TriggerStatement::Loop(block) = program.body.statements[0] else {
+        panic!("loop body")
+    };
+    for pop in [true, false] {
+        workspace.reset();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut retained = ControlFrames::new(&workspace, code.layout(), &source).unwrap();
+            let mut resources = retained.reserve_resources(&workspace).unwrap();
+            {
+                let mut frames = retained
+                    .execution(&source, &workspace, code, &mut resources)
+                    .unwrap();
+                frames.start(program.body);
+                let rows = super::super::loop_rows::LoopRows::capture(
+                    &pool,
+                    TriggerForRows {
+                        values: &[Datum::Text("owned row")],
+                        empty: Datum::Null,
+                    },
+                )
+                .unwrap();
+                frames.enter(FrameEntry {
+                    block,
+                    continuation: Continuation::Rows {
+                        target: SqlName::parse("x").unwrap(),
+                        index: 0,
+                    },
+                    resource: FrameResource::Rows(rows),
+                });
+                assert!(pool.lease::<u8>(4096).is_err());
+                if pop {
+                    let exited = frames.pop();
+                    assert!(matches!(frames.resources[1], FrameResource::Empty));
+                    assert!(pool.lease::<u8>(4096).is_err());
+                    drop(exited);
+                    assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+                    frames.pop();
+                }
+            }
+            drop(resources);
+            assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+        });
+    }
 }
 
 #[test]
@@ -182,7 +423,10 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
     };
     crate::mem::guard::forbid_alloc(|| {
         let mut retained = ControlFrames::new(&arena, code.layout(), &arena).unwrap();
-        let mut frames = retained.execution(&arena, code).unwrap();
+        let mut resources = retained.reserve_resources(&arena).unwrap();
+        let mut frames = retained
+            .execution(&arena, &arena, code, &mut resources)
+            .unwrap();
         frames.start(program.body);
         frames.last_mut().next = 1;
         let error = sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero");
@@ -224,7 +468,7 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
-        assert!(frames.state.slots.iter().all(Option::is_none));
+        assert!(frames.slots.iter().all(Option::is_none));
     });
 }
 
@@ -235,8 +479,8 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     let original = Arena::new(&mut budget, "owned procedural source", 1 << 16).unwrap();
     let mut parsing = Arena::new(&mut budget, "recycled procedural syntax", 1 << 16).unwrap();
     let workspace = Arena::new(&mut budget, "procedural positions", 1 << 16).unwrap();
-    let replacement = Arena::new(&mut budget, "replacement procedural source", 1 << 16).unwrap();
-    let replacement_parsing = Arena::new(&mut budget, "replacement syntax", 1 << 16).unwrap();
+    let replacement = Arena::new(&mut budget, "replacement procedural source", 1 << 14).unwrap();
+    let replacement_parsing = Arena::new(&mut budget, "replacement syntax", 1 << 14).unwrap();
     let source = crate::mem::guard::forbid_alloc(|| {
         let text = parsing.alloc_str(SOURCE).unwrap();
         ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &original).unwrap()
@@ -245,7 +489,10 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     let saved = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&original, &parsing).unwrap();
         let mut retained = ControlFrames::new(&workspace, code.layout(), &original).unwrap();
-        let mut frames = retained.execution(&original, code).unwrap();
+        let mut resources = retained.reserve_resources(&workspace).unwrap();
+        let mut frames = retained
+            .execution(&original, &workspace, code, &mut resources)
+            .unwrap();
         let TriggerStatement::While(while_program) = program.body.statements[0] else {
             panic!("while program")
         };
@@ -272,17 +519,26 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
         .unwrap();
         let (_, new_code) = replaced.parse(&replacement, &replacement_parsing).unwrap();
         let mut retained = ControlFrames::new(&workspace, saved.0, &moved).unwrap();
+        let mut resources = retained.reserve_resources(&workspace).unwrap();
         assert_eq!(
             retained
-                .execution(&replacement, new_code)
+                .execution(&replacement, &workspace, new_code, &mut resources)
                 .err()
                 .unwrap()
                 .sqlstate,
             "40001"
         );
         assert_eq!(retained.active, 0);
-        assert!(retained.slots.iter().all(Option::is_none));
-        let frames = retained.execution(&moved, code).unwrap();
+        assert!(
+            workspace
+                .retained_slice_mut(retained.slots)
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        let frames = retained
+            .execution(&moved, &workspace, code, &mut resources)
+            .unwrap();
         assert_eq!(saved.2, frames.program.block(saved.1).statements.len());
         assert!(matches!(
             frames.program.block(saved.1).statements[0],
@@ -348,7 +604,13 @@ fn frame_layouts_outlive_syntax_and_reject_foreign_or_reset_source_images() {
             "40001"
         );
         assert_eq!(retained.active, 0);
-        assert!(retained.slots.iter().all(Option::is_none));
+        assert!(
+            workspace
+                .retained_slice_mut(retained.slots)
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
     });
 }
 

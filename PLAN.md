@@ -87,8 +87,10 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Finish saving local values, declared types, selected source definitions, control
-positions, output bindings and the enclosing write across scheduler returns.
+Carry saved control positions through scheduler returns together with live local
+values, declared types, selected source definitions, output bindings and the
+enclosing write. The separate loop-value owner must survive until those values
+are saved; preserving positions alone cannot resume a whole invocation.
 Keep the original source image and kind when rebuilding syntax; reused parsing
 memory or a replacement function must not redirect saved positions. Preserve
 source-owner checks alongside the selected definitions and session settings.

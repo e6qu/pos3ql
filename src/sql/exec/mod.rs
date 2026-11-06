@@ -18000,7 +18000,7 @@ impl<'a> TriggerExecutionStatus<'a> {
                 .map_err(control_flow::execution_full)?;
         }
         Ok(Self {
-            numeric_frames: NumericLoopFrames::new(arena, program.root(), locals)?,
+            numeric_frames: NumericLoopFrames::new(arena, program.root(), locals, pool)?,
             control_frames: Some(control_frames),
             control_resources: Some(control_resources),
             found: Some(false),

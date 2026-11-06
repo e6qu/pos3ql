@@ -41,7 +41,7 @@ consistent; readers should not need to memorize them to use the database.
 - **commit batch**: immutable journal bytes plus a descriptor; recoverable only after the CAS commit head names it.
 - **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
 - **entity tag**: an opaque, strong, quoted object generation token used for compare-and-swap.
-- **execution control pool**: fixed startup memory shared by running procedural calls for their branch, loop and error-handler positions and named-output bindings.
+- **execution control pool**: fixed startup memory shared by running procedural calls for their branch, loop and error-handler positions, numeric-scope metadata and named-output bindings.
 - **manifest**: the durable inventory of table definitions and immutable storage objects for a checkpoint; updated by compare-and-swap.
 - **MVCC**: keeping row versions so transactions see the versions allowed by their isolation level. For example, a repeatable-read transaction can keep seeing an order's old status after another transaction commits an update.
 - **LSN**: log sequence number, a position in the recovery journal. It identifies replay and replication progress; only validated transaction boundaries are accepted as recovery targets.

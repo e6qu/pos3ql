@@ -468,7 +468,7 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
         .rposition(|local| local.name == program.target);
     let target = existing.unwrap_or(locals.len());
     let count = locals.len() + usize::from(existing.is_none());
-    let workspace = status.numeric_frames.take()?;
+    let mut workspace = status.numeric_frames.take()?;
     if count > workspace.locals.len() || count > workspace.values.len() {
         status.numeric_frames.restore(workspace);
         return Err(frame_full());

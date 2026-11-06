@@ -320,6 +320,9 @@ its saved values remain checked statement-memory images. Loop
 buffers and materialized rows have a separate, uniquely paired directory whose
 scoped owner releases its values. An entry owns its control data and required
 resource in one enum before publishing them to their indexed slots.
+Numeric-loop scope directories and local-variable descriptions also own control
+pool ranges; their value buffers remain in statement memory. Taking a scope
+keeps its metadata range owned until that scope is returned or dropped.
 Binding a view checks the source, workspace
 and directory identity before entering the body. A replaced, foreign or reset source
 returns `40001`; source-image exhaustion names its statement-memory limit with
@@ -663,7 +666,10 @@ function, procedure or trigger reserves one range for its maximum lexical
 nesting. Set-returning functions with named outputs reserve another range for
 their output bindings before local initialization. Empty
 tables and cached plans do not receive private control ranges. Dropping the
-call returns those ranges, including after errors. A full pool returns `54000`
+call returns those ranges, including after errors. Numeric loops reserve another
+range for their scope directory and one local-description range per maximum
+active nesting level. All are admitted before initializers; partial admission
+returns the ranges already reserved. A full pool returns `54000`
 naming both settings before body initializers can have effects. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.

@@ -118,8 +118,11 @@ errors and release temporary scan memory for the next operation.
 Keep those source-owner checks while retaining selected definitions and session
 settings; owning the text alone does not preserve their original meaning.
 Preserve once-only declaration initialization after input/output parameter slots
-are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
-reads and assignments use the innermost binding, while returning outputs uses
+are seeded. Keep parameter, local, handler and numeric-loop bindings distinct.
+Retain whether an initializer needs evaluation or only conversion, together with
+its evaluated value. Validate a declared domain's implicit initial NULL before
+body statements, including scalar, composite and array domains.
+Reads and assignments use the innermost binding, while returning outputs uses
 the original output slots. Preserve quoted names and reject constant assignment
 and FETCH targets before effects. Keep named constant cursors readable at OPEN.
 Caught-error directories and bytes now have control-pool owners. Preserve

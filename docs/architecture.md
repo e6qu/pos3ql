@@ -330,6 +330,15 @@ call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
 descriptions and value-slot arrays in the control pool. Each call pairs its
 resolved ordinary declarations, value slots and execution status together.
+Calls without row transitions use an empty borrowed table-definition view,
+keeping unused maximum-width column and constraint arrays off that path.
+Initialization records whether the next variable needs expression evaluation or
+conversion. Its evaluated value is saved before conversion can pause, and the
+compiled source supplies the initializer expressions directly.
+An omitted initializer still validates a domain's initial NULL before the body.
+For example, declaring a variable of an integer domain marked `NOT NULL`
+returns `23502` before a later `nextval()` can run. PostgreSQL 18.6 implements
+that check at [block entry](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c#L1608-L1628).
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges
@@ -339,8 +348,9 @@ frame suspension saves ordinary and active numeric values as typed rows in the
 shared row-work pool, then clears every borrowed reference while retaining the
 original slot ranges. Only pausing captures the ordinary declarations into a
 control-pool image; normal calls borrow compiled declarations, and repeated
-pauses share the captured image. Restoration copies each saved row once and decodes all its
-columns in one pass. Images are released only after every scope has restored;
+pauses share the captured image. Restoration copies each saved row once and
+decodes all its columns in one pass. Images are released only after every scope
+has restored;
 destination exhaustion preserves all images and reservations. This frame owner
 alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.

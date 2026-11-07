@@ -1230,12 +1230,8 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                             ..empty_plpgsql_local()
                         })
                         .unwrap();
-                    let initializers = scratch
-                        .alloc_slice_with(parsed.locals.len(), |index| parsed.locals[index].initial)
-                        .unwrap();
                     let program = TriggerProgram {
                         locals,
-                        initializers,
                         body: parsed.body,
                         input_sites: parsed.input_sites,
                     };
@@ -1351,6 +1347,7 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         execution.values[1] = Datum::Text(core::str::from_utf8(large).unwrap());
         execution.status.found = Some(true);
         execution.status.row_count = 37;
+        execution.initialization = execution_frame::Initialization::Complete;
         let mut retained = execution.status.control_frames.take().unwrap();
         {
             let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -1442,6 +1439,10 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
         assert_eq!(execution.values[0], Datum::Text("outside counter"));
         assert!(
             matches!(execution.values[1], Datum::Text(value) if value.len() == 4096 && value.bytes().all(|byte| byte == b'z'))
+        );
+        assert_eq!(
+            execution.initialization,
+            execution_frame::Initialization::Complete
         );
         assert_eq!(execution.status.found, Some(true));
         assert_eq!(execution.status.row_count, 37);
@@ -1543,6 +1544,7 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
             ExecutionFrame::new(&workspace, &code, &locals, 0, &controls, &rows).unwrap();
         execution.values[0] = Datum::Text("outside counter");
         execution.values[1] = Datum::Text("ordinary value");
+        execution.initialization = execution_frame::Initialization::Complete;
         let mut retained = execution.status.control_frames.take().unwrap();
         {
             let mut frames = retained.execution(&workspace, &code).unwrap();
@@ -1635,6 +1637,7 @@ fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata(
         let mut execution =
             ExecutionFrame::new(&workspace, &code, &declarations, 0, &controls, &rows).unwrap();
         execution.values[0] = Datum::Text(workspace.alloc_str("live value").unwrap());
+        execution.initialization = execution_frame::Initialization::Coerce(0);
         let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
         let held = controls.lease::<u8>(free).unwrap();
         let (execution, error) = execution.suspend().err().unwrap();
@@ -1646,6 +1649,10 @@ fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata(
         let saved = execution.suspend().ok().unwrap();
         let execution = saved.restore(&output, &code).ok().unwrap();
         assert!(execution.locals[0].constant);
+        assert_eq!(
+            execution.initialization,
+            execution_frame::Initialization::Coerce(0)
+        );
         assert_eq!(execution.values[0], Datum::Text("live value"));
         let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
         let saved = execution.suspend().ok().unwrap();

@@ -7,6 +7,14 @@ pub(super) struct ExecutionFrame<'declarations, 'values> {
     pub(super) locals: LocalDeclarations<'declarations>,
     pub(super) values: local_values::LocalValues<'values>,
     pub(super) status: TriggerExecutionStatus<'values>,
+    pub(super) initialization: Initialization,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Initialization {
+    Value(usize),
+    Coerce(usize),
+    Complete,
 }
 
 pub(super) enum LocalDeclarations<'a> {
@@ -47,6 +55,7 @@ pub(super) struct SuspendedExecutionFrame {
     row_count: i64,
     set_result: Option<PlpgsqlSetResult>,
     outputs: MutableSlice<OutputBinding>,
+    initialization: Initialization,
 }
 
 impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
@@ -72,6 +81,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
                 values: declarations,
                 controls: std::sync::Arc::clone(controls),
             },
+            initialization: Initialization::Value(0),
         })
     }
 
@@ -121,6 +131,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             row_count,
             set_result,
             outputs,
+            initialization: self.initialization,
         })
     }
 }
@@ -148,6 +159,7 @@ impl SuspendedExecutionFrame {
             row_count,
             set_result,
             outputs,
+            initialization,
         } = self;
         let mark = arena.mark();
         let mut control_frames = match control_frames.restore(arena, program) {
@@ -163,6 +175,7 @@ impl SuspendedExecutionFrame {
                         row_count,
                         set_result,
                         outputs,
+                        initialization,
                     },
                     error,
                 ));
@@ -179,6 +192,7 @@ impl SuspendedExecutionFrame {
                 row_count,
                 set_result,
                 outputs,
+                initialization,
             };
             // SAFETY: suspension removed all references created while decoding.
             // Only the original owned images escape this failed restoration.
@@ -200,6 +214,7 @@ impl SuspendedExecutionFrame {
                 set_result,
                 outputs,
             },
+            initialization,
         })
     }
 }

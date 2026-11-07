@@ -602,274 +602,372 @@ pub(super) fn start_row_loop<'syntax, 'a>(
     )))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the interpreter retains the complete typed firing context"
-)]
-pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionBacking>(
-    context: &mut TriggerExecContext<'_, 'a, '_>,
-    definition: &crate::storage::TableDefinition<Definition0>,
-    invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: &mut Option<&mut [Datum<'a>]>,
-    before: bool,
-    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
-    locals: &[TriggerLocalDecl],
-    values: &mut [Datum<'a>],
-    program: &CompiledProgram<'a>,
-    status: &mut TriggerExecutionStatus<'a>,
-) -> Result<Option<TriggerFlow<'a>>, SqlError> {
-    let mut retained = status
-        .control_frames
-        .take()
-        .expect("one procedural frame owner");
-    let mut frames = retained.execution(context.arena, program)?;
-    assert_eq!(frames.state.active, 0);
-    frames.start(program.root());
-    let mut outcome = Ok(None);
-    let mut pending_error = None;
-    while frames.state.active != 0 {
-        let action = (|| {
-            if let Some(error) = pending_error.take() {
+impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
+    pub(super) fn initialize(
+        &mut self,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        invocation: TriggerInvocation<'a>,
+        transition: TriggerTransition<'_, '_, 'a>,
+        program: &CompiledProgram<'a>,
+        seeded: &[Datum<'a>],
+    ) -> Result<(), SqlError> {
+        use execution_frame::Initialization;
+        let frames = self
+            .status
+            .control_frames
+            .as_ref()
+            .expect("one procedural frame owner");
+        frames.require_source(program.source())?;
+        frames.require_workspace(context.arena)?;
+        let declaration_start = self
+            .locals
+            .len()
+            .checked_sub(program.declarations.len())
+            .expect("local initialization layout");
+        assert!(seeded.len() <= declaration_start, "local parameter layout");
+        loop {
+            let index = match self.initialization {
+                Initialization::Complete => return Ok(()),
+                Initialization::Value(index) | Initialization::Coerce(index) => index,
+            };
+            if index == self.locals.len() {
+                self.initialization = Initialization::Complete;
+                return Ok(());
+            }
+            let local = self.locals[index];
+            if matches!(self.initialization, Initialization::Value(_)) {
+                let value = if let Some(value) = seeded.get(index).copied() {
+                    Some(value)
+                } else {
+                    self.values[index] = Datum::Null;
+                    if index < declaration_start {
+                        None
+                    } else if let Some(initial) =
+                        program.declarations[index - declaration_start].initial
+                    {
+                        let scope = TriggerLocalScope {
+                            locals: &self.locals[..=index],
+                            values: &self.values[..=index],
+                            found: Some(false),
+                            invocation,
+                            transition: &transition,
+                        };
+                        Some(eval_procedural_expression(context, initial, &scope)?)
+                    } else if local.not_null {
+                        return Err(sql_err!(
+                            sqlstate::NULL_VALUE_NOT_ALLOWED,
+                            "variable \"{}\" declared NOT NULL cannot default to NULL",
+                            local.name.as_str()
+                        ));
+                    } else {
+                        // A declared domain can reject its implicit NULL just
+                        // as it rejects an explicitly supplied initial value.
+                        Some(Datum::Null)
+                    }
+                };
+                let Some(value) = value else {
+                    self.initialization = Initialization::Value(index + 1);
+                    continue;
+                };
+                // Preserve an evaluated expression before a conversion can
+                // yield. Resuming conversion must not repeat that expression.
+                self.values[index] = value;
+                self.initialization = Initialization::Coerce(index);
+            }
+            self.values[index] = coerce_plpgsql_local(context, local, self.values[index])?;
+            self.initialization = Initialization::Value(index + 1);
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the interpreter retains the complete typed firing context"
+    )]
+    pub(super) fn execute_block<Definition0: crate::storage::DefinitionBacking>(
+        &mut self,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        definition: &crate::storage::TableDefinition<Definition0>,
+        invocation: TriggerInvocation<'a>,
+        old: Option<&[Datum<'a>]>,
+        new: &mut Option<&mut [Datum<'a>]>,
+        before: bool,
+        transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+        program: &CompiledProgram<'a>,
+    ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+        if self.initialization != execution_frame::Initialization::Complete {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "procedural execution started before local initialization completed"
+            ));
+        }
+        let locals = &self.locals;
+        let values = &mut self.values;
+        let status = &mut self.status;
+        let mut retained = status
+            .control_frames
+            .take()
+            .expect("one procedural frame owner");
+        let mut frames = match retained.execution(context.arena, program) {
+            Ok(frames) => frames,
+            Err(error) => {
+                status.control_frames = Some(retained);
                 return Err(error);
             }
-            super::super::query::check_timeout()?;
-            if let Some(statement) = frames
-                .program
-                .block(frames.last().block)
-                .statements
-                .get(frames.last().next)
-                .copied()
-            {
-                let invocation = bind_exception_variables(
-                    invocation,
-                    frames.diagnostic(),
-                    statement,
-                    context.arena,
-                )?;
-                let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
-                let (scope, scope_values, exception) = frames.scope(locals, values);
-                return execute_trigger_step(
-                    context,
-                    definition,
-                    invocation,
-                    old,
-                    new,
-                    before,
-                    transition_relations,
-                    scope,
-                    scope_values,
-                    statement,
-                    child_scope,
-                    status,
-                    exception,
-                )
-                .map(Some);
-            }
-            match frames.last().continuation {
-                Continuation::Loop => {
-                    frames.last_mut().next = 0;
+        };
+        assert_eq!(frames.state.active, 0);
+        frames.start(program.root());
+        let mut outcome = Ok(None);
+        let mut pending_error = None;
+        while frames.state.active != 0 {
+            let action = (|| {
+                if let Some(error) = pending_error.take() {
+                    return Err(error);
                 }
-                Continuation::While => {
-                    let TriggerStatement::While(program) =
-                        frames.source_statement(frames.last().source)
-                    else {
-                        unreachable!("while frame source")
-                    };
-                    let condition = program.condition;
+                super::super::query::check_timeout()?;
+                if let Some(statement) = frames
+                    .program
+                    .block(frames.last().block)
+                    .statements
+                    .get(frames.last().next)
+                    .copied()
+                {
                     let invocation = bind_exception_variables(
                         invocation,
                         frames.diagnostic(),
-                        TriggerStatement::While(program),
+                        statement,
                         context.arena,
                     )?;
-                    let (scope, scope_values, _) = frames.scope(locals, values);
-                    if trigger_condition(
+                    let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
+                    let (scope, scope_values, exception) = frames.scope(locals, values);
+                    return execute_trigger_step(
                         context,
-                        condition,
                         definition,
                         invocation,
                         old,
-                        new.as_deref(),
+                        new,
+                        before,
+                        transition_relations,
                         scope,
                         scope_values,
-                        status.found,
-                    )? {
-                        frames.last_mut().next = 0;
-                    } else {
-                        let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, true);
-                    }
+                        statement,
+                        child_scope,
+                        status,
+                        exception,
+                    )
+                    .map(Some);
                 }
-                Continuation::Numeric(ref range) => {
-                    let next = if range.reverse {
-                        range.value.checked_sub(range.step)
-                    } else {
-                        range.value.checked_add(range.step)
-                    };
-                    if let Some(next) = next.filter(|value| {
-                        if range.reverse {
-                            *value >= range.upper
+                match frames.last().continuation {
+                    Continuation::Loop => {
+                        frames.last_mut().next = 0;
+                    }
+                    Continuation::While => {
+                        let TriggerStatement::While(program) =
+                            frames.source_statement(frames.last().source)
+                        else {
+                            unreachable!("while frame source")
+                        };
+                        let condition = program.condition;
+                        let invocation = bind_exception_variables(
+                            invocation,
+                            frames.diagnostic(),
+                            TriggerStatement::While(program),
+                            context.arena,
+                        )?;
+                        let (scope, scope_values, _) = frames.scope(locals, values);
+                        if trigger_condition(
+                            context,
+                            condition,
+                            definition,
+                            invocation,
+                            old,
+                            new.as_deref(),
+                            scope,
+                            scope_values,
+                            status.found,
+                        )? {
+                            frames.last_mut().next = 0;
                         } else {
-                            *value <= range.upper
+                            let frame = frames.pop();
+                            frames.finish(frame, locals, values, status, true);
                         }
-                    }) {
-                        let frame = frames.last_mut();
-                        let Continuation::Numeric(range) = &mut frame.continuation else {
+                    }
+                    Continuation::Numeric(ref range) => {
+                        let next = if range.reverse {
+                            range.value.checked_sub(range.step)
+                        } else {
+                            range.value.checked_add(range.step)
+                        };
+                        if let Some(next) = next.filter(|value| {
+                            if range.reverse {
+                                *value >= range.upper
+                            } else {
+                                *value <= range.upper
+                            }
+                        }) {
+                            let frame = frames.last_mut();
+                            let Continuation::Numeric(range) = &mut frame.continuation else {
+                                unreachable!()
+                            };
+                            range.value = next;
+                            let target = range.target;
+                            frame.next = 0;
+                            let FrameResource::Numeric { workspace, .. } =
+                                &mut frames.state.resources[frames.state.active - 1]
+                            else {
+                                unreachable!("numeric frame resource")
+                            };
+                            workspace.values[target] = Datum::Int4(next);
+                        } else {
+                            let frame = frames.pop();
+                            frames.finish(frame, locals, values, status, true);
+                        }
+                    }
+                    Continuation::Rows { target, index } => {
+                        let FrameResource::Rows(rows) =
+                            &frames.state.resources[frames.state.active - 1]
+                        else {
+                            unreachable!("row frame resource")
+                        };
+                        if index + 1 < rows.len() {
+                            let value = rows.value(index + 1, context.arena)?;
+                            let (scope, scope_values, _) = frames.scope(locals, values);
+                            assign_trigger_local(context, scope, scope_values, target, value)?;
+                            let frame = frames.last_mut();
+                            let Continuation::Rows { index, .. } = &mut frame.continuation else {
+                                unreachable!("row-loop frame")
+                            };
+                            *index += 1;
+                            frame.next = 0;
+                        } else {
+                            let frame = frames.pop();
+                            frames.finish(frame, locals, values, status, true);
+                        }
+                    }
+                    Continuation::Protected { .. } => {
+                        let Continuation::Protected {
+                            boundary,
+                            releasing,
+                            ..
+                        } = &mut frames.last_mut().continuation
+                        else {
                             unreachable!()
                         };
-                        range.value = next;
-                        let target = range.target;
-                        frame.next = 0;
-                        let FrameResource::Numeric { workspace, .. } =
-                            &mut frames.state.resources[frames.state.active - 1]
-                        else {
-                            unreachable!("numeric frame resource")
-                        };
-                        workspace.values[target] = Datum::Int4(next);
-                    } else {
+                        *releasing = true;
+                        release_trigger_subtransaction(context, boundary)?;
+                        let frame = frames.pop();
+                        frames.finish(frame, locals, values, status, true);
+                    }
+                    Continuation::Once | Continuation::Handler => {
                         let frame = frames.pop();
                         frames.finish(frame, locals, values, status, true);
                     }
                 }
-                Continuation::Rows { target, index } => {
-                    let FrameResource::Rows(rows) =
-                        &frames.state.resources[frames.state.active - 1]
-                    else {
-                        unreachable!("row frame resource")
-                    };
-                    if index + 1 < rows.len() {
-                        let value = rows.value(index + 1, context.arena)?;
-                        let (scope, scope_values, _) = frames.scope(locals, values);
-                        assign_trigger_local(context, scope, scope_values, target, value)?;
-                        let frame = frames.last_mut();
-                        let Continuation::Rows { index, .. } = &mut frame.continuation else {
-                            unreachable!("row-loop frame")
-                        };
-                        *index += 1;
-                        frame.next = 0;
-                    } else {
+                Ok(None)
+            })();
+            match action {
+                Ok(Some(Step::Enter(frame))) => {
+                    frames.enter(frame);
+                }
+                Ok(Some(Step::Complete(None))) => frames.last_mut().next += 1,
+                Ok(None) => {}
+                Ok(Some(Step::Complete(Some(mut flow)))) => {
+                    while frames.state.active != 0 {
+                        if frames.last().is_loop() {
+                            match flow {
+                                TriggerFlow::Continue(0) => {
+                                    frames.last_mut().next =
+                                        frames.program.block(frames.last().block).statements.len();
+                                    break;
+                                }
+                                TriggerFlow::Exit(0) => {
+                                    let frame = frames.pop();
+                                    frames.finish(frame, locals, values, status, true);
+                                    break;
+                                }
+                                TriggerFlow::Continue(depth) => {
+                                    flow = TriggerFlow::Continue(depth - 1)
+                                }
+                                TriggerFlow::Exit(depth) => flow = TriggerFlow::Exit(depth - 1),
+                                TriggerFlow::Return(_) => {}
+                            }
+                        }
+                        if let Continuation::Protected {
+                            boundary,
+                            releasing,
+                            ..
+                        } = &mut frames.last_mut().continuation
+                        {
+                            *releasing = true;
+                            if let Err(error) = release_trigger_subtransaction(context, boundary) {
+                                pending_error = Some(error);
+                                break;
+                            }
+                        }
                         let frame = frames.pop();
                         frames.finish(frame, locals, values, status, true);
-                    }
-                }
-                Continuation::Protected { .. } => {
-                    let Continuation::Protected {
-                        boundary,
-                        releasing,
-                        ..
-                    } = &mut frames.last_mut().continuation
-                    else {
-                        unreachable!()
-                    };
-                    *releasing = true;
-                    release_trigger_subtransaction(context, boundary)?;
-                    let frame = frames.pop();
-                    frames.finish(frame, locals, values, status, true);
-                }
-                Continuation::Once | Continuation::Handler => {
-                    let frame = frames.pop();
-                    frames.finish(frame, locals, values, status, true);
-                }
-            }
-            Ok(None)
-        })();
-        match action {
-            Ok(Some(Step::Enter(frame))) => {
-                frames.enter(frame);
-            }
-            Ok(Some(Step::Complete(None))) => frames.last_mut().next += 1,
-            Ok(None) => {}
-            Ok(Some(Step::Complete(Some(mut flow)))) => {
-                while frames.state.active != 0 {
-                    if frames.last().is_loop() {
-                        match flow {
-                            TriggerFlow::Continue(0) => {
-                                frames.last_mut().next =
-                                    frames.program.block(frames.last().block).statements.len();
-                                break;
-                            }
-                            TriggerFlow::Exit(0) => {
-                                let frame = frames.pop();
-                                frames.finish(frame, locals, values, status, true);
-                                break;
-                            }
-                            TriggerFlow::Continue(depth) => flow = TriggerFlow::Continue(depth - 1),
-                            TriggerFlow::Exit(depth) => flow = TriggerFlow::Exit(depth - 1),
-                            TriggerFlow::Return(_) => {}
+                        if frames.state.active == 0 {
+                            outcome = Ok(Some(flow));
                         }
                     }
-                    if let Continuation::Protected {
-                        boundary,
-                        releasing,
-                        ..
-                    } = &mut frames.last_mut().continuation
-                    {
-                        *releasing = true;
-                        if let Err(error) = release_trigger_subtransaction(context, boundary) {
-                            pending_error = Some(error);
+                }
+                Err(mut error) => {
+                    let mut handler = None;
+                    while frames.state.active != 0 {
+                        let frame = frames.pop();
+                        if let Continuation::Protected {
+                            ref boundary,
+                            releasing: false,
+                        } = frame.continuation
+                        {
+                            match rollback_trigger_subtransaction(context, boundary) {
+                                Ok(()) => {
+                                    let TriggerStatement::Exception(program) =
+                                        frames.source_statement(frame.source)
+                                    else {
+                                        unreachable!("exception frame source")
+                                    };
+                                    handler = program.handlers.iter().find(|handler| {
+                                        handler.conditions.iter().copied().any(|condition| {
+                                            trigger_exception_matches(condition, &error)
+                                        })
+                                    });
+                                }
+                                Err(rollback_error) => error = rollback_error,
+                            }
+                        }
+                        frames.finish(frame, locals, values, status, false);
+                        if handler.is_some() {
                             break;
                         }
                     }
-                    let frame = frames.pop();
-                    frames.finish(frame, locals, values, status, true);
-                    if frames.state.active == 0 {
-                        outcome = Ok(Some(flow));
-                    }
-                }
-            }
-            Err(mut error) => {
-                let mut handler = None;
-                while frames.state.active != 0 {
-                    let frame = frames.pop();
-                    if let Continuation::Protected {
-                        ref boundary,
-                        releasing: false,
-                    } = frame.continuation
-                    {
-                        match rollback_trigger_subtransaction(context, boundary) {
-                            Ok(()) => {
-                                let TriggerStatement::Exception(program) =
-                                    frames.source_statement(frame.source)
-                                else {
-                                    unreachable!("exception frame source")
-                                };
-                                handler = program.handlers.iter().find(|handler| {
-                                    handler.conditions.iter().copied().any(|condition| {
-                                        trigger_exception_matches(condition, &error)
-                                    })
-                                });
-                            }
-                            Err(rollback_error) => error = rollback_error,
-                        }
-                    }
-                    frames.finish(frame, locals, values, status, false);
-                    if handler.is_some() {
+                    let Some(handler) = handler else {
+                        outcome = Err(error);
                         break;
+                    };
+                    match catch_diagnostic(
+                        context,
+                        invocation,
+                        &error,
+                        &mut frames.state.diagnostics,
+                    ) {
+                        Ok(()) => frames.push(
+                            FrameEntry::new(handler.block, EntryState::Handler),
+                            FrameSource::Handler,
+                        ),
+                        Err(error) => pending_error = Some(error),
                     }
-                }
-                let Some(handler) = handler else {
-                    outcome = Err(error);
-                    break;
-                };
-                match catch_diagnostic(context, invocation, &error, &mut frames.state.diagnostics) {
-                    Ok(()) => frames.push(
-                        FrameEntry::new(handler.block, EntryState::Handler),
-                        FrameSource::Handler,
-                    ),
-                    Err(error) => pending_error = Some(error),
                 }
             }
         }
+        // Capacity/error exits release every lexical owner before the caller can
+        // rewind statement memory. Transaction rollback remains the caller's job.
+        while frames.state.active != 0 {
+            let frame = frames.pop();
+            frames.finish(frame, locals, values, status, false);
+        }
+        status.control_frames = Some(retained);
+        outcome
     }
-    // Capacity/error exits release every lexical owner before the caller can
-    // rewind statement memory. Transaction rollback remains the caller's job.
-    while frames.state.active != 0 {
-        let frame = frames.pop();
-        frames.finish(frame, locals, values, status, false);
-    }
-    status.control_frames = Some(retained);
-    outcome
 }
 
 // Bind snapshots before a child query borrows the remaining arena. Only input

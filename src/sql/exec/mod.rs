@@ -794,7 +794,7 @@ mod loop_rows;
 mod numeric_loops;
 mod set_rows;
 
-use control_flow::{CompiledProgram, ControlFrames, ProgramSource, execute_trigger_block};
+use control_flow::{CompiledProgram, ControlFrames, ProgramSource};
 use set_rows::PlpgsqlSetResult;
 mod projected;
 use numeric_loops::NumericLoopFrames;
@@ -3967,10 +3967,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         &context.storage().execution_control,
         &context.storage().row_work,
     )?;
-    let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    initialize_trigger_locals(
+    execution.initialize(
         context,
         invocation,
         TriggerTransition {
@@ -3978,12 +3975,10 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
             old,
             new: new.as_deref(),
         },
-        locals,
-        program.initializers,
+        &code,
         &[],
-        local_values,
     )?;
-    match execute_trigger_block(
+    match execution.execute_block(
         context,
         definition,
         invocation,
@@ -3991,10 +3986,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         new,
         before,
         transition_relations,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
         Some(TriggerFlow::Return(result)) => match result {
             TriggerReturnValue::Null if before => Ok(false),
@@ -17920,7 +17912,6 @@ impl<'a, T: Copy + 'a> ProgramList<'a, T> {
 #[derive(Clone, Copy)]
 struct TriggerProgram<'a> {
     locals: &'a [TriggerLocalDecl],
-    initializers: &'a [Option<&'a Expr<'a>>],
     body: TriggerBlock<'a>,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
 }
@@ -20942,12 +20933,8 @@ fn resolve_plpgsql_program_locals<'a>(
             not_null: local.not_null,
         };
     }
-    let initializers = arena
-        .alloc_slice_with(program.locals.len(), |index| program.locals[index].initial)
-        .map_err(|_| super::query::arena_full_pub())?;
     let program = TriggerProgram {
         locals: resolved,
-        initializers,
         body: program.body,
         input_sites: program.input_sites,
     };
@@ -21313,7 +21300,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         arena,
         &|_| false,
     )?;
-    let definition = TableDef::empty();
+    let definition = crate::storage::TableDefView::empty();
     let invocation = TriggerInvocation::anonymous()?.with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -21336,10 +21323,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &context.storage().execution_control,
         &context.storage().row_work,
     )?;
-    let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    initialize_trigger_locals(
+    execution.initialize(
         &mut context,
         invocation,
         TriggerTransition {
@@ -21347,13 +21331,11 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
             old: None,
             new: None,
         },
-        locals,
-        program.initializers,
+        &code,
         &[],
-        local_values,
     )?;
     let mut no_new = None;
-    match execute_trigger_block(
+    match execution.execute_block(
         &mut context,
         &definition,
         invocation,
@@ -21361,10 +21343,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &mut no_new,
         false,
         None,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21405,7 +21384,7 @@ pub(crate) fn execute_event_trigger<'a>(
                     .any(|column| column.name == name)
         },
     )?;
-    let definition = TableDef::empty();
+    let definition = crate::storage::TableDefView::empty();
     let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21429,10 +21408,7 @@ pub(crate) fn execute_event_trigger<'a>(
         &context.storage().execution_control,
         &context.storage().row_work,
     )?;
-    let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    initialize_trigger_locals(
+    execution.initialize(
         &mut context,
         invocation,
         TriggerTransition {
@@ -21440,13 +21416,11 @@ pub(crate) fn execute_event_trigger<'a>(
             old: None,
             new: None,
         },
-        locals,
-        program.initializers,
+        &code,
         &[],
-        local_values,
     )?;
     let mut no_new = None;
-    match execute_trigger_block(
+    match execution.execute_block(
         &mut context,
         &definition,
         invocation,
@@ -21454,10 +21428,7 @@ pub(crate) fn execute_event_trigger<'a>(
         &mut no_new,
         false,
         None,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21571,7 +21542,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = TableDef::empty();
+    let definition = crate::storage::TableDefView::empty();
     let invocation = TriggerInvocation::procedure(routine, input_collation, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21595,10 +21566,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &context.storage().execution_control,
         &context.storage().row_work,
     )?;
-    let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    initialize_trigger_locals(
+    execution.initialize(
         &mut context,
         invocation,
         TriggerTransition {
@@ -21606,14 +21574,12 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             old: None,
             new: None,
         },
-        locals,
-        program.initializers,
+        &code,
         &seeded[..seeded_count],
-        local_values,
     )?;
     drop(seeded);
     let mut no_new = None;
-    match execute_trigger_block(
+    match execution.execute_block(
         &mut context,
         &definition,
         invocation,
@@ -21621,10 +21587,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &mut no_new,
         false,
         None,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => {}
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
@@ -21636,11 +21599,12 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         if !parameter.mode.is_output() {
             continue;
         }
-        outputs[output_count] = locals
+        outputs[output_count] = execution
+            .locals
             .iter()
             .position(|local| local.name == parameter.name)
             .filter(|_| !parameter.name.as_str().is_empty())
-            .map_or(Datum::Null, |index| local_values[index]);
+            .map_or(Datum::Null, |index| execution.values[index]);
         output_count += 1;
     }
     Ok(output_count)
@@ -21756,7 +21720,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = TableDef::empty();
+    let definition = crate::storage::TableDefView::empty();
     let invocation = TriggerInvocation::function(routine, program_kind, input_collation, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21780,10 +21744,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         &context.storage().execution_control,
         &context.storage().row_work,
     )?;
-    let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    initialize_trigger_locals(
+    execution.initialize(
         &mut context,
         invocation,
         TriggerTransition {
@@ -21791,14 +21752,12 @@ pub(crate) fn execute_plpgsql_function<'a>(
             old: None,
             new: None,
         },
-        locals,
-        program.initializers,
+        &code,
         &seeded[..seeded_count],
-        local_values,
     )?;
     drop(seeded);
     let mut no_new = None;
-    match execute_trigger_block(
+    match execution.execute_block(
         &mut context,
         &definition,
         invocation,
@@ -21806,10 +21765,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         &mut no_new,
         false,
         None,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
         Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
         None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Text("")),
@@ -21821,7 +21777,14 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
             if program_kind == PlpgsqlProgramKind::OutputFunction =>
         {
-            plpgsql_output_value(engine, routine, locals, local_values, txn.txid, arena)
+            plpgsql_output_value(
+                engine,
+                routine,
+                &execution.locals,
+                &execution.values,
+                txn.txid,
+                arena,
+            )
         }
         None => Err(sql_err!(
             sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
@@ -21935,7 +21898,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = TableDef::empty();
+    let definition = crate::storage::TableDefView::empty();
     let invocation = TriggerInvocation::function(
         routine,
         PlpgsqlProgramKind::SetFunction,
@@ -21965,12 +21928,12 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &context.storage().row_work,
     )?;
     let locals = &execution.locals;
-    let local_values = &mut execution.values;
-    let status = &mut execution.status;
-    status.collect_set_rows(PlpgsqlSetResult::for_routine(
-        routine,
-        &context.storage().row_work,
-    )?);
+    execution
+        .status
+        .collect_set_rows(PlpgsqlSetResult::for_routine(
+            routine,
+            &context.storage().row_work,
+        )?);
     let output_local_indices = arena
         .alloc_slice_with(output_columns.len(), |_| 0usize)
         .map_err(|_| super::query::arena_full_pub())?;
@@ -21987,7 +21950,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
                 )
             })?;
     }
-    initialize_trigger_locals(
+    execution.initialize(
         &mut context,
         invocation,
         TriggerTransition {
@@ -21995,18 +21958,16 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             old: None,
             new: None,
         },
-        locals,
-        program.initializers,
+        &code,
         &seeded[..seeded_count],
-        local_values,
     )?;
     drop(seeded);
-    status.set_output_locals(
+    execution.status.set_output_locals(
         &output_local_indices[..output_columns.len()],
-        local_values.len(),
+        execution.values.len(),
     );
     let mut no_new = None;
-    match execute_trigger_block(
+    match execution.execute_block(
         &mut context,
         &definition,
         invocation,
@@ -22014,12 +21975,10 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &mut no_new,
         false,
         None,
-        locals,
-        local_values,
         &code,
-        status,
     )? {
-        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => status
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => execution
+            .status
             .set_result
             .as_ref()
             .expect("set invocation owns its result collector")
@@ -26096,54 +26055,6 @@ fn empty_plpgsql_local() -> TriggerLocalDecl {
     }
 }
 
-fn initialize_trigger_locals<'a>(
-    context: &mut TriggerExecContext<'_, 'a, '_>,
-    invocation: TriggerInvocation<'a>,
-    transition: TriggerTransition<'_, '_, 'a>,
-    locals: &[TriggerLocalDecl],
-    initializers: &[Option<&'a Expr<'a>>],
-    seeded: &[Datum<'a>],
-    values: &mut [Datum<'a>],
-) -> Result<(), SqlError> {
-    // Parameters, including unseeded OUT slots, precede declared locals.
-    // Initializers describe only the declaration tail, not every unseeded slot.
-    let declaration_start = locals
-        .len()
-        .checked_sub(initializers.len())
-        .expect("local initialization layout");
-    assert!(seeded.len() <= declaration_start, "local parameter layout");
-    for (index, local) in locals.iter().enumerate() {
-        if let Some(value) = seeded.get(index).copied() {
-            values[index] = coerce_plpgsql_local(context, *local, value)?;
-            continue;
-        }
-        values[index] = Datum::Null;
-        if index < declaration_start {
-            continue;
-        }
-        let Some(initial) = initializers[index - declaration_start] else {
-            if local.not_null {
-                return Err(sql_err!(
-                    sqlstate::NULL_VALUE_NOT_ALLOWED,
-                    "variable \"{}\" declared NOT NULL cannot default to NULL",
-                    local.name.as_str()
-                ));
-            }
-            continue;
-        };
-        let scope = TriggerLocalScope {
-            locals: &locals[..=index],
-            values: &values[..=index],
-            found: Some(false),
-            invocation,
-            transition: &transition,
-        };
-        let value = eval_procedural_expression(context, initial, &scope)?;
-        values[index] = coerce_plpgsql_local(context, *local, value)?;
-    }
-    Ok(())
-}
-
 fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usize, SqlError> {
     locals
         .iter()
@@ -30123,10 +30034,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             &context.storage().execution_control,
             &context.storage().row_work,
         )?;
-        let locals = &execution.locals;
-        let local_values = &mut execution.values;
-        let status = &mut execution.status;
-        initialize_trigger_locals(
+        execution.initialize(
             &mut context,
             invocation,
             TriggerTransition {
@@ -30134,12 +30042,10 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
                 old: None,
                 new: None,
             },
-            locals,
-            program.initializers,
+            &code,
             &[],
-            local_values,
         )?;
-        match execute_trigger_block(
+        match execution.execute_block(
             &mut context,
             definition,
             invocation,
@@ -30147,10 +30053,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             &mut no_new,
             before,
             transition_relations,
-            locals,
-            local_values,
             &code,
-            status,
         )? {
             Some(TriggerFlow::Return(_)) => {}
             None => {

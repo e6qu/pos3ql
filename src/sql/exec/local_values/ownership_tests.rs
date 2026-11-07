@@ -43,7 +43,7 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
         4,
     )
     .unwrap();
-    let mut saved = SavedValue::new(&pool).unwrap();
+    let mut saved = SavedValues::new(&pool).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let text = source.alloc_str("independent text").unwrap();
         let array = crate::sql::array::build_shaped(
@@ -74,7 +74,7 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
                 },
             ])
             .unwrap();
-        saved.replace(Datum::Record(fields)).unwrap();
+        saved.replace(&[Datum::Record(fields)]).unwrap();
     });
     source.reset();
     let mut moved = saved;
@@ -82,8 +82,8 @@ fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
         source.alloc_slice_with(2048, |_| 0xaau8).unwrap();
         drop(source);
         drop(pool);
-        let value = moved.read(&output).unwrap();
-        moved.replace(Datum::Bytea(&[9; 2048])).unwrap();
+        let value = moved.read(0, &output).unwrap();
+        moved.replace(&[Datum::Bytea(&[9; 2048])]).unwrap();
         drop(moved);
         let Datum::Record(fields) = value else {
             panic!("saved record")
@@ -130,36 +130,39 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let mut saved = SavedValue::new(&pool).unwrap();
-        assert_eq!(saved.read(&output).unwrap_err().sqlstate, "XX000");
-        saved.replace(Datum::Bytea(&[0; 512])).unwrap();
+        let mut saved = SavedValues::new(&pool).unwrap();
+        assert_eq!(saved.read(0, &output).unwrap_err().sqlstate, "XX000");
+        saved.replace(&[Datum::Bytea(&[0; 512])]).unwrap();
         let capacity = saved.bytes.capacity();
         for turn in 0..64u8 {
-            saved.replace(Datum::Bytea(&[turn; 512])).unwrap();
+            saved.replace(&[Datum::Bytea(&[turn; 512])]).unwrap();
             output
                 .with_remaining_region(|scratch| {
-                    assert_eq!(saved.read(scratch).unwrap(), Datum::Bytea(&[turn; 512]));
+                    assert_eq!(saved.read(0, scratch).unwrap(), Datum::Bytea(&[turn; 512]));
                 })
                 .unwrap();
-            saved.replace(Datum::Int4(i32::from(turn))).unwrap();
+            saved.replace(&[Datum::Int4(i32::from(turn))]).unwrap();
             output
                 .with_remaining_region(|scratch| {
-                    assert_eq!(saved.read(scratch).unwrap(), Datum::Int4(i32::from(turn)));
+                    assert_eq!(
+                        saved.read(0, scratch).unwrap(),
+                        Datum::Int4(i32::from(turn))
+                    );
                 })
                 .unwrap();
             assert_eq!(saved.bytes.capacity(), capacity);
         }
-        let mut kept = SavedValue::new(&small).unwrap();
-        kept.replace(Datum::Text("kept")).unwrap();
+        let mut kept = SavedValues::new(&small).unwrap();
+        kept.replace(&[Datum::Text("kept")]).unwrap();
         let capacity = kept.bytes.capacity();
         let large = source.alloc_slice_with(1024, |_| b'x').unwrap();
         let text = core::str::from_utf8(large).unwrap();
-        let error = kept.replace(Datum::Text(text)).unwrap_err();
+        let error = kept.replace(&[Datum::Text(text)]).unwrap_err();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("execution_control_bytes"));
         assert_eq!(kept.bytes.capacity(), capacity);
-        assert_eq!(kept.read(&output).unwrap(), Datum::Text("kept"));
-        assert_eq!(kept.read(&tiny).unwrap_err().sqlstate, "54000");
+        assert_eq!(kept.read(0, &output).unwrap(), Datum::Text("kept"));
+        assert_eq!(kept.read(0, &tiny).unwrap_err().sqlstate, "54000");
         let invalid_name = source.alloc_slice_with(1 << 16, |_| b'x').unwrap();
         let fields = [RecordField {
             name: core::str::from_utf8(invalid_name).unwrap(),
@@ -167,28 +170,33 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
             value: Datum::Int4(1),
         }];
         assert_eq!(
-            kept.replace(Datum::Record(&fields)).unwrap_err().sqlstate,
+            kept.replace(&[Datum::Record(&fields)])
+                .unwrap_err()
+                .sqlstate,
             "54000"
         );
         assert_eq!(kept.bytes.capacity(), capacity);
-        let previous = kept.read(&output).unwrap();
+        let previous = kept.read(0, &output).unwrap();
         source
             .with_remaining_region(|scratch| {
-                kept.replace(Datum::Text(scratch.alloc_str("next").unwrap()))
+                kept.replace(&[Datum::Text(scratch.alloc_str("next").unwrap())])
                     .unwrap();
             })
             .unwrap();
-        assert_eq!(kept.read(&output).unwrap(), Datum::Text("next"));
-        kept.replace(Datum::Null).unwrap();
+        assert_eq!(kept.read(0, &output).unwrap(), Datum::Text("next"));
+        kept.replace(&[Datum::Null]).unwrap();
         assert_eq!(previous, Datum::Text("kept"));
-        assert!(kept.read(&output).unwrap().is_null());
-        let mut unpublished = SavedValue::new(&small).unwrap();
+        assert!(kept.read(0, &output).unwrap().is_null());
+        let mut unpublished = SavedValues::new(&small).unwrap();
         assert_eq!(
-            unpublished.replace(Datum::Text(text)).unwrap_err().sqlstate,
+            unpublished
+                .replace(&[Datum::Text(text)])
+                .unwrap_err()
+                .sqlstate,
             "54000"
         );
         assert!(unpublished.length.is_none());
-        assert_eq!(unpublished.read(&output).unwrap_err().sqlstate, "XX000");
+        assert_eq!(unpublished.read(0, &output).unwrap_err().sqlstate, "XX000");
         drop(kept);
         assert_eq!(small.lease::<u8>(128).unwrap().capacity(), 128);
     });
@@ -206,30 +214,87 @@ fn saved_value_growth_moves_owned_bytes_and_failed_growth_keeps_published_values
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let mut saved = SavedValue::new(&pool).unwrap();
-        saved.replace(Datum::Text("before move")).unwrap();
-        let earlier = saved.read(&output).unwrap();
+        let mut saved = SavedValues::new(&pool).unwrap();
+        saved.replace(&[Datum::Text("before move")]).unwrap();
+        let earlier = saved.read(0, &output).unwrap();
         let blocker = pool.lease::<u8>(64).unwrap();
         let descriptor_guards = [pool.lease::<u8>(64).unwrap(), pool.lease::<u8>(64).unwrap()];
-        let error = saved.replace(Datum::Bytea(&[7; 128])).unwrap_err();
+        let error = saved.replace(&[Datum::Bytea(&[7; 128])]).unwrap_err();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("execution_control_leases"));
         assert!(error.message.as_str().contains("0 available leases"));
-        assert_eq!(saved.read(&output).unwrap(), Datum::Text("before move"));
+        assert_eq!(saved.read(0, &output).unwrap(), Datum::Text("before move"));
         drop(descriptor_guards);
-        saved.replace(Datum::Bytea(&[7; 128])).unwrap();
-        assert_eq!(saved.read(&output).unwrap(), Datum::Bytea(&[7; 128]));
-        let after_move = saved.read(&output).unwrap();
+        saved.replace(&[Datum::Bytea(&[7; 128])]).unwrap();
+        assert_eq!(saved.read(0, &output).unwrap(), Datum::Bytea(&[7; 128]));
+        let after_move = saved.read(0, &output).unwrap();
         let later_blocker = pool.lease::<u8>(512).unwrap();
-        let error = saved.replace(Datum::Bytea(&[8; 300])).unwrap_err();
+        let error = saved.replace(&[Datum::Bytea(&[8; 300])]).unwrap_err();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("execution_control_bytes"));
-        assert_eq!(saved.read(&output).unwrap(), Datum::Bytea(&[7; 128]));
+        assert_eq!(saved.read(0, &output).unwrap(), Datum::Bytea(&[7; 128]));
         assert_eq!(earlier, Datum::Text("before move"));
         assert_eq!(after_move, Datum::Bytea(&[7; 128]));
         drop(later_blocker);
         drop(blocker);
         drop(saved);
         assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
+    });
+}
+
+#[test]
+fn suspended_local_slots_drop_source_borrows_and_preserve_images_after_failed_restore() {
+    let mut budget = Budget::new(64 << 10);
+    let mut source = Arena::new(&mut budget, "live local payloads", 8192).unwrap();
+    let output = Arena::new(&mut budget, "restored local payloads", 8192).unwrap();
+    let tiny = Arena::new(&mut budget, "failed local restore", 1).unwrap();
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut values = LocalValues::new(&controls, &rows, 3).unwrap();
+        values[0] = Datum::Text(source.alloc_str("before waiting").unwrap());
+        values[1] = Datum::Bytea(source.alloc_slice_copy(&[3, 5, 7]).unwrap());
+        let address = values.slots.as_ptr() as usize;
+        let slot = values.slots.slot();
+        values.capture().unwrap();
+        let suspended = values.suspend();
+        assert_eq!(suspended.slots.as_ptr() as usize, address);
+        assert_eq!(suspended.slots.slot(), slot);
+        assert!(suspended.iter().all(Datum::is_null));
+        source.reset();
+        source.alloc_slice_with(4096, |_| 0xffu8).unwrap();
+        drop(source);
+        let mut attempted = suspended.rebind_saved();
+        assert_eq!(attempted.restore(&tiny).unwrap_err().sqlstate, "54000");
+        let kept = attempted.suspend();
+        let mut restored = kept.rebind_saved();
+        restored.restore(&output).unwrap();
+        restored.discard_saved();
+        let mut reused = rows.lease::<u8>(2048).unwrap();
+        reused.extend_from_slice(&[0xff; 2048]).unwrap();
+        assert_eq!(
+            &*restored,
+            &[
+                Datum::Text("before waiting"),
+                Datum::Bytea(&[3, 5, 7]),
+                Datum::Null
+            ]
+        );
+        assert_eq!(restored.slots.as_ptr() as usize, address);
+        assert_eq!(restored.slots.slot(), slot);
+        drop(restored);
+        assert_eq!(controls.lease::<u8>(4096).unwrap().capacity(), 4096);
     });
 }

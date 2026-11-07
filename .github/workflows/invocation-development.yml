@@ -1,0 +1,43 @@
+name: Invocation development checks
+
+on:
+  push:
+    branches: [retain-procedural-invocations]
+
+concurrency:
+  group: invocation-development-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ownership:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-invocation-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Compile library tests and exercise value ownership
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --lib --locked --profile native-ci --jobs 1 -- \
+            inplace_conversion_ suspended_local_slots_ suspended_execution_ \
+            --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/invocation-development.log"
+      - name: Retain development diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: invocation-development-${{ github.sha }}
+          path: ${{ runner.temp }}/invocation-development.log
+          if-no-files-found: error
+          retention-days: 1

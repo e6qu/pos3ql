@@ -154,6 +154,10 @@ pub(super) struct ControlFrames<'a> {
     workspace: ArenaIdentity,
 }
 
+/// Every payload reference has been removed; only owned images and reservations
+/// remain. This state cannot execute until all live values have been restored.
+pub(super) struct SuspendedControlFrames(ControlFrames<'static>);
+
 impl<'a> ControlFrames<'a> {
     pub(super) fn new(
         arena: &Arena,
@@ -177,6 +181,44 @@ impl<'a> ControlFrames<'a> {
             diagnostics: DiagnosticBuffers::new(pool, layout.handlers)?,
             resources,
             workspace: arena.identity(),
+        })
+    }
+
+    pub(super) fn capture(&mut self) -> Result<(), SqlError> {
+        for resource in &mut self.resources[..self.active] {
+            if let FrameResource::Numeric { workspace } = resource {
+                workspace.values.capture()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn discard_saved(&mut self) {
+        for resource in &mut self.resources[..self.active] {
+            if let FrameResource::Numeric { workspace } = resource {
+                workspace.values.discard_saved();
+            }
+        }
+    }
+
+    pub(super) fn suspend(self) -> SuspendedControlFrames {
+        SuspendedControlFrames(ControlFrames {
+            source: self.source,
+            slots: self.slots,
+            active: self.active,
+            diagnostics: self.diagnostics,
+            resources: self.resources.map_in_place(|resource| match resource {
+                FrameResource::Empty => FrameResource::Empty,
+                FrameResource::Rows(rows) => FrameResource::Rows(rows),
+                FrameResource::Numeric { workspace } => FrameResource::Numeric {
+                    workspace: NumericLoopWorkspace {
+                        depth: workspace.depth,
+                        locals: workspace.locals,
+                        values: workspace.values.suspend(),
+                    },
+                },
+            }),
+            workspace: self.workspace,
         })
     }
 
@@ -205,6 +247,55 @@ impl<'a> ControlFrames<'a> {
             state: self,
             program,
         })
+    }
+}
+
+impl SuspendedControlFrames {
+    pub(super) fn source(&self) -> &ProgramSource {
+        &self.0.source
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed restoration returns the original owner without runtime allocation"
+    )]
+    pub(super) fn restore<'out>(
+        self,
+        arena: &'out Arena,
+        program: &CompiledProgram<'_>,
+    ) -> Result<ControlFrames<'out>, (Self, SqlError)> {
+        if let Err(error) = self.0.require_source(program.source()) {
+            return Err((self, error));
+        }
+        let mut frames = ControlFrames {
+            source: self.0.source,
+            slots: self.0.slots,
+            active: self.0.active,
+            diagnostics: self.0.diagnostics,
+            resources: self.0.resources.map_in_place(|resource| match resource {
+                FrameResource::Empty => FrameResource::Empty,
+                FrameResource::Rows(rows) => FrameResource::Rows(rows),
+                FrameResource::Numeric { workspace } => FrameResource::Numeric {
+                    workspace: NumericLoopWorkspace {
+                        depth: workspace.depth,
+                        locals: workspace.locals,
+                        values: workspace.values.rebind_saved(),
+                    },
+                },
+            }),
+            workspace: self.0.workspace,
+        };
+        for resource in &mut frames.resources[..frames.active] {
+            if let FrameResource::Numeric { workspace } = resource
+                && let Err(error) = workspace.values.restore(arena)
+            {
+                return Err((frames.suspend(), error));
+            }
+        }
+        // Images remain intact until the enclosing invocation has restored its
+        // ordinary values and firing context too. A later failure can resuspend.
+        frames.workspace = arena.identity();
+        Ok(frames)
     }
 }
 

@@ -92,6 +92,10 @@ with declared types, selected source definitions, output bindings and the
 enclosing write. Ordinary and numeric active local slots still refer to
 statement-memory payloads. Keep those payloads alive or save them before
 recycling scratch; positions alone cannot resume an invocation.
+Restore the whole frame before publishing it. If a later local value exceeds
+destination memory after earlier loop scopes have decoded, retain all original
+images and reservations without leaving references into the failed destination.
+Dropping a paused call must return both its control and row-work capacity.
 Saved output bytes now own reusable control-pool ranges independent of their
 source arenas. Preserve that ownership, the outer value through nested counters,
 failure-preserving growth, rollback and reuse after exhaustion, and decoded

@@ -37,7 +37,7 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
     let free = pool.lease::<u8>(4096).err().unwrap().free_bytes;
     crate::mem::guard::forbid_alloc(|| {
         let held = pool.lease::<u8>(64).unwrap();
-        let error = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool)
+        let error = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool)
             .err()
             .unwrap();
         assert_eq!(error.sqlstate, "54000");
@@ -45,7 +45,8 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
         drop(held);
         assert_eq!(pool.lease::<u8>(free).unwrap().capacity(), free);
 
-        let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool).unwrap();
         status.set_output_locals(&[0], locals.len());
         assert_eq!(status.outputs[0].local, 0);
         assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
@@ -195,7 +196,8 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
         ctype: ColType::Text,
         ..empty_plpgsql_local()
     }];
-    let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool).unwrap();
+    let mut status =
+        TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool).unwrap();
     status.set_output_locals(&[0], locals.len());
     crate::mem::guard::forbid_alloc(|| {
         let text = temporary.alloc_str("original output").unwrap();
@@ -220,11 +222,11 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
     temporary.reset();
     crate::mem::guard::forbid_alloc(|| {
         temporary.alloc_slice_with(2048, |_| 0xffu8).unwrap();
-        let first = status.outputs[0].value.read(&output).unwrap();
+        let first = status.outputs[0].value.read(0, &output).unwrap();
         assert_eq!(first, Datum::Text("original output"));
         status.unshadow_output_local(0);
         assert_eq!(status.outputs[0].shadow_depth, 1);
-        assert_eq!(status.outputs[0].value.read(&output).unwrap(), first);
+        assert_eq!(status.outputs[0].value.read(0, &output).unwrap(), first);
         status.unshadow_output_local(0);
         source
             .with_remaining_region(|scratch| {
@@ -236,7 +238,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
             .unwrap();
         assert_eq!(status.outputs[0].shadow_depth, 0);
         assert_eq!(
-            status.outputs[0].value.read(&output).unwrap(),
+            status.outputs[0].value.read(0, &output).unwrap(),
             Datum::Text("new output")
         );
         let used = workspace.used();
@@ -251,7 +253,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
             "54000"
         );
         assert_eq!(status.outputs[0].shadow_depth, u8::MAX);
-        assert!(status.outputs[0].value.read(&output).unwrap().is_null());
+        assert!(status.outputs[0].value.read(0, &output).unwrap().is_null());
         assert_eq!(workspace.used(), used);
         assert_eq!(first, Datum::Text("original output"));
         for _ in 0..u8::MAX {
@@ -300,7 +302,8 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
 
         let mut frames = retained.execution(&arena, &code).unwrap();
@@ -408,7 +411,8 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     .unwrap();
     let (mut status, retained, mut values) = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&parsing).unwrap();
-        let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
 
         let mut values = [Datum::Text("outside counter"), Datum::Text("before")];
@@ -1291,5 +1295,203 @@ fn procedural_lexical_exhaustion_is_a_resource_error_and_releases_scan_memory() 
         assert_eq!(error.sqlstate, "54000");
         assert_eq!(scan.used(), 0);
         assert_eq!(split_trigger_statements("NULL", &scan).unwrap(), ["NULL"]);
+    });
+}
+
+#[test]
+fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destruction() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(512 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        32 << 10,
+        64,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        64 << 10,
+        16,
+    )
+    .unwrap();
+    let mut original = Arena::new(&mut budget, "suspended original syntax", 64 << 10).unwrap();
+    let mut workspace = Arena::new(&mut budget, "suspended original values", 32 << 10).unwrap();
+    let mut parsing = Arena::new(&mut budget, "restored syntax", 64 << 10).unwrap();
+    let partial = Arena::new(&mut budget, "partial value restoration", 1024).unwrap();
+    let output = Arena::new(&mut budget, "restored execution values", 32 << 10).unwrap();
+    const SOURCE: &str =
+        "BEGIN FOR x IN 1..3 LOOP FOR y IN 1..2 LOOP NULL; END LOOP; END LOOP; END";
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) =
+            parse_owned_program(SOURCE, &original, &controls, PlpgsqlProgramKind::Anonymous)
+                .unwrap();
+        let locals = [
+            TriggerLocalDecl {
+                name: SqlName::parse("x").unwrap(),
+                ctype: ColType::Text,
+                constant: true,
+                ..empty_plpgsql_local()
+            },
+            TriggerLocalDecl {
+                name: SqlName::parse("marker").unwrap(),
+                ctype: ColType::Text,
+                not_null: true,
+                type_mod: 4128,
+                ..empty_plpgsql_local()
+            },
+        ];
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &locals, 1, &controls, &rows).unwrap();
+        execution.status.set_output_locals(&[0], locals.len());
+        execution.values[0] = Datum::Text(workspace.alloc_str("outside counter").unwrap());
+        let large = workspace.alloc_slice_with(4096, |_| b'z').unwrap();
+        execution.values[1] = Datum::Text(core::str::from_utf8(large).unwrap());
+        execution.status.found = Some(true);
+        execution.status.row_count = 37;
+        let mut retained = execution.status.control_frames.take().unwrap();
+        {
+            let mut frames = retained.execution(&workspace, &code).unwrap();
+            frames.start(program.body);
+            let TriggerStatement::For(outer) = program.body.statements[0] else {
+                panic!("outer numeric loop")
+            };
+            let Step::Enter(entry) = start_numeric_loop(
+                outer,
+                1,
+                3,
+                1,
+                false,
+                PlpgsqlScope::frame(2),
+                &execution.locals,
+                &execution.values,
+                &mut execution.status,
+            )
+            .unwrap() else {
+                panic!("outer entry")
+            };
+            frames.enter(entry);
+            let TriggerStatement::For(inner) = outer.block.statements[0] else {
+                panic!("inner numeric loop")
+            };
+            let (locals, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            let changed = workspace.alloc_slice_with(128, |_| b'a').unwrap();
+            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            let Step::Enter(entry) = start_numeric_loop(
+                inner,
+                1,
+                2,
+                1,
+                false,
+                PlpgsqlScope::frame(3),
+                locals,
+                values,
+                &mut execution.status,
+            )
+            .unwrap() else {
+                panic!("inner entry")
+            };
+            frames.enter(entry);
+            let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            let changed = workspace.alloc_slice_with(256, |_| b'b').unwrap();
+            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            frames.last_mut().next = 1;
+        }
+        execution.status.control_frames = Some(retained);
+        execution.suspend().ok().unwrap()
+    });
+    original.reset();
+    workspace.reset();
+    original.alloc_slice_with(4096, |_| 0xffu8).unwrap();
+    workspace.alloc_slice_with(8192, |_| 0xffu8).unwrap();
+    drop((original, workspace));
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        // An identical replacement image still cannot change the selected body.
+        let (_, replacement) =
+            parse_owned_program(SOURCE, &parsing, &controls, PlpgsqlProgramKind::Anonymous)
+                .unwrap();
+        let before = partial.used();
+        let (unchanged, error) = saved.restore(&partial, &replacement).err().unwrap();
+        assert_eq!(error.sqlstate, "40001");
+        assert_eq!(partial.used(), before);
+        drop(replacement);
+        unchanged
+    });
+    parsing.reset();
+    let (saved, source) = crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = saved.source().parse(&parsing).unwrap();
+        let (saved, error) = saved.restore(&partial, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        // Both numeric images fitted before the ordinary 4096-byte local failed.
+        assert!(partial.used() > 256);
+        let source = saved.source().clone();
+        (saved, source)
+    });
+    parsing.reset();
+    crate::mem::guard::forbid_alloc(|| {
+        parsing.alloc_slice_with(1024, |_| 0xaau8).unwrap();
+        let (_, code) = source.parse(&parsing).unwrap();
+        let mut execution = saved.restore(&output, &code).ok().unwrap();
+        assert!(execution.locals[0].constant);
+        assert!(execution.locals[1].not_null);
+        assert_eq!(execution.locals[1].type_mod, 4128);
+        assert_eq!(execution.values[0], Datum::Text("outside counter"));
+        assert!(
+            matches!(execution.values[1], Datum::Text(value) if value.len() == 4096 && value.bytes().all(|byte| byte == b'z'))
+        );
+        assert_eq!(execution.status.found, Some(true));
+        assert_eq!(execution.status.row_count, 37);
+        assert_eq!(execution.status.outputs[0].shadow_depth, 1);
+        assert_eq!(
+            execution.status.outputs[0].value.read(0, &output).unwrap(),
+            Datum::Text("outside counter")
+        );
+        // Restored values borrow the destination, not the released saved images.
+        let mut overwritten = rows.lease::<u8>(64 << 10).unwrap();
+        overwritten.extend_from_slice(&[0xff; 4096]).unwrap();
+        drop(overwritten);
+        let mut retained = execution.status.control_frames.take().unwrap();
+        let mut frames = retained.execution(&output, &code).unwrap();
+        assert_eq!(frames.state.active, 3);
+        assert_eq!(frames.last().next, 1);
+        let (_, current, _) = frames.scope(&execution.locals, &mut execution.values);
+        assert_eq!(current[0], Datum::Int4(1));
+        assert_eq!(current[2], Datum::Int4(1));
+        assert!(
+            matches!(current[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+        );
+        let inner = frames.pop();
+        frames.finish(
+            inner,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        let outer = frames.pop();
+        frames.finish(
+            outer,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        assert_eq!(execution.values[0], Datum::Text("outside counter"));
+        assert!(
+            matches!(execution.values[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+        );
+        let root = frames.pop();
+        frames.finish(
+            root,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        execution.status.control_frames = Some(retained);
+        drop((execution, code, source));
+        assert_eq!(controls.lease::<u8>(32 << 10).unwrap().capacity(), 32 << 10);
+        assert_eq!(rows.lease::<u8>(64 << 10).unwrap().capacity(), 64 << 10);
     });
 }

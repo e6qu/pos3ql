@@ -34,7 +34,7 @@ fn numeric_scope_owners_outlive_layout_and_syntax_without_borrowing_their_memory
             PlpgsqlProgramKind::Anonymous,
         )
         .unwrap();
-        let frames = NumericLoopFrames::new(&layout, program.body, &[], &pool).unwrap();
+        let frames = NumericLoopFrames::new(&layout, program.body, &[], &pool, &pool).unwrap();
         assert_eq!(layout.used(), 0);
         frames
     });
@@ -78,7 +78,7 @@ fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservat
     let locals = layout_locals(&program, &parse);
     crate::mem::guard::forbid_alloc(|| {
         let held = pool.lease::<u8>(64).unwrap();
-        let error = NumericLoopFrames::new(&arena, program.body, locals, &pool)
+        let error = NumericLoopFrames::new(&arena, program.body, locals, &pool, &pool)
             .err()
             .unwrap();
         assert_eq!(error.sqlstate, "54000");
@@ -86,7 +86,8 @@ fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservat
         drop(held);
         assert_eq!(pool.lease::<u8>(8192).unwrap().capacity(), 8192);
 
-        let mut frames = NumericLoopFrames::new(&arena, program.body, locals, &pool).unwrap();
+        let mut frames =
+            NumericLoopFrames::new(&arena, program.body, locals, &pool, &pool).unwrap();
         let mut outer = frames.take().unwrap();
         let inner = frames.take().unwrap();
         outer.locals[0] = locals[0];
@@ -121,9 +122,14 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let mut frames =
-            NumericLoopFrames::new(&arena, program.body, layout_locals(&program, &parse), &pool)
-                .unwrap();
+        let mut frames = NumericLoopFrames::new(
+            &arena,
+            program.body,
+            layout_locals(&program, &parse),
+            &pool,
+            &pool,
+        )
+        .unwrap();
         let mark = arena.mark();
         let mut prior_high_water = None;
         for _ in 0..256 {
@@ -227,6 +233,7 @@ fn every_procedural_branch_reserves_exact_numeric_scope_capacity() {
                 program.body,
                 layout_locals(&program, &parse),
                 &pool,
+                &pool,
             )
             .unwrap();
             let mut held = [None, None];
@@ -264,14 +271,20 @@ fn reservation_failure_names_statement_memory_without_heap_growth() {
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let empty =
-            NumericLoopFrames::new(&arena, TriggerBlock { statements: &[] }, &[], &pool).unwrap();
+            NumericLoopFrames::new(&arena, TriggerBlock { statements: &[] }, &[], &pool, &pool)
+                .unwrap();
         assert_eq!(empty.active, 0);
         assert_eq!(arena.used(), 0);
         drop(empty);
-        let error =
-            NumericLoopFrames::new(&arena, program.body, layout_locals(&program, &parse), &pool)
-                .err()
-                .unwrap();
+        let error = NumericLoopFrames::new(
+            &arena,
+            program.body,
+            layout_locals(&program, &parse),
+            &pool,
+            &pool,
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert_eq!(
             error.message.as_str(),

@@ -1,15 +1,45 @@
 //! Lexical positions, declared types and live values share one execution owner.
 
 use super::*;
+use crate::mem::lease_pool::SharedSlice;
 
-pub(super) struct ExecutionFrame<'a> {
-    pub(super) locals: MutableSlice<TriggerLocalDecl>,
-    pub(super) values: local_values::LocalValues<'a>,
-    pub(super) status: TriggerExecutionStatus<'a>,
+pub(super) struct ExecutionFrame<'declarations, 'values> {
+    pub(super) locals: LocalDeclarations<'declarations>,
+    pub(super) values: local_values::LocalValues<'values>,
+    pub(super) status: TriggerExecutionStatus<'values>,
+}
+
+pub(super) enum LocalDeclarations<'a> {
+    Borrowed {
+        values: &'a [TriggerLocalDecl],
+        controls: std::sync::Arc<LeasePool>,
+    },
+    Owned(SharedSlice<TriggerLocalDecl>),
+}
+
+impl LocalDeclarations<'_> {
+    fn capture(&self) -> Result<SharedSlice<TriggerLocalDecl>, SqlError> {
+        match self {
+            Self::Borrowed { values, controls } => controls
+                .copy_slice(values)
+                .map_err(control_flow::execution_full),
+            Self::Owned(values) => Ok(values.clone()),
+        }
+    }
+}
+
+impl core::ops::Deref for LocalDeclarations<'_> {
+    type Target = [TriggerLocalDecl];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed { values, .. } => values,
+            Self::Owned(values) => values,
+        }
+    }
 }
 
 pub(super) struct SuspendedExecutionFrame {
-    locals: MutableSlice<TriggerLocalDecl>,
+    locals: SharedSlice<TriggerLocalDecl>,
     values: local_values::LocalValues<'static>,
     numeric_frames: NumericLoopFrames<'static>,
     control_frames: control_flow::SuspendedControlFrames,
@@ -19,32 +49,29 @@ pub(super) struct SuspendedExecutionFrame {
     outputs: MutableSlice<OutputBinding>,
 }
 
-impl<'a> ExecutionFrame<'a> {
+impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
     pub(super) fn new(
         arena: &Arena,
         program: &CompiledProgram<'_>,
-        declarations: &[TriggerLocalDecl],
+        declarations: &'declarations [TriggerLocalDecl],
         output_count: usize,
         controls: &std::sync::Arc<LeasePool>,
         rows: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let mut locals = controls
-            .lease(declarations.len())
-            .map_err(control_flow::execution_full)?;
-        locals
-            .extend_from_slice(declarations)
-            .map_err(control_flow::execution_full)?;
         Ok(Self {
-            values: local_values::LocalValues::new(controls, rows, locals.len())?,
+            values: local_values::LocalValues::new(controls, rows, declarations.len())?,
             status: TriggerExecutionStatus::new(
                 arena,
                 program,
-                &locals,
+                declarations,
                 output_count,
                 controls,
                 rows,
             )?,
-            locals,
+            locals: LocalDeclarations::Borrowed {
+                values: declarations,
+                controls: std::sync::Arc::clone(controls),
+            },
         })
     }
 
@@ -53,6 +80,12 @@ impl<'a> ExecutionFrame<'a> {
         reason = "failed capture returns the live execution owner without allocating"
     )]
     pub(super) fn suspend(mut self) -> Result<SuspendedExecutionFrame, (Self, SqlError)> {
+        // Normal calls keep using their compiled declarations. Only an actual
+        // pause needs an independent metadata image; resumed calls share it.
+        let locals = match self.locals.capture() {
+            Ok(locals) => locals,
+            Err(error) => return Err((self, error)),
+        };
         let captured = self.values.capture().and_then(|()| {
             self.status
                 .control_frames
@@ -78,7 +111,7 @@ impl<'a> ExecutionFrame<'a> {
             outputs,
         } = self.status;
         Ok(SuspendedExecutionFrame {
-            locals: self.locals,
+            locals,
             values: self.values.suspend(),
             numeric_frames: numeric_frames.suspend(),
             control_frames: control_frames
@@ -105,7 +138,7 @@ impl SuspendedExecutionFrame {
         self,
         arena: &'out Arena,
         program: &CompiledProgram<'_>,
-    ) -> Result<ExecutionFrame<'out>, (Self, SqlError)> {
+    ) -> Result<ExecutionFrame<'out, 'out>, (Self, SqlError)> {
         let Self {
             locals,
             values,
@@ -157,7 +190,7 @@ impl SuspendedExecutionFrame {
         values.discard_saved();
         control_frames.discard_saved();
         Ok(ExecutionFrame {
-            locals,
+            locals: LocalDeclarations::Owned(locals),
             values,
             status: TriggerExecutionStatus {
                 numeric_frames: numeric_frames.rebind(),

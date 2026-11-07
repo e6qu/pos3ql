@@ -96,6 +96,9 @@ Restore the whole frame before publishing it. If a later local value exceeds
 destination memory after earlier loop scopes have decoded, retain all original
 images and reservations without leaving references into the failed destination.
 Dropping a paused call must return both its control and row-work capacity.
+Capture ordinary declarations only when needed for a pause, and share that
+image through subsequent pauses. Preserve normal-call memory admission and
+keep each nested write's selection owner separate from the enclosing write.
 Saved output bytes now own reusable control-pool ranges independent of their
 source arenas. Preserve that ownership, the outer value through nested counters,
 failure-preserving growth, rollback and reuse after exhaustion, and decoded

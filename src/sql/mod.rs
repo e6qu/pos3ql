@@ -735,30 +735,18 @@ pub struct CopyRowContext<'a, 'response> {
     guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
-    dml_scratch: CopyDmlScratch<'a>,
     transition_rows: &'a mut exec::CopyTransitionRows,
-}
-
-enum CopyDmlScratch<'a> {
-    ActiveWorkspace,
-    SubscriptionWorker(&'a mut exec::DmlScratch),
 }
 
 pub(crate) struct SubscriptionCopyWorkspace<'a> {
     arena: &'a mut Arena,
-    dml_scratch: &'a mut exec::DmlScratch,
     transition_rows: &'a exec::CopyTransitionRows,
 }
 
 impl<'a> SubscriptionCopyWorkspace<'a> {
-    pub(crate) fn new(
-        arena: &'a mut Arena,
-        dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a exec::CopyTransitionRows,
-    ) -> Self {
+    pub(crate) fn new(arena: &'a mut Arena, transition_rows: &'a exec::CopyTransitionRows) -> Self {
         Self {
             arena,
-            dml_scratch,
             transition_rows,
         }
     }
@@ -777,25 +765,6 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
             guc,
             arena,
             responder,
-            dml_scratch: CopyDmlScratch::ActiveWorkspace,
-            transition_rows,
-        }
-    }
-
-    pub(crate) fn for_subscription_worker(
-        txn: &'a mut TxnState,
-        guc: &'a GucState,
-        arena: &'a Arena,
-        responder: &'a mut Responder<'response>,
-        dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a mut exec::CopyTransitionRows,
-    ) -> Self {
-        Self {
-            txn,
-            guc,
-            arena,
-            responder,
-            dml_scratch: CopyDmlScratch::SubscriptionWorker(dml_scratch),
             transition_rows,
         }
     }
@@ -2767,10 +2736,6 @@ impl Engine {
         self.work.select(workspace);
         self.wal.select_database(self.work.database_oid());
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
-    }
-
-    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
-        &self.storage.row_work
     }
 
     pub(crate) fn release_query_workspace_rows(&mut self, workspace: QueryWorkspaceId) {
@@ -8506,7 +8471,6 @@ impl Engine {
             arena,
             guc.seq_session(),
             responder,
-            &mut *self.dml_scratch,
             boundary,
         )
     }
@@ -10613,10 +10577,6 @@ impl Engine {
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
-        let scratch = match context.dml_scratch {
-            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
-            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
-        };
         exec::copy_row(
             &mut self.storage,
             context.txn,
@@ -10625,7 +10585,6 @@ impl Engine {
             line,
             context.arena,
             context.responder,
-            scratch,
             context.transition_rows,
         )
     }
@@ -10653,10 +10612,6 @@ impl Engine {
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
-        let scratch = match context.dml_scratch {
-            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
-            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
-        };
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
@@ -10665,7 +10620,6 @@ impl Engine {
             row,
             context.arena,
             context.responder,
-            scratch,
             context.transition_rows,
         )
     }
@@ -10680,56 +10634,13 @@ impl Engine {
     ) -> Result<(), SqlError> {
         let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
-        Self::copy_start_with_scratch(
-            &mut self.storage,
-            setup,
-            txn,
-            guc,
-            arena,
-            responder,
-            &mut self.dml_scratch,
-        )
-    }
-
-    pub(crate) fn subscription_copy_start(
-        &mut self,
-        setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        guc: &GucState,
-        arena: &Arena,
-        responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
-    ) -> Result<(), SqlError> {
-        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
-        let _atomic_reads = self.atomic_block_read_scope();
-        Self::copy_start_with_scratch(
-            &mut self.storage,
-            setup,
-            txn,
-            guc,
-            arena,
-            responder,
-            scratch,
-        )
-    }
-
-    fn copy_start_with_scratch(
-        storage: &mut Storage,
-        setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        guc: &GucState,
-        arena: &Arena,
-        responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
-    ) -> Result<(), SqlError> {
         exec::copy_statement_begin(
-            storage,
+            &mut self.storage,
             txn,
             setup,
             guc.seq_session(),
             arena,
             responder,
-            scratch,
         )
     }
 
@@ -10780,14 +10691,13 @@ impl Engine {
             exec::TriggerQueueBoundary::Statement
         };
         self.work.reset();
-        let result = Self::copy_finish_with_scratch(
+        let result = Self::finish_copy_statement(
             &mut self.storage,
             &self.work,
             setup,
             txn,
             guc,
             responder,
-            &mut self.dml_scratch,
             inserted,
             boundary,
         );
@@ -10835,14 +10745,13 @@ impl Engine {
         } else {
             exec::TriggerQueueBoundary::Statement
         };
-        Self::copy_finish_with_scratch(
+        Self::finish_copy_statement(
             &mut self.storage,
             workspace.arena,
             setup,
             txn,
             guc,
             responder,
-            workspace.dml_scratch,
             workspace.transition_rows,
             boundary,
         )?;
@@ -10856,14 +10765,13 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "COPY completion binds its statement state and caller-owned fixed scratch"
     )]
-    fn copy_finish_with_scratch(
+    fn finish_copy_statement(
         storage: &mut Storage,
         arena: &Arena,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
         responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
         inserted: &exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
@@ -10875,7 +10783,6 @@ impl Engine {
             guc.seq_session(),
             arena,
             responder,
-            scratch,
             inserted,
         )?;
         exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
@@ -10885,7 +10792,6 @@ impl Engine {
             arena,
             guc.seq_session(),
             responder,
-            scratch,
             boundary,
         )?;
         txn.compact_completed_constraints();
@@ -13802,7 +13708,6 @@ impl Engine {
             let outcome = match dml {
                 Stmt::Merge(_) => Self::execute_merge(
                     &mut self.storage,
-                    &mut self.dml_scratch,
                     &self.work,
                     dml,
                     txn,
@@ -14727,7 +14632,6 @@ impl Engine {
         if let Err(error) = exec::fire_view_statement_triggers(
             storage,
             txn,
-            scratch,
             arena,
             guc.seq_session(),
             responder,
@@ -14759,7 +14663,6 @@ impl Engine {
         if let Err(error) = exec::fire_view_statement_triggers(
             storage,
             txn,
-            scratch,
             arena,
             guc.seq_session(),
             responder,
@@ -14786,7 +14689,6 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute_merge<'a, 'capture>(
         storage: &mut Storage,
-        scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
@@ -14818,7 +14720,6 @@ impl Engine {
         exec::merge(
             storage,
             txn,
-            scratch,
             expanded,
             arena,
             params,
@@ -14973,7 +14874,6 @@ impl Engine {
                 exec::insert(
                     storage,
                     txn,
-                    scratch,
                     insert,
                     authorization,
                     view_check,
@@ -15523,7 +15423,6 @@ impl Engine {
                             }
                             Stmt::Merge(_) => Self::execute_merge(
                                 &mut self.storage,
-                                &mut self.dml_scratch,
                                 arena,
                                 statement,
                                 txn,
@@ -17669,7 +17568,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -17746,7 +17644,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -20704,7 +20601,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 arena,
                 statement,
                 txn,
@@ -20729,7 +20625,6 @@ impl Engine {
             } => exec::truncate(
                 &mut self.storage,
                 txn,
-                &mut self.dml_scratch,
                 arena,
                 guc.seq_session(),
                 tables,

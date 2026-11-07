@@ -19146,7 +19146,6 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -77891,7 +77890,6 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         engine.subscription_confirmed_lsn("apply_changes").unwrap(),
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let relation = [
@@ -78240,7 +78238,6 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         121,
         no_origin_behavior,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     begin[8] = 130;
@@ -78319,15 +78316,7 @@ fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
         .unwrap()
         .1
         .behavior;
-    let mut apply = SubscriptionApply::new(
-        &mut budget,
-        stream,
-        &config,
-        0,
-        behavior,
-        std::sync::Arc::clone(&engine.storage.row_work),
-    )
-    .unwrap();
+    let mut apply = SubscriptionApply::new(&mut budget, stream, &config, 0, behavior).unwrap();
     let relation = [
         b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b's', b't', b'r', b'e', b'a',
         b'm', b'e', b'd', b'_', b'r', b'o', b'w', b's', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0,
@@ -78600,7 +78589,6 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -91763,7 +91751,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
     );
     session.transaction.begin_command().unwrap();
     let capture_arena = Arena::new(&mut budget, "retained DML test", 1 << 20).unwrap();
-    let mut scratch = engine.row_work_pool().lease(0).unwrap();
+    let mut scratch = engine.storage.row_work.lease(0).unwrap();
     let images = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::collect_matches(
             &engine.storage,
@@ -92650,7 +92638,7 @@ fn alter_rewrite_sources_keep_selected_pending_and_saved_bytes_after_rollback_an
         session.success(&mut engine,
             "BEGIN; UPDATE alter_source SET amount = amount + 100 WHERE id = 2; DELETE FROM alter_source WHERE id = 3", true);
         let table = engine.storage.find_table("public", "alter_source").unwrap();
-        let mut scratch = engine.row_work_pool().lease(0).unwrap();
+        let mut scratch = engine.storage.row_work.lease(0).unwrap();
         let arena = Arena::new(&mut budget, "alter selected source", 2 << 20).unwrap();
         let source = crate::mem::guard::forbid_alloc(|| {
             exec::capture_alter_rewrite_rows(
@@ -92740,7 +92728,7 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
     )
     .unwrap();
     let mut short = short_pool.lease(0).unwrap();
-    let mut complete = engine.row_work_pool().lease(0).unwrap();
+    let mut complete = engine.storage.row_work.lease(0).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let error = exec::capture_alter_rewrite_rows(
             &engine.storage,
@@ -92920,7 +92908,6 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let schema = SqlName::parse("public").unwrap();
@@ -93471,7 +93458,6 @@ fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     receive(

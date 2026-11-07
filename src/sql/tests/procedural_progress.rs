@@ -1189,3 +1189,29 @@ fn checked_array_inputs_in_row_triggers_keep_inserted_rows_and_prior_effects() {
         );
     }
 }
+
+#[test]
+fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-write-selection-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/266_nested_write_selection.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["63|396|123|141|10|0|2|3|8193|3|4"],
+            "{mode:?}"
+        );
+    }
+}

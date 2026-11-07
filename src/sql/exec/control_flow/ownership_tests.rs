@@ -1596,3 +1596,62 @@ fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity()
         assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
     });
 }
+
+#[test]
+fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        4096,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "declaration capture syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "declaration capture values", 8192).unwrap();
+    let output = Arena::new(&mut budget, "declaration capture output", 8192).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let declarations = [TriggerLocalDecl {
+            name: SqlName::parse("selected").unwrap(),
+            ctype: ColType::Text,
+            constant: true,
+            ..empty_plpgsql_local()
+        }];
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &declarations, 0, &controls, &rows).unwrap();
+        execution.values[0] = Datum::Text(workspace.alloc_str("live value").unwrap());
+        let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
+        let held = controls.lease::<u8>(free).unwrap();
+        let (execution, error) = execution.suspend().err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_bytes"));
+        assert_eq!(execution.values[0], Datum::Text("live value"));
+        assert_eq!(rows.lease::<u8>(4096).unwrap().capacity(), 4096);
+        drop(held);
+        let saved = execution.suspend().ok().unwrap();
+        let execution = saved.restore(&output, &code).ok().unwrap();
+        assert!(execution.locals[0].constant);
+        assert_eq!(execution.values[0], Datum::Text("live value"));
+        let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
+        let saved = execution.suspend().ok().unwrap();
+        assert_eq!(controls.lease::<u8>(4096).err().unwrap().free_bytes, free);
+        drop((saved, code));
+        assert_eq!(controls.lease::<u8>(4096).unwrap().capacity(), 4096);
+        assert_eq!(rows.lease::<u8>(4096).unwrap().capacity(), 4096);
+    });
+}

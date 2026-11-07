@@ -18,7 +18,6 @@ pub(super) fn prepare_move<'arena>(
     params: &[Datum<'arena>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: *mut DmlScratch,
 ) -> Result<bool, SqlError> {
     let (old_table, rowid, _) = selected.local_parts();
     if !fire_partition_row_triggers(
@@ -27,7 +26,6 @@ pub(super) fn prepare_move<'arena>(
         arena,
         seq_session,
         responder,
-        scratch,
         old_table,
         old_definition,
         TriggerEvents::DELETE,
@@ -62,7 +60,6 @@ pub(super) fn prepare_move<'arena>(
         arena,
         seq_session,
         responder,
-        scratch,
         target,
         definition,
         TriggerEvents::INSERT,
@@ -97,7 +94,6 @@ pub(super) fn prepare_move<'arena>(
             arena,
             seq_session,
             responder,
-            scratch,
             old_table,
             old_definition,
             TriggerEvents::DELETE,
@@ -127,7 +123,6 @@ pub(super) fn fire_after_move<'arena>(
     arena: &'arena Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: *mut DmlScratch,
 ) -> Result<(), SqlError> {
     fire_partition_row_triggers(
         storage,
@@ -135,7 +130,6 @@ pub(super) fn fire_after_move<'arena>(
         arena,
         seq_session,
         responder,
-        scratch,
         old_table,
         old_definition,
         TriggerEvents::DELETE,
@@ -151,7 +145,6 @@ pub(super) fn fire_after_move<'arena>(
         arena,
         seq_session,
         responder,
-        scratch,
         target,
         definition,
         TriggerEvents::INSERT,

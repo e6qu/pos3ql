@@ -328,8 +328,8 @@ its saved values own separate byte ranges in the same pool. The same owner holds
 the position and resource directories, so they cannot be rebound to a different
 call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
-descriptions and value-slot arrays in the control pool. Each call also owns its
-resolved ordinary local declarations, value slots and execution status together.
+descriptions and value-slot arrays in the control pool. Each call pairs its
+resolved ordinary declarations, value slots and execution status together.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges
@@ -337,11 +337,19 @@ owned until that scope is returned or dropped.
 Active value slots borrow variable-length payloads in statement memory. Internal
 frame suspension saves ordinary and active numeric values as typed rows in the
 shared row-work pool, then clears every borrowed reference while retaining the
-original slot ranges. Restoration copies each saved row once and decodes all its
+original slot ranges. Only pausing captures the ordinary declarations into a
+control-pool image; normal calls borrow compiled declarations, and repeated
+pauses share the captured image. Restoration copies each saved row once and decodes all its
 columns in one pass. Images are released only after every scope has restored;
 destination exhaustion preserves all images and reservations. This frame owner
 alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.
+Nested procedural updates and deletes own independent row-selection ranges in
+the shared row-work pool. They do not replace the caller's selection or borrow
+it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry
+an unused row-selection workspace. For example, a trigger updating another table
+must leave its caller's remaining target rows intact even when it catches an
+error and rolls back a nested delete.
 Binding a view checks the source owner and execution workspace before entering
 the body. A different source image, even with identical text, or a foreign/reset
 workspace returns `40001`. Source capture returns `54000` naming the execution
@@ -693,8 +701,9 @@ saved output bytes and caught error directories and text.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
 one immutable byte range for its actual source text, shared by compiled syntax
 and retained positions. It also reserves two ranges for its position and
-resource directories, sized to maximum lexical nesting, plus separate ranges for
-nonempty local declarations and value arrays. Set-returning
+resource directories, sized to maximum lexical nesting, plus a range for
+nonempty local-value arrays. Pausing also captures actual ordinary declarations;
+resuming and pausing again share that image. Set-returning
 functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
 local descriptions and value slots. Calls with exception handlers reserve one

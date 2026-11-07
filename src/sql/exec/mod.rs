@@ -367,25 +367,21 @@ pub const MAX_PROJ: usize = 1_664;
 /// scratch is statically bounded, including PostgreSQL's complete result width.
 pub const QUERY_STACK_BYTES: usize = 128 << 20;
 
-/// Fixed resources needed when logical apply invokes the ordinary trigger
-/// executor. The worker owns all three at startup, so a remote row cannot
-/// create an unbounded execution path.
+/// Apply uses its worker's session and bounded response buffer. Nested writes
+/// own their selection ranges in the shared startup row-work pool.
 pub(crate) struct ReplicationTriggerContext<'a, 'response> {
     seq_session: &'a crate::sql::guc::SeqSession,
     responder: &'a mut Responder<'response>,
-    scratch: &'a mut DmlScratch,
 }
 
 impl<'a, 'response> ReplicationTriggerContext<'a, 'response> {
     pub(crate) fn new(
         seq_session: &'a crate::sql::guc::SeqSession,
         responder: &'a mut Responder<'response>,
-        scratch: &'a mut DmlScratch,
     ) -> Self {
         Self {
             seq_session,
             responder,
-            scratch,
         }
     }
 }
@@ -403,7 +399,6 @@ pub(crate) fn finish_replication_row(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: context.scratch as *mut _,
                 seq_session: context.seq_session,
             },
             txn,
@@ -6002,7 +5997,6 @@ fn handle_conflict<
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<ConflictOutcome<'a>, SqlError>
@@ -6262,7 +6256,6 @@ where
         arena,
         seq_session,
         responder,
-        scratch as *mut _,
         table_index,
         def,
         TriggerEvents::UPDATE,
@@ -6406,7 +6399,6 @@ where
         arena,
         seq_session,
         responder,
-        scratch as *mut _,
         table_index,
         def,
         TriggerEvents::UPDATE,
@@ -21829,7 +21821,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
             if program_kind == PlpgsqlProgramKind::OutputFunction =>
         {
-            plpgsql_output_value(engine, routine, locals, &local_values, txn.txid, arena)
+            plpgsql_output_value(engine, routine, locals, local_values, txn.txid, arena)
         }
         None => Err(sql_err!(
             sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
@@ -23001,9 +22993,6 @@ fn snapshot_trigger_dml_scope<'a>(
 enum PlpgsqlExecHost<'s> {
     Atomic {
         storage: &'s mut Storage,
-        // Nested DML reuses the caller's startup-sized scratch only after the
-        // outer scan is detached; the pointer is never borrowed concurrently.
-        scratch: *mut DmlScratch,
         seq_session: &'s crate::sql::guc::SeqSession,
     },
     Routine {
@@ -23021,11 +23010,9 @@ impl PlpgsqlExecHost<'_> {
         match self {
             PlpgsqlExecHost::Atomic {
                 storage,
-                scratch,
                 seq_session,
             } => PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: *scratch,
                 seq_session,
             },
             PlpgsqlExecHost::Routine {
@@ -23055,13 +23042,6 @@ impl PlpgsqlExecHost<'_> {
         match self {
             Self::Atomic { storage, .. } => storage,
             Self::Routine { engine, .. } => &mut engine.storage,
-        }
-    }
-
-    fn scratch(&mut self) -> *mut DmlScratch {
-        match self {
-            Self::Atomic { scratch, .. } => *scratch,
-            Self::Routine { engine, .. } => &mut *engine.dml_scratch,
         }
     }
 
@@ -23165,10 +23145,6 @@ impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
         self.host.storage_mut()
     }
 
-    fn scratch(&mut self) -> *mut DmlScratch {
-        self.host.scratch()
-    }
-
     fn seq_session(&self) -> &crate::sql::guc::SeqSession {
         self.host.seq_session()
     }
@@ -23178,23 +23154,19 @@ impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
     ) -> (
         &'borrow mut Storage,
         &'borrow mut TxnState,
-        *mut DmlScratch,
         &'borrow mut Responder<'b>,
         &'borrow crate::sql::guc::SeqSession,
     ) {
-        let (storage, scratch, seq_session) = match &mut self.host {
+        let (storage, seq_session) = match &mut self.host {
             PlpgsqlExecHost::Atomic {
                 storage,
-                scratch,
                 seq_session,
-            } => (&mut **storage, *scratch, *seq_session),
-            PlpgsqlExecHost::Routine { engine, guc, .. } => (
-                &mut engine.storage,
-                &mut *engine.dml_scratch as *mut _,
-                guc.seq_session(),
-            ),
+            } => (&mut **storage, *seq_session),
+            PlpgsqlExecHost::Routine { engine, guc, .. } => {
+                (&mut engine.storage, guc.seq_session())
+            }
         };
-        (storage, self.txn, scratch, self.responder, seq_session)
+        (storage, self.txn, self.responder, seq_session)
     }
 }
 
@@ -23841,9 +23813,8 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     };
                     let arena = context.arena;
                     let params = query.arguments;
-                    let (storage, txn, scratch, responder, seq_session) =
-                        context.dml_parts_with_sequence();
-                    let scratch = unsafe { &mut *scratch };
+                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
                     responder.clear_affected_rows();
@@ -23851,7 +23822,6 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                         insert(
                             storage,
                             txn,
-                            scratch,
                             statement,
                             DmlAuthorization::Invoker,
                             None,
@@ -23875,27 +23845,24 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     dynamic_dml_outcome(responder, outcome, "INSERT")
                 }
                 Stmt::Update(statement) => {
-                    let scratch = unsafe { &mut *context.scratch() };
                     let arena = context.arena;
                     let params = query.arguments;
-                    let (storage, txn, _, responder, seq_session) =
-                        context.dml_parts_with_sequence();
+                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
-                    let nested = scratch.pool().lease(0).map_err(|error| {
+                    let mut scratch = storage.row_work.lease(0).map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "nested DML selection: {}",
                             error
                         )
                     })?;
-                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_query_output(|responder| {
                         update(
                             storage,
                             txn,
-                            scratch,
+                            &mut scratch,
                             statement,
                             DmlAuthorization::Invoker,
                             None,
@@ -23908,31 +23875,27 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                         )
                     });
                     drop(command);
-                    *scratch = saved;
                     dynamic_dml_outcome(responder, outcome, "UPDATE")
                 }
                 Stmt::Delete(statement) => {
-                    let scratch = unsafe { &mut *context.scratch() };
                     let arena = context.arena;
                     let params = query.arguments;
-                    let (storage, txn, _, responder, seq_session) =
-                        context.dml_parts_with_sequence();
+                    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
-                    let nested = scratch.pool().lease(0).map_err(|error| {
+                    let mut scratch = storage.row_work.lease(0).map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "nested DML selection: {}",
                             error
                         )
                     })?;
-                    let saved = core::mem::replace(scratch, nested);
                     responder.clear_affected_rows();
                     let outcome = responder.without_query_output(|responder| {
                         delete(
                             storage,
                             txn,
-                            scratch,
+                            &mut scratch,
                             statement,
                             DmlAuthorization::Invoker,
                             arena,
@@ -23944,7 +23907,6 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                         )
                     });
                     drop(command);
-                    *scratch = saved;
                     dynamic_dml_outcome(responder, outcome, "DELETE")
                 }
                 _ => Err(sql_err!(
@@ -25632,7 +25594,6 @@ fn execute_bound_plpgsql_utility<'a>(
                 } => super::exec::truncate(
                     &mut engine.storage,
                     txn,
-                    &mut engine.dml_scratch,
                     context.arena,
                     guc.seq_session(),
                     tables,
@@ -28446,8 +28407,8 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             };
             let arena = context.arena;
             let params = context.params;
-            let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
-            let scratch = unsafe { &mut *scratch };
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
+
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
             responder.clear_affected_rows();
@@ -28455,7 +28416,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 insert(
                     storage,
                     txn,
-                    scratch,
                     &statement,
                     DmlAuthorization::Invoker,
                     None,
@@ -28525,7 +28485,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 }
                 None => statement,
             };
-            let scratch = unsafe { &mut *context.scratch() };
             let transition = TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
                 old,
@@ -28540,23 +28499,22 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             };
             let arena = context.arena;
             let params = context.params;
-            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
-            let nested = scratch.pool().lease(0).map_err(|error| {
+            let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "nested DML selection: {}",
                     error
                 )
             })?;
-            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
                 update(
                     storage,
                     txn,
-                    scratch,
+                    &mut scratch,
                     &statement,
                     DmlAuthorization::Invoker,
                     None,
@@ -28569,7 +28527,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 )
             });
             drop(command);
-            *scratch = saved;
             match outcome {
                 Ok(Ok(())) => status.set_rows(
                     context
@@ -28619,7 +28576,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 }
                 None => statement,
             };
-            let scratch = unsafe { &mut *context.scratch() };
             let transition = TriggerTransition {
                 definition: crate::storage::RelationDefinition::from_definition(definition),
                 old,
@@ -28634,23 +28590,22 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             };
             let arena = context.arena;
             let params = context.params;
-            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
+            let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
-            let nested = scratch.pool().lease(0).map_err(|error| {
+            let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "nested DML selection: {}",
                     error
                 )
             })?;
-            let saved = core::mem::replace(scratch, nested);
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
                 delete(
                     storage,
                     txn,
-                    scratch,
+                    &mut scratch,
                     &statement,
                     DmlAuthorization::Invoker,
                     arena,
@@ -28662,7 +28617,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 )
             });
             drop(command);
-            *scratch = saved;
             match outcome {
                 Ok(Ok(())) => status.set_rows(
                     context
@@ -29564,13 +29518,12 @@ fn fire_row_triggers<
         );
         let arena = context.arena;
         let params = context.params;
-        let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
+        let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
         if matches!(
             fire_row_trigger_slot(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch,
                         seq_session
                     },
                     txn,
@@ -29613,7 +29566,6 @@ fn execute_deferred_trigger_event<'a>(
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: *mut DmlScratch,
     index: usize,
     trigger_slot: u16,
     table: u16,
@@ -29653,7 +29605,6 @@ fn execute_deferred_trigger_event<'a>(
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Atomic {
             storage,
-            scratch,
             seq_session,
         },
         txn,
@@ -29725,14 +29676,13 @@ fn fire_statement_row_trigger_events<'a>(
             continue;
         };
         let arena = context.arena;
-        let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
+        let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
         execute_deferred_trigger_event(
             storage,
             txn,
             arena,
             seq_session,
             responder,
-            scratch,
             index,
             trigger_slot,
             table,
@@ -29751,7 +29701,6 @@ pub(crate) fn fire_constraint_triggers(
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: *mut DmlScratch,
     boundary: TriggerQueueBoundary,
 ) -> Result<(), SqlError> {
     let mut index = 0usize;
@@ -29810,7 +29759,6 @@ pub(crate) fn fire_constraint_triggers(
             arena,
             seq_session,
             responder,
-            scratch,
             index,
             trigger_slot,
             table,
@@ -29835,7 +29783,6 @@ fn fire_partition_row_triggers<'a, Definition0: crate::storage::DefinitionBackin
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: *mut DmlScratch,
     leaf: usize,
     definition: &crate::storage::TableDefinition<Definition0>,
     event: u8,
@@ -29888,7 +29835,6 @@ fn fire_partition_row_triggers<'a, Definition0: crate::storage::DefinitionBackin
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch,
                         seq_session
                     },
                     txn,
@@ -30232,12 +30178,11 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
     let trigger_depth = context.txn.trigger_depth();
     let arena = context.arena;
     let params = context.params;
-    let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
+    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
     fire_statement_row_trigger_events(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch,
                 seq_session,
             },
             txn,
@@ -58192,7 +58137,6 @@ pub(crate) fn copy_statement_begin(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
 ) -> Result<(), SqlError> {
     let _files = setup.restore_snapshot(storage)?;
     let definition = setup
@@ -58213,7 +58157,6 @@ pub(crate) fn copy_statement_begin(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -58229,10 +58172,6 @@ pub(crate) fn copy_statement_begin(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "COPY completion owns its statement trigger boundary"
-)]
 pub(crate) fn copy_statement_end(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -58240,7 +58179,6 @@ pub(crate) fn copy_statement_end(
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     inserted: &CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let _files = setup.restore_snapshot(storage)?;
@@ -58271,7 +58209,6 @@ pub(crate) fn copy_statement_end(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -58368,7 +58305,6 @@ pub(crate) fn copy_row(
     line: &[u8],
     arena: &Arena,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     let coercion_txid = txn.txid;
@@ -58480,7 +58416,6 @@ pub(crate) fn copy_row(
         txn,
         seq_session,
         responder,
-        scratch,
         inserted,
         write_target,
         setup.security_role,
@@ -58508,7 +58443,6 @@ pub(crate) fn copy_row_binary(
     row: &[u8],
     arena: &Arena,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     let coercion_txid = txn.txid;
@@ -58607,7 +58541,6 @@ pub(crate) fn copy_row_binary(
         txn,
         seq_session,
         responder,
-        scratch,
         inserted,
         write_target,
         setup.security_role,
@@ -58628,7 +58561,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     txn: &mut TxnState,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     inserted: &mut CopyTransitionRows,
     logical_target: crate::storage::TableDefinitionTarget,
     security_role: Option<u16>,
@@ -58671,7 +58603,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 target,
                 physical,
                 TriggerEvents::INSERT,
@@ -58812,7 +58743,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 arena,
                 seq_session,
                 responder,
-                scratch,
                 target,
                 physical,
                 TriggerEvents::INSERT,
@@ -58940,7 +58870,6 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 arena,
                 context.seq_session,
                 context.responder,
-                context.scratch,
                 target_table,
                 definition,
                 TriggerEvents::INSERT,
@@ -58990,7 +58919,6 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
                 arena,
                 context.seq_session,
                 context.responder,
-                context.scratch,
                 target_table,
                 definition,
                 TriggerEvents::INSERT,
@@ -59340,7 +59268,6 @@ fn apply_replication_delete_row(
         arena,
         context.seq_session,
         context.responder,
-        context.scratch,
         row_table,
         definition,
         TriggerEvents::DELETE,
@@ -59387,7 +59314,6 @@ fn apply_replication_delete_row(
         arena,
         context.seq_session,
         context.responder,
-        context.scratch,
         row_table,
         definition,
         TriggerEvents::DELETE,
@@ -59544,7 +59470,6 @@ pub(crate) fn apply_replication_update(
         arena,
         context.seq_session,
         context.responder,
-        context.scratch,
         row_table,
         definition,
         TriggerEvents::UPDATE,
@@ -59620,7 +59545,6 @@ pub(crate) fn apply_replication_update(
         arena,
         context.seq_session,
         context.responder,
-        context.scratch,
         row_table,
         definition,
         TriggerEvents::UPDATE,
@@ -62303,7 +62227,6 @@ pub fn describe_merge_returning<'a>(
 pub(crate) fn merge<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     statement: &'a crate::sql::ast::Merge<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -62645,7 +62568,6 @@ pub(crate) fn merge<'a>(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch: scratch as *mut _,
                         seq_session,
                     },
                     txn,
@@ -63326,7 +63248,6 @@ pub(crate) fn merge<'a>(
                             arena,
                             seq_session,
                             responder,
-                            scratch as *mut _,
                             target_tables[j],
                             row_definition,
                             TriggerEvents::DELETE,
@@ -63424,7 +63345,6 @@ pub(crate) fn merge<'a>(
                             arena,
                             seq_session,
                             responder,
-                            scratch as *mut _,
                             target_tables[j],
                             row_definition,
                             TriggerEvents::DELETE,
@@ -63591,7 +63511,6 @@ pub(crate) fn merge<'a>(
                             arena,
                             seq_session,
                             responder,
-                            scratch as *mut _,
                             target_tables[j],
                             row_definition,
                             TriggerEvents::UPDATE,
@@ -63667,7 +63586,6 @@ pub(crate) fn merge<'a>(
                                 params,
                                 seq_session,
                                 responder,
-                                scratch as *mut _,
                             ) {
                                 Ok(true) => {}
                                 Ok(false) => break,
@@ -63883,7 +63801,6 @@ pub(crate) fn merge<'a>(
                                 arena,
                                 seq_session,
                                 responder,
-                                scratch as *mut _,
                             )
                         } else {
                             fire_partition_row_triggers(
@@ -63892,7 +63809,6 @@ pub(crate) fn merge<'a>(
                                 arena,
                                 seq_session,
                                 responder,
-                                scratch as *mut _,
                                 updated_table,
                                 new_definition,
                                 TriggerEvents::UPDATE,
@@ -64011,7 +63927,6 @@ pub(crate) fn merge<'a>(
                             &checks,
                             insert_check,
                             responder,
-                            scratch,
                             insert_transitions.as_mut(),
                         ) {
                             Ok(Some(inserted)) => {
@@ -64071,7 +63986,6 @@ pub(crate) fn merge<'a>(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch: scratch as *mut _,
                         seq_session,
                     },
                     txn,
@@ -64170,7 +64084,6 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
     checks: &ParsedChecks,
     row_security_check: Option<super::query::RowSecurityPlan<'a>>,
     responder: &mut Responder,
-    scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     let coercion_txid = txn.txid;
@@ -64302,7 +64215,6 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 target_table,
                 def,
                 TriggerEvents::INSERT,
@@ -64419,7 +64331,6 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 target_table,
                 def,
                 TriggerEvents::INSERT,
@@ -64469,7 +64380,6 @@ fn finish_insert_row<'a, 'outer, 'snapshot, Definition0: crate::storage::Definit
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
     transition_capture: Option<&mut TransitionCapture<'a>>,
     conflict_transition_capture: Option<&mut TransitionCapture<'a>>,
-    scratch: &mut DmlScratch,
     outer: Option<&'outer TriggerDmlSnapshot<'snapshot>>,
 ) -> Result<Result<bool, SqlError>, WireFull>
 where
@@ -64523,7 +64433,6 @@ where
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 table_index,
                 definition,
                 TriggerEvents::INSERT,
@@ -64641,7 +64550,6 @@ where
                     params,
                     seq_session,
                     responder,
-                    scratch,
                     outer,
                     conflict_transition_capture,
                 ) {
@@ -64751,7 +64659,6 @@ where
                 arena,
                 seq_session,
                 responder,
-                scratch,
                 table_index,
                 definition,
                 TriggerEvents::INSERT,
@@ -64890,7 +64797,6 @@ pub(crate) fn view_trigger_definition<'a>(
 pub(crate) fn fire_view_statement_triggers(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
@@ -64918,7 +64824,6 @@ pub(crate) fn fire_view_statement_triggers(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -65166,7 +65071,6 @@ pub(crate) fn instead_of_view_dml<'a>(
                     match finish_instead_of_view_new_row(
                         storage,
                         txn,
-                        scratch,
                         arena,
                         seq_session,
                         responder,
@@ -65235,7 +65139,6 @@ pub(crate) fn instead_of_view_dml<'a>(
                     match finish_instead_of_view_new_row(
                         storage,
                         txn,
-                        scratch,
                         arena,
                         seq_session,
                         responder,
@@ -65397,7 +65300,6 @@ pub(crate) fn instead_of_view_dml<'a>(
                 match fire_view_row_trigger(
                     storage,
                     txn,
-                    scratch,
                     arena,
                     seq_session,
                     responder,
@@ -65519,7 +65421,6 @@ pub(crate) fn instead_of_view_dml<'a>(
                 match fire_view_row_trigger(
                     storage,
                     txn,
-                    scratch,
                     arena,
                     seq_session,
                     responder,
@@ -65662,7 +65563,6 @@ fn materialize_view_rows<'a>(
 fn fire_view_row_trigger<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
@@ -65676,7 +65576,6 @@ fn fire_view_row_trigger<'a, Definition0: crate::storage::DefinitionBacking>(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -65699,7 +65598,6 @@ fn fire_view_row_trigger<'a, Definition0: crate::storage::DefinitionBacking>(
 fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     arena: &'a Arena,
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
@@ -65714,7 +65612,6 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     let fired = match fire_view_row_trigger(
         storage,
         txn,
-        scratch,
         arena,
         seq_session,
         responder,
@@ -65758,7 +65655,6 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
 pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     statement: &Insert<'a>,
     authorization: DmlAuthorization,
     view_check: Option<ViewCheck<'a>>,
@@ -66031,7 +65927,6 @@ where
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -66052,7 +65947,6 @@ where
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
-                    scratch: scratch as *mut _,
                     seq_session,
                 },
                 txn,
@@ -66280,7 +66174,6 @@ where
                 &mut capture,
                 transition_capture.as_mut(),
                 conflict_transition_capture.as_mut(),
-                scratch,
                 conflict_outer,
             )? {
                 Ok(true) => inserted += 1,
@@ -66293,7 +66186,6 @@ where
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch: scratch as *mut _,
                         seq_session,
                     },
                     txn,
@@ -66316,7 +66208,6 @@ where
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
-                    scratch: scratch as *mut _,
                     seq_session,
                 },
                 txn,
@@ -66526,7 +66417,6 @@ where
             &mut capture,
             transition_capture.as_mut(),
             conflict_transition_capture.as_mut(),
-            scratch,
             conflict_outer,
         )? {
             Ok(true) => inserted += 1,
@@ -66539,7 +66429,6 @@ where
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
-                    scratch: scratch as *mut _,
                     seq_session,
                 },
                 txn,
@@ -66562,7 +66451,6 @@ where
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -67257,7 +67145,6 @@ pub(crate) fn update<'a>(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -67834,7 +67721,6 @@ pub(crate) fn update<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 row_definition,
                 TriggerEvents::UPDATE,
@@ -67909,7 +67795,6 @@ pub(crate) fn update<'a>(
                     params,
                     seq_session,
                     responder,
-                    scratch as *mut _,
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -68057,7 +67942,6 @@ pub(crate) fn update<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 def,
                 TriggerEvents::UPDATE,
@@ -68211,7 +68095,6 @@ pub(crate) fn update<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
             )
         } else {
             fire_partition_row_triggers(
@@ -68220,7 +68103,6 @@ pub(crate) fn update<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 target_table,
                 new_definition,
                 TriggerEvents::UPDATE,
@@ -68268,7 +68150,6 @@ pub(crate) fn update<'a>(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -68384,7 +68265,6 @@ pub(crate) fn delete<'a>(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -68632,7 +68512,6 @@ pub(crate) fn delete<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 def,
                 TriggerEvents::DELETE,
@@ -68693,7 +68572,6 @@ pub(crate) fn delete<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 def,
                 TriggerEvents::DELETE,
@@ -68769,7 +68647,6 @@ pub(crate) fn delete<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 row_definition,
                 TriggerEvents::DELETE,
@@ -68824,7 +68701,6 @@ pub(crate) fn delete<'a>(
                 arena,
                 seq_session,
                 responder,
-                scratch as *mut _,
                 row_table,
                 row_definition,
                 TriggerEvents::DELETE,
@@ -68869,7 +68745,6 @@ pub(crate) fn delete<'a>(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
-                scratch: scratch as *mut _,
                 seq_session,
             },
             txn,
@@ -68908,7 +68783,6 @@ pub(crate) fn delete<'a>(
 pub(crate) fn truncate(
     storage: &mut Storage,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
     arena: &Arena,
     seq_session: &crate::sql::guc::SeqSession,
     tables: &[QualName],
@@ -69061,7 +68935,6 @@ pub(crate) fn truncate(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
-                    scratch: scratch as *mut _,
                     seq_session,
                 },
                 txn,
@@ -69114,7 +68987,6 @@ pub(crate) fn truncate(
                 TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage,
-                        scratch: scratch as *mut _,
                         seq_session,
                     },
                     txn,
@@ -69198,7 +69070,6 @@ pub(crate) fn truncate(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
-                    scratch: scratch as *mut _,
                     seq_session,
                 },
                 txn,

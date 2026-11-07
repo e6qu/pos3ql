@@ -210,6 +210,13 @@ fn saved_value_growth_moves_owned_bytes_and_failed_growth_keeps_published_values
         saved.replace(Datum::Text("before move")).unwrap();
         let earlier = saved.read(&output).unwrap();
         let blocker = pool.lease::<u8>(64).unwrap();
+        let descriptor_guards = [pool.lease::<u8>(64).unwrap(), pool.lease::<u8>(64).unwrap()];
+        let error = saved.replace(Datum::Bytea(&[7; 128])).unwrap_err();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_leases"));
+        assert!(error.message.as_str().contains("0 available leases"));
+        assert_eq!(saved.read(&output).unwrap(), Datum::Text("before move"));
+        drop(descriptor_guards);
         saved.replace(Datum::Bytea(&[7; 128])).unwrap();
         assert_eq!(saved.read(&output).unwrap(), Datum::Bytea(&[7; 128]));
         let after_move = saved.read(&output).unwrap();

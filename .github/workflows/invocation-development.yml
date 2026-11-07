@@ -26,6 +26,8 @@ jobs:
           key: ${{ runner.os }}-invocation-dependencies-${{ hashFiles('Cargo.lock') }}
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Verify ownership manifest guards
+        run: python3 -m unittest tools/tests/test_miri_ownership_manifest.py
       - name: Compile library tests and exercise value ownership
         shell: bash
         run: |
@@ -59,20 +61,26 @@ jobs:
   miri:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [memory-sql, storage]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - run: cargo miri setup
-      - name: Verify the complete ownership manifest
-        run: bash tools/test-miri-ownership.sh "$RUNNER_TEMP/invocation-miri.log"
+      - name: Verify the ownership group
+        run: bash tools/test-miri-ownership.sh "$RUNNER_TEMP/invocation-miri.log" "${{ matrix.group }}"
       - name: Retain ownership diagnostics
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: invocation-miri-${{ github.sha }}
-          path: ${{ runner.temp }}/invocation-miri.log
+          name: invocation-miri-${{ matrix.group }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/invocation-miri.log
+            ${{ runner.temp }}/invocation-miri.log.manifest
           if-no-files-found: error
           retention-days: 1
 

@@ -381,6 +381,8 @@ Reclaim each polling snapshot's scratch space instead of relying on a favorable
 thread schedule to finish before the arena fills.
 Keep compiler and per-test progress visible through CI cancellation while
 diagnosing deadline overruns; preserve the existing job budgets.
+Require both ownership groups to complete successfully and cover the full named
+manifest without missing, repeated or ignored proofs.
 
 No runtime heap growth, growing pools or allocating sorts. Keep consequential
 settings explicit and avoid needless wrappers and fallbacks. Capacity increases

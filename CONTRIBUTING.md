@@ -390,8 +390,10 @@ catalog and wire contracts; they do not select pos3ql's object block layout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
-`tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
-runner. The explicit `miri-ownership` Cargo feature omits unrelated test modules
+`tools/test-miri-ownership.sh LOG GROUP` runs an ownership group on a suitable
+runner. Run both explicit groups, `memory-sql` and `storage`. Each has a
+15-minute job budget and shares one interpreter startup. The explicit
+`miri-ownership` Cargo feature omits unrelated test modules
 only under Miri; native builds retain their full test set. This avoids spending
 interpreter time constructing test descriptions that the ownership gate never
 runs. Miri without that feature keeps the broader test harness available.
@@ -401,10 +403,13 @@ owner through `type_input_plans::with_owner`, as the command executor does.
 Keep missing production ownership an error.
 List every selected case by its complete Rust name in
 `tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
-The script checks that every listed proof passes, with none missing, failed or
-ignored. Preserve the full proof set when reducing interpreter startup work.
+Every manifest entry belongs to exactly one group. Both jobs must finish
+successfully; a cancelled job does not qualify even if its last test passed.
+The script checks that every selected proof passes exactly once, with none
+missing, failed or ignored, and retains the group's manifest beside its log.
+Preserve the full proof set when reducing interpreter startup work.
 Polling tests release each snapshot before reusing its fixed scratch arena,
-even when writers are slow. All selected proofs share one interpreter startup.
+even when writers are slow.
 Coverage stops at a failed build or instrumentation setup and retains its
 diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort

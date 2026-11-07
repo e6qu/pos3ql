@@ -221,6 +221,10 @@ jobs:
     needs: formatting
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [memory-sql, storage]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
@@ -228,7 +232,17 @@ jobs:
           components: miri
       - run: cargo miri setup
       - name: Shared ownership and publication
-        run: bash tools/test-miri-ownership.sh "$RUNNER_TEMP/miri-ownership.log"
+        run: bash tools/test-miri-ownership.sh "$RUNNER_TEMP/miri-ownership.log" "${{ matrix.group }}"
+      - name: Retain ownership results and selected manifest
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: miri-ownership-${{ matrix.group }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/miri-ownership.log
+            ${{ runner.temp }}/miri-ownership.log.manifest
+          if-no-files-found: error
+          retention-days: 1
 
   release-package:
     needs: formatting
@@ -305,6 +319,7 @@ jobs:
       - name: Tool guard tests
         run: >-
           python3 -m unittest tools/tests/test_coverage_merge.py
+          tools/tests/test_miri_ownership_manifest.py
           tools/tests/test_coverage_script.py
           tools/tests/test_check_dups.py
           tools/tests/test_postgres_regress_diff.py

@@ -4,7 +4,7 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix reproducible defects in the PR that finds them, including incidental defects
 and live-value ownership, source-image, saved-output or caught-error exhaustion and rollback, partial
-admission, incomplete procedural syntax, quoted statement boundaries, configuration-fixture
+admission, incomplete procedural syntax, quoted statement boundaries, lexical capacity classification, configuration-fixture
 or build-budget failures.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations

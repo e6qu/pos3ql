@@ -1268,3 +1268,25 @@ fn procedural_statement_boundaries_use_sql_quoting_and_discard_scan_scratch() {
         assert!(arena.used() < 1024);
     });
 }
+
+#[test]
+fn procedural_lexical_exhaustion_is_a_resource_error_and_releases_scan_memory() {
+    let mut budget = Budget::new(4096);
+    let tiny = Arena::new(&mut budget, "lexical exhaustion", 1).unwrap();
+    let scan = Arena::new(&mut budget, "failed scan scratch", 256).unwrap();
+    let quoted = format!("PERFORM E'{}';", "x".repeat(512));
+    crate::mem::guard::forbid_alloc(|| {
+        for sql in ["SELECT", "'it''s'", r"E'\n'", "\"a\"\"b\""] {
+            let mut lexer = crate::sql::lexer::Lexer::new(sql, &tiny);
+            let error = lexer.next_token().unwrap_err();
+            assert_eq!(error.kind.sqlstate(), "54000");
+            let error = super::super::super::parse_error_to_sql(&error.into());
+            assert_eq!(error.sqlstate, "54000");
+            assert_eq!(error.message.as_str(), "statement too large for SQL arena");
+        }
+        let error = split_trigger_statements(&quoted, &scan).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(scan.used(), 0);
+        assert_eq!(split_trigger_statements("NULL", &scan).unwrap(), ["NULL"]);
+    });
+}

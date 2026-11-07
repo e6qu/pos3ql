@@ -105,6 +105,8 @@ Incomplete blocks must return syntax error `42601` and release their source stor
 keep that coverage against PostgreSQL for loops, branches and exception handlers.
 Split procedural statements at SQL token boundaries so semicolons inside dollar
 strings, escaped strings and comments remain part of the original statement.
+Lexer buffer exhaustion must return resource limit `54000`, preserve real syntax
+errors and release temporary scan memory for the next operation.
 Keep those source-owner checks while retaining selected definitions and session
 settings; owning the text alone does not preserve their original meaning.
 Preserve once-only declaration initialization after input/output parameter slots

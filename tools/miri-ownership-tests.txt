@@ -255,3 +255,4 @@ sql::exec::diagnostics::ownership_tests::diagnostic_admission_and_descriptor_fai
 sql::exec::diagnostics::ownership_tests::diagnostic_growth_moves_bytes_and_recovers_after_fragmented_exhaustion
 sql::exec::control_flow::ownership_tests::source_capture_and_parse_failures_preserve_live_frames_and_return_capacity
 sql::exec::control_flow::ownership_tests::procedural_statement_boundaries_use_sql_quoting_and_discard_scan_scratch
+sql::exec::control_flow::ownership_tests::procedural_lexical_exhaustion_is_a_resource_error_and_releases_scan_memory

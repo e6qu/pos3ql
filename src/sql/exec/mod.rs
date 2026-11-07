@@ -79196,15 +79196,17 @@ mod tests {
 
     #[test]
     fn procedural_static_utility_parse_preserves_lexical_errors_and_assignments() {
-        for (sql, capacity, message) in [
+        for (sql, capacity, state, message) in [
             (
                 "CREATE TABLE orders(id integer)",
                 1,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "statement too large for SQL arena",
             ),
             (
                 "create \"unterminated",
                 4096,
+                sqlstate::SYNTAX_ERROR,
                 "unterminated quoted identifier",
             ),
         ] {
@@ -79215,7 +79217,7 @@ mod tests {
                     .err()
                     .expect("invalid utility input must fail")
             });
-            assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
+            assert_eq!(error.sqlstate, state);
             assert_eq!(error.message.as_str(), message);
         }
         let mut budget = Budget::new(8192);

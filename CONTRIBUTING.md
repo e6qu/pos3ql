@@ -237,7 +237,9 @@ reparsing a replacement definition must not redirect unfinished work. Capture
 source bytes before initializers; test byte/descriptor and parse-memory failures,
 capacity recovery, source/input/arena destruction and shared-owner drop. Compare
 a function replacing its own definition with PostgreSQL: the current call returns
-the original result and the next call uses the replacement.
+the original result and the next call uses the replacement. Distinguish lexer
+buffer exhaustion (`54000`) from malformed SQL (`42601`) and prove failed scans
+release their temporary memory.
 Coverage library partitions stream compiler output and each test's progress
 through the native allocation-error reporter. Use those timestamps to locate
 deadline overruns; buffered output must not hide the last running test.

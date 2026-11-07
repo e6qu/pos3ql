@@ -52,14 +52,8 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
         let mut status =
             TriggerExecutionStatus::new(&workspace, &workspace, code, &locals, 1, &pool).unwrap();
         status.set_output_locals(&[0], locals.len());
-        status
-            .shadow_output_local(0, Datum::Text("owned output"), &workspace)
-            .unwrap();
+        assert_eq!(status.outputs[0].local, 0);
         assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
-        assert_eq!(
-            status.outputs[0].value.read(&workspace, &parsing).unwrap(),
-            Datum::Text("owned output")
-        );
         drop(status);
         assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
     });
@@ -204,64 +198,59 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
     status.set_output_locals(&[0], locals.len());
     crate::mem::guard::forbid_alloc(|| {
         let text = temporary.alloc_str("original output").unwrap();
-        status
-            .shadow_output_local(0, Datum::Text(text), &workspace)
-            .unwrap();
+        status.shadow_output_local(0, Datum::Text(text)).unwrap();
         let used = workspace.used();
-        status
-            .shadow_output_local(0, Datum::Int4(7), &workspace)
-            .unwrap();
+        status.shadow_output_local(0, Datum::Int4(7)).unwrap();
         assert_eq!(workspace.used(), used);
         assert_eq!(status.outputs[0].shadow_depth, 2);
-        let foreign_used = source.used();
         assert_eq!(
             status
-                .shadow_output_local(0, Datum::Int4(9), &source)
-                .unwrap_err()
+                .control_frames
+                .as_mut()
+                .unwrap()
+                .execution(&workspace, &source, code)
+                .err()
+                .unwrap()
                 .sqlstate,
-            "XX000"
+            "40001"
         );
         assert_eq!(status.outputs[0].shadow_depth, 2);
-        assert_eq!(source.used(), foreign_used);
     });
     temporary.reset();
     crate::mem::guard::forbid_alloc(|| {
         temporary.alloc_slice_with(2048, |_| 0xffu8).unwrap();
-        let first = status.outputs[0].value.read(&workspace, &output).unwrap();
+        let first = status.outputs[0].value.read(&output).unwrap();
         assert_eq!(first, Datum::Text("original output"));
         status.unshadow_output_local(0);
         assert_eq!(status.outputs[0].shadow_depth, 1);
-        assert_eq!(
-            status.outputs[0].value.read(&workspace, &output).unwrap(),
-            first
-        );
+        assert_eq!(status.outputs[0].value.read(&output).unwrap(), first);
         status.unshadow_output_local(0);
-        let error = status
-            .shadow_output_local(0, Datum::Null, &source)
-            .unwrap_err();
-        assert_eq!(error.sqlstate, "XX000");
+        source
+            .with_remaining_region(|scratch| {
+                status
+                    .shadow_output_local(0, Datum::Text(scratch.alloc_str("new output").unwrap()))
+                    .unwrap();
+                status.unshadow_output_local(0);
+            })
+            .unwrap();
         assert_eq!(status.outputs[0].shadow_depth, 0);
+        assert_eq!(
+            status.outputs[0].value.read(&output).unwrap(),
+            Datum::Text("new output")
+        );
         let used = workspace.used();
         for _ in 0..u8::MAX {
-            status
-                .shadow_output_local(0, Datum::Null, &workspace)
-                .unwrap();
+            status.shadow_output_local(0, Datum::Null).unwrap();
         }
         assert_eq!(
             status
-                .shadow_output_local(0, Datum::Int4(9), &workspace)
+                .shadow_output_local(0, Datum::Int4(9))
                 .unwrap_err()
                 .sqlstate,
             "54000"
         );
         assert_eq!(status.outputs[0].shadow_depth, u8::MAX);
-        assert!(
-            status.outputs[0]
-                .value
-                .read(&workspace, &output)
-                .unwrap()
-                .is_null()
-        );
+        assert!(status.outputs[0].value.read(&output).unwrap().is_null());
         assert_eq!(workspace.used(), used);
         assert_eq!(first, Datum::Text("original output"));
         for _ in 0..u8::MAX {
@@ -328,7 +317,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 &locals,
                 &values,
                 &mut status,
-                &arena,
             )
             .unwrap() else {
                 panic!("numeric frame")
@@ -348,7 +336,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 scope,
                 current,
                 &mut status,
-                &arena,
             )
             .unwrap() else {
                 panic!("nested frame")
@@ -437,7 +424,6 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
                 &locals,
                 &values,
                 &mut status,
-                &workspace,
             )
             .unwrap() else {
                 panic!("numeric loop entry")

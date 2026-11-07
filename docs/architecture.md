@@ -254,11 +254,12 @@ source. Layout checks every branch and reserves only the largest local scope
 needed at each depth; shadowed counters reuse their existing local slot.
 Entering a loop copies its current scope into that depth's frame; leaving
 copies back assignments while restoring the shadowed counter. Returning
-the frame clears references into completed temporary work. These frames remain
-inside the existing statement arena; `54000` names insufficient capacity.
+the frame clears references into completed temporary work. Their local descriptions and value-slot arrays own ranges in the startup
+execution control pool; `54000` names insufficient capacity. Variable-length
+values in active local slots may still refer to statement memory.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
 When a loop counter shadows a named output, the outer output value is saved as
-typed bytes in a reusable statement-arena buffer. Nested counters keep the same
+typed bytes in a reusable, owned execution-control buffer. Nested counters keep the same
 saved value; leaving the outer counter restores normal output lookup. For
 example, `RETURN NEXT` inside `FOR answer IN 1..2` returns the function's text
 output `answer`, while expressions in that loop see its integer counter.
@@ -266,7 +267,11 @@ Saved outputs retain record names/types, nulls and array bounds without borrowin
 the expression's scratch. Growing a buffer reserves its replacement before
 publication; failed sizing or reservation preserves the previous value.
 Repeated entries reuse capacity based on the largest value, rather than the
-number of assignments. `54000` names saved-value statement memory on exhaustion.
+number of assignments. Saving needs control-pool bytes and a range descriptor;
+`54000` names `execution_control_bytes` and `execution_control_leases` on
+exhaustion. Reading copies into an explicit destination arena and can instead
+exhaust statement memory. A decoded value survives replacement or destruction
+of its saved buffer. Saved bytes survive reuse or destruction of the source arena.
 The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-saved-output-scopes/README.md)
 records repeated and nested counters, caught errors and typed outputs.
 Runtime local declarations contain names, resolved types and flags, without
@@ -316,7 +321,7 @@ original body and program kind use an immutable, checked source image. Parsed
 blocks belong to a separate compiled view. Mutable frame metadata owns a range
 in the shared execution control pool and retains no references to syntax or
 loop-value buffers. Output-binding metadata owns a separate range in that pool;
-its saved values remain checked statement-memory images. The same owner holds
+its saved values own separate byte ranges in the same pool. The same owner holds
 the position and resource directories, so they cannot be rebound to a different
 call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
@@ -356,7 +361,7 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-Numeric workspaces and ordinary local values still borrow statement memory;
+Variable-length payloads in ordinary and numeric local slots still borrow statement memory;
 saved control positions, source images and diagnostics do not yet let the whole invocation survive
 returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
@@ -665,7 +670,7 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves shared memory for procedural positions,
-resource directories, local-value slots and named-output bindings.
+resource directories, local-value slots, named-output bindings and saved output bytes.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
 two ranges for its position and resource directories, sized to its maximum
 lexical nesting, plus a range for nonempty local-value arrays. Set-returning
@@ -673,12 +678,14 @@ functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
 local descriptions and value slots. Named parameters may own another value range
 during initialization; it is released afterward. Empty tables and cached plans
-receive no private execution ranges. All are admitted before initializers;
-partial admission returns ranges already reserved. A full pool returns `54000`
-naming both settings before body initializers can have effects. The byte limit
+receive no private execution ranges. These metadata and slot ranges are admitted
+before initializers; partial admission returns ranges already reserved. Saved
+output buffers acquire a descriptor and grow as values are captured. A full pool
+returns `54000` naming both settings. An error while saving an output rolls back
+the command through the usual transaction rules. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.
-Variable-length value payloads, source images and diagnostics retain separate
+Active local-value payloads, source images and diagnostics retain separate
 statement or foreground-work ownership; this pool alone does not resume a whole invocation.
 
 For example, a function with 128 declared locals and one named input stages one

@@ -250,3 +250,4 @@ sql::exec::control_flow::ownership_tests::output_binding_admission_returns_contr
 sql::exec::numeric_loops::ownership_tests::numeric_control_admission_preserves_live_owners_and_releases_partial_reservations
 sql::exec::numeric_loops::ownership_tests::numeric_scope_owners_outlive_layout_and_syntax_without_borrowing_their_memory
 sql::exec::local_values::ownership_tests::local_slot_owners_preserve_values_on_failed_admission_and_return_capacity_on_drop
+sql::exec::local_values::ownership_tests::saved_value_growth_moves_owned_bytes_and_failed_growth_keeps_published_values

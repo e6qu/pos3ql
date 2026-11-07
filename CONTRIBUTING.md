@@ -205,6 +205,12 @@ address-based pairing check. Prove numeric layout scratch can be dropped while
 its owned scopes remain usable. Bind the original source arena explicitly when
 rebuilding syntax in a separate execution workspace. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
+Saved output bytes must survive dropping their source arena and external pool
+owner. Decoded copies must survive buffer growth, replacement and owner drop.
+Force fragmented growth and failed replacement; preserve the published value
+and return every range. At unchanged statement capacity, exhaust the saved-byte
+budget in both transaction modes, verify rollback of earlier writes and no loop
+body effects, then reuse the same pool successfully.
 Repeat queries and nested results on every iteration at unchanged capacity;
 short loops cannot prove that discarded work is reclaimed. Function comparisons
 must cover output names in `FROM`, nulls, whole and nested named rows, and field

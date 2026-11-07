@@ -20922,6 +20922,13 @@ fn resolve_plpgsql_program_locals<'a>(
                 ctype.name()
             ));
         }
+        if local.not_null && local.initial.is_none() {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "variable \"{}\" must have a default value, since it's declared NOT NULL",
+                local.name.as_str()
+            ));
+        }
         resolved[index] = TriggerLocalDecl {
             scope: PlpgsqlScope::Invocation,
             name: local.name,

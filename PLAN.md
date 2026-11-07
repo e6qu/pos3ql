@@ -122,6 +122,8 @@ are seeded. Keep parameter, local, handler and numeric-loop bindings distinct.
 Retain whether an initializer needs evaluation or only conversion, together with
 its evaluated value. Validate a declared domain's implicit initial NULL before
 body statements, including scalar, composite and array domains.
+Reject an explicitly `NOT NULL` declaration without an initializer while
+validating the definition, before installing the routine.
 Reads and assignments use the innermost binding, while returning outputs uses
 the original output slots. Preserve quoted names and reject constant assignment
 and FETCH targets before effects. Keep named constant cursors readable at OPEN.

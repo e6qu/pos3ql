@@ -653,12 +653,6 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             transition: &transition,
                         };
                         Some(eval_procedural_expression(context, initial, &scope)?)
-                    } else if local.not_null {
-                        return Err(sql_err!(
-                            sqlstate::NULL_VALUE_NOT_ALLOWED,
-                            "variable \"{}\" declared NOT NULL cannot default to NULL",
-                            local.name.as_str()
-                        ));
                     } else {
                         // A declared domain can reject its implicit NULL just
                         // as it rejects an explicitly supplied initial value.

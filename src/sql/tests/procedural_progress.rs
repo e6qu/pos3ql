@@ -1237,7 +1237,7 @@ fn uninitialized_domain_locals_validate_null_before_body_effects() {
         );
         assert_eq!(
             data_rows(&session.success(&mut engine, sql, true)),
-            ["23502|23514|23502|23502|7|t|3"],
+            ["23502|23514|23502|23502|22004|0|7:true|2"],
             "{mode:?}"
         );
     }

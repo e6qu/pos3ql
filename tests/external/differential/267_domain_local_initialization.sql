@@ -33,25 +33,34 @@ EXCEPTION WHEN OTHERS THEN
     RETURN SQLSTATE;
 END
 $$;
-CREATE FUNCTION local_explicit_value() RETURNS integer LANGUAGE plpgsql AS $$
-DECLARE value local_required := 7;
-BEGIN PERFORM nextval('local_initialization_ticks'); RETURN value; END
+CREATE FUNCTION local_legal_values() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE accepted_value local_required := 7; empty_value local_nullable;
+BEGIN
+    PERFORM nextval('local_initialization_ticks');
+    RETURN accepted_value::text || ':' || (empty_value IS NULL)::text;
+END
 $$;
-CREATE FUNCTION local_nullable_value() RETURNS boolean LANGUAGE plpgsql AS $$
-DECLARE value local_nullable;
-BEGIN PERFORM nextval('local_initialization_ticks'); RETURN value IS NULL; END
+CREATE FUNCTION local_declaration_error() RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE 'CREATE FUNCTION local_rejected() RETURNS integer LANGUAGE plpgsql AS ''DECLARE answer integer NOT NULL; BEGIN RETURN answer; END''';
+    RETURN 'accepted';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE;
+END
 $$;
 SELECT local_initialization_error(1),local_initialization_error(2),
        local_initialization_error(3),local_initialization_error(4),
-       local_explicit_value(),local_nullable_value(),
+       local_declaration_error(),
+       (SELECT count(*) FROM pg_proc WHERE proname='local_rejected'),
+       local_legal_values(),
        nextval('local_initialization_ticks');
 DROP FUNCTION local_initialization_error(integer);
 DROP FUNCTION local_missing_scalar();
 DROP FUNCTION local_missing_checked();
 DROP FUNCTION local_missing_pair();
 DROP FUNCTION local_missing_array();
-DROP FUNCTION local_explicit_value();
-DROP FUNCTION local_nullable_value();
+DROP FUNCTION local_legal_values();
+DROP FUNCTION local_declaration_error();
 DROP DOMAIN local_required;
 DROP DOMAIN local_checked;
 DROP DOMAIN local_pair_required;

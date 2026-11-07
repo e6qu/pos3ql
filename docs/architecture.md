@@ -339,6 +339,9 @@ An omitted initializer still validates a domain's initial NULL before the body.
 For example, declaring a variable of an integer domain marked `NOT NULL`
 returns `23502` before a later `nextval()` can run. PostgreSQL 18.6 implements
 that check at [block entry](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c#L1608-L1628).
+A declaration explicitly marked `NOT NULL` needs an initializer; routine
+definition validation rejects its omission with `22004`, as PostgreSQL's
+[declaration grammar](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_gram.y#L507-L516) requires.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges

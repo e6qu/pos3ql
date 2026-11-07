@@ -220,6 +220,13 @@ transactions; retain every assertion and the original capacities.
 Test repeated and nested error handlers with unchanged statement memory.
 Saved SQLERRM values must survive reuse, absent stacked fields must be empty
 text, and an exhausted diagnostic buffer must leave its outer handler usable.
+Handler views must borrow owned buffers rather than copy storage handles.
+Destroy source arenas and external pool owners before reading retained errors;
+keep copied fields valid after their diagnostic owner drops. Cover fragmented
+growth, byte/descriptor exhaustion, depth admission, rethrow and reuse. In both
+transaction modes, reject handler-directory admission before initializers and
+verify that failed text capture rolls back earlier writes without entering its
+handler, then admits a successful call at the original capacity.
 Test indexed execution positions after releasing their original parsing
 storage. Resumption must retain the selected source, definitions and types;
 reparsing a replacement definition must not redirect unfinished work.

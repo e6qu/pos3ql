@@ -61,6 +61,12 @@ impl<'a> ExecutionFrame<'a> {
                 .capture()
         });
         if let Err(error) = captured {
+            self.values.discard_saved();
+            self.status
+                .control_frames
+                .as_mut()
+                .expect("one procedural frame owner")
+                .discard_saved();
             return Err((self, error));
         }
         let TriggerExecutionStatus {
@@ -110,6 +116,7 @@ impl SuspendedExecutionFrame {
             set_result,
             outputs,
         } = self;
+        let mark = arena.mark();
         let mut control_frames = match control_frames.restore(arena, program) {
             Ok(frames) => frames,
             Err((control_frames, error)) => {
@@ -130,19 +137,20 @@ impl SuspendedExecutionFrame {
         };
         let mut values = values.rebind_saved();
         if let Err(error) = values.restore(arena) {
-            return Err((
-                Self {
-                    locals,
-                    values: values.suspend(),
-                    numeric_frames,
-                    control_frames: control_frames.suspend(),
-                    found,
-                    row_count,
-                    set_result,
-                    outputs,
-                },
-                error,
-            ));
+            let saved = Self {
+                locals,
+                values: values.suspend(),
+                numeric_frames,
+                control_frames: control_frames.suspend(),
+                found,
+                row_count,
+                set_result,
+                outputs,
+            };
+            // SAFETY: suspension removed all references created while decoding.
+            // Only the original owned images escape this failed restoration.
+            unsafe { arena.rewind_to(mark) };
+            return Err((saved, error));
         }
         // Publish only after every group has decoded. A failure above can clear
         // partial references without recapturing or losing the original images.

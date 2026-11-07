@@ -195,7 +195,7 @@ fn saved_values_reuse_capacity_and_preserve_prior_values_after_failed_changes() 
                 .sqlstate,
             "54000"
         );
-        assert!(unpublished.length.is_none());
+        assert!(unpublished.width.is_none());
         assert_eq!(unpublished.read(0, &output).unwrap_err().sqlstate, "XX000");
         drop(kept);
         assert_eq!(small.lease::<u8>(128).unwrap().capacity(), 128);

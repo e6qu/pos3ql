@@ -211,11 +211,7 @@ impl<'a> ControlFrames<'a> {
                 FrameResource::Empty => FrameResource::Empty,
                 FrameResource::Rows(rows) => FrameResource::Rows(rows),
                 FrameResource::Numeric { workspace } => FrameResource::Numeric {
-                    workspace: NumericLoopWorkspace {
-                        depth: workspace.depth,
-                        locals: workspace.locals,
-                        values: workspace.values.suspend(),
-                    },
+                    workspace: workspace.suspend(),
                 },
             }),
             workspace: self.workspace,
@@ -267,6 +263,7 @@ impl SuspendedControlFrames {
         if let Err(error) = self.0.require_source(program.source()) {
             return Err((self, error));
         }
+        let mark = arena.mark();
         let mut frames = ControlFrames {
             source: self.0.source,
             slots: self.0.slots,
@@ -276,11 +273,7 @@ impl SuspendedControlFrames {
                 FrameResource::Empty => FrameResource::Empty,
                 FrameResource::Rows(rows) => FrameResource::Rows(rows),
                 FrameResource::Numeric { workspace } => FrameResource::Numeric {
-                    workspace: NumericLoopWorkspace {
-                        depth: workspace.depth,
-                        locals: workspace.locals,
-                        values: workspace.values.rebind_saved(),
-                    },
+                    workspace: workspace.rebind(),
                 },
             }),
             workspace: self.0.workspace,
@@ -289,7 +282,11 @@ impl SuspendedControlFrames {
             if let FrameResource::Numeric { workspace } = resource
                 && let Err(error) = workspace.values.restore(arena)
             {
-                return Err((frames.suspend(), error));
+                let saved = frames.suspend();
+                // SAFETY: every partially decoded value has moved to the
+                // reference-free suspended state before releasing its scratch.
+                unsafe { arena.rewind_to(mark) };
+                return Err((saved, error));
             }
         }
         // Images remain intact until the enclosing invocation has restored its

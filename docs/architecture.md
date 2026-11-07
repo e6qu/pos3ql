@@ -254,7 +254,8 @@ source. Layout checks every branch and reserves only the largest local scope
 needed at each depth; shadowed counters reuse their existing local slot.
 Entering a loop copies its current scope into that depth's frame; leaving
 copies back assignments while restoring the shadowed counter. Returning
-the frame clears references into completed temporary work. Their local descriptions and value-slot arrays own ranges in the startup
+the frame clears references into completed temporary work. Local descriptions
+and value-slot arrays own ranges in the startup
 execution control pool; `54000` names insufficient capacity. Variable-length
 values in active local slots may still refer to statement memory.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
@@ -327,13 +328,20 @@ its saved values own separate byte ranges in the same pool. The same owner holds
 the position and resource directories, so they cannot be rebound to a different
 call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
-descriptions and value-slot arrays in the control pool. Ordinary local-value and
-parameter-slot arrays use that pool too; parameter staging reserves named
+descriptions and value-slot arrays in the control pool. Each call also owns its
+resolved ordinary local declarations, value slots and execution status together.
+Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges
 owned until that scope is returned or dropped.
-These value slots may still borrow variable-length payloads in statement memory;
-owning the arrays does not yet preserve those payloads through a scheduler return.
+Active value slots borrow variable-length payloads in statement memory. Internal
+frame suspension saves ordinary and active numeric values as typed rows in the
+shared row-work pool, then clears every borrowed reference while retaining the
+original slot ranges. Restoration copies each saved row once and decodes all its
+columns in one pass. Images are released only after every scope has restored;
+destination exhaustion preserves all images and reservations. This frame owner
+alone does not yet retain the enclosing write or unfinished nested input work
+through a scheduler return.
 Binding a view checks the source owner and execution workspace before entering
 the body. A different source image, even with identical text, or a foreign/reset
 workspace returns `40001`. Source capture returns `54000` naming the execution
@@ -371,9 +379,9 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-Variable-length payloads in ordinary and numeric local slots still borrow statement memory;
-saved control positions, source owners and diagnostics do not yet let the whole invocation survive
-returning to the connection scheduler during a storage wait.
+The complete invocation still needs the enclosing write, selected definitions,
+settings and unfinished query/input work to survive returning to the connection
+scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.
 Source query work and nested invocation receipts use one scoped arena and are
@@ -680,13 +688,13 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves shared memory for procedural positions,
-resource directories, local-value slots, source images, named-output bindings,
+resource directories, resolved local declarations, local-value slots, source images, named-output bindings,
 saved output bytes and caught error directories and text.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
 one immutable byte range for its actual source text, shared by compiled syntax
 and retained positions. It also reserves two ranges for its position and
-resource directories, sized to maximum lexical nesting, plus a range for
-nonempty local-value arrays. Set-returning
+resource directories, sized to maximum lexical nesting, plus separate ranges for
+nonempty local declarations and value arrays. Set-returning
 functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
 local descriptions and value slots. Calls with exception handlers reserve one

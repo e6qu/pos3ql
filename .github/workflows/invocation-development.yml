@@ -31,7 +31,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --lib --locked --profile native-ci --jobs 1 -- \
-            inplace_conversion_ suspended_local_slots_ suspended_execution_ \
+            inplace_conversion_ exec::control_flow::ownership_tests \
+            exec::local_values::ownership_tests exec::numeric_loops::ownership_tests \
             --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/invocation-development.log"
       - name: Retain development diagnostics
         if: always()
@@ -39,5 +40,74 @@ jobs:
         with:
           name: invocation-development-${{ github.sha }}
           path: ${{ runner.temp }}/invocation-development.log
+          if-no-files-found: error
+          retention-days: 1
+
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Verify the complete ownership manifest
+        run: bash tools/test-miri-ownership.sh "$RUNNER_TEMP/invocation-miri.log"
+      - name: Retain ownership diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: invocation-miri-${{ github.sha }}
+          path: ${{ runner.temp }}/invocation-miri.log
+          if-no-files-found: error
+          retention-days: 1
+
+  postgres-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:18@sha256:885953109528ad3dfc90362b1a6f50a78620b5315be19f187753d267e484dc5b
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_INITDB_ARGS: "--lc-collate=C --lc-ctype=C --encoding=UTF8"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Capture trigger input behavior from PostgreSQL
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/trigger-input-reference"
+          cd "$RUNNER_TEMP/trigger-input-reference"
+          cp "$GITHUB_WORKSPACE/tests/external/differential/265_trigger_input_visibility.sql" fixture.sql
+          git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
+          test "$(cat server-version.txt)" = 180006
+          docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
+          docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
+            "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
+            < fixture.sql > stdout.txt 2> stderr.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          expected = '1|3|1|1|1|1|8193|2'
+          assert Path('stdout.txt').read_text().splitlines().count(expected) == 1
+          assert not Path('stderr.txt').read_bytes()
+          print(f'PostgreSQL 18.6 trigger input result: {expected}')
+          PY
+          sha256sum fixture.sql revision server-version.txt image-id stdout.txt stderr.txt > SHA256SUMS
+      - name: Retain PostgreSQL reference
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: trigger-input-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/trigger-input-reference/
           if-no-files-found: error
           retention-days: 1

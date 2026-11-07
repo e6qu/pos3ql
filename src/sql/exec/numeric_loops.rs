@@ -9,6 +9,26 @@ pub(super) struct NumericLoopWorkspace<'a> {
     pub(super) values: LocalValues<'a>,
 }
 
+impl NumericLoopWorkspace<'_> {
+    pub(super) fn suspend(self) -> NumericLoopWorkspace<'static> {
+        NumericLoopWorkspace {
+            depth: self.depth,
+            locals: self.locals,
+            values: self.values.suspend(),
+        }
+    }
+}
+
+impl NumericLoopWorkspace<'static> {
+    pub(super) fn rebind<'out>(self) -> NumericLoopWorkspace<'out> {
+        NumericLoopWorkspace {
+            depth: self.depth,
+            locals: self.locals,
+            values: self.values.rebind_saved(),
+        }
+    }
+}
+
 pub(super) struct NumericLoopFrames<'a> {
     slots: MutableSlice<Option<NumericLoopWorkspace<'a>>>,
     active: usize,

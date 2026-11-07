@@ -123,14 +123,15 @@ pub(crate) fn dispatch<'a>(
         if values[..args.len()].iter().any(Datum::is_null) {
             return Ok(Datum::Null);
         }
-        let (invocations, statement_arena) = crate::sql::query::active_routine_invocations()
-            .ok_or_else(|| {
+        crate::sql::query::with_active_routine_invocations(|context| {
+            let (invocations, statement_arena) = context.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "large-object functions require a resumable query executor"
                 )
             })?;
-        invocations.resolve_intrinsic(oid, &values[..args.len()], statement_arena, arena)
+            invocations.resolve_intrinsic(oid, &values[..args.len()], statement_arena, arena)
+        })
     })())
 }
 

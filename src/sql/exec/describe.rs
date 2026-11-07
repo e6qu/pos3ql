@@ -2314,14 +2314,10 @@ struct ShapePool {
 }
 
 std::thread_local! {
-    /// Statement-scoped registry of record shapes: a derived table's
-    /// record-typed column stores a handle here (in its `type_mod`, which
-    /// records otherwise never use) so field access can be typed statically —
-    /// PostgreSQL knows the row type; this is our transient stand-in. Reset
-    /// at each statement start. Boxed, not inline: glibc places static TLS
-    /// inside each thread's stack allocation (the PR-114 stack overflow), so
-    /// TLS slots stay pointer-sized; the box is allocated by
-    /// [`init_record_shapes`] before the allocator freezes.
+    /// Record-typed derived columns use `type_mod` as a statement-local shape
+    /// handle for field lookup. Keep thread-local storage pointer-sized:
+    /// [`init_record_shapes`] allocates the registry before the allocator
+    /// freezes, and each statement resets its handles.
     static RECORD_SHAPES: core::cell::RefCell<Option<Box<ShapePool>>> =
         const { core::cell::RefCell::new(None) };
 }

@@ -9927,13 +9927,15 @@ impl RoutineDef {
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
-        matches!(
-            self.kind,
-            RoutineKind::TableFunction
-                | RoutineKind::RecordFunction {
-                    set_returning: true
-                }
-        )
+        // FROM exposes declared OUT names independently of result cardinality.
+        (self.result_column_count != 0
+            && matches!(
+                self.kind,
+                RoutineKind::TableFunction
+                    | RoutineKind::RecordFunction { .. }
+                    | RoutineKind::Function { .. }
+                    | RoutineKind::SetFunction { .. }
+            ))
         .then_some(&self.result_columns[..self.result_column_count])
     }
 
@@ -15686,6 +15688,7 @@ pub struct Storage {
     max_row_versions_per_row: usize,
     row_versions: RowVersionPools,
     pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
@@ -20812,6 +20815,10 @@ impl Storage {
                 config.row_work_leases,
             ),
             crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.execution_control_bytes,
+                config.execution_control_leases,
+            ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
                 config.table_metadata_bytes,
                 config.table_metadata_leases,
             ),
@@ -21079,6 +21086,12 @@ impl Storage {
             crate::mem::lease_pool::Purpose::ROW_WORK,
             config.row_work_bytes,
             config.row_work_leases,
+        )?;
+        let execution_control = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+            config.execution_control_bytes,
+            config.execution_control_leases,
         )?;
         let metadata_pool = crate::mem::lease_pool::LeasePool::new(
             budget,
@@ -21904,6 +21917,7 @@ impl Storage {
             max_row_versions_per_row: config.max_row_versions_per_row,
             row_versions,
             row_work,
+            execution_control,
             metadata_pool,
             statistics_pool,
             row_overlay,

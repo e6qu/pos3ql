@@ -73,6 +73,18 @@ omitted defaults run in the declared input order. Defaults share the caller's
 session: a default using `nextval('order_numbers')` updates that
 connection's `currval('order_numbers')`. Function lookup and missing-function
 errors do not run arguments to discover their types.
+In `FROM`, named `OUT` and `INOUT` parameters become result columns. A function
+returning one value produces one row, including a null value; a set-returning
+function produces the rows it returns. For example,
+`SELECT total FROM calculate_order(42)` can select its declared `OUT total`
+column without expanding a record expression in the select list.
+The 100-input-argument limit does not limit a table function's result width.
+For example, a function returning columns `c0` through `c100` can expose its
+last field with `SELECT (wide_function_rows()).c100`, or both ends with
+`SELECT c0,c100 FROM wide_function_rows()`.
+A SQL function returning a named row type can select its fields or return one
+complete row value. Its field constraints run when the result is converted;
+calling a constraint helper does not rerun the completed function body.
 Aggregate support functions can refer to supported built-ins by their selected
 identifier. Using a built-in as the implementation of `CREATE CAST` or
 `CREATE OPERATOR` remains unsupported and fails explicitly with `0A000`.
@@ -174,6 +186,11 @@ their unfinished execution while the engine prepares that value; replaying
 after undoing earlier row changes would give constraints the wrong data.
 Event triggers use the engine's procedural execution context and retain each
 statement's checked inputs across calls.
+
+An unmatched procedural `CASE` without `ELSE` raises `20000` (`case_not_found`).
+For example, `DO $$BEGIN CASE WHEN false THEN NULL; END CASE; END$$` fails with
+`case not found` and the hint `CASE statement is missing ELSE part.`. An explicit
+`ELSE` runs normally, and a simple `CASE` evaluates its operand once.
 
 Catalog statistics types `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`
 reject client text and binary input with `0A000`, matching PostgreSQL. Reports
@@ -282,6 +299,11 @@ boundaries apply through catalogs, wire, WAL, checkpoints, and recovery:
 | Stored default expressions | 120 bytes, including enum member bindings and saved catalog display text | Existing startup reservation; SQLSTATE 54000 names an overfull default or bound enum expression before installation |
 | Startup capacities | Independent catalog, connection, transaction/savepoint, row-version, lock, replication, cache, and checkpoint pools | Configuration and exact startup memory plan; named errors before partial publication |
 | Completed routine workspaces | Existing statement arena; one scoped workspace for each active scalar, table-function or engine-owned call | Completed parsing, locals and temporary plans are reclaimed; only typed result bytes survive in the caller. Nested calls share the same fixed capacity. SQLSTATE 54000 rejects an oversized active call without heap growth |
+| Numeric FOR local frames | Existing statement arena; one frame per simultaneously nested numeric loop, sized to that depth's largest lexical local scope; shadowed counters reuse a slot | Reserved before local initializers; reused through repeated entries, errors and nonlocal exits. SQLSTATE 54000 names insufficient numeric-loop frame memory; iteration count does not multiply local-buffer storage |
+| Procedural execution metadata | Shared `execution_control_bytes` and `execution_control_leases`; a control-stack range per call, numeric scope/local-description ranges when needed, and named-output bindings for set-returning functions | Reserved before local initializers; SQLSTATE 54000 names control-pool exhaustion. Failed admission and dropping owners return their ranges. Positions and local descriptions have no references to parsing memory; numeric value views still borrow statement memory, and saved output bytes remain there. Ordinary values and the enclosing operation still need ownership before full scheduler resumption |
+| Saved output values | Existing statement arena; one reusable encoded buffer for each named output shadowed by a numeric counter | Nested counters keep the outer output. Repeated shadows reuse capacity; nulls, typed records and array bounds survive source-scratch reuse. Growth checks the original owner and reserves replacements before publication; named SQLSTATE 54000 on capacity exhaustion |
+| Materialized loop inputs | Actual encoded bytes in shared `row_work_bytes` and one `row_work_leases` slot per active query/array loop | Source scratch is reclaimed before the body; row names/types, nulls and array bounds remain owned. End, exit and errors release the lease. SQLSTATE 54000 names shared work exhaustion; decoded local variables still use statement memory |
+| Discarded procedural queries | `PERFORM` reclaims temporary query and nested invocation results inside the existing statement arena | Row counts and `FOUND` survive; locals, input bindings and active exception diagnostics remain owned. Static statements with unchanged inputs reuse their compiled syntax |
 | Connection startup options | 256 bytes per decoded option word; backslashes escape spaces and backslashes | SQLSTATE 54000 on word exhaustion; values are decoded without SQL quoting rules, and RESET restores the startup value |
 | MVCC row history | Explicit shared `row_history_slots` across tables/large objects, plus `max_row_versions_per_row` per row | Updates reserve before durability, including queued/prepared commits; exhaustion is `54000`; locking mode requires zero history slots |
 | Durable object requests | `object_store_get_slots` read clients, `object_store_put_slots` journal upload clients, `object_store_block_put_slots` physical upload clients, one separate atomic block client, administrative and independent journal/file cleanup clients, manifest publication clients, and configured credential/ownership clients | Each reserves header and response capacity; journal upload slots also reserve `wal_upload_buffer_bytes` immutable body bytes; physical slots reserve 256 KiB each and share a fixed writer-emission buffer. Read controls, upload outcomes and a 256 KiB block scratch buffer are charged separately from caches; atomic operations may wait synchronously |

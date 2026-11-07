@@ -78,6 +78,20 @@ the workflow that owns the check. Native build, lint and boundary checks cover
 Linux amd64, Linux arm64 and macOS arm64. See `Cargo.toml`, `examples/dev.conf`, and
 `.github/workflows/` for the actual build and environment definitions.
 
+The Linux arm64 and macOS arm64 jobs build every target with `native-ci` and one
+Cargo worker. That profile retains debug assertions, overflow checks and
+source-line backtraces while omitting full variable/type debug data. Native lint
+uses the same profile. Cargo progress and timing reports identify unfinished
+build work; native test artifacts still require a completed build of the checked
+revision. Keep the 15-minute build limit and require both native execution jobs;
+a cancelled producer and its skipped tests do not qualify as passing CI.
+
+The configured SQL-session test harness records the most recent query-memory
+error's source location and the arena's requested, remaining and capacity bytes
+without allocating. Failed success assertions include those values, whether a
+temporary region was active, and wire output. Distinguish genuine exhaustion
+from an allocation blocked by a temporary borrow before changing a limit. This diagnostic is test-only and keeps client errors unchanged.
+
 Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a
 `formatting-<revision>` artifact containing the correction. Apply that patch
@@ -86,6 +100,11 @@ the Rust code compiles and passes lint, with warnings treated as failures. Build
 matrices start only after both checks pass, so one compiler error does not
 launch dozens of copies of the same failing build.
 
+When adding a required configuration setting, update file samples, generators
+and embedded test configuration strings, including those outside `config.rs`.
+Capacity tests must reach the intended limit and print the actual error when
+its diagnostic differs; an earlier missing-setting error is not limit coverage.
+
 Library coverage shards require `COVERAGE_NATIVE_DEBUGGER=gdb` or `none`.
 CI uses `gdb` to print every thread's stack if a native test crashes. It runs
 the exact executable reported by Cargo with the configured `RUST_MIN_STACK`,
@@ -93,6 +112,12 @@ the same test selection and ordinary test parallelism. A crash still fails
 the job; the debugger does not retry or resume it. GDB launches the executable
 directly: rebuilding thousands of test filters as one shell argument exceeds
 Linux's argument-size limit before the tests start.
+Coverage builds, library execution, server execution and reports all select the
+`coverage` Cargo profile. It inherits release behavior with optimization level
+1, reducing instrumented compilation cost within the fixed job budget. Verify
+both build and execution timings on the checked revision. Production
+release builds and their correctness/performance gates keep release settings.
+The 70% merged coverage floor and all test selections remain unchanged.
 A historical crash reproduction records its source revision, compiler/coverage
 versions, original test partition, stack limit, ordinary test parallelism and
 process outcome. Its artifact describes that failed revision. Finish current-head
@@ -166,6 +191,28 @@ repair. Keep the failing selection, parallelism and original capacity limits.
 Verify the invariant or external contract, not a test that merely restates the
 implementation. Boundary changes generally need accepted/rejected capacity,
 rollback, failure cleanup, WAL/checkpoint, and empty-cache recovery coverage.
+For procedural frame changes, run long nested loops in both transaction modes
+at the existing statement capacity. Include a shadowed counter, a caught error
+and a nonlocal exit; verify locals and `FOUND`, and prove inactive frames release
+references before temporary memory is reused. Exhaust the separate control pool,
+prove no declaration initializer ran, and verify capacity returns after owners
+drop while other active calls keep their positions. Cover both frame-byte and
+numeric-scope and output-binding lease exhaustion, including partially reserved
+directories and live scopes whose directory has dropped. Bind the original source arena explicitly when
+rebuilding syntax in a separate execution workspace. Keep deadline ownership proofs
+independent of the host clock under Miri isolation.
+Repeat queries and nested results on every iteration at unchanged capacity;
+short loops cannot prove that discarded work is reclaimed. Function comparisons
+must cover output names in `FROM`, nulls, whole and nested named rows, and field
+constraints that call helpers with side effects. Keep extended fixtures within
+their configured catalog limits by releasing completed definitions between
+transactions; retain every assertion and the original capacities.
+Test repeated and nested error handlers with unchanged statement memory.
+Saved SQLERRM values must survive reuse, absent stacked fields must be empty
+text, and an exhausted diagnostic buffer must leave its outer handler usable.
+Test indexed execution positions after releasing their original parsing
+storage. Resumption must retain the selected source, definitions and types;
+reparsing a replacement definition must not redirect unfinished work.
 Coverage library partitions stream compiler output and each test's progress
 through the native allocation-error reporter. Use those timestamps to locate
 deadline overruns; buffered output must not hide the last running test.
@@ -322,7 +369,10 @@ only under Miri; native builds retain their full test set. This avoids spending
 interpreter time constructing test descriptions that the ownership gate never
 runs. Miri without that feature keeps the broader test harness available.
 Keep ownership cases beside their runtime modules and shared helpers outside
-native fixture modules. List every selected case by its complete Rust name in
+native fixture modules. Tests constructing an anonymous invocation must install an explicit SQL plan
+owner through `type_input_plans::with_owner`, as the command executor does.
+Keep missing production ownership an error.
+List every selected case by its complete Rust name in
 `tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
 The script checks that every listed proof passes, with none missing, failed or
 ignored. Preserve the full proof set when reducing interpreter startup work.

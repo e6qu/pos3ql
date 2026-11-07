@@ -148,15 +148,16 @@ pub(crate) fn dispatch<'a>(
             None
         };
         let values = argument.as_slice();
-        let (invocations, statement_arena) = crate::sql::query::active_routine_invocations()
-            .ok_or_else(|| {
+        crate::sql::query::with_active_routine_invocations(|context| {
+            let (invocations, statement_arena) = context.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "{} requires a resumable query executor",
                     name
                 )
             })?;
-        invocations.resolve_intrinsic(intrinsic_oid, values, statement_arena, arena)
+            invocations.resolve_intrinsic(intrinsic_oid, values, statement_arena, arena)
+        })
     })())
 }
 

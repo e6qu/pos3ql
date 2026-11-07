@@ -1,5 +1,5 @@
-//! Set-returning functions: the ones written in the select list, and the ones
-//! written in FROM.
+//! Set-returning functions in the select list, and scalar or set-returning
+//! functions used as row sources in FROM.
 //!
 //! A set-returning function in the select list makes each input row produce as
 //! many output rows as the function yields, so the projection has to know how
@@ -1096,7 +1096,6 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     source,
                     storage,
                     txid,
-                    arena,
                     slot,
                     &input_oids[..args.len()],
                 )?;
@@ -1467,14 +1466,18 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             .map_err(|_| arena_full())?;
         if let Some(columns) = routine.record_result_columns() {
             for (value, encoded) in values.iter_mut().zip(rows) {
-                let mut decoded = [crate::sql::types::RecordField {
-                    name: "",
-                    type_oid: 0,
-                    value: Datum::Null,
-                }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let decoded = arena
+                    .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
+                        name: "",
+                        type_oid: 0,
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
                 for (index, column) in columns.iter().enumerate() {
                     decoded[index] = crate::sql::types::RecordField {
-                        name: column.name.as_str(),
+                        name: arena
+                            .alloc_str(column.name.as_str())
+                            .map_err(|_| arena_full())?,
                         type_oid: storage
                             .routine_type_oid(column.ctype, column.user_type, txid)
                             .ok_or_else(|| {
@@ -1488,10 +1491,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         )?,
                     };
                 }
-                let fields = arena
-                    .alloc_slice_copy(&decoded[..columns.len()])
-                    .map_err(|_| arena_full())?;
-                *value = Datum::Record(fields);
+                *value = Datum::Record(&*decoded);
             }
         } else {
             for (value, encoded) in values.iter_mut().zip(rows) {
@@ -3119,7 +3119,6 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     tref,
                     storage,
                     txid,
-                    arena,
                     slot,
                     &input_oids[..table_function_input_count(tref)],
                 )?,
@@ -3616,7 +3615,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             );
         }
         names.len()
-    } else if let Some((_, routine)) = routine {
+    } else if let Some((_, ref routine)) = routine {
         if let Some(creation) = routine_composite_result(routine, storage, txid)? {
             let target = crate::storage::TypeDefinitionTarget::by_creation(
                 storage,
@@ -3663,7 +3662,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 SqlName::parse(name)?,
                 routine.kind.function_result().expect("set routine result"),
                 routine.kind.function_result().and(match routine.kind {
-                    crate::storage::RoutineKind::SetFunction { result } => result.user_type,
+                    crate::storage::RoutineKind::Function { result }
+                    | crate::storage::RoutineKind::SetFunction { result } => result.user_type,
                     _ => None,
                 }),
                 -1,
@@ -4079,7 +4079,7 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     } else {
         tref.table
     };
-    let selection = if let Some(oid) = super::input_progress::selected_target() {
+    let selection = if let Some(oid) = super::input_progress::selected_target()? {
         storage.routine_slot_by_oid(oid, txid).map_or(
             crate::storage::RoutineCallSelection::Absent,
             crate::storage::RoutineCallSelection::Stored,
@@ -4118,14 +4118,13 @@ pub(super) fn select_table_func_routine<'a, C: ColumnLookup<'a>>(
     Ok((selection, argument_type_oids))
 }
 
-fn capture_table_func_routine<'a>(
-    tref: &TableRef<'a>,
+fn capture_table_func_routine(
+    tref: &TableRef<'_>,
     storage: &Storage,
     txid: u32,
-    arena: &'a Arena,
     slot: usize,
     argument_type_oids: &[i32],
-) -> Result<&'a mut RoutineDef, SqlError> {
+) -> Result<RoutineDef, SqlError> {
     let args = tref.func_args.expect("table function carries arguments");
     let args = &args[..table_function_input_count(tref)];
     storage.require_routine_execute(slot, txid)?;
@@ -4147,7 +4146,7 @@ fn capture_table_func_routine<'a>(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
-    arena.alloc(routine).map_err(|_| arena_full())
+    Ok(routine)
 }
 
 fn routine_composite_result(
@@ -4175,6 +4174,47 @@ struct TableFunctionRows<'a> {
     composite: Option<crate::storage::TypeCreation>,
 }
 
+/// A scalar call in FROM produces one row, even for a null result. Anonymous
+/// OUT records expose their fields here; named composites are expanded later.
+fn scalar_function_row<'a>(
+    routine: &RoutineDef,
+    value: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let encoded = if let Some(columns) = routine.record_result_columns() {
+        if columns.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table function output exceeds configured column capacity"
+            ));
+        }
+        let values = arena
+            .alloc_slice_with(columns.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        match value {
+            Datum::Record(fields) if fields.len() == columns.len() => {
+                for (output, field) in values.iter_mut().zip(fields) {
+                    *output = field.value;
+                }
+            }
+            Datum::Null => {}
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "scalar function result changed its declared OUT shape"
+                ));
+            }
+        }
+        crate::sql::exec::encode_projected_pub(values, arena)?
+    } else {
+        crate::sql::exec::encode_projected_pub(&[value], arena)?
+    };
+    arena
+        .alloc_slice_copy(&[encoded])
+        .map(|rows| &*rows)
+        .map_err(|_| arena_full())
+}
+
 /// Evaluates a table function's arguments against `columns` — an
 /// outer row, for a `LATERAL func(outer.col)`.
 #[allow(clippy::too_many_arguments)]
@@ -4186,7 +4226,7 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let produced = table_func_base_rows_outer(
@@ -4299,7 +4339,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<TableFunctionRows<'a>, SqlError> {
     let argument_catalog = super::storage_catalog(storage, arena, txid);
@@ -4344,7 +4384,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                             tref,
                             storage,
                             txid,
-                            arena,
                             slot,
                             &input_oids[..table_function_input_count(tref)],
                         )?,
@@ -5747,8 +5786,17 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 return Ok(&*rows);
             }
         }
-        if let Some((routine_slot, routine)) = selected {
-            let catalog = super::storage_catalog(storage, arena, txid);
+        if let Some((routine_slot, mut declaration)) = selected {
+            // The selected definition is temporary; only actual SQL text and
+            // output names may become part of arena-owned results.
+            let routine = &mut declaration;
+            let catalog = super::StorageCatalog {
+                storage,
+                routine_workspace: arena,
+                txid,
+                invocations,
+                statement_arena,
+            };
             let hooks = crate::sql::eval::EvalHooks {
                 catalog: Some(&catalog),
                 ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
@@ -5788,12 +5836,37 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 arena,
             )?
             else {
+                if !routine.kind.is_set_returning() {
+                    composite = routine_composite_result(routine, storage, txid)?;
+                    return scalar_function_row(routine, Datum::Null, arena);
+                }
                 return Ok(&[]);
             };
             let input_collation = routine_params.input_collation;
             let routine_params = routine_params.values;
-            let _input_body = super::input_progress::enter_body();
             composite = routine_composite_result(routine, storage, txid)?;
+            if !routine.kind.is_set_returning() {
+                let value = catalog
+                    .execute_routine(
+                        routine_slot,
+                        routine,
+                        &routine_params[..routine.argument_count],
+                        input_collation,
+                        crate::sql::eval::RoutineCallAccess::Caller,
+                        tref.func_source_position
+                            .get()
+                            .map(super::InvocationSite::Expression),
+                        arena,
+                    )?
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "scalar function produced no result"
+                        )
+                    })?;
+                return scalar_function_row(routine, value, arena);
+            }
+            let _input_body = super::input_progress::enter_body();
             let table_columns = routine.table_columns();
             let scalar_result = routine.kind.function_result();
             let _formal_scope = crate::sql::exec::enter_routine_parameter_types(
@@ -5812,38 +5885,46 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
                 .transpose()?;
             if invocations.is_some()
-                || super::active_routine_invocations().is_some()
+                || super::with_active_routine_invocations(|context| context.is_some())
                 || routine.language == crate::storage::RoutineLanguage::PlPgSql
             {
-                let (invocations, statement_arena) = match (invocations, statement_arena) {
-                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "PL/pgSQL table functions require a resumable query executor"
-                        )
-                    })?,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine invocation state is missing its statement arena"
-                        ));
-                    }
+                let resolve = |invocations: &super::RoutineInvocationState,
+                               statement_arena: &Arena| {
+                    invocations
+                        .resolve_rows(
+                            routine,
+                            &routine_params[..routine.argument_count],
+                            statement_arena,
+                            tref.func_source_position.get(),
+                            input_collation,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "pending PL/pgSQL table routine did not suspend query execution"
+                            )
+                        })
                 };
-                return invocations
-                    .resolve_rows(
-                        routine,
-                        &routine_params[..routine.argument_count],
-                        statement_arena,
-                        tref.func_source_position.get(),
-                        input_collation,
-                    )?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "pending PL/pgSQL table routine did not suspend query execution"
-                        )
-                    });
+                return match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => {
+                        resolve(invocations, statement_arena)?.rows(statement_arena, arena)
+                    }
+                    (None, None) => super::with_active_routine_invocations(|context| {
+                        let (invocations, statement_arena) = context.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "PL/pgSQL table functions require a resumable query executor"
+                            )
+                        })?;
+                        // An inherited callback owner cannot lend bytes beyond
+                        // its scope. This query owns its independent row image.
+                        resolve(invocations, statement_arena)?.copied_rows(statement_arena, arena)
+                    }),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    )),
+                };
             }
             let dependencies =
                 storage.snapshot_routine_dependencies_for(routine_slot, txid, arena)?;
@@ -5854,12 +5935,18 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     .type_inputs()
                     .detached_bindings(crate::storage::StoredInputSection::RoutineBody, arena)?
             };
+            let body = arena
+                .alloc_str(routine.body.as_str())
+                .map_err(|_| arena_full())?;
+            let name = arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| arena_full())?;
             let program = super::parse_stored_routine_function_program(
                 routine.body_kind,
-                routine.body.as_str(),
+                body,
                 arena,
                 scalar_result == Some(ColType::Void),
-                routine.name.as_str(),
+                name,
                 routine.arguments(),
                 inputs,
                 |parser| {
@@ -5867,35 +5954,43 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 },
             )?;
             if super::routine_program_requires_mutable_execution(&program) {
-                let (invocations, statement_arena) = match (invocations, statement_arena) {
-                    (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
-                    (None, None) => super::active_routine_invocations().ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "data-modifying SQL table functions require a resumable query executor"
-                        )
-                    })?,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "routine invocation state is missing its statement arena"
-                        ));
-                    }
+                let resolve = |invocations: &super::RoutineInvocationState,
+                               statement_arena: &Arena| {
+                    invocations
+                        .resolve_rows(
+                            routine,
+                            &routine_params[..routine.argument_count],
+                            statement_arena,
+                            tref.func_source_position.get(),
+                            input_collation,
+                        )?
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "pending SQL table routine did not suspend query execution"
+                            )
+                        })
                 };
-                return invocations
-                    .resolve_rows(
-                        routine,
-                        &routine_params[..routine.argument_count],
-                        statement_arena,
-                        tref.func_source_position.get(),
-                        input_collation,
-                    )?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "pending SQL table routine did not suspend query execution"
-                        )
-                    });
+                return match (invocations, statement_arena) {
+                    (Some(invocations), Some(statement_arena)) => {
+                        resolve(invocations, statement_arena)?.rows(statement_arena, arena)
+                    }
+                    (None, None) => super::with_active_routine_invocations(|context| {
+                        let (invocations, statement_arena) = context.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "data-modifying SQL table functions require a resumable query executor"
+                            )
+                        })?;
+                        // An inherited callback owner cannot lend bytes beyond
+                        // its scope. This query owns its independent row image.
+                        resolve(invocations, statement_arena)?.copied_rows(statement_arena, arena)
+                    }),
+                    _ => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    )),
+                };
             }
             for query in program.preceding {
                 let super::RoutinePrelude::Statement(statement) = query else {
@@ -7039,7 +7134,7 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
-    invocations: Option<&super::RoutineInvocationState<'a>>,
+    invocations: Option<&super::RoutineInvocationState>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     const EMPTY_ROWS: &[&[u8]] = &[];

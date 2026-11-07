@@ -1,16 +1,12 @@
 //! SELECT execution: one pipeline for single tables and joins.
 //!
-//! Shape: resolve the FROM clause into a scope → enumerate source rows
-//! (nested-loop joins, LEFT emitting a null row) → WHERE → then either
-//! stream straight to the wire, or materialize projected rows as tagged
-//! byte strings in the statement arena for GROUP BY / DISTINCT / ORDER BY.
-//! ORDER BY keys ride along as hidden columns after the visible ones, so
-//! arbitrary key expressions order both plain and joined queries.
-//!
-//! Subqueries are uncorrelated and pre-evaluated once per statement; their
-//! results are injected into evaluation by node identity (EvalHooks).
+//! Binds FROM sources, chooses the supported scan or join path, filters rows,
+//! then streams results or materializes them for grouping, windows and sorting.
+//! Hidden ORDER BY values travel with projected rows. SQL scans prepare
+//! uncorrelated subqueries once and correlated subqueries per outer row;
+//! procedural expressions evaluate only the subqueries they reach.
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::{Arena, ArenaIdentity, ArenaList};
 use crate::pg::respond::{Responder, ResultFmt};
 use crate::pg::wire::WireFull;
 use crate::sql_err;
@@ -29,6 +25,9 @@ use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
 pub(super) mod input_progress;
+mod invocation_results;
+pub(crate) use invocation_results::OwnedRoutineResult;
+use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::RetainedSelect;
 
@@ -935,9 +934,9 @@ pub(crate) enum InvocationSite {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PendingRoutineInvocation<'a> {
-    pub target: PendingRoutineTarget<'a>,
-    pub arguments: &'a [u8],
+pub(crate) struct PendingRoutineInvocation {
+    pub target: PendingRoutineTarget,
+    arguments: crate::mem::arena::FrozenArenaSliceHandle<u8>,
     pub argument_count: usize,
     pub source_position: Option<InvocationSite>,
     pub input_collation: super::ast::Collation,
@@ -946,9 +945,45 @@ pub(crate) struct PendingRoutineInvocation<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum PendingRoutineTarget<'a> {
-    Stored(&'a RoutineCallContract<'a>),
+pub(crate) enum PendingRoutineTarget {
+    Stored(crate::mem::arena::ArenaHandle<OwnedRoutineCallContract>),
     Intrinsic(i32),
+}
+
+impl PendingRoutineInvocation {
+    fn capture_arguments(
+        values: &[Datum<'_>],
+        arena: &Arena,
+    ) -> Result<crate::mem::arena::FrozenArenaSliceHandle<u8>, SqlError> {
+        let length = super::exec::projected_row_len(values)?;
+        let handle = arena.retain_slice_with(length, |_| 0u8).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending routine arguments exceed statement memory"
+            )
+        })?;
+        let mut bytes = arena
+            .retained_slice_mut(handle)
+            .map_err(|_| inactive_pending_call())?;
+        super::exec::encode_projected_into(values, &mut bytes)?;
+        drop(bytes);
+        arena
+            .freeze_retained_slice(handle)
+            .map_err(|_| inactive_pending_call())
+    }
+
+    pub(crate) fn arguments<'out>(&self, source: &'out Arena) -> Result<&'out [u8], SqlError> {
+        source
+            .retained_slice(self.arguments)
+            .map_err(|_| inactive_pending_call())
+    }
+}
+
+pub(super) fn inactive_pending_call() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "pending routine call storage is inactive"
+    )
 }
 
 pub(super) fn require_routine_call_access(
@@ -1022,20 +1057,21 @@ enum RoutineCallResult {
 /// Keep the selected SQL types after values have erased domains and
 /// polymorphic bindings. The body is resolved when execution starts, matching
 /// PostgreSQL when evaluating an input replaces that body's definition.
+type RoutineCallContract<'a> = RoutineSignature<&'a [crate::storage::RoutineArgumentDef]>;
+type OwnedRoutineCallContract =
+    RoutineSignature<crate::mem::arena::ArenaSliceHandle<crate::storage::RoutineArgumentDef>>;
+
 #[derive(Clone, Copy)]
-pub(crate) struct RoutineCallContract<'a> {
+pub(crate) struct RoutineSignature<Arguments> {
     pub oid: i32,
-    arguments: &'a [crate::storage::RoutineArgumentDef],
-    parameters: &'a [crate::storage::RoutineArgumentDef],
+    arguments: Arguments,
+    parameters: Arguments,
     result: RoutineCallResult,
-    result_columns: &'a [crate::storage::RoutineArgumentDef],
+    result_columns: Arguments,
 }
 
-impl<'a> RoutineCallContract<'a> {
-    fn capture(
-        routine: &crate::storage::RoutineDef,
-        arena: &'a Arena,
-    ) -> Result<&'a Self, SqlError> {
+impl OwnedRoutineCallContract {
+    fn capture(routine: &crate::storage::RoutineDef, arena: &Arena) -> Result<Self, SqlError> {
         let full = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1056,18 +1092,17 @@ impl<'a> RoutineCallContract<'a> {
                 ));
             }
         };
-        let captured = Self::copy_signature(
+        Self::copy_signature(
             routine,
             result,
             |values| {
                 arena
-                    .alloc_persistent_slice_with(values.len(), |index| values[index])
-                    .map(|values| &*values)
+                    .retain_slice_with(values.len(), |index| values[index])
                     .map_err(|_| full())
             },
             |parameters| {
                 arena
-                    .alloc_persistent_slice_with(parameters.len(), |index| {
+                    .retain_slice_with(parameters.len(), |index| {
                         let parameter = &parameters[index];
                         crate::storage::RoutineArgumentDef {
                             name: parameter.name,
@@ -1075,26 +1110,44 @@ impl<'a> RoutineCallContract<'a> {
                             user_type: parameter.user_type,
                         }
                     })
-                    .map(|values| &*values)
                     .map_err(|_| full())
             },
-        )?;
-        let retained = arena
-            .alloc_persistent_slice_with(1, |_| captured)
-            .map_err(|_| full())?;
-        Ok(&retained[0])
+        )
     }
 
+    pub(crate) fn bind(
+        &self,
+        routine: &mut crate::storage::RoutineDef,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        let arguments = arena
+            .retained_slice_mut(self.arguments)
+            .map_err(|_| inactive_pending_call())?;
+        let parameters = arena
+            .retained_slice_mut(self.parameters)
+            .map_err(|_| inactive_pending_call())?;
+        let result_columns = arena
+            .retained_slice_mut(self.result_columns)
+            .map_err(|_| inactive_pending_call())?;
+        RoutineCallContract {
+            oid: self.oid,
+            arguments: &arguments,
+            parameters: &parameters,
+            result: self.result,
+            result_columns: &result_columns,
+        }
+        .bind(routine)
+    }
+}
+
+impl<Arguments> RoutineSignature<Arguments> {
     fn copy_signature(
         routine: &crate::storage::RoutineDef,
         result: RoutineCallResult,
-        mut copy: impl FnMut(
-            &[crate::storage::RoutineArgumentDef],
-        ) -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        mut copy: impl FnMut(&[crate::storage::RoutineArgumentDef]) -> Result<Arguments, SqlError>,
         copy_parameters: impl FnOnce(
             &[crate::storage::RoutineParameterDef],
-        )
-            -> Result<&'a [crate::storage::RoutineArgumentDef], SqlError>,
+        ) -> Result<Arguments, SqlError>,
     ) -> Result<Self, SqlError> {
         Ok(Self {
             oid: crate::storage::routine_oid(routine),
@@ -1104,7 +1157,9 @@ impl<'a> RoutineCallContract<'a> {
             result_columns: copy(&routine.result_columns[..routine.result_column_count])?,
         })
     }
+}
 
+impl RoutineCallContract<'_> {
     pub(crate) fn bind(&self, routine: &mut crate::storage::RoutineDef) -> Result<(), SqlError> {
         if crate::storage::routine_oid(routine) != self.oid
             || routine.argument_count != self.arguments.len()
@@ -1138,6 +1193,10 @@ impl<'a> RoutineCallContract<'a> {
 pub(crate) enum RoutineResultShape<'a> {
     Scalar,
     Record(&'a [super::types::RecordField<'a>]),
+    Composite {
+        creation: crate::storage::TypeCreation,
+        width: usize,
+    },
 }
 
 impl<'a> RoutineResultShape<'a> {
@@ -1147,6 +1206,25 @@ impl<'a> RoutineResultShape<'a> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
+        if let Some(ColType::Composite(Some(creation))) = routine.kind.function_result() {
+            let target = crate::storage::TypeDefinitionTarget::by_creation(
+                storage,
+                crate::storage::NamedTypeKind::Composite,
+                creation,
+            )?;
+            let definition = storage
+                .read_composite_definition(target, txid)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite result type does not exist"
+                    )
+                })?;
+            return Ok(Self::Composite {
+                creation,
+                width: definition.active_field_count(),
+            });
+        }
         if !matches!(
             routine.kind,
             crate::storage::RoutineKind::RecordFunction { .. }
@@ -1183,9 +1261,22 @@ impl<'a> RoutineResultShape<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
+        if let Self::Composite { creation, .. } = self
+            && let [value] = values
+            && match value {
+                Datum::Null | Datum::Record(_) => true,
+                Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => {
+                    slot == creation
+                }
+                _ => false,
+            }
+        {
+            return super::exec::detach_routine_datum(*value, arena);
+        }
         let width = match self {
             Self::Scalar => 1,
             Self::Record(fields) => fields.len(),
+            Self::Composite { width, .. } => *width,
         };
         if values.len() != width {
             return Err(sql_err!(
@@ -1205,38 +1296,45 @@ impl<'a> RoutineResultShape<'a> {
                 }
                 Ok(Datum::Record(fields))
             }
+            Self::Composite { .. } => {
+                let fields = arena
+                    .alloc_slice_with(values.len(), |index| super::types::RecordField {
+                        name: "",
+                        type_oid: if values[index].is_null() {
+                            super::types::oid::UNKNOWN
+                        } else {
+                            values[index].type_oid()
+                        },
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
+                for (index, field) in fields.iter_mut().enumerate() {
+                    field.value = super::exec::decode_projected_col_record(encoded, index, arena)?;
+                }
+                Ok(Datum::Record(fields))
+            }
         }
     }
 }
 
-/// A completed routine invocation is either a scalar expression value or the
-/// encoded rows of a table source. Keeping the two contracts distinct prevents
-/// a restart from ever interpreting one as the other.
-#[derive(Clone, Copy)]
-enum RoutineInvocationResult<'a> {
-    Scalar(Datum<'a>, super::sequence::StatementReplayCursor),
-    Rows(&'a [&'a [u8]], super::sequence::StatementReplayCursor),
-}
-
-pub(crate) struct RoutineInvocationState<'a> {
+pub(crate) struct RoutineInvocationState {
     next: Cell<usize>,
-    completed: Cell<usize>,
-    pending: Cell<Option<PendingRoutineInvocation<'a>>>,
+    pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
-    arena: &'a Arena,
-    results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
-    inputs: input_progress::RoutineInputs<'a>,
+    owner: ArenaIdentity,
+    results: RefCell<RoutineResults>,
+    inputs: input_progress::RoutineInputs,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RoutineInvocationContext<'scope, 'arena> {
-    invocations: &'scope RoutineInvocationState<'arena>,
+    invocations: &'scope RoutineInvocationState,
     statement_arena: &'arena Arena,
 }
 
 impl<'scope, 'arena> RoutineInvocationContext<'scope, 'arena> {
     pub(crate) const fn new(
-        invocations: &'scope RoutineInvocationState<'arena>,
+        invocations: &'scope RoutineInvocationState,
         statement_arena: &'arena Arena,
     ) -> Self {
         Self {
@@ -1253,7 +1351,7 @@ thread_local! {
 /// Installs the statement-owned routine invocation log while its query work
 /// arena is scanned. Scan callbacks do not own an engine reference, so this
 /// scoped bridge carries the already-borrowed context without duplicating it.
-pub(crate) struct RoutineInvocationScope(Option<(*const (), *const ())>);
+struct RoutineInvocationScope(Option<(*const (), *const ())>);
 
 impl Drop for RoutineInvocationScope {
     fn drop(&mut self) {
@@ -1261,32 +1359,38 @@ impl Drop for RoutineInvocationScope {
     }
 }
 
-pub(crate) fn enter_routine_invocation_scope(
+pub(crate) fn with_routine_invocation_scope<R>(
     context: Option<RoutineInvocationContext<'_, '_>>,
-) -> RoutineInvocationScope {
+    execute: impl FnOnce() -> R,
+) -> R {
     let current = match context {
         Some(context) => Some((
-            context.invocations as *const RoutineInvocationState<'_> as *const (),
+            context.invocations as *const RoutineInvocationState as *const (),
             context.statement_arena as *const Arena as *const (),
         )),
         None => ACTIVE_ROUTINE_INVOCATIONS.with(Cell::get),
     };
     let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
-    RoutineInvocationScope(prior)
+    // Keep the guard private: a caller cannot forget it and leave dangling TLS.
+    let _scope = RoutineInvocationScope(prior);
+    execute()
 }
 
-pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationState<'a>, &'a Arena)>
-{
+pub(crate) fn with_active_routine_invocations<R>(
+    read: impl for<'scope> FnOnce(Option<(&'scope RoutineInvocationState, &'scope Arena)>) -> R,
+) -> R {
     ACTIVE_ROUTINE_INVOCATIONS.with(|active| {
-        let (invocations, arena) = active.get()?;
-        // The only writer is `enter_routine_invocation_scope`; its guard stays
-        // live for the synchronous scan and restores any enclosing execution.
-        Some(unsafe {
+        let Some((invocations, arena)) = active.get() else {
+            return read(None);
+        };
+        // The installing guard pins both owners. The higher-ranked callback
+        // prevents either reference escaping after that scope ends.
+        read(Some(unsafe {
             (
-                &*(invocations as *const RoutineInvocationState<'a>),
+                &*(invocations as *const RoutineInvocationState),
                 &*(arena as *const Arena),
             )
-        })
+        }))
     })
 }
 
@@ -1333,17 +1437,23 @@ pub(crate) fn protect_statement_effects() {
     });
 }
 
-impl<'a> RoutineInvocationState<'a> {
-    pub(crate) fn new(arena: &'a Arena) -> Self {
+impl RoutineInvocationState {
+    pub(crate) fn new(arena: &Arena) -> Self {
         Self {
             next: Cell::new(0),
-            completed: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
-            arena,
-            results: RefCell::new(ArenaList::new_persistent(arena)),
-            inputs: input_progress::RoutineInputs::new(arena),
+            owner: arena.identity(),
+            results: RefCell::new(RoutineResults::new()),
+            inputs: input_progress::RoutineInputs::new(),
         }
+    }
+
+    pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
+        if self.owner != arena.identity() {
+            return Err(inactive_pending_call());
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_attempt(&self) {
@@ -1360,25 +1470,26 @@ impl<'a> RoutineInvocationState<'a> {
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         query_arena: &'query Arena,
         source_position: Option<InvocationSite>,
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
     ) -> Result<Option<Datum<'query>>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().as_slice()[ordinal]
-            else {
+        if ordinal < self.results.borrow().len() {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Scalar(value) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a table source to a scalar expression"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
-            return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
+            super::sequence::restore_replay_cursor(saved.replay)?;
+            return Ok(Some(value.scalar(statement_arena, query_arena)?));
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1387,11 +1498,17 @@ impl<'a> RoutineInvocationState<'a> {
             source_position,
             input_collation,
             access,
-            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
-                routine,
-                statement_arena,
-            )?),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            target: PendingRoutineTarget::Stored(
+                statement_arena
+                    .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending routine type contract exceeds statement memory"
+                        )
+                    })?,
+            ),
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -1404,22 +1521,23 @@ impl<'a> RoutineInvocationState<'a> {
         &self,
         oid: i32,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         query_arena: &'query Arena,
     ) -> Result<Datum<'query>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value, replay) =
-                self.results.borrow().as_slice()[ordinal]
-            else {
+        if ordinal < self.results.borrow().len() {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Scalar(value) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "intrinsic invocation changed result shape"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
-            return super::exec::detach_routine_datum(value, query_arena);
+            super::sequence::restore_replay_cursor(saved.replay)?;
+            return value.scalar(statement_arena, query_arena);
         }
         self.pending_replay
             .set(super::sequence::begin_replay_cursor()?);
@@ -1429,7 +1547,7 @@ impl<'a> RoutineInvocationState<'a> {
             input_collation: super::ast::Collation::None,
             access: super::eval::RoutineCallAccess::Caller,
             target: PendingRoutineTarget::Intrinsic(oid),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -1438,48 +1556,45 @@ impl<'a> RoutineInvocationState<'a> {
         ))
     }
 
-    pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation<'a>> {
+    pub(crate) fn take_pending(&self) -> Option<PendingRoutineInvocation> {
         self.pending.replace(None)
     }
 
-    pub(crate) fn complete(&self, result: Datum<'a>) -> Result<(), SqlError> {
-        let ordinal = self.completed.get();
+    pub(crate) fn complete(
+        &self,
+        value: OwnedRoutineResult,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        self.require_arena(arena)?;
+        value.validate(arena)?;
+        let replay = super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?;
         self.results
             .borrow_mut()
-            .push(RoutineInvocationResult::Scalar(
-                result,
-                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ))
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "mutable routine replay exceeds statement memory"
-                )
-            })?;
-        self.completed.set(ordinal + 1);
-        Ok(())
+            .push(arena, RoutineInvocationResult { value, replay })
+            .map_err(invocation_results::directory_error)
     }
 
     pub(crate) fn resolve_rows(
         &self,
         routine: &crate::storage::RoutineDef,
         arguments: &[Datum],
-        statement_arena: &'a Arena,
+        statement_arena: &Arena,
         source_position: Option<usize>,
         input_collation: super::ast::Collation,
-    ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
+    ) -> Result<Option<invocation_results::ResultBytes>, SqlError> {
+        self.require_arena(statement_arena)?;
         let ordinal = self.next.get();
         self.next.set(ordinal + 1);
-        if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Rows(rows, replay) =
-                self.results.borrow().as_slice()[ordinal]
-            else {
+        if ordinal < self.results.borrow().len() {
+            let saved =
+                invocation_results::result_at(&self.results.borrow(), statement_arena, ordinal)?;
+            let OwnedRoutineResult::Rows(rows) = saved.value else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a scalar expression to a table source"
                 ));
             };
-            super::sequence::restore_replay_cursor(replay)?;
+            super::sequence::restore_replay_cursor(saved.replay)?;
             return Ok(Some(rows));
         }
         self.pending_replay
@@ -1489,35 +1604,23 @@ impl<'a> RoutineInvocationState<'a> {
             source_position: source_position.map(InvocationSite::Expression),
             input_collation,
             access: super::eval::RoutineCallAccess::Caller,
-            target: PendingRoutineTarget::Stored(RoutineCallContract::capture(
-                routine,
-                statement_arena,
-            )?),
-            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
+            target: PendingRoutineTarget::Stored(
+                statement_arena
+                    .retain(OwnedRoutineCallContract::capture(routine, statement_arena)?)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending routine type contract exceeds statement memory"
+                        )
+                    })?,
+            ),
+            arguments: PendingRoutineInvocation::capture_arguments(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable SQL routine invocation is pending"
         ))
-    }
-
-    pub(crate) fn complete_rows(&self, rows: &'a [&'a [u8]]) -> Result<(), SqlError> {
-        let ordinal = self.completed.get();
-        self.results
-            .borrow_mut()
-            .push(RoutineInvocationResult::Rows(
-                rows,
-                super::sequence::finish_replay_cursor(self.pending_replay.take(), self.arena)?,
-            ))
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "mutable routine replay exceeds statement memory"
-                )
-            })?;
-        self.completed.set(ordinal + 1);
-        Ok(())
     }
 }
 const SUBQUERY_DEPTH: u32 = 4;
@@ -2055,7 +2158,7 @@ pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> 
     storage: &'storage Storage,
     routine_workspace: &'workspace Arena,
     txid: u32,
-    invocations: Option<&'invocation RoutineInvocationState<'statement>>,
+    invocations: Option<&'invocation RoutineInvocationState>,
     statement_arena: Option<&'statement Arena>,
 }
 
@@ -2097,6 +2200,7 @@ pub(crate) fn execute_index_comparison<'a>(
             &[left, right],
             super::ast::Collation::None,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -2876,6 +2980,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     &arguments[..routine.argument_count],
                     input_collation,
                     super::eval::RoutineCallAccess::Caller,
+                    input_progress::invocation_site(),
                     arena,
                 )?
                 .unwrap_or(Datum::Null)
@@ -3045,6 +3150,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
             &coerced[..expected_count],
             input_collation,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -3061,6 +3167,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selected scalar calls retain source ownership in FROM and expression contexts"
+    )]
     fn execute_routine<'a>(
         &self,
         slot: usize,
@@ -3068,12 +3178,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
         arguments: &[Datum<'a>],
         input_collation: super::ast::Collation,
         access: super::eval::RoutineCallAccess,
+        source_position: Option<InvocationSite>,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
-        let source_position = input_progress::invocation_site();
         let _input_body = input_progress::enter_body();
         let owner = crate::storage::SessionIdentity::bound(
             self.storage
@@ -3110,24 +3220,21 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.txid,
             arena,
         )?;
-        if self.invocations.is_some()
-            || active_routine_invocations().is_some()
-            || routine.language == crate::storage::RoutineLanguage::PlPgSql
-        {
-            if let Some(invocations) = self.invocations {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    self.statement_arena
-                        .expect("routine invocation state has statement arena"),
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
-            if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(
+        if let Some(invocations) = self.invocations {
+            return invocations.resolve(
+                routine,
+                arguments,
+                self.statement_arena
+                    .expect("routine invocation state has statement arena"),
+                arena,
+                source_position,
+                input_collation,
+                access,
+            );
+        }
+        if let Some(result) = with_active_routine_invocations(|context| {
+            context.map(|(invocations, statement_arena)| {
+                invocations.resolve(
                     routine,
                     arguments,
                     statement_arena,
@@ -3135,8 +3242,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     source_position,
                     input_collation,
                     access,
-                );
-            }
+                )
+            })
+        }) {
+            return result;
+        }
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "PL/pgSQL functions require a resumable query executor"
@@ -3173,29 +3284,6 @@ impl StorageCatalog<'_, '_, '_, '_> {
             },
         )?;
         if routine_program_requires_mutable_execution(&function_program) {
-            if let Some(invocations) = self.invocations {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    self.statement_arena
-                        .expect("routine invocation state has statement arena"),
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
-            if let Some((invocations, statement_arena)) = active_routine_invocations() {
-                return invocations.resolve(
-                    routine,
-                    arguments,
-                    statement_arena,
-                    arena,
-                    source_position,
-                    input_collation,
-                    access,
-                );
-            }
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a resumable query executor"
@@ -3312,7 +3400,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
             if result_contract.polymorphic_type().is_some() {
                 Ok(Some(result))
             } else {
-                super::eval::cast_to(result, result_type, arena).map(Some)
+                if matches!(result_type, ColType::Composite(_)) {
+                    self.coerce_result(result, result_contract, arena, None)
+                        .map(Some)
+                } else {
+                    super::eval::cast_to(result, result_type, arena).map(Some)
+                }
             }
         })();
         if let Some((total, own)) = super::statistics::finish_function_timing(timed)
@@ -4522,6 +4615,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             &completed.values[..declared.argument_count],
             completed.input_collation,
             super::eval::RoutineCallAccess::Caller,
+            input_progress::invocation_site(),
             arena,
         )?
         .ok_or_else(|| {
@@ -4632,7 +4726,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                     "bound support function polymorphic contract does not match its arguments"
                 )
             })?;
-        self.execute_routine(slot, &routine, arguments, input_collation, access, arena)
+        self.execute_routine(
+            slot,
+            &routine,
+            arguments,
+            input_collation,
+            access,
+            input_progress::invocation_site(),
+            arena,
+        )
     }
 
     fn cast_evaluation(
@@ -8630,15 +8732,15 @@ pub fn select_query<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn select_query_resumable<'a, 'statement>(
+pub(crate) fn select_query_resumable<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
-    invocations: Option<&RoutineInvocationState<'statement>>,
-    statement_arena: Option<&'statement Arena>,
+    invocations: Option<&RoutineInvocationState>,
+    statement_arena: Option<&Arena>,
     responder: &mut Responder,
 ) -> Outcome {
     let statement = match expand_select_record_calls(statement, storage, txid, arena, None) {
@@ -9287,15 +9389,15 @@ pub fn constant_select<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn constant_select_resumable<'a, 'statement>(
+pub(crate) fn constant_select_resumable<'a>(
     storage: &'a Storage,
     txid: u32,
     statement: &'a Select<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq: Option<&dyn SequenceAccess>,
-    invocations: Option<&RoutineInvocationState<'statement>>,
-    statement_arena: Option<&'statement Arena>,
+    invocations: Option<&RoutineInvocationState>,
+    statement_arena: Option<&Arena>,
     responder: &mut Responder,
 ) -> Outcome {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -12991,7 +13093,23 @@ pub fn first_from_match<'a>(
     Ok(found)
 }
 
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+thread_local! {
+    static LAST_ARENA_FAILURE: Cell<Option<(&'static str, u32)>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+pub(super) fn take_arena_full_location() -> Option<(&'static str, u32)> {
+    LAST_ARENA_FAILURE.with(|failure| failure.take())
+}
+
+#[track_caller]
 fn arena_full() -> SqlError {
+    #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+    {
+        let caller = core::panic::Location::caller();
+        LAST_ARENA_FAILURE.with(|failure| failure.set(Some((caller.file(), caller.line()))));
+    }
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "query result exceeds the statement arena"
@@ -12999,6 +13117,7 @@ fn arena_full() -> SqlError {
 }
 
 /// Public view-DML rewriting uses this for arena-exhaustion.
+#[track_caller]
 pub fn arena_full_pub() -> SqlError {
     arena_full()
 }

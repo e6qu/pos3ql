@@ -21,6 +21,12 @@ pub(crate) struct Purpose {
 }
 
 impl Purpose {
+    pub(crate) const EXECUTION_CONTROL: Self = Self {
+        pool: "execution control pool",
+        bytes: "execution_control_bytes",
+        leases: "execution_control_leases",
+        ranges: "execution control free ranges",
+    };
     pub(crate) const ROW_WORK: Self = Self {
         pool: "row work pool",
         bytes: "row_work_bytes",

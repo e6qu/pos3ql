@@ -32,6 +32,8 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "--row-overlay-slots", "512",
             "--row-work-bytes", "8388608",
             "--row-work-leases", "128",
+            "--execution-control-bytes", "262144",
+            "--execution-control-leases", "256",
             "--definition-image-slots", "256",
             "--table-metadata-bytes", "67108864",
             "--table-metadata-leases", "8192",
@@ -104,6 +106,8 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(result["hardware_description"], "fixed host type")
         self.assertEqual(result["suite"]["catalog_relations"], 128)
+        self.assertEqual(result["suite"]["execution_control_bytes"], 262144)
+        self.assertEqual(result["suite"]["execution_control_leases"], 256)
         self.assertEqual(result["suite"]["cache_storage_description"], "local NVMe")
         store = result["pos3ql_object_store"]
         self.assertTrue(store["independently_operated"])

@@ -57,9 +57,23 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Build all native targets
-        run: >-
-          cargo build --all-targets --locked --target "$NATIVE_TARGET"
-          --message-format=json-render-diagnostics > "$RUNNER_TEMP/native-build.jsonl"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --all-targets --locked --profile native-ci --jobs 1 \
+            --target "$NATIVE_TARGET" --timings --message-format=json-render-diagnostics \
+            | tee "$RUNNER_TEMP/native-build.jsonl"
+
+      - name: Retain native build progress and timings
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-build-progress-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/native-build.jsonl
+            target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Prepare the exact native test executable
         run: >-
@@ -177,7 +191,9 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-native-dependencies-${{ hashFiles('Cargo.lock') }}
 
       - name: Native allocation-free boundaries
-        run: cargo clippy --all-targets --locked --target "$NATIVE_TARGET" -- -D warnings
+        run: >-
+          cargo clippy --all-targets --locked --profile native-ci --jobs 1
+          --target "$NATIVE_TARGET" -- -D warnings
 
   macos-lock-ownership:
     needs: formatting

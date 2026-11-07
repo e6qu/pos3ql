@@ -5,7 +5,7 @@
 # Coverage-producing runs retain separate lcov files for the merge gate.
 # Instrumented unit tests are partitioned after one build per worker so test
 # growth cannot consume the fixed 15-minute job budget. The budget includes a
-# cold release build, dependency setup, artifact upload, and runner cleanup.
+# cold instrumented build, dependency setup, artifact upload, and runner cleanup.
 name: coverage
 on:
   push:

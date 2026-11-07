@@ -84,6 +84,8 @@ Also choose the shared hard capacities explicitly:
 row_overlay_slots = 8192
 row_work_bytes = 8MiB
 row_work_leases = 128
+execution_control_bytes = 256KiB
+execution_control_leases = 256
 definition_image_slots = 256
 table_metadata_bytes = 64MiB
 table_metadata_leases = 8192

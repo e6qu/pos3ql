@@ -15,7 +15,12 @@ use std::alloc::Layout;
 use super::budget::{Budget, BudgetError};
 
 mod retained_slice;
-pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle};
+pub(crate) use retained_slice::{ArenaSliceError, ArenaSliceHandle, FrozenArenaSliceHandle};
+mod retained_list;
+pub(crate) use retained_list::{RetainedList, RetainedListError};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArenaIdentity(u64);
 
 pub struct Arena {
     what: &'static str,
@@ -106,12 +111,22 @@ pub(crate) struct ArenaMark {
 // move between threads. Allocation references stay within their arena borrow.
 unsafe impl Send for Arena {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArenaFull {
     pub what: &'static str,
     pub requested: usize,
     pub remaining: usize,
     pub capacity: usize,
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+thread_local! {
+    static LAST_ALLOCATION_FAILURE: Cell<Option<(ArenaFull, bool)>> = const { Cell::new(None) };
+}
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+pub(crate) fn take_last_allocation_failure() -> Option<(ArenaFull, bool)> {
+    LAST_ALLOCATION_FAILURE.with(|failure| failure.take())
 }
 
 impl fmt::Display for ArenaFull {
@@ -129,6 +144,10 @@ impl std::error::Error for ArenaFull {}
 const ARENA_ALIGN: usize = 16;
 
 impl Arena {
+    pub(crate) const fn identity(&self) -> ArenaIdentity {
+        ArenaIdentity(self.retention_identity)
+    }
+
     pub fn new(
         budget: &mut Budget,
         what: &'static str,
@@ -597,12 +616,16 @@ impl Arena {
     }
 
     fn full(&self, requested: usize) -> ArenaFull {
-        ArenaFull {
+        let error = ArenaFull {
             what: self.what,
             requested,
             remaining: self.allocation_limit().saturating_sub(self.offset.get()),
             capacity: self.capacity,
-        }
+        };
+        #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+        LAST_ALLOCATION_FAILURE
+            .with(|failure| failure.set(Some((error, self.region_active.get()))));
+        error
     }
 
     fn allocation_limit(&self) -> usize {

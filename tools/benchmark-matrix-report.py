@@ -52,6 +52,8 @@ SUITE_IDENTITY_FIELDS = (
     "row_overlay_slots",
     "row_work_bytes",
     "row_work_leases",
+    "execution_control_bytes",
+    "execution_control_leases",
     "definition_image_slots",
     "table_metadata_bytes",
     "table_metadata_leases",

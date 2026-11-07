@@ -36,3 +36,19 @@ checkpoint-profile = []
 
 [profile.release]
 panic = "abort"
+
+# Native CI needs source-line backtraces, without full variable/type debug data
+# for the large library test executable. Keep development assertions and checks.
+[profile.native-ci]
+inherits = "dev"
+opt-level = 0
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+
+# Instrumented builds need line coverage, without full release optimization
+# dominating the fixed CI budget. Production release settings remain separate.
+[profile.coverage]
+inherits = "release"
+opt-level = 1

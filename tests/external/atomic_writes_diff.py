@@ -194,6 +194,7 @@ class Node:
             "block_cache_bytes": "512KiB", "disk_cache_bytes": 0,
             "max_tables": 8, "row_overlay_slots": 256, "txn_rows": 256,
             "row_work_bytes": "8MiB", "row_work_leases": 128, "definition_image_slots": 256,
+            "execution_control_bytes": "256KiB", "execution_control_leases": 256,
             "table_metadata_bytes": "64MiB", "table_metadata_leases": 8192,
             "statistics_bytes": "1MiB", "statistics_leases": 1024,
             "index_statistics_slots": 4096,

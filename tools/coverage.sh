@@ -113,7 +113,7 @@ eval "$coverage_environment"
 # target/ without a CACHEDIR.TAG; drop the raw profiles directly instead.
 find target -name '*.profraw' -delete 2>/dev/null || true
 
-# Everything is measured in the release profile so that the unit tests and the
+# Everything is measured in the explicit coverage profile so the unit tests and
 # server binary the external suites drive produce profiles against the same
 # objects; mixing profiles makes llvm-cov fail to find one of them.
 # The in-process tests have their own trace shard so their growing runtime
@@ -121,7 +121,7 @@ find target -name '*.profraw' -delete 2>/dev/null || true
 case "$SHARD" in
 "")
     echo "=== in-process tests ==="
-    if ! python3 tools/test_command.py cargo test --locked --lib --release; then
+    if ! python3 tools/test_command.py cargo test --locked --lib --profile coverage; then
         echo "FAIL: in-process tests did not pass; coverage cannot be reported"
         exit 1
     fi
@@ -147,7 +147,7 @@ lib:*)
     case "${COVERAGE_NATIVE_DEBUGGER-}" in
     gdb)
         command -v gdb >/dev/null || { echo "FAIL: COVERAGE_NATIVE_DEBUGGER=gdb requires gdb"; exit 1; }
-        if ! cargo test --locked --lib --release --no-run \
+        if ! cargo test --locked --lib --profile coverage --no-run \
             --message-format=json-render-diagnostics > "$TMP/lib-build.jsonl"; then
             echo "FAIL: in-process tests could not be built"
             exit 1
@@ -167,7 +167,7 @@ PY
         "$native_test_binary" --list > "$TMP/lib.list"
         ;;
     none)
-        if ! cargo test --locked --lib --release -- --list > "$TMP/lib.list"; then
+        if ! cargo test --locked --lib --profile coverage -- --list > "$TMP/lib.list"; then
             tail -80 "$TMP/lib.list"
             echo "FAIL: in-process tests could not be enumerated"
             exit 1
@@ -206,7 +206,7 @@ PY
             -ex 'handle SIGPIPE nostop noprint pass' \
             -ex run -ex 'thread apply all bt 40' --args "$native_test_binary" "$@"
     else
-        set -- cargo test --locked --lib --release -- "$@"
+        set -- cargo test --locked --lib --profile coverage -- "$@"
     fi
     if ! python3 tools/test_command.py "$@"; then
         echo "FAIL: in-process test partition $partition did not pass"
@@ -221,7 +221,7 @@ LIB_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
 case "$SHARD" in
 lib:*)
     echo "=== lcov tracefile ==="
-    cargo llvm-cov report --release --lcov --output-path "$LCOV_OUT"
+    cargo llvm-cov report --profile coverage --lcov --output-path "$LCOV_OUT"
     echo "wrote $LCOV_OUT"
     exit 0
     ;;
@@ -232,8 +232,8 @@ echo "=== building the instrumented server ==="
 # uninstrumented binary can survive this build and silently contribute no
 # profile at all. Touching the crate root forces the rebuild.
 touch src/lib.rs
-cargo build --release --locked
-BIN="$PWD/target/release/pos3ql"
+cargo build --profile coverage --locked
+BIN="$PWD/target/coverage/pos3ql"
 
 run_differential() {
     echo "=== differential suite (server binary) ==="
@@ -251,7 +251,7 @@ run_differential() {
 
 write_lcov() {
     echo "=== lcov tracefile ==="
-    cargo llvm-cov report --release --lcov --output-path "$LCOV_OUT"
+    cargo llvm-cov report --profile coverage --lcov --output-path "$LCOV_OUT"
     echo "wrote $LCOV_OUT"
 }
 
@@ -279,7 +279,7 @@ case "$SHARD" in
             echo "      the external layer would contribute nothing. Suspect a stale" \
                  "uninstrumented binary, kill -9'd servers flushing nothing, or a"
             echo "      profile-signature mismatch. llvm-cov/profdata detail:"
-            cargo llvm-cov report --release --summary-only 2>&1 | grep -iE "warning|error|fail|no .*prof" || true
+            cargo llvm-cov report --profile coverage --summary-only 2>&1 | grep -iE "warning|error|fail|no .*prof" || true
             exit 1
         fi
     else
@@ -296,8 +296,8 @@ case "$SHARD" in
     fi
 
     echo "=== combined report ==="
-    cargo llvm-cov report --release --summary-only 2>&1 | tail -3
-    PCT=$(cargo llvm-cov report --release --summary-only 2>/dev/null | awk '/^TOTAL/ {gsub("%","",$10); print int($10)}')
+    cargo llvm-cov report --profile coverage --summary-only 2>&1 | tail -3
+    PCT=$(cargo llvm-cov report --profile coverage --summary-only 2>/dev/null | awk '/^TOTAL/ {gsub("%","",$10); print int($10)}')
     echo "line coverage: ${PCT}%  (floor ${MIN}%)"
     [ "$PCT" -ge "$MIN" ] || { echo "FAIL: line coverage ${PCT}% is below the ${MIN}% floor"; exit 1; }
     echo "OK"

@@ -126,7 +126,7 @@ whether a SQL function can be inlined needs the properties of text concatenation
 even though its internal `textcat` function is not exposed as a SQL call.
 Initialized callable declarations take precedence over bootstrap facts. Adding
 these facts does not add callable functions; [source hashes and generation
-details](../tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
+details](https://github.com/e6qu/pos3ql/blob/d79ba0232874d6dfbd7a9f7a744af9a9a12f3318/tests/external/reference/2026-11-03-input-plans/planner-procedure-properties.json)
 record their origin.
 
 Parameterized Bind attempts keep separate checked planner values. Parameterless
@@ -156,6 +156,15 @@ or an explicit `BEGIN`, still prevents that command with `25001`. Query analysis
 pins the data snapshot; preparing a transaction-setting utility does not. Errors
 roll back implicit work, while an explicit failed block remains failed until a
 transaction-exit command such as `ROLLBACK`.
+The connection retains its original command deadline between Parse, Bind,
+Describe and Execute. Idle time does not renew that timer: the next supported
+message checks it before producing buffered rows or replies, including Flush,
+Close and Sync. An expired Sync still completes error recovery with
+ReadyForQuery. COPY also rebinds its owning session, identity, search path,
+rendering settings and original statement/transaction timestamps at start,
+each row and completion. Another connection cannot lend it settings or reset
+its clock. Once durable publication starts, timer restoration cannot cancel
+the required commit receipt.
 Standalone utilities with an immediate commit boundary, such as `CREATE DATABASE`,
 complete durable publication before their Execute response. A storage wait resumes
 that publication without executing the utility again. Prepared resolution retains
@@ -181,6 +190,49 @@ current_setting('application_name') || '.', false))` appends one dot when the
 input finishes across those function handoffs. Simple builtin trees that cannot
 pause consume no retained input records. Engine-owned statistics, replication
 and large-object calls use the same explicit handoff classification.
+The pending call stores checked handles for its encoded arguments and selected
+argument, parameter and result types. Those handles survive moving the owning
+arena or recycling its temporary front; reset or a different arena rejects
+them with an internal error before reading their bytes. Arguments become
+immutable before publication. Execution reads their stored bytes directly;
+even an older mutable handle cannot reopen that allocation for writing.
+Callback lookup exposes the invocation log only inside a scoped closure. Its
+installer keeps the restoring guard private and restores the previous owner on
+success, errors or unwinding.
+This owns the call's inputs. The running body and enclosing write still need
+complete ownership across a scheduler return.
+Completed scalar values and table-source rows keep their encoded bytes in
+checked arena allocations too. Their result directory stores handles and effect
+receipts, rather than references to returned values or row slices. For example,
+a function returning `ROW('saved text')` keeps the field's name, type and text
+after its body memory is reused. A body encodes its result in temporary memory;
+as that workspace closes, the arena moves it directly into one immutable
+retained image. This also works when the parent is another temporary arena.
+The move handles overlapping bytes before writing the retained header, and
+keeps no intermediate image in the parent's temporary front. Scalar consumers
+copy their value into their own arena. Table queries with an explicit owner
+rebuild row pointers that refer directly to the saved payload. A nested query
+using the active callback copies its row image into its own arena before the
+callback ends; no reference to the callback owner can escape. Ordinary table
+queries avoid another full payload copy. Directory growth reserves its
+replacement before publishing it; exhaustion keeps every previous result
+readable. All reservations stay
+inside the existing statement capacity and report `54000` if they do not fit.
+The [nested-result reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-nested-callback-results/README.md)
+records summaries of 4,096-row results through nested SQL/procedural calls,
+including exactly one sequence increment and audit write per invocation.
+Unfinished input frames retain checked handles for values, call names, defaults,
+type signatures, selected casts, dependencies and effect receipts. A new attempt
+rebuilds temporary metadata views; an already encoded value is copied only when
+the consumer reads it. Stale input selections return `40001` before choosing a
+replacement function or cast. Publishing a suspension uses the arena's retained
+tail, including while a row scan borrows its temporary front. The invocation log
+and its sorted input directories store an arena identity and checked handles,
+with no borrowed metadata or values. Moving the log together with its arena
+preserves saved inputs, results and selected casts; resetting that arena rejects
+the old log. Temporary execution scopes borrow both owners so neither can move
+while a scan callback uses them. The result directory's published length is the
+completed-call count, avoiding a separate counter that could disagree.
 Nested SQL queries, including a `ts_rewrite` rule query, have their own input
 scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested
@@ -194,6 +246,146 @@ If restarting would lose their data writes
 or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
+
+Numeric `FOR` loops reserve reusable local-variable frames before running a
+call's local initializers. The reservation follows maximum simultaneous loop
+nesting, rather than iteration count or the number of separate loops in the
+source. Layout checks every branch and reserves only the largest local scope
+needed at each depth; shadowed counters reuse their existing local slot.
+Entering a loop copies its current scope into that depth's frame; leaving
+copies back assignments while restoring the shadowed counter. Returning
+the frame clears references into completed temporary work. These frames remain
+inside the existing statement arena; `54000` names insufficient capacity.
+This prevents repeated inner-loop entry from consuming fresh local buffers.
+When a loop counter shadows a named output, the outer output value is saved as
+typed bytes in a reusable statement-arena buffer. Nested counters keep the same
+saved value; leaving the outer counter restores normal output lookup. For
+example, `RETURN NEXT` inside `FOR answer IN 1..2` returns the function's text
+output `answer`, while expressions in that loop see its integer counter.
+Saved outputs retain record names/types, nulls and array bounds without borrowing
+the expression's scratch. Growing a buffer reserves its replacement before
+publication; failed sizing or reservation preserves the previous value.
+Repeated entries reuse capacity based on the largest value, rather than the
+number of assignments. `54000` names saved-value statement memory on exhaustion.
+The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-saved-output-scopes/README.md)
+records repeated and nested counters, caught errors and typed outputs.
+Runtime local declarations contain names, resolved types and flags, without
+references to initializer expressions. The compiled program owns those
+expressions separately; initialization seeds parameters first, then evaluates
+local defaults once in declaration order. For example, a later local can use
+an earlier constant initialized by `nextval`, and a loop counter must restore
+the initialized local that it shadows.
+Procedural declarations and target names cross the SQL lexer before lookup.
+Unquoted `MixedCase` becomes `mixedcase`; quoted `"MixedCase"` remains distinct.
+Local variables, record fields and built-in handler/status/context names compare
+those normalized names exactly, so `SQLERRM` and `"SQLERRM"` are different.
+Quoted cursor names use the same token boundaries for `OPEN`, `FETCH`, `MOVE`
+and `CLOSE`, including spaces and doubled quotes. Local declarations can shadow
+context variables: `DECLARE found integer := 42` makes both its value and
+`pg_typeof(found)` use that integer. Inside an exception handler, its implicit
+`SQLSTATE` and `SQLERRM` bindings shadow outer declarations. Values, declared
+types and domain identities share one lookup rule, including captured cursor
+inputs and detached conflict-update inputs. The
+[PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-name-bindings/README.md)
+records those cases. Quoted `"NEW"` is distinct from the trigger record `new`.
+A numeric loop inside a handler can introduce its own integer `SQLSTATE`
+counter; leaving that loop restores the handler's text error code. A handler
+inside that loop introduces its own error code. Each binding records how
+deeply its block or loop is nested. Reusing an error buffer does not change
+which variable a name selects. Constant-target
+validation follows the same nesting before the body runs, including `FETCH`
+targets. Opening a constant cursor with an existing name reads that variable;
+opening a NULL constant fails when a generated name would need assignment.
+The [scope reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-lexical-scopes/README.md)
+records values, types and creation/runtime errors.
+Function and procedure parameters occupy an outer scope. A declaration such as
+`DECLARE value text := 'local'` can shadow an integer parameter named `value`;
+reads and assignments then select the text local. Output parameters retain
+their own slots, so changing a shadowing local does not change the returned
+output. Parameters can also use the names `SQLSTATE` and `SQLERRM`; an error
+handler temporarily introduces its own text variables. The
+[parameter reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-procedural-parameter-scopes/README.md)
+checks scalar, set-returning and procedure outputs, types and cursor capture.
+Trigger names and relation/schema names have PostgreSQL type `name`; `TG_RELID`
+is an `oid`, and trigger argument counts are integers. `TG_TABLESPACE` is not
+a PostgreSQL trigger variable and raises an undefined-column error.
+Branches, loops and exception handlers use an explicit execution frame stack,
+reserved to the maximum lexical nesting before local initialization. Each frame
+stores a block index and next-statement offset in its compiled program. The
+original body and program kind use an immutable, checked source image. Parsed
+blocks belong to a separate compiled view. Mutable frame metadata owns a range
+in the shared execution control pool and retains no references to syntax or
+loop-value buffers. Output-binding metadata owns a separate range in that pool;
+its saved values remain checked statement-memory images. Loop
+buffers and materialized rows have a separate, uniquely paired directory whose
+scoped owner releases its values. An entry owns its control data and required
+resource in one enum before publishing them to their indexed slots.
+Numeric-loop scope directories and local-variable descriptions also own control
+pool ranges; their value buffers remain in statement memory. Taking a scope
+keeps its metadata range owned until that scope is returned or dropped.
+Binding a view checks the source, workspace
+and directory identity before entering the body. A replaced, foreign or reset source
+returns `40001`; source-image exhaustion names its statement-memory limit with
+`54000`. Rebuilding syntax from that image keeps the original body after parsing
+scratch is reused. This preserves source text, not the invocation's selected
+definitions or session settings; those still need retained owners. An active
+numeric loop can bind rebuilt syntax without resetting its range, local values,
+shadowed counter or next statement, provided its value owner remains alive.
+Loop conditions and handler syntax resolve through the bound view; loop values
+stay in their paired directory and diagnostic/savepoint positions stay in the
+control stack. Child blocks do
+not recursively call the interpreter. Leaving a scope
+restores shadowed counters, copies assignments back and releases its references.
+Caught error text and buffer descriptors use checked, address-independent
+handles in retained statement memory. Moving the arena or recycling its
+temporary front preserves those handles; a full reset invalidates them.
+Caught error text uses a reusable buffer for each simultaneously
+active handler depth. Buffer payloads grow geometrically within the statement
+arena; repeated catches reuse their storage. Leaving a handler invalidates its
+view. Nested handlers keep the outer error available; SQLSTATE/SQLERRM and
+requested stacked fields copy text before exposing it to local variables.
+Assignment rewriting keeps the original target and value dependencies: for
+example, `document[SQLERRM] := to_jsonb(SQLSTATE)` still sees both handler
+variables after lowering to the shared JSON setter.
+For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
+keep that message after later catches reuse the handler buffer. Missing stacked
+fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
+records repeated catches, nested handlers and rethrow.
+Numeric workspaces and ordinary local values still borrow statement memory;
+saved control positions, source images and diagnostics do not yet let the whole invocation survive
+returning to the connection scheduler during a storage wait.
+Materialized query and array loop inputs own their encoded values in
+`row_work_bytes`/`row_work_leases`, shared with other foreground row work.
+Source query work and nested invocation receipts use one scoped arena and are
+released before the loop body. Each iteration decodes its selected value into
+statement memory; record field names/types, nulls and array bounds survive.
+Finishing a loop, leaving it early or raising an error returns its input lease.
+Exhaustion names the shared work settings with `54000`.
+Table-function lookup keeps its selected definition as a temporary value;
+statement memory retains only actual SQL text and output names needed by parsed
+queries or returned records. Repeated schema and execution probes do not retain
+the definition's maximum-width argument, result and configuration arrays.
+Functions producing record values in a result list decode the declared output
+width into an actual-sized field slice; the input-argument limit does not size
+that result buffer.
+Set-function result collectors own encoded rows and actual output-column
+metadata in that same shared pool. A row becomes visible to the collector only
+after conversion, capacity admission and encoding finish. A failed append keeps
+earlier rows, including a prefix returned before a caught SQL error; the next
+append overwrites any unpublished bytes. `RETURN NEXT` releases expression and
+conversion scratch after each row. Output-variable bindings reserve their actual
+count before local initialization, rather than a maximum-width array for every
+invocation. At function completion, exported rows receive independent statement
+storage before the collector releases its leases. These owners do not yet make
+the whole invocation resumable across connection-scheduler returns.
+Input admission also releases parser/dependency scratch when no checked values
+or planner candidates need retaining. Expressions and static statements with no
+input substitutions reuse their compiled source while keeping the normal
+input-owner scope. `PERFORM` uses a scoped arena for query work and nested
+invocation receipts; both are released when the query finishes. Only its row
+count and `FOUND` return to the interpreter. Prior locals, handler diagnostics
+and input bindings stay outside that workspace.
+It does not yet save a function's execution position across a storage wait.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind
 and remote savepoint mirroring with explicit SQL savepoints. Every admission,
@@ -466,6 +658,23 @@ named error reports requested bytes, total free bytes, the largest free extent
 and remaining lease descriptors. For example,
 an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
+
+`execution_control_bytes` reserves one shared pool for the branch, loop and
+handler positions and output-binding metadata of running procedural calls.
+`execution_control_leases` bounds simultaneously owned ranges; each active
+function, procedure or trigger reserves one range for its maximum lexical
+nesting. Set-returning functions with named outputs reserve another range for
+their output bindings before local initialization. Empty
+tables and cached plans do not receive private control ranges. Dropping the
+call returns those ranges, including after errors. Numeric loops reserve another
+range for their scope directory and one local-description range per maximum
+active nesting level. All are admitted before initializers; partial admission
+returns the ranges already reserved. A full pool returns `54000`
+naming both settings before body initializers can have effects. The byte limit
+must be a positive multiple of 64; startup accounting includes its backing and
+lease/free-range records. Both settings are explicit in configuration files.
+Values, source images and diagnostic buffers retain their separate statement
+or foreground-work ownership; this pool alone does not resume a whole invocation.
 
 `table_metadata_bytes` reserves one shared backing pool for actual-length table
 columns, physical column-number records, constraints, pending edit mappings and

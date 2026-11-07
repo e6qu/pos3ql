@@ -322,6 +322,7 @@ python3 tools/measure-embedded-capacity.py --output NEW_DIRECTORY \
 The explicit 2 GiB ceiling rejects an oversized reservation; it does not allocate
 2 GiB. The 64-sample matrix uses equal explicit `row_overlay_slots`,
 `row_work_bytes`, `row_work_leases`, `definition_image_slots`,
+`execution_control_bytes` (256 KiB), `execution_control_leases` (256),
 `table_metadata_bytes` (64 MiB), `table_metadata_leases` (8,192),
 `statistics_bytes` (1 MiB), `statistics_leases` (1,024) and
 `index_statistics_slots` (4,096) for

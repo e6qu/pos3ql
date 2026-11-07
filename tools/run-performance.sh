@@ -299,6 +299,8 @@ max_rules = $MAX_RULES
 row_overlay_slots = $TABLE_CAPACITY
 row_work_bytes = 8MiB
 row_work_leases = 128
+execution_control_bytes = 256KiB
+execution_control_leases = 256
 definition_image_slots = 256
 table_metadata_bytes = 64MiB
 table_metadata_leases = 8192
@@ -639,7 +641,7 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --output "$OUTPUT/environment.json" --binary "$ROOT/target/release/pos3ql" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --row-overlay-slots "$TABLE_CAPACITY" --row-work-bytes 8388608 \
-  --row-work-leases 128 --definition-image-slots 256 \
+  --row-work-leases 128 --execution-control-bytes 262144 --execution-control-leases 256 --definition-image-slots 256 \
   --table-metadata-bytes 67108864 --table-metadata-leases 8192 \
   --statistics-bytes "$STATISTICS_BYTES" --statistics-leases "$STATISTICS_LEASES" \
   --index-statistics-slots "$INDEX_STATISTICS_SLOTS" \

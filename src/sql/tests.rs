@@ -18361,6 +18361,8 @@ impl ConfiguredTransactionSession {
     }
 
     fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        let _ = query::take_arena_full_location();
+        let _ = crate::mem::arena::take_last_allocation_failure();
         let status = self.execute_status(engine, sql, fixed_memory);
         assert_eq!(status, ExecutionStatus::Complete, "{sql}");
         self.send.readable().to_vec()
@@ -18370,8 +18372,10 @@ impl ConfiguredTransactionSession {
         let output = self.execute(engine, sql, fixed_memory);
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{sql}: {}",
-            String::from_utf8_lossy(&output)
+            "{sql}: {}; last query allocation error: {:?}; (arena failure, region active): {:?}",
+            String::from_utf8_lossy(&output),
+            query::take_arena_full_location(),
+            crate::mem::arena::take_last_allocation_failure(),
         );
         output
     }
@@ -44820,48 +44824,12 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SCHEMA trigger_context_schema;
-         CREATE TABLE trigger_context_schema.trigger_context_target (id integer PRIMARY KEY);
-         CREATE TABLE trigger_context_audit (
-           name text, timing text, level text, operation text, relid integer,
-           table_name text, table_schema text, nargs integer, first_argument text, second_argument text,
-           relation_name text, has_tablespace boolean
-         );
-         CREATE FUNCTION trigger_context_function() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN
-              INSERT INTO trigger_context_audit VALUES
-                (TG_NAME, TG_WHEN, TG_LEVEL, TG_OP, TG_RELID, TG_TABLE_NAME,
-                 TG_TABLE_SCHEMA, TG_NARGS, TG_ARGV[0], TG_ARGV[1], TG_RELNAME,
-                 TG_TABLESPACE IS NOT NULL);
-              RETURN NEW;
-            END';
-         CREATE TABLE trigger_context_conflict (value text PRIMARY KEY);
-         INSERT INTO trigger_context_conflict VALUES ('first');
-         CREATE FUNCTION trigger_context_nested_function() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN
-              INSERT INTO trigger_context_conflict VALUES (TG_ARGV[0])
-                ON CONFLICT (value) DO UPDATE SET value = TG_ARGV[1];
-              RETURN NEW;
-            END';
-         CREATE TRIGGER trigger_context_name BEFORE INSERT
-           ON trigger_context_schema.trigger_context_target FOR EACH ROW
-           EXECUTE FUNCTION trigger_context_function('first', 'second');
-         CREATE TRIGGER trigger_context_nested_name AFTER INSERT
-           ON trigger_context_schema.trigger_context_target FOR EACH ROW
-           EXECUTE FUNCTION trigger_context_nested_function('first', 'nested');
-         INSERT INTO trigger_context_schema.trigger_context_target VALUES (1);
-         SELECT name, timing, level, operation, relid = relation.oid,
-                table_name, table_schema, nargs, first_argument, second_argument,
-                relation_name, has_tablespace
-           FROM trigger_context_audit
-           CROSS JOIN pg_class relation
-          WHERE relation.relname = 'trigger_context_target';
-         SELECT value FROM trigger_context_conflict;",
+        include_str!("../../tests/external/differential/256_trigger_context_audit.sql"),
     );
     assert_eq!(
         data_rows(&output),
         [
-            "trigger_context_name|BEFORE|ROW|INSERT|t|trigger_context_target|trigger_context_schema|2|first|second|trigger_context_target|f",
+            "trigger_context_name|BEFORE|ROW|INSERT|t|trigger_context_target|trigger_context_schema|2|first|second|trigger_context_target|name:oid",
             "nested"
         ],
         "{}",
@@ -44870,21 +44838,23 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
 }
 
 #[test]
-fn trigger_context_names_cannot_be_shadowed_by_locals() {
+fn trigger_context_names_can_be_shadowed_by_locals() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE trigger_context_shadow_target (id integer PRIMARY KEY);
          CREATE FUNCTION trigger_context_shadow_function() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE TG_NAME text; BEGIN RETURN NEW; END';
+           'DECLARE TG_NAME text := ''local''; BEGIN NEW.id := length(TG_NAME); RETURN NEW; END';
          CREATE TRIGGER trigger_context_shadow_name BEFORE INSERT
            ON trigger_context_shadow_target FOR EACH ROW
            EXECUTE FUNCTION trigger_context_shadow_function();
-         INSERT INTO trigger_context_shadow_target VALUES (1);",
+         INSERT INTO trigger_context_shadow_target VALUES (1);
+         SELECT id FROM trigger_context_shadow_target;",
     );
-    assert!(
-        String::from_utf8_lossy(&output).contains("42P13"),
+    assert_eq!(
+        data_rows(&output),
+        ["5"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -45328,17 +45298,19 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
         String::from_utf8_lossy(&output)
     );
 
-    let invalid = run_with(
+    let shadowed = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FUNCTION trigger_diagnostic_scope_invalid() RETURNS trigger LANGUAGE plpgsql AS
-           'DECLARE sqlstate text;
-            BEGIN RETURN NEW; END';",
+        "CREATE FUNCTION trigger_diagnostic_scope_local() RETURNS text LANGUAGE plpgsql AS
+           'DECLARE sqlstate text := ''local'';
+            BEGIN RETURN sqlstate; END';
+         SELECT trigger_diagnostic_scope_local();",
     );
-    assert!(
-        String::from_utf8_lossy(&invalid).contains("conflicts with a runtime variable"),
+    assert_eq!(
+        data_rows(&shadowed),
+        ["local"],
         "{}",
-        String::from_utf8_lossy(&invalid)
+        String::from_utf8_lossy(&shadowed)
     );
 }
 

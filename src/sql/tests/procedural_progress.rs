@@ -1163,3 +1163,29 @@ fn input_validation_reports_bad_data_but_propagates_domain_expression_errors() {
         }
     }
 }
+
+#[test]
+fn checked_array_inputs_in_row_triggers_keep_inserted_rows_and_prior_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("retained-trigger-input-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/265_trigger_input_visibility.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["1|3|1|1|1|1|8193|2"],
+            "{mode:?}"
+        );
+    }
+}

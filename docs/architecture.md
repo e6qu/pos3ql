@@ -317,7 +317,9 @@ a PostgreSQL trigger variable and raises an undefined-column error.
 Branches, loops and exception handlers use an explicit execution frame stack,
 reserved to the maximum lexical nesting before local initialization. Each frame
 stores a block index and next-statement offset in its compiled program. The
-original body and program kind use an immutable, checked source image. Parsed
+original body and program kind use an immutable source image owned by the
+execution control pool. Compiled syntax and retained positions share that owner;
+cloning it reserves no extra bytes or descriptors. Parsed
 blocks belong to a separate compiled view. Mutable frame metadata owns a range
 in the shared execution control pool and retains no references to syntax or
 loop-value buffers. Output-binding metadata owns a separate range in that pool;
@@ -332,12 +334,14 @@ scratch is released before entering the body. Taking a scope keeps its ranges
 owned until that scope is returned or dropped.
 These value slots may still borrow variable-length payloads in statement memory;
 owning the arrays does not yet preserve those payloads through a scheduler return.
-Binding a view checks the source and workspace before entering the body.
-A replaced, foreign or reset source
-returns `40001`; source-image exhaustion names its statement-memory limit with
-`54000`. Rebuilding syntax from that image keeps the original body after parsing
-scratch is reused. This preserves source text, not the invocation's selected
-definitions or session settings; those still need retained owners. An active
+Binding a view checks the source owner and execution workspace before entering
+the body. A different source image, even with identical text, or a foreign/reset
+workspace returns `40001`. Source capture returns `54000` naming the execution
+control settings on exhaustion. Rebuilding syntax copies the owned text into
+explicit parsing memory; exhausting that destination names statement memory.
+The source survives destruction of its input arena, parsing scratch and external
+pool handles. This preserves original text and program kind, not the invocation's
+selected definitions or session settings; those still need retained owners. An active
 numeric loop can bind rebuilt syntax without resetting its range, local values,
 shadowed counter or next statement, provided its value owner remains alive.
 Loop conditions and handler syntax resolve through the bound view; loop values
@@ -368,7 +372,7 @@ keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
 Variable-length payloads in ordinary and numeric local slots still borrow statement memory;
-saved control positions, source images and diagnostics do not yet let the whole invocation survive
+saved control positions, source owners and diagnostics do not yet let the whole invocation survive
 returning to the connection scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.
@@ -676,11 +680,13 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves shared memory for procedural positions,
-resource directories, local-value slots, named-output bindings, saved output bytes
-and caught-error directories and text.
+resource directories, local-value slots, source images, named-output bindings,
+saved output bytes and caught error directories and text.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
-two ranges for its position and resource directories, sized to its maximum
-lexical nesting, plus a range for nonempty local-value arrays. Set-returning
+one immutable byte range for its actual source text, shared by compiled syntax
+and retained positions. It also reserves two ranges for its position and
+resource directories, sized to maximum lexical nesting, plus a range for
+nonempty local-value arrays. Set-returning
 functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
 local descriptions and value slots. Calls with exception handlers reserve one
@@ -694,8 +700,7 @@ a diagnostic follows the enclosing exception and transaction rules; an uncaught
 error rolls back the command. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.
-Active local-value payloads and source images retain separate
-statement or foreground-work ownership; this pool alone does not resume a whole invocation.
+Active local-value payloads retain separate statement or foreground-work ownership; this pool alone does not resume a whole invocation.
 
 For example, a function with 128 declared locals and one named input stages one
 parameter value, then releases that staging buffer after initialization. It does

@@ -158,10 +158,8 @@ impl<'a> ControlFrames<'a> {
     pub(super) fn new(
         arena: &Arena,
         layout: ProgramLayout,
-        source: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        layout.source.require(source)?;
         let mut slots = pool.lease(layout.depth).map_err(execution_full)?;
         for _ in 0..layout.depth {
             slots.push_reserved(None).map_err(execution_full)?;
@@ -182,11 +180,11 @@ impl<'a> ControlFrames<'a> {
         })
     }
 
-    fn require_source(&self, arena: &Arena, source: ProgramSource) -> Result<(), SqlError> {
-        if self.source != source {
+    fn require_source(&self, source: &ProgramSource) -> Result<(), SqlError> {
+        if self.source != *source {
             return Err(program::changed());
         }
-        source.require(arena)
+        Ok(())
     }
 
     fn require_workspace(&self, arena: &Arena) -> Result<(), SqlError> {
@@ -198,11 +196,10 @@ impl<'a> ControlFrames<'a> {
 
     fn execution<'scope, 'syntax>(
         &'scope mut self,
-        source: &Arena,
         workspace: &Arena,
-        program: CompiledProgram<'syntax>,
+        program: &'scope CompiledProgram<'syntax>,
     ) -> Result<FrameExecution<'scope, 'syntax, 'a>, SqlError> {
-        self.require_source(source, program.source())?;
+        self.require_source(program.source())?;
         self.require_workspace(workspace)?;
         Ok(FrameExecution {
             state: self,
@@ -213,7 +210,7 @@ impl<'a> ControlFrames<'a> {
 
 struct FrameExecution<'scope, 'syntax, 'values> {
     state: &'scope mut ControlFrames<'values>,
-    program: CompiledProgram<'syntax>,
+    program: &'scope CompiledProgram<'syntax>,
 }
 
 impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
@@ -531,14 +528,14 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
     values: &mut [Datum<'a>],
-    program: CompiledProgram<'a>,
+    program: &CompiledProgram<'a>,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
     let mut retained = status
         .control_frames
         .take()
         .expect("one procedural frame owner");
-    let mut frames = retained.execution(context.arena, context.arena, program)?;
+    let mut frames = retained.execution(context.arena, program)?;
     assert_eq!(frames.state.active, 0);
     frames.start(program.root());
     let mut outcome = Ok(None);

@@ -97,9 +97,19 @@ source arenas. Preserve that ownership, the outer value through nested counters,
 failure-preserving growth, rollback and reuse after exhaustion, and decoded
 copies after the saved buffer drops.
 Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
-Keep the original source image and kind when rebuilding syntax; reused parsing
-memory or a replacement function must not redirect saved positions. Preserve
-source-owner checks alongside the selected definitions and session settings.
+Source images now own control-pool bytes shared by compiled syntax and saved
+positions. Preserve original text and program kind after input/parsing storage
+is destroyed, and reject replacement images even when their text is identical.
+Source capture must precede initializers and return failed admission capacity.
+Incomplete blocks must return syntax error `42601` and release their source storage;
+keep that coverage against PostgreSQL for empty bodies, incomplete declarations,
+loops, branches and exception handlers.
+Split procedural statements at SQL token boundaries so semicolons inside dollar
+strings, escaped strings and comments remain part of the original statement.
+Lexer buffer exhaustion must return resource limit `54000`, preserve real syntax
+errors and release temporary scan memory for the next operation.
+Keep those source-owner checks while retaining selected definitions and session
+settings; owning the text alone does not preserve their original meaning.
 Preserve once-only declaration initialization after input/output parameter slots
 are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
 reads and assignments use the innermost binding, while returning outputs uses

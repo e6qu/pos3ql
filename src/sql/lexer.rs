@@ -44,6 +44,7 @@ pub enum LexErrorKind {
     Syntax,
     Encoding,
     UnicodeEscape,
+    Memory,
 }
 
 impl LexErrorKind {
@@ -52,6 +53,7 @@ impl LexErrorKind {
             Self::Syntax => sqlstate::SYNTAX_ERROR,
             Self::Encoding => sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
             Self::UnicodeEscape => sqlstate::INVALID_ESCAPE_SEQUENCE,
+            Self::Memory => sqlstate::PROGRAM_LIMIT_EXCEEDED,
         }
     }
 }
@@ -680,7 +682,7 @@ impl<'a> Lexer<'a> {
         LexError {
             at,
             message: "statement too large for SQL arena",
-            kind: LexErrorKind::Syntax,
+            kind: LexErrorKind::Memory,
         }
     }
 

@@ -41,7 +41,7 @@ consistent; readers should not need to memorize them to use the database.
 - **commit batch**: immutable journal bytes plus a descriptor; recoverable only after the CAS commit head names it.
 - **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
 - **entity tag**: an opaque, strong, quoted object generation token used for compare-and-swap.
-- **execution control pool**: fixed startup memory shared by running procedural calls for positions, resource directories, local-value slots, numeric scopes, named-output bindings, saved output bytes, and caught-error directories and text. Active local-variable payloads still use separate storage.
+- **execution control pool**: fixed startup memory shared by running procedural calls for positions, resource directories, local-value slots, numeric scopes, immutable source images, named-output bindings, saved output bytes, and caught-error directories and text. Active local-variable payloads still use separate storage.
 - **value slot**: one typed SQL value entry. A number can fit directly in the entry; text, arrays and records can refer to bytes stored elsewhere. Owning the entry does not own those referenced bytes.
 - **manifest**: the durable inventory of table definitions and immutable storage objects for a checkpoint; updated by compare-and-swap.
 - **MVCC**: keeping row versions so transactions see the versions allowed by their isolation level. For example, a repeatable-read transaction can keep seeing an order's old status after another transaction commits an update.

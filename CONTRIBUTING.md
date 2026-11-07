@@ -226,7 +226,9 @@ keep copied fields valid after their diagnostic owner drops. Cover fragmented
 growth, byte/descriptor exhaustion, depth admission, rethrow and reuse. In both
 transaction modes, reject handler-directory admission before initializers and
 verify that failed text capture rolls back earlier writes without entering its
-handler, then admits a successful call at the original capacity.
+handler, then admits a successful call at the original capacity. Keep the shared
+PostgreSQL fixture for 512 nested diagnostic calls: every call must preserve its
+outer detail, return buffer capacity, and issue one audit row and sequence value.
 Test indexed execution positions after releasing their original parsing
 storage. Resumption must retain the selected source, definitions and types;
 reparsing a replacement definition must not redirect unfinished work.

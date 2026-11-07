@@ -348,12 +348,12 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             current[1] = Datum::Int4(41);
             status.set_found(false);
             let inner = frames.pop();
-            frames.finish(&arena, inner, &locals, &mut values, &mut status, success);
+            frames.finish(inner, &locals, &mut values, &mut status, success);
             let (_, current, _) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
             assert_eq!(current[1], Datum::Int4(41));
             let outer = frames.pop();
-            frames.finish(&arena, outer, &locals, &mut values, &mut status, success);
+            frames.finish(outer, &locals, &mut values, &mut status, success);
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
@@ -470,7 +470,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             &[Datum::Int4(1), Datum::Text("changed once before waiting")]
         );
         let child = frames.pop();
-        frames.finish(&workspace, child, &locals, &mut values, &mut status, true);
+        frames.finish(child, &locals, &mut values, &mut status, true);
         assert!(matches!(
             frames.last().continuation,
             Continuation::Numeric(NumericLoop {
@@ -482,7 +482,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             })
         ));
         let numeric = frames.pop();
-        frames.finish(&workspace, numeric, &locals, &mut values, &mut status, true);
+        frames.finish(numeric, &locals, &mut values, &mut status, true);
         assert_eq!(
             values,
             [
@@ -491,7 +491,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             ]
         );
         let root = frames.pop();
-        frames.finish(&workspace, root, &locals, &mut values, &mut status, true);
+        frames.finish(root, &locals, &mut values, &mut status, true);
         assert!(frames.state.slots.iter().all(Option::is_none));
         assert!(
             frames

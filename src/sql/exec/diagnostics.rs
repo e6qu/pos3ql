@@ -45,11 +45,7 @@ impl<'text> CaughtDiagnostic<'text> {
         )
     }
 
-    pub(super) fn text<'out>(
-        self,
-        field: Field,
-        destination: &'out Arena,
-    ) -> Result<Option<&'out str>, SqlError> {
+    pub(super) fn text(self, field: Field, destination: &Arena) -> Result<Option<&str>, SqlError> {
         self.field(field)
             .map(|text| destination.alloc_str(text).map_err(|_| memory_full()))
             .transpose()
@@ -74,10 +70,10 @@ impl<'text> CaughtDiagnostic<'text> {
             .transpose()
     }
 
-    pub(super) fn variables<'out>(
+    pub(super) fn variables(
         self,
-        destination: &'out Arena,
-    ) -> Result<TriggerExceptionVariables<'out>, SqlError> {
+        destination: &Arena,
+    ) -> Result<TriggerExceptionVariables<'_>, SqlError> {
         Ok(TriggerExceptionVariables {
             sqlstate_text: self
                 .text(Field::Sqlstate, destination)?

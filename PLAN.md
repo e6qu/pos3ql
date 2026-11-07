@@ -107,7 +107,10 @@ the original output slots. Preserve quoted names and reject constant assignment
 and FETCH targets before effects. Keep named constant cursors readable at OPEN.
 Caught-error directories and bytes now have control-pool owners. Preserve
 borrowed handler views, saved fields after source/owner destruction, nesting,
-rethrow, admission before initializers, and rollback/reuse after failed capture. Preserve
+rethrow, admission before initializers, and rollback/reuse after failed capture.
+Nested calls must release diagnostic capacity after each call and keep audit
+writes and sequence effects once; qualify the same SQL in both transaction modes
+and against PostgreSQL. Preserve
 handler variables in rewritten local and NEW-row assignments, including JSON
 subscripts. Keep trigger context types and undefined-name errors compatible.
 

@@ -518,6 +518,30 @@ fn diagnostic_payload_exhaustion_rolls_back_without_entering_the_handler_and_reu
 }
 
 #[test]
+fn nested_diagnostic_calls_return_capacity_and_keep_each_call_effect_once() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-diagnostic-calls-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 32768;
+        config.execution_control_leases = 32;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/262_nested_diagnostic_calls.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["outer 512:inner:8192", "512|131328|1|512", "513"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn caught_diagnostics_reuse_storage_and_preserve_saved_and_nested_values() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

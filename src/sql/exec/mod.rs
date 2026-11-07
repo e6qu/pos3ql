@@ -17992,7 +17992,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             outputs
                 .push_reserved(OutputBinding {
                     local: 0,
-                    value: local_values::SavedValue::new(),
+                    value: local_values::SavedValue::new(pool)?,
                     shadow_depth: 0,
                 })
                 .map_err(control_flow::execution_full)?;
@@ -18025,18 +18025,11 @@ impl<'a> TriggerExecutionStatus<'a> {
         }
     }
 
-    fn shadow_output_local(
-        &mut self,
-        local: usize,
-        value: Datum<'_>,
-        arena: &Arena,
-    ) -> Result<(), SqlError> {
+    fn shadow_output_local(&mut self, local: usize, value: Datum<'_>) -> Result<(), SqlError> {
         for output in self.outputs.iter_mut() {
             if output.local == local {
                 if output.shadow_depth == 0 {
-                    output.value.replace(value, arena)?;
-                } else {
-                    output.value.require_owner(arena)?;
+                    output.value.replace(value)?;
                 }
                 output.shadow_depth = output.shadow_depth.checked_add(1).ok_or_else(|| {
                     sql_err!(
@@ -26950,7 +26943,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                                 *value = if output.shadow_depth == 0 {
                                     local_values[output.local]
                                 } else {
-                                    output.value.read(output_source, arena)?
+                                    output.value.read(arena)?
                                 };
                             }
                             values
@@ -28724,7 +28717,6 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     locals,
                     local_values,
                     status,
-                    context.arena,
                 )
             } else {
                 let target = trigger_local_index(locals, program.target)?;

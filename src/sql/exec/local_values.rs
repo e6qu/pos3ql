@@ -1,68 +1,58 @@
-//! Saved values own reusable encoded bytes, independently of expression scratch.
+//! Saved values own reusable byte ranges independently of every statement arena.
 
 use super::*;
-use crate::mem::arena::ArenaSliceHandle;
-
 pub(super) struct SavedValue {
-    bytes: Option<ArenaSliceHandle<u8>>,
-    capacity: usize,
-    length: usize,
+    bytes: MutableSlice<u8>,
+    length: Option<usize>,
 }
 
 impl SavedValue {
-    pub(super) const fn new() -> Self {
-        Self {
-            bytes: None,
-            capacity: 0,
-            length: 0,
-        }
+    pub(super) fn new(pool: &std::sync::Arc<LeasePool>) -> Result<Self, SqlError> {
+        Ok(Self {
+            bytes: pool.lease(0).map_err(exhausted)?,
+            length: None,
+        })
     }
 
-    pub(super) fn replace(&mut self, value: Datum<'_>, arena: &Arena) -> Result<(), SqlError> {
-        self.require_owner(arena)?;
+    pub(super) fn replace(&mut self, value: Datum<'_>) -> Result<(), SqlError> {
         // Validate the complete value before changing a previously saved image.
         let length = projected_row_len(&[value])?;
-        let (handle, capacity) = if length > self.capacity {
-            let capacity = length.checked_next_power_of_two().ok_or_else(full)?;
-            let handle = arena
-                .retain_slice_with(capacity, |_| 0u8)
-                .map_err(|_| full())?;
-            (handle, capacity)
-        } else {
-            (self.bytes.ok_or_else(inactive)?, self.capacity)
-        };
-        let mut bytes = arena.retained_slice_mut(handle).map_err(|_| inactive())?;
+        let capacity = length
+            .checked_next_power_of_two()
+            .ok_or_else(full)?
+            .min(self.bytes.max_entries())
+            .max(length);
+        self.bytes.reserve_exact(capacity).map_err(exhausted)?;
+        const ZEROES: [u8; 4096] = [0; 4096];
+        while self.bytes.len() < length {
+            super::super::query::check_timeout()?;
+            let count = (length - self.bytes.len()).min(ZEROES.len());
+            self.bytes
+                .extend_from_slice(&ZEROES[..count])
+                .map_err(exhausted)?;
+        }
         // Encoding repeats the same validation before its first write. After
         // successful sizing there is no fallible conversion or helper call.
-        encode_projected_into(&[value], &mut bytes[..length])?;
-        self.bytes = Some(handle);
-        self.capacity = capacity;
-        self.length = length;
+        encode_projected_into(&[value], &mut self.bytes[..length])?;
+        self.length = Some(length);
         Ok(())
     }
 
-    pub(super) fn require_owner(&self, arena: &Arena) -> Result<(), SqlError> {
-        if let Some(handle) = self.bytes {
-            // Validate even when a nested shadow keeps the bytes unchanged.
-            drop(arena.retained_slice_mut(handle).map_err(|_| inactive())?);
-        }
-        Ok(())
-    }
-
-    pub(super) fn read<'out>(
-        &self,
-        source: &Arena,
-        output: &'out Arena,
-    ) -> Result<Datum<'out>, SqlError> {
-        let bytes = source
-            .retained_slice_mut(self.bytes.ok_or_else(inactive)?)
-            .map_err(|_| inactive())?;
+    pub(super) fn read<'out>(&self, output: &'out Arena) -> Result<Datum<'out>, SqlError> {
+        let length = self.length.ok_or_else(inactive)?;
         let copied = output
-            .alloc_slice_copy(&bytes[..self.length])
+            .alloc_slice_copy(&self.bytes[..length])
             .map_err(|_| full())?;
-        drop(bytes);
         decode_projected_col_record(copied, 0, output)
     }
+}
+
+fn exhausted(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "PL/pgSQL saved values: {}",
+        error
+    )
 }
 
 fn full() -> SqlError {
@@ -75,7 +65,7 @@ fn full() -> SqlError {
 fn inactive() -> SqlError {
     sql_err!(
         sqlstate::INTERNAL_ERROR,
-        "PL/pgSQL saved value storage was reset or replaced"
+        "PL/pgSQL saved value has not been initialized"
     )
 }
 

@@ -422,7 +422,6 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
     status: &mut TriggerExecutionStatus<'a>,
-    arena: &Arena,
 ) -> Result<Step<'syntax, 'a>, SqlError> {
     if if reverse {
         lower < upper
@@ -457,7 +456,7 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
     workspace.values[..count].fill(Datum::Null);
     workspace.values[..locals.len()].copy_from_slice(&values[..locals.len()]);
     let prior_target = workspace.values[target];
-    if let Err(error) = status.shadow_output_local(target, prior_target, arena) {
+    if let Err(error) = status.shadow_output_local(target, prior_target) {
         status.numeric_frames.restore(workspace);
         return Err(error);
     }

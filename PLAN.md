@@ -88,12 +88,14 @@ including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
 Carry owned control and value-slot buffers through scheduler returns together
-with saved variable-length payloads, declared types, selected source definitions,
-output bindings and the enclosing write. Owning a value array does not preserve
-the statement-memory bytes to which its entries refer. Keep those payloads alive
-or save them before recycling scratch; positions alone cannot resume an invocation.
-Keep saved output values independent of expression scratch, preserve the outer
-value through nested counters, and reuse capacity across repeated shadowing.
+with declared types, selected source definitions, output bindings and the
+enclosing write. Ordinary and numeric active local slots still refer to
+statement-memory payloads. Keep those payloads alive or save them before
+recycling scratch; positions alone cannot resume an invocation.
+Saved output bytes now own reusable control-pool ranges independent of their
+source arenas. Preserve that ownership, the outer value through nested counters,
+failure-preserving growth, rollback and reuse after exhaustion, and decoded
+copies after the saved buffer drops.
 Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
 Keep the original source image and kind when rebuilding syntax; reused parsing
 memory or a replacement function must not redirect saved positions. Preserve
@@ -140,7 +142,7 @@ return position, resource, local-value, numeric-scope and output-binding capacit
 on failure or owner drop, independently of table count. Keep resource pairing in
 one owner and save only live parameter slots. Preserve unchanged parent counter
 slots when copying a completed numeric scope back. Keep saved output bytes
-separate from their metadata.
+in their own reusable control-pool ranges, separate from binding metadata.
 Keep file, generated and embedded test configurations explicit and complete;
 capacity regressions must reach their intended limit rather than an earlier
 missing-setting error.

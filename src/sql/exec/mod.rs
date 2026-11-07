@@ -20812,9 +20812,12 @@ fn parse_plpgsql_program_inner<'a>(
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     let body = body.trim().strip_suffix(';').unwrap_or(body.trim()).trim();
+    if body.is_empty() {
+        return Err(incomplete_trigger_body());
+    }
     let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
         let Some(begin_at) = trigger_top_level_keyword(declarations, "begin") else {
-            return Err(unsupported_trigger_body());
+            return Err(incomplete_trigger_body());
         };
         let declaration_source = declarations[..begin_at].trim();
         let segments = split_trigger_statements(declaration_source, arena)?;

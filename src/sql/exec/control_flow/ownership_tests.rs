@@ -909,10 +909,13 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         assert!(error.message.as_str().contains("statement memory"));
         assert_eq!(retained.active, 1);
         assert_eq!(retained.slots[0].as_ref().unwrap().next, 1);
-        let invalid =
-            ProgramSource::capture("BEGIN", PlpgsqlProgramKind::Anonymous, &pool).unwrap();
-        assert_eq!(invalid.parse(&parsing).err().unwrap().sqlstate, "42601");
-        drop(invalid);
+        for text in ["BEGIN", "", "DECLARE", "DECLARE value integer"] {
+            let invalid =
+                ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &pool).unwrap();
+            assert_eq!(invalid.parse(&parsing).err().unwrap().sqlstate, "42601");
+            drop(invalid);
+            assert_eq!(pool.lease::<u8>(4096).err().unwrap().free_bytes, free);
+        }
         retained.require_source(&source).unwrap();
         retained.execution(&workspace, &code).unwrap().pop();
         drop((retained, code, source));

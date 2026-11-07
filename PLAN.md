@@ -102,7 +102,8 @@ positions. Preserve original text and program kind after input/parsing storage
 is destroyed, and reject replacement images even when their text is identical.
 Source capture must precede initializers and return failed admission capacity.
 Incomplete blocks must return syntax error `42601` and release their source storage;
-keep that coverage against PostgreSQL for loops, branches and exception handlers.
+keep that coverage against PostgreSQL for empty bodies, incomplete declarations,
+loops, branches and exception handlers.
 Split procedural statements at SQL token boundaries so semicolons inside dollar
 strings, escaped strings and comments remain part of the original statement.
 Lexer buffer exhaustion must return resource limit `54000`, preserve real syntax

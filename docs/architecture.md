@@ -316,15 +316,19 @@ original body and program kind use an immutable, checked source image. Parsed
 blocks belong to a separate compiled view. Mutable frame metadata owns a range
 in the shared execution control pool and retains no references to syntax or
 loop-value buffers. Output-binding metadata owns a separate range in that pool;
-its saved values remain checked statement-memory images. Loop
-buffers and materialized rows have a separate, uniquely paired directory whose
-scoped owner releases its values. An entry owns its control data and required
-resource in one enum before publishing them to their indexed slots.
-Numeric-loop scope directories and local-variable descriptions also own control
-pool ranges; their value buffers remain in statement memory. Taking a scope
-keeps its metadata range owned until that scope is returned or dropped.
-Binding a view checks the source, workspace
-and directory identity before entering the body. A replaced, foreign or reset source
+its saved values remain checked statement-memory images. The same owner holds
+the position and resource directories, so they cannot be rebound to a different
+call's buffers. An entry owns its control data and required resource in one enum
+before publishing them to their indexed slots. Numeric scopes own both local
+descriptions and value-slot arrays in the control pool. Ordinary local-value and
+parameter-slot arrays use that pool too; parameter staging reserves named
+parameters only and releases its range after initialization. Numeric layout
+scratch is released before entering the body. Taking a scope keeps its ranges
+owned until that scope is returned or dropped.
+These value slots may still borrow variable-length payloads in statement memory;
+owning the arrays does not yet preserve those payloads through a scheduler return.
+Binding a view checks the source and workspace before entering the body.
+A replaced, foreign or reset source
 returns `40001`; source-image exhaustion names its statement-memory limit with
 `54000`. Rebuilding syntax from that image keeps the original body after parsing
 scratch is reused. This preserves source text, not the invocation's selected
@@ -335,7 +339,8 @@ Loop conditions and handler syntax resolve through the bound view; loop values
 stay in their paired directory and diagnostic/savepoint positions stay in the
 control stack. Child blocks do
 not recursively call the interpreter. Leaving a scope
-restores shadowed counters, copies assignments back and releases its references.
+restores shadowed counters from the unchanged parent slots, copies assignments
+back and releases its references.
 Caught error text and buffer descriptors use checked, address-independent
 handles in retained statement memory. Moving the arena or recycling its
 temporary front preserves those handles; a full reset invalidates them.
@@ -659,22 +664,27 @@ and remaining lease descriptors. For example,
 an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
-`execution_control_bytes` reserves one shared pool for the branch, loop and
-handler positions and output-binding metadata of running procedural calls.
-`execution_control_leases` bounds simultaneously owned ranges; each active
-function, procedure or trigger reserves one range for its maximum lexical
-nesting. Set-returning functions with named outputs reserve another range for
-their output bindings before local initialization. Empty
-tables and cached plans do not receive private control ranges. Dropping the
-call returns those ranges, including after errors. Numeric loops reserve another
-range for their scope directory and one local-description range per maximum
-active nesting level. All are admitted before initializers; partial admission
-returns the ranges already reserved. A full pool returns `54000`
+`execution_control_bytes` reserves shared memory for procedural positions,
+resource directories, local-value slots and named-output bindings.
+`execution_control_leases` bounds simultaneously owned ranges. A call reserves
+two ranges for its position and resource directories, sized to its maximum
+lexical nesting, plus a range for nonempty local-value arrays. Set-returning
+functions with named outputs also reserve their output-binding range. Numeric
+loops reserve a scope directory and two ranges per maximum active nesting level:
+local descriptions and value slots. Named parameters may own another value range
+during initialization; it is released afterward. Empty tables and cached plans
+receive no private execution ranges. All are admitted before initializers;
+partial admission returns ranges already reserved. A full pool returns `54000`
 naming both settings before body initializers can have effects. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.
-Values, source images and diagnostic buffers retain their separate statement
-or foreground-work ownership; this pool alone does not resume a whole invocation.
+Variable-length value payloads, source images and diagnostics retain separate
+statement or foreground-work ownership; this pool alone does not resume a whole invocation.
+
+For example, a function with 128 declared locals and one named input stages one
+parameter value, then releases that staging buffer after initialization. It does
+not reserve a second 129-value array to hold that single input. Its local slots
+stay owned for the call, while larger text or record payloads still live elsewhere.
 
 `table_metadata_bytes` reserves one shared backing pool for actual-length table
 columns, physical column-number records, constraints, pending edit mappings and

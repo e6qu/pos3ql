@@ -5,7 +5,7 @@ use super::*;
 pub(super) struct NumericLoopWorkspace<'a> {
     depth: usize,
     pub(super) locals: MutableSlice<TriggerLocalDecl>,
-    pub(super) values: &'a mut [Datum<'a>],
+    pub(super) values: MutableSlice<Datum<'a>>,
 }
 
 pub(super) struct NumericLoopFrames<'a> {
@@ -15,36 +15,44 @@ pub(super) struct NumericLoopFrames<'a> {
 
 impl<'a> NumericLoopFrames<'a> {
     pub(super) fn new(
-        arena: &'a Arena,
+        arena: &Arena,
         block: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
         let depth = numeric_depth(block);
-        let counts = arena
-            .alloc_slice_with(depth, |_| 0usize)
-            .map_err(|_| frame_full())?;
-        frame_layout(block, locals, None, locals.len(), 0, counts);
-        let mut slots = pool.lease(depth).map_err(control_flow::execution_full)?;
-        for (depth, count) in counts.iter().copied().enumerate() {
-            let mut locals = pool.lease(count).map_err(control_flow::execution_full)?;
-            for _ in 0..count {
-                locals
-                    .push_reserved(empty_plpgsql_local())
-                    .map_err(control_flow::execution_full)?;
-            }
-            let values = arena
-                .alloc_slice_with(count, |_| Datum::Null)
-                .map_err(|_| frame_full())?;
-            slots
-                .push_reserved(Some(NumericLoopWorkspace {
-                    depth,
-                    locals,
-                    values,
-                }))
-                .map_err(control_flow::execution_full)?;
+        if depth == 0 {
+            return Ok(Self {
+                slots: pool.lease(0).map_err(control_flow::execution_full)?,
+                active: 0,
+            });
         }
-        Ok(Self { slots, active: 0 })
+        arena
+            .with_remaining_region(|layout| {
+                let counts = layout
+                    .alloc_slice_with(depth, |_| 0usize)
+                    .map_err(|_| frame_full())?;
+                frame_layout(block, locals, None, locals.len(), 0, counts);
+                let mut slots = pool.lease(depth).map_err(control_flow::execution_full)?;
+                for (depth, count) in counts.iter().copied().enumerate() {
+                    let mut locals = pool.lease(count).map_err(control_flow::execution_full)?;
+                    for _ in 0..count {
+                        locals
+                            .push_reserved(empty_plpgsql_local())
+                            .map_err(control_flow::execution_full)?;
+                    }
+                    let values = allocate_plpgsql_local_values(pool, count)?;
+                    slots
+                        .push_reserved(Some(NumericLoopWorkspace {
+                            depth,
+                            locals,
+                            values,
+                        }))
+                        .map_err(control_flow::execution_full)?;
+                }
+                Ok(Self { slots, active: 0 })
+            })
+            .map_err(|_| frame_full())?
     }
 
     pub(super) fn take(&mut self) -> Result<NumericLoopWorkspace<'a>, SqlError> {
@@ -62,7 +70,7 @@ impl<'a> NumericLoopFrames<'a> {
         assert_eq!(self.active, depth + 1, "numeric frame stack order");
         assert!(self.slots[depth].is_none());
         // Inactive values cannot retain references into a completed body's
-        // temporary arena suffix. Value buffers precede all body execution.
+        // temporary arena suffix. The scope owns both of its buffer ranges.
         workspace.locals.fill(empty_plpgsql_local());
         workspace.values.fill(Datum::Null);
         self.active -= 1;

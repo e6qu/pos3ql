@@ -15,6 +15,50 @@ fn layout_locals<'a>(
 }
 
 #[test]
+fn numeric_scope_owners_outlive_layout_and_syntax_without_borrowing_their_memory() {
+    let mut budget = Budget::new(64 << 10);
+    let parsing = Arena::new(&mut budget, "owned scope syntax", 16 << 10).unwrap();
+    let layout = Arena::new(&mut budget, "owned scope layout", 4096).unwrap();
+    let source = Arena::new(&mut budget, "owned scope source values", 16 << 10).unwrap();
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        8,
+    )
+    .unwrap();
+    let mut frames = crate::mem::guard::forbid_alloc(|| {
+        let program = parse_plpgsql_program(
+            "BEGIN FOR i IN 1..2 LOOP FOR j IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
+            &parsing,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let frames = NumericLoopFrames::new(&layout, program.body, &[], &pool).unwrap();
+        assert_eq!(layout.used(), 0);
+        frames
+    });
+    drop(parsing);
+    drop(layout);
+    crate::mem::guard::forbid_alloc(|| {
+        let mut outer = frames.take().unwrap();
+        let mut inner = frames.take().unwrap();
+        outer.values[0] = Datum::Text(source.alloc_str("outer remains selected").unwrap());
+        inner.values[0] = Datum::Int4(7);
+        inner.values[1] = Datum::Text(source.alloc_str("inner remains selected").unwrap());
+        drop(frames);
+        let moved = outer;
+        assert_eq!(moved.values[0], Datum::Text("outer remains selected"));
+        assert_eq!(inner.values[1], Datum::Text("inner remains selected"));
+        drop(inner);
+        assert!(pool.lease::<u8>(16 << 10).is_err());
+        assert_eq!(moved.values[0], Datum::Text("outer remains selected"));
+        drop(moved);
+        assert_eq!(pool.lease::<u8>(16 << 10).unwrap().capacity(), 16 << 10);
+    });
+}
+
+#[test]
 fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservations() {
     let mut budget = Budget::new(64 << 10);
     let parse = Arena::new(&mut budget, "numeric control syntax", 16 << 10).unwrap();
@@ -23,7 +67,7 @@ fn numeric_control_admission_preserves_live_owners_and_releases_partial_reservat
         &mut budget,
         crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
         8192,
-        3,
+        5,
     )
     .unwrap();
     let program = parse_plpgsql_program(
@@ -84,7 +128,7 @@ fn nested_frames_reuse_backing_and_release_references_before_scratch_rewinds() {
         let mut prior_high_water = None;
         for _ in 0..256 {
             {
-                let outer = frames.take().unwrap();
+                let mut outer = frames.take().unwrap();
                 outer.values[0] = Datum::Int4(41);
                 let mut inner = frames.take().unwrap();
                 let temporary = arena.alloc_str("temporary loop text").unwrap();
@@ -211,7 +255,7 @@ fn reservation_failure_names_statement_memory_without_heap_growth() {
     .unwrap();
     let mut budget = Budget::new(1 << 17);
     let parse = Arena::new(&mut budget, "numeric reservation program", 1 << 16).unwrap();
-    let arena = Arena::new(&mut budget, "numeric reservation bytes", 64).unwrap();
+    let arena = Arena::new(&mut budget, "numeric reservation bytes", 1).unwrap();
     let program = parse_plpgsql_program(
         "DECLARE x integer; y integer; BEGIN FOR i IN 1..2 LOOP NULL; END LOOP; END",
         &parse,
@@ -219,6 +263,11 @@ fn reservation_failure_names_statement_memory_without_heap_growth() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
+        let empty =
+            NumericLoopFrames::new(&arena, TriggerBlock { statements: &[] }, &[], &pool).unwrap();
+        assert_eq!(empty.active, 0);
+        assert_eq!(arena.used(), 0);
+        drop(empty);
         let error =
             NumericLoopFrames::new(&arena, program.body, layout_locals(&program, &parse), &pool)
                 .err()

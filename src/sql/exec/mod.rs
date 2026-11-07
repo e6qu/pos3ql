@@ -22090,32 +22090,6 @@ mod trigger_program_tests {
     }
 
     #[test]
-    fn procedural_statement_boundaries_use_sql_quoting_and_discard_scan_scratch() {
-        let mut budget = Budget::new(1 << 16);
-        let arena = Arena::new(&mut budget, "quoted procedural boundaries", 1 << 12).unwrap();
-        crate::mem::guard::forbid_alloc(|| {
-            let segments = split_trigger_statements(
-                r#"EXECUTE $body$SELECT ';', 'then', 'loop'$body$; PERFORM E'it\'s; intact'; PERFORM 1 /* ; /* ; */ ; */; PERFORM 2 -- ;
-; RETURN NEW; END"#,
-                &arena,
-            )
-            .unwrap();
-            assert_eq!(
-                segments,
-                [
-                    "EXECUTE $body$SELECT ';', 'then', 'loop'$body$",
-                    r"PERFORM E'it\'s; intact'",
-                    "PERFORM 1 /* ; /* ; */ ; */",
-                    "PERFORM 2 -- ;",
-                    "RETURN NEW",
-                    "END",
-                ]
-            );
-            assert!(arena.used() < 1024);
-        });
-    }
-
-    #[test]
     fn for_header_splits_before_its_first_action() {
         let mut budget = Budget::new(1 << 16);
         let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();

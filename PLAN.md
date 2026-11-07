@@ -96,6 +96,10 @@ Restore the whole frame before publishing it. If a later local value exceeds
 destination memory after earlier loop scopes have decoded, retain all original
 images and reservations without leaving references into the failed destination.
 Dropping a paused call must return both its control and row-work capacity.
+Retain an unfinished `RETURN`, loop exit or error cleanup as part of that call.
+Keep the original error detail and hint before cleanup can run other SQL or a
+different connection. A storage wait during rollback or release must retain its
+boundary and phase; a failed handler capture must return its capacity error.
 Capture ordinary declarations only when needed for a pause, and share that
 image through subsequent pauses. Preserve normal-call memory admission and
 keep each nested write's selection owner separate from the enclosing write.

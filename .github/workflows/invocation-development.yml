@@ -33,9 +33,13 @@ jobs:
           cargo test --lib --locked --profile native-ci --jobs 1 -- \
             inplace_conversion_ exec::control_flow::ownership_tests \
             exec::local_values::ownership_tests exec::numeric_loops::ownership_tests \
+            exec::diagnostics::ownership_tests \
             procedural_parameter_staging_ procedural_source_ \
             procedural_locals_initialize_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \
+            diagnostic_payload_exhaustion_ nested_diagnostic_calls_ caught_diagnostics_ \
+            procedural_control_frames_ numeric_loop_frames_ custom_sqlstates_ \
+            expired_procedural_blocks_ owned_set_results_ input_validation_ \
             uninitialized_domain_locals_ parameter_names_and_shadowed_ \
             saved_output_scopes_reuse_ \
             nested_static_and_dynamic_writes_ routine_calls:: procedural_subtransactions:: \

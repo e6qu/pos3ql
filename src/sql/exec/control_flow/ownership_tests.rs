@@ -1,6 +1,178 @@
 use super::*;
 use crate::mem::budget::Budget;
 
+#[test]
+fn execution_waits_require_private_provenance_and_exclude_consumer_completion() {
+    use crate::sql::eval::InternalControl;
+    crate::mem::guard::forbid_alloc(|| {
+        for (control, waiting) in [
+            (InternalControl::LockWait, true),
+            (InternalControl::IoWait, true),
+            (InternalControl::RoutineInvocation, true),
+            (InternalControl::QueryConsumerComplete, false),
+        ] {
+            assert_eq!(is_execution_wait(&sql_err!(control, "control")), waiting);
+            assert!(!is_execution_wait(&sql_err!(
+                control.diagnostic_code(),
+                "user error"
+            )));
+        }
+        assert!(!is_execution_wait(&sql_err!("57014", "user cancellation")));
+    });
+}
+
+#[test]
+fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "pending error syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "pending error original", 8192).unwrap();
+    let restored_syntax = Arena::new(&mut budget, "pending error reparse", 16 << 10).unwrap();
+    let output = Arena::new(&mut budget, "pending error restored", 64).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        frames
+            .execution(&workspace, &code)
+            .unwrap()
+            .start(program.body);
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str("original detail")),
+            Some(StackStr::from_str("original hint")),
+        );
+        frames.progress = ExecutionProgress::Error(PendingError::capture(
+            sql_err!("PZ002", "original error"),
+            &controls,
+        ));
+        execution.suspend().ok().unwrap()
+    });
+    drop((parsing, workspace));
+    crate::mem::guard::forbid_alloc(|| {
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("another connection")), None);
+        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let mut execution = saved.restore(&output, &code).ok().unwrap();
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        assert_eq!(frames.active, 1);
+        assert_eq!(frames.slots[0].as_ref().unwrap().next, 0);
+        let ExecutionProgress::Error(error) =
+            core::mem::replace(&mut frames.progress, ExecutionProgress::Complete)
+        else {
+            panic!("unfinished error cleanup")
+        };
+        let error = error.publish();
+        assert_eq!(error.sqlstate, "PZ002");
+        assert!(error.sqlstate.internal_control().is_none());
+        assert_eq!(error.message.as_str(), "original error");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert_eq!(diagnostic.detail.unwrap().as_str(), "original detail");
+        assert_eq!(diagnostic.hint.unwrap().as_str(), "original hint");
+        drop((execution, code));
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+    });
+}
+
+#[test]
+fn unfinished_returns_preserve_values_after_failed_capture_and_workspace_destruction() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "pending return syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "pending return original", 8192).unwrap();
+    let tiny = Arena::new(&mut budget, "pending return failed restore", 64).unwrap();
+    let output = Arena::new(&mut budget, "pending return output", 8192).unwrap();
+    let restored_syntax = Arena::new(&mut budget, "pending return reparse", 16 << 10).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN RETURN 'original'; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Function,
+        )
+        .unwrap();
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        frames
+            .execution(&workspace, &code)
+            .unwrap()
+            .start(program.body);
+        let text = workspace.alloc_slice_with(1024, |_| b'r').unwrap();
+        frames.progress = ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(
+            Datum::Text(core::str::from_utf8(text).unwrap()),
+        )));
+        let held = rows.lease::<u8>(1024).unwrap();
+        let (execution, error) = execution.suspend().err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        let frames = execution.status.control_frames.as_ref().unwrap();
+        assert_eq!(frames.active, 1);
+        assert!(
+            matches!(frames.progress.return_value(), Some(Datum::Text(value)) if value.len() == 1024)
+        );
+        assert!(frames.saved_return.is_none());
+        drop(held);
+        execution.suspend().ok().unwrap()
+    });
+    drop((parsing, workspace));
+    crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let (saved, error) = saved.restore(&tiny, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(tiny.used(), 0);
+        let execution = saved.restore(&output, &code).ok().unwrap();
+        let frames = execution.status.control_frames.as_ref().unwrap();
+        assert_eq!(frames.active, 1);
+        assert!(frames.saved_return.is_none());
+        let Some(Datum::Text(value)) = frames.progress.return_value() else {
+            panic!("pending return value")
+        };
+        assert_eq!(value.len(), 1024);
+        assert!(value.bytes().all(|byte| byte == b'r'));
+        let saved = execution.suspend().ok().unwrap();
+        drop((saved, code));
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+    });
+}
+
 fn parse_owned_program<'a>(
     text: &str,
     parsing: &'a Arena,

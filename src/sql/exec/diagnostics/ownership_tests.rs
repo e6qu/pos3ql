@@ -2,6 +2,110 @@ use super::*;
 use crate::mem::Budget;
 
 #[test]
+fn pending_errors_own_metadata_before_cleanup_and_release_it_after_handler_capture() {
+    let mut budget = Budget::new(16 << 10);
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        8,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str("original é detail")),
+            Some(StackStr::from_str("")),
+        );
+        let error = PendingError::capture(sql_err!("PZ003", "original error"), &pool);
+        assert!(crate::sql::eval::take_diagnostic().is_none());
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str("cleanup detail")),
+            Some(StackStr::from_str("cleanup hint")),
+        );
+        let mut handlers = DiagnosticBuffers::new(&pool, 1).unwrap();
+        error.catch(&mut handlers, "original call").unwrap();
+        let caught = handlers.current().unwrap();
+        assert_eq!(caught.sqlstate, "PZ003");
+        assert!(caught.sqlstate.internal_control().is_none());
+        assert_eq!(caught.field(Field::Message), Some("original error"));
+        assert_eq!(caught.field(Field::Detail), Some("original é detail"));
+        assert_eq!(caught.field(Field::Hint), Some(""));
+        assert_eq!(caught.field(Field::Context), Some("original call"));
+        drop(pool);
+        let caught = handlers.current().unwrap();
+        assert_eq!(caught.field(Field::Detail), Some("original é detail"));
+        assert_eq!(caught.field(Field::Hint), Some(""));
+        let _ = crate::sql::eval::take_diagnostic();
+    });
+}
+
+#[test]
+fn publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata() {
+    let mut budget = Budget::new(4096);
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        1024,
+        4,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str("saved detail")),
+            Some(StackStr::from_str("saved hint")),
+        );
+        let error = PendingError::capture(sql_err!("22012", "original error"), &pool);
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("other work")), None);
+        let error = error.publish();
+        assert_eq!(error.sqlstate, "22012");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert_eq!(diagnostic.detail.unwrap().as_str(), "saved detail");
+        assert_eq!(diagnostic.hint.unwrap().as_str(), "saved hint");
+        assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
+
+        let error = PendingError::capture(sql_err!("22003", "without metadata"), &pool);
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("stale detail")), None);
+        assert_eq!(error.publish().sqlstate, "22003");
+        assert!(crate::sql::eval::take_diagnostic().is_none());
+        assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
+    });
+}
+
+#[test]
+fn pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse() {
+    let mut budget = Budget::new(4096);
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        1024,
+        4,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let _ = crate::sql::eval::take_diagnostic();
+        let held = pool.lease::<u8>(1024).unwrap();
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("original detail")), None);
+        let pending = PendingError::capture(sql_err!("22012", "original error"), &pool);
+        assert_eq!(pending.error.sqlstate, "22012");
+        let error = pending.publish();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_bytes"));
+        assert!(crate::sql::eval::take_diagnostic().is_none());
+        drop(held);
+        crate::sql::eval::stash_diagnostic(None, Some(StackStr::from_str("")));
+        let error = PendingError::capture(sql_err!("22012", "retry"), &pool);
+        let error = error.publish();
+        assert_eq!(error.sqlstate, "22012");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert!(diagnostic.detail.is_none());
+        assert_eq!(diagnostic.hint.unwrap().as_str(), "");
+        assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
+    });
+}
+
+#[test]
 fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
     let mut budget = Budget::new(1 << 18);
     let output = Arena::new(&mut budget, "saved error text", 4096).unwrap();

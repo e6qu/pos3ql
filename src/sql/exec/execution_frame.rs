@@ -101,7 +101,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
                 .control_frames
                 .as_mut()
                 .expect("one procedural frame owner")
-                .capture()
+                .capture(self.values.row_pool())
         });
         if let Err(error) = captured {
             self.values.discard_saved();

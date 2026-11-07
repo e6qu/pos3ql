@@ -96,6 +96,10 @@ pub(super) struct LocalValues<'a> {
 }
 
 impl<'a> LocalValues<'a> {
+    pub(super) fn row_pool(&self) -> &std::sync::Arc<LeasePool> {
+        self.saved.bytes.pool()
+    }
+
     pub(super) fn new(
         controls: &std::sync::Arc<LeasePool>,
         rows: &std::sync::Arc<LeasePool>,

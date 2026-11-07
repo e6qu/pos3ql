@@ -1,6 +1,6 @@
 //! Procedural positions and lexical scopes belong to bounded execution frames.
 
-use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
+use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers, PendingError};
 use super::*;
 use crate::mem::arena::ArenaIdentity;
 
@@ -142,6 +142,47 @@ enum Continuation {
     Handler,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an unfinished SQL error stays inline without runtime heap allocation"
+)]
+enum ExecutionProgress<'a> {
+    Ready,
+    Statements,
+    Flow(TriggerFlow<'a>),
+    Error(PendingError),
+    Complete,
+}
+
+impl ExecutionProgress<'_> {
+    fn return_value(&self) -> Option<Datum<'_>> {
+        match self {
+            Self::Flow(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn rebind<'out>(self) -> ExecutionProgress<'out> {
+        match self {
+            Self::Ready => ExecutionProgress::Ready,
+            Self::Statements => ExecutionProgress::Statements,
+            Self::Flow(flow) => ExecutionProgress::Flow(match flow {
+                TriggerFlow::Exit(depth) => TriggerFlow::Exit(depth),
+                TriggerFlow::Continue(depth) => TriggerFlow::Continue(depth),
+                TriggerFlow::Return(value) => TriggerFlow::Return(match value {
+                    TriggerReturnValue::New => TriggerReturnValue::New,
+                    TriggerReturnValue::Old => TriggerReturnValue::Old,
+                    TriggerReturnValue::Null => TriggerReturnValue::Null,
+                    TriggerReturnValue::Void => TriggerReturnValue::Void,
+                    TriggerReturnValue::Value(_) => TriggerReturnValue::Value(Datum::Null),
+                }),
+            }),
+            Self::Error(error) => ExecutionProgress::Error(error),
+            Self::Complete => ExecutionProgress::Complete,
+        }
+    }
+}
+
 /// The lexical maximum is reserved before local initializers can have effects.
 /// A frame owns its next statement and loop/handler state; entering a child does
 /// not keep another Rust interpreter invocation on the call stack.
@@ -152,6 +193,8 @@ pub(super) struct ControlFrames<'a> {
     diagnostics: DiagnosticBuffers,
     resources: MutableSlice<FrameResource<'a>>,
     workspace: ArenaIdentity,
+    progress: ExecutionProgress<'a>,
+    saved_return: Option<local_values::SavedValues>,
 }
 
 /// Every payload reference has been removed; only owned images and reservations
@@ -181,19 +224,27 @@ impl<'a> ControlFrames<'a> {
             diagnostics: DiagnosticBuffers::new(pool, layout.handlers)?,
             resources,
             workspace: arena.identity(),
+            progress: ExecutionProgress::Ready,
+            saved_return: None,
         })
     }
 
-    pub(super) fn capture(&mut self) -> Result<(), SqlError> {
+    pub(super) fn capture(&mut self, rows: &std::sync::Arc<LeasePool>) -> Result<(), SqlError> {
         for resource in &mut self.resources[..self.active] {
             if let FrameResource::Numeric { workspace } = resource {
                 workspace.values.capture()?;
             }
         }
+        if let Some(value) = self.progress.return_value() {
+            let mut saved = local_values::SavedValues::new(rows)?;
+            saved.replace(&[value])?;
+            self.saved_return = Some(saved);
+        }
         Ok(())
     }
 
     pub(super) fn discard_saved(&mut self) {
+        self.saved_return = None;
         for resource in &mut self.resources[..self.active] {
             if let FrameResource::Numeric { workspace } = resource {
                 workspace.values.discard_saved();
@@ -202,6 +253,11 @@ impl<'a> ControlFrames<'a> {
     }
 
     pub(super) fn suspend(self) -> SuspendedControlFrames {
+        assert_eq!(
+            self.progress.return_value().is_some(),
+            self.saved_return.is_some(),
+            "an unfinished return needs its owned value image"
+        );
         SuspendedControlFrames(ControlFrames {
             source: self.source,
             slots: self.slots,
@@ -215,6 +271,8 @@ impl<'a> ControlFrames<'a> {
                 },
             }),
             workspace: self.workspace,
+            progress: self.progress.rebind(),
+            saved_return: self.saved_return,
         })
     }
 
@@ -277,6 +335,8 @@ impl SuspendedControlFrames {
                 },
             }),
             workspace: self.0.workspace,
+            progress: self.0.progress.rebind(),
+            saved_return: self.0.saved_return,
         };
         for resource in &mut frames.resources[..frames.active] {
             if let FrameResource::Numeric { workspace } = resource
@@ -288,6 +348,23 @@ impl SuspendedControlFrames {
                 unsafe { arena.rewind_to(mark) };
                 return Err((saved, error));
             }
+        }
+        if let Some(saved) = &frames.saved_return {
+            let value = match saved.read(0, arena) {
+                Ok(value) => value,
+                Err(error) => {
+                    let saved = frames.suspend();
+                    // SAFETY: suspension cleared every partially restored payload.
+                    unsafe { arena.rewind_to(mark) };
+                    return Err((saved, error));
+                }
+            };
+            let ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(slot))) =
+                &mut frames.progress
+            else {
+                unreachable!("saved return value belongs to its unfinished return")
+            };
+            *slot = value;
         }
         // Images remain intact until the enclosing invocation has restored its
         // ordinary values and firing context too. A later failure can resuspend.
@@ -354,7 +431,9 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
 
     fn start(&mut self, block: TriggerBlock<'_>) {
         assert_eq!(self.state.active, 0);
+        assert!(matches!(self.state.progress, ExecutionProgress::Ready));
         self.push(FrameEntry::new(block, EntryState::Once), FrameSource::Root);
+        self.state.progress = ExecutionProgress::Statements;
     }
 
     fn enter(&mut self, entry: FrameEntry<'_, 'a>) {
@@ -708,15 +787,150 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 return Err(error);
             }
         };
-        assert_eq!(frames.state.active, 0);
-        frames.start(program.root());
+        if matches!(frames.state.progress, ExecutionProgress::Ready) {
+            frames.start(program.root());
+        } else if matches!(frames.state.progress, ExecutionProgress::Complete) {
+            status.control_frames = Some(retained);
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a completed procedural invocation cannot run again"
+            ));
+        }
         let mut outcome = Ok(None);
-        let mut pending_error = None;
-        while frames.state.active != 0 {
-            let action = (|| {
-                if let Some(error) = pending_error.take() {
-                    return Err(error);
+        let mut paused = false;
+        'execute: while frames.state.active != 0 {
+            match core::mem::replace(&mut frames.state.progress, ExecutionProgress::Statements) {
+                ExecutionProgress::Flow(mut flow) => {
+                    while frames.state.active != 0 {
+                        if frames.last().is_loop() {
+                            match flow {
+                                TriggerFlow::Continue(0) => {
+                                    frames.last_mut().next =
+                                        frames.program.block(frames.last().block).statements.len();
+                                    break;
+                                }
+                                TriggerFlow::Exit(0) => {
+                                    let frame = frames.pop();
+                                    frames.finish(frame, locals, values, status, true);
+                                    break;
+                                }
+                                TriggerFlow::Continue(depth) => {
+                                    flow = TriggerFlow::Continue(depth - 1)
+                                }
+                                TriggerFlow::Exit(depth) => flow = TriggerFlow::Exit(depth - 1),
+                                TriggerFlow::Return(_) => {}
+                            }
+                        }
+                        if let Continuation::Protected {
+                            boundary,
+                            releasing,
+                        } = &mut frames.last_mut().continuation
+                        {
+                            *releasing = true;
+                            if let Err(error) = release_trigger_subtransaction(context, boundary) {
+                                if is_execution_wait(&error) {
+                                    frames.state.progress = ExecutionProgress::Flow(flow);
+                                    outcome = Err(error);
+                                    paused = true;
+                                    break 'execute;
+                                }
+                                frames.state.progress =
+                                    ExecutionProgress::Error(PendingError::capture(
+                                        error,
+                                        &context.storage().execution_control,
+                                    ));
+                                break;
+                            }
+                        }
+                        let frame = frames.pop();
+                        frames.finish(frame, locals, values, status, true);
+                        if frames.state.active == 0 {
+                            outcome = Ok(Some(flow));
+                        }
+                    }
+                    continue;
                 }
+                ExecutionProgress::Error(mut error) => {
+                    let mut handler = None;
+                    while frames.state.active != 0 {
+                        if let Continuation::Protected {
+                            boundary,
+                            releasing: false,
+                        } = frames.last().continuation
+                        {
+                            match rollback_trigger_subtransaction(context, &boundary) {
+                                Ok(()) => {
+                                    let TriggerStatement::Exception(program) =
+                                        frames.source_statement(frames.last().source)
+                                    else {
+                                        unreachable!("exception frame source")
+                                    };
+                                    handler = program.handlers.iter().find(|handler| {
+                                        handler.conditions.iter().copied().any(|condition| {
+                                            trigger_exception_matches(condition, &error.error)
+                                        })
+                                    });
+                                }
+                                Err(wait) if is_execution_wait(&wait) => {
+                                    // The protected frame and original diagnostic
+                                    // remain owned until rollback actually finishes.
+                                    frames.state.progress = ExecutionProgress::Error(error);
+                                    outcome = Err(wait);
+                                    paused = true;
+                                    break 'execute;
+                                }
+                                Err(rollback_error) => {
+                                    error = PendingError::capture(
+                                        rollback_error,
+                                        &context.storage().execution_control,
+                                    );
+                                }
+                            }
+                        }
+                        let frame = frames.pop();
+                        frames.finish(frame, locals, values, status, false);
+                        if handler.is_some() {
+                            break;
+                        }
+                    }
+                    let Some(handler) = handler else {
+                        outcome = Err(error.publish());
+                        break;
+                    };
+                    match catch_diagnostic(
+                        context,
+                        invocation,
+                        error,
+                        &mut frames.state.diagnostics,
+                    ) {
+                        Ok(()) => frames.push(
+                            FrameEntry::new(handler.block, EntryState::Handler),
+                            FrameSource::Handler,
+                        ),
+                        Err(error) => {
+                            frames.state.progress = ExecutionProgress::Error(
+                                PendingError::capture(error, &context.storage().execution_control),
+                            );
+                            if frames.state.active == 0 {
+                                let ExecutionProgress::Error(error) = core::mem::replace(
+                                    &mut frames.state.progress,
+                                    ExecutionProgress::Complete,
+                                ) else {
+                                    unreachable!()
+                                };
+                                outcome = Err(error.publish());
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                ExecutionProgress::Statements => {}
+                ExecutionProgress::Ready | ExecutionProgress::Complete => {
+                    unreachable!("active procedural execution position")
+                }
+            }
+            let action = (|| {
                 super::super::query::check_timeout()?;
                 if let Some(statement) = frames
                     .program
@@ -864,104 +1078,45 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 }
                 Ok(Some(Step::Complete(None))) => frames.last_mut().next += 1,
                 Ok(None) => {}
-                Ok(Some(Step::Complete(Some(mut flow)))) => {
-                    while frames.state.active != 0 {
-                        if frames.last().is_loop() {
-                            match flow {
-                                TriggerFlow::Continue(0) => {
-                                    frames.last_mut().next =
-                                        frames.program.block(frames.last().block).statements.len();
-                                    break;
-                                }
-                                TriggerFlow::Exit(0) => {
-                                    let frame = frames.pop();
-                                    frames.finish(frame, locals, values, status, true);
-                                    break;
-                                }
-                                TriggerFlow::Continue(depth) => {
-                                    flow = TriggerFlow::Continue(depth - 1)
-                                }
-                                TriggerFlow::Exit(depth) => flow = TriggerFlow::Exit(depth - 1),
-                                TriggerFlow::Return(_) => {}
-                            }
-                        }
-                        if let Continuation::Protected {
-                            boundary,
-                            releasing,
-                            ..
-                        } = &mut frames.last_mut().continuation
-                        {
-                            *releasing = true;
-                            if let Err(error) = release_trigger_subtransaction(context, boundary) {
-                                pending_error = Some(error);
-                                break;
-                            }
-                        }
-                        let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, true);
-                        if frames.state.active == 0 {
-                            outcome = Ok(Some(flow));
-                        }
-                    }
+                Ok(Some(Step::Complete(Some(flow)))) => {
+                    frames.state.progress = ExecutionProgress::Flow(flow);
                 }
-                Err(mut error) => {
-                    let mut handler = None;
-                    while frames.state.active != 0 {
-                        let frame = frames.pop();
-                        if let Continuation::Protected {
-                            ref boundary,
-                            releasing: false,
-                        } = frame.continuation
-                        {
-                            match rollback_trigger_subtransaction(context, boundary) {
-                                Ok(()) => {
-                                    let TriggerStatement::Exception(program) =
-                                        frames.source_statement(frame.source)
-                                    else {
-                                        unreachable!("exception frame source")
-                                    };
-                                    handler = program.handlers.iter().find(|handler| {
-                                        handler.conditions.iter().copied().any(|condition| {
-                                            trigger_exception_matches(condition, &error)
-                                        })
-                                    });
-                                }
-                                Err(rollback_error) => error = rollback_error,
-                            }
-                        }
-                        frames.finish(frame, locals, values, status, false);
-                        if handler.is_some() {
-                            break;
-                        }
-                    }
-                    let Some(handler) = handler else {
-                        outcome = Err(error);
-                        break;
-                    };
-                    match catch_diagnostic(
-                        context,
-                        invocation,
-                        &error,
-                        &mut frames.state.diagnostics,
-                    ) {
-                        Ok(()) => frames.push(
-                            FrameEntry::new(handler.block, EntryState::Handler),
-                            FrameSource::Handler,
-                        ),
-                        Err(error) => pending_error = Some(error),
-                    }
+                Err(error) if is_execution_wait(&error) => {
+                    outcome = Err(error);
+                    paused = true;
+                    break;
+                }
+                Err(error) => {
+                    frames.state.progress = ExecutionProgress::Error(PendingError::capture(
+                        error,
+                        &context.storage().execution_control,
+                    ));
                 }
             }
         }
         // Capacity/error exits release every lexical owner before the caller can
         // rewind statement memory. Transaction rollback remains the caller's job.
-        while frames.state.active != 0 {
-            let frame = frames.pop();
-            frames.finish(frame, locals, values, status, false);
+        if !paused {
+            while frames.state.active != 0 {
+                let frame = frames.pop();
+                frames.finish(frame, locals, values, status, false);
+            }
+            frames.state.progress = ExecutionProgress::Complete;
         }
         status.control_frames = Some(retained);
         outcome
     }
+}
+
+fn is_execution_wait(error: &SqlError) -> bool {
+    matches!(
+        error.sqlstate.internal_control(),
+        Some(
+            crate::sql::eval::InternalControl::LockWait
+                | crate::sql::eval::InternalControl::IoWait
+                | crate::sql::eval::InternalControl::RoutineInvocation
+        )
+    )
 }
 
 // Bind snapshots before a child query borrows the remaining arena. Only input
@@ -1068,17 +1223,17 @@ fn bind_exception_variables<'a>(
 fn catch_diagnostic(
     context: &mut TriggerExecContext<'_, '_, '_>,
     invocation: TriggerInvocation<'_>,
-    error: &SqlError,
+    error: PendingError,
     buffers: &mut DiagnosticBuffers,
 ) -> Result<(), SqlError> {
-    if error.sqlstate == sqlstate::QUERY_CANCELED {
+    if error.error.sqlstate == sqlstate::QUERY_CANCELED {
         context
             .txn
             .catch_query_cancellation(super::super::datetime::now_micros());
         super::super::sequence::record_caught_cancellation(context.seq_session());
     }
-    let diagnostic = crate::sql::eval::take_diagnostic();
-    buffers.capture(error, diagnostic.as_ref(), invocation.context().as_str())
+    let _ = crate::sql::eval::take_diagnostic();
+    error.catch(buffers, invocation.context().as_str())
 }
 
 #[cfg(test)]

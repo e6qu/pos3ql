@@ -342,6 +342,13 @@ that check at [block entry](https://github.com/postgres/postgres/blob/REL_18_6/s
 A declaration explicitly marked `NOT NULL` needs an initializer; routine
 definition validation rejects its omission with `22004`, as PostgreSQL's
 [declaration grammar](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_gram.y#L507-L516) requires.
+The internal interpreter also retains whether it is executing statements,
+finishing a return or loop exit, or finding an error handler. Before cleanup,
+an error takes its detail and hint out of the worker-local diagnostic slot into
+the shared execution control pool. Cleanup cannot replace those fields with
+another command's error. Pending return payloads join the saved row-work images
+only when a call pauses. These internal owners still need the enclosing write
+and scheduler handoff described below; they do not enable checked trigger inputs.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges

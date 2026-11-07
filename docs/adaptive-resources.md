@@ -31,14 +31,16 @@ reserved memory must remain unchanged.
   finishes. That overlap and fragmentation can exhaust the pool even when total
   free bytes look sufficient; diagnostics name the requested extent, free bytes,
   largest contiguous extent and available descriptors.
-- Procedural branch, loop and handler positions, numeric-scope metadata and output bindings share `execution_control_bytes`,
-  bounded by `execution_control_leases`. A call reserves its maximum lexical
-  depth and a separate range for named-output bindings before local initialization.
-  Numeric loops also reserve a scope directory and local-description ranges for
-  each nesting level. Dropping owners returns their ranges, including after
-  failed admission. An active scope retains its range if its directory drops.
+- Procedural positions, resource directories, value-slot arrays, numeric-scope
+  metadata and output bindings share `execution_control_bytes`, bounded by
+  `execution_control_leases`. A call admits its actual local count and maximum
+  lexical nesting before initializers can have effects. Position and resource
+  directories have one owner. Numeric scopes own their descriptions and value
+  arrays; named-parameter staging is released after initialization. Dropping
+  owners returns their ranges, including after failed admission. An active
+  scope retains both buffers if its directory drops.
   Table count and cached-plan count do not reserve private execution ranges.
-  Local values and their workspaces still have separate ownership.
+  Variable-length value payloads still have separate statement-memory ownership.
   Checkpoint and relocation buffers retain independent guaranteed progress
   capacity, sized from the resident objects they can visit. They do not borrow
   foreground space needed by a report that may outlive maintenance.

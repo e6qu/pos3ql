@@ -198,7 +198,11 @@ references before temporary memory is reused. Exhaust the separate control pool,
 prove no declaration initializer ran, and verify capacity returns after owners
 drop while other active calls keep their positions. Cover both frame-byte and
 numeric-scope and output-binding lease exhaustion, including partially reserved
-directories and live scopes whose directory has dropped. Bind the original source arena explicitly when
+directories and live scopes whose directory has dropped. Preserve local-value
+owners across moves and failed admission, and release parameter staging after
+initialization. Frame positions and resources must have one owner, without an
+address-based pairing check. Prove numeric layout scratch can be dropped while
+its owned scopes remain usable. Bind the original source arena explicitly when
 rebuilding syntax in a separate execution workspace. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
 Repeat queries and nested results on every iteration at unchanged capacity;

@@ -87,10 +87,11 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Carry saved control positions through scheduler returns together with live local
-values, declared types, selected source definitions, output bindings and the
-enclosing write. The separate loop-value owner must survive until those values
-are saved; preserving positions alone cannot resume a whole invocation.
+Carry owned control and value-slot buffers through scheduler returns together
+with saved variable-length payloads, declared types, selected source definitions,
+output bindings and the enclosing write. Owning a value array does not preserve
+the statement-memory bytes to which its entries refer. Keep those payloads alive
+or save them before recycling scratch; positions alone cannot resume an invocation.
 Keep saved output values independent of expression scratch, preserve the outer
 value through nested counters, and reuse capacity across repeated shadowing.
 Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
@@ -135,8 +136,11 @@ errors, cancellation, rollback and connection closure. Prove no heap growth,
 no stale arena handles, fair progress for another connection and named capacity
 errors. Keep live-call control ownership separate from shared cached plans and
 row payloads. Preserve shared-pool admission before initializer effects and
-return position, numeric-scope and output-binding capacity on failure or owner drop,
-independently of table count. Keep saved output bytes separate from their metadata.
+return position, resource, local-value, numeric-scope and output-binding capacity
+on failure or owner drop, independently of table count. Keep resource pairing in
+one owner and save only live parameter slots. Preserve unchanged parent counter
+slots when copying a completed numeric scope back. Keep saved output bytes
+separate from their metadata.
 Keep file, generated and embedded test configurations explicit and complete;
 capacity regressions must reach their intended limit rather than an earlier
 missing-setting error.

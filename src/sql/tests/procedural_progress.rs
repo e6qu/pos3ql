@@ -1,12 +1,51 @@
 use super::*;
 
 #[test]
+fn procedural_parameter_staging_uses_named_parameters_instead_of_all_declarations() {
+    let mut declarations = String::new();
+    for index in 0..128 {
+        declarations.push_str(&format!("v{index} integer;"));
+    }
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("owned-parameter-slots-{mode:?}"));
+        config.transaction_mode = mode;
+        let value_slots = 130 * core::mem::size_of::<Datum<'static>>();
+        // Admit one full local array plus control metadata, without room for
+        // another declaration-sized array used only to stage a few arguments.
+        config.execution_control_bytes = (value_slots + 1024).next_multiple_of(64);
+        config.execution_control_leases = 8;
+        assert!(value_slots * 2 > config.execution_control_bytes);
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(&mut engine, &format!("CREATE FUNCTION named_scalar(p integer) RETURNS integer LANGUAGE plpgsql AS $$DECLARE {declarations} BEGIN v127 := p; RETURN v127; END$$"), true);
+        session.success(&mut engine, &format!("CREATE FUNCTION named_table(p integer) RETURNS TABLE(answer integer) LANGUAGE plpgsql AS $$DECLARE {declarations} BEGIN v127 := p; answer := v127; RETURN NEXT; END$$"), true);
+        session.success(&mut engine, &format!("CREATE PROCEDURE named_procedure(IN p integer, OUT answer integer) LANGUAGE plpgsql AS $$DECLARE {declarations} BEGIN v127 := p; answer := v127; END$$"), true);
+        for sql in [
+            "SELECT named_scalar(73)",
+            "SELECT * FROM named_table(73)",
+            "CALL named_procedure(73, NULL)",
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, sql, true)),
+                ["73"],
+                "{mode:?}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
 fn control_capacity_is_admitted_before_procedural_initializer_effects() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        for (capacity, bytes, leases) in [("bytes", 64, 8), ("leases", 4096, 1)] {
+        for (capacity, bytes, leases) in [("bytes", 64, 8), ("leases", 4096, 3)] {
             let mut config = test_config(&format!("control-admission-{mode:?}-{capacity}"));
             config.transaction_mode = mode;
             config.execution_control_bytes = bytes;
@@ -41,7 +80,7 @@ fn output_control_admission_precedes_initializers_and_releases_failed_calls() {
         let mut config = test_config(&format!("output-control-admission-{mode:?}"));
         config.transaction_mode = mode;
         config.execution_control_bytes = 4096;
-        config.execution_control_leases = 1;
+        config.execution_control_leases = 3;
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session =

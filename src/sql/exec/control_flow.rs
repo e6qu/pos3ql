@@ -2,7 +2,7 @@
 
 use super::diagnostics::{CaughtDiagnostic, DiagnosticBuffers};
 use super::*;
-use crate::mem::arena::{ArenaIdentity, OwnedArenaSlice};
+use crate::mem::arena::ArenaIdentity;
 
 mod program;
 use numeric_loops::NumericLoopWorkspace;
@@ -62,7 +62,6 @@ enum EntryState<'a> {
     Numeric {
         position: NumericLoop,
         workspace: NumericLoopWorkspace<'a>,
-        prior_target: Datum<'a>,
     },
     Rows {
         target: SqlName,
@@ -120,12 +119,9 @@ struct NumericLoop {
     reverse: bool,
 }
 
-pub(super) enum FrameResource<'a> {
+enum FrameResource<'a> {
     Empty,
-    Numeric {
-        workspace: NumericLoopWorkspace<'a>,
-        prior_target: Datum<'a>,
-    },
+    Numeric { workspace: NumericLoopWorkspace<'a> },
     Rows(super::loop_rows::LoopRows),
 }
 
@@ -149,16 +145,16 @@ enum Continuation {
 /// The lexical maximum is reserved before local initializers can have effects.
 /// A frame owns its next statement and loop/handler state; entering a child does
 /// not keep another Rust interpreter invocation on the call stack.
-pub(super) struct ControlFrames {
+pub(super) struct ControlFrames<'a> {
     source: ProgramSource,
     slots: MutableSlice<Option<Frame<()>>>,
     active: usize,
     diagnostics: DiagnosticBuffers,
-    resource_identity: Option<usize>,
+    resources: MutableSlice<FrameResource<'a>>,
     workspace: ArenaIdentity,
 }
 
-impl ControlFrames {
+impl<'a> ControlFrames<'a> {
     pub(super) fn new(
         arena: &Arena,
         layout: ProgramLayout,
@@ -170,12 +166,18 @@ impl ControlFrames {
         for _ in 0..layout.depth {
             slots.push_reserved(None).map_err(execution_full)?;
         }
+        let mut resources = pool.lease(layout.depth).map_err(execution_full)?;
+        for _ in 0..layout.depth {
+            resources
+                .push_reserved(FrameResource::Empty)
+                .map_err(execution_full)?;
+        }
         Ok(Self {
             source: layout.source,
             slots,
             active: 0,
             diagnostics: DiagnosticBuffers::new(arena, layout.handlers)?,
-            resource_identity: None,
+            resources,
             workspace: arena.identity(),
         })
     }
@@ -194,53 +196,24 @@ impl ControlFrames {
         Ok(())
     }
 
-    pub(super) fn reserve_resources<'a>(
-        &mut self,
-        arena: &'a Arena,
-    ) -> Result<OwnedArenaSlice<'a, FrameResource<'a>>, SqlError> {
-        if self.resource_identity.is_some() {
-            return Err(program::changed());
-        }
-        self.require_workspace(arena)?;
-        let count = self.slots.len();
-        let resources = arena
-            .alloc_owned_slice_with(count, |_| FrameResource::Empty)
-            .map_err(|_| frame_full())?;
-        // This address identifies a nonempty, uniquely reserved tail directory;
-        // it is never dereferenced. Workspace identity rejects a later reset.
-        self.resource_identity = Some(resources.as_ptr() as usize);
-        Ok(resources)
-    }
-
-    fn execution<'scope, 'syntax, 'values>(
+    fn execution<'scope, 'syntax>(
         &'scope mut self,
         source: &Arena,
         workspace: &Arena,
         program: CompiledProgram<'syntax>,
-        resources: &'scope mut [FrameResource<'values>],
-    ) -> Result<FrameExecution<'scope, 'syntax, 'values>, SqlError> {
+    ) -> Result<FrameExecution<'scope, 'syntax, 'a>, SqlError> {
         self.require_source(source, program.source())?;
         self.require_workspace(workspace)?;
-        if self.resource_identity != Some(resources.as_ptr() as usize) {
-            return Err(program::changed());
-        }
-        assert_eq!(
-            self.slots.len(),
-            resources.len(),
-            "procedural resource capacity"
-        );
         Ok(FrameExecution {
             state: self,
             program,
-            resources,
         })
     }
 }
 
 struct FrameExecution<'scope, 'syntax, 'values> {
-    state: &'scope mut ControlFrames,
+    state: &'scope mut ControlFrames<'values>,
     program: CompiledProgram<'syntax>,
-    resources: &'scope mut [FrameResource<'values>],
 }
 
 impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
@@ -252,7 +225,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         );
         assert!(self.state.slots[self.state.active].is_none());
         assert!(matches!(
-            self.resources[self.state.active],
+            self.state.resources[self.state.active],
             FrameResource::Empty
         ));
         let (continuation, resource) = match entry.state {
@@ -262,13 +235,9 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             EntryState::Numeric {
                 position,
                 workspace,
-                prior_target,
             } => (
                 Continuation::Numeric(position),
-                FrameResource::Numeric {
-                    workspace,
-                    prior_target,
-                },
+                FrameResource::Numeric { workspace },
             ),
             EntryState::Rows {
                 target,
@@ -289,7 +258,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 (Continuation::Handler(diagnostic), FrameResource::Empty)
             }
         };
-        self.resources[self.state.active] = resource;
+        self.state.resources[self.state.active] = resource;
         self.state.slots[self.state.active] = Some(Frame {
             block: self.program.index(entry.block),
             next: 0,
@@ -333,7 +302,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             source: position.source,
             continuation: position.continuation,
             resource: core::mem::replace(
-                &mut self.resources[self.state.active],
+                &mut self.state.resources[self.state.active],
                 FrameResource::Empty,
             ),
         }
@@ -358,7 +327,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
         for (frame, resource) in self.state.slots[..self.state.active]
             .iter()
-            .zip(&mut self.resources[..self.state.active])
+            .zip(&mut self.state.resources[..self.state.active])
             .rev()
         {
             if let Some(Frame {
@@ -401,15 +370,15 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
     ) {
         match frame.continuation {
             Continuation::Numeric(scope) => {
-                let FrameResource::Numeric {
-                    workspace,
-                    prior_target,
-                } = frame.resource
-                else {
+                let FrameResource::Numeric { mut workspace } = frame.resource else {
                     unreachable!("numeric frame resource")
                 };
                 let (_, parent_values) = self.scope(locals, values);
-                workspace.values[scope.target] = prior_target;
+                // A numeric child changes its own slots. The parent still owns
+                // the shadowed value when assignments are copied back.
+                if let Some(prior) = parent_values.get(scope.target).copied() {
+                    workspace.values[scope.target] = prior;
+                }
                 parent_values.copy_from_slice(&workspace.values[..parent_values.len()]);
                 status.unshadow_output_local(scope.target);
                 status.numeric_frames.restore(workspace);
@@ -505,7 +474,6 @@ pub(super) fn start_numeric_loop<'syntax, 'a>(
                 reverse,
             },
             workspace,
-            prior_target,
         },
     )))
 }
@@ -563,11 +531,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         .control_frames
         .take()
         .expect("one procedural frame owner");
-    let mut resources = status
-        .control_resources
-        .take()
-        .expect("one procedural resource owner");
-    let mut frames = retained.execution(context.arena, context.arena, program, &mut resources)?;
+    let mut frames = retained.execution(context.arena, context.arena, program)?;
     assert_eq!(frames.state.active, 0);
     frames.start(program.root());
     let mut outcome = Ok(None);
@@ -664,7 +628,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         let target = range.target;
                         frame.next = 0;
                         let FrameResource::Numeric { workspace, .. } =
-                            &mut frames.resources[frames.state.active - 1]
+                            &mut frames.state.resources[frames.state.active - 1]
                         else {
                             unreachable!("numeric frame resource")
                         };
@@ -675,7 +639,8 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     }
                 }
                 Continuation::Rows { target, index } => {
-                    let FrameResource::Rows(rows) = &frames.resources[frames.state.active - 1]
+                    let FrameResource::Rows(rows) =
+                        &frames.state.resources[frames.state.active - 1]
                     else {
                         unreachable!("row frame resource")
                     };
@@ -810,7 +775,6 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
         frames.finish(context.arena, frame, locals, values, status, false);
     }
     status.control_frames = Some(retained);
-    status.control_resources = Some(resources);
     outcome
 }
 

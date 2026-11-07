@@ -2,6 +2,36 @@ use super::*;
 use crate::mem::budget::Budget;
 
 #[test]
+fn local_slot_owners_preserve_values_on_failed_admission_and_return_capacity_on_drop() {
+    let mut budget = Budget::new(32 << 10);
+    let source = Arena::new(&mut budget, "owned local payloads", 16 << 10).unwrap();
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        2,
+    )
+    .unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let mut values = allocate_plpgsql_local_values(&pool, 3).unwrap();
+        values[0] = Datum::Text(source.alloc_str("selected value").unwrap());
+        values[1] = Datum::Int4(73);
+        assert!(values[2].is_null());
+        let held = pool.lease::<u8>(64).unwrap();
+        let error = allocate_plpgsql_local_values(&pool, 1).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_leases"));
+        let moved = values;
+        drop(held);
+        assert_eq!(moved[0], Datum::Text("selected value"));
+        assert_eq!(moved[1], Datum::Int4(73));
+        assert!(pool.lease::<u8>(4096).is_err());
+        drop(moved);
+        assert_eq!(pool.lease::<u8>(4096).unwrap().capacity(), 4096);
+    });
+}
+
+#[test]
 fn saved_values_keep_typed_nested_data_after_sources_and_owners_are_recycled() {
     let mut budget = Budget::new(32 << 10);
     let mut source = Arena::new(&mut budget, "saved value source", 8 << 10).unwrap();

@@ -322,7 +322,7 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 panic!("numeric frame")
             };
             frames.enter(frame);
-            let (scope, current) = frames.scope(&locals, &mut values);
+            let (scope, current, _) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
             assert_eq!(scope[1].name.as_str(), "n");
             assert_eq!(scope[0].scope, PlpgsqlScope::frame(2));
@@ -341,19 +341,19 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
                 panic!("nested frame")
             };
             frames.enter(frame);
-            let (scope, current) = frames.scope(&locals, &mut values);
+            let (scope, current, _) = frames.scope(&locals, &mut values);
             assert_eq!(scope.len(), 3);
             assert_eq!(scope[2].name.as_str(), "j");
             assert_eq!(scope[2].scope, PlpgsqlScope::frame(3));
             current[1] = Datum::Int4(41);
             status.set_found(false);
             let inner = frames.pop();
-            frames.finish(&arena, inner, &locals, &mut values, &mut status, success);
-            let (_, current) = frames.scope(&locals, &mut values);
+            frames.finish(inner, &locals, &mut values, &mut status, success);
+            let (_, current, _) = frames.scope(&locals, &mut values);
             assert_eq!(current[0], Datum::Int4(1));
             assert_eq!(current[1], Datum::Int4(41));
             let outer = frames.pop();
-            frames.finish(&arena, outer, &locals, &mut values, &mut status, success);
+            frames.finish(outer, &locals, &mut values, &mut status, success);
             assert_eq!(values, [Datum::Text("outside"), Datum::Int4(41)]);
             assert_eq!(status.found, Some(success));
             assert!(matches!(frames.pop().continuation, Continuation::Once));
@@ -429,7 +429,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
                 panic!("numeric loop entry")
             };
             frames.enter(entry);
-            let (_, current) = frames.scope(&locals, &mut values);
+            let (_, current, _) = frames.scope(&locals, &mut values);
             current[1] = Datum::Text(workspace.alloc_str("changed once before waiting").unwrap());
             let TriggerStatement::While(program) = program.block.statements[0] else {
                 panic!("while loop")
@@ -464,13 +464,13 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             panic!("rebuilt while loop")
         };
         assert!(matches!(program.condition, Expr::Bool(true)));
-        let (_, current) = frames.scope(&locals, &mut values);
+        let (_, current, _) = frames.scope(&locals, &mut values);
         assert_eq!(
             current,
             &[Datum::Int4(1), Datum::Text("changed once before waiting")]
         );
         let child = frames.pop();
-        frames.finish(&workspace, child, &locals, &mut values, &mut status, true);
+        frames.finish(child, &locals, &mut values, &mut status, true);
         assert!(matches!(
             frames.last().continuation,
             Continuation::Numeric(NumericLoop {
@@ -482,7 +482,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             })
         ));
         let numeric = frames.pop();
-        frames.finish(&workspace, numeric, &locals, &mut values, &mut status, true);
+        frames.finish(numeric, &locals, &mut values, &mut status, true);
         assert_eq!(
             values,
             [
@@ -491,7 +491,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
             ]
         );
         let root = frames.pop();
-        frames.finish(&workspace, root, &locals, &mut values, &mut status, true);
+        frames.finish(root, &locals, &mut values, &mut status, true);
         assert!(frames.state.slots.iter().all(Option::is_none));
         assert!(
             frames
@@ -666,13 +666,13 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         frames.start(program.body);
         frames.last_mut().next = 1;
         let error = sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero");
-        let diagnostic = frames
+        frames
             .state
             .diagnostics
-            .capture(&arena, &error, None, "handler")
+            .capture(&error, None, "handler")
             .unwrap();
         frames.push(
-            FrameEntry::new(handler, EntryState::Handler(diagnostic)),
+            FrameEntry::new(handler, EntryState::Handler),
             FrameSource::Handler,
         );
         frames.enter(FrameEntry::new(
@@ -681,10 +681,11 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
         ));
         assert_eq!(
             frames
-                .diagnostic()
+                .state
+                .diagnostics
+                .current()
                 .unwrap()
-                .0
-                .variables(&arena, &arena)
+                .variables(&arena)
                 .unwrap()
                 .message,
             "division by zero"
@@ -695,12 +696,15 @@ fn handler_diagnostics_and_statement_positions_survive_nested_frame_changes() {
             TriggerStatement::If(_)
         ));
         assert_eq!(frames.last().next, 1);
-        assert_eq!(frames.diagnostic().unwrap().0.sqlstate, "22012");
+        assert_eq!(
+            frames.state.diagnostics.current().unwrap().sqlstate,
+            "22012"
+        );
         let handler = frames.pop();
-        let Continuation::Handler(diagnostic) = handler.continuation else {
+        let Continuation::Handler = handler.continuation else {
             panic!("handler");
         };
-        frames.state.diagnostics.release(&arena, diagnostic);
+        frames.state.diagnostics.release();
         assert!(frames.diagnostic().is_none());
         assert_eq!(frames.last().next, 1);
         frames.pop();
@@ -874,11 +878,17 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
             ..
         }
     ));
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        4,
+    )
+    .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let mut buffers = DiagnosticBuffers::new(&arena, 1).unwrap();
-        let caught = buffers
+        let mut buffers = DiagnosticBuffers::new(&pool, 1).unwrap();
+        buffers
             .capture(
-                &arena,
                 &sql_err!(sqlstate::RAISE_EXCEPTION, "caught"),
                 None,
                 "handler",
@@ -895,7 +905,7 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
         .with_input_sites(program.input_sites);
         let bound = bind_exception_variables(
             invocation,
-            Some((caught, PlpgsqlScope::frame(2))),
+            Some((buffers.current().unwrap(), PlpgsqlScope::frame(2))),
             statement,
             &arena,
         )
@@ -906,7 +916,7 @@ fn lowered_assignment_inputs_bind_handler_variables_from_the_original_source() {
             .values;
         assert_eq!(variables.message, "caught");
         assert_eq!(variables.sqlstate_text, "P0001");
-        buffers.release(&arena, caught);
+        buffers.release();
         assert_eq!(variables.message, "caught");
     });
 }

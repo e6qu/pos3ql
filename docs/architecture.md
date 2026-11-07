@@ -346,14 +346,20 @@ control stack. Child blocks do
 not recursively call the interpreter. Leaving a scope
 restores shadowed counters from the unchanged parent slots, copies assignments
 back and releases its references.
-Caught error text and buffer descriptors use checked, address-independent
-handles in retained statement memory. Moving the arena or recycling its
-temporary front preserves those handles; a full reset invalidates them.
-Caught error text uses a reusable buffer for each simultaneously
-active handler depth. Buffer payloads grow geometrically within the statement
-arena; repeated catches reuse their storage. Leaving a handler invalidates its
-view. Nested handlers keep the outer error available; SQLSTATE/SQLERRM and
-requested stacked fields copy text before exposing it to local variables.
+Caught errors own their handler directory and reusable byte buffers in the
+execution control pool. The directory follows maximum simultaneous handler
+nesting and is admitted before local initializers. Text capacity grows only
+when an error is caught; repeated catches reuse that capacity. These owners
+survive destruction of the arena that supplied the context text.
+A handler reads through a borrowed view, without a copyable storage handle or
+generation token. Rust prevents a live view from surviving buffer reuse or
+owner destruction. Nested handlers keep the outer error available; leaving the
+inner handler restores the outer view. SQLSTATE/SQLERRM and requested stacked
+fields copy text before exposing it to local variables, so those copies survive
+later catches and owner destruction. Pool exhaustion returns `54000` naming
+`execution_control_bytes` and `execution_control_leases`; copying a field can
+separately exhaust its destination statement memory. Failed capture leaves the
+outer handler usable and does not enter the failed handler.
 Assignment rewriting keeps the original target and value dependencies: for
 example, `document[SQLERRM] := to_jsonb(SQLSTATE)` still sees both handler
 variables after lowering to the shared JSON setter.
@@ -670,22 +676,25 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves shared memory for procedural positions,
-resource directories, local-value slots, named-output bindings and saved output bytes.
+resource directories, local-value slots, named-output bindings, saved output bytes
+and caught-error directories and text.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
 two ranges for its position and resource directories, sized to its maximum
 lexical nesting, plus a range for nonempty local-value arrays. Set-returning
 functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
-local descriptions and value slots. Named parameters may own another value range
-during initialization; it is released afterward. Empty tables and cached plans
+local descriptions and value slots. Calls with exception handlers reserve one
+handler-directory range, sized to maximum simultaneous handler nesting. Named
+parameters may own another value range during initialization; it is released afterward. Empty tables and cached plans
 receive no private execution ranges. These metadata and slot ranges are admitted
 before initializers; partial admission returns ranges already reserved. Saved
-output buffers acquire a descriptor and grow as values are captured. A full pool
-returns `54000` naming both settings. An error while saving an output rolls back
-the command through the usual transaction rules. The byte limit
+output and caught-error buffers acquire a descriptor and grow as values are
+captured. A full pool returns `54000` naming both settings. An error while saving an output or catching
+a diagnostic follows the enclosing exception and transaction rules; an uncaught
+error rolls back the command. The byte limit
 must be a positive multiple of 64; startup accounting includes its backing and
 lease/free-range records. Both settings are explicit in configuration files.
-Active local-value payloads, source images and diagnostics retain separate
+Active local-value payloads and source images retain separate
 statement or foreground-work ownership; this pool alone does not resume a whole invocation.
 
 For example, a function with 128 declared locals and one named input stages one

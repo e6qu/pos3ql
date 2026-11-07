@@ -26861,7 +26861,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     statement: TriggerStatement<'a>,
     child_scope: PlpgsqlScope,
     status: &mut TriggerExecutionStatus<'a>,
-    exception: Option<&diagnostics::CaughtDiagnostic>,
+    exception: Option<diagnostics::CaughtDiagnostic<'_>>,
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     super::query::check_timeout()?;
     let (statement, input_plan) = {
@@ -28208,15 +28208,14 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             let exception = exception.expect("bare RAISE is parsed only in an exception handler");
             crate::sql::eval::stash_diagnostic(
                 exception.stack::<{ super::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>(
-                    context.arena,
                     diagnostics::Field::Detail,
                 )?,
-                exception.stack::<128>(context.arena, diagnostics::Field::Hint)?,
+                exception.stack::<128>(diagnostics::Field::Hint)?,
             );
             Err(SqlError {
                 sqlstate: exception.sqlstate,
                 message: exception
-                    .stack::<192>(context.arena, diagnostics::Field::Message)?
+                    .stack::<192>(diagnostics::Field::Message)?
                     .expect("caught error has a message"),
             })
         }),
@@ -28334,9 +28333,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     }
                 };
                 let value = Datum::Text(match field {
-                    Some(field) => exception
-                        .text(context.arena, field, context.arena)?
-                        .unwrap_or(""),
+                    Some(field) => exception.text(field, context.arena)?.unwrap_or(""),
                     None => "",
                 });
                 assign_trigger_local(context, locals, local_values, assignment.target, value)?;

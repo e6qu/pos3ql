@@ -69,7 +69,7 @@ enum EntryState<'a> {
         index: usize,
     },
     Protected(TriggerSubtransaction),
-    Handler(CaughtDiagnostic),
+    Handler,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +139,7 @@ enum Continuation {
         boundary: TriggerSubtransaction,
         releasing: bool,
     },
-    Handler(CaughtDiagnostic),
+    Handler,
 }
 
 /// The lexical maximum is reserved before local initializers can have effects.
@@ -176,7 +176,7 @@ impl<'a> ControlFrames<'a> {
             source: layout.source,
             slots,
             active: 0,
-            diagnostics: DiagnosticBuffers::new(arena, layout.handlers)?,
+            diagnostics: DiagnosticBuffers::new(pool, layout.handlers)?,
             resources,
             workspace: arena.identity(),
         })
@@ -254,9 +254,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 },
                 FrameResource::Empty,
             ),
-            EntryState::Handler(diagnostic) => {
-                (Continuation::Handler(diagnostic), FrameResource::Empty)
-            }
+            EntryState::Handler => (Continuation::Handler, FrameResource::Empty),
         };
         self.state.resources[self.state.active] = resource;
         self.state.slots[self.state.active] = Some(Frame {
@@ -324,7 +322,12 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         &'s mut self,
         locals: &'s [TriggerLocalDecl],
         values: &'s mut [Datum<'a>],
-    ) -> (&'s [TriggerLocalDecl], &'s mut [Datum<'a>]) {
+    ) -> (
+        &'s [TriggerLocalDecl],
+        &'s mut [Datum<'a>],
+        Option<CaughtDiagnostic<'s>>,
+    ) {
+        let diagnostic = self.state.diagnostics.current();
         for (frame, resource) in self.state.slots[..self.state.active]
             .iter()
             .zip(&mut self.state.resources[..self.state.active])
@@ -341,27 +344,32 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 return (
                     &workspace.locals[..scope.count],
                     &mut workspace.values[..scope.count],
+                    diagnostic,
                 );
             }
         }
-        (locals, values)
+        (locals, values, diagnostic)
     }
 
-    fn diagnostic(&self) -> Option<(CaughtDiagnostic, PlpgsqlScope)> {
-        self.state.slots[..self.state.active]
+    fn diagnostic(&self) -> Option<(CaughtDiagnostic<'_>, PlpgsqlScope)> {
+        let scope = self.state.slots[..self.state.active]
             .iter()
             .enumerate()
             .rev()
             .filter_map(|(depth, frame)| frame.as_ref().map(|frame| (depth, frame)))
             .find_map(|(depth, frame)| match frame.continuation {
-                Continuation::Handler(caught) => Some((caught, PlpgsqlScope::frame(depth + 1))),
+                Continuation::Handler => Some(PlpgsqlScope::frame(depth + 1)),
                 _ => None,
-            })
+            });
+        match (self.state.diagnostics.current(), scope) {
+            (None, None) => None,
+            (Some(diagnostic), Some(scope)) => Some((diagnostic, scope)),
+            _ => unreachable!("handler positions and diagnostic owners share scope order"),
+        }
     }
 
     fn finish(
         &mut self,
-        arena: &Arena,
         frame: Frame<FrameResource<'a>>,
         locals: &[TriggerLocalDecl],
         values: &mut [Datum<'a>],
@@ -373,7 +381,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 let FrameResource::Numeric { mut workspace } = frame.resource else {
                     unreachable!("numeric frame resource")
                 };
-                let (_, parent_values) = self.scope(locals, values);
+                let (_, parent_values, _) = self.scope(locals, values);
                 // A numeric child changes its own slots. The parent still owns
                 // the shadowed value when assignments are copied back.
                 if let Some(prior) = parent_values.get(scope.target).copied() {
@@ -387,7 +395,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 }
             }
             Continuation::Rows { .. } if success => status.set_found(true),
-            Continuation::Handler(diagnostic) => self.state.diagnostics.release(arena, diagnostic),
+            Continuation::Handler => self.state.diagnostics.release(),
             _ => {}
         }
     }
@@ -536,8 +544,6 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     let mut outcome = Ok(None);
     let mut pending_error = None;
     while frames.state.active != 0 {
-        let caught = frames.diagnostic();
-        let exception = caught.as_ref().map(|(diagnostic, _)| diagnostic);
         let action = (|| {
             if let Some(error) = pending_error.take() {
                 return Err(error);
@@ -550,10 +556,14 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                 .get(frames.last().next)
                 .copied()
             {
-                let invocation =
-                    bind_exception_variables(invocation, caught, statement, context.arena)?;
+                let invocation = bind_exception_variables(
+                    invocation,
+                    frames.diagnostic(),
+                    statement,
+                    context.arena,
+                )?;
                 let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
-                let (scope, scope_values) = frames.scope(locals, values);
+                let (scope, scope_values, exception) = frames.scope(locals, values);
                 return execute_trigger_step(
                     context,
                     definition,
@@ -584,11 +594,11 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     let condition = program.condition;
                     let invocation = bind_exception_variables(
                         invocation,
-                        caught,
+                        frames.diagnostic(),
                         TriggerStatement::While(program),
                         context.arena,
                     )?;
-                    let (scope, scope_values) = frames.scope(locals, values);
+                    let (scope, scope_values, _) = frames.scope(locals, values);
                     if trigger_condition(
                         context,
                         condition,
@@ -603,7 +613,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         frames.last_mut().next = 0;
                     } else {
                         let frame = frames.pop();
-                        frames.finish(context.arena, frame, locals, values, status, true);
+                        frames.finish(frame, locals, values, status, true);
                     }
                 }
                 Continuation::Numeric(ref range) => {
@@ -634,7 +644,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         workspace.values[target] = Datum::Int4(next);
                     } else {
                         let frame = frames.pop();
-                        frames.finish(context.arena, frame, locals, values, status, true);
+                        frames.finish(frame, locals, values, status, true);
                     }
                 }
                 Continuation::Rows { target, index } => {
@@ -645,7 +655,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     };
                     if index + 1 < rows.len() {
                         let value = rows.value(index + 1, context.arena)?;
-                        let (scope, scope_values) = frames.scope(locals, values);
+                        let (scope, scope_values, _) = frames.scope(locals, values);
                         assign_trigger_local(context, scope, scope_values, target, value)?;
                         let frame = frames.last_mut();
                         let Continuation::Rows { index, .. } = &mut frame.continuation else {
@@ -655,7 +665,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         frame.next = 0;
                     } else {
                         let frame = frames.pop();
-                        frames.finish(context.arena, frame, locals, values, status, true);
+                        frames.finish(frame, locals, values, status, true);
                     }
                 }
                 Continuation::Protected { .. } => {
@@ -670,11 +680,11 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     *releasing = true;
                     release_trigger_subtransaction(context, boundary)?;
                     let frame = frames.pop();
-                    frames.finish(context.arena, frame, locals, values, status, true);
+                    frames.finish(frame, locals, values, status, true);
                 }
-                Continuation::Once | Continuation::Handler(_) => {
+                Continuation::Once | Continuation::Handler => {
                     let frame = frames.pop();
-                    frames.finish(context.arena, frame, locals, values, status, true);
+                    frames.finish(frame, locals, values, status, true);
                 }
             }
             Ok(None)
@@ -696,7 +706,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                             }
                             TriggerFlow::Exit(0) => {
                                 let frame = frames.pop();
-                                frames.finish(context.arena, frame, locals, values, status, true);
+                                frames.finish(frame, locals, values, status, true);
                                 break;
                             }
                             TriggerFlow::Continue(depth) => flow = TriggerFlow::Continue(depth - 1),
@@ -717,7 +727,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                         }
                     }
                     let frame = frames.pop();
-                    frames.finish(context.arena, frame, locals, values, status, true);
+                    frames.finish(frame, locals, values, status, true);
                     if frames.state.active == 0 {
                         outcome = Ok(Some(flow));
                     }
@@ -748,7 +758,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                             Err(rollback_error) => error = rollback_error,
                         }
                     }
-                    frames.finish(context.arena, frame, locals, values, status, false);
+                    frames.finish(frame, locals, values, status, false);
                     if handler.is_some() {
                         break;
                     }
@@ -758,8 +768,8 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
                     break;
                 };
                 match catch_diagnostic(context, invocation, &error, &mut frames.state.diagnostics) {
-                    Ok(caught) => frames.push(
-                        FrameEntry::new(handler.block, EntryState::Handler(caught)),
+                    Ok(()) => frames.push(
+                        FrameEntry::new(handler.block, EntryState::Handler),
                         FrameSource::Handler,
                     ),
                     Err(error) => pending_error = Some(error),
@@ -771,7 +781,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
     // rewind statement memory. Transaction rollback remains the caller's job.
     while frames.state.active != 0 {
         let frame = frames.pop();
-        frames.finish(context.arena, frame, locals, values, status, false);
+        frames.finish(frame, locals, values, status, false);
     }
     status.control_frames = Some(retained);
     outcome
@@ -781,7 +791,7 @@ pub(super) fn execute_trigger_block<'a, Definition0: crate::storage::DefinitionB
 // sites that can resolve the handler variables need independent copies.
 fn bind_exception_variables<'a>(
     invocation: TriggerInvocation<'a>,
-    diagnostic: Option<(CaughtDiagnostic, PlpgsqlScope)>,
+    diagnostic: Option<(CaughtDiagnostic<'_>, PlpgsqlScope)>,
     statement: TriggerStatement<'a>,
     arena: &'a Arena,
 ) -> Result<TriggerInvocation<'a>, SqlError> {
@@ -872,7 +882,7 @@ fn bind_exception_variables<'a>(
         ) => false,
     };
     if needed {
-        Ok(invocation.with_exception(diagnostic.variables(arena, arena)?, scope))
+        Ok(invocation.with_exception(diagnostic.variables(arena)?, scope))
     } else {
         Ok(invocation)
     }
@@ -883,7 +893,7 @@ fn catch_diagnostic(
     invocation: TriggerInvocation<'_>,
     error: &SqlError,
     buffers: &mut DiagnosticBuffers,
-) -> Result<CaughtDiagnostic, SqlError> {
+) -> Result<(), SqlError> {
     if error.sqlstate == sqlstate::QUERY_CANCELED {
         context
             .txn
@@ -891,12 +901,7 @@ fn catch_diagnostic(
         super::super::sequence::record_caught_cancellation(context.seq_session());
     }
     let diagnostic = crate::sql::eval::take_diagnostic();
-    buffers.capture(
-        context.arena,
-        error,
-        diagnostic.as_ref(),
-        invocation.context().as_str(),
-    )
+    buffers.capture(error, diagnostic.as_ref(), invocation.context().as_str())
 }
 
 #[cfg(test)]

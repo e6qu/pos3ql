@@ -403,6 +403,145 @@ fn lowered_assignments_bind_handler_variables_in_values_and_subscripts() {
 }
 
 #[test]
+fn diagnostic_directory_admission_precedes_initializers_and_releases_failed_calls() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("diagnostic-directory-admission-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 4096;
+        config.execution_control_leases = 3;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE diagnostic_initializer_calls",
+            true,
+        );
+        session.success(&mut engine, "CREATE FUNCTION denied_diagnostic() RETURNS integer LANGUAGE plpgsql AS $$DECLARE v integer := nextval('diagnostic_initializer_calls'); BEGIN RETURN v; EXCEPTION WHEN OTHERS THEN RETURN -1; END$$", true);
+        session.success(&mut engine, "CREATE FUNCTION admitted_diagnostic_control() RETURNS integer LANGUAGE plpgsql AS $$BEGIN RETURN 7; END$$", true);
+        for _ in 0..2 {
+            let error = session.execute(&mut engine, "SELECT denied_diagnostic()", true);
+            assert_eq!(error_sqlstates(&error), ["54000"], "{mode:?}");
+            assert!(String::from_utf8_lossy(&error).contains("PL/pgSQL diagnostics"));
+            assert!(String::from_utf8_lossy(&error).contains("execution_control_leases"));
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT admitted_diagnostic_control()",
+                    true
+                )),
+                ["7"]
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('diagnostic_initializer_calls')",
+                true
+            )),
+            ["1"]
+        );
+    }
+}
+
+#[test]
+fn diagnostic_payload_exhaustion_rolls_back_without_entering_the_handler_and_reuses_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("diagnostic-payload-admission-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 4096;
+        config.execution_control_leases = 16;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(
+            &mut engine,
+            "CREATE SEQUENCE diagnostic_handler_calls",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "CREATE TABLE diagnostic_payload_audit(id integer)",
+            true,
+        );
+        session.success(&mut engine, "CREATE FUNCTION diagnostic_payload(p text) RETURNS text LANGUAGE plpgsql AS $$DECLARE detail text; BEGIN INSERT INTO diagnostic_payload_audit VALUES (1); BEGIN RAISE EXCEPTION 'caught' USING DETAIL = p; EXCEPTION WHEN OTHERS THEN PERFORM nextval('diagnostic_handler_calls'); GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL; RETURN SQLERRM || ':' || detail; END; END$$", true);
+        for expected in 1..=2 {
+            let error = session.execute(
+                &mut engine,
+                "SELECT diagnostic_payload(repeat('x',8192))",
+                true,
+            );
+            assert_eq!(error_sqlstates(&error), ["54000"], "{mode:?}");
+            assert!(String::from_utf8_lossy(&error).contains("PL/pgSQL diagnostics"));
+            assert!(String::from_utf8_lossy(&error).contains("execution_control_bytes"));
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT count(*) FROM diagnostic_payload_audit",
+                    true
+                )),
+                [(expected - 1).to_string()],
+                "{mode:?}"
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, "SELECT diagnostic_payload('ok')", true)),
+                ["caught:ok"],
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT count(*) FROM diagnostic_payload_audit",
+                true
+            )),
+            ["2"]
+        );
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT nextval('diagnostic_handler_calls')",
+                true
+            )),
+            ["3"],
+            "{mode:?}: a failed capture must not enter its handler"
+        );
+    }
+}
+
+#[test]
+fn nested_diagnostic_calls_return_capacity_and_keep_each_call_effect_once() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-diagnostic-calls-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 32768;
+        config.execution_control_leases = 32;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/262_nested_diagnostic_calls.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["outer 512:inner:8192", "512|131328|1|512", "513"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn caught_diagnostics_reuse_storage_and_preserve_saved_and_nested_values() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

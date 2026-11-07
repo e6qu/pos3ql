@@ -105,7 +105,12 @@ are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
 reads and assignments use the innermost binding, while returning outputs uses
 the original output slots. Preserve quoted names and reject constant assignment
 and FETCH targets before effects. Keep named constant cursors readable at OPEN.
-Saved diagnostics must survive later catches, nesting and rethrow. Preserve
+Caught-error directories and bytes now have control-pool owners. Preserve
+borrowed handler views, saved fields after source/owner destruction, nesting,
+rethrow, admission before initializers, and rollback/reuse after failed capture.
+Nested calls must release diagnostic capacity after each call and keep audit
+writes and sequence effects once; qualify the same SQL in both transaction modes
+and against PostgreSQL. Preserve
 handler variables in rewritten local and NEW-row assignments, including JSON
 subscripts. Keep trigger context types and undefined-name errors compatible.
 
@@ -141,8 +146,10 @@ row payloads. Preserve shared-pool admission before initializer effects and
 return position, resource, local-value, numeric-scope and output-binding capacity
 on failure or owner drop, independently of table count. Keep resource pairing in
 one owner and save only live parameter slots. Preserve unchanged parent counter
-slots when copying a completed numeric scope back. Keep saved output bytes
-in their own reusable control-pool ranges, separate from binding metadata.
+slots when copying a completed numeric scope back. Keep saved output and
+caught-error bytes in their own reusable control-pool ranges, separate from
+binding and handler metadata. Release handler capacity with its invocation;
+repeated catches must reuse buffers, not accumulate abandoned arena allocations.
 Keep file, generated and embedded test configurations explicit and complete;
 capacity regressions must reach their intended limit rather than an earlier
 missing-setting error.

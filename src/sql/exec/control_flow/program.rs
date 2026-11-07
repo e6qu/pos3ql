@@ -2,66 +2,70 @@
 
 use super::super::numeric_loops::{self, BlockEdge};
 use super::*;
-use crate::mem::arena::FrozenArenaSliceHandle;
+use crate::mem::lease_pool::SharedSlice;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub(in crate::sql::exec) struct ProgramSource {
-    bytes: FrozenArenaSliceHandle<u8>,
+    bytes: SharedSlice<u8>,
     kind: PlpgsqlProgramKind,
 }
+
+impl PartialEq for ProgramSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && SharedSlice::ptr_eq(&self.bytes, &other.bytes)
+    }
+}
+impl Eq for ProgramSource {}
 
 impl ProgramSource {
     pub(in crate::sql::exec) fn capture(
         text: &str,
         kind: PlpgsqlProgramKind,
-        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let bytes = text.as_bytes();
-        let handle = arena
-            .retain_slice_with(bytes.len(), |index| bytes[index])
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "PL/pgSQL source image exceeds statement memory"
-                )
-            })?;
+        let mut bytes = pool.lease(text.len()).map_err(source_full)?;
+        for chunk in text.as_bytes().chunks(4096) {
+            super::super::super::query::check_timeout()?;
+            bytes.extend_from_slice(chunk).map_err(source_full)?;
+        }
         Ok(Self {
-            bytes: arena.freeze_retained_slice(handle).map_err(|_| changed())?,
+            bytes: bytes.freeze(),
             kind,
         })
     }
 
-    fn text(self, arena: &Arena) -> Result<&str, SqlError> {
-        let bytes = arena.retained_slice(self.bytes).map_err(|_| changed())?;
-        core::str::from_utf8(bytes).map_err(|_| changed())
-    }
-
-    pub(super) fn require(self, arena: &Arena) -> Result<(), SqlError> {
-        arena
-            .retained_slice(self.bytes)
-            .map(|_| ())
-            .map_err(|_| changed())
-    }
-
     pub(in crate::sql::exec) fn parse<'a>(
-        self,
-        source: &'a Arena,
+        &self,
         parsing: &'a Arena,
     ) -> Result<(ParsedTriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
-        let program = parse_plpgsql_program(self.text(source)?, parsing, self.kind)?;
-        let code = CompiledProgram::new(self, program.body, parsing)?;
+        let text = core::str::from_utf8(&self.bytes).expect("program sources copy UTF-8 text");
+        let text = parsing.alloc_str(text).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL source parsing exceeds statement memory"
+            )
+        })?;
+        let program = parse_plpgsql_program(text, parsing, self.kind)?;
+        let code = CompiledProgram::new(self.clone(), program.body, parsing)?;
         Ok((program, code))
     }
 }
 
-#[derive(Clone, Copy)]
+fn source_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "PL/pgSQL source image: {}",
+        error
+    )
+}
+
+#[derive(Clone)]
 pub(in crate::sql::exec) struct ProgramLayout {
     pub(super) source: ProgramSource,
     pub(super) depth: usize,
     pub(super) handlers: usize,
 }
 
-#[derive(Clone, Copy)]
 pub(in crate::sql::exec) struct CompiledProgram<'a> {
     blocks: &'a [TriggerBlock<'a>],
     layout: ProgramLayout,
@@ -109,11 +113,11 @@ impl<'a> CompiledProgram<'a> {
     }
 
     pub(in crate::sql::exec) fn layout(&self) -> ProgramLayout {
-        self.layout
+        self.layout.clone()
     }
 
-    pub(in crate::sql::exec) fn source(&self) -> ProgramSource {
-        self.layout.source
+    pub(in crate::sql::exec) fn source(&self) -> &ProgramSource {
+        &self.layout.source
     }
 
     pub(in crate::sql::exec) fn root(&self) -> TriggerBlock<'a> {
@@ -137,6 +141,6 @@ impl<'a> CompiledProgram<'a> {
 pub(super) fn changed() -> SqlError {
     sql_err!(
         sqlstate::SERIALIZATION_FAILURE,
-        "procedural execution source was reset or replaced"
+        "procedural execution source or workspace was replaced"
     )
 }

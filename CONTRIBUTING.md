@@ -202,8 +202,10 @@ directories and live scopes whose directory has dropped. Preserve local-value
 owners across moves and failed admission, and release parameter staging after
 initialization. Frame positions and resources must have one owner, without an
 address-based pairing check. Prove numeric layout scratch can be dropped while
-its owned scopes remain usable. Bind the original source arena explicitly when
-rebuilding syntax in a separate execution workspace. Keep deadline ownership proofs
+its owned scopes remain usable. Bind the immutable source owner and the original
+execution workspace explicitly when rebuilding syntax in separate parsing memory.
+Reject a replacement image even if its text is identical; preserve workspace
+identity checks while active local values borrow its memory. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
 Saved output bytes must survive dropping their source arena and external pool
 owner. Decoded copies must survive buffer growth, replacement and owner drop.
@@ -231,7 +233,11 @@ PostgreSQL fixture for 512 nested diagnostic calls: every call must preserve its
 outer detail, return buffer capacity, and issue one audit row and sequence value.
 Test indexed execution positions after releasing their original parsing
 storage. Resumption must retain the selected source, definitions and types;
-reparsing a replacement definition must not redirect unfinished work.
+reparsing a replacement definition must not redirect unfinished work. Capture
+source bytes before initializers; test byte/descriptor and parse-memory failures,
+capacity recovery, source/input/arena destruction and shared-owner drop. Compare
+a function replacing its own definition with PostgreSQL: the current call returns
+the original result and the next call uses the replacement.
 Coverage library partitions stream compiler output and each test's progress
 through the native allocation-error reporter. Use those timestamps to locate
 deadline overruns; buffered output must not hide the last running test.

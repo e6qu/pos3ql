@@ -3967,8 +3967,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         allocate_plpgsql_local_values(&context.storage().execution_control, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         program.locals,
         0,
         &context.storage().execution_control,
@@ -3996,7 +3995,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         transition_relations,
         program.locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         Some(TriggerFlow::Return(result)) => match result {
@@ -17978,13 +17977,12 @@ struct TriggerExecutionStatus<'a> {
 impl<'a> TriggerExecutionStatus<'a> {
     fn new(
         arena: &Arena,
-        source: &Arena,
-        program: CompiledProgram<'_>,
+        program: &CompiledProgram<'_>,
         locals: &[TriggerLocalDecl],
         output_count: usize,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
-        let control_frames = ControlFrames::new(arena, program.layout(), source, pool)?;
+        let control_frames = ControlFrames::new(arena, program.layout(), pool)?;
         let mut outputs = pool
             .lease(output_count)
             .map_err(control_flow::execution_full)?;
@@ -18478,6 +18476,10 @@ fn unsupported_trigger_body() -> SqlError {
     )
 }
 
+fn incomplete_trigger_body() -> SqlError {
+    sql_err!(sqlstate::SYNTAX_ERROR, "syntax error at end of input")
+}
+
 fn strip_trigger_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     let prefix = text.get(..keyword.len())?;
     if prefix.eq_ignore_ascii_case(keyword)
@@ -18590,37 +18592,43 @@ fn split_trigger_statements<'a>(
     body: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [&'a str], SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
     let mut statements = ProgramList::new(arena);
     let mut start = 0;
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in body.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ';' if depth == 0 => {
-                let statement = body[start..offset].trim();
-                if !statement.is_empty() {
-                    append_trigger_control(statement, &mut statements)?;
+    while start < body.len() {
+        let remaining = &body[start..];
+        // Only offsets leave scratch. Unescaped strings and folded identifiers
+        // are discarded before allocating the retained statement directory.
+        let (boundary, consumed) = arena
+            .with_remaining_region(|scratch| {
+                let mut lexer = Lexer::new(remaining, scratch);
+                let mut depth = 0usize;
+                loop {
+                    let token = lexer
+                        .next_token()
+                        .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                    match token {
+                        Tok::Op("(") => depth += 1,
+                        Tok::Op(")") if depth > 0 => depth -= 1,
+                        Tok::Op(";") if depth == 0 => {
+                            return Ok((lexer.token_start(), lexer.token_end()));
+                        }
+                        Tok::Eof => {
+                            if depth != 0 {
+                                return Err(incomplete_trigger_body());
+                            }
+                            return Ok((remaining.len(), remaining.len()));
+                        }
+                        _ => {}
+                    }
                 }
-                start = offset + 1;
-            }
-            _ => {}
+            })
+            .map_err(|_| super::query::arena_full_pub())??;
+        let statement = remaining[..boundary].trim();
+        if !statement.is_empty() {
+            append_trigger_control(statement, &mut statements)?;
         }
-    }
-    if quote.is_some() || depth != 0 {
-        return Err(unsupported_trigger_body());
-    }
-    let statement = body[start..].trim();
-    if !statement.is_empty() {
-        append_trigger_control(statement, &mut statements)?;
+        start += consumed;
     }
     Ok(statements.as_slice())
 }
@@ -20388,7 +20396,7 @@ fn parse_trigger_exception_handlers<'a>(
 ) -> Result<TriggerException<'a>, SqlError> {
     let mut handlers = ProgramList::new(arena);
     let Some(&header) = segments.get(*at) else {
-        return Err(unsupported_trigger_body());
+        return Err(incomplete_trigger_body());
     };
     let Some(conditions) = strip_trigger_keyword(header, "when") else {
         return Err(unsupported_trigger_body());
@@ -20582,7 +20590,7 @@ fn parse_trigger_block<'a>(
                 .transpose()?;
             let mut branches = ProgramList::new(arena);
             let Some(&first) = segments.get(*at) else {
-                return Err(unsupported_trigger_body());
+                return Err(incomplete_trigger_body());
             };
             let Some(first) = strip_trigger_keyword(first, "when") else {
                 return Err(unsupported_trigger_body());
@@ -20754,7 +20762,7 @@ fn parse_trigger_block<'a>(
         saw_return = matches!(statement, TriggerStatement::Return(_));
         statements.push(statement)?;
     }
-    Err(unsupported_trigger_body())
+    Err(incomplete_trigger_body())
 }
 
 fn parse_plpgsql_expression<'a>(
@@ -20956,8 +20964,8 @@ fn compile_plpgsql_execution<'a>(
     arena: &'a Arena,
     has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
-    let source = ProgramSource::capture(source, kind, arena)?;
-    let (parsed, code) = source.parse(arena, arena)?;
+    let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
+    let (parsed, code) = source.parse(arena)?;
     let program = resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)?;
     Ok((program, code))
 }
@@ -21325,8 +21333,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         allocate_plpgsql_local_values(&context.storage().execution_control, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         program.locals,
         0,
         &context.storage().execution_control,
@@ -21355,7 +21362,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         None,
         program.locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
@@ -21417,8 +21424,7 @@ pub(crate) fn execute_event_trigger<'a>(
         allocate_plpgsql_local_values(&context.storage().execution_control, program.locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         program.locals,
         0,
         &context.storage().execution_control,
@@ -21447,7 +21453,7 @@ pub(crate) fn execute_event_trigger<'a>(
         None,
         program.locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
@@ -21582,8 +21588,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         allocate_plpgsql_local_values(&context.storage().execution_control, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         locals,
         0,
         &context.storage().execution_control,
@@ -21613,7 +21618,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         None,
         locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => {}
@@ -21766,8 +21771,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         allocate_plpgsql_local_values(&context.storage().execution_control, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         locals,
         0,
         &context.storage().execution_control,
@@ -21797,7 +21801,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None,
         locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
@@ -21949,8 +21953,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         allocate_plpgsql_local_values(&context.storage().execution_control, locals.len())?;
     let mut status = TriggerExecutionStatus::new(
         context.arena,
-        context.arena,
-        code,
+        &code,
         locals,
         output_columns.len(),
         &context.storage().execution_control,
@@ -22004,7 +22007,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         None,
         locals,
         &mut local_values,
-        code,
+        &code,
         &mut status,
     )? {
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => status
@@ -22084,6 +22087,32 @@ mod trigger_program_tests {
                 "END",
             ]
         );
+    }
+
+    #[test]
+    fn procedural_statement_boundaries_use_sql_quoting_and_discard_scan_scratch() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "quoted procedural boundaries", 1 << 12).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let segments = split_trigger_statements(
+                r#"EXECUTE $body$SELECT ';', 'then', 'loop'$body$; PERFORM E'it\'s; intact'; PERFORM 1 /* ; /* ; */ ; */; PERFORM 2 -- ;
+; RETURN NEW; END"#,
+                &arena,
+            )
+            .unwrap();
+            assert_eq!(
+                segments,
+                [
+                    "EXECUTE $body$SELECT ';', 'then', 'loop'$body$",
+                    r"PERFORM E'it\'s; intact'",
+                    "PERFORM 1 /* ; /* ; */ ; */",
+                    "PERFORM 2 -- ;",
+                    "RETURN NEW",
+                    "END",
+                ]
+            );
+            assert!(arena.used() < 1024);
+        });
     }
 
     #[test]
@@ -30155,8 +30184,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         )?;
         let mut status = TriggerExecutionStatus::new(
             context.arena,
-            context.arena,
-            code,
+            &code,
             program.locals,
             0,
             &context.storage().execution_control,
@@ -30184,7 +30212,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             transition_relations,
             program.locals,
             &mut local_values,
-            code,
+            &code,
             &mut status,
         )? {
             Some(TriggerFlow::Return(_)) => {}

@@ -32,11 +32,12 @@ reserved memory must remain unchanged.
   free bytes look sufficient; diagnostics name the requested extent, free bytes,
   largest contiguous extent and available descriptors.
 - Procedural positions, resource directories, value-slot arrays, numeric-scope
-  metadata, output bindings, saved output bytes, and caught-error directories
+  metadata, source images, output bindings, saved output bytes, and caught error directories
   and text share `execution_control_bytes`, bounded by
   `execution_control_leases`. A call admits its actual local count and maximum
   lexical nesting before initializers can have effects. Position and resource
-  directories have one owner. Numeric scopes own their descriptions and value
+  directories have one owner. Compiled syntax and positions share the source
+  image; its bytes are charged once, before local initializers. Numeric scopes own their descriptions and value
   arrays; named-parameter staging is released after initialization. Dropping
   owners returns their ranges, including after failed admission. An active
   scope retains both buffers if its directory drops.

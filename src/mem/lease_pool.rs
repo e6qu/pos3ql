@@ -674,7 +674,6 @@ impl<T> SharedSlice<T> {
         };
         unsafe { core::slice::from_raw_parts(pointer, self.len) }
     }
-    #[cfg(test)]
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
         match (&left.pool, left.reservation, &right.pool, right.reservation) {
             (None, None, None, None) => true,

@@ -15,6 +15,9 @@ DECLARE result record; command text;
 BEGIN
     FOREACH command IN ARRAY ARRAY[
         'SELECT * FROM record_source',
+        'SELECT id,label FROM record_source',
+        'SELECT t.id,t.label FROM record_source t',
+        'SELECT public.record_source.id,public.record_source.label FROM public.record_source',
         'SELECT t.* FROM record_source t',
         'SELECT (t).* FROM record_source t',
         'SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,''seven''::record_label)).* FROM record_source) q',

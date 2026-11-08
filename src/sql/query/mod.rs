@@ -11234,7 +11234,17 @@ pub fn describe_scope_items<'q>(
                 let (mut oid, mut typlen) = match user_type {
                     Some(description) => (description.type_oid, description.typlen),
                     None => {
-                        let (oid, typlen) = super::exec::infer_type_res(expression, &resolver)?;
+                        let (inferred_oid, typlen) =
+                            super::exec::infer_type_res(expression, &resolver)?;
+                        // Physical column types describe evaluation storage;
+                        // SQL output keeps the declared identity until the
+                        // protocol converts it to its wire representation.
+                        let oid = match expression {
+                            Expr::Column { .. } | Expr::SchemaColumn { .. } => {
+                                super::exec::infer_routine_argument_oid(expression, &resolver)?
+                            }
+                            _ => inferred_oid,
+                        };
                         if oid == super::types::oid::UNKNOWN {
                             (super::types::oid::TEXT, -1)
                         } else {

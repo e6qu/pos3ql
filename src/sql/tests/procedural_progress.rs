@@ -1836,6 +1836,9 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
         session.success(&mut engine, setup, true);
         for query in [
             "SELECT * FROM record_source",
+            "SELECT id,label FROM record_source",
+            "SELECT t.id,t.label FROM record_source t",
+            "SELECT public.record_source.id,public.record_source.label FROM public.record_source",
             "SELECT t.* FROM record_source t",
             "SELECT (t).* FROM record_source t",
             "SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,'seven'::record_label)).* FROM record_source) q",
@@ -1861,7 +1864,8 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
                  IF pg_typeof(result.id)<>'record_positive'::regtype \
                  OR pg_typeof(result.label)<>'record_label'::regtype \
                  OR result.id<>7 OR result.label<>'seven' THEN \
-                 RAISE EXCEPTION 'declared record type or value changed'; END IF; END$$",
+                 RAISE EXCEPTION 'declared record changed: types %, %, values %, %', \
+                 pg_typeof(result.id),pg_typeof(result.label),result.id,result.label; END IF; END$$",
                 query.replace('\'', "''")
             );
             session.success(&mut engine, &procedural, true);

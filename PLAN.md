@@ -93,7 +93,8 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   ordinary SQL error. Preserve remote savepoint boundaries when a foreign
   connection first opens inside nested procedural work.
   Query descriptions retain domain identities through casts, record expansion,
-  field selection and array subscripting. Saved procedural queries expose
+  named columns, field selection and array subscripting, including columns
+  selected from derived tables. Saved procedural queries expose
   ordinary record fields as well as trigger records, including NULL fields.
   Comparisons between two text-domain fields must also keep their collation.
   Preserve whole-row aliases such as `(t).*` in procedural query planning.

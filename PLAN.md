@@ -128,7 +128,8 @@ Preserve the existing SQL-boundary checks: initialization and conversion happen
 once, declared domains validate initial NULL, invalid declarations fail before
 installation, and parameters, locals, loop counters and outputs keep their own
 bindings. Source images retain original text and program kind; replacement
-images fail with `40001`. SQL quoting controls statement boundaries, incomplete
+images fail with `40001`. SQL quoting controls statement, clause and argument
+boundaries; incomplete
 bodies return `42601`, and lexer exhaustion returns `54000` without losing real
 syntax errors. Error handlers preserve original diagnostics through nested work
 and reuse their reserved buffers. Transition tables keep declared types for

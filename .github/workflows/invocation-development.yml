@@ -141,11 +141,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/271_trigger_setting_scope.sql" fixture-271.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/272_write_completion.sql" fixture-272.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/273_dynamic_write_completion.sql" fixture-273.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/274_procedural_lexical_boundaries.sql" fixture-274.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267 268 269 270 271 272 273; do
+          for fixture in 265 266 267 268 269 270 271 272 273 274; do
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
               < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
@@ -162,6 +163,7 @@ jobs:
               (271, '10|5|t|t|t|t|t|outer|hex|warning|t'),
               (272, '16|8|6|2|t|3|17'),
               (273, '1|1|1|1|1|1|1|16385|1|1|t|integer'),
+              (274, 'ok|branch|20|INTO, USING, THEN, LOOP|first,second|x|1'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()

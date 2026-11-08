@@ -282,6 +282,11 @@ local defaults once in declaration order. For example, a later local can use
 an earlier constant initialized by `nextval`, and a loop counter must restore
 the initialized local that it shadows.
 Procedural declarations and target names cross the SQL lexer before lookup.
+Clause, control, assignment, range and argument boundaries use that lexer too.
+For example, `INTO` in `EXECUTE $sql$INSERT INTO orders VALUES(1)$sql$` belongs
+to the command string. Commas inside strings, array subscripts or comments do
+not introduce `USING` arguments. Lexical errors retain their SQL error codes;
+temporary token text is released before statement directories are allocated.
 Unquoted `MixedCase` becomes `mixedcase`; quoted `"MixedCase"` remains distinct.
 Local variables, record fields and built-in handler/status/context names compare
 those normalized names exactly, so `SQLERRM` and `"SQLERRM"` are different.

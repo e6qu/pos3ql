@@ -1588,6 +1588,33 @@ fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings(
 }
 
 #[test]
+fn procedural_source_boundaries_follow_sql_quoting_comments_and_subscripts() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-lexical-boundaries-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!(
+            "../../../tests/external/differential/274_procedural_lexical_boundaries.sql"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["ok|branch|20|INTO, USING, THEN, LOOP|first,second|x|1"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

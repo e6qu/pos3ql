@@ -18504,86 +18504,64 @@ fn trigger_label_prefix(statement: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((name, label[end + 2..].trim_start()))
 }
 
-fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
+fn trigger_control_header<'a>(
+    statement: &'a str,
+    arena: &Arena,
+) -> Result<Option<(&'a str, &'a str)>, SqlError> {
     let statement = statement.trim();
     let content = trigger_label_prefix(statement)
         .map(|(_, content)| content)
         .unwrap_or(statement);
     let content_offset = statement.len() - content.len();
     if strip_trigger_keyword(content, "case").is_some() {
-        let when_at = trigger_top_level_keyword(content, "when")?;
-        let header = statement[..content_offset + when_at].trim_end();
-        let rest = content[when_at..].trim_start();
-        return (!rest.is_empty()).then_some((header, rest));
+        let Some(when_at) = trigger_top_level_keyword(content, "when", arena)? else {
+            return Ok(None);
+        };
+        return Ok(Some((
+            statement[..content_offset + when_at].trim_end(),
+            content[when_at..].trim_start(),
+        )));
     }
-    let (prefix, terminator) = if strip_trigger_keyword(content, "if").is_some() {
-        ("if", "then")
-    } else if strip_trigger_keyword(content, "elsif").is_some() {
-        ("elsif", "then")
-    } else if strip_trigger_keyword(content, "when").is_some() {
-        ("when", "then")
-    } else if strip_trigger_keyword(content, "for").is_some() {
-        ("for", "loop")
-    } else if strip_trigger_keyword(content, "foreach").is_some() {
-        ("foreach", "loop")
-    } else if strip_trigger_keyword(content, "while").is_some() {
-        ("while", "loop")
-    } else if let Some(rest) = strip_trigger_keyword(content, "loop") {
-        let rest = rest.trim();
-        return (!rest.is_empty()).then_some((statement[..content_offset + 4].trim_end(), rest));
-    } else if strip_trigger_keyword(content, "else").is_some() {
-        let rest = strip_trigger_keyword(content, "else")?.trim();
-        return (!rest.is_empty()).then_some(("ELSE", rest));
-    } else if strip_trigger_keyword(content, "begin").is_some() {
-        let rest = strip_trigger_keyword(content, "begin")?.trim();
-        return (!rest.is_empty()).then_some(("BEGIN", rest));
-    } else if strip_trigger_keyword(content, "exception").is_some() {
-        let rest = strip_trigger_keyword(content, "exception")?.trim();
-        return (!rest.is_empty()).then_some(("EXCEPTION", rest));
-    } else {
-        return None;
+    for keyword in ["loop", "else", "begin", "exception"] {
+        if let Some(rest) = strip_trigger_keyword(content, keyword) {
+            let rest = rest.trim();
+            return Ok((!rest.is_empty())
+                .then_some((statement[..content_offset + keyword.len()].trim_end(), rest)));
+        }
+    }
+    let control = [
+        ("if", "then"),
+        ("elsif", "then"),
+        ("when", "then"),
+        ("for", "loop"),
+        ("foreach", "loop"),
+        ("while", "loop"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| strip_trigger_keyword(content, prefix).is_some());
+    let Some((prefix, terminator)) = control else {
+        return Ok(None);
     };
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in content.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            _ if depth == 0
-                && content
-                    .get(offset..offset + terminator.len())
-                    .is_some_and(|word| word.eq_ignore_ascii_case(terminator)) =>
-            {
-                let before = content[..offset].chars().next_back();
-                let after = content[offset + terminator.len()..].chars().next();
-                if before.is_some_and(|character| character.is_ascii_whitespace())
-                    && after.is_some_and(|character| character.is_ascii_whitespace())
-                    && content[..offset].trim_start().len() > prefix.len()
-                {
-                    let header = statement[..content_offset + offset + terminator.len()].trim_end();
-                    let rest = content[offset + terminator.len()..].trim();
-                    return (!rest.is_empty()).then_some((header, rest));
-                }
-            }
-            _ => {}
-        }
+    let Some(at) = trigger_top_level_keyword(content, terminator, arena)? else {
+        return Ok(None);
+    };
+    if content[..at].trim().len() <= prefix.len() {
+        return Ok(None);
     }
-    None
+    let rest = content[at + terminator.len()..].trim();
+    Ok((!rest.is_empty()).then_some((
+        statement[..content_offset + at + terminator.len()].trim_end(),
+        rest,
+    )))
 }
 
 fn append_trigger_control<'a>(
     statement: &'a str,
     statements: &mut ProgramList<'a, &'a str>,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let mut remaining = statement;
-    while let Some((header, rest)) = trigger_control_header(remaining) {
+    while let Some((header, rest)) = trigger_control_header(remaining, arena)? {
         statements.push(header)?;
         remaining = rest;
     }
@@ -18628,7 +18606,7 @@ fn split_trigger_statements<'a>(
             .map_err(|_| super::query::arena_full_pub())??;
         let statement = remaining[..boundary].trim();
         if !statement.is_empty() {
-            append_trigger_control(statement, &mut statements)?;
+            append_trigger_control(statement, &mut statements, arena)?;
         }
         start += consumed;
     }
@@ -18637,33 +18615,25 @@ fn split_trigger_statements<'a>(
 
 /// Locate the PL/pgSQL assignment operator outside strings and subscripts.
 /// SQL/control statements are dispatched before this target parser.
-fn trigger_assignment_operator(statement: &str) -> Option<(usize, usize)> {
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in statement.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' | '[' => depth += 1,
-            ')' | ']' if depth > 0 => depth -= 1,
-            ':' if depth == 0 && statement[offset..].starts_with(":=") => return Some((offset, 2)),
-            '=' if depth == 0 => return Some((offset, 1)),
-            _ => {}
-        }
-    }
-    None
+fn trigger_assignment_operator(
+    statement: &str,
+    arena: &Arena,
+) -> Result<Option<(usize, usize)>, SqlError> {
+    scan_trigger_top_level(statement, arena, |token, start, _| {
+        use crate::sql::lexer::Tok;
+        Ok(match token {
+            Tok::Op(":") if statement[start..].starts_with(":=") => Some((start, 2)),
+            Tok::Op("=") => Some((start, 1)),
+            _ => None,
+        })
+    })
 }
 
 fn parse_trigger_assignment<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<Option<TriggerAssignment<'a>>, SqlError> {
-    let Some((offset, width)) = trigger_assignment_operator(statement) else {
+    let Some((offset, width)) = trigger_assignment_operator(statement, arena)? else {
         return Ok(None);
     };
     let (target, expression) = (&statement[..offset], &statement[offset + width..]);
@@ -18749,7 +18719,7 @@ fn parse_trigger_local_assignment<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<Option<TriggerLocalAssignment<'a>>, SqlError> {
-    let Some((offset, width)) = trigger_assignment_operator(statement) else {
+    let Some((offset, width)) = trigger_assignment_operator(statement, arena)? else {
         return Ok(None);
     };
     let name = statement[..offset].trim();
@@ -18771,37 +18741,63 @@ fn parse_trigger_local_assignment<'a>(
     }))
 }
 
-fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in text.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            _ if depth == 0
-                && text
-                    .get(offset..offset + keyword.len())
-                    .is_some_and(|word| word.eq_ignore_ascii_case(keyword)) =>
-            {
-                let before = text[..offset].chars().next_back();
-                let after = text[offset + keyword.len()..].chars().next();
-                if before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
-                    && after.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
-                {
-                    return Some(offset);
+/// Only offsets or caller-owned values leave lexical scratch. Procedural
+/// boundaries share the SQL lexer's quoting, comments and nested expressions.
+fn scan_trigger_top_level<T>(
+    text: &str,
+    arena: &Arena,
+    mut select: impl for<'token> FnMut(
+        crate::sql::lexer::Tok<'token>,
+        usize,
+        usize,
+    ) -> Result<Option<T>, SqlError>,
+) -> Result<Option<T>, SqlError> {
+    arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(text, scratch);
+            let mut depth = 0usize;
+            loop {
+                let token = lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                match token {
+                    Tok::Op("(" | "[") => depth += 1,
+                    Tok::Op(")" | "]") => {
+                        depth = depth.checked_sub(1).ok_or_else(incomplete_trigger_body)?;
+                    }
+                    Tok::Eof => {
+                        return if depth == 0 {
+                            Ok(None)
+                        } else {
+                            Err(incomplete_trigger_body())
+                        };
+                    }
+                    _ if depth == 0 => {
+                        if let Some(value) = select(token, lexer.token_start(), lexer.token_end())?
+                        {
+                            return Ok(Some(value));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
-        }
-    }
-    None
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+fn trigger_top_level_keyword(
+    text: &str,
+    keyword: &str,
+    arena: &Arena,
+) -> Result<Option<usize>, SqlError> {
+    let mut qualified = false;
+    scan_trigger_top_level(text, arena, |token, start, _| {
+        let found = !qualified
+            && matches!(token, crate::sql::lexer::Tok::Ident(word) if word.eq_ignore_ascii_case(keyword));
+        qualified = matches!(token, crate::sql::lexer::Tok::Op("."));
+        Ok(found.then_some(start))
+    })
 }
 
 /// Return the normalized name and the lexer-owned boundary after it.
@@ -18883,8 +18879,8 @@ fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
 ) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
-    let assignment = trigger_assignment_operator(statement);
-    let default = trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7));
+    let assignment = trigger_assignment_operator(statement, arena)?;
+    let default = trigger_top_level_keyword(statement, "default", arena)?.map(|offset| (offset, 7));
     let initial = match (assignment, default) {
         (Some(assignment), Some(default)) => Some(if assignment.0 < default.0 {
             assignment
@@ -18970,16 +18966,18 @@ fn parse_trigger_select_into<'a>(
     if strip_trigger_keyword(statement, "select").is_none() {
         return Ok(None);
     }
-    let Some(into_at) = trigger_top_level_keyword(statement, "into") else {
+    let Some(into_at) = trigger_top_level_keyword(statement, "into", arena)? else {
         return Ok(None);
     };
     let after_into = &statement[into_at + 4..];
-    let clause_at = [
+    let mut clause_at = None;
+    for keyword in [
         "from", "where", "group", "having", "order", "limit", "offset", "fetch",
-    ]
-    .into_iter()
-    .filter_map(|keyword| trigger_top_level_keyword(after_into, keyword))
-    .min();
+    ] {
+        if let Some(at) = trigger_top_level_keyword(after_into, keyword, arena)? {
+            clause_at = Some(clause_at.map_or(at, |prior: usize| prior.min(at)));
+        }
+    }
     let (target_source, tail) = clause_at
         .map(|at| (&after_into[..at], &after_into[at..]))
         .unwrap_or((after_into, ""));
@@ -19028,38 +19026,25 @@ fn parse_trigger_select_into<'a>(
     }))
 }
 
-fn split_trigger_arguments(text: &str) -> Result<([Option<&str>; MAX_COLUMNS], usize), SqlError> {
+fn split_trigger_arguments<'a>(
+    text: &'a str,
+    arena: &Arena,
+) -> Result<([Option<&'a str>; MAX_COLUMNS], usize), SqlError> {
     let mut arguments = [None; MAX_COLUMNS];
     let mut count = 0usize;
     let mut start = 0usize;
-    let mut quote = None;
-    let mut depth = 0usize;
-    for (offset, character) in text.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
+    let _ = scan_trigger_top_level(text, arena, |token, offset, end| {
+        if matches!(token, crate::sql::lexer::Tok::Op(",")) {
+            let argument = text[start..offset].trim();
+            if argument.is_empty() || count == arguments.len() {
+                return Err(unsupported_trigger_body());
             }
-            continue;
+            arguments[count] = Some(argument);
+            count += 1;
+            start = end;
         }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ',' if depth == 0 => {
-                let argument = text[start..offset].trim();
-                if argument.is_empty() || count == arguments.len() {
-                    return Err(unsupported_trigger_body());
-                }
-                arguments[count] = Some(argument);
-                count += 1;
-                start = offset + 1;
-            }
-            _ => {}
-        }
-    }
-    if quote.is_some() || depth != 0 {
-        return Err(unsupported_trigger_body());
-    }
+        Ok(None::<()>)
+    })?;
     let argument = text[start..].trim();
     if argument.is_empty() || count == arguments.len() {
         return Err(unsupported_trigger_body());
@@ -19082,7 +19067,7 @@ fn parse_plpgsql_dynamic_query<'a>(
     let count = match using {
         None => 0,
         Some(using) => {
-            let (source, count) = split_trigger_arguments(using.trim())?;
+            let (source, count) = split_trigger_arguments(using.trim(), arena)?;
             if count > arguments.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -19143,8 +19128,8 @@ fn parse_trigger_dynamic_execute<'a>(
         return Ok(None);
     };
     let body = body.trim();
-    let into_at = trigger_top_level_keyword(body, "into");
-    let using_at = trigger_top_level_keyword(body, "using");
+    let into_at = trigger_top_level_keyword(body, "into", arena)?;
+    let using_at = trigger_top_level_keyword(body, "using", arena)?;
     if into_at.is_some_and(|into| using_at.is_some_and(|using| using < into)) {
         return Err(unsupported_trigger_body());
     }
@@ -19178,7 +19163,7 @@ fn parse_trigger_assert<'a>(
     let Some(body) = strip_trigger_keyword(statement, "assert") else {
         return Ok(None);
     };
-    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let (parts, count) = split_trigger_arguments(body.trim(), arena)?;
     if count > 2 {
         return Err(unsupported_trigger_body());
     }
@@ -19239,7 +19224,7 @@ fn parse_trigger_raise<'a>(
             "RAISE without parameters cannot be used outside an exception handler"
         ));
     }
-    let using_at = trigger_top_level_keyword(body, "using");
+    let using_at = trigger_top_level_keyword(body, "using", arena)?;
     let (format_body, options) = using_at
         .map(|at| (body[..at].trim(), Some(body[at + 5..].trim())))
         .unwrap_or((body, None));
@@ -19285,7 +19270,7 @@ fn parse_trigger_raise<'a>(
                 "RAISE cannot specify both a format string and MESSAGE"
             ));
         }
-        let (parts, count) = split_trigger_arguments(format_body)?;
+        let (parts, count) = split_trigger_arguments(format_body, arena)?;
         let format = match parse_plpgsql_expression(parts[0].expect("RAISE format"), arena)? {
             Expr::Str(format) => format,
             _ => return Err(unsupported_trigger_body()),
@@ -19344,7 +19329,7 @@ fn parse_trigger_raise_options<'a>(
             hint: None,
         });
     };
-    let (parts, count) = split_trigger_arguments(options)?;
+    let (parts, count) = split_trigger_arguments(options, arena)?;
     let mut sqlstate = None;
     let mut message = None;
     let mut detail = None;
@@ -19463,13 +19448,14 @@ fn parse_trigger_get_diagnostics<'a>(
     let Some(body) = strip_trigger_keyword(body, "diagnostics") else {
         return Err(unsupported_trigger_body());
     };
-    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let (parts, count) = split_trigger_arguments(body.trim(), arena)?;
     let mut assignments = [None; MAX_COLUMNS];
     for (index, part) in parts[..count].iter().enumerate() {
         let part = part.expect("diagnostic assignment initialized");
-        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
+        let Some((offset, width)) = trigger_assignment_operator(part, arena)? else {
             return Err(unsupported_trigger_body());
         };
+        let (target, item) = (&part[..offset], &part[offset + width..]);
         let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
@@ -19513,13 +19499,14 @@ fn parse_trigger_get_stacked_diagnostics<'a>(
     let Some(body) = strip_trigger_keyword(body.trim(), "diagnostics") else {
         return Err(unsupported_trigger_body());
     };
-    let (parts, count) = split_trigger_arguments(body.trim())?;
+    let (parts, count) = split_trigger_arguments(body.trim(), arena)?;
     let mut assignments = [None; MAX_COLUMNS];
     for (index, part) in parts[..count].iter().enumerate() {
         let part = part.expect("diagnostic assignment initialized");
-        let Some((target, item)) = part.split_once(":=").or_else(|| part.split_once('=')) else {
+        let Some((offset, width)) = trigger_assignment_operator(part, arena)? else {
             return Err(unsupported_trigger_body());
         };
+        let (target, item) = (&part[..offset], &part[offset + width..]);
         let target = parse_plpgsql_identifier(target.trim(), arena)?.name;
         if item.trim().is_empty() {
             return Err(unsupported_trigger_body());
@@ -19671,7 +19658,7 @@ fn parse_trigger_set_return<'a>(
             return Err(unsupported_trigger_body());
         }
         if let Some(command) = strip_trigger_keyword(query, "execute") {
-            let using_at = trigger_top_level_keyword(command, "using");
+            let using_at = trigger_top_level_keyword(command, "using", arena)?;
             return Ok(Some(TriggerStatement::ReturnDynamicQuery(
                 parse_plpgsql_dynamic_query(
                     using_at.map(|at| &command[..at]).unwrap_or(command),
@@ -19687,26 +19674,13 @@ fn parse_trigger_set_return<'a>(
     Ok(None)
 }
 
-fn trigger_top_level_range(text: &str) -> Option<usize> {
-    let mut quote = None;
-    let mut depth = 0usize;
-    let bytes = text.as_bytes();
-    for (offset, character) in text.char_indices() {
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            '.' if depth == 0 && bytes.get(offset + 1) == Some(&b'.') => return Some(offset),
-            _ => {}
-        }
-    }
-    None
+fn trigger_top_level_range(text: &str, arena: &Arena) -> Result<Option<usize>, SqlError> {
+    scan_trigger_top_level(text, arena, |token, start, _| {
+        Ok(
+            (matches!(token, crate::sql::lexer::Tok::Op(".")) && text[start..].starts_with(".."))
+                .then_some(start),
+        )
+    })
 }
 
 fn parse_trigger_for_header<'a>(
@@ -19719,7 +19693,7 @@ fn parse_trigger_for_header<'a>(
     let Some(body) = trigger_tail(body, "loop") else {
         return Err(unsupported_trigger_body());
     };
-    let Some(in_at) = trigger_top_level_keyword(body, "in") else {
+    let Some(in_at) = trigger_top_level_keyword(body, "in", arena)? else {
         return Err(unsupported_trigger_body());
     };
     let target = parse_plpgsql_identifier(body[..in_at].trim(), arena)?;
@@ -19728,7 +19702,7 @@ fn parse_trigger_for_header<'a>(
         return Err(unsupported_trigger_body());
     }
     if let Some(command) = strip_trigger_keyword(source, "execute") {
-        let using_at = trigger_top_level_keyword(command, "using");
+        let using_at = trigger_top_level_keyword(command, "using", arena)?;
         let query = parse_plpgsql_dynamic_query(
             using_at.map(|at| &command[..at]).unwrap_or(command),
             using_at.map(|at| &command[at + "using".len()..]),
@@ -19748,12 +19722,12 @@ fn parse_trigger_for_header<'a>(
     } else {
         false
     };
-    let Some(range_at) = trigger_top_level_range(source) else {
+    let Some(range_at) = trigger_top_level_range(source, arena)? else {
         return Err(unsupported_trigger_body());
     };
     let lower = source[..range_at].trim();
     let upper_step = source[range_at + 2..].trim();
-    let (upper, step) = match trigger_top_level_keyword(upper_step, "by") {
+    let (upper, step) = match trigger_top_level_keyword(upper_step, "by", arena)? {
         Some(at) => (upper_step[..at].trim(), Some(upper_step[at + 2..].trim())),
         None => (upper_step, None),
     };
@@ -19789,11 +19763,11 @@ fn parse_trigger_foreach_header<'a>(
     let Some(body) = trigger_tail(body, "loop") else {
         return Err(unsupported_trigger_body());
     };
-    let Some(in_at) = trigger_top_level_keyword(body, "in") else {
+    let Some(in_at) = trigger_top_level_keyword(body, "in", arena)? else {
         return Err(unsupported_trigger_body());
     };
     let target_source = body[..in_at].trim();
-    let (target, slice) = match trigger_top_level_keyword(target_source, "slice") {
+    let (target, slice) = match trigger_top_level_keyword(target_source, "slice", arena)? {
         Some(at) => {
             let target = parse_plpgsql_identifier(target_source[..at].trim(), arena)?.name;
             let slice = target_source[at + 5..].trim();
@@ -20069,7 +20043,7 @@ fn parse_plpgsql_cursor_open<'a>(
     let body = body.trim();
     let (variable, split) = parse_plpgsql_identifier_prefix(body, arena)?;
     let body = body[split..].trim();
-    let Some(for_at) = trigger_top_level_keyword(body, "for") else {
+    let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
         return Err(unsupported_trigger_body());
     };
     let options = body[..for_at].trim();
@@ -20088,7 +20062,7 @@ fn parse_plpgsql_cursor_open<'a>(
     }
     let query = if let Some(dynamic) = strip_trigger_keyword(query, "execute") {
         let dynamic = dynamic.trim();
-        let using_at = trigger_top_level_keyword(dynamic, "using");
+        let using_at = trigger_top_level_keyword(dynamic, "using", arena)?;
         let command = using_at.map_or(dynamic, |at| &dynamic[..at]);
         let using = using_at.map(|at| &dynamic[at + 5..]);
         PlpgsqlCursorQuery::Dynamic(parse_plpgsql_dynamic_query(command, using, arena)?)
@@ -20119,7 +20093,7 @@ fn parse_plpgsql_cursor_motion<'a>(
     } else {
         return Ok(None);
     };
-    let into_at = trigger_top_level_keyword(body, "into");
+    let into_at = trigger_top_level_keyword(body, "into", arena)?;
     if move_only && into_at.is_some() {
         return Err(unsupported_trigger_body());
     }
@@ -20229,11 +20203,12 @@ fn parse_trigger_exception_conditions<'a>(
     // `OR` is a keyword, not a substring: split only on whitespace-delimited
     // occurrences so a future condition name cannot be split accidentally.
     while !remaining.is_empty() {
-        let (condition, rest) = if let Some(index) = trigger_top_level_keyword(remaining, "or") {
-            (&remaining[..index], remaining[index + 2..].trim())
-        } else {
-            (remaining, "")
-        };
+        let (condition, rest) =
+            if let Some(index) = trigger_top_level_keyword(remaining, "or", arena)? {
+                (&remaining[..index], remaining[index + 2..].trim())
+            } else {
+                (remaining, "")
+            };
         if condition.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
@@ -20818,7 +20793,7 @@ fn parse_plpgsql_program_inner<'a>(
         return Err(incomplete_trigger_body());
     }
     let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
-        let Some(begin_at) = trigger_top_level_keyword(declarations, "begin") else {
+        let Some(begin_at) = trigger_top_level_keyword(declarations, "begin", arena)? else {
             return Err(incomplete_trigger_body());
         };
         let declaration_source = declarations[..begin_at].trim();

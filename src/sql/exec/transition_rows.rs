@@ -122,6 +122,117 @@ pub(super) struct SavedTransitionRows {
     row_count: usize,
 }
 
+/// All operation-specific tables travel with one unfinished mixed write.
+pub(super) struct SavedTransitionRowSets {
+    inserted: Option<SavedTransitionRows>,
+    updated: Option<SavedTransitionRows>,
+    deleted: Option<SavedTransitionRows>,
+    row_count: usize,
+}
+
+impl SavedTransitionRowSets {
+    pub(super) fn capture(
+        rows: TransitionRowSets<'_>,
+        pool: &Arc<LeasePool>,
+    ) -> Result<Self, SqlError> {
+        let row_count = [rows.inserted, rows.updated, rows.deleted]
+            .into_iter()
+            .flatten()
+            .try_fold(0usize, |count, rows| {
+                count
+                    .checked_add(rows.old.len())
+                    .and_then(|count| count.checked_add(rows.new.len()))
+            })
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "mixed-write transition row count exceeds addressable work memory"
+                )
+            })?;
+        Ok(Self {
+            inserted: rows
+                .inserted
+                .map(|rows| SavedTransitionRows::capture(rows, pool))
+                .transpose()?,
+            updated: rows
+                .updated
+                .map(|rows| SavedTransitionRows::capture(rows, pool))
+                .transpose()?,
+            deleted: rows
+                .deleted
+                .map(|rows| SavedTransitionRows::capture(rows, pool))
+                .transpose()?,
+            row_count,
+        })
+    }
+
+    pub(super) fn restore<'out>(
+        &'out self,
+        arena: &'out Arena,
+    ) -> Result<TransitionRowSets<'out>, SqlError> {
+        let groups = [
+            self.inserted.as_ref(),
+            self.updated.as_ref(),
+            self.deleted.as_ref(),
+        ];
+        let mut payloads = groups
+            .into_iter()
+            .flatten()
+            .flat_map(SavedTransitionRows::iter);
+        // One admission publishes every operation's directories together. A
+        // failed attempt never rewinds memory lent to an active child.
+        let directory: &'out [&'out [u8]] = arena
+            .alloc_slice_with(self.row_count, |_| {
+                payloads.next().expect("captured mixed-write row count")
+            })
+            .map_err(|_| super::super::query::arena_full_pub())?;
+        let mut offset = 0;
+        let mut restore_group = |index: usize| {
+            groups[index].map(|saved| {
+                let rows = &directory[offset..offset + saved.row_count];
+                offset += saved.row_count;
+                let (old, new) = rows.split_at(saved.old_count);
+                TransitionRows { old, new }
+            })
+        };
+        Ok(TransitionRowSets {
+            inserted: restore_group(0),
+            updated: restore_group(1),
+            deleted: restore_group(2),
+        })
+    }
+}
+
+struct SavedRowsIter<'rows> {
+    saved: &'rows SavedTransitionRows,
+    next: usize,
+    position: usize,
+}
+
+impl<'rows> Iterator for SavedRowsIter<'rows> {
+    type Item = &'rows [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.saved.row_count {
+            return None;
+        }
+        if self.next == self.saved.old_count {
+            self.position = self.saved.old_end + 8;
+        }
+        let length = usize::try_from(u64::from_le_bytes(
+            self.saved.bytes[self.position..self.position + 8]
+                .try_into()
+                .expect("captured row length header"),
+        ))
+        .expect("captured row length fits the original address space");
+        self.position += 8;
+        let row = &self.saved.bytes[self.position..self.position + length];
+        self.position += length;
+        self.next += 1;
+        Some(row)
+    }
+}
+
 impl SavedTransitionRows {
     pub(super) fn capture(
         rows: TransitionRows<'_>,
@@ -170,28 +281,24 @@ impl SavedTransitionRows {
         &'out self,
         arena: &'out Arena,
     ) -> Result<TransitionRows<'out>, SqlError> {
-        let mut position = 8;
+        let mut payloads = self.iter();
         // Admit both directories at once. No rollback of scratch is needed,
         // including when its parent currently lends a temporary region.
         let rows = arena
-            .alloc_slice_with(self.row_count, |index| {
-                if index == self.old_count {
-                    position = self.old_end + 8;
-                }
-                let length = usize::try_from(u64::from_le_bytes(
-                    self.bytes[position..position + 8]
-                        .try_into()
-                        .expect("captured row length header"),
-                ))
-                .expect("captured row length fits the original address space");
-                position += 8;
-                let row = &self.bytes[position..position + length];
-                position += length;
-                row
+            .alloc_slice_with(self.row_count, |_| {
+                payloads.next().expect("captured transition row count")
             })
             .map_err(|_| super::super::query::arena_full_pub())?;
         let (old, new) = rows.split_at(self.old_count);
         Ok(TransitionRows { old, new })
+    }
+
+    fn iter(&self) -> SavedRowsIter<'_> {
+        SavedRowsIter {
+            saved: self,
+            next: 0,
+            position: 8,
+        }
     }
 }
 

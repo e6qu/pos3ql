@@ -731,14 +731,17 @@ impl<'b> Responder<'b> {
         &mut self,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
     ) -> Result<(), WireFull> {
+        // A partially drained send buffer can compact during the first append.
+        // Save the retry boundary only after that compaction.
+        let _ = self.buffer.writable();
         let mark = self.buffer.mark();
         match build(self.buffer) {
             Ok(()) => Ok(()),
             Err(WireFull) => {
+                self.buffer.truncate_to(mark);
                 if matches!(self.flush, FlushSink::None) {
                     return Err(WireFull);
                 }
-                self.buffer.truncate_to(mark);
                 if self.buffer.is_empty() {
                     // The message alone exceeds the whole buffer.
                     return Err(WireFull);
@@ -746,7 +749,11 @@ impl<'b> Responder<'b> {
                 if !self.drain() {
                     return Err(WireFull);
                 }
-                build(self.buffer)
+                let result = build(self.buffer);
+                if result.is_err() {
+                    self.buffer.truncate_to(0);
+                }
+                result
             }
         }
     }
@@ -1678,7 +1685,10 @@ impl<'b> Responder<'b> {
         let start = self.buffer.mark();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_COMMAND_COMPLETE);
         m.cstr(tag);
-        m.finish()?;
+        if let Err(error) = m.finish() {
+            self.buffer.truncate_to(start);
+            return Err(error);
+        }
         self.last_command_completion = Some((start, self.buffer.mark()));
         Ok(())
     }
@@ -1720,8 +1730,9 @@ impl<'b> Responder<'b> {
     /// Nested trigger execution consumes the count as typed execution state;
     /// clients still receive only PostgreSQL's ordinary command tag.
     pub(crate) fn command_complete_rows(&mut self, tag: &str, rows: u64) -> Result<(), WireFull> {
+        self.command_complete(tag)?;
         self.set_affected_rows(rows);
-        self.command_complete(tag)
+        Ok(())
     }
 
     pub(crate) fn set_affected_rows(&mut self, rows: u64) {
@@ -1916,6 +1927,47 @@ impl<'b> Responder<'b> {
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn completion_streaming_preserves_compacted_prefix_and_discards_failed_retry() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(false).unwrap();
+        reader.set_nonblocking(false).unwrap();
+        let mut budget = crate::mem::Budget::new(64);
+        let mut buffer = super::FixedBuf::new(&mut budget, "completion streaming", 64).unwrap();
+        let mut responder = super::Responder::new(&mut buffer).with_flush(writer.as_raw_fd());
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(responder.buffer.append(&[0xa5; 50]));
+            responder.buffer.consume(20);
+            responder
+                .data_row(&[crate::sql::types::Datum::Text(
+                    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                )])
+                .unwrap();
+            let mut previous = [0; 30];
+            reader.read_exact(&mut previous).unwrap();
+            assert_eq!(previous, [0xa5; 30]);
+            assert_eq!(responder.buffer.len(), 51);
+            assert_eq!(responder.buffer.readable()[0], b'D');
+            assert!(responder.data_row(&[crate::sql::types::Datum::Text(
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            )]).is_err());
+            assert!(responder.buffer.is_empty());
+            let mut sent = [0; 51];
+            reader.read_exact(&mut sent).unwrap();
+            assert_eq!(sent[0], b'D');
+            assert_eq!(&sent[1..5], &50_u32.to_be_bytes());
+            assert_eq!(&sent[7..11], &40_u32.to_be_bytes());
+            assert_eq!(&sent[11..], &[b'x'; 40]);
+            responder.command_complete_rows("INSERT 0 1", 1).unwrap();
+            assert_eq!(responder.take_affected_rows(), Some(1));
+            assert_eq!(responder.buffer.readable()[0], b'C');
+        });
+    }
+
     use super::*;
     use crate::mem::Budget;
     use crate::mem::arena::Arena;

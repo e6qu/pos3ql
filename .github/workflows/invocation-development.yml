@@ -33,8 +33,6 @@ jobs:
           python3 tools/check-docs.py
           bash tools/check-bugs.sh
           bash tools/check-ci-timeouts.sh
-      - name: Check library and test lints
-        run: cargo clippy --lib --tests --locked --profile native-ci --jobs 1 -- -D warnings
       - name: Compile library tests and exercise value ownership
         shell: bash
         run: |
@@ -47,6 +45,8 @@ jobs:
             exec::diagnostics::ownership_tests \
             exec::transition_rows::ownership_tests \
             exec::trigger_firing::ownership_tests \
+            exec::write_completion::ownership_tests \
+            completion_streaming_preserves_ \
             sequence::tests::retained_statement_position_ \
             lock::tests::advisory_ \
             procedural_parameter_staging_ procedural_source_ \
@@ -68,6 +68,8 @@ jobs:
             streamed_copy_trigger_handlers_keep_ statement_files_streamed_copy_ \
             copy_from_ binary_copy_ \
             --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/invocation-development.log"
+      - name: Check library and test lints
+        run: cargo clippy --lib --tests --locked --profile native-ci --jobs 1 -- -D warnings
       - name: Retain development diagnostics
         if: always()
         uses: actions/upload-artifact@v6

@@ -428,6 +428,17 @@ AFTER STATEMENT triggers. It retains the row-event index, trigger depth,
 operation and last selected trigger name without syntax pointers. The same
 selectors serve the immediate trigger boundaries, COPY and ordinary write
 completion; nested trigger SQL cannot drain events from its caller's depth.
+The cursor also owns the affected-row count and choice of client response or
+internal count. It rejects completion before AFTER work ends and rejects a
+second completion. A full output buffer removes the unfinished completion frame
+and leaves the previous count intact; a retry can publish the new count and
+complete message together. Saved firings also check their original command
+identity and trigger depth before changing any execution context.
+Mixed-write transition images keep INSERT, UPDATE and DELETE tables under one
+owner. Restoration reserves all row directories in one allocation, so a failed
+admission publishes none and cannot rewind an active child's memory. Payloads
+stay in the existing row-work pool after the original collection arena drops;
+failed capture releases any operation images already reserved.
 This cursor is part of the remaining enclosing-write handoff; it does not yet
 make checked inputs in data-change triggers resumable.
 An internal nested-command owner also saves the command identity, nesting depth

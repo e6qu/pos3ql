@@ -135,6 +135,19 @@ impl SavedEnvironment {
 struct FiringOwner {
     identity: super::super::ExecutionIdentity,
     transaction: u32,
+    command: u32,
+    depth: u16,
+}
+
+impl FiringOwner {
+    fn capture(context: &TriggerExecContext<'_, '_, '_>) -> Self {
+        Self {
+            identity: super::super::execution_identity(),
+            transaction: context.txn.txid,
+            command: context.txn.command_id,
+            depth: context.txn.trigger_depth(),
+        }
+    }
 }
 
 impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
@@ -161,10 +174,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
             code,
             binding,
             environment,
-            owner: FiringOwner {
-                identity: super::super::execution_identity(),
-                transaction: context.txn.txid,
-            },
+            owner: FiringOwner::capture(context),
         })
     }
 
@@ -270,8 +280,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
     }
 
     fn require_context(&self, context: &TriggerExecContext<'_, '_, '_>) -> Result<(), SqlError> {
-        if self.owner.identity != super::super::execution_identity()
-            || self.owner.transaction != context.txn.txid
+        if self.owner != FiringOwner::capture(context)
             || !std::sync::Arc::ptr_eq(
                 self.execution.values.row_pool(),
                 &context.storage().row_work,
@@ -305,8 +314,7 @@ struct SavedMetadata {
     aliases: [Option<SavedAlias>; 2],
     level: TriggerLevel,
     before: bool,
-    identity: super::super::ExecutionIdentity,
-    transaction: u32,
+    owner: FiringOwner,
 }
 
 struct SavedAlias {
@@ -435,8 +443,7 @@ impl SavedBinding {
                 aliases,
                 level: binding.level,
                 before: binding.before,
-                identity: super::super::execution_identity(),
-                transaction: context.txn.txid,
+                owner: FiringOwner::capture(context),
             },
             values,
             environment,
@@ -504,7 +511,7 @@ impl SavedMetadata {
                         source: crate::sql::ast::MaterializedCteSource::Inline(rows.old),
                     })
                     .map_err(|_| super::super::query::arena_full_pub())?;
-                *output = (&*name, Some(&*relation));
+                *output = (name, Some(&*relation));
             }
             let relations = arena
                 .alloc_slice_with(relation_count, |index| {
@@ -577,8 +584,7 @@ impl SuspendedTriggerFiring {
         &mut self,
         context: &mut TriggerExecContext<'_, '_, '_>,
     ) -> Result<FiringProgress, SqlError> {
-        if self.saved.metadata.identity != super::super::execution_identity()
-            || self.saved.metadata.transaction != context.txn.txid
+        if self.saved.metadata.owner != FiringOwner::capture(context)
             || !std::sync::Arc::ptr_eq(self.saved.values.pool(), &context.storage().row_work)
         {
             return Err(changed());
@@ -687,10 +693,7 @@ fn resume<'run>(
             execution,
             binding,
             environment: active_environment,
-            owner: FiringOwner {
-                identity: metadata.identity,
-                transaction: metadata.transaction,
-            },
+            owner: metadata.owner,
         };
         match firing.execute(&mut context) {
             Ok(accepted) => {

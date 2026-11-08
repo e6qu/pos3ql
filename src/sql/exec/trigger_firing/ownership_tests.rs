@@ -467,6 +467,32 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 );
                 assert_eq!(resumed.used(), 0);
                 super::super::super::set_execution_connection_id(1);
+                let parent_command = context.txn.command_id;
+                context.txn.begin_command().unwrap();
+                assert_eq!(
+                    saved.poll(&mut context).err().unwrap().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                context.txn.command_id = parent_command;
+                {
+                    let mut nested = context
+                        .txn
+                        .enter_trigger_sql(context.host.storage())
+                        .unwrap();
+                    let mut nested_context = TriggerExecContext {
+                        host: context.host.reborrow(),
+                        txn: &mut nested,
+                        arena: context.arena,
+                        params: crate::sql::eval::NO_PARAMS,
+                        responder: context.responder,
+                    };
+                    assert_eq!(
+                        saved.poll(&mut nested_context).err().unwrap().sqlstate,
+                        sqlstate::SERIALIZATION_FAILURE
+                    );
+                }
+                assert_eq!(context.txn.command_id, parent_command);
+                assert_eq!(resumed.used(), 0);
             }
             assert_eq!(
                 saved.poll(&mut context).unwrap(),

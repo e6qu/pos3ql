@@ -9,6 +9,10 @@ use numeric_loops::NumericLoopWorkspace;
 use program::ProgramLayout;
 pub(super) use program::{CompiledProgram, ProgramSource};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "entry transfers loop and subtransaction owners without heap allocation"
+)]
 pub(super) enum Step<'syntax, 'values> {
     Complete(Option<TriggerFlow<'values>>),
     Enter(FrameEntry<'syntax, 'values>),

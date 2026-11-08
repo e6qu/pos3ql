@@ -2,6 +2,116 @@ use super::*;
 use crate::mem::Budget;
 
 #[test]
+fn mixed_transition_tables_restore_all_operations_atomically_after_source_drop() {
+    let mut budget = Budget::new(96 << 10);
+    let source = Arena::new(&mut budget, "mixed transition source", 16 << 10).unwrap();
+    let output = Arena::new(&mut budget, "mixed transition output", 512).unwrap();
+    let small = Arena::new(&mut budget, "mixed transition failed admission", 64).unwrap();
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        32 << 10,
+        4,
+    )
+    .unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let text = [b'x'; 8192];
+        let old = encode_projected_pub(
+            &[Datum::Text(core::str::from_utf8(&text).unwrap())],
+            &source,
+        )
+        .unwrap();
+        let inserted = encode_projected_pub(&[Datum::Int4(1)], &source).unwrap();
+        let updated = encode_projected_pub(&[Datum::Int4(3)], &source).unwrap();
+        let deleted = encode_projected_pub(&[Datum::Int4(4)], &source).unwrap();
+        let rows = TransitionRowSets {
+            inserted: Some(TransitionRows {
+                old: &[],
+                new: &[inserted],
+            }),
+            updated: Some(TransitionRows {
+                old: &[old],
+                new: &[updated],
+            }),
+            deleted: Some(TransitionRows {
+                old: &[deleted],
+                new: &[],
+            }),
+        };
+        let held_a = pool.lease::<u8>(1).unwrap();
+        let held_b = pool.lease::<u8>(1).unwrap();
+        let error = SavedTransitionRowSets::capture(rows, &pool).err().unwrap();
+        assert!(error.message.as_str().contains("row_work_leases"));
+        drop((held_a, held_b));
+        SavedTransitionRowSets::capture(rows, &pool).unwrap()
+    });
+    drop(source);
+    let external = Arc::clone(&pool);
+    drop(pool);
+    crate::mem::guard::forbid_alloc(|| {
+        let prefix = small.alloc_str("kept").unwrap();
+        let before = small.used();
+        for _ in 0..2 {
+            assert_eq!(
+                saved.restore(&small).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(small.used(), before);
+            assert_eq!(prefix, "kept");
+        }
+        small
+            .with_remaining_region(|child| {
+                let live = child.alloc_str("live child").unwrap();
+                assert_eq!(
+                    saved.restore(&small).err().unwrap().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert_eq!(live, "live child");
+            })
+            .unwrap();
+        let restored = saved.restore(&output).unwrap();
+        let inserted = restored.for_event(TriggerEvents::INSERT).unwrap();
+        assert!(inserted.old.is_empty());
+        assert_eq!(
+            decode_projected_col_record(inserted.new[0], 0, &output).unwrap(),
+            Datum::Int4(1)
+        );
+        let updated = restored.for_event(TriggerEvents::UPDATE).unwrap();
+        let Datum::Text(text) = decode_projected_col_record(updated.old[0], 0, &output).unwrap()
+        else {
+            panic!("original UPDATE old value");
+        };
+        assert_eq!(text.len(), 8192);
+        assert!(text.bytes().all(|byte| byte == b'x'));
+        assert_eq!(
+            decode_projected_col_record(updated.new[0], 0, &output).unwrap(),
+            Datum::Int4(3)
+        );
+        let deleted = restored.for_event(TriggerEvents::DELETE).unwrap();
+        assert!(deleted.new.is_empty());
+        assert_eq!(
+            decode_projected_col_record(deleted.old[0], 0, &output).unwrap(),
+            Datum::Int4(4)
+        );
+        drop(saved);
+        assert_eq!(external.lease::<u8>(32 << 10).unwrap().capacity(), 32 << 10);
+        let empty = SavedTransitionRowSets::capture(
+            TransitionRowSets {
+                inserted: Some(TransitionRows { old: &[], new: &[] }),
+                updated: None,
+                deleted: None,
+            },
+            &external,
+        )
+        .unwrap();
+        let restored = empty.restore(&output).unwrap();
+        assert!(restored.inserted.is_some());
+        assert!(restored.updated.is_none());
+        assert!(restored.deleted.is_none());
+    });
+}
+
+#[test]
 fn published_transition_rows_own_payloads_after_collection_memory_is_recycled() {
     let mut budget = Budget::new(96 << 10);
     let mut inputs = Arena::new(&mut budget, "transition input values", 16 << 10).unwrap();

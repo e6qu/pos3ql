@@ -90,7 +90,8 @@ Commands combining inserts, updates or deletes must retain separate transition
 tables for each operation while preserving their row-trigger firing order.
 Keep their ordered AFTER work, affected-row count and eventual completion reply
 with the unfinished write. A wakeup must not send that reply or earlier
-`RETURNING` rows again.
+`RETURNING` rows again. Preserve the completion cursor's full-buffer and
+once-only response checks when connecting it to the write driver.
 
 Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.

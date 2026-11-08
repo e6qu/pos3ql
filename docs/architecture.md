@@ -251,6 +251,13 @@ or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
 
+With `SET track_functions = 'all'`, function statistics separate time spent in
+the function from time spent in its children. An active timer owns its entry
+in a fixed 1,024-entry stack on the SQL execution thread. Completing the call,
+returning an error or unwinding releases that entry; exhaustion returns `54000`
+and names the function timing stack. Saving timing across a function-body pause
+remains part of retaining that unfinished call.
+
 Numeric `FOR` loops reserve reusable local-variable frames before running a
 call's local initializers. The reservation follows maximum simultaneous loop
 nesting, rather than iteration count or the number of separate loops in the

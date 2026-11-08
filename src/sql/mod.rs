@@ -15757,13 +15757,15 @@ impl Engine {
                 }
                 guc::TrackFunctions::All => true,
             };
-            let timed = statistics::begin_function_timing(track);
+            let timed = match statistics::begin_function_timing(track) {
+                Ok(timed) => timed,
+                Err(error) => return Ok(Err(error)),
+            };
             if track
                 && let Err(error) = self
                     .storage
                     .ensure_function_statistics(crate::storage::routine_oid(&routine))
             {
-                let _ = statistics::finish_function_timing(timed);
                 return Ok(Err(error));
             }
             #[expect(
@@ -15807,7 +15809,7 @@ impl Engine {
                 ))),
             };
             let succeeded = executed.is_ok();
-            if let Some((total, own)) = statistics::finish_function_timing(timed)
+            if let Some((total, own)) = timed.finish()
                 && succeeded
                 && let Err(error) = self.storage.record_function_call(
                     txn.txid,

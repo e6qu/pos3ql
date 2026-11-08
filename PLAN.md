@@ -57,6 +57,8 @@ Complete these connected execution paths:
   statements. A completed body must not run again if checking its return value
   waits. Scalar and table functions need the same guarantees; result width is
   independent of the input-argument limit.
+  Preserve one timing count across pauses; an active timer must release its
+  fixed-stack entry on failure and report exhaustion rather than omit tracking.
 - Finish write phases before and around AFTER work: BEFORE/INSTEAD triggers,
   source scans, row locks, partitions, constraints and transition collection.
   Include combined commands, rules, data-modifying common table expressions,

@@ -86,7 +86,8 @@ jobs:
             exec::trigger_firing::ownership_tests \
             exec::write_completion::ownership_tests \
             completion_streaming_preserves_ \
-            sequence::tests::retained_statement_position_ \
+            sequence::tests::retained_statement_position_ statistics::ownership_tests \
+            user_function_statistics_track_nested_calls_ \
             lock::tests::advisory_ \
             procedural_parameter_staging_ procedural_source_ \
             concurrent_reindex_preserves_unbuilt_ \

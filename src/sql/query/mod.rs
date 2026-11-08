@@ -3295,14 +3295,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
             super::guc::active_track_functions(),
             super::guc::TrackFunctions::All
         );
-        let timed = super::statistics::begin_function_timing(track);
-        if track
-            && let Err(error) = self
-                .storage
-                .ensure_function_statistics(crate::storage::routine_oid(routine))
-        {
-            let _ = super::statistics::finish_function_timing(timed);
-            return Err(error);
+        let timed = super::statistics::begin_function_timing(track)?;
+        if track {
+            self.storage
+                .ensure_function_statistics(crate::storage::routine_oid(routine))?;
         }
         let output = (|| -> Result<Option<Datum<'a>>, SqlError> {
             let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -3410,7 +3406,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 }
             }
         })();
-        if let Some((total, own)) = super::statistics::finish_function_timing(timed)
+        if let Some((total, own)) = timed.finish()
             && output.is_ok()
         {
             self.storage.record_function_call(

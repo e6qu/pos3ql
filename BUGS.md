@@ -13,6 +13,8 @@ Include empty-query descriptions, saved local-record fields and the saved
 advisory-call position across a concurrent index command's internal commits.
 Two record fields with a text domain must remain comparable to each other.
 Metadata discovery must preserve whole-row alias resolution in procedural SQL.
+Fixed function-timing capacity must fail explicitly and return entries after
+early errors or unwinding; silently disabling requested tracking is a defect.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.

@@ -37,14 +37,42 @@ std::thread_local! {
     };
 }
 
-pub(crate) fn begin_function_timing(enabled: bool) -> bool {
+/// An active timer belongs to the current SQL thread and ends before it yields.
+#[must_use = "keep the timer until the function call finishes"]
+pub(crate) struct FunctionTiming {
+    depth: Option<usize>,
+    _thread: core::marker::PhantomData<*mut ()>,
+}
+
+impl FunctionTiming {
+    pub(crate) fn finish(mut self) -> Option<(u64, u64)> {
+        self.depth.take().map(finish_function_timing)
+    }
+}
+
+impl Drop for FunctionTiming {
+    fn drop(&mut self) {
+        if let Some(depth) = self.depth.take() {
+            let _ = finish_function_timing(depth);
+        }
+    }
+}
+
+pub(crate) fn begin_function_timing(enabled: bool) -> Result<FunctionTiming, SqlError> {
     if !enabled {
-        return false;
+        return Ok(FunctionTiming {
+            depth: None,
+            _thread: core::marker::PhantomData,
+        });
     }
     FUNCTION_TIMING.with(|stack| {
         let mut stack = stack.borrow_mut();
         if stack.depth == stack.frames.len() {
-            return false;
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "function timing stack exhausted ({} active calls)",
+                MAX_FUNCTION_TIMING_DEPTH
+            ));
         }
         let depth = stack.depth;
         stack.frames[depth] = FunctionTimingFrame {
@@ -52,19 +80,21 @@ pub(crate) fn begin_function_timing(enabled: bool) -> bool {
             child_micros: 0,
         };
         stack.depth += 1;
-        true
+        Ok(FunctionTiming {
+            depth: Some(depth),
+            _thread: core::marker::PhantomData,
+        })
     })
 }
 
-pub(crate) fn finish_function_timing(enabled: bool) -> Option<(u64, u64)> {
-    if !enabled {
-        return None;
-    }
+fn finish_function_timing(depth: usize) -> (u64, u64) {
     FUNCTION_TIMING.with(|stack| {
         let mut stack = stack.borrow_mut();
-        if stack.depth == 0 {
-            return None;
-        }
+        assert_eq!(
+            stack.depth,
+            depth + 1,
+            "function timers finish in reverse call order"
+        );
         stack.depth -= 1;
         let frame = stack.frames[stack.depth];
         let total = crate::sql::datetime::now_micros()
@@ -75,7 +105,7 @@ pub(crate) fn finish_function_timing(enabled: bool) -> Option<(u64, u64)> {
             stack.frames[parent].child_micros =
                 stack.frames[parent].child_micros.saturating_add(total);
         }
-        Some((total, total.saturating_sub(frame.child_micros)))
+        (total, total.saturating_sub(frame.child_micros))
     })
 }
 
@@ -341,5 +371,90 @@ fn execute_unrecorded(
             sqlstate::INTERNAL_ERROR,
             "unknown statistics intrinsic"
         )),
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::sql::datetime::test_clock;
+
+    #[test]
+    fn function_timers_account_nested_children_without_allocating() {
+        let _clock = test_clock::enter(1_000);
+        crate::mem::guard::forbid_alloc(|| {
+            let parent = begin_function_timing(true).unwrap();
+            let child = {
+                let _clock = test_clock::enter(1_100);
+                begin_function_timing(true).unwrap()
+            };
+            {
+                let _clock = test_clock::enter(1_500);
+                assert_eq!(child.finish(), Some((400, 400)));
+            }
+            {
+                let _clock = test_clock::enter(1_800);
+                assert_eq!(begin_function_timing(false).unwrap().finish(), None);
+                assert_eq!(parent.finish(), Some((800, 400)));
+                assert_eq!(begin_function_timing(true).unwrap().finish(), Some((0, 0)));
+            }
+        });
+    }
+
+    #[test]
+    fn function_timers_release_unfinished_calls_and_unwinding_children() {
+        let _clock = test_clock::enter(1_000);
+        let parent = begin_function_timing(true).unwrap();
+        let child = {
+            let _clock = test_clock::enter(1_100);
+            begin_function_timing(true).unwrap()
+        };
+        {
+            let _clock = test_clock::enter(1_500);
+            drop(child);
+            let unwound = std::panic::catch_unwind(|| {
+                let _child = begin_function_timing(true).unwrap();
+                panic!("unfinished timed function");
+            });
+            assert!(unwound.is_err());
+        }
+        {
+            let _clock = test_clock::enter(1_800);
+            assert_eq!(parent.finish(), Some((800, 400)));
+            assert_eq!(begin_function_timing(true).unwrap().finish(), Some((0, 0)));
+        }
+    }
+
+    #[test]
+    fn function_timers_report_exhaustion_without_disabling_tracking() {
+        let _clock = test_clock::enter(1_000);
+        let mut timers = Vec::with_capacity(MAX_FUNCTION_TIMING_DEPTH);
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::mem::guard::forbid_alloc(|| {
+                for _ in 0..MAX_FUNCTION_TIMING_DEPTH {
+                    timers.push(begin_function_timing(true).unwrap());
+                }
+                let error = match begin_function_timing(true) {
+                    Err(error) => error,
+                    Ok(_) => panic!("timing exhaustion was accepted"),
+                };
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(
+                    error.message.as_str(),
+                    "function timing stack exhausted (1024 active calls)"
+                );
+                assert_eq!(begin_function_timing(false).unwrap().finish(), None);
+                FUNCTION_TIMING.with(|stack| {
+                    assert_eq!(stack.borrow().depth, MAX_FUNCTION_TIMING_DEPTH);
+                });
+            });
+        }));
+        while let Some(timer) = timers.pop() {
+            drop(timer);
+        }
+        checked.unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(begin_function_timing(true).unwrap().finish(), Some((0, 0)));
+        });
     }
 }

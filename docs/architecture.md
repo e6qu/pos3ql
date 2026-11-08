@@ -445,6 +445,11 @@ the original undo boundary, physical definitions, transition images, remaining
 trigger order and final response. A trigger that waits saves its active firing;
 the frontend retains earlier `RETURNING` rows and resumes that owner without
 redoing the insert, update or delete. Real errors use the original undo boundary.
+The existing control arena reserves the completion state only for active writes.
+A selected statement-trigger definition has its own temporary reservation,
+released before that body starts; row-trigger selections retain only their
+queue positions. Idle connections carry the small arena owner, not a maximum
+trigger definition or an additional startup pool.
 BEFORE and INSTEAD OF work, nested write handoffs, modifying CTEs, rewrite rules,
 COPY and replication apply still need the same complete enclosing owner before
 their rejected checked inputs can be enabled. Cold object-store waiting and the

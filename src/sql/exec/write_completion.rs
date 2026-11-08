@@ -181,6 +181,45 @@ enum AfterFiring {
     },
 }
 
+enum SavedAfterFiring {
+    Row(QueuedFiring),
+    Statement {
+        trigger: MutableSlice<crate::storage::TriggerDef>,
+        event: u8,
+    },
+}
+
+impl SavedAfterFiring {
+    fn capture(
+        firing: AfterFiring,
+        controls: &std::sync::Arc<LeasePool>,
+    ) -> Result<Self, SqlError> {
+        match firing {
+            AfterFiring::Row(row) => Ok(Self::Row(row)),
+            AfterFiring::Statement { trigger, event } => {
+                let mut saved = controls.lease(1).map_err(control_flow::execution_full)?;
+                saved
+                    .push_reserved(trigger)
+                    .map_err(control_flow::execution_full)?;
+                Ok(Self::Statement {
+                    trigger: saved,
+                    event,
+                })
+            }
+        }
+    }
+
+    fn into_firing(self) -> AfterFiring {
+        match self {
+            Self::Row(row) => AfterFiring::Row(row),
+            Self::Statement { trigger, event } => AfterFiring::Statement {
+                trigger: trigger[0],
+                event,
+            },
+        }
+    }
+}
+
 struct CompletionCursor {
     completion: WriteCompletion,
     reply: CompletionReply,
@@ -188,8 +227,12 @@ struct CompletionCursor {
 }
 
 pub(crate) struct SuspendedWriteCompletion {
+    state: MutableSlice<WriteCompletionState>,
+}
+
+struct WriteCompletionState {
     cursor: CompletionCursor,
-    selected: Option<AfterFiring>,
+    selected: Option<SavedAfterFiring>,
     firing: Option<trigger_firing::SuspendedTriggerFiring>,
     target: crate::storage::TriggerTarget,
     definitions: crate::storage::TableDefinitionImages,
@@ -212,6 +255,12 @@ impl SuspendedWriteCompletion {
         transitions: TransitionRowSets<'_>,
         boundary: super::super::txn::StatementMark,
     ) -> Result<Self, SqlError> {
+        let mut state = context
+            .storage()
+            .execution_control
+            .lease(1)
+            .map_err(control_flow::execution_full)?;
+        let selected = SavedAfterFiring::capture(selected, &context.storage().execution_control)?;
         let definitions = context.storage().table_definition_images();
         let definition = definitions.retain_relation(&definition)?;
         let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
@@ -226,27 +275,36 @@ impl SuspendedWriteCompletion {
             transitions,
             &context.storage().row_work,
         )?;
-        Ok(Self {
-            cursor,
-            selected: Some(selected),
-            firing: None,
-            target,
-            definitions,
-            definition,
-            transitions,
-            identity: super::super::execution_identity(),
-            transaction: context.txn.txid,
-            command: context.txn.command_id(),
-            depth: context.txn.trigger_depth(),
-            boundary,
-        })
+        state
+            .push_reserved(WriteCompletionState {
+                cursor,
+                selected: Some(selected),
+                firing: None,
+                target,
+                definitions,
+                definition,
+                transitions,
+                identity: super::super::execution_identity(),
+                transaction: context.txn.txid,
+                command: context.txn.command_id(),
+                depth: context.txn.trigger_depth(),
+                boundary,
+            })
+            .map_err(control_flow::execution_full)?;
+        Ok(Self { state })
     }
 
     pub(crate) fn boundary(&self) -> super::super::txn::StatementMark {
-        self.boundary
+        self.state[0].boundary
     }
 
     pub(super) fn poll(&mut self, context: &mut TriggerExecContext<'_, '_, '_>) -> Outcome {
+        self.state[0].poll(context)
+    }
+}
+
+impl WriteCompletionState {
+    fn poll(&mut self, context: &mut TriggerExecContext<'_, '_, '_>) -> Outcome {
         if self.identity != super::super::execution_identity()
             || self.transaction != context.txn.txid
             || self.command != context.txn.command_id()
@@ -285,7 +343,7 @@ impl SuspendedWriteCompletion {
                 }
             }
             let selected = match self.selected.take() {
-                Some(selected) => selected,
+                Some(selected) => selected.into_firing(),
                 None => match self.cursor.next(context, self.target) {
                     Ok(Some(selected)) => selected,
                     Ok(None) => return self.cursor.complete(context.responder),
@@ -320,7 +378,7 @@ impl SuspendedWriteCompletion {
     clippy::too_many_arguments,
     reason = "write resumption uses the original connection execution services"
 )]
-pub(super) fn resume(
+pub(in crate::sql) fn resume(
     engine: &mut super::super::Engine,
     txn: &mut TxnState,
     arena: &Arena,
@@ -353,7 +411,7 @@ pub(super) fn resume(
     {
         txn.pending_write_completion = Some(completion);
     } else if matches!(&result, Ok(Err(_))) {
-        let boundary = completion.boundary;
+        let boundary = completion.boundary();
         drop(completion);
         engine.rollback_waiting_statement(txn, boundary);
     }

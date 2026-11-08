@@ -46,8 +46,9 @@ contracts. Keep that coverage while completing the following execution work.
 Preserve remote savepoint boundaries when the first foreign connection opens
 inside a procedural block, including after nested release or rollback.
 
-Data-change triggers still reject reached domain-array literal checks with
-`0A000`. For example, an `AFTER INSERT` trigger that evaluates
+Finish retaining writes through checked inputs in data-change triggers. Paths
+without a retained write still return `0A000` for domain-array literal checks.
+For example, an `AFTER INSERT` trigger that evaluates
 `'{1}'::positive_integer[]` must eventually run the domain constraint with the
 inserted rows visible. It must keep earlier trigger writes, local variables,
 branch and loop positions, `OLD`/`NEW` values and statement transition rows while

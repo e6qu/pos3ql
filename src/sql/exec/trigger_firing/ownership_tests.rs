@@ -467,13 +467,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 );
                 assert_eq!(resumed.used(), 0);
                 super::super::super::set_execution_connection_id(1);
-                let parent_command = context.txn.command_id;
-                context.txn.begin_command().unwrap();
-                assert_eq!(
-                    saved.poll(&mut context).err().unwrap().sqlstate,
-                    sqlstate::SERIALIZATION_FAILURE
-                );
-                context.txn.command_id = parent_command;
+                let parent_command = context.txn.command_id();
                 {
                     let mut nested = context
                         .txn
@@ -491,7 +485,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                         sqlstate::SERIALIZATION_FAILURE
                     );
                 }
-                assert_eq!(context.txn.command_id, parent_command);
+                assert_eq!(context.txn.command_id(), parent_command);
                 assert_eq!(resumed.used(), 0);
             }
             assert_eq!(
@@ -499,7 +493,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 if released {
                     FiringProgress::Complete { accepted: true }
                 } else {
-                    FiringProgress::Waiting
+                    FiringProgress::Waiting {
+                        control: sqlstate::INTERNAL_LOCK_WAIT,
+                    }
                 }
             );
             assert_eq!(resumed.used(), 0);

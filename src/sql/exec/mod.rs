@@ -796,6 +796,8 @@ mod set_rows;
 mod transition_rows;
 mod trigger_firing;
 mod write_completion;
+pub(super) use write_completion::SuspendedWriteCompletion;
+pub(super) use write_completion::resume as resume_write_completion;
 
 use transition_rows::{TransitionCapture, TransitionRowSets, TransitionRows};
 
@@ -3837,10 +3839,10 @@ fn compare_partition_bound_tuples(
     Ok(Ordering::Equal)
 }
 
-fn row_trigger_when_passes<'a, Definition0: crate::storage::DefinitionBacking>(
+fn row_trigger_when_passes<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
-    definition: &crate::storage::TableDefinition<Definition0>,
+    definition: crate::storage::RelationDefinition<'_>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
 ) -> Result<bool, SqlError> {
@@ -3865,7 +3867,7 @@ fn row_trigger_when_passes<'a, Definition0: crate::storage::DefinitionBacking>(
         context.storage(),
         context.txn.txid,
         &TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(definition),
+            definition,
             old,
             new,
         },
@@ -3876,7 +3878,7 @@ fn row_trigger_when_passes<'a, Definition0: crate::storage::DefinitionBacking>(
         context,
         condition,
         &TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(definition),
+            definition,
             old,
             new,
         },
@@ -29327,7 +29329,13 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
     {
         return Ok(None);
     }
-    if !row_trigger_when_passes(&context, &trigger, definition, old, new.as_deref())? {
+    if !row_trigger_when_passes(
+        &context,
+        &trigger,
+        crate::storage::RelationDefinition::from_definition(definition),
+        old,
+        new.as_deref(),
+    )? {
         return Ok(None);
     }
     let encode = |values: Option<&[Datum<'a>]>| -> Result<Option<&'a [u8]>, SqlError> {
@@ -29842,7 +29850,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             &mut context,
             &trigger,
             target,
-            definition,
+            crate::storage::RelationDefinition::from_definition(definition),
             event,
             before,
             rows,
@@ -29851,11 +29859,11 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     Ok(())
 }
 
-fn execute_statement_trigger<'a, Definition: crate::storage::DefinitionBacking>(
+fn execute_statement_trigger<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
     target: crate::storage::TriggerTarget,
-    definition: &crate::storage::TableDefinition<Definition>,
+    definition: crate::storage::RelationDefinition<'_>,
     event: u8,
     before: bool,
     rows: Option<TransitionRows<'a>>,
@@ -29872,7 +29880,7 @@ fn execute_statement_trigger<'a, Definition: crate::storage::DefinitionBacking>(
             schema: definition.schema,
             name: definition.name,
         },
-        crate::storage::RelationDefinition::from_definition(definition),
+        definition,
         event,
         before,
         None,

@@ -8576,6 +8576,11 @@ impl Engine {
     /// before discovering a lock wait. Transaction-level locks remain held
     /// while the protocol message is parked.
     fn rollback_waiting_statement(&mut self, txn: &mut TxnState, mark: txn::StatementMark) {
+        let mark = if let Some(completion) = txn.pending_write_completion.take() {
+            completion.boundary()
+        } else {
+            mark
+        };
         assert!(
             txn.owns_statement_mark(mark),
             "a statement rewind cannot cross a transaction boundary"
@@ -10373,6 +10378,9 @@ impl Engine {
         arena: &Arena,
         context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
+        if txn.pending_write_completion.is_some() {
+            return Ok(false);
+        }
         if let Some(wait) = &txn.cache_capacity_wait {
             txn.restore_statement_deadline(wait.deadline);
             query::check_timeout()?;
@@ -11756,6 +11764,7 @@ impl Engine {
                         || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
                         && txn.staged_commit().is_none()
                         && txn.commit_admission().is_none()
+                        && txn.pending_write_completion.is_none()
                         && let Err(error) = sequence::ensure_statement_effects_replayable()
                     {
                         e = error;
@@ -11770,6 +11779,18 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
+                        if txn.pending_write_completion.is_some() && !lock_timeout_expired {
+                            self.storage.preserve_advisory_statement();
+                            return Ok(ExecutionStatus::Blocked {
+                                completed_statements: statement_index,
+                                output_mark: responder.buffer.mark(),
+                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
+                            });
+                        }
                         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
                             if txn.concurrent_index.is_none() {
                                 sequence_scope.discard(guc.seq_session());
@@ -12392,6 +12413,7 @@ impl Engine {
                                     || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
                                     && txn.staged_commit().is_none()
                                     && txn.commit_admission().is_none()
+                                    && txn.pending_write_completion.is_none()
                                     && let Err(error) =
                                         sequence::ensure_statement_effects_replayable()
                                 {
@@ -12408,6 +12430,18 @@ impl Engine {
                                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {
+                                    if txn.pending_write_completion.is_some()
+                                        && !lock_timeout_expired
+                                    {
+                                        self.storage.preserve_advisory_statement();
+                                        return Ok(ExtendedExecutionStatus::Blocked {
+                                            wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                                StatementWait::ObjectIo
+                                            } else {
+                                                StatementWait::Lock
+                                            },
+                                        });
+                                    }
                                     if txn.staged_commit().is_some()
                                         || txn.commit_admission().is_some()
                                     {
@@ -15378,6 +15412,11 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if txn.pending_write_completion.is_some() {
+            return exec::resume_write_completion(
+                self, txn, arena, sqlprep, cursors, guc, responder,
+            );
+        }
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, &self.storage, txn.txid, arena, None)
         {
@@ -15388,6 +15427,42 @@ impl Engine {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
+        let direct_relation = match statement {
+            Stmt::Insert(insert) => Some(insert.table),
+            Stmt::Update(update) => Some(update.table),
+            Stmt::Delete(delete) => Some(delete.table),
+            Stmt::Merge(merge) => Some(merge.target),
+            _ => None,
+        };
+        let completion_handoff = direct_relation
+            .and_then(|relation| {
+                match self
+                    .storage
+                    .resolve_relation(relation.schema, relation.name, txn.txid)
+                {
+                    Some(crate::storage::ResolvedRelation::Table(table)) => Some(table),
+                    _ => None,
+                }
+            })
+            .is_some_and(|table| {
+                [
+                    crate::storage::RewriteEvent::Insert,
+                    crate::storage::RewriteEvent::Update,
+                    crate::storage::RewriteEvent::Delete,
+                ]
+                .into_iter()
+                .all(|event| {
+                    self.storage
+                        .firing_rules_for(
+                            crate::storage::RuleTarget::Table(table as u16),
+                            event,
+                            txn.replication_apply,
+                            txn.txid,
+                        )
+                        .next()
+                        .is_none()
+                })
+            });
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -15398,6 +15473,12 @@ impl Engine {
             let output_mark = responder.buffer.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
+                mark: statement_mark,
+                command: txn.command_id(),
+                depth: txn.trigger_depth(),
+            });
+            let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
                 query::with_routine_invocation_scope(
                     Some(query::RoutineInvocationContext::new(&invocations, arena)),
@@ -15434,8 +15515,16 @@ impl Engine {
                             _ => unreachable!("resumable modification has a mutation statement"),
                         })
                     },
-                )?
+                )
             };
+            txn.write_completion_boundary = prior_handoff;
+            let outcome = outcome?;
+            if txn.pending_write_completion.is_some() {
+                self.dml_scratch.clear();
+                return exec::resume_write_completion(
+                    self, txn, arena, sqlprep, cursors, guc, responder,
+                );
+            }
             let Err(error) = outcome else {
                 return Ok(outcome);
             };
@@ -19079,6 +19168,11 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if reset_workspace && txn.pending_write_completion.is_some() {
+            return exec::resume_write_completion(
+                self, txn, arena, sqlprep, cursors, guc, responder,
+            );
+        }
         if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
             return Ok(Err(error));
         }

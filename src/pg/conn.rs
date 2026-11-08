@@ -3941,10 +3941,12 @@ impl Conn {
                     return Step::Continue;
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { wait }) => {
-                    if paged {
-                        self.portals[portal_slot].result.clear();
-                    } else {
-                        self.send.truncate_to(send_mark);
+                    if !self.txn.has_pending_write_completion() {
+                        if paged {
+                            self.portals[portal_slot].result.clear();
+                        } else {
+                            self.send.truncate_to(send_mark);
+                        }
                     }
                     self.park(wait, engine.statement_wait_generation(wait, self.id));
                     engine.park_backend_statement(self.id, wait);

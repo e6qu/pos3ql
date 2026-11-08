@@ -144,7 +144,7 @@ impl FiringOwner {
         Self {
             identity: super::super::execution_identity(),
             transaction: context.txn.txid,
-            command: context.txn.command_id,
+            command: context.txn.command_id(),
             depth: context.txn.trigger_depth(),
         }
     }
@@ -566,8 +566,12 @@ pub(super) struct SuspendedTriggerFiring {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FiringProgress {
-    Waiting,
-    Complete { accepted: bool },
+    Waiting {
+        control: crate::sql::eval::InternalControl,
+    },
+    Complete {
+        accepted: bool,
+    },
 }
 
 #[expect(
@@ -717,7 +721,15 @@ fn resume<'run>(
                     .map_err(ResumeError::Executed)?;
                 *advisory = context.storage().advisory_statement_position();
                 *environment = saved_environment;
-                Ok((FiringState::Paused(frame), FiringProgress::Waiting))
+                Ok((
+                    FiringState::Paused(frame),
+                    FiringProgress::Waiting {
+                        control: error
+                            .sqlstate
+                            .internal_control()
+                            .expect("execution wait is private control"),
+                    },
+                ))
             }
             Err(error) => Err(ResumeError::Executed(error)),
         }

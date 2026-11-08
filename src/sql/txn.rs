@@ -82,6 +82,13 @@ pub(crate) struct StatementMark {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransactionEffectMark([usize; 15]);
 
+#[derive(Clone, Copy)]
+pub(super) struct WriteCompletionBoundary {
+    pub(super) mark: StatementMark,
+    pub(super) command: u32,
+    pub(super) depth: u16,
+}
+
 pub(crate) fn establish_savepoint(
     storage: &Storage,
     txn: &mut TxnState,
@@ -420,6 +427,8 @@ pub struct TxnState {
     snapshot_taken: bool,
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
+    pub(super) write_completion_boundary: Option<WriteCompletionBoundary>,
+    pub(super) pending_write_completion: Option<super::exec::SuspendedWriteCompletion>,
     pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
@@ -1125,6 +1134,8 @@ impl TxnState {
             snapshot_taken: false,
             transaction_start: None,
             suspended_statement: None,
+            write_completion_boundary: None,
+            pending_write_completion: None,
             cache_capacity_wait: None,
             checkpoint_request: None,
             command_id: 1,
@@ -1714,6 +1725,10 @@ impl TxnState {
 
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
+    }
+
+    pub(crate) fn has_pending_write_completion(&self) -> bool {
+        self.pending_write_completion.is_some()
     }
 
     pub(crate) fn enter_extension_script(&mut self) {
@@ -3243,6 +3258,8 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.pending_write_completion = None;
+        self.write_completion_boundary = None;
         self.concurrent_index = None;
         self.immediate_index_utility = None;
         if let Some(owner) = &self.plan_invalidations {

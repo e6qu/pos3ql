@@ -187,6 +187,268 @@ struct CompletionCursor {
     phase: AfterPhase,
 }
 
+pub(crate) struct SuspendedWriteCompletion {
+    cursor: CompletionCursor,
+    selected: Option<AfterFiring>,
+    firing: Option<trigger_firing::SuspendedTriggerFiring>,
+    target: crate::storage::TriggerTarget,
+    definitions: crate::storage::TableDefinitionImages,
+    definition: crate::storage::DefinitionImageId,
+    transitions: transition_rows::SavedTransitionRowSets,
+    identity: super::super::ExecutionIdentity,
+    transaction: u32,
+    command: u32,
+    depth: u16,
+    boundary: super::super::txn::StatementMark,
+}
+
+impl SuspendedWriteCompletion {
+    fn capture(
+        cursor: CompletionCursor,
+        selected: AfterFiring,
+        context: &mut TriggerExecContext<'_, '_, '_>,
+        target: crate::storage::TriggerTarget,
+        definition: crate::storage::RelationDefinition<'_>,
+        transitions: TransitionRowSets<'_>,
+        boundary: super::super::txn::StatementMark,
+    ) -> Result<Self, SqlError> {
+        let definitions = context.storage().table_definition_images();
+        let definition = definitions.retain_relation(&definition)?;
+        let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
+        while let Some(firing) = row_cursor.next(context)? {
+            definitions.definition(
+                context.storage(),
+                usize::from(firing.table),
+                context.txn.txid,
+            )?;
+        }
+        let transitions = transition_rows::SavedTransitionRowSets::capture(
+            transitions,
+            &context.storage().row_work,
+        )?;
+        Ok(Self {
+            cursor,
+            selected: Some(selected),
+            firing: None,
+            target,
+            definitions,
+            definition,
+            transitions,
+            identity: super::super::execution_identity(),
+            transaction: context.txn.txid,
+            command: context.txn.command_id(),
+            depth: context.txn.trigger_depth(),
+            boundary,
+        })
+    }
+
+    pub(crate) fn boundary(&self) -> super::super::txn::StatementMark {
+        self.boundary
+    }
+
+    pub(super) fn poll(&mut self, context: &mut TriggerExecContext<'_, '_, '_>) -> Outcome {
+        if self.identity != super::super::execution_identity()
+            || self.transaction != context.txn.txid
+            || self.command != context.txn.command_id()
+            || self.depth != context.txn.trigger_depth()
+        {
+            return sql_fail(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "unfinished write belongs to a different command"
+            ));
+        }
+        let mut execution_context = TriggerExecContext {
+            host: context.host.reborrow(),
+            txn: context.txn,
+            arena: context.arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: context.responder,
+        };
+        let context = &mut execution_context;
+        let arena = context.arena;
+        let rows = match self.transitions.restore(arena) {
+            Ok(rows) => rows,
+            Err(error) => return sql_fail(error),
+        };
+        let definition = self
+            .definitions
+            .retained_relation(self.definition)
+            .expect("unfinished write retains its selected relation");
+        loop {
+            if let Some(firing) = &mut self.firing {
+                match firing.poll(context) {
+                    Ok(trigger_firing::FiringProgress::Waiting { control }) => {
+                        return sql_fail(sql_err!(control, "unfinished trigger is waiting"));
+                    }
+                    Ok(trigger_firing::FiringProgress::Complete { .. }) => self.firing = None,
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            let selected = match self.selected.take() {
+                Some(selected) => selected,
+                None => match self.cursor.next(context, self.target) {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => return self.cursor.complete(context.responder),
+                    Err(error) => return sql_fail(error),
+                },
+            };
+            let mark = arena.mark();
+            let result = run_selected_firing(
+                context,
+                &self.definitions,
+                definition,
+                self.target,
+                rows,
+                selected,
+            );
+            // Every firing has completed or transferred its values and lexical
+            // execution into the returned owner before temporary syntax leaves.
+            unsafe { arena.rewind_to(mark) };
+            match result {
+                Ok(None) => {}
+                Ok(Some((firing, wait))) => {
+                    self.firing = Some(firing);
+                    return sql_fail(wait);
+                }
+                Err(error) => return sql_fail(error),
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "write resumption uses the original connection execution services"
+)]
+pub(super) fn resume(
+    engine: &mut super::super::Engine,
+    txn: &mut TxnState,
+    arena: &Arena,
+    sqlprep: &mut super::super::prep::SqlPreparedPool,
+    cursors: &mut super::super::cursor::CursorPool,
+    guc: &super::super::guc::GucState,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(mut completion) = txn.pending_write_completion.take() else {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "write resumption has no unfinished command"
+        ));
+    };
+    let result = completion.poll(&mut TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    });
+    if result.is_err()
+        || matches!(&result, Ok(Err(error)) if control_flow::is_execution_wait(error))
+    {
+        txn.pending_write_completion = Some(completion);
+    } else if matches!(&result, Ok(Err(_))) {
+        let boundary = completion.boundary;
+        drop(completion);
+        engine.rollback_waiting_statement(txn, boundary);
+    }
+    result
+}
+
+fn run_selected_firing<'run>(
+    context: &mut TriggerExecContext<'_, 'run, '_>,
+    definitions: &'run crate::storage::TableDefinitionImages,
+    definition: crate::storage::RelationDefinition<'run>,
+    target: crate::storage::TriggerTarget,
+    transitions: TransitionRowSets<'run>,
+    selected: AfterFiring,
+) -> Result<Option<(trigger_firing::SuspendedTriggerFiring, SqlError)>, SqlError> {
+    let mut context = context.for_trigger();
+    let firing = match selected {
+        AfterFiring::Statement { trigger, event } => {
+            if !row_trigger_when_passes(&context, &trigger, definition, None, None)? {
+                return Ok(None);
+            }
+            prepare_trigger_firing(
+                &context,
+                &trigger,
+                TriggerRelationIdentity {
+                    target,
+                    schema: definition.schema,
+                    name: definition.name,
+                },
+                definition,
+                event,
+                false,
+                None,
+                None,
+                transitions.for_event(event),
+            )?
+        }
+        AfterFiring::Row(selected) => {
+            let event = context.txn.deferred_trigger_events()[selected.index];
+            let definition = definitions.definition(
+                context.storage(),
+                usize::from(selected.table),
+                context.txn.txid,
+            )?;
+            let relation = crate::storage::RelationDefinition::from_definition(definition);
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            definition.schema(&mut schema);
+            let decode = |tuple| -> Result<Option<&'run mut [Datum<'run>]>, SqlError> {
+                let Some(tuple) = tuple else {
+                    return Ok(None);
+                };
+                let bytes = context
+                    .arena
+                    .alloc_slice_copy(context.txn.deferred_trigger_bytes(tuple))
+                    .map_err(|_| super::super::query::arena_full_pub())?;
+                let values = context
+                    .arena
+                    .alloc_slice_with(definition.n_columns, |_| Datum::Null)
+                    .map_err(|_| super::super::query::arena_full_pub())?;
+                rowenc::decode(bytes, &schema[..definition.n_columns], values)?;
+                Ok(Some(values))
+            };
+            let old = decode(event.old)?;
+            let new = decode(event.new)?;
+            let trigger = context
+                .storage()
+                .trigger(usize::from(selected.trigger_slot));
+            context.txn.complete_deferred_trigger(selected.index)?;
+            prepare_trigger_firing(
+                &context,
+                &trigger,
+                TriggerRelationIdentity {
+                    target: crate::storage::TriggerTarget::Table(selected.table),
+                    schema: relation.schema,
+                    name: relation.name,
+                },
+                relation,
+                event.event,
+                false,
+                old.map(|row| &*row),
+                new,
+                transitions.for_event(event.event),
+            )?
+        }
+    };
+    let mut firing = firing;
+    match firing.execute(&mut context) {
+        Ok(_) => Ok(None),
+        Err(error) if control_flow::is_execution_wait(&error) => {
+            let saved = firing.suspend(&context).map_err(|(_, error)| error)?;
+            Ok(Some((saved, error)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl CompletionCursor {
     fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16) -> Self {
         Self {
@@ -294,6 +556,39 @@ impl WriteCompletion {
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
         let mut cursor = CompletionCursor::new(self, reply, depth);
+        if let Some(boundary) = context.txn.write_completion_boundary
+            && boundary.command == context.txn.command_id()
+            && boundary.depth == depth
+        {
+            let selected = match cursor.next(&mut context, target) {
+                Ok(Some(selected)) => selected,
+                Ok(None) => return cursor.complete(context.responder),
+                Err(error) => return sql_fail(error),
+            };
+            if context.txn.pending_write_completion.is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "one unfinished write owns the command completion"
+                ));
+            }
+            let pending = match SuspendedWriteCompletion::capture(
+                cursor,
+                selected,
+                &mut context,
+                target,
+                crate::storage::RelationDefinition::from_definition(definition),
+                transitions,
+                boundary.mark,
+            ) {
+                Ok(pending) => pending,
+                Err(error) => return sql_fail(error),
+            };
+            context.txn.pending_write_completion = Some(pending);
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                "write completion requires the caller's execution services"
+            ));
+        }
         loop {
             let firing = match cursor.next(&mut context, target) {
                 Ok(Some(firing)) => firing,
@@ -312,7 +607,7 @@ impl WriteCompletion {
                     &mut context,
                     &trigger,
                     target,
-                    definition,
+                    crate::storage::RelationDefinition::from_definition(definition),
                     event,
                     false,
                     transitions.for_event(event),

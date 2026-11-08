@@ -439,8 +439,16 @@ owner. Restoration reserves all row directories in one allocation, so a failed
 admission publishes none and cannot rewind an active child's memory. Payloads
 stay in the existing row-work pool after the original collection arena drops;
 failed capture releases any operation images already reserved.
-This cursor is part of the remaining enclosing-write handoff; it does not yet
-make checked inputs in data-change triggers resumable.
+Direct table writes without rewrite rules transfer their AFTER completion to
+the engine after releasing the write's storage borrow. The retained owner keeps
+the original undo boundary, physical definitions, transition images, remaining
+trigger order and final response. A trigger that waits saves its active firing;
+the frontend retains earlier `RETURNING` rows and resumes that owner without
+redoing the insert, update or delete. Real errors use the original undo boundary.
+BEFORE and INSTEAD OF work, nested write handoffs, modifying CTEs, rewrite rules,
+COPY and replication apply still need the same complete enclosing owner before
+their rejected checked inputs can be enabled. Cold object-store waiting and the
+full protocol paths remain qualification gates in the plan.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.

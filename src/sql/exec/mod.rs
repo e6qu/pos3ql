@@ -21908,12 +21908,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declaration_count += 1;
     }
     let seeded_count = declaration_count;
-    let output_columns = match routine.kind {
-        crate::storage::RoutineKind::TableFunction => {
-            &routine.result_columns[..routine.result_column_count]
-        }
-        _ => &routine.result_columns[..routine.result_column_count],
-    };
+    let output_columns = &routine.result_columns[..routine.result_column_count];
     for output in output_columns {
         if output.name.as_str().is_empty()
             || declarations[..declaration_count]

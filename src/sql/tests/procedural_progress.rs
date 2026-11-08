@@ -1841,6 +1841,8 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
             "SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,'seven'::record_label)).* FROM record_source) q",
             "SELECT record_return_positive() AS id,record_return_label() AS label",
             "SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source",
+            "SELECT (ARRAY[7::record_positive])[1] AS id,(ARRAY['seven'::record_label])[1] AS label",
+            "SELECT (ROW(7,'seven')::record_pair).*",
             "SELECT (record_return_pair()).* FROM record_source",
             "SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source",
             "UPDATE record_source SET id=id RETURNING *",
@@ -1854,6 +1856,15 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
                 [types::oid::INT4, types::oid::TEXT],
                 "{query}"
             );
+            let procedural = format!(
+                "DO $$DECLARE result record; BEGIN EXECUTE '{}' INTO STRICT result; \
+                 IF pg_typeof(result.id)<>'record_positive'::regtype \
+                 OR pg_typeof(result.label)<>'record_label'::regtype \
+                 OR result.id<>7 OR result.label<>'seven' THEN \
+                 RAISE EXCEPTION 'declared record type or value changed'; END IF; END$$",
+                query.replace('\'', "''")
+            );
+            session.success(&mut engine, &procedural, true);
         }
         assert_eq!(
             data_rows(&session.success(&mut engine, final_query, true)),

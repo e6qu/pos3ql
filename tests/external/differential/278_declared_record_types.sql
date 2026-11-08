@@ -20,6 +20,8 @@ BEGIN
         'SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,''seven''::record_label)).* FROM record_source) q',
         'SELECT record_return_positive() AS id,record_return_label() AS label',
         'SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source',
+        'SELECT (ARRAY[7::record_positive])[1] AS id,(ARRAY[''seven''::record_label])[1] AS label',
+        'SELECT (ROW(7,''seven'')::record_pair).*',
         'SELECT (record_return_pair()).* FROM record_source',
         'SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source',
         'UPDATE record_source SET id=id RETURNING *',
@@ -46,7 +48,8 @@ BEGIN
             RAISE EXCEPTION 'unknown record expansion returned the wrong error: %',message;
         END IF;
     END;
-    RETURN code='XX000';
+    EXECUTE 'SELECT (ROW(NULL,''text''::text)).f2 AS value' INTO result;
+    RETURN code='XX000' AND result.value='text';
 END$$;
 CREATE FUNCTION check_null_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE result record; copied record; matched boolean;

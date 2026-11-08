@@ -890,9 +890,17 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        match self.column_meta(qualifier, name) {
-            Some(metadata) => Ok(metadata.ctype),
-            None => self.row.resolve_column_type(qualifier, name),
+        if self.row.column_type_oid(qualifier, name).is_some() {
+            self.column_meta(qualifier, name)
+                .map(|metadata| metadata.ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "record field's declared type is unavailable"
+                    )
+                })
+        } else {
+            self.row.resolve_column_type(qualifier, name)
         }
     }
 

@@ -94,6 +94,7 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   field selection and array subscripting. Saved procedural queries expose
   ordinary record fields as well as trigger records, including NULL fields.
   Comparisons between two text-domain fields must also keep their collation.
+  Preserve whole-row aliases such as `(t).*` in procedural query planning.
 - Cancellation, timeout, rollback, connection closure and successful completion
   release owners. A handled timeout stays consumed if its handler waits.
   Memory remains inside the existing startup pools, with named exhaustion and

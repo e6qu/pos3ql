@@ -52,12 +52,27 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        self.columns.resolve(qualifier, name)
+        // A column descriptor cannot replace whole-row alias resolution.
+        // Only saved record OIDs need catalog-backed physical type lookup.
+        if self.row.column_type_oid(qualifier, name).is_some() {
+            self.col_type(qualifier, name).ok_or_else(|| {
+                sql_err!(
+                    super::sqlstate::UNDEFINED_OBJECT,
+                    "record field's declared type is unavailable"
+                )
+            })
+        } else {
+            self.row.resolve_column_type(qualifier, name)
+        }
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.columns
-            .column_meta(qualifier, name)
-            .map(|column| column.ctype)
+        if let Some(type_oid) = self.row.column_type_oid(qualifier, name) {
+            crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+                self.columns.domain_base_type(oid)
+            })
+        } else {
+            self.row.col_type(qualifier, name)
+        }
     }
     fn column_user_type(
         &self,

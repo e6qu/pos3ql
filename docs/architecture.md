@@ -411,6 +411,12 @@ Restoration also lends the firing its original statement and transaction
 timestamps and deadline. The transaction's consumed-timeout state prevents
 rearming a timeout already handled by the routine. Returning from a poll restores
 the worker's previous clock and timer, including after a failed attachment.
+Saving a firing also records its position among the statement's completed
+sequence calls and input checks, together with the sequence selected by
+`lastval()`. The connection retains that record and its sequence session.
+Attachment checks the original statement attempt and nested effect record before
+advancing their positions. A failed attachment restores the caller's previous
+position; another pause saves the new position without copying the record.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.

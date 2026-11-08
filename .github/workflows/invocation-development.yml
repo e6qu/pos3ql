@@ -45,6 +45,7 @@ jobs:
             exec::diagnostics::ownership_tests \
             exec::transition_rows::ownership_tests \
             exec::trigger_firing::ownership_tests \
+            sequence::tests::retained_statement_position_ \
             procedural_parameter_staging_ procedural_source_ \
             procedural_locals_initialize_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \

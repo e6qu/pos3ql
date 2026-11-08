@@ -87,6 +87,10 @@ a timeout already consumed by its transaction.
 Retain nested SQL's command and read snapshot together. Resuming it must not
 issue another command identity or restore another connection's visibility;
 completion and another pause must restore the caller's context.
+Keep the position of completed sequence calls and input checks with the saved
+firing. Reattach only to the original statement and nested effect record; failed
+attachment must leave the caller's position intact. A later statement or another
+connection must not inherit that progress.
 Preserve typed control ownership: an application raising the same diagnostic
 code must still return or catch its own error normally, including in functions
 returning rows and category handlers.

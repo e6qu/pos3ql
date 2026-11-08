@@ -2,6 +2,7 @@ use super::*;
 use crate::mem::FixedBuf;
 use crate::sql::guc::GucState;
 use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
+use crate::sql::sequence;
 
 #[test]
 fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
@@ -96,6 +97,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     let mut resumed = Arena::new(&mut budget, "trigger firing resumption", 64 << 10).unwrap();
     let small = Arena::new(&mut budget, "trigger firing failed admission", 64).unwrap();
     let output = Arena::new(&mut budget, "trigger firing result", 32 << 10).unwrap();
+    let statement_arena = Arena::new(&mut budget, "trigger firing journal", 16 << 10).unwrap();
     let mut send = FixedBuf::new(&mut budget, "trigger firing output", 4096).unwrap();
     let mut responder = Responder::new(&mut send);
     let guc = GucState::new_with_capacities(&mut budget, 1, 4, config.transaction_mode).unwrap();
@@ -138,7 +140,23 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     columns[0].ctype = ColType::Int4;
     columns[1].name = SqlName::parse("note").unwrap();
     columns[1].ctype = ColType::Text;
+    let effects = core::cell::Cell::new(0);
     let mut saved = crate::mem::guard::forbid_alloc(|| {
+        let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), false);
+        sequence::statement_effect(
+            sequence::StatementEffectKind::Cursor,
+            &[Datum::Text("before firing")],
+            sequence::StatementEffectRetry::Continue,
+            &original,
+            || {
+                effects.set(effects.get() + 1);
+                sequence::StatementEffectAttempt {
+                    result: Ok(&[Datum::Int8(1)]),
+                    rewound_state: false,
+                }
+            },
+        )
+        .unwrap();
         let definition = RelationDefinition {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("selected_rows").unwrap(),
@@ -305,6 +323,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     crate::sql::datetime::begin_transaction();
     super::super::super::query::restore_statement_deadline(812_345_678_901_233);
     crate::mem::guard::forbid_alloc(|| {
+        let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
         assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
         assert_eq!(
             crate::sql::eval::funcs::system::current_identity().as_str(),
@@ -337,6 +356,10 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let error = saved.poll(&mut context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(small.used(), 0);
+        assert!(matches!(
+            sequence::expected_input().unwrap(),
+            sequence::ExpectedInput::OtherEffect
+        ));
         assert_eq!(
             crate::sql::datetime::statement_micros(),
             812_345_678_961_234
@@ -380,6 +403,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             .unwrap();
         resumed
             .with_remaining_region(|scratch| {
+                let _statement =
+                    sequence::enter_statement(&statement_arena, guc.seq_session(), true);
                 let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
@@ -394,6 +419,10 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 let error = saved.poll(&mut context).err().unwrap();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 assert_eq!(scratch.used(), 0);
+                assert!(matches!(
+                    sequence::expected_input().unwrap(),
+                    sequence::ExpectedInput::OtherEffect
+                ));
                 assert!(matches!(saved.state, FiringState::Paused(_)));
             })
             .unwrap();
@@ -407,6 +436,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             super::super::super::set_execution_connection_id(1);
         }
         crate::mem::guard::forbid_alloc(|| {
+            let statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
             let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
@@ -436,6 +466,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 }
             );
             assert_eq!(resumed.used(), 0);
+            assert_eq!(effects.get(), 1);
+            assert!(matches!(
+                sequence::expected_input().unwrap(),
+                sequence::ExpectedInput::None
+            ));
             assert_eq!(
                 crate::sql::datetime::statement_micros(),
                 812_345_678_961_234
@@ -455,6 +490,22 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                     saved.poll(&mut context).err().unwrap().sqlstate,
                     sqlstate::INTERNAL_ERROR
                 );
+                sequence::statement_effect(
+                    sequence::StatementEffectKind::Cursor,
+                    &[Datum::Text("after firing")],
+                    sequence::StatementEffectRetry::Continue,
+                    &output,
+                    || {
+                        effects.set(effects.get() + 1);
+                        sequence::StatementEffectAttempt {
+                            result: Ok(&[Datum::Int8(2)]),
+                            rewound_state: false,
+                        }
+                    },
+                )
+                .unwrap();
+                statement.finish(guc.seq_session()).unwrap();
+                assert_eq!(effects.get(), 2);
             }
         });
         resumed.reset();

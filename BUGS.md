@@ -6,7 +6,8 @@ Fix reproducible defects in the PR that finds them, including incidental defects
 and failures during admission, initialization, suspension, restoration, nested
 writes, trigger dispatch, mixed-operation transition tables, nested command
 restoration, borrowed-memory admission, routine-setting scopes, binary-value
-rendering, readable-setting completeness, write-completion ordering or cleanup.
+rendering, readable-setting completeness, write-completion ordering, saved-effect
+positions or cleanup.
 Firing capture and attachment include arguments, row values and selected column
 descriptions, configured routine settings, effective user, original timestamps
 and deadline as well as lexical execution state. Isolated ownership tests use an

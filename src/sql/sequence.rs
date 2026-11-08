@@ -461,6 +461,91 @@ pub(crate) struct StatementReplayStart {
 #[derive(Clone, Copy)]
 pub(crate) struct StatementReplayCursor(Option<StatementReplayEnd>);
 
+/// A paused invocation's position in its connection-owned statement journal.
+/// The statement arena and sequence session remain with that connection.
+pub(crate) struct SavedStatementPosition(Option<StatementReplayStart>);
+
+pub(crate) struct StatementPositionAdmission<'session> {
+    session: Option<&'session SeqSession>,
+    prior: StatementSequenceReplay,
+    lastval: Option<(usize, u64)>,
+    committed: bool,
+}
+
+impl StatementPositionAdmission<'_> {
+    /// Commit only after every part of the invocation has attached, before SQL
+    /// can change the journal. Failed attachment restores the caller's cursor.
+    pub(crate) fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StatementPositionAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(session) = self.session
+        {
+            session.statement_replay.set(self.prior);
+            session.restore_last_sequence(self.lastval);
+        }
+    }
+}
+
+impl SavedStatementPosition {
+    pub(crate) fn capture() -> Result<Self, SqlError> {
+        begin_replay_cursor().map(Self)
+    }
+
+    pub(crate) fn take(&mut self) -> Self {
+        Self(self.0.take())
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed admission returns its original unattached owner without allocating"
+    )]
+    pub(crate) fn with_resume<T, R>(
+        &self,
+        owner: T,
+        execute: impl for<'session> FnOnce(T, &mut StatementPositionAdmission<'session>) -> R,
+    ) -> Result<R, (T, SqlError)> {
+        with_statement_context(|context| {
+            let mut admission = StatementPositionAdmission {
+                session: None,
+                prior: StatementSequenceReplay::EMPTY,
+                lastval: None,
+                committed: false,
+            };
+            match (self.0, context) {
+                (None, None) => {}
+                (Some(saved), Some((arena, session))) => {
+                    let mut replay = session.statement_replay.get();
+                    let positions = (|| {
+                        validate_cursor(arena, replay, saved)?;
+                        Ok((
+                            sequence_position(arena, replay, saved.sequences)?,
+                            effect_position(arena, replay, saved.effects)?,
+                        ))
+                    })();
+                    let (next, effects_next) = match positions {
+                        Ok(positions) => positions,
+                        Err(error) => return Err((owner, error)),
+                    };
+                    admission.session = Some(session);
+                    admission.prior = replay;
+                    admission.lastval = session.last_sequence();
+                    replay.next = next;
+                    replay.effects_next = effects_next;
+                    session.statement_replay.set(replay);
+                    session.restore_last_sequence(saved.lastval);
+                }
+                _ => return Err((owner, replay_changed())),
+            }
+            Ok(execute(owner, &mut admission))
+        })
+    }
+}
+
 impl StatementReplayCursor {
     pub(crate) const EMPTY: Self = Self(None);
 
@@ -1403,6 +1488,122 @@ impl SequenceAccess for SeqEval<'_> {
 mod tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn retained_statement_position_admission_keeps_receipts_and_owners() {
+        struct Owner<'a>(&'a Cell<usize>);
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let mut budget = Budget::new(96 << 10);
+        let arena = Arena::new(&mut budget, "statement position journal", 64 << 10).unwrap();
+        let other_arena = Arena::new(&mut budget, "foreign position journal", 16 << 10).unwrap();
+        let output = Arena::new(&mut budget, "statement position output", 16 << 10).unwrap();
+        let guc = crate::sql::guc::GucState::new();
+        let other = crate::sql::guc::GucState::new();
+        let session = guc.seq_session();
+        let calls = Cell::new(0);
+        let drops = Cell::new(0);
+        let mut plan_bytes = [0; 16];
+        plan_bytes[0] = 1;
+        plan_bytes[8] = 1;
+        let plan = super::super::type_input_plans::PlanId::from_key_bytes(&plan_bytes).unwrap();
+        let saved = crate::mem::guard::forbid_alloc(|| {
+            let empty = SavedStatementPosition::capture().unwrap();
+            assert_eq!(
+                empty
+                    .with_resume(17, |owner, admission| {
+                        admission.commit();
+                        owner
+                    })
+                    .unwrap(),
+                17
+            );
+            let _scope = enter_statement(&arena, session, false);
+            assert_eq!(
+                statement_call(
+                    session,
+                    SequenceCall {
+                        operation: SequenceOperation::Next,
+                        source: None,
+                    },
+                    || {
+                        calls.set(calls.get() + 1);
+                        session.record_nextval(0, 1, 7);
+                        Ok(7)
+                    }
+                )
+                .unwrap(),
+                7
+            );
+            ready_routine_input(plan, &output).unwrap();
+            SavedStatementPosition::capture().unwrap()
+        });
+        let moved = arena;
+        crate::mem::guard::forbid_alloc(|| {
+            {
+                let _scope = enter_statement(&other_arena, other.seq_session(), false);
+                let (owner, error) = saved
+                    .with_resume(Owner(&drops), |_, _| -> () {
+                        panic!("foreign statement cannot attach")
+                    })
+                    .err()
+                    .unwrap();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                assert_eq!(drops.get(), 0);
+                drop(owner);
+                assert_eq!(drops.get(), 1);
+            }
+            let scope = enter_statement(&moved, session, true);
+            let before = session.statement_replay.get();
+            let lastval = session.last_sequence();
+            saved
+                .with_resume((), |(), _admission| {
+                    assert!(session.statement_replay.get().next.is_none());
+                    assert!(session.statement_replay.get().effects_next.is_none());
+                    assert_eq!(session.last_sequence(), Some((0, 1)));
+                })
+                .unwrap();
+            assert!(session.statement_replay.get().next == before.next);
+            assert!(session.statement_replay.get().effects_next == before.effects_next);
+            assert_eq!(session.last_sequence(), lastval);
+            saved
+                .with_resume((), |(), admission| {
+                    admission.commit();
+                    assert!(session.statement_replay.get().next.is_none());
+                    assert!(session.statement_replay.get().effects_next.is_none());
+                    assert_eq!(session.currval(0, 1), Some(7));
+                    assert_eq!(session.last_sequence(), Some((0, 1)));
+                    assert_eq!(
+                        statement_call(
+                            session,
+                            SequenceCall {
+                                operation: SequenceOperation::Next,
+                                source: None,
+                            },
+                            || {
+                                calls.set(calls.get() + 1);
+                                session.record_nextval(0, 1, 8);
+                                Ok(8)
+                            }
+                        )
+                        .unwrap(),
+                        8
+                    );
+                    ready_routine_input(plan, &output).unwrap();
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 2);
+            assert_eq!(session.currval(0, 1), Some(8));
+            scope.finish(session).unwrap();
+            assert_eq!(
+                saved.with_resume((), |(), _| ()).err().unwrap().1.sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+        });
+    }
 
     #[test]
     fn compact_ready_inputs_mix_with_full_errors_waits_and_scoped_cursors() {

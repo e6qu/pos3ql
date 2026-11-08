@@ -793,6 +793,9 @@ mod local_values;
 mod loop_rows;
 mod numeric_loops;
 mod set_rows;
+mod transition_rows;
+
+use transition_rows::{TransitionCapture, TransitionRows};
 
 use control_flow::{CompiledProgram, ControlFrames, ProgramSource};
 use set_rows::PlpgsqlSetResult;
@@ -29760,84 +29763,6 @@ fn fire_partition_row_triggers<'a, Definition0: crate::storage::DefinitionBackin
     }
 }
 
-/// Statement triggers have no `OLD`/`NEW` image; their declared transition
-/// relations are bound only after the statement has produced its row sets.
-#[derive(Clone, Copy)]
-struct TransitionRows<'a> {
-    old: &'a [&'a [u8]],
-    new: &'a [&'a [u8]],
-}
-
-/// Pre-sized transition row slots. Each DML path derives capacity from its
-/// candidate count, so capture cannot grow a pool; encoded rows live in the
-/// fixed statement arena and exhaustion is a named error.
-struct TransitionCapture<'a> {
-    old: *mut &'a [u8],
-    old_capacity: usize,
-    old_len: usize,
-    new: *mut &'a [u8],
-    new_capacity: usize,
-    new_len: usize,
-}
-
-impl<'a> TransitionCapture<'a> {
-    fn new(arena: &'a Arena, old_capacity: usize, new_capacity: usize) -> Result<Self, SqlError> {
-        let old = arena
-            .alloc_slice_with(old_capacity, |_| &[][..])
-            .map_err(|_| super::query::arena_full_pub())?;
-        let new = arena
-            .alloc_slice_with(new_capacity, |_| &[][..])
-            .map_err(|_| super::query::arena_full_pub())?;
-        Ok(Self {
-            old: old.as_mut_ptr(),
-            old_capacity,
-            old_len: 0,
-            new: new.as_mut_ptr(),
-            new_capacity,
-            new_len: 0,
-        })
-    }
-
-    fn push_old(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
-        if self.old_len == self.old_capacity {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "OLD TABLE exceeds its pre-sized statement capture"
-            ));
-        }
-        let row = encode_projected_pub(values, arena)?;
-        // The destination was allocated from this statement arena and no slice
-        // into it is exposed before `rows` creates the immutable relation.
-        unsafe { self.old.add(self.old_len).write(row) };
-        self.old_len += 1;
-        Ok(())
-    }
-
-    fn push_new(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
-        if self.new_len == self.new_capacity {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "NEW TABLE exceeds its pre-sized statement capture"
-            ));
-        }
-        let row = encode_projected_pub(values, arena)?;
-        // See `push_old`: the raw pointer is confined to collection, before
-        // any transition relation borrows the backing allocation.
-        unsafe { self.new.add(self.new_len).write(row) };
-        self.new_len += 1;
-        Ok(())
-    }
-
-    fn rows(&self) -> TransitionRows<'a> {
-        // Both arrays originate in the statement arena and outlive every
-        // trigger program invoked by this statement.
-        TransitionRows {
-            old: unsafe { core::slice::from_raw_parts(self.old, self.old_len) },
-            new: unsafe { core::slice::from_raw_parts(self.new, self.new_len) },
-        }
-    }
-}
-
 fn transition_relation<'a>(
     storage: &Storage,
     txid: u32,
@@ -58124,7 +58049,7 @@ pub(crate) fn copy_statement_end(
         definition,
         TriggerEvents::INSERT,
         ColumnSet::EMPTY,
-        transition_capture.as_ref().map(TransitionCapture::rows),
+        transition_capture.take().map(TransitionCapture::into_rows),
     )
 }
 
@@ -63907,13 +63832,13 @@ pub(crate) fn merge<'a>(
                 },
                 match event {
                     TriggerEvents::INSERT => {
-                        insert_transitions.as_ref().map(TransitionCapture::rows)
+                        insert_transitions.take().map(TransitionCapture::into_rows)
                     }
                     TriggerEvents::UPDATE => {
-                        update_transitions.as_ref().map(TransitionCapture::rows)
+                        update_transitions.take().map(TransitionCapture::into_rows)
                     }
                     TriggerEvents::DELETE => {
-                        delete_transitions.as_ref().map(TransitionCapture::rows)
+                        delete_transitions.take().map(TransitionCapture::into_rows)
                     }
                     _ => None,
                 },
@@ -66102,8 +66027,8 @@ where
                 2,
                 updated_columns,
                 conflict_transition_capture
-                    .as_ref()
-                    .map(TransitionCapture::rows),
+                    .take()
+                    .map(TransitionCapture::into_rows),
             )
         {
             return sql_fail(error);
@@ -66123,7 +66048,7 @@ where
             def,
             1,
             ColumnSet::EMPTY,
-            transition_capture.as_ref().map(TransitionCapture::rows),
+            transition_capture.take().map(TransitionCapture::into_rows),
         ) {
             return sql_fail(error);
         }
@@ -66345,8 +66270,8 @@ where
             2,
             updated_columns,
             conflict_transition_capture
-                .as_ref()
-                .map(TransitionCapture::rows),
+                .take()
+                .map(TransitionCapture::into_rows),
         )
     {
         return sql_fail(error);
@@ -66366,7 +66291,7 @@ where
         def,
         1,
         ColumnSet::EMPTY,
-        transition_capture.as_ref().map(TransitionCapture::rows),
+        transition_capture.take().map(TransitionCapture::into_rows),
     ) {
         return sql_fail(error);
     }
@@ -68065,7 +67990,7 @@ pub(crate) fn update<'a>(
         def,
         2,
         updated_columns,
-        transition_capture.as_ref().map(TransitionCapture::rows),
+        transition_capture.take().map(TransitionCapture::into_rows),
     ) {
         return sql_fail(error);
     }
@@ -68660,7 +68585,7 @@ pub(crate) fn delete<'a>(
         def,
         4,
         ColumnSet::EMPTY,
-        transition_capture.as_ref().map(TransitionCapture::rows),
+        transition_capture.take().map(TransitionCapture::into_rows),
     ) {
         return sql_fail(error);
     }

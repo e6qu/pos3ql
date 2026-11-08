@@ -61,12 +61,19 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
         storage
             .begin_transaction_identity(transaction.txid)
             .unwrap();
+        let parent_command = transaction.command_id();
+        let _parent_snapshot = storage.dml_expression_snapshot(parent_command);
+        let mut nested_command = parent_command;
         let saved = crate::mem::guard::forbid_alloc(|| {
+            let mut command = transaction.enter_trigger_sql(&storage).unwrap();
+            assert!(command.command_id() > parent_command);
+            nested_command = command.command_id();
+            assert_eq!(command.trigger_depth(), 1);
             let (program, code) = compile_plpgsql_execution(
                 SOURCE,
                 PlpgsqlProgramKind::Anonymous,
                 &storage,
-                transaction.txid,
+                command.txid,
                 &original,
                 &|_| false,
             )
@@ -86,13 +93,13 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             )
             .unwrap()
             .with_input_sites(program.input_sites);
-            let _settings = crate::sql::guc::enter_eval_scope(&guc, &mut transaction);
+            let _settings = crate::sql::guc::enter_eval_scope(&guc, &mut command);
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage: &mut storage,
                     seq_session: guc.seq_session(),
                 },
-                txn: &mut transaction,
+                txn: &mut command,
                 arena: &original,
                 params: crate::sql::eval::NO_PARAMS,
                 responder: &mut responder,
@@ -126,8 +133,12 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 .unwrap();
             assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT, "{mode:?}");
             assert!(execution.status.control_frames.as_ref().unwrap().active > 1);
-            execution.suspend().ok().unwrap()
+            let execution = execution.suspend().ok().unwrap();
+            (execution, command.suspend())
         });
+        assert_eq!(transaction.command_id(), parent_command);
+        assert_eq!(transaction.trigger_depth(), 0);
+        assert_eq!(storage.read_snapshot(), parent_command);
         drop(original);
         let mut saved = Some(saved);
         for attempt in 0..2 {
@@ -167,7 +178,18 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 crate::sql::set_execution_connection_id(1);
             }
             saved = crate::mem::guard::forbid_alloc(|| {
-                let saved = saved.take().unwrap();
+                let (saved, command) = saved.take().unwrap();
+                crate::sql::set_execution_connection_id(2);
+                let (command, error) = command.resume(&mut transaction).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+                assert_eq!(transaction.command_id(), parent_command);
+                assert_eq!(transaction.trigger_depth(), 0);
+                assert_eq!(storage.read_snapshot(), parent_command);
+                crate::sql::set_execution_connection_id(1);
+                let mut command = command.resume(&mut transaction).ok().unwrap();
+                assert_eq!(command.trigger_depth(), 1);
+                assert_eq!(command.command_id(), nested_command);
+                assert_eq!(storage.read_snapshot(), crate::storage::SNAPSHOT_ALL);
                 let (program, code) = saved.source().parse(&resumed).unwrap();
                 let mut execution = saved.restore(&resumed, &code).ok().unwrap();
                 let invocation = crate::sql::type_input_plans::with_owner(
@@ -176,13 +198,13 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 )
                 .unwrap()
                 .with_input_sites(program.input_sites);
-                let _settings = crate::sql::guc::enter_eval_scope(&guc, &mut transaction);
+                let _settings = crate::sql::guc::enter_eval_scope(&guc, &mut command);
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage: &mut storage,
                         seq_session: guc.seq_session(),
                     },
-                    txn: &mut transaction,
+                    txn: &mut command,
                     arena: &resumed,
                     params: crate::sql::eval::NO_PARAMS,
                     responder: &mut responder,
@@ -204,7 +226,8 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                         sqlstate::INTERNAL_LOCK_WAIT,
                         "{mode:?}"
                     );
-                    return Some(execution.suspend().ok().unwrap());
+                    let execution = execution.suspend().ok().unwrap();
+                    return Some((execution, command.suspend()));
                 }
                 assert!(outcome.unwrap().is_none());
                 assert_eq!(execution.values[0], Datum::Int4(3));
@@ -232,6 +255,9 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 assert!(error.message.as_str().contains("cannot run again"));
                 None
             });
+            assert_eq!(transaction.command_id(), parent_command);
+            assert_eq!(transaction.trigger_depth(), 0);
+            assert_eq!(storage.read_snapshot(), parent_command);
             resumed.reset();
         }
         assert!(saved.is_none());

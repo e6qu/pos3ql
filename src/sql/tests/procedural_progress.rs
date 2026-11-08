@@ -1244,6 +1244,32 @@ fn uninitialized_domain_locals_validate_null_before_body_effects() {
 }
 
 #[test]
+fn trigger_parameters_remain_separate_from_prepared_write_parameters() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("trigger-parameter-scope-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/269_trigger_parameter_scope.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["6|2|2|2|t|t|15"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn transition_columns_keep_declared_types_for_old_new_and_null_values() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

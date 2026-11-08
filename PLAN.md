@@ -63,6 +63,12 @@ transaction rollback rules. A private wait must not be caught as a user error.
 Keep the caller's execution services through immediate and queued trigger
 dispatch. Trigger bodies cannot end the caller's transaction or inherit its
 SQL parameters; trigger arguments remain available through `TG_ARGV`.
+Publish transition tables only after collection ends. A paused write must own
+both row sets independently of recycled scratch; restoration must publish both
+directories together and preserve their bytes after a failed admission.
+Retain nested SQL's command and read snapshot together. Resuming it must not
+issue another command identity or restore another connection's visibility;
+completion and another pause must restore the caller's context.
 Preserve typed control ownership: an application raising the same diagnostic
 code must still return or catch its own error normally, including in functions
 returning rows and category handlers.

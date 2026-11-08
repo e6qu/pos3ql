@@ -355,6 +355,12 @@ Transition tables retain copied, interned column metadata
 and declared type OIDs. For example, `pg_typeof(new_rows.amount)` keeps the
 column's domain type when a statement trigger reads inserted rows, including NULL
 values; it does not infer that type from the stored integer value.
+Collection ends before a transition table becomes readable: publishing consumes
+its writer, so later capture cannot change the published row list. Internal
+saved transition images keep both lists in shared row-work memory. Restoration
+admits both lists together and borrows their immutable payloads; even a large
+row therefore needs only its list entry in resumption scratch. These images
+still need the enclosing-write handoff below.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges
@@ -370,6 +376,11 @@ has restored;
 destination exhaustion preserves all images and reservations. This frame owner
 alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.
+An internal nested-command owner also saves the command identity, nesting depth
+and read visibility before restoring its caller. Attachment checks the original
+connection, database, transaction and parent command before changing any state.
+It resumes the same command rather than issuing a new identity. Completing or
+pausing that scope restores the caller's visibility again.
 Nested procedural updates and deletes own independent row-selection ranges in
 the shared row-work pool. They do not replace the caller's selection or borrow
 it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry

@@ -214,6 +214,67 @@ pub(crate) struct TriggerSqlScope<'txn> {
     _snapshot: crate::storage::ReadSnapshotScope,
 }
 
+/// One unfinished nested command, independent of its worker and stack frame.
+pub(crate) struct SuspendedTriggerSql {
+    transaction: u32,
+    identity: super::ExecutionIdentity,
+    parent_command: u32,
+    parent_depth: u16,
+    command: u32,
+    depth: u16,
+    snapshot: crate::storage::SavedReadSnapshot,
+}
+
+impl TriggerSqlScope<'_> {
+    pub(crate) fn suspend(self) -> SuspendedTriggerSql {
+        SuspendedTriggerSql {
+            transaction: self.transaction.txid,
+            identity: super::execution_identity(),
+            parent_command: self.parent_command,
+            parent_depth: self.parent_depth,
+            command: self.transaction.command_id,
+            depth: self.transaction.trigger_depth,
+            snapshot: self._snapshot.capture_current(),
+        }
+    }
+}
+
+impl SuspendedTriggerSql {
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed attachment returns the original command owner without allocating"
+    )]
+    pub(crate) fn resume(
+        self,
+        transaction: &mut TxnState,
+    ) -> Result<TriggerSqlScope<'_>, (Self, SqlError)> {
+        if transaction.failed
+            || transaction.mode == TxnMode::Idle
+            || transaction.txid != self.transaction
+            || super::execution_identity() != self.identity
+            || transaction.command_id != self.parent_command
+            || transaction.trigger_depth != self.parent_depth
+            || transaction.command_counter < self.command
+        {
+            return Err((
+                self,
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "suspended nested SQL belongs to a different command"
+                ),
+            ));
+        }
+        transaction.command_id = self.command;
+        transaction.trigger_depth = self.depth;
+        Ok(TriggerSqlScope {
+            transaction,
+            parent_command: self.parent_command,
+            parent_depth: self.parent_depth,
+            _snapshot: self.snapshot.resume(),
+        })
+    }
+}
+
 impl core::ops::Deref for TriggerSqlScope<'_> {
     type Target = TxnState;
     fn deref(&self) -> &TxnState {

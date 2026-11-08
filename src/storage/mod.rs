@@ -14618,6 +14618,25 @@ pub(crate) struct ReadSnapshotScope {
     thread: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+/// Saved visibility contains no worker borrow; its transaction retains the
+/// reader lease while execution is parked.
+pub(crate) struct SavedReadSnapshot(VisibilityContext);
+
+impl ReadSnapshotScope {
+    pub(crate) fn capture_current(&self) -> SavedReadSnapshot {
+        SavedReadSnapshot(execution_visibility())
+    }
+}
+
+impl SavedReadSnapshot {
+    pub(crate) fn resume(self) -> ReadSnapshotScope {
+        ReadSnapshotScope {
+            previous: replace_execution_visibility(self.0),
+            thread: core::marker::PhantomData,
+        }
+    }
+}
+
 impl Drop for ReadSnapshotScope {
     fn drop(&mut self) {
         replace_execution_visibility(self.previous);

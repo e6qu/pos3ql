@@ -1,0 +1,344 @@
+use super::*;
+use crate::mem::FixedBuf;
+use crate::sql::guc::GucState;
+use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
+
+#[test]
+fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destruction() {
+    let mut config = crate::storage::tests::test_config();
+    config.max_tables = 1;
+    config.max_catalog_versions_per_object = 1;
+    config.txn_rows = 16;
+    config.max_ddl_per_transaction = 2;
+    config.row_history_slots = 16;
+    config.row_overlay_slots = 16;
+    config.catalog_history_bytes = 4096;
+    config.definition_image_slots = 4;
+    config.table_metadata_bytes = 64 << 10;
+    config.table_metadata_leases = 64;
+    config.execution_control_bytes = 64 << 10;
+    config.execution_control_leases = 64;
+    config.row_work_bytes = 64 << 10;
+    config.row_work_leases = 32;
+    let mut budget = crate::storage::tests::test_budget(&config);
+    let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+    let controls = std::sync::Arc::clone(&storage.execution_control);
+    let rows = std::sync::Arc::clone(&storage.row_work);
+    let original = Arena::new(&mut budget, "trigger firing source", 64 << 10).unwrap();
+    let mut resumed = Arena::new(&mut budget, "trigger firing resumption", 64 << 10).unwrap();
+    let small = Arena::new(&mut budget, "trigger firing failed admission", 64).unwrap();
+    let output = Arena::new(&mut budget, "trigger firing result", 32 << 10).unwrap();
+    let mut send = FixedBuf::new(&mut budget, "trigger firing output", 4096).unwrap();
+    let mut responder = Responder::new(&mut send);
+    let guc = GucState::new_with_capacities(&mut budget, 1, 4, config.transaction_mode).unwrap();
+    let mut transaction = TxnState::new_with_config(&mut budget, &config).unwrap();
+    transaction.txid = 100;
+    transaction.mode = TxnMode::Explicit;
+    transaction.begin_command().unwrap();
+    let prior = super::super::super::execution_identity();
+    super::super::super::set_execution_connection_id(2);
+    storage.begin_transaction_identity(200).unwrap();
+    let blocking = AdvisoryKey::from_bigint(42);
+    assert_eq!(
+        storage
+            .acquire_advisory_lock(200, blocking, AdvisoryMode::Exclusive, true, false,)
+            .unwrap(),
+        AdvisoryDecision::Acquired
+    );
+    super::super::super::set_execution_connection_id(1);
+    storage.begin_transaction_identity(100).unwrap();
+    let _deadline = super::super::super::query::enter_deadline_scope();
+    super::super::super::query::disarm_timeout();
+    let mut columns = [crate::storage::ColumnMeta::EMPTY; 2];
+    columns[0].name = SqlName::parse("id").unwrap();
+    columns[0].ctype = ColType::Int4;
+    columns[1].name = SqlName::parse("note").unwrap();
+    columns[1].ctype = ColType::Text;
+    let mut saved = crate::mem::guard::forbid_alloc(|| {
+        let definition = RelationDefinition {
+            schema: SqlName::parse("public").unwrap(),
+            name: SqlName::parse("selected_rows").unwrap(),
+            n_columns: 2,
+            columns: &columns,
+        };
+        let old_note = original.alloc_slice_with(8192, |_| b'x').unwrap();
+        let old = [
+            Datum::Int4(10),
+            Datum::Text(core::str::from_utf8(old_note).unwrap()),
+        ];
+        let mut new = [
+            Datum::Int4(11),
+            Datum::Text(original.alloc_str("initial").unwrap()),
+        ];
+        let argv = crate::sql::array::build_shaped(
+            &[Datum::Text(original.alloc_str("!").unwrap())],
+            crate::sql::array::Shape::new(&[1], &[0]).unwrap(),
+            &original,
+        )
+        .unwrap();
+        let source = "DECLARE n integer := 0; marker text := 'once'; BEGIN \
+            n := n + 1; PERFORM pg_advisory_lock(41); \
+            PERFORM pg_advisory_xact_lock(42); \
+            NEW.note := OLD.note || TG_ARGV[0] || marker; NEW.id := NEW.id + n; \
+            RETURN NEW; END";
+        let (program, code) = compile_plpgsql_execution(
+            source,
+            PlpgsqlProgramKind::Trigger,
+            &storage,
+            100,
+            &original,
+            &|_| false,
+        )
+        .unwrap();
+        let transition_row = encode_projected_pub(&new, &original).unwrap();
+        let transition_rows = original.alloc_slice_copy(&[transition_row]).unwrap();
+        let alias = transition_relation(
+            &storage,
+            100,
+            SqlName::parse("inserted_rows").unwrap(),
+            definition,
+            transition_rows,
+            &original,
+        )
+        .unwrap();
+        let relations = original
+            .alloc_slice_copy(&[("inserted_rows", alias)])
+            .unwrap();
+        let invocation = TriggerInvocation {
+            program_kind: PlpgsqlProgramKind::Trigger,
+            name: original.alloc_str("selected_trigger").unwrap(),
+            routine_schema: original.alloc_str("public").unwrap(),
+            routine_name: original.alloc_str("selected_body").unwrap(),
+            table_schema: original.alloc_str("public").unwrap(),
+            table_name: original.alloc_str("selected_rows").unwrap(),
+            relid: 42,
+            routine_oid: 43,
+            input_origin: super::super::super::plpgsql_inputs::Origin::Routine {
+                oid: 43,
+                version: 7,
+            },
+            input_owner: super::super::super::type_input_plans::Owner::Backend,
+            input_collation: crate::sql::ast::Collation::None,
+            input_sites: program.input_sites,
+            materialized_relations: Some(relations),
+            nargs: 1,
+            when: "BEFORE",
+            level: "ROW",
+            operation: "INSERT",
+            argv: Datum::Array {
+                element: ArrElem::Text,
+                raw: argv,
+            },
+            event: "",
+            tag: "",
+            exception: None,
+        };
+        let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
+        let mut context = TriggerExecContext {
+            host: PlpgsqlExecHost::Atomic {
+                storage: &mut storage,
+                seq_session: guc.seq_session(),
+            },
+            txn: &mut transaction,
+            arena: &original,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: &mut responder,
+        };
+        let mut firing = TriggerFiring::new(
+            &context,
+            code,
+            program.locals,
+            FiringBinding {
+                invocation,
+                definition,
+                old: Some(&old),
+                new: Some(&mut new),
+                level: TriggerLevel::Row,
+                before: true,
+            },
+        )
+        .unwrap();
+        let error = firing.execute(&mut context).err().unwrap();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
+        let held = rows.lease::<u8>(64 << 10).unwrap();
+        let (firing, error) = firing.suspend(&context).err().unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("row_work_bytes"));
+        drop(held);
+        let available = controls
+            .lease::<u8>(64 << 10)
+            .err()
+            .unwrap()
+            .available_leases;
+        let mut held: [Option<MutableSlice<u8>>; 64] = std::array::from_fn(|_| None);
+        for slot in &mut held[..available - 1] {
+            *slot = Some(controls.lease::<u8>(1).unwrap());
+        }
+        let (firing, error) = firing.suspend(&context).err().unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("execution_control_leases"));
+        assert_eq!(
+            controls
+                .lease::<u8>(64 << 10)
+                .err()
+                .unwrap()
+                .available_leases,
+            1
+        );
+        drop(held);
+        firing.suspend(&context).ok().unwrap()
+    });
+    columns[0].name = SqlName::parse("replaced_id").unwrap();
+    columns[1].ctype = ColType::Bool;
+    drop(original);
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(saved.saved.metadata.header.routine_oid, 43);
+        let definition = saved
+            .saved
+            .metadata
+            .definitions
+            .retained_relation(saved.saved.metadata.definition)
+            .unwrap();
+        assert_eq!(definition.columns()[0].name.as_str(), "id");
+        assert_eq!(definition.columns()[1].ctype, ColType::Text);
+        let alias = saved.saved.metadata.aliases[0].as_ref().unwrap();
+        assert_eq!(alias.types[0].0, 23);
+        assert_eq!(alias.types[1].0, 25);
+        let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
+        let mut context = TriggerExecContext {
+            host: PlpgsqlExecHost::Atomic {
+                storage: &mut storage,
+                seq_session: guc.seq_session(),
+            },
+            txn: &mut transaction,
+            arena: &small,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: &mut responder,
+        };
+        let error = saved.poll(&mut context).err().unwrap();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert_eq!(small.used(), 0);
+        assert!(matches!(saved.state, FiringState::Paused(_)));
+    });
+    crate::mem::guard::forbid_alloc(|| {
+        let metadata_bytes = resumed
+            .with_remaining_region(|scratch| {
+                let FiringState::Paused(frame) = &saved.state else {
+                    panic!("paused firing")
+                };
+                let (parsed, _code) = frame.source().parse(scratch).unwrap();
+                let values = saved.saved.values.decode(scratch).unwrap();
+                let binding = saved
+                    .saved
+                    .metadata
+                    .bind(values, parsed.input_sites, scratch)
+                    .unwrap();
+                let relations = binding.invocation.materialized_relations.unwrap();
+                assert_eq!(relations[0].0, "inserted_rows");
+                assert_eq!(relations[0].1.column_types[1].0, 25);
+                scratch.used()
+            })
+            .unwrap();
+        assert_eq!(resumed.used(), 0);
+        let available = metadata_bytes.next_multiple_of(16);
+        assert!(available + 16 < resumed.capacity());
+        resumed
+            .alloc_slice_with(resumed.capacity() - available, |_| 0xcc_u8)
+            .unwrap();
+        resumed
+            .with_remaining_region(|scratch| {
+                let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
+                let mut context = TriggerExecContext {
+                    host: PlpgsqlExecHost::Atomic {
+                        storage: &mut storage,
+                        seq_session: guc.seq_session(),
+                    },
+                    txn: &mut transaction,
+                    arena: scratch,
+                    params: crate::sql::eval::NO_PARAMS,
+                    responder: &mut responder,
+                };
+                let error = saved.poll(&mut context).err().unwrap();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+                assert_eq!(scratch.used(), 0);
+                assert!(matches!(saved.state, FiringState::Paused(_)));
+            })
+            .unwrap();
+    });
+    resumed.reset();
+    for released in [false, true] {
+        if released {
+            super::super::super::set_execution_connection_id(2);
+            storage.release_advisory_transaction_locks(200);
+            storage.finish_transaction_identity(200, true);
+            super::super::super::set_execution_connection_id(1);
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
+            let mut context = TriggerExecContext {
+                host: PlpgsqlExecHost::Atomic {
+                    storage: &mut storage,
+                    seq_session: guc.seq_session(),
+                },
+                txn: &mut transaction,
+                arena: &resumed,
+                params: crate::sql::eval::NO_PARAMS,
+                responder: &mut responder,
+            };
+            if !released {
+                super::super::super::set_execution_connection_id(2);
+                assert_eq!(
+                    saved.poll(&mut context).err().unwrap().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                assert_eq!(resumed.used(), 0);
+                super::super::super::set_execution_connection_id(1);
+            }
+            assert_eq!(
+                saved.poll(&mut context).unwrap(),
+                if released {
+                    FiringProgress::Complete { accepted: true }
+                } else {
+                    FiringProgress::Waiting
+                }
+            );
+            assert_eq!(resumed.used(), 0);
+            if released {
+                assert_eq!(
+                    saved.poll(&mut context).err().unwrap().sqlstate,
+                    sqlstate::INTERNAL_ERROR
+                );
+            }
+        });
+        resumed.reset();
+    }
+    crate::mem::guard::forbid_alloc(|| {
+        let completed = saved.new_values(&output).unwrap().unwrap();
+        assert_eq!(completed[0], Datum::Int4(12));
+        drop(saved);
+        let mut overwritten = rows.lease::<u8>(64 << 10).unwrap();
+        overwritten.extend_from_slice(&[0xff; 8192]).unwrap();
+        let all_controls = controls.lease::<u8>(64 << 10).unwrap();
+        let Datum::Text(note) = completed[1] else {
+            panic!("restored NEW.note")
+        };
+        assert_eq!(note.len(), 8197);
+        assert!(note[..8192].bytes().all(|byte| byte == b'x'));
+        assert_eq!(&note[8192..], "!once");
+        let prefix = AdvisoryKey::from_bigint(41);
+        assert!(
+            storage
+                .unlock_advisory_session(prefix, AdvisoryMode::Exclusive)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .unlock_advisory_session(prefix, AdvisoryMode::Exclusive)
+                .unwrap()
+        );
+        storage.release_advisory_transaction_locks(100);
+        storage.finish_transaction_identity(100, true);
+        drop(all_controls);
+    });
+    super::super::super::publish_execution_identity(prior);
+}

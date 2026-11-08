@@ -39,6 +39,7 @@ jobs:
             exec::local_values::ownership_tests exec::numeric_loops::ownership_tests \
             exec::diagnostics::ownership_tests \
             exec::transition_rows::ownership_tests \
+            exec::trigger_firing::ownership_tests \
             procedural_parameter_staging_ procedural_source_ \
             procedural_locals_initialize_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \

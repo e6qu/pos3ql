@@ -380,6 +380,16 @@ has restored. A memory error preserves all images and reservations, including
 when a child borrows the destination; the child's live bytes remain valid.
 This frame owner alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.
+Row and statement trigger execution now combines the compiled program, lexical
+frame, arguments and row binding in one firing owner. Saving a firing copies its
+`OLD`/`NEW` payloads and arguments into shared row-work memory, retains the selected
+column image and preserves transition aliases and declared type OIDs. Restored
+transition rows borrow immutable saved bytes; modified `NEW` values are encoded
+before temporary memory is released. Admission errors retain the previous owner,
+and attachment checks connection, database, transaction and storage ownership.
+Normal calls keep borrowing their row context. The enclosing write, routine
+settings/security context and unfinished input work still need the scheduler
+integration described above; this owner does not enable rejected checked inputs.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.

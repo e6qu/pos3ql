@@ -123,6 +123,10 @@ impl<'a> CompiledProgram<'a> {
         &self.layout.source
     }
 
+    pub(in crate::sql::exec) fn kind(&self) -> PlpgsqlProgramKind {
+        self.layout.source.kind
+    }
+
     pub(in crate::sql::exec) fn root(&self) -> TriggerBlock<'a> {
         self.blocks[0]
     }

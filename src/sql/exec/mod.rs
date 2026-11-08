@@ -794,6 +794,7 @@ mod loop_rows;
 mod numeric_loops;
 mod set_rows;
 mod transition_rows;
+mod trigger_firing;
 
 use transition_rows::{TransitionCapture, TransitionRowSets, TransitionRows};
 
@@ -3903,8 +3904,8 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     new: &mut Option<&mut [Datum<'a>]>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
-    let mut firing = context.for_trigger();
-    let context = &mut firing;
+    let mut firing_context = context.for_trigger();
+    let context = &mut firing_context;
     let (table_schema, table_name) = match target {
         crate::storage::TriggerTarget::Table(table) => {
             let target_definition = context
@@ -3970,53 +3971,20 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         materialized_relations: transition_relations,
         ..invocation
     };
-    let mut execution = execution_frame::ExecutionFrame::new(
-        context.arena,
-        &code,
-        program.locals,
-        0,
-        &context.storage().execution_control,
-        &context.storage().row_work,
-    )?;
-    execution.initialize(
+    let mut firing = trigger_firing::TriggerFiring::new(
         context,
-        invocation,
-        TriggerTransition {
+        code,
+        program.locals,
+        trigger_firing::FiringBinding {
+            invocation,
             definition: crate::storage::RelationDefinition::from_definition(definition),
             old,
-            new: new.as_deref(),
+            new: new.as_deref_mut(),
+            level: TriggerLevel::Row,
+            before,
         },
-        &code,
-        &[],
     )?;
-    match execution.execute_block(
-        context,
-        crate::storage::RelationDefinition::from_definition(definition),
-        invocation,
-        old,
-        new,
-        before,
-        transition_relations,
-        &code,
-    )? {
-        Some(TriggerFlow::Return(result)) => match result {
-            TriggerReturnValue::Null if before => Ok(false),
-            TriggerReturnValue::Old if before => {
-                let Some(old) = old else { return Ok(false) };
-                if let Some(new) = new.as_deref_mut() {
-                    new.copy_from_slice(old);
-                }
-                Ok(true)
-            }
-            TriggerReturnValue::New if before && new.is_none() => Ok(false),
-            _ => Ok(true),
-        },
-        None => Err(sql_err!(
-            sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
-            "control reached end of trigger procedure without RETURN"
-        )),
-        Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => Err(unsupported_trigger_body()),
-    }
+    firing.execute(context)
 }
 
 #[expect(
@@ -29973,47 +29941,20 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             materialized_relations: transition_relations,
             ..invocation
         };
-        let mut no_new = None;
-        let mut execution = execution_frame::ExecutionFrame::new(
-            context.arena,
-            &code,
+        let mut firing = trigger_firing::TriggerFiring::new(
+            &context,
+            code,
             program.locals,
-            0,
-            &context.storage().execution_control,
-            &context.storage().row_work,
-        )?;
-        execution.initialize(
-            &mut context,
-            invocation,
-            TriggerTransition {
+            trigger_firing::FiringBinding {
+                invocation,
                 definition: crate::storage::RelationDefinition::from_definition(definition),
                 old: None,
                 new: None,
+                level: TriggerLevel::Statement,
+                before,
             },
-            &code,
-            &[],
         )?;
-        match execution.execute_block(
-            &mut context,
-            crate::storage::RelationDefinition::from_definition(definition),
-            invocation,
-            None,
-            &mut no_new,
-            before,
-            transition_relations,
-            &code,
-        )? {
-            Some(TriggerFlow::Return(_)) => {}
-            None => {
-                return Err(sql_err!(
-                    sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
-                    "control reached end of trigger procedure without RETURN"
-                ));
-            }
-            Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
-                return Err(unsupported_trigger_body());
-            }
-        }
+        firing.execute(&mut context)?;
     }
     Ok(())
 }

@@ -283,7 +283,7 @@ impl<'a> ControlFrames<'a> {
         Ok(())
     }
 
-    fn require_workspace(&self, arena: &Arena) -> Result<(), SqlError> {
+    pub(super) fn require_workspace(&self, arena: &Arena) -> Result<(), SqlError> {
         if self.workspace != arena.identity() {
             return Err(program::changed());
         }
@@ -1138,7 +1138,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
     }
 }
 
-fn is_execution_wait(error: &SqlError) -> bool {
+pub(super) fn is_execution_wait(error: &SqlError) -> bool {
     matches!(
         error.sqlstate.internal_control(),
         Some(

@@ -66,6 +66,10 @@ SQL parameters; trigger arguments remain available through `TG_ARGV`.
 Publish transition tables only after collection ends. A paused write must own
 both row sets independently of recycled scratch; restoration must publish both
 directories together and preserve their bytes after a failed admission.
+Keep the firing's arguments, `OLD`/`NEW`, selected row columns and transition
+descriptions with its execution position. Failed capture keeps the live firing;
+failed attachment keeps its saved images. Only a complete attachment may resume
+the body, and completed firings cannot run again.
 Retain nested SQL's command and read snapshot together. Resuming it must not
 issue another command identity or restore another connection's visibility;
 completion and another pause must restore the caller's context.

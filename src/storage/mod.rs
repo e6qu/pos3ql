@@ -56769,10 +56769,10 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         let mut c = Config::default_dev();
         c.memtable_bytes = 1 << 16;
         c.max_connections = 2;
@@ -56787,7 +56787,7 @@ mod tests {
         c
     }
 
-    pub(super) fn test_budget(config: &Config) -> Budget {
+    pub(crate) fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 

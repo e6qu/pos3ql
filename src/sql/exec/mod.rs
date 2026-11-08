@@ -767,7 +767,7 @@ pub(crate) use describe::{
     visit_catalog_rowtype_fields,
 };
 pub use describe::{
-    ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
+    ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
     infer_type_pub, infer_type_res, init_record_shapes, not_composite, record_field_metadata,
     record_field_type, record_shape, register_named_composite_shape, register_shape_for,
@@ -778,7 +778,7 @@ pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
     infer_type_catalog, intrinsic_record_field_meta, record_shape_metadata,
     record_shape_pool_bytes, routine_result_metadata, unify_numeric_tower,
-    visit_array_constructor_conversions, wire_column_description, with_temporary_record_shapes,
+    visit_array_constructor_conversions, with_temporary_record_shapes,
 };
 pub(crate) use describe::{
     bound_parameter_context_active, bound_parameter_type_oid, enter_routine_parameter_types,
@@ -18488,7 +18488,7 @@ fn strip_trigger_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
         && text[keyword.len()..]
             .chars()
             .next()
-            .is_none_or(|character| character.is_ascii_whitespace())
+            .is_none_or(|character| !super::lexer::is_identifier_continue(character))
     {
         Some(&text[keyword.len()..])
     } else {
@@ -19937,7 +19937,15 @@ enum TriggerBlockEnd<'a> {
 fn trigger_tail<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     let text = text.trim_end();
     let start = text.len().checked_sub(keyword.len())?;
-    text.get(start..)?
+    let suffix = text.get(start..)?;
+    if text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(super::lexer::is_identifier_continue)
+    {
+        return None;
+    }
+    suffix
         .eq_ignore_ascii_case(keyword)
         .then_some(text[..start].trim_end())
 }
@@ -26502,14 +26510,14 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     context.txn.txid,
                     arena,
                     &mut columns,
-                )?,
+                 crate::sql::exec::DescriptionTarget::Sql)?,
                 Stmt::SetQuery(set_query) => super::query::describe_set_query(
                     context.storage(),
                     context.txn.txid,
                     set_query,
                     &mut columns,
                     arena,
-                )?,
+                 crate::sql::exec::DescriptionTarget::Sql)?,
                 _ => 0,
             };
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
@@ -26595,7 +26603,7 @@ where
     'result: 'query,
 {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
+    let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)?;
     let mut rows = ArenaList::new(result_arena);
     super::query::select_into_rows(
         storage,
@@ -26898,13 +26906,23 @@ fn execute_trigger_step<'a>(
                         "nested write lost its returned values"
                     )
                 })?;
-                if output.rows != rows {
+                let (values, returned) = match output {
+                    write_completion::NestedWriteOutput::Rows { values, rows } => (values, rows),
+                    write_completion::NestedWriteOutput::NoResult => {
+                        status.set_row_count(rows)?;
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "INTO used with a command that cannot return data"
+                        ));
+                    }
+                };
+                if returned != rows {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "nested write returned a different row count"
                     ));
                 }
-                let selected = output.values.decode(context.arena)?;
+                let selected = values.decode(context.arena)?;
                 finish_dynamic_into(
                     context,
                     locals,
@@ -27518,19 +27536,8 @@ fn execute_trigger_step<'a>(
                             let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
                                 unreachable!("cursor host cannot change during execution")
                             };
-                            let description = cursors.description(name).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_CURSOR,
-                                    "cursor \"{}\" does not exist",
-                                    name
-                                )
-                            })?;
                             let mut borrowed_names = [None; MAX_COLUMNS];
-                            let count = super::cursor::description_columns(
-                                description,
-                                &mut borrowed_names,
-                                &mut column_type_oids,
-                            )?;
+                            let count = cursors.record_columns(name, &mut borrowed_names, &mut column_type_oids)?;
                             for (target, source) in column_names[..count]
                                 .iter_mut()
                                 .zip(&borrowed_names[..count])
@@ -27730,7 +27737,7 @@ fn execute_trigger_step<'a>(
                     context.txn.txid,
                     arena,
                     &mut columns,
-                )?;
+                 crate::sql::exec::DescriptionTarget::Sql)?;
                 for (field, column) in fields.iter_mut().zip(&columns[..width]) {
                     *field = (
                         arena
@@ -27864,6 +27871,12 @@ fn execute_trigger_step<'a>(
                 DynamicCommandKind::Statement,
             )?;
             let query = resolve_plpgsql_dynamic_prepared(context, query)?;
+            let has_result = match query.statement {
+                Stmt::Insert(statement) => !statement.returning.is_empty(),
+                Stmt::Update(statement) => !statement.returning.is_empty(),
+                Stmt::Delete(statement) => !statement.returning.is_empty(),
+                _ => true,
+            };
             with_bound_parameter_types(query.parameter_types, || {
                 let record_target = statement.targets.len() == 1
                     && matches!(
@@ -27871,44 +27884,108 @@ fn execute_trigger_step<'a>(
                         ColType::Record | ColType::Composite(_)
                     );
                 let (record_width, record_names, record_type_oids) = {
-                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                    let record_width = match query.statement {
-                        Stmt::Select(select) if record_target => super::query::describe_select(
-                            select,
-                            context.storage(),
-                            context.txn.txid,
-                            context.arena,
-                            &mut columns,
-                        )?,
-                        Stmt::SetQuery(set_query) if record_target => {
-                            super::query::describe_set_query(
-                                context.storage(),
-                                context.txn.txid,
-                                set_query,
-                                &mut columns,
-                                context.arena,
-                            )?
-                        }
-                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if record_target => {
-                            describe_data_modification_columns(
-                                context.storage(),
-                                query.statement,
-                                context.arena,
-                                context.txn.txid,
-                                &mut columns,
-                            )?
-                        }
-                        _ => 0,
-                    };
                     let mut names = [StackStr::<63>::new(); MAX_PROJ];
                     let mut type_oids = [0i32; MAX_PROJ];
-                    for (index, column) in columns[..record_width].iter().enumerate() {
-                        names[index] = StackStr::from_str(column.name);
-                        type_oids[index] = column.type_oid;
-                    }
-                    (record_width, names, type_oids)
+                    let width = if record_target
+                        && let Stmt::FetchCursor {
+                            name,
+                            move_only: false,
+                            ..
+                        } = query.statement
+                    {
+                        let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SQL cursors are not available in trigger execution"
+                            ));
+                        };
+                        let mut borrowed = [None; MAX_PROJ];
+                        let width = cursors.record_columns(name, &mut borrowed, &mut type_oids)?;
+                        for (name, source) in names[..width].iter_mut().zip(&borrowed[..width]) {
+                            *name = StackStr::from_str(
+                                source.expect("cursor description name initialized"),
+                            );
+                        }
+                        width
+                    } else {
+                        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                        let width = match query.statement {
+                            Stmt::Select(select) if record_target => super::query::describe_select(
+                                select,
+                                context.storage(),
+                                context.txn.txid,
+                                context.arena,
+                                &mut columns,
+                             crate::sql::exec::DescriptionTarget::Sql)?,
+                            Stmt::SetQuery(set_query) if record_target => {
+                                super::query::describe_set_query(
+                                    context.storage(),
+                                    context.txn.txid,
+                                    set_query,
+                                    &mut columns,
+                                    context.arena,
+                                 crate::sql::exec::DescriptionTarget::Sql)?
+                            }
+                            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+                                if record_target =>
+                            {
+                                describe_data_modification_columns(
+                                    context.storage(),
+                                    query.statement,
+                                    context.arena,
+                                    context.txn.txid,
+                                    &mut columns,
+                                 crate::sql::exec::DescriptionTarget::Sql)?
+                            }
+                            Stmt::Show(name) if record_target => {
+                                let title = super::guc::canonical_setting_name(name)?;
+                                let title = context
+                                    .arena
+                                    .alloc_str(title.as_str())
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                columns[0] = ColDesc::new(title, super::types::oid::TEXT, -1);
+                                1
+                            }
+                            Stmt::ShowAll if record_target => {
+                                columns[..3].copy_from_slice(&super::guc::SHOW_ALL_COLUMNS);
+                                3
+                            }
+                            Stmt::Explain { .. } if record_target => {
+                                columns[0] =
+                                    ColDesc::new("QUERY PLAN", super::types::oid::TEXT, -1);
+                                1
+                            }
+                            _ => 0,
+                        };
+                        for (index, column) in columns[..width].iter().enumerate() {
+                            names[index] = StackStr::from_str(column.name);
+                            type_oids[index] = column.type_oid;
+                        }
+                        width
+                    };
+                    (width, names, type_oids)
                 };
                 let arena = context.arena;
+                let prepare_empty_record = |selected: &mut [Datum<'a>],
+                                            found: bool|
+                 -> Result<(), SqlError> {
+                    if record_target && !found && !statement.strict {
+                        let fields = arena
+                            .alloc_slice_with(record_width, |index| RecordField {
+                                name: "",
+                                type_oid: record_type_oids[index],
+                                value: Datum::Null,
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        for (field, name) in fields.iter_mut().zip(&record_names[..record_width]) {
+                            field.name = arena
+                                .alloc_str(name.as_str())
+                                .map_err(|_| super::query::arena_full_pub())?;
+                        }
+                        selected[0] = Datum::Record(fields);
+                    }
+                    Ok(())
+                };
                 let mut capture = |values: &[Datum]| {
                     if !record_target && values.len() != statement.targets.len() {
                         return Err(sql_err!(
@@ -28088,8 +28165,14 @@ fn execute_trigger_step<'a>(
                                 if control_flow::is_execution_wait(&error)
                                     && let Some(pending) = &mut status.pending_write
                                 {
+                                    let values = if has_result {
+                                        prepare_empty_record(&mut selected, found)?;
+                                        Some(&selected[..statement.targets.len()])
+                                    } else {
+                                        None
+                                    };
                                     pending.save_output(
-                                        &selected[..statement.targets.len()],
+                                        values,
                                         row_count as u64,
                                         &context.storage().row_work,
                                     )?;
@@ -28097,6 +28180,13 @@ fn execute_trigger_step<'a>(
                                 return Err(error);
                             }
                         };
+                        if !has_result {
+                            status.set_row_count(affected)?;
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "INTO used with a command that cannot return data"
+                            ));
+                        }
                         debug_assert_eq!(affected, row_count as u64);
                     }
                     _ => {
@@ -28106,6 +28196,7 @@ fn execute_trigger_step<'a>(
                         ));
                     }
                 }
+                prepare_empty_record(&mut selected, found)?;
                 finish_dynamic_into(
                     context,
                     locals,
@@ -62073,7 +62164,7 @@ pub fn describe_merge_returning<'a>(
     statement: &crate::sql::ast::Merge<'a>,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
-) -> Result<usize, SqlError> {
+ description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
     use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
 
     let target = TableRef {
@@ -62179,7 +62270,7 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-            );
+             description_target);
             scope.names[0] = saved_name;
             count += width?;
         } else if uses_output_alias(item) {
@@ -62232,7 +62323,7 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-            )?;
+             description_target)?;
         } else if matches!(item, SelectItem::Wildcard) {
             let source_star =
                 SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
@@ -62246,7 +62337,7 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-            )?;
+             description_target)?;
             count += super::query::describe_scope_items(
                 core::slice::from_ref(&target_star),
                 &scope,
@@ -62255,7 +62346,7 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-            )?;
+             description_target)?;
         } else {
             let width = super::query::describe_scope_items(
                 core::slice::from_ref(item),
@@ -62265,7 +62356,7 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-            )?;
+             description_target)?;
             count += width;
         }
     }
@@ -62758,7 +62849,7 @@ pub(crate) fn merge<'a>(
         let mark = arena.mark();
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         let count =
-            match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns) {
+            match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns, crate::sql::exec::DescriptionTarget::Wire) {
                 Ok(count) => count,
                 Err(error) => {
                     unsafe { arena.rewind_to(mark) };
@@ -64975,7 +65066,7 @@ pub(crate) fn instead_of_view_dml<'a>(
             txn.txid,
             arena,
             &mut description,
-        ) {
+         crate::sql::exec::DescriptionTarget::Wire) {
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
@@ -65006,7 +65097,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                     txn.txid,
                     arena,
                     &mut source_columns,
-                ) {
+                 crate::sql::exec::DescriptionTarget::Sql) {
                     Ok(count) => count,
                     Err(error) => return sql_fail(error),
                 };
@@ -66008,7 +66099,7 @@ where
             txn.txid,
             arena,
             &mut columns,
-        ) {
+         crate::sql::exec::DescriptionTarget::Wire) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -67384,7 +67475,7 @@ pub(crate) fn update<'a>(
             txn.txid,
             arena,
             &mut columns,
-        ) {
+         crate::sql::exec::DescriptionTarget::Wire) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -68444,7 +68535,7 @@ pub(crate) fn delete<'a>(
             txn.txid,
             arena,
             &mut columns,
-        ) {
+         crate::sql::exec::DescriptionTarget::Wire) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }

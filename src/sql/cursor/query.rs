@@ -21,6 +21,7 @@ pub(crate) struct CursorQuery {
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
+    result_type_oids: Option<&'static [i32]>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
 }
@@ -59,6 +60,7 @@ impl CursorQuery {
         Ok(Self {
             bound: None,
             retained: None,
+            result_type_oids: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
         })
@@ -66,6 +68,7 @@ impl CursorQuery {
 
     pub(crate) fn clear(&mut self) {
         self.retained = None;
+        self.result_type_oids = None;
         self.bound = None;
         self.arena.reset();
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
@@ -73,6 +76,10 @@ impl CursorQuery {
 
     pub(crate) fn is_bound(&self) -> bool {
         self.bound.is_some()
+    }
+
+    pub(crate) fn result_type_oids(&self) -> Option<&[i32]> {
+        self.result_type_oids
     }
 
     pub(crate) fn bind(
@@ -202,6 +209,40 @@ impl CursorQuery {
         responder: &mut crate::pg::respond::Responder<'_>,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
+        if self.result_type_oids.is_none() {
+            let mut types = [0; crate::sql::MAX_PROJ];
+            let count = self.arena.with_remaining_region(|scratch| {
+                crate::sql::type_input_plans::with_owner(self.owner, || {
+                    crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+                        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0);
+                            crate::sql::MAX_PROJ];
+                        let count = match bound.statement {
+                            CursorStatement::Select(select) => {
+                                let select = crate::sql::query::expand_ctes(select, storage, txid, scratch)?;
+                                crate::sql::query::describe_select(
+                                    select, storage, txid, scratch, &mut columns,
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                )?
+                            },
+                            CursorStatement::SetQuery(query) => crate::sql::query::describe_set_query(
+                                storage, txid, query, &mut columns, scratch,
+                                crate::sql::exec::DescriptionTarget::Sql,
+                            )?,
+                        };
+                        for (target, column) in types.iter_mut().zip(&columns[..count]) {
+                            *target = column.type_oid;
+                        }
+                        Ok::<_, SqlError>(count)
+                    })
+                })
+            }).map_err(|_| query_full())??;
+            let types = self.arena.alloc_slice_copy(&types[..count]).map_err(|_| query_full())?;
+            // This private allocation also owns the bound query. clear drops
+            // both owners before resetting it; callers receive shortened borrows.
+            self.result_type_oids = Some(unsafe {
+                core::mem::transmute::<&[i32], &'static [i32]>(types)
+            });
+        }
         let CursorStatement::Select(statement) = bound.statement else {
             return Ok(false);
         };

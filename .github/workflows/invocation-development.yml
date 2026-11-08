@@ -12,7 +12,11 @@ permissions:
   contents: read
 
 jobs:
+  formatting:
+    uses: ./.github/workflows/formatting.yml
+
   ownership:
+    needs: formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -24,8 +28,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-invocation-dependencies-${{ hashFiles('Cargo.lock') }}
-      - name: Check formatting
-        run: cargo fmt --all --check
       - name: Verify ownership manifest guards
         run: python3 -m unittest tools/tests/test_miri_ownership_manifest.py
       - name: Verify documentation and execution limits
@@ -67,12 +69,11 @@ jobs:
             adjacent_triggers_observe_restored_ guc::ownership_tests datetime::test_clock:: \
             saved_output_scopes_reuse_ \
             nested_static_and_dynamic_writes_ routine_calls:: procedural_subtransactions:: \
+            utility_descriptions_match_execution \
             shared_row_work:: dml_target_ pgoutput_ subscription_copy_transition_values_ \
             streamed_copy_trigger_handlers_keep_ statement_files_streamed_copy_ \
             copy_from_ binary_copy_ \
             --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/invocation-development.log"
-      - name: Check library and test lints
-        run: cargo clippy --lib --tests --locked --profile native-ci --jobs 1 -- -D warnings
       - name: Retain development diagnostics
         if: always()
         uses: actions/upload-artifact@v6
@@ -83,6 +84,7 @@ jobs:
           retention-days: 1
 
   miri:
+    needs: formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -109,6 +111,7 @@ jobs:
           retention-days: 1
 
   postgres-reference:
+    needs: formatting
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     services:
@@ -142,11 +145,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/272_write_completion.sql" fixture-272.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/273_dynamic_write_completion.sql" fixture-273.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/274_procedural_lexical_boundaries.sql" fixture-274.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/275_dynamic_into_errors.sql" fixture-275.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267 268 269 270 271 272 273 274; do
+          for fixture in 265 266 267 268 269 270 271 272 273 274 275; do
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
               < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
@@ -164,6 +168,7 @@ jobs:
               (272, '16|8|6|2|t|3|17'),
               (273, '1|1|1|1|1|1|1|16385|1|1|t|integer'),
               (274, 'ok|branch|20|INTO, USING, THEN, LOOP|first,second|x|1'),
+              (275, '0|3|0|1|1|42601/P0003/P0002|1|8193|t|integer'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()

@@ -5431,7 +5431,7 @@ pub struct ColDesc<'a> {
 }
 
 impl<'a> ColDesc<'a> {
-    pub fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
+    pub const fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
         Self {
             name,
             type_oid,

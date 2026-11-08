@@ -2489,11 +2489,11 @@ pub(crate) mod test_clock {
         crate::mem::guard::forbid_alloc(|| {
             let outer = enter(812_345_678_901_234);
             assert_eq!(super::now_micros(), 812_345_678_901_234);
-            let failed: Result<(), ()> = (|| {
+            let failed: Result<(), ()> = {
                 let _inner = enter(812_345_678_901_235);
                 assert_eq!(super::now_micros(), 812_345_678_901_235);
                 Err(())
-            })();
+            };
             assert!(failed.is_err());
             assert_eq!(super::now_micros(), 812_345_678_901_234);
             drop(outer);

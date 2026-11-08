@@ -236,9 +236,12 @@ pub(super) struct PendingNestedWrite {
     output: Option<NestedWriteOutput>,
 }
 
-pub(super) struct NestedWriteOutput {
-    pub(super) values: local_values::SavedValues,
-    pub(super) rows: u64,
+pub(super) enum NestedWriteOutput {
+    Rows {
+        values: local_values::SavedValues,
+        rows: u64,
+    },
+    NoResult,
 }
 
 impl PendingNestedWrite {
@@ -256,7 +259,7 @@ impl PendingNestedWrite {
 
     pub(super) fn save_output(
         &mut self,
-        values: &[Datum<'_>],
+        values: Option<&[Datum<'_>]>,
         rows: u64,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
@@ -266,11 +269,16 @@ impl PendingNestedWrite {
                 "nested write output is already saved"
             ));
         }
-        let mut saved = local_values::SavedValues::new(pool)?;
-        saved.replace(values)?;
-        self.output = Some(NestedWriteOutput {
-            values: saved,
-            rows,
+        self.output = Some(match values {
+            Some(values) => {
+                let mut saved = local_values::SavedValues::new(pool)?;
+                saved.replace(values)?;
+                NestedWriteOutput::Rows {
+                    values: saved,
+                    rows,
+                }
+            }
+            None => NestedWriteOutput::NoResult,
         });
         Ok(())
     }

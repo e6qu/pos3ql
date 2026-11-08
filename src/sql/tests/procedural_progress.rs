@@ -1512,78 +1512,95 @@ fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
 
 #[test]
 fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings() {
-    let fixture =
-        include_str!("../../../tests/external/differential/273_dynamic_write_completion.sql");
-    let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
-    let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
-    for mode in [
-        crate::config::TransactionMode::Mvcc,
-        crate::config::TransactionMode::Locking,
+    for (label, fixture, probe, expected_probe, expected) in [
+        (
+            "returned",
+            include_str!("../../../tests/external/differential/273_dynamic_write_completion.sql"),
+            "SELECT 40+2; SELECT (SELECT last_value FROM dynamic_held_bind),(SELECT last_value FROM dynamic_held_child)",
+            ["42", "1|1"],
+            "1|1|1|1|1|1|1|16385|1|1|t|integer",
+        ),
+        (
+            "into-errors",
+            include_str!("../../../tests/external/differential/275_dynamic_into_errors.sql"),
+            "SELECT 40+2; SELECT last_value FROM into_edge_sequence",
+            ["42", "1"],
+            "0|3|0|1|1|42601/P0003/P0002|1|8193|t|integer",
+        ),
     ] {
-        let mut config = test_config(&format!("dynamic-nested-returning-{mode:?}"));
-        config.transaction_mode = mode;
-        config.execution_control_bytes = 64 << 10;
-        config.execution_control_leases = 64;
-        config.row_work_bytes = 128 << 10;
-        config.row_work_leases = 64;
-        let mut budget = test_engine_budget(&config, 1 << 29);
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-        let mut holder =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(&mut engine, setup, true);
-        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
-        let mut status = writer.execute_status(&mut engine, write, true);
-        for released in [false, false, true] {
-            let ExecutionStatus::Blocked {
-                completed_statements,
-                output_mark,
-                wait,
-            } = status
-            else {
-                panic!(
-                    "dynamic write failed to retain returned values: {status:?}: {}",
-                    String::from_utf8_lossy(writer.send.readable())
-                );
-            };
-            assert_eq!(wait, StatementWait::Lock);
-            assert_eq!(data_rows(writer.send.readable()), ["10"]);
-            assert!(command_tags(writer.send.readable()).is_empty());
-            assert_eq!(data_rows(&holder.success(&mut engine,
-                "SELECT 40+2; SELECT (SELECT last_value FROM dynamic_held_bind),(SELECT last_value FROM dynamic_held_child)",true)),["42","1|1"]);
-            if released {
-                holder.success(&mut engine, "COMMIT", true);
-            }
-            writer.send.truncate_to(output_mark);
-            writer.arena.recycle_front();
-            status = crate::mem::guard::forbid_alloc(|| {
-                engine.execute_simple_from(
-                    write,
+        let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+        let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("dynamic-nested-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine, setup, true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+            let mut status = writer.execute_status(&mut engine, write, true);
+            for released in [false, false, true] {
+                let ExecutionStatus::Blocked {
                     completed_statements,
-                    &writer.arena,
-                    &mut writer.transaction,
-                    &mut writer.pool,
-                    &mut writer.cursors,
-                    &writer.guc,
-                    &mut Responder::new(&mut writer.send),
-                    writer.connection_id,
-                    false,
-                )
-            })
-            .unwrap();
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "dynamic write failed to retain returned values: {status:?}: {}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                assert!(command_tags(writer.send.readable()).is_empty());
+                assert_eq!(
+                    data_rows(&holder.success(&mut engine, probe, true)),
+                    expected_probe
+                );
+                if released {
+                    holder.success(&mut engine, "COMMIT", true);
+                }
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        write,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(data_rows(writer.send.readable()), ["10"]);
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+            assert_eq!(
+                data_rows(&writer.success(&mut engine, inspect, true)),
+                [expected]
+            );
         }
-        assert_eq!(status, ExecutionStatus::Complete);
-        assert!(
-            error_sqlstates(writer.send.readable()).is_empty(),
-            "{}",
-            String::from_utf8_lossy(writer.send.readable())
-        );
-        assert_eq!(data_rows(writer.send.readable()), ["10"]);
-        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
-        assert_eq!(
-            data_rows(&writer.success(&mut engine, inspect, true)),
-            ["1|1|1|1|1|1|1|16385|1|1|t|integer"]
-        );
     }
 }
 
@@ -1610,6 +1627,43 @@ fn procedural_source_boundaries_follow_sql_quoting_comments_and_subscripts() {
             data_rows(&session.success(&mut engine, sql, true)),
             ["ok|branch|20|INTO, USING, THEN, LOOP|first,second|x|1"],
             "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn utility_descriptions_match_execution() {
+    let config = test_config("utility-descriptions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine, "CREATE DOMAIN described_positive AS integer CHECK(VALUE>0)", true);
+    for sql in [
+        "SELECT NULL::described_positive AS value",
+        "SELECT (SELECT NULL::described_positive) AS value",
+        "SELECT value FROM (SELECT NULL::described_positive AS value) s",
+        "SELECT NULL::described_positive AS value UNION ALL SELECT NULL::described_positive WHERE false",
+    ] {
+        let described = describe_with(&mut engine, &mut budget, sql);
+        let executed = session.success(&mut engine, sql, false);
+        assert_eq!(row_description_type_oids(&described), [types::oid::INT4], "{sql}");
+        assert_eq!(row_description_type_oids(&executed), [types::oid::INT4], "{sql}");
+    }
+    for (sql, names) in [
+        ("SHOW TIMEZONE", &["TimeZone"][..]),
+        ("SHOW DateStyle", &["DateStyle"][..]),
+        ("SHOW IntervalStyle", &["IntervalStyle"][..]),
+        ("SHOW application_name", &["application_name"][..]),
+        ("SHOW ALL", &["name", "setting", "description"][..]),
+    ] {
+        let described = describe_with(&mut engine, &mut budget, sql);
+        let executed = session.success(&mut engine, sql, false);
+        assert_eq!(row_description_names(&described), names, "{sql}");
+        assert_eq!(row_description_names(&executed), names, "{sql}");
+        assert_eq!(
+            row_description_type_oids(&described),
+            row_description_type_oids(&executed),
+            "{sql}"
         );
     }
 }

@@ -17,6 +17,32 @@ use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
 
+/// SQL records retain declared type identities; protocol descriptions expose
+/// the representation expected by PostgreSQL clients.
+#[derive(Clone, Copy)]
+pub enum DescriptionTarget {
+    Sql,
+    Wire,
+}
+
+impl DescriptionTarget {
+    pub(crate) fn finish(
+        self,
+        columns: &mut [ColDesc<'_>],
+        storage: Option<&crate::storage::Storage>,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if let Self::Wire = self
+            && let Some(storage) = storage
+        {
+            for column in columns {
+                *column = wire_column_description(*column, storage, txid)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The atttypmod RowDescription reports for an output expression: a bare table
 /// column carries its declared modifier, a cast its target's, and every other
 /// expression `-1` — matching what PostgreSQL sends (`upper(v)` has none even
@@ -77,6 +103,7 @@ pub(crate) fn wire_column_description<'a>(
     Ok(description)
 }
 
+#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<crate::storage::RelationDefinition<'_>>,
@@ -85,8 +112,8 @@ pub fn describe_items<'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
-) -> Result<usize, SqlError> {
-    describe_items_with_output_aliases(
+ description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    let count = describe_items_with_output_aliases(
         items,
         DescribeContext {
             def,
@@ -97,7 +124,9 @@ pub fn describe_items<'q>(
             arena,
         },
         out,
-    )
+    )?;
+    description_target.finish(&mut out[..count], storage, txid)?;
+    Ok(count)
 }
 
 #[derive(Clone, Copy)]
@@ -139,10 +168,7 @@ fn describe_items_with_output_aliases<'q>(
                     "target lists can have at most 1664 entries"
                 ));
             }
-            out[n] = match storage {
-                Some(storage) => wire_column_description(desc, storage, txid)?,
-                None => desc,
-            };
+            out[n] = desc;
             n += 1;
             Ok(())
         };
@@ -272,13 +298,13 @@ pub(crate) fn describe_data_modification_columns<'a>(
     arena: &'a crate::mem::arena::Arena,
     txid: u32,
     columns: &mut [ColDesc<'a>],
-) -> Result<usize, SqlError> {
+ description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
     use crate::sql::ast::Stmt;
     if let Stmt::Merge(merge) = statement {
         if merge.returning.is_empty() {
             return Ok(0);
         }
-        return crate::sql::exec::describe_merge_returning(storage, txid, merge, arena, columns);
+        return crate::sql::exec::describe_merge_returning(storage, txid, merge, arena, columns, description_target);
     }
     let (target, returning, target_alias) = match statement {
         Stmt::Insert(insert) => {
@@ -333,12 +359,13 @@ pub(crate) fn describe_data_modification_columns<'a>(
             txid,
             arena,
             columns,
-        )
+         description_target)
     })
 }
 
 /// Describe a single DML target's `RETURNING` list, including the names that
 /// PostgreSQL adds only to the output scope.
+#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
 pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     returning: crate::sql::ast::Returning<'q>,
     definition: Option<&TableDef>,
@@ -347,7 +374,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
-) -> Result<usize, SqlError> {
+ description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
     let count = describe_items_with_output_aliases(
         returning.items,
@@ -370,6 +397,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             }
         )
     }) {
+        description_target.finish(&mut out[..count], storage, txid)?;
         return Ok(count);
     }
     let Some(storage) = storage else {
@@ -434,6 +462,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             }
         }
     }
+    description_target.finish(&mut out[..count], Some(storage), txid)?;
     Ok(count)
 }
 

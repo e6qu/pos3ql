@@ -480,6 +480,19 @@ and types, before a child trigger waits. Resumption assigns those saved values
 without evaluating the command text or `USING` arguments again. Dynamic execution
 updates `ROW_COUNT` while preserving `FOUND`; `STRICT` checks the completed row
 count. The saved values use the existing row-work pool.
+An `EXECUTE 'UPDATE orders ...' INTO result` needs `RETURNING` to supply values.
+Without it, SQLSTATE `42601` follows the command and its triggers; a surrounding
+exception block rolls back their writes, while issued sequence values remain
+issued. Empty results keep their field names and declared types with NULL values.
+`STRICT` errors preserve the target's earlier value and expose the completed row
+count to diagnostics. These boundaries follow the
+[PostgreSQL 18.6 executor](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c).
+SQL record descriptions retain declared types separately from the protocol's
+wire descriptions. For example, after `FETCH` from a cursor selecting
+`NULL::positive_integer`, `pg_typeof(result.id)` still names that domain,
+including when no row was fetched. Each cursor keeps only the selected type IDs
+in its existing `cursor_query_bytes` arena; no extra per-cursor pool is reserved.
+`SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
 Unowned row phases still reject suspension with `0A000`; their full continuations
 remain required before enabling those waits. Completed function calls and query
 values also need complete ownership before their temporary query memory can be

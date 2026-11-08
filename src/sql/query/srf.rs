@@ -2304,7 +2304,7 @@ pub(crate) fn describe_derived_definition<'a>(
             &mut descriptors,
             arena,
             Some(&mut type_oids),
-        )?,
+         crate::sql::exec::DescriptionTarget::Sql)?,
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;
@@ -2316,7 +2316,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     txid,
                     arena,
                     &mut descriptors,
-                )?;
+                 crate::sql::exec::DescriptionTarget::Sql)?;
                 // A bare scalar/array subquery item (possibly correlated) has
                 // no static type from the scope and describes as text; infer
                 // its real type from the inner select's projection so the
@@ -2432,7 +2432,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     txid,
                     arena,
                     &mut descriptors,
-                )?;
+                 crate::sql::exec::DescriptionTarget::Sql)?;
                 preserve_projection_type_identities(
                     sub.items,
                     Some(outer),
@@ -2456,7 +2456,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     txid,
                     arena,
                     &mut descriptors,
-                )?;
+                 crate::sql::exec::DescriptionTarget::Sql)?;
                 let mut slot = 0usize;
                 for item in sub.items {
                     if let SelectItem::Expr { expression, .. } = item {

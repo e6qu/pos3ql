@@ -20,6 +20,12 @@ use super::eval::SqlError;
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
 
+pub(crate) const SHOW_ALL_COLUMNS: [super::types::ColDesc<'static>; 3] = [
+    super::types::ColDesc::new("name", super::types::oid::TEXT, -1),
+    super::types::ColDesc::new("setting", super::types::oid::TEXT, -1),
+    super::types::ColDesc::new("description", super::types::oid::TEXT, -1),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrngState {
     s0: u64,

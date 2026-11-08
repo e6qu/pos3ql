@@ -1156,7 +1156,7 @@ impl<'a> RetainedSelect<'a> {
             txid,
             arena,
             &mut columns,
-        )?;
+         crate::sql::exec::DescriptionTarget::Sql)?;
         let subqueries = SubqueryValues {
             scalars: &[],
             lists: &[],
@@ -1304,6 +1304,9 @@ impl<'a> RetainedSelect<'a> {
                 available: !eliminated,
             }
         };
+        crate::sql::exec::DescriptionTarget::Wire.finish(
+            &mut columns[..width], Some(storage), txid,
+        )?;
         responder
             .row_description(&columns[..width])
             .map_err(|_| match mode {

@@ -72,8 +72,11 @@ both the saved call and the caller's context usable.
 
 Nested INSERT, UPDATE and DELETE keep their command, read snapshot and unfinished
 AFTER work with the calling trigger. Qualify dynamic SQL and returned-value
-ownership against PostgreSQL and repeated waits, including unchanged `FOUND` and
-once-only `USING` arguments. Finish retaining unfinished row phases. Resume the same command;
+ownership against PostgreSQL and repeated waits, including unchanged `FOUND`,
+once-only `USING` arguments, typed empty records and error/rollback boundaries.
+Keep declared record types separate from protocol representations, including
+domains returned by SELECT, RETURNING and empty or non-empty FETCH results.
+Finish retaining unfinished row phases. Resume the same command;
 completion and another pause must restore the caller's visibility. Triggers
 cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`
 continues to carry trigger arguments. Only completed row collections may become

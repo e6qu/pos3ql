@@ -9944,7 +9944,7 @@ impl Engine {
                             txn.txid,
                             arena,
                             &mut result_columns,
-                        )
+                         crate::sql::exec::DescriptionTarget::Wire)
                     }),
                 Stmt::SetQuery(query) => query::describe_set_query(
                     &self.storage,
@@ -9952,15 +9952,15 @@ impl Engine {
                     query,
                     &mut result_columns,
                     arena,
-                ),
+                 crate::sql::exec::DescriptionTarget::Wire),
                 Stmt::With { statement, .. } => self.describe_data_modification_columns(
                     statement,
                     arena,
                     txn,
                     &mut result_columns,
-                ),
+                 crate::sql::exec::DescriptionTarget::Wire),
                 Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(statement, arena, txn, &mut result_columns),
+                    .describe_data_modification_columns(statement, arena, txn, &mut result_columns, crate::sql::exec::DescriptionTarget::Wire),
                 _ => Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "utility statements cannot be prepared"
@@ -13375,8 +13375,8 @@ impl Engine {
         arena: &'a Arena,
         txn: &TxnState,
         columns: &mut [ColDesc<'a>],
-    ) -> Result<usize, SqlError> {
-        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns)
+     description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns, description_target)
     }
 
     fn describe_data_modification<'a>(
@@ -13387,7 +13387,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match self.describe_data_modification_columns(statement, arena, txn, &mut columns) {
+        match self.describe_data_modification_columns(statement, arena, txn, &mut columns, crate::sql::exec::DescriptionTarget::Wire) {
             Ok(count) => {
                 if count == 0 {
                     responder.no_data()?;
@@ -13476,38 +13476,10 @@ impl Engine {
                     }
                 };
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                let described = match &s.from {
-                    Some(from) => {
-                        match query::QueryScope::resolve_schema(
-                            &self.storage,
-                            from,
-                            txn.txid,
-                            arena,
-                            None,
-                        ) {
-                            Ok(scope) => query::describe_select_items(
-                                s.items,
-                                Some(&scope),
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                &mut columns,
-                            ),
-                            Err(e) => {
-                                responder.error(e.sqlstate, e.message.as_str())?;
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    None => query::describe_select_items(
-                        s.items,
-                        None,
-                        &self.storage,
-                        txn.txid,
-                        arena,
-                        &mut columns,
-                    ),
-                };
+                let described = query::describe_select(
+                    s, &self.storage, txn.txid, arena, &mut columns,
+                    exec::DescriptionTarget::Wire,
+                );
                 match described {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
@@ -13521,7 +13493,7 @@ impl Engine {
             }
             Stmt::SetQuery(q) => {
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                match query::describe_set_query(&self.storage, txn.txid, q, &mut columns, arena) {
+                match query::describe_set_query(&self.storage, txn.txid, q, &mut columns, arena, crate::sql::exec::DescriptionTarget::Wire) {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
                         Ok(true)
@@ -13597,7 +13569,18 @@ impl Engine {
                 Ok(true)
             }
             Stmt::Show(name) => {
-                responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+                let title = match guc::canonical_setting_name(name) {
+                    Ok(title) => title,
+                    Err(error) => {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(false);
+                    }
+                };
+                responder.row_description(&[ColDesc::new(title.as_str(), types::oid::TEXT, -1)])?;
+                Ok(true)
+            }
+            Stmt::ShowAll => {
+                responder.row_description(&guc::SHOW_ALL_COLUMNS)?;
                 Ok(true)
             }
             Stmt::FetchCursor {
@@ -13694,7 +13677,7 @@ impl Engine {
             // Protocol and CTE outputs share view rewriting, target ownership,
             // aliases, and catalog-derived result types.
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs)?;
+            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs, crate::sql::exec::DescriptionTarget::Sql)?;
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,
@@ -23740,18 +23723,11 @@ impl Engine {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        // The column titles as PostgreSQL canonicalizes them: most parameters
-        // are lowercase, but a few keep their registered mixed case.
-        let title = if name.eq_ignore_ascii_case("timezone") {
-            "TimeZone"
-        } else if name.eq_ignore_ascii_case("datestyle") {
-            "DateStyle"
-        } else if name.eq_ignore_ascii_case("intervalstyle") {
-            "IntervalStyle"
-        } else {
-            name
+        let title = match guc::canonical_setting_name(name) {
+            Ok(title) => title,
+            Err(error) => return Ok(Err(error)),
         };
-        responder.row_description(&[ColDesc::new(title, types::oid::TEXT, -1)])?;
+        responder.row_description(&[ColDesc::new(title.as_str(), types::oid::TEXT, -1)])?;
         responder.data_row(&[Datum::Text(value.as_str())])?;
         responder.command_complete("SHOW")?;
         Ok(Ok(()))
@@ -23765,11 +23741,7 @@ impl Engine {
         txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        responder.row_description(&[
-            ColDesc::new("name", types::oid::TEXT, -1),
-            ColDesc::new("setting", types::oid::TEXT, -1),
-            ColDesc::new("description", types::oid::TEXT, -1),
-        ])?;
+        responder.row_description(&guc::SHOW_ALL_COLUMNS)?;
         self.visit_show_all_rows(guc, txn, |name, value| {
             responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
         })?;

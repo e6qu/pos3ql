@@ -112,8 +112,11 @@ Keep the original command deadline, settings, identity, snapshot and clocks
 while binding inputs, waiting, running handlers or crossing internal commits.
 Keep the unfinished instruction's receipt position separate from the firing's
 completed instructions. A sequence or advisory-lock call before a wait in the
-same SQL expression must not run twice. Extend this ownership to the remaining
-expression values and query positions before allowing their object-store waits.
+same SQL expression must not run twice. Preserve the unfinished `PERFORM` owner's
+completed function results and selected inputs across repeated waits, including
+new calls after resumption and ordinary temporary-memory reuse. Extend that
+ownership to the remaining expression values, function bodies and query positions
+before allowing their object-store waits.
 Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-request-path),
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its

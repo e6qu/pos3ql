@@ -57,6 +57,7 @@ pub(super) struct SuspendedExecutionFrame {
     outputs: MutableSlice<OutputBinding>,
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::super::sequence::SavedStatementPosition>,
+    pending_query: Option<super::super::query::RoutineInvocationState>,
     initialization: Initialization,
 }
 
@@ -123,6 +124,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             outputs,
             pending_write,
             pending_statement,
+            pending_query,
         } = self.status;
         Ok(SuspendedExecutionFrame {
             locals,
@@ -137,6 +139,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             outputs,
             pending_write,
             pending_statement,
+            pending_query,
             initialization: self.initialization,
         })
     }
@@ -167,6 +170,7 @@ impl SuspendedExecutionFrame {
             outputs,
             pending_write,
             pending_statement,
+            pending_query,
             initialization,
         } = self;
         let mark = arena.mark();
@@ -185,6 +189,7 @@ impl SuspendedExecutionFrame {
                         outputs,
                         pending_write,
                         pending_statement,
+                        pending_query,
                         initialization,
                     },
                     error,
@@ -204,6 +209,7 @@ impl SuspendedExecutionFrame {
                 outputs,
                 pending_write,
                 pending_statement,
+                pending_query,
                 initialization,
             };
             // SAFETY: suspension removed all references created while decoding.
@@ -227,6 +233,7 @@ impl SuspendedExecutionFrame {
                 outputs,
                 pending_write,
                 pending_statement,
+                pending_query,
             },
             initialization,
         })

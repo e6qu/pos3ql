@@ -17971,6 +17971,7 @@ struct TriggerExecutionStatus<'a> {
     outputs: MutableSlice<OutputBinding>,
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::sequence::SavedStatementPosition>,
+    pending_query: Option<super::query::RoutineInvocationState>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -18004,6 +18005,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             outputs,
             pending_write: None,
             pending_statement: None,
+            pending_query: None,
         })
     }
     fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
@@ -23222,6 +23224,7 @@ impl<'a> ProceduralQueryRows<'a> {
 
 fn execute_procedural_query<T>(
     context: &mut TriggerExecContext<'_, '_, '_>,
+    continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
     mut evaluate: impl FnMut(&Storage, &dyn crate::sql::eval::SequenceAccess) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
     let txid = context.txn.txid;
@@ -23246,6 +23249,7 @@ fn execute_procedural_query<T>(
             engine
                 .execute_retained_expression(
                     arena,
+                    continuation,
                     snapshot,
                     context.txn,
                     sqlprep,
@@ -23363,6 +23367,7 @@ fn eval_procedural_expression<'a>(
         engine
             .execute_retained_expression(
                 arena,
+                None,
                 snapshot,
                 context.txn,
                 sqlprep,
@@ -23692,7 +23697,7 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     let rows = super::type_input_plans::with_owner(query.owner, || {
         super::type_inputs::with_source(input_source, query.source, query.inputs, || {
             with_bound_parameter_types(query.parameter_types, || {
-                execute_procedural_query(context, |storage, sequence| {
+                execute_procedural_query(context, None, |storage, sequence| {
                     let mut rows = ArenaList::new(arena);
                     let mut capture = |values: &[Datum]| {
                         rows.push(encode_projected_pub(values, arena)?)
@@ -27076,7 +27081,7 @@ fn execute_trigger_step<'a>(
             let arena = context.arena;
             let params = context.params;
             let txid = context.txn.txid;
-            let rows = execute_procedural_query(context, |storage, sequence| {
+            let rows = execute_procedural_query(context, None, |storage, sequence| {
                 let mut rows = ArenaList::new(arena);
                 let result = super::query::select_into_rows(
                     storage,
@@ -27766,71 +27771,83 @@ fn execute_trigger_step<'a>(
             };
             let params = context.params;
             let txid = context.txn.txid;
-            let (selected, row_count) = execute_procedural_query(context, |storage, sequence| {
-                let mut selected = [Datum::Null; MAX_COLUMNS];
-                let mut found = false;
-                let mut row_count = 0usize;
-                super::query::consume_query_rows(
-                    core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
-                        .expect("SELECT INTO consumes one or two rows"),
-                    |emit| {
-                        super::query::select_into_rows(
-                            storage,
-                            txid,
-                            query,
-                            arena,
-                            params,
-                            Some(&scope),
-                            Some(sequence),
-                            emit,
-                        )
-                    },
-                    &mut |values| {
-                        if !record_target && values.len() != statement.targets.len() {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "query returned {} columns but SELECT INTO expects {}",
-                                values.len(),
-                                statement.targets.len()
-                            ));
-                        }
-                        if record_target && values.len() != record_width {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "SELECT INTO record shape changed during execution"
-                            ));
-                        }
-                        if !found {
-                            if record_target {
-                                let mut row_fields = [RecordField {
-                                    name: "",
-                                    type_oid: 0,
-                                    value: Datum::Null,
-                                }; MAX_PROJ];
-                                for (index, value) in values.iter().copied().enumerate() {
-                                    row_fields[index] = RecordField {
-                                        name: fields[index].0,
-                                        type_oid: fields[index].1,
-                                        value: detached_trigger_datum(value, arena)?,
-                                    };
-                                }
-                                let fields = arena
-                                    .alloc_slice_copy(&row_fields[..values.len()])
-                                    .map_err(|_| super::query::arena_full_pub())?;
-                                selected[0] = Datum::Record(&*fields);
-                            } else {
-                                for (index, value) in values.iter().copied().enumerate() {
-                                    selected[index] = detached_trigger_datum(value, arena)?;
-                                }
+            let (selected, row_count) =
+                execute_procedural_query(context, None, |storage, sequence| {
+                    let mut selected = [Datum::Null; MAX_COLUMNS];
+                    let mut found = false;
+                    let mut row_count = 0usize;
+                    super::query::consume_query_rows(
+                        core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
+                            .expect("SELECT INTO consumes one or two rows"),
+                        |emit| {
+                            super::query::select_into_rows(
+                                storage,
+                                txid,
+                                query,
+                                arena,
+                                params,
+                                Some(&scope),
+                                Some(sequence),
+                                emit,
+                            )
+                        },
+                        &mut |values| {
+                            if !record_target && values.len() != statement.targets.len() {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "query returned {} columns but SELECT INTO expects {}",
+                                    values.len(),
+                                    statement.targets.len()
+                                ));
                             }
-                            found = true;
-                        }
-                        row_count += 1;
-                        Ok(())
-                    },
-                )?;
-                Ok((selected, row_count))
-            })?;
+                            if record_target && values.len() != record_width {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "SELECT INTO record shape changed during execution"
+                                ));
+                            }
+                            if !found {
+                                if record_target {
+                                    let mut row_fields = [RecordField {
+                                        name: "",
+                                        type_oid: 0,
+                                        value: Datum::Null,
+                                    };
+                                        MAX_PROJ];
+                                    for (index, value) in values.iter().copied().enumerate() {
+                                        row_fields[index] = RecordField {
+                                            name: fields[index].0,
+                                            type_oid: fields[index].1,
+                                            value: detached_trigger_datum(value, arena)?,
+                                        };
+                                    }
+                                    let fields = arena
+                                        .alloc_slice_copy(&row_fields[..values.len()])
+                                        .map_err(|_| super::query::arena_full_pub())?;
+                                    selected[0] = Datum::Record(&*fields);
+                                } else {
+                                    for (index, value) in values.iter().copied().enumerate() {
+                                        selected[index] = detached_trigger_datum(value, arena)?;
+                                    }
+                                }
+                                found = true;
+                            }
+                            row_count += 1;
+                            Ok(())
+                        },
+                    )?;
+                    if record_target && row_count == 0 && !statement.strict {
+                        let empty = arena
+                            .alloc_slice_with(record_width, |index| RecordField {
+                                name: fields[index].0,
+                                type_oid: fields[index].1,
+                                value: Datum::Null,
+                            })
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        selected[0] = Datum::Record(empty);
+                    }
+                    Ok((selected, row_count))
+                })?;
             status.set_rows(row_count as u64)?;
             if statement.strict {
                 match row_count {
@@ -28351,28 +28368,32 @@ fn execute_trigger_step<'a>(
                 let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
-                execute_procedural_query(&mut context, |storage, sequence| {
-                    let mut row_count = 0u64;
-                    super::query::select_into_rows(
-                        storage,
-                        txid,
-                        query,
-                        arena,
-                        params,
-                        Some(&scope),
-                        Some(sequence),
-                        &mut |_| {
-                            row_count = row_count.checked_add(1).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "PL/pgSQL query returned too many rows"
-                                )
-                            })?;
-                            Ok(())
-                        },
-                    )?;
-                    Ok(row_count)
-                })
+                execute_procedural_query(
+                    &mut context,
+                    Some(&mut status.pending_query),
+                    |storage, sequence| {
+                        let mut row_count = 0u64;
+                        super::query::select_into_rows(
+                            storage,
+                            txid,
+                            query,
+                            arena,
+                            params,
+                            Some(&scope),
+                            Some(sequence),
+                            &mut |_| {
+                                row_count = row_count.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        )?;
+                        Ok(row_count)
+                    },
+                )
             });
             status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
 
@@ -29041,19 +29062,23 @@ fn execute_trigger_step<'a>(
                                 let arena = context.arena;
                                 let params = context.params;
                                 let txid = context.txn.txid;
-                                execute_procedural_query(&mut context, |storage, sequence| {
-                                    if locals[target].ctype == ColType::Record {
-                                        materialize_trigger_for_record_query(
-                                            storage, query, arena, arena, txid, params, sequence,
-                                            &scope,
-                                        )
-                                    } else {
-                                        materialize_trigger_for_query(
-                                            storage, query, arena, arena, txid, params, sequence,
-                                            &scope,
-                                        )
-                                    }
-                                })?
+                                execute_procedural_query(
+                                    &mut context,
+                                    None,
+                                    |storage, sequence| {
+                                        if locals[target].ctype == ColType::Record {
+                                            materialize_trigger_for_record_query(
+                                                storage, query, arena, arena, txid, params,
+                                                sequence, &scope,
+                                            )
+                                        } else {
+                                            materialize_trigger_for_query(
+                                                storage, query, arena, arena, txid, params,
+                                                sequence, &scope,
+                                            )
+                                        }
+                                    },
+                                )?
                             }
                             TriggerForSource::DynamicQuery(query) => {
                                 let transition = TriggerTransition {

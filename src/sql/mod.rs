@@ -13262,6 +13262,7 @@ impl Engine {
                 let value = self
                     .execute_retained_expression(
                         scratch,
+                        &mut None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -15217,6 +15218,7 @@ impl Engine {
                 pending,
                 &invocations,
                 arena,
+                arena,
                 txn,
                 sqlprep,
                 cursors,
@@ -15232,6 +15234,7 @@ impl Engine {
     fn execute_retained_expression<T>(
         &mut self,
         frame: &Arena,
+        mut continuation: Option<&mut Option<query::RoutineInvocationState>>,
         source_snapshot: u32,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -15246,52 +15249,87 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
-        let invocations = query::RoutineInvocationState::new(frame);
+        let saved = continuation.as_deref_mut().and_then(Option::take);
+        let resumed = saved.is_some();
+        let owner = if resumed {
+            frame.retention_owner()
+        } else {
+            frame
+        };
+        let invocations = saved.unwrap_or_else(|| query::RoutineInvocationState::new(owner));
+        if let Err(error) = invocations.require_arena(owner) {
+            if let Some(continuation) = continuation {
+                *continuation = Some(invocations);
+            }
+            return Ok(Err(error));
+        }
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
-        loop {
-            if let Err(error) = sequence::rewind_replay_cursor(replay) {
-                return Ok(Err(error));
+        let result = (|| {
+            loop {
+                if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                    return Ok(Err(error));
+                }
+                self.work.reset();
+                self.storage.set_read_snapshot(source_snapshot);
+                invocations.begin_attempt();
+                let output_mark = responder.buffer.mark();
+                let outcome = {
+                    let sequence =
+                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                    query::with_routine_invocation_scope(
+                        Some(query::RoutineInvocationContext::new(&invocations, owner)),
+                        || evaluate(&self.storage, &self.work, &sequence, &invocations, cursors),
+                    )
+                };
+                let Err(error) = outcome else {
+                    return Ok(outcome);
+                };
+                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                    return Ok(Err(error));
+                }
+                responder.buffer.truncate_to(output_mark);
+                let Some(pending) = invocations.take_pending() else {
+                    return Ok(Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "retained expression yielded without a pending call"
+                    )));
+                };
+                if let Err(error) = self.complete_pending_routine(
+                    pending,
+                    &invocations,
+                    owner,
+                    frame,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )? {
+                    return Ok(Err(error));
+                }
             }
-            self.work.reset();
-            self.storage.set_read_snapshot(source_snapshot);
-            invocations.begin_attempt();
-            let output_mark = responder.buffer.mark();
-            let outcome = {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                query::with_routine_invocation_scope(
-                    Some(query::RoutineInvocationContext::new(&invocations, frame)),
-                    || evaluate(&self.storage, &self.work, &sequence, &invocations, cursors),
-                )
+        })();
+        if result.as_ref().is_ok_and(|outcome| {
+            outcome.as_ref().is_err_and(|error| {
+                error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            })
+        }) && let Some(continuation) = continuation
+        {
+            let saved = if resumed {
+                Ok(invocations)
+            } else {
+                invocations.relocate(owner, frame.retention_owner())
             };
-            let Err(error) = outcome else {
-                return Ok(outcome);
-            };
-            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                return Ok(Err(error));
-            }
-            responder.buffer.truncate_to(output_mark);
-            let Some(pending) = invocations.take_pending() else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "retained expression yielded without a pending call"
-                )));
-            };
-            if let Err(error) = self.complete_pending_routine(
-                pending,
-                &invocations,
-                frame,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-            )? {
-                return Ok(Err(error));
+            match saved {
+                Ok(saved) => *continuation = Some(saved),
+                Err(error) => return Ok(Err(error)),
             }
         }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15329,6 +15367,7 @@ impl Engine {
                 let txid = txn.txid;
                 let passes = self.execute_retained_expression(
                     frame,
+                    None,
                     source_snapshot,
                     txn,
                     sqlprep,
@@ -15359,6 +15398,7 @@ impl Engine {
                 for index in 0..source.statement_items_len() {
                     let values = self.execute_retained_expression(
                         frame,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -15579,6 +15619,7 @@ impl Engine {
                 pending,
                 &invocations,
                 arena,
+                arena,
                 txn,
                 sqlprep,
                 cursors,
@@ -15598,6 +15639,7 @@ impl Engine {
         pending: query::PendingRoutineInvocation,
         invocations: &query::RoutineInvocationState,
         arena: &Arena,
+        work: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -15612,7 +15654,7 @@ impl Engine {
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
-                    let retained = arena.with_remaining_retained_bytes(|scratch| {
+                    let retained = work.with_remaining_retained_bytes(arena, |scratch| {
                         let encoded_arguments = pending.arguments(arena)?;
                         let arguments = scratch
                             .alloc_slice_with(pending.argument_count, |_| Datum::Null)
@@ -15655,6 +15697,7 @@ impl Engine {
                     return Ok(invocations.complete(
                         query::OwnedRoutineResult::from_scalar_image(retained),
                         arena,
+                        work,
                     ));
                 }
             };
@@ -15694,7 +15737,7 @@ impl Engine {
                 Wire(WireFull),
             }
             let set_returning = routine.kind.is_set_returning();
-            let executed = arena.with_remaining_retained_bytes(|scratch| {
+            let executed = work.with_remaining_retained_bytes(arena, |scratch| {
                 // Transfer the encoded output directly into retained storage
                 // when the body ends, including inside another borrowed body.
                 if set_returning {
@@ -15747,7 +15790,7 @@ impl Engine {
             } else {
                 query::OwnedRoutineResult::from_scalar_image(retained)
             };
-            Ok(invocations.complete(retained, arena))
+            Ok(invocations.complete(retained, arena, work))
         });
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
@@ -15948,6 +15991,7 @@ impl Engine {
                             pending,
                             &nested_invocations,
                             arena,
+                            arena,
                             txn,
                             sqlprep,
                             cursors,
@@ -16012,6 +16056,7 @@ impl Engine {
                                 pending,
                                 &nested_invocations,
                                 arena,
+                                arena,
                                 txn,
                                 sqlprep,
                                 cursors,
@@ -16069,6 +16114,7 @@ impl Engine {
                                 pending,
                                 &nested_invocations,
                                 arena,
+                                arena,
                                 txn,
                                 sqlprep,
                                 cursors,
@@ -16099,6 +16145,7 @@ impl Engine {
                     };
                     self.execute_retained_expression(
                         arena,
+                        None,
                         snapshot,
                         txn,
                         sqlprep,
@@ -17494,6 +17541,7 @@ impl Engine {
                                     pending,
                                     &nested_invocations,
                                     arena,
+                                    arena,
                                     txn,
                                     sqlprep,
                                     cursors,
@@ -17555,6 +17603,7 @@ impl Engine {
                                         pending,
                                         &nested_invocations,
                                         arena,
+                                        arena,
                                         txn,
                                         sqlprep,
                                         cursors,
@@ -17615,6 +17664,7 @@ impl Engine {
                                     if let Err(error) = self.complete_pending_routine(
                                         pending,
                                         &nested_invocations,
+                                        arena,
                                         arena,
                                         txn,
                                         sqlprep,
@@ -23233,6 +23283,7 @@ impl Engine {
             }
             self.execute_retained_expression(
                 frame,
+                None,
                 snapshot,
                 txn,
                 sqlprep,
@@ -23379,6 +23430,7 @@ impl Engine {
                 arena.with_remaining_region(|frame| -> Result<Result<bool, SqlError>, WireFull> {
                     let passes = self.execute_retained_expression(
                         frame,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -23415,6 +23467,7 @@ impl Engine {
                     for index in 0..count {
                         let values = self.execute_retained_expression(
                             frame,
+                            None,
                             source_snapshot,
                             txn,
                             sqlprep,

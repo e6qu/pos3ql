@@ -83,6 +83,23 @@ pub(crate) enum OwnedRoutineResult {
 }
 
 impl OwnedRoutineResult {
+    pub(super) fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
+        let (Self::Scalar(bytes) | Self::Rows(bytes)) = self;
+        let bytes = source.retained_slice(bytes.0).map_err(|_| inactive())?;
+        let copied = target
+            .retain_slice_with(bytes.len(), |index| bytes[index])
+            .map_err(|_| full())?;
+        let copied = ResultBytes(
+            target
+                .freeze_retained_slice(copied)
+                .map_err(|_| inactive())?,
+        );
+        Ok(match self {
+            Self::Scalar(_) => Self::Scalar(copied),
+            Self::Rows(_) => Self::Rows(copied),
+        })
+    }
+
     pub(crate) fn from_scalar_image(image: FrozenArenaSliceHandle<u8>) -> Self {
         Self::Scalar(ResultBytes(image))
     }

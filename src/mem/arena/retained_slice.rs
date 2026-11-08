@@ -92,13 +92,15 @@ impl<T> AsMut<[T]> for ArenaSliceMut<'_, T> {
 
 impl Arena {
     /// Closes a child workspace and transfers its encoded output directly into
-    /// immutable retained storage, including when this arena is itself borrowed.
+    /// the selected owner's immutable storage. Temporary query memory and the
+    /// output owner may differ when an invocation has survived a scheduler wait.
     pub(crate) fn with_remaining_retained_bytes<E>(
         &self,
+        target: &Arena,
         each: impl for<'region> FnOnce(&'region Arena) -> Result<&'region [u8], E>,
     ) -> Result<Result<FrozenArenaSliceHandle<u8>, E>, ArenaFull> {
-        if self.retention_identity == 0 {
-            return Err(self.full(usize::MAX));
+        if target.retention_identity == 0 {
+            return Err(target.full(usize::MAX));
         }
         let output = self.with_remaining_region(|region| {
             each(region).map(|bytes| (bytes.as_ptr(), bytes.len()))
@@ -107,8 +109,8 @@ impl Arena {
             Ok(output) => output,
             Err(error) => return Ok(Err(error)),
         };
-        let (layout, data_offset) = slice_layout::<u8>(len).map_err(|_| self.full(len))?;
-        let base = self.alloc_raw_tail(layout)?;
+        let (layout, data_offset) = slice_layout::<u8>(len).map_err(|_| target.full(len))?;
+        let base = target.alloc_raw_tail(layout)?;
         // Ending the region releases its frontier, not the backing bytes.
         // Reservation does not initialize them. Move the payload before writing
         // its header: either destination may overlap the child's old output.
@@ -121,8 +123,8 @@ impl Arena {
             });
         }
         Ok(Ok(FrozenArenaSliceHandle(ArenaSliceHandle {
-            identity: self.retention_identity,
-            offset: base as usize - self.base as usize,
+            identity: target.retention_identity,
+            offset: base as usize - target.base as usize,
             value: PhantomData,
             invariant: PhantomData,
         })))
@@ -235,12 +237,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_region_transfers_keep_explicit_parent_outputs_after_query_teardown() {
+        let mut budget = Budget::new(4096);
+        let owner = Arena::new(&mut budget, "explicit retained output", 4096).unwrap();
+        let image = crate::mem::guard::forbid_alloc(|| {
+            owner
+                .with_remaining_region(|query| {
+                    query
+                        .with_remaining_retained_bytes(&owner, |scratch| {
+                            scratch
+                                .alloc_slice_with(300, |at| (at * 37 % 251) as u8)
+                                .map(|bytes| &*bytes)
+                        })
+                        .unwrap()
+                        .unwrap()
+                })
+                .unwrap()
+        });
+        let mut moved = owner;
+        crate::mem::guard::forbid_alloc(|| {
+            moved.recycle_front();
+            moved.alloc_slice_with(1024, |_| 0xccu8).unwrap();
+            let bytes = moved.retained_slice(image).unwrap();
+            assert_eq!(bytes.len(), 300);
+            for (at, byte) in bytes.iter().enumerate() {
+                assert_eq!(*byte, (at * 37 % 251) as u8);
+            }
+            moved.reset();
+            assert!(moved.retained_slice(image).is_err());
+        });
+    }
+
+    #[test]
     fn retained_region_transfers_move_overlapping_payload_before_initializing_headers() {
         let mut budget = Budget::new(512);
         let original = Arena::new(&mut budget, "overlapping retained result", 512).unwrap();
         let image = crate::mem::guard::forbid_alloc(|| {
             original
-                .with_remaining_retained_bytes(|child| {
+                .with_remaining_retained_bytes(&original, |child| {
                     child.alloc_slice_with(16, |_| 0u8)?;
                     child
                         .alloc_slice_with(300, |at| (at * 37 % 251) as u8)
@@ -255,7 +289,7 @@ mod tests {
             let used = moved.used();
             assert!(
                 moved
-                    .with_remaining_retained_bytes(|child| {
+                    .with_remaining_retained_bytes(&moved, |child| {
                         child.alloc_slice_with(180, |_| 0xffu8).map(|bytes| &*bytes)
                     })
                     .is_err()
@@ -263,7 +297,7 @@ mod tests {
             assert_eq!(moved.used(), used);
             assert!(matches!(
                 moved
-                    .with_remaining_retained_bytes(|_| Err::<&[u8], _>(7))
+                    .with_remaining_retained_bytes(&moved, |_| Err::<&[u8], _>(7))
                     .unwrap(),
                 Err(7)
             ));
@@ -287,8 +321,8 @@ mod tests {
         let owner = Arena::new(&mut budget, "nested retained result", 4096).unwrap();
         crate::mem::guard::forbid_alloc(|| {
             let image = owner
-                .with_remaining_retained_bytes(|parent| {
-                    let nested = parent.with_remaining_retained_bytes(|child| {
+                .with_remaining_retained_bytes(&owner, |parent| {
+                    let nested = parent.with_remaining_retained_bytes(parent, |child| {
                         child
                             .alloc_slice_with(300, |at| (at * 37 % 251) as u8)
                             .map(|bytes| &*bytes)

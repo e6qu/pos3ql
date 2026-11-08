@@ -26,6 +26,7 @@ use super::types::{ColDesc, ColType, Datum};
 
 pub(super) mod input_progress;
 mod invocation_results;
+mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
@@ -1564,10 +1565,11 @@ impl RoutineInvocationState {
         &self,
         value: OwnedRoutineResult,
         arena: &Arena,
+        scratch: &Arena,
     ) -> Result<(), SqlError> {
         self.require_arena(arena)?;
         value.validate(arena)?;
-        let replay = super::sequence::finish_replay_cursor(self.pending_replay.take(), arena)?;
+        let replay = super::sequence::finish_replay_cursor(self.pending_replay.take(), scratch)?;
         self.results
             .borrow_mut()
             .push(arena, RoutineInvocationResult { value, replay })

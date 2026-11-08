@@ -1345,31 +1345,72 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
         config.row_work_leases = 64;
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine,
-            "CREATE SEQUENCE nested_expression_sequence; CREATE TABLE nested_expression_rows(id integer); \
-             CREATE TABLE nested_expression_audit(label text,n bigint); \
-             CREATE FUNCTION nested_expression_call(label text) RETURNS bigint LANGUAGE plpgsql AS $$ \
-             DECLARE n bigint:=nextval('nested_expression_sequence'); BEGIN \
-             PERFORM pg_advisory_lock(44); INSERT INTO nested_expression_audit VALUES(label,n); \
-             RETURN n; END$$; \
-             CREATE FUNCTION nested_expression_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN PERFORM pg_advisory_lock(41),nested_expression_call('one'), \
-             nested_expression_call('two'),pg_advisory_lock(42); RETURN NEW; END$$; \
-             CREATE TRIGGER nested_expression_trigger AFTER INSERT ON nested_expression_rows \
-             FOR EACH ROW EXECUTE FUNCTION nested_expression_trigger(); \
-             INSERT INTO nested_expression_rows VALUES(1)", true);
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        let fixture = include_str!(
+            "../../../tests/external/differential/276_suspended_query_invocations.sql"
+        );
+        let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+        let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+        writer.success(&mut engine, setup, true);
+        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
+        let mut status = writer.execute_status(&mut engine, write, true);
+        for released in [false, false, true] {
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!(
+                    "query failed to retain completed calls: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            assert!(writer.transaction.has_pending_write_completion());
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT 40+2; SELECT last_value FROM nested_expression_sequence",
+                    true
+                )),
+                ["42", "2"]
+            );
+            if released {
+                holder.success(&mut engine, "COMMIT", true);
+            }
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    write,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+        }
         assert_eq!(
-            data_rows(&session.success(
-                &mut engine,
-                "SELECT label,n FROM nested_expression_audit ORDER BY n; \
-             SELECT last_value FROM nested_expression_sequence; \
-             SELECT pg_advisory_unlock(41),pg_advisory_unlock(41), \
-             pg_advisory_unlock(44),pg_advisory_unlock(44),pg_advisory_unlock(44), \
-             pg_advisory_unlock(42),pg_advisory_unlock(42)",
-                true
-            )),
-            ["one|1", "two|2", "2", "t|f|t|t|f|t|f"],
+            status,
+            ExecutionStatus::Complete,
+            "{mode:?}: {}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        assert!(error_sqlstates(writer.send.readable()).is_empty());
+        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+        assert!(!writer.transaction.has_pending_write_completion());
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, inspect, true)),
+            ["one,two,three|6|3|t|f|t|t|t|f|t|f"],
             "{mode:?}"
         );
     }

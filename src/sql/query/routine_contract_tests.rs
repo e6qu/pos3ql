@@ -317,6 +317,7 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
                 .complete(
                     OwnedRoutineResult::capture_scalar(Datum::Record(fields), &statement).unwrap(),
                     &statement,
+                    &statement,
                 )
                 .unwrap();
         })

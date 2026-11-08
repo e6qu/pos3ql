@@ -365,6 +365,70 @@ pub(super) struct RoutineInputs {
 }
 
 impl RoutineInputs {
+    pub(super) fn relocate(&self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
+        let output = Self::new();
+        output.next.set(self.next.get());
+        let saved = self.saved.borrow();
+        for index in 0..saved.len() {
+            let entry = saved
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            let frames = source
+                .retained_slice_mut(entry.frames)
+                .map_err(|_| changed())?;
+            let copied = target
+                .retain_slice_with(frames.len(), |index| frames[index])
+                .map_err(|_| full())?;
+            for (index, handle) in frames.iter().copied().enumerate() {
+                let frame = source.retained(handle).ok_or_else(changed)?;
+                let frame = frame.relocate(source, target)?;
+                let frame = target.retain(frame).map_err(|_| full())?;
+                target.retained_slice_mut(copied).map_err(|_| changed())?[index] = frame;
+            }
+            output
+                .saved
+                .borrow_mut()
+                .push(
+                    target,
+                    SavedInputs {
+                        ordinal: entry.ordinal,
+                        frames: copied,
+                    },
+                )
+                .map_err(directory_error)?;
+        }
+        let evaluations = self.evaluations.borrow();
+        for index in 0..evaluations.len() {
+            let entry = evaluations
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            output
+                .evaluations
+                .borrow_mut()
+                .push(target, entry)
+                .map_err(directory_error)?;
+        }
+        let casts = self.cast_selections.borrow();
+        for index in 0..casts.len() {
+            let entry = casts
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            let cast = entry
+                .value(source)?
+                .map(|cast| target.retain(cast).map_err(|_| full()))
+                .transpose()?;
+            output
+                .cast_selections
+                .borrow_mut()
+                .push(target, CastSelection { cast, ..entry })
+                .map_err(directory_error)?;
+        }
+        Ok(output)
+    }
+
     pub(super) fn new() -> Self {
         Self {
             next: Cell::new(0),
@@ -1153,6 +1217,7 @@ mod tests {
                         .complete(
                             OwnedRoutineResult::capture_scalar(Datum::Int4(42), &original).unwrap(),
                             &original,
+                            &original,
                         )
                         .unwrap();
                     evaluation(77, crate::sql::eval::ExpressionEvaluation::Runtime).unwrap();
@@ -1224,7 +1289,10 @@ mod tests {
             let retained = OwnedRoutineResult::capture_scalar(Datum::Null, &moved).unwrap();
             moved.reset();
             assert_eq!(
-                invocations.complete(retained, &moved).unwrap_err().sqlstate,
+                invocations
+                    .complete(retained, &moved, &moved,)
+                    .unwrap_err()
+                    .sqlstate,
                 "XX000"
             );
         });
@@ -1564,6 +1632,7 @@ mod tests {
                             invocations
                                 .complete(
                                     OwnedRoutineResult::capture_scalar(body, &statement).unwrap(),
+                                    &statement,
                                     &statement,
                                 )
                                 .unwrap();

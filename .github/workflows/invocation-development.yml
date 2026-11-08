@@ -227,7 +227,7 @@ jobs:
               output = Path(f'stdout-{fixture}.txt').read_text().splitlines()
               errors = Path(f'stderr-{fixture}.txt').read_text()
               status = Path(f'exit-code-{fixture}.txt').read_text().strip()
-              expected_errors = "WARNING:  you don't own a lock of type ExclusiveLock\n" * 3 if fixture in (276, 277) else ''
+              expected_errors = "WARNING:  you don't own a lock of type ExclusiveLock\n" * 4 if fixture in (276, 277) else ''
               if fixture == 279:
                   expected_errors = ''.join(f"WARNING:  you don't own a lock of type {mode}\n" for mode in ('ExclusiveLock', 'ShareLock') * 2)
               if status != '0' or errors != expected_errors or output.count(expected) != 1:

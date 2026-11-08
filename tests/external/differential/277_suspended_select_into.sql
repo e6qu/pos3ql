@@ -12,7 +12,7 @@ CREATE FUNCTION nested_expression_trigger() RETURNS trigger LANGUAGE plpgsql AS 
 DECLARE result record;
 BEGIN
     SELECT pg_advisory_lock(41),nested_expression_call('one') AS first_value,
-        nested_expression_call('two') AS second_value,pg_advisory_lock(42),
+        nested_expression_call('two') AS second_value,pg_advisory_unlock(99),pg_advisory_lock(42),
         nested_expression_call('three') AS third_value INTO STRICT result;
     IF result.first_value<>1 OR result.second_value<>2 OR result.third_value<>3 THEN
         RAISE EXCEPTION 'SELECT INTO lost saved expression values';

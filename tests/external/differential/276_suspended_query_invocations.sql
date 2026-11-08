@@ -11,7 +11,7 @@ END$$;
 CREATE FUNCTION nested_expression_trigger() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM pg_advisory_lock(41),nested_expression_call('one'),
-        nested_expression_call('two'),pg_advisory_lock(42),nested_expression_call('three');
+        nested_expression_call('two'),pg_advisory_unlock(99),pg_advisory_lock(42),nested_expression_call('three');
     RETURN NEW;
 END$$;
 CREATE TRIGGER nested_expression_trigger AFTER INSERT ON nested_expression_rows

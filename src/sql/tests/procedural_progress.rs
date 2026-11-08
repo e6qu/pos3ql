@@ -1378,6 +1378,14 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
                     );
                 };
                 assert_eq!(wait, StatementWait::Lock);
+                assert_eq!(
+                    message_types(writer.send.readable())
+                        .iter()
+                        .filter(|kind| **kind == b'N')
+                        .count(),
+                    1,
+                    "warning prefix changed across a procedural wait"
+                );
                 assert!(writer.transaction.has_pending_write_completion());
                 assert_eq!(
                     data_rows(&holder.success(
@@ -1414,6 +1422,14 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
                 "{mode:?}: {}",
                 String::from_utf8_lossy(writer.send.readable())
             );
+            assert_eq!(
+                message_types(writer.send.readable())
+                    .iter()
+                    .filter(|kind| **kind == b'N')
+                    .count(),
+                1,
+                "warning repeated or disappeared after resumption"
+            );
             assert!(error_sqlstates(writer.send.readable()).is_empty());
             assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
             assert!(!writer.transaction.has_pending_write_completion());
@@ -1447,7 +1463,9 @@ fn retained_write_completion_distinguishes_transition_rows_from_catalog_dependen
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         let output = session.success(
             &mut engine,
-            include_str!("../../../tests/external/differential/280_transition_write_dependencies.sql"),
+            include_str!(
+                "../../../tests/external/differential/280_transition_write_dependencies.sql"
+            ),
             true,
         );
         assert_eq!(data_rows(&output), ["1|13"], "{mode:?}");

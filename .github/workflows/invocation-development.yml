@@ -147,7 +147,7 @@ jobs:
               (268, '8|2|2|2|2|4|t'),
               (269, '6|2|2|2|t|t|15'),
               (270, '10|4|4|2|t|t|301'),
-              (271, '10|5|t|t|t|t|t|outer|hex|warning'),
+              (271, '10|5|t|t|t|t|t|outer|hex|warning|t'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()

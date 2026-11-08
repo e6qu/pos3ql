@@ -1263,7 +1263,7 @@ fn adjacent_triggers_observe_restored_settings_and_preserved_session_changes() {
             include_str!("../../../tests/external/differential/271_trigger_setting_scope.sql");
         assert_eq!(
             data_rows(&session.success(&mut engine, sql, true)),
-            ["10|5|t|t|t|t|t|outer|hex|warning"],
+            ["10|5|t|t|t|t|t|outer|hex|warning|t"],
             "{mode:?}"
         );
     }

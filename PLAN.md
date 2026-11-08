@@ -75,6 +75,8 @@ settings named in the routine's `SET` clause; preserve unlisted `SET LOCAL`
 changes until transaction end. An explicit session-wide `SET` overrides routine
 restoration even when it assigns the same value as before. `current_setting()`,
 `pg_settings` and rendered values must agree throughout.
+Keep every supported writable setting readable, including `event_triggers` and
+`password_encryption`, with PostgreSQL's value types and privilege metadata.
 Keep the configured routine's current values and restoration baseline in the
 same startup-reserved owner while it waits. Reject another connection or a
 changed parent scope before installing those values. Restore the caller's
@@ -114,67 +116,25 @@ Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-reques
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its
 handler waits; a user-raised cancellation must not disable a future timeout.
-Carry owned control and value-slot buffers through scheduler returns together
-with declared types, selected source definitions, output bindings and the
-enclosing write. Ordinary and numeric active local slots still refer to
-statement-memory payloads. Keep those payloads alive or save them before
-recycling scratch; positions alone cannot resume an invocation.
-Restore the whole frame before publishing it. If a later local value exceeds
-destination memory after earlier loop scopes have decoded, retain all original
-images and reservations without leaving references into the failed destination.
-Dropping a paused call must return both its control and row-work capacity.
-Restoring into memory lent to a child must return the named memory error without
-panicking, reclaiming the child's live bytes or losing the original call images.
-Retain an unfinished `RETURN`, loop exit or error cleanup as part of that call.
-Keep the original error detail and hint before cleanup can run other SQL or a
-different connection. A storage wait during rollback or release must retain its
-boundary and phase; a failed handler capture must return its capacity error.
-Errors needing no rollback callback must preserve their original code and detail
-without reserving an unnecessary control image.
-Force repeated real waits inside a protected numeric loop after earlier
-statements. Destroy the old temporary memory, preserve locals and once-only
-session effects, and verify wakeups before completing the same call.
-Capture ordinary declarations only when needed for a pause, and share that
-image through subsequent pauses. Preserve normal-call memory admission and
-keep each nested write's selection owner separate from the enclosing write.
-Saved output bytes now own reusable control-pool ranges independent of their
-source arenas. Preserve that ownership, the outer value through nested counters,
-failure-preserving growth, rollback and reuse after exhaustion, and decoded
-copies after the saved buffer drops.
-Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
-Source images now own control-pool bytes shared by compiled syntax and saved
-positions. Preserve original text and program kind after input/parsing storage
-is destroyed, and reject replacement images even when their text is identical.
-Source capture must precede initializers and return failed admission capacity.
-Incomplete blocks must return syntax error `42601` and release their source storage;
-keep that coverage against PostgreSQL for empty bodies, incomplete declarations,
-loops, branches and exception handlers.
-Split procedural statements at SQL token boundaries so semicolons inside dollar
-strings, escaped strings and comments remain part of the original statement.
-Lexer buffer exhaustion must return resource limit `54000`, preserve real syntax
-errors and release temporary scan memory for the next operation.
-Keep those source-owner checks while retaining selected definitions and session
-settings; owning the text alone does not preserve their original meaning.
-Preserve once-only declaration initialization after input/output parameter slots
-are seeded. Keep parameter, local, handler and numeric-loop bindings distinct.
-Retain whether an initializer needs evaluation or only conversion, together with
-its evaluated value. Validate a declared domain's implicit initial NULL before
-body statements, including scalar, composite and array domains.
-Reject an explicitly `NOT NULL` declaration without an initializer while
-validating the definition, before installing the routine.
-Reads and assignments use the innermost binding, while returning outputs uses
-the original output slots. Preserve quoted names and reject constant assignment
-and FETCH targets before effects. Keep named constant cursors readable at OPEN.
-Caught-error directories and bytes now have control-pool owners. Preserve
-borrowed handler views, saved fields after source/owner destruction, nesting,
-rethrow, admission before initializers, and rollback/reuse after failed capture.
-Nested calls must release diagnostic capacity after each call and keep audit
-writes and sequence effects once; qualify the same SQL in both transaction modes
-and against PostgreSQL. Preserve
-handler variables in rewritten local and NEW-row assignments, including JSON
-subscripts. Keep trigger context types and undefined-name errors compatible.
-`OLD TABLE` and `NEW TABLE` must retain each column's declared domain, enum,
-composite and array types, including when its value is NULL.
+Carry the call's positions, values, unfinished return or error cleanup, output
+bindings and selected definitions with the enclosing write. Positions alone do
+not own text, arrays or row values. Existing owners and their detailed contracts
+are described in the [request path](docs/architecture.md#the-request-path).
+Keep their regression coverage while finishing the driver: a failed save retains
+the live call, a failed restore retains all saved values, and recycling old
+memory must not change a resumed call. Admission into memory lent to a child
+returns a named error without reclaiming its bytes. Drop returns shared capacity.
+
+Preserve the existing SQL-boundary checks: initialization and conversion happen
+once, declared domains validate initial NULL, invalid declarations fail before
+installation, and parameters, locals, loop counters and outputs keep their own
+bindings. Source images retain original text and program kind; replacement
+images fail with `40001`. SQL quoting controls statement boundaries, incomplete
+bodies return `42601`, and lexer exhaustion returns `54000` without losing real
+syntax errors. Error handlers preserve original diagnostics through nested work
+and reuse their reserved buffers. Transition tables keep declared types for
+NULL values too. The architecture and executable reference fixtures own the
+individual cases; they are preservation gates, not separate roadmap projects.
 
 Retain current input, call, diagnostic and result ownership checks described in
 the [architecture](docs/architecture.md#the-request-path): moved/reset/foreign

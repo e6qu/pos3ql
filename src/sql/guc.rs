@@ -314,16 +314,6 @@ pub fn set_active_config(
 }
 
 pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
-    let txn_pointer = ACTIVE_TXN.with(Cell::get);
-    if !txn_pointer.is_null() {
-        // SAFETY: EvalScope owns the pointer's dynamic extent.
-        let txn = unsafe { &*txn_pointer };
-        if let Some(value) = transaction_setting_owned(txn, name) {
-            let reset = guc.transaction_reset_owned(name).unwrap_or(value);
-            crate::sql::eval::funcs::system::update_session_setting(name, value, reset, "session");
-            return;
-        }
-    }
     if let Some(value) = guc.get_owned(name) {
         let reset = guc.reset_owned(name).unwrap_or(value);
         crate::sql::eval::funcs::system::update_session_setting(
@@ -332,6 +322,19 @@ pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
             reset,
             guc.source(name),
         );
+    } else {
+        // Ordinary settings do not borrow the executor's mutable transaction.
+        let txn_pointer = ACTIVE_TXN.with(Cell::get);
+        if !txn_pointer.is_null() {
+            // SAFETY: EvalScope owns the pointer's dynamic extent.
+            let txn = unsafe { &*txn_pointer };
+            if let Some(value) = transaction_setting_owned(txn, name) {
+                let reset = guc.transaction_reset_owned(name).unwrap_or(value);
+                crate::sql::eval::funcs::system::update_session_setting(
+                    name, value, reset, "session",
+                );
+            }
+        }
     }
     ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
     if name.eq_ignore_ascii_case("timezone") {
@@ -3271,6 +3274,12 @@ mod ownership_tests {
 
     #[test]
     fn routine_exit_keeps_unlisted_local_settings_and_publishes_restored_values() {
+        assert_eq!(
+            super::super::SETTING_NAMES
+                .iter()
+                .fold(0, |mask, name| mask | guc_bit(name)),
+            GUC_ALL
+        );
         let guc = GucState::new();
         let mut budget = Budget::new(
             super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1) + 128,

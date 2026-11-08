@@ -162,7 +162,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         .unwrap();
         let source = "DECLARE n integer := 0; marker text := 'once'; \
             anchor timestamp with time zone := statement_timestamp(); BEGIN \
-            n := n + 1; PERFORM pg_advisory_lock(41); \
+            n := n + 1; PERFORM set_config('application_name', 'changed', true); \
+            PERFORM pg_advisory_lock(41); \
             PERFORM pg_advisory_xact_lock(42); \
             IF statement_timestamp() <> anchor OR transaction_timestamp() <> anchor THEN \
                 RAISE EXCEPTION 'trigger clocks changed'; END IF; \
@@ -262,7 +263,10 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let (firing, error) = firing.suspend(&context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("row_work_bytes"));
-        assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "bound");
+        assert_eq!(
+            guc.get_owned("application_name").unwrap().as_str(),
+            "changed"
+        );
         assert_eq!(
             crate::sql::eval::funcs::system::current_identity().as_str(),
             "postgres"
@@ -463,9 +467,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let Datum::Text(note) = completed[1] else {
             panic!("restored NEW.note")
         };
-        assert_eq!(note.len(), 8210);
+        assert_eq!(note.len(), 8212);
         assert!(note[..8192].bytes().all(|byte| byte == b'x'));
-        assert_eq!(&note[8192..], "!onceboundpostgres");
+        assert_eq!(&note[8192..], "!oncechangedpostgres");
         let prefix = AdvisoryKey::from_bigint(41);
         assert!(
             storage

@@ -31682,6 +31682,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "application_name" | "default_tablespace" => "",
             "bytea_output" => "hex",
             "check_function_bodies"
+            | "event_triggers"
             | "integer_datetimes"
             | "row_security"
             | "standard_conforming_strings" => "on",
@@ -31703,6 +31704,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "max_connections" => "100",
             "max_locks_per_transaction" => "64",
             "max_prepared_transactions" => "0",
+            "password_encryption" => "scram-sha-256",
             "search_path" => "\"$user\", public",
             "server_version" => crate::pg::REPORTED_SERVER_VERSION,
             "server_version_num" => crate::pg::REPORTED_SERVER_VERSION_NUM,
@@ -31717,6 +31719,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let vartype = if matches!(
             name,
             "check_function_bodies"
+                | "event_triggers"
                 | "integer_datetimes"
                 | "is_superuser"
                 | "row_security"
@@ -31730,7 +31733,12 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "bool"
         } else if matches!(
             name,
-            "DateStyle" | "IntervalStyle" | "bytea_output" | "track_functions" | "xmloption"
+            "DateStyle"
+                | "IntervalStyle"
+                | "bytea_output"
+                | "password_encryption"
+                | "track_functions"
+                | "xmloption"
         ) {
             "enum"
         } else if matches!(
@@ -31760,7 +31768,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
         ) {
             "postmaster"
-        } else if name == "track_functions" {
+        } else if matches!(name, "event_triggers" | "track_functions") {
             "superuser"
         } else {
             "user"

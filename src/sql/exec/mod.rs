@@ -3922,11 +3922,11 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         routine.ownership.owner_to(context.txn.txid).into(),
         context.txn.txid,
     )?);
-    let _security = routine
+    let security = routine
         .attributes
         .security_definer
         .then(|| super::eval::funcs::system::enter_current_user(owner));
-    let _config = (!routine.configs().is_empty())
+    let config = (!routine.configs().is_empty())
         .then(|| super::guc::enter_active_routine_configs(routine.configs()))
         .transpose()?;
     let invocation = TriggerInvocation::new(
@@ -3983,7 +3983,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
             level: TriggerLevel::Row,
             before,
         },
-        trigger_firing::FiringEnvironment::new(_config, _security),
+        trigger_firing::FiringEnvironment::new(config, security),
     )?;
     firing.execute(context)
 }
@@ -29893,11 +29893,11 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             routine.ownership.owner_to(context.txn.txid).into(),
             context.txn.txid,
         )?);
-        let _security = routine
+        let security = routine
             .attributes
             .security_definer
             .then(|| super::eval::funcs::system::enter_current_user(owner));
-        let _config = (!routine.configs().is_empty())
+        let config = (!routine.configs().is_empty())
             .then(|| super::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
         let invocation = TriggerInvocation::new(
@@ -29954,7 +29954,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
                 level: TriggerLevel::Statement,
                 before,
             },
-            trigger_firing::FiringEnvironment::new(_config, _security),
+            trigger_firing::FiringEnvironment::new(config, security),
         )?;
         firing.execute(&mut context)?;
     }

@@ -416,8 +416,8 @@ workspace returns `40001`. Source capture returns `54000` naming the execution
 control settings on exhaustion. Rebuilding syntax copies the owned text into
 explicit parsing memory; exhausting that destination names statement memory.
 The source survives destruction of its input arena, parsing scratch and external
-pool handles. This preserves original text and program kind, not the invocation's
-selected definitions or session settings; those still need retained owners. An active
+pool handles. Source images preserve text and program kind; the invocation's
+selected definitions and settings require their own retained owners. An active
 numeric loop can bind rebuilt syntax without resetting its range, local values,
 shadowed counter or next statement, provided its value owner remains alive.
 Loop conditions and handler syntax resolve through the bound view; loop values

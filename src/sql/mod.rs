@@ -13262,7 +13262,7 @@ impl Engine {
                 let value = self
                     .execute_retained_expression(
                         scratch,
-                        &mut None,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,

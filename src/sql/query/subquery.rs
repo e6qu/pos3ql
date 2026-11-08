@@ -161,7 +161,15 @@ fn spooled_column_witness<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+        super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
@@ -1008,8 +1016,15 @@ fn subquery_collations<'a>(
     let mut output = [Collation::None; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count =
-            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+        let count = super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
                 crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1036,7 +1051,14 @@ fn subquery_collations<'a>(
         .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::describe_select(select, storage, txid, arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)?;
+        let count = super::describe_select(
+            select,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
             *slot = column.collation;
         }
@@ -1121,8 +1143,15 @@ fn row_subquery_witness<'a>(
     }; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count =
-            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+        let count = super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
             fields[index] = RecordField {
@@ -1142,7 +1171,14 @@ fn row_subquery_witness<'a>(
         .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::describe_select(select, storage, txid, arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)?;
+        let count = super::describe_select(
+            select,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         for (index, column) in columns[..count].iter().enumerate() {
             fields[index] = RecordField {
                 name: column.name,

@@ -1637,7 +1637,11 @@ fn utility_descriptions_match_execution() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE DOMAIN described_positive AS integer CHECK(VALUE>0)", true);
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN described_positive AS integer CHECK(VALUE>0)",
+        true,
+    );
     for sql in [
         "SELECT NULL::described_positive AS value",
         "SELECT (SELECT NULL::described_positive) AS value",
@@ -1646,8 +1650,16 @@ fn utility_descriptions_match_execution() {
     ] {
         let described = describe_with(&mut engine, &mut budget, sql);
         let executed = session.success(&mut engine, sql, false);
-        assert_eq!(row_description_type_oids(&described), [types::oid::INT4], "{sql}");
-        assert_eq!(row_description_type_oids(&executed), [types::oid::INT4], "{sql}");
+        assert_eq!(
+            row_description_type_oids(&described),
+            [types::oid::INT4],
+            "{sql}"
+        );
+        assert_eq!(
+            row_description_type_oids(&executed),
+            [types::oid::INT4],
+            "{sql}"
+        );
     }
     for (sql, names) in [
         ("SHOW TIMEZONE", &["TimeZone"][..]),

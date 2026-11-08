@@ -169,7 +169,8 @@ fn projected_shape<'a>(
             txid,
             arena,
             &mut columns,
-         crate::sql::exec::DescriptionTarget::Sql)?,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?,
         None => query::describe_catalog_items(
             statement.items,
             None,
@@ -177,7 +178,8 @@ fn projected_shape<'a>(
             txid,
             arena,
             &mut columns,
-         crate::sql::exec::DescriptionTarget::Sql)?,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?,
     };
     let mut width = 0u32;
     let mut output = StackStr::new();

@@ -1888,7 +1888,14 @@ fn filter_set_view_conjunct<'a>(
             let columns = arena
                 .alloc_slice_with(definition.n_columns, |_| ColDesc::new("", 0, 0))
                 .map_err(|_| arena_full())?;
-            let count = super::describe_select(select, storage, txid, arena, columns, crate::sql::exec::DescriptionTarget::Sql)?;
+            let count = super::describe_select(
+                select,
+                storage,
+                txid,
+                arena,
+                columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             if count != definition.n_columns {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -2559,7 +2566,15 @@ fn materialize_query_cte<'a>(
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, tree, txid, &mut described, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let ncols = describe_set_body(
+        storage,
+        tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     if aliases.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -2615,9 +2630,18 @@ pub fn describe_set_query<'a>(
     q: &'a SetQuery<'a>,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let body = expand_set_tree(q.with, q.body, storage, txid, None, None, arena)?;
-    describe_set_body(storage, body, txid, columns, arena, None, description_target)
+    describe_set_body(
+        storage,
+        body,
+        txid,
+        columns,
+        arena,
+        None,
+        description_target,
+    )
 }
 
 /// Expands WITH CTEs and view references across a whole set-operation tree
@@ -3736,7 +3760,15 @@ fn reject_recursive_name_collision<'a>(
         arena,
     )?;
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    describe_set_body(storage, rewritten, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    describe_set_body(
+        storage,
+        rewritten,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     Err(sql_err!(
         sqlstate::SYNTAX_ERROR,
         "{} column name \"{}\" already used in WITH query column list",
@@ -4053,7 +4085,8 @@ fn describe_dml_materialized<'a>(
         arena,
         txid,
         &mut described,
-     crate::sql::exec::DescriptionTarget::Sql)?;
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     if cte.columns.len() > count {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -4111,7 +4144,15 @@ fn describe_recursive_materialized<'a>(
     let (base_tree, recursive_tree, _) = recursive_parts(cte.query, cte.name)?;
     let base_tree = subst_set_tree(base_tree, outer, arena)?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let ncols = describe_set_body(
+        storage,
+        base_tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -4486,7 +4527,15 @@ fn materialize_recursive<'a>(
     // Column names and types come from the non-recursive term, with the CTE's
     // rename list applied.
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let ncols = describe_set_body(
+        storage,
+        base_tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -4634,7 +4683,15 @@ fn materialize_recursive<'a>(
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+        let stepn = describe_set_body(
+            storage,
+            step_tree,
+            txid,
+            &mut step_desc,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         let expected_step_columns = ncols + decoration.state_types.len();
         if stepn != expected_step_columns {
             return Err(sql_err!(
@@ -4774,7 +4831,15 @@ fn materialize_recursive<'a>(
     };
     let step_tree = subst_set_tree(recursive_tree, context, arena)?;
     let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let stepn = describe_set_body(
+        storage,
+        step_tree,
+        txid,
+        &mut step_desc,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     let expected_step_columns = ncols + decoration.state_types.len();
     if stepn != expected_step_columns {
         return Err(sql_err!(

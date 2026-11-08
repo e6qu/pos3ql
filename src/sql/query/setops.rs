@@ -69,7 +69,15 @@ pub fn set_query<'a>(
     };
     // Column names + types from the first leaf, unified across every leaf.
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n_cols = match describe_set_body(storage, body, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Wire) {
+    let n_cols = match describe_set_body(
+        storage,
+        body,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Wire,
+    ) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -222,7 +230,15 @@ pub(crate) fn set_query_into_rows<'a>(
         );
     }
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let column_count = describe_set_body(storage, body, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let column_count = describe_set_body(
+        storage,
+        body,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
         target[column] = exec::catalog_column_type(storage, txid, desc.type_oid)
@@ -692,7 +708,15 @@ pub(crate) fn external_set_body_into<'a>(
     };
 
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let column_count = describe_set_body(storage, tree, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let column_count = describe_set_body(
+        storage,
+        tree,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
         target[column] = exec::catalog_column_type(storage, txid, columns[column].type_oid)
@@ -1057,12 +1081,27 @@ fn describe_leaf_inner<'a>(
     type_oids: &mut [i32],
 ) -> Result<usize, SqlError> {
     if let Some(tree) = s.set_body {
-        return describe_set_body(storage, tree, txid, columns, arena, Some(type_oids), crate::sql::exec::DescriptionTarget::Sql);
+        return describe_set_body(
+            storage,
+            tree,
+            txid,
+            columns,
+            arena,
+            Some(type_oids),
+            crate::sql::exec::DescriptionTarget::Sql,
+        );
     }
     match &s.from {
         None => {
-            let count =
-                super::describe_catalog_items(s.items, None, storage, txid, arena, columns, crate::sql::exec::DescriptionTarget::Sql)?;
+            let count = super::describe_catalog_items(
+                s.items,
+                None,
+                storage,
+                txid,
+                arena,
+                columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             super::srf::preserve_projection_type_identities(
                 s.items,
                 None,
@@ -1081,7 +1120,16 @@ fn describe_leaf_inner<'a>(
         }
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-            let count = describe_scope_items(s.items, &scope, None, storage, txid, arena, columns, crate::sql::exec::DescriptionTarget::Sql)?;
+            let count = describe_scope_items(
+                s.items,
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             super::srf::preserve_projection_type_identities(
                 s.items,
                 Some(&scope),
@@ -1416,7 +1464,8 @@ pub(crate) fn describe_set_body<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: Option<&mut [i32]>,
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();
@@ -1612,7 +1661,15 @@ fn materialize_set_body_tied<'a>(
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = describe_set_body(storage, tree, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?;
+    let n = describe_set_body(
+        storage,
+        tree,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
         tgt[c] = exec::catalog_column_type(storage, txid, columns[c].type_oid)

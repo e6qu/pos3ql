@@ -9944,7 +9944,8 @@ impl Engine {
                             txn.txid,
                             arena,
                             &mut result_columns,
-                         crate::sql::exec::DescriptionTarget::Wire)
+                            crate::sql::exec::DescriptionTarget::Wire,
+                        )
                     }),
                 Stmt::SetQuery(query) => query::describe_set_query(
                     &self.storage,
@@ -9952,15 +9953,23 @@ impl Engine {
                     query,
                     &mut result_columns,
                     arena,
-                 crate::sql::exec::DescriptionTarget::Wire),
+                    crate::sql::exec::DescriptionTarget::Wire,
+                ),
                 Stmt::With { statement, .. } => self.describe_data_modification_columns(
                     statement,
                     arena,
                     txn,
                     &mut result_columns,
-                 crate::sql::exec::DescriptionTarget::Wire),
+                    crate::sql::exec::DescriptionTarget::Wire,
+                ),
                 Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(statement, arena, txn, &mut result_columns, crate::sql::exec::DescriptionTarget::Wire),
+                    .describe_data_modification_columns(
+                        statement,
+                        arena,
+                        txn,
+                        &mut result_columns,
+                        crate::sql::exec::DescriptionTarget::Wire,
+                    ),
                 _ => Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "utility statements cannot be prepared"
@@ -13375,8 +13384,16 @@ impl Engine {
         arena: &'a Arena,
         txn: &TxnState,
         columns: &mut [ColDesc<'a>],
-     description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
-        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns, description_target)
+        description_target: crate::sql::exec::DescriptionTarget,
+    ) -> Result<usize, SqlError> {
+        exec::describe_data_modification_columns(
+            &self.storage,
+            statement,
+            arena,
+            txn.txid,
+            columns,
+            description_target,
+        )
     }
 
     fn describe_data_modification<'a>(
@@ -13387,7 +13404,13 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match self.describe_data_modification_columns(statement, arena, txn, &mut columns, crate::sql::exec::DescriptionTarget::Wire) {
+        match self.describe_data_modification_columns(
+            statement,
+            arena,
+            txn,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(count) => {
                 if count == 0 {
                     responder.no_data()?;
@@ -13477,7 +13500,11 @@ impl Engine {
                 };
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let described = query::describe_select(
-                    s, &self.storage, txn.txid, arena, &mut columns,
+                    s,
+                    &self.storage,
+                    txn.txid,
+                    arena,
+                    &mut columns,
                     exec::DescriptionTarget::Wire,
                 );
                 match described {
@@ -13493,7 +13520,14 @@ impl Engine {
             }
             Stmt::SetQuery(q) => {
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                match query::describe_set_query(&self.storage, txn.txid, q, &mut columns, arena, crate::sql::exec::DescriptionTarget::Wire) {
+                match query::describe_set_query(
+                    &self.storage,
+                    txn.txid,
+                    q,
+                    &mut columns,
+                    arena,
+                    crate::sql::exec::DescriptionTarget::Wire,
+                ) {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
                         Ok(true)
@@ -13677,7 +13711,13 @@ impl Engine {
             // Protocol and CTE outputs share view rewriting, target ownership,
             // aliases, and catalog-derived result types.
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs, crate::sql::exec::DescriptionTarget::Sql)?;
+            let ncols = self.describe_data_modification_columns(
+                dml,
+                arena,
+                txn,
+                &mut descs,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,

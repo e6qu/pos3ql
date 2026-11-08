@@ -3668,7 +3668,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let query = super::parser::parse_query(query_sql, arena)?;
         let described = expand_ctes(query, self.storage, self.txid, arena)?;
         let mut columns = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let count = describe_select(described, self.storage, self.txid, arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)?;
+        let count = describe_select(
+            described,
+            self.storage,
+            self.txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         let valid = count == 2
             && columns[..count]
                 .iter()
@@ -7614,7 +7621,14 @@ pub fn describe_query<'a>(
 ) -> Result<usize, SqlError> {
     let sel = super::parser::parse_query(sql, arena)?;
     let sel = expand_ctes(sel, storage, txid, arena)?;
-    describe_select(sel, storage, txid, arena, out, crate::sql::exec::DescriptionTarget::Sql)
+    describe_select(
+        sel,
+        storage,
+        txid,
+        arena,
+        out,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )
 }
 
 /// Resolves a stored view body's output under the creator's captured search
@@ -7632,7 +7646,14 @@ pub(crate) fn describe_query_under<'a>(
         super::type_inputs::validate_restored(parser, storage, txid)
     })?;
     let select = expand_ctes_under(select, storage, txid, path, arena)?;
-    describe_select(select, storage, txid, arena, out, crate::sql::exec::DescriptionTarget::Sql)
+    describe_select(
+        select,
+        storage,
+        txid,
+        arena,
+        out,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )
 }
 
 #[expect(
@@ -7651,7 +7672,14 @@ pub(crate) fn describe_stored_query<'a>(
 ) -> Result<usize, SqlError> {
     let select = parse_stored_query(sql, input_source, storage, txid, dependencies, arena)?;
     let select = expand_stored_query(select, storage, txid, path, dependencies, arena)?;
-    describe_select(select, storage, txid, arena, out, crate::sql::exec::DescriptionTarget::Sql)
+    describe_select(
+        select,
+        storage,
+        txid,
+        arena,
+        out,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )
 }
 
 pub(crate) fn describe_select<'a>(
@@ -7660,17 +7688,42 @@ pub(crate) fn describe_select<'a>(
     txid: u32,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     // Set operations unify every branch before exposing SQL or wire types.
     if let Some(body) = sel.set_body {
-        return setops::describe_set_body(storage, body, txid, out, arena, None, description_target);
+        return setops::describe_set_body(
+            storage,
+            body,
+            txid,
+            out,
+            arena,
+            None,
+            description_target,
+        );
     }
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
-            describe_select_items(sel.items, Some(&scope), storage, txid, arena, out, description_target)
+            describe_select_items(
+                sel.items,
+                Some(&scope),
+                storage,
+                txid,
+                arena,
+                out,
+                description_target,
+            )
         }
-        None => describe_select_items(sel.items, None, storage, txid, arena, out, description_target),
+        None => describe_select_items(
+            sel.items,
+            None,
+            storage,
+            txid,
+            arena,
+            out,
+            description_target,
+        ),
     }
 }
 
@@ -8939,7 +8992,8 @@ pub(crate) fn select_query_resumable<'a>(
         txid,
         arena,
         &mut columns,
-     crate::sql::exec::DescriptionTarget::Sql) {
+        crate::sql::exec::DescriptionTarget::Sql,
+    ) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
@@ -8966,7 +9020,9 @@ pub(crate) fn select_query_resumable<'a>(
         return sql_fail(error);
     }
     if let Err(error) = crate::sql::exec::DescriptionTarget::Wire.finish(
-        &mut columns[..n_cols], Some(storage), txid,
+        &mut columns[..n_cols],
+        Some(storage),
+        txid,
     ) {
         return sql_fail(error);
     }
@@ -9391,8 +9447,15 @@ pub(crate) fn constant_select_resumable<'a>(
     responder: &mut Responder,
 ) -> Outcome {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let n = match describe_catalog_items(statement.items, None, storage, txid, arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)
-    {
+    let n = match describe_catalog_items(
+        statement.items,
+        None,
+        storage,
+        txid,
+        arena,
+        &mut columns,
+        crate::sql::exec::DescriptionTarget::Sql,
+    ) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
@@ -9498,9 +9561,9 @@ pub(crate) fn constant_select_resumable<'a>(
     ) {
         return sql_fail(error);
     }
-    if let Err(error) = crate::sql::exec::DescriptionTarget::Wire.finish(
-        &mut columns[..n], Some(storage), txid,
-    ) {
+    if let Err(error) =
+        crate::sql::exec::DescriptionTarget::Wire.finish(&mut columns[..n], Some(storage), txid)
+    {
         return sql_fail(error);
     }
     let catalog = StorageCatalog {
@@ -9660,7 +9723,8 @@ pub(crate) fn constant_select_resumable<'a>(
                         txid,
                         arena,
                         &mut described,
-                     crate::sql::exec::DescriptionTarget::Wire) {
+                        crate::sql::exec::DescriptionTarget::Wire,
+                    ) {
                         Ok(width) => width,
                         Err(error) => return sql_fail(error),
                     }
@@ -10083,8 +10147,15 @@ fn select_into_rows_mode<'a>(
             None
         } else {
             let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-            setops::describe_set_body(storage, tree, txid, &mut columns, arena, None,
-                crate::sql::exec::DescriptionTarget::Sql)?;
+            setops::describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut columns,
+                arena,
+                None,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             Some(columns)
         };
         if let Some(ref cols) = columns_owned {
@@ -11095,7 +11166,10 @@ fn materialize_composite_outputs<'a>(
 
 /// Column descriptions across the whole scope (wildcards expand every
 /// table).
-#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub fn describe_scope_items<'q>(
     items: &[SelectItem<'_>],
     scope: &QueryScope<'_>,
@@ -11104,7 +11178,8 @@ pub fn describe_scope_items<'q>(
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let mut n = 0;
     for item in items {
         validate_projection_source(item, scope)?;
@@ -11252,7 +11327,8 @@ pub fn describe_catalog_items<'q>(
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     describe_catalog_items_as(
         items,
         definition.map(crate::storage::RelationDefinition::from_definition),
@@ -11261,10 +11337,14 @@ pub fn describe_catalog_items<'q>(
         txid,
         arena,
         out,
-     description_target)
+        description_target,
+    )
 }
 
-#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub fn describe_catalog_items_as<'q>(
     items: &[SelectItem<'q>],
     definition: Option<crate::storage::RelationDefinition<'q>>,
@@ -11273,7 +11353,8 @@ pub fn describe_catalog_items_as<'q>(
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     // User-defined casts carry identity and, for named composites, field
     // shape through the catalog. Resolve them before the catalog-free
     // descriptor pass: static inference deliberately cannot reconstruct that
@@ -11325,7 +11406,8 @@ pub fn describe_catalog_items_as<'q>(
             txid,
             arena,
             &mut out[count..],
-         crate::sql::exec::DescriptionTarget::Sql)?;
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?;
         count += width;
         item_width[item_index] = width;
     }
@@ -11364,10 +11446,28 @@ pub fn describe_select_items<'q>(
     txid: u32,
     arena: &'q Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let count = match scope {
-        Some(scope) => describe_scope_items(items, scope, None, storage, txid, arena, out, crate::sql::exec::DescriptionTarget::Sql)?,
-        None => describe_catalog_items(items, None, storage, txid, arena, out, crate::sql::exec::DescriptionTarget::Sql)?,
+        Some(scope) => describe_scope_items(
+            items,
+            scope,
+            None,
+            storage,
+            txid,
+            arena,
+            out,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?,
+        None => describe_catalog_items(
+            items,
+            None,
+            storage,
+            txid,
+            arena,
+            out,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?,
     };
     let mut column = 0;
     for item in items {
@@ -11497,7 +11597,8 @@ fn array_subquery_field_type_inner<'q>(
                 txid,
                 arena,
                 &mut element,
-             crate::sql::exec::DescriptionTarget::Sql)?
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?
         }
         None => describe_select_items(
             select.items,
@@ -11506,7 +11607,8 @@ fn array_subquery_field_type_inner<'q>(
             txid,
             arena,
             &mut element,
-         crate::sql::exec::DescriptionTarget::Sql)?,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?,
     };
     if count != 1 {
         return Err(sql_err!(
@@ -11575,7 +11677,15 @@ fn subquery_result_type_inner<'a>(
     };
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let count = if let Some(body) = select.set_body {
-        setops::describe_set_body(storage, body, txid, &mut columns, arena, None, crate::sql::exec::DescriptionTarget::Sql)?
+        setops::describe_set_body(
+            storage,
+            body,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+        )?
     } else {
         match &select.from {
             Some(from) => {
@@ -11597,7 +11707,8 @@ fn subquery_result_type_inner<'a>(
                     txid,
                     arena,
                     &mut columns,
-                 crate::sql::exec::DescriptionTarget::Sql)?
+                    crate::sql::exec::DescriptionTarget::Sql,
+                )?
             }
             None => describe_select_items(
                 select.items,
@@ -11606,7 +11717,8 @@ fn subquery_result_type_inner<'a>(
                 txid,
                 arena,
                 &mut columns,
-             crate::sql::exec::DescriptionTarget::Sql)?,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?,
         }
     };
     if count != 1 {

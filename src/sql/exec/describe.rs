@@ -103,7 +103,10 @@ pub(crate) fn wire_column_description<'a>(
     Ok(description)
 }
 
-#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<crate::storage::RelationDefinition<'_>>,
@@ -112,7 +115,8 @@ pub fn describe_items<'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let count = describe_items_with_output_aliases(
         items,
         DescribeContext {
@@ -298,13 +302,21 @@ pub(crate) fn describe_data_modification_columns<'a>(
     arena: &'a crate::mem::arena::Arena,
     txid: u32,
     columns: &mut [ColDesc<'a>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     use crate::sql::ast::Stmt;
     if let Stmt::Merge(merge) = statement {
         if merge.returning.is_empty() {
             return Ok(0);
         }
-        return crate::sql::exec::describe_merge_returning(storage, txid, merge, arena, columns, description_target);
+        return crate::sql::exec::describe_merge_returning(
+            storage,
+            txid,
+            merge,
+            arena,
+            columns,
+            description_target,
+        );
     }
     let (target, returning, target_alias) = match statement {
         Stmt::Insert(insert) => {
@@ -359,13 +371,17 @@ pub(crate) fn describe_data_modification_columns<'a>(
             txid,
             arena,
             columns,
-         description_target)
+            description_target,
+        )
     })
 }
 
 /// Describe a single DML target's `RETURNING` list, including the names that
 /// PostgreSQL adds only to the output scope.
-#[expect(clippy::too_many_arguments, reason = "description explicitly selects SQL identities or protocol types")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     returning: crate::sql::ast::Returning<'q>,
     definition: Option<&TableDef>,
@@ -374,7 +390,8 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
     let count = describe_items_with_output_aliases(
         returning.items,

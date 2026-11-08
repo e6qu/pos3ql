@@ -26510,14 +26510,16 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     context.txn.txid,
                     arena,
                     &mut columns,
-                 crate::sql::exec::DescriptionTarget::Sql)?,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                )?,
                 Stmt::SetQuery(set_query) => super::query::describe_set_query(
                     context.storage(),
                     context.txn.txid,
                     set_query,
                     &mut columns,
                     arena,
-                 crate::sql::exec::DescriptionTarget::Sql)?,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                )?,
                 _ => 0,
             };
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
@@ -26603,7 +26605,14 @@ where
     'result: 'query,
 {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns, crate::sql::exec::DescriptionTarget::Sql)?;
+    let width = super::query::describe_select(
+        query,
+        storage,
+        txid,
+        query_arena,
+        &mut columns,
+        crate::sql::exec::DescriptionTarget::Sql,
+    )?;
     let mut rows = ArenaList::new(result_arena);
     super::query::select_into_rows(
         storage,
@@ -27537,7 +27546,11 @@ fn execute_trigger_step<'a>(
                                 unreachable!("cursor host cannot change during execution")
                             };
                             let mut borrowed_names = [None; MAX_COLUMNS];
-                            let count = cursors.record_columns(name, &mut borrowed_names, &mut column_type_oids)?;
+                            let count = cursors.record_columns(
+                                name,
+                                &mut borrowed_names,
+                                &mut column_type_oids,
+                            )?;
                             for (target, source) in column_names[..count]
                                 .iter_mut()
                                 .zip(&borrowed_names[..count])
@@ -27737,7 +27750,8 @@ fn execute_trigger_step<'a>(
                     context.txn.txid,
                     arena,
                     &mut columns,
-                 crate::sql::exec::DescriptionTarget::Sql)?;
+                    crate::sql::exec::DescriptionTarget::Sql,
+                )?;
                 for (field, column) in fields.iter_mut().zip(&columns[..width]) {
                     *field = (
                         arena
@@ -27916,7 +27930,8 @@ fn execute_trigger_step<'a>(
                                 context.txn.txid,
                                 context.arena,
                                 &mut columns,
-                             crate::sql::exec::DescriptionTarget::Sql)?,
+                                crate::sql::exec::DescriptionTarget::Sql,
+                            )?,
                             Stmt::SetQuery(set_query) if record_target => {
                                 super::query::describe_set_query(
                                     context.storage(),
@@ -27924,7 +27939,8 @@ fn execute_trigger_step<'a>(
                                     set_query,
                                     &mut columns,
                                     context.arena,
-                                 crate::sql::exec::DescriptionTarget::Sql)?
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                )?
                             }
                             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
                                 if record_target =>
@@ -27935,7 +27951,8 @@ fn execute_trigger_step<'a>(
                                     context.arena,
                                     context.txn.txid,
                                     &mut columns,
-                                 crate::sql::exec::DescriptionTarget::Sql)?
+                                    crate::sql::exec::DescriptionTarget::Sql,
+                                )?
                             }
                             Stmt::Show(name) if record_target => {
                                 let title = super::guc::canonical_setting_name(name)?;
@@ -62164,7 +62181,8 @@ pub fn describe_merge_returning<'a>(
     statement: &crate::sql::ast::Merge<'a>,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
- description_target: crate::sql::exec::DescriptionTarget) -> Result<usize, SqlError> {
+    description_target: crate::sql::exec::DescriptionTarget,
+) -> Result<usize, SqlError> {
     use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
 
     let target = TableRef {
@@ -62270,7 +62288,8 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-             description_target);
+                description_target,
+            );
             scope.names[0] = saved_name;
             count += width?;
         } else if uses_output_alias(item) {
@@ -62323,7 +62342,8 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-             description_target)?;
+                description_target,
+            )?;
         } else if matches!(item, SelectItem::Wildcard) {
             let source_star =
                 SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
@@ -62337,7 +62357,8 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-             description_target)?;
+                description_target,
+            )?;
             count += super::query::describe_scope_items(
                 core::slice::from_ref(&target_star),
                 &scope,
@@ -62346,7 +62367,8 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-             description_target)?;
+                description_target,
+            )?;
         } else {
             let width = super::query::describe_scope_items(
                 core::slice::from_ref(item),
@@ -62356,7 +62378,8 @@ pub fn describe_merge_returning<'a>(
                 txid,
                 arena,
                 &mut out[count..],
-             description_target)?;
+                description_target,
+            )?;
             count += width;
         }
     }
@@ -62848,14 +62871,20 @@ pub(crate) fn merge<'a>(
     if !statement.returning.is_empty() && !capturing {
         let mark = arena.mark();
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let count =
-            match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns, crate::sql::exec::DescriptionTarget::Wire) {
-                Ok(count) => count,
-                Err(error) => {
-                    unsafe { arena.rewind_to(mark) };
-                    return sql_fail(error);
-                }
-            };
+        let count = match describe_merge_returning(
+            storage,
+            txn.txid,
+            statement,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                unsafe { arena.rewind_to(mark) };
+                return sql_fail(error);
+            }
+        };
         if let Err(wire) = responder.row_description(&columns[..count]) {
             unsafe { arena.rewind_to(mark) };
             return Err(wire);
@@ -65066,7 +65095,8 @@ pub(crate) fn instead_of_view_dml<'a>(
             txn.txid,
             arena,
             &mut description,
-         crate::sql::exec::DescriptionTarget::Wire) {
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(count) => count,
             Err(error) => return sql_fail(error),
         };
@@ -65097,7 +65127,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                     txn.txid,
                     arena,
                     &mut source_columns,
-                 crate::sql::exec::DescriptionTarget::Sql) {
+                    crate::sql::exec::DescriptionTarget::Sql,
+                ) {
                     Ok(count) => count,
                     Err(error) => return sql_fail(error),
                 };
@@ -66099,7 +66130,8 @@ where
             txn.txid,
             arena,
             &mut columns,
-         crate::sql::exec::DescriptionTarget::Wire) {
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -67475,7 +67507,8 @@ pub(crate) fn update<'a>(
             txn.txid,
             arena,
             &mut columns,
-         crate::sql::exec::DescriptionTarget::Wire) {
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }
@@ -68535,7 +68568,8 @@ pub(crate) fn delete<'a>(
             txn.txid,
             arena,
             &mut columns,
-         crate::sql::exec::DescriptionTarget::Wire) {
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(n) => responder.row_description(&columns[..n])?,
             Err(e) => return sql_fail(e),
         }

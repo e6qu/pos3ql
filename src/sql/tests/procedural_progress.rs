@@ -1954,6 +1954,32 @@ fn whole_row_dependencies_keep_expanded_and_selected_columns() {
 }
 
 #[test]
+fn record_projection_layout_keeps_sort_group_window_and_deferred_slots() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("record-projection-layout-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!(
+                    "../../../tests/external/differential/282_record_projection_layout.sql"
+                ),
+                true,
+            )),
+            ["t|t|t|t|t|t|t|t|t", "2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

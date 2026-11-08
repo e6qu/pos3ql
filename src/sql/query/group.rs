@@ -882,6 +882,8 @@ pub(super) fn grouped_rows<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
             &order_arr[..k],
         )?;
         // The sort key evaluates against the group, so it faces the same
@@ -1090,11 +1092,17 @@ pub(super) fn grouped_select<'a>(
     if statement.with_ties && limit > 0 {
         let mut collations = [Collation::None; MAX_PROJ];
         for (index, order) in statement.order_by.iter().enumerate() {
-            let expression =
-                match resolve_order_target(order.expression, statement.items, scope, arena) {
-                    Ok(expression) => expression,
-                    Err(error) => return sql_fail(error),
-                };
+            let expression = match resolve_order_target(
+                order.expression,
+                statement.items,
+                scope,
+                arena,
+                storage,
+                txid,
+            ) {
+                Ok(expression) => expression,
+                Err(error) => return sql_fail(error),
+            };
             collations[index] = match scope.expression_collation(storage, arena, expression) {
                 Ok(collation) => collation,
                 Err(error) => return sql_fail(error),

@@ -6781,7 +6781,7 @@ fn patch_subquery_column_types<'a>(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += record_star_description_width(base, scope, storage, txid, arena)?;
+                slot += record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
@@ -6921,6 +6921,8 @@ fn check_key_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<(), SqlError> {
     let noncomparable = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
@@ -6944,7 +6946,8 @@ fn check_key_types<'a>(
         }
     }
     for order in statement.order_by {
-        let target = resolve_order_target(order.expression, statement.items, scope, arena)?;
+        let target =
+            resolve_order_target(order.expression, statement.items, scope, arena, storage, txid)?;
         if let Some(ctype) = noncomparable(target) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -7044,9 +7047,15 @@ fn resolve_group_ordinals<'a>(
             .map_err(|_| arena_full())?;
         for (slot, grouping) in resolved.iter_mut().zip(statement.group_by) {
             *slot = match grouping {
-                Expr::Int(_) => {
-                    resolve_position_target(grouping, statement.items, scope, arena, "GROUP BY")?
-                }
+                Expr::Int(_) => resolve_position_target(
+                    grouping,
+                    statement.items,
+                    scope,
+                    arena,
+                    storage,
+                    txid,
+                    "GROUP BY",
+                )?,
                 _ => grouping,
             };
         }
@@ -7067,10 +7076,9 @@ fn resolve_group_ordinals<'a>(
                 Some(scope) => scope.qualified_star_columns(qualifier)?,
                 None => 0,
             },
-            SelectItem::RecordStar(expression) => scope
-                .map(|scope| record_star_width(expression, scope))
-                .transpose()?
-                .unwrap_or(0),
+            SelectItem::RecordStar(expression) => {
+                record_star_width(expression, scope, storage, txid, arena)?
+            }
             SelectItem::Expr { .. } => 1,
         };
     }
@@ -7114,8 +7122,12 @@ pub(super) fn resolve_order_target<'a>(
     items: &'a [SelectItem<'a>],
     scope: &QueryScope<'a>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    resolve_position_target(expression, items, Some(scope), arena, "ORDER BY")
+    resolve_position_target(
+        expression, items, Some(scope), arena, storage, txid, "ORDER BY",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -7153,9 +7165,11 @@ pub(super) fn resolve_sort_key<'a>(
     items: &'a [SelectItem<'a>],
     scope: &QueryScope<'a>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
     earlier: &[Option<ResolvedSortKey<'a>>],
 ) -> Result<ResolvedSortKey<'a>, SqlError> {
-    let expression = resolve_order_target(original, items, scope, arena)?;
+    let expression = resolve_order_target(original, items, scope, arena, storage, txid)?;
     let source = if let Expr::Int(position) = original {
         // Resolution above checked this against the expanded output width.
         SortKeySource::Projection(*position as usize - 1)
@@ -7184,7 +7198,9 @@ pub(super) fn resolve_sort_key<'a>(
                 SelectItem::TableWildcard(qualifier) => {
                     index += scope.qualified_star_columns(qualifier)?;
                 }
-                SelectItem::RecordStar(base) => index += record_star_width(base, scope)?,
+                SelectItem::RecordStar(base) => {
+                    index += record_star_width(base, Some(scope), storage, txid, arena)?;
+                }
             }
         }
         if let Some(index) = named_output.or(equal_output) {
@@ -7209,6 +7225,8 @@ fn resolve_position_target<'a>(
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'_>>,
     arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
     clause: &str,
 ) -> Result<&'a Expr<'a>, SqlError> {
     let Expr::Int(n) = expression else {
@@ -7275,15 +7293,31 @@ fn resolve_position_target<'a>(
                 remaining -= width;
             }
             SelectItem::RecordStar(base) => {
-                let Some(scope) = scope else {
-                    return Err(position_error());
-                };
-                let width = record_star_width(base, scope)?;
+                let width = record_star_width(base, scope, storage, txid, arena)?;
                 if remaining < width {
                     let target = remaining;
                     let mut result = None;
                     let mut index = 0usize;
-                    super::exec::record_shape(base, &ScopeCols(scope), |name, _| {
+                    let scoped_columns = scope.map(|scope| CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    });
+                    let empty_columns = super::exec::CatalogCols {
+                        definition: None,
+                        alias: None,
+                        output_aliases: &[],
+                        storage,
+                        txid,
+                        arena,
+                    };
+                    let columns: &dyn super::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
+                        &empty_columns as &dyn super::exec::ColTypeResolver,
+                        |columns| columns,
+                    );
+                    super::exec::record_shape_metadata(base, columns, |name, _| {
                         if result.is_none() && index == target {
                             result =
                                 Some(arena.alloc_str(name).map_err(|_| arena_full()).and_then(
@@ -8439,6 +8473,8 @@ fn check_select_types<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
         )?)?;
     }
     Ok(())
@@ -8885,7 +8921,7 @@ pub(crate) fn select_query_resumable<'a>(
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
-    if let Err(e) = check_key_types(statement, &scope, arena) {
+    if let Err(e) = check_key_types(statement, &scope, arena, storage, txid) {
         return sql_fail(e);
     }
 
@@ -10371,7 +10407,7 @@ fn select_into_rows_mode<'a>(
             outer,
         )?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
-        check_key_types(statement, &scope, arena)?;
+        check_key_types(statement, &scope, arena, storage, txid)?;
         let sub_exprs = arena
             .alloc_slice_with(2 + statement.items.len() + 2 * scope.n, |_| None)
             .map_err(|_| arena_full())?;
@@ -10548,7 +10584,7 @@ fn select_into_rows_mode<'a>(
         // subqueries/projections that Limit will never request.
         let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
         check_select_types(statement, &scope, storage, txid, arena, outer)?;
-        check_key_types(statement, &scope, arena)?;
+        check_key_types(statement, &scope, arena, storage, txid)?;
         materialize::prepare_materialization(storage, txid, statement, &scope, &[], outer, arena)?;
         scan::validate_materialized_view_reads(
             storage,
@@ -11466,7 +11502,7 @@ pub fn describe_select_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += record_star_description_width(base, scope, storage, txid, arena)?;
+                column += record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(description) =
@@ -11508,7 +11544,7 @@ fn patch_array_subquery_field_types<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += record_star_description_width(base, outer_scope, storage, txid, arena)?;
+                column += record_star_width(base, outer_scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(metadata) =
@@ -13102,15 +13138,9 @@ fn scope_column_type_mod(
     }
 }
 
-/// The number of columns a `(base).*` record expansion contributes, or 0 when
-/// its shape is not statically known (surfaced loudly at projection time).
-pub(super) fn record_star_width(base: &Expr, scope: &QueryScope) -> Result<usize, SqlError> {
-    Ok(super::exec::record_shape(base, &ScopeCols(scope), |_, _| {})?.unwrap_or(0))
-}
-
-/// Description offsets need the named type's fields, including without FROM.
+/// Projection offsets include catalog-declared fields, including without FROM.
 /// An unknown shape cannot silently reserve zero output columns.
-fn record_star_description_width(
+pub(super) fn record_star_width(
     base: &Expr<'_>,
     scope: Option<&QueryScope<'_>>,
     storage: &Storage,

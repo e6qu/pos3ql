@@ -144,6 +144,13 @@ The type-only pass releases its arena and temporary record descriptions while
 preserving descriptions owned by the enclosing statement. SQL `EXECUTE` carries
 declared parameter types through planning and execution, even for NULL values.
 Metadata adapters carry declared sizes, collations and anonymous record shapes.
+SQL output descriptions preserve a column's declared domain type when it is
+selected by name, through a derived table or with `*`; protocol output converts
+domains to the base representation expected by clients. Record expansion uses
+catalog field counts for sorting, grouping, window queries and deferred output.
+For example, after a two-field `(record_value).*`, `ORDER BY 3` refers to the
+following result. Expanded fields also keep their text comparison rules during
+duplicate elimination.
 For example, `(q).f1` remains usable when `q` comes from `ROW(7)` in a nested
 query. Expanded views retain their original schema and name while aliases
 control which names SQL can reference. `RETURNING` adds the target's old/new

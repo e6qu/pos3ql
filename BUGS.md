@@ -15,6 +15,8 @@ Two record fields with a text domain must remain comparable to each other.
 Metadata discovery must preserve whole-row alias resolution in procedural SQL.
 Selecting a column by name must preserve its declared domain type through
 derived tables as well as direct table reads and wildcard expansion.
+Expanded records must occupy their actual output width in ordering, grouping,
+window queries, set operations and deferred evaluation after sorting.
 Dependency capture must resolve whole rows, selected fields and schema-qualified
 columns while retaining the columns actually required by later schema changes.
 Fixed function-timing capacity must fail explicitly and return entries after

@@ -1588,6 +1588,8 @@ pub(crate) fn project_window_rows<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
             &order_exprs[..k],
         )?);
     }
@@ -1733,13 +1735,18 @@ fn compare_encoded_order<'a>(
 fn projected_width<'a>(
     items: &[SelectItem<'a>],
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
 ) -> Result<usize, SqlError> {
     let mut width = 0;
     for item in items {
         width += match item {
             SelectItem::Wildcard => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
-            SelectItem::RecordStar(base) => record_star_width(base, scope)?,
+            SelectItem::RecordStar(base) => {
+                record_star_width(base, Some(scope), storage, txid, arena)?
+            }
             SelectItem::Expr { .. } => 1,
         };
     }
@@ -1811,6 +1818,8 @@ pub(crate) fn external_window_into<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
             &order_exprs[..k],
         )?);
     }
@@ -2090,7 +2099,7 @@ pub(crate) fn external_window_into<'a>(
 
     // Re-scan the source, projecting each row with its window values read
     // back from the completed run, and sort the projected rows by ORDER BY.
-    let width = projected_width(statement.items, scope)?;
+    let width = projected_width(statement.items, scope, storage, txid, arena)?;
     let statement_order_collations: &mut [Collation] = arena
         .alloc_slice_with(statement.order_by.len(), |_| Collation::None)
         .map_err(|_| arena_full())?;

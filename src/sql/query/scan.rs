@@ -2704,7 +2704,14 @@ pub(crate) fn ordered_index_access_plan<'a>(
     let mut order_columns = [None; MAX_INDEX_COLS];
     let mut order_targets = [&Expr::Null; MAX_INDEX_COLS];
     for (position, requested) in order.iter().enumerate() {
-        let expression = super::resolve_order_target(requested.expression, items, scope, arena)?;
+        let expression = super::resolve_order_target(
+            requested.expression,
+            items,
+            scope,
+            arena,
+            storage,
+            txid,
+        )?;
         order_targets[position] = expression;
         order_columns[position] = resolve_column(expression).map(|column| column as u16);
     }

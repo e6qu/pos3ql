@@ -100,6 +100,9 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   Preserve whole-row aliases such as `(t).*` in procedural query planning.
   Track expanded columns and selected fields in saved-query dependencies,
   preserving column precedence when its name matches a table alias.
+  Count expanded record fields consistently in sorting, grouping, window
+  queries and deferred output. For example, after a two-field record expands,
+  `ORDER BY 3` selects the following output column, including without `FROM`.
 - Cancellation, timeout, rollback, connection closure and successful completion
   release owners. A handled timeout stays consumed if its handler waits.
   Memory remains inside the existing startup pools, with named exhaustion and

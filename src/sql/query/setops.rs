@@ -1322,10 +1322,7 @@ fn register_record_shapes_inner(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += scope
-                    .map(|scope| super::record_star_width(base, scope))
-                    .transpose()?
-                    .unwrap_or(0);
+                slot += super::record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < count && columns[slot].type_oid == crate::sql::types::oid::RECORD {

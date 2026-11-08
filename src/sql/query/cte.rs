@@ -1639,6 +1639,8 @@ pub(crate) fn filter_view_rows<'a>(
                 select.items,
                 scope.as_ref(),
                 arena,
+                storage,
+                txid,
                 "view output",
             )?)
             .map_err(|_| arena_full())?;
@@ -1703,6 +1705,8 @@ pub(crate) fn filter_view_rows<'a>(
                     select.items,
                     scope.as_ref(),
                     arena,
+                    storage,
+                    txid,
                     "DISTINCT ON",
                 )? == **expression;
             }

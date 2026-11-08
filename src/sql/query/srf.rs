@@ -2330,7 +2330,9 @@ pub(crate) fn describe_derived_definition<'a>(
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
-                        SelectItem::RecordStar(base) => slot += record_star_width(base, &ss)?,
+                        SelectItem::RecordStar(base) => {
+                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
+                        }
                         SelectItem::Expr { expression, .. } => {
                             // A record-valued item registers its field shape;
                             // the column's type_mod carries the handle so
@@ -2398,7 +2400,7 @@ pub(crate) fn describe_derived_definition<'a>(
                             }
                         }
                         SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, &ss)?;
+                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
                         }
                         SelectItem::Expr { expression, .. } => {
                             output_collations[slot] =

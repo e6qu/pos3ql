@@ -6781,10 +6781,7 @@ fn patch_subquery_column_types<'a>(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += scope
-                    .map(|s| record_star_width(base, s))
-                    .transpose()?
-                    .unwrap_or(0);
+                slot += record_star_description_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
@@ -11459,10 +11456,7 @@ pub fn describe_select_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += scope
-                    .map(|scope| record_star_width(base, scope))
-                    .transpose()?
-                    .unwrap_or(0);
+                column += record_star_description_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
                 if let Some(description) =
@@ -11504,16 +11498,19 @@ fn patch_array_subquery_field_types<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                column += outer_scope
-                    .map(|scope| record_star_width(base, scope))
-                    .transpose()?
-                    .unwrap_or(0);
+                column += record_star_description_width(base, outer_scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
-                if let Some((ctype, type_mod)) =
+                if let Some(metadata) =
                     array_subquery_field_type(expression, outer_scope, storage, txid, arena)?
                 {
-                    out[column] = ColDesc::of_type(out[column].name, ctype).with_type_mod(type_mod);
+                    out[column] = ColDesc::new(
+                        out[column].name,
+                        metadata.type_oid,
+                        metadata.ctype.typlen(),
+                    )
+                    .with_type_mod(metadata.type_mod)
+                    .with_collation(metadata.collation);
                 }
                 column += 1;
             }
@@ -11528,7 +11525,7 @@ fn array_subquery_field_type<'q>(
     storage: &'q Storage,
     txid: u32,
     arena: &'q Arena,
-) -> Result<Option<(ColType, i32)>, SqlError> {
+) -> Result<Option<super::exec::StaticTypeMeta>, SqlError> {
     let mark = arena.mark();
     let result = array_subquery_field_type_inner(expression, outer_scope, storage, txid, arena);
     // Type identities are owned values, not references to the temporary scope.
@@ -11544,7 +11541,7 @@ fn array_subquery_field_type_inner<'q>(
     storage: &'q Storage,
     txid: u32,
     arena: &'q Arena,
-) -> Result<Option<(ColType, i32)>, SqlError> {
+) -> Result<Option<super::exec::StaticTypeMeta>, SqlError> {
     let Expr::Field { base, field } = expression else {
         return Ok(None);
     };
@@ -11613,10 +11610,25 @@ fn array_subquery_field_type_inner<'q>(
                 "composite type no longer exists"
             )
         })?;
-    Ok(composite
+    composite
         .active_fields()
         .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
-        .map(|candidate| (candidate.ctype, candidate.type_mod)))
+        .map(|candidate| {
+            Ok(super::exec::StaticTypeMeta {
+                type_oid: storage
+                    .routine_type_oid(candidate.ctype, candidate.user_type, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "record field's declared type is unavailable"
+                        )
+                    })?,
+                ctype: candidate.ctype,
+                type_mod: candidate.type_mod,
+                collation: candidate.collation,
+            })
+        })
+        .transpose()
 }
 
 #[derive(Clone, Copy)]
@@ -12270,7 +12282,11 @@ fn describe_scope_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if scope.table_index(table).is_ok() => {
+        } if scope.table_index(table).is_ok()
+            && (matches!(base, Expr::WholeRow(_))
+                || scope.find_column(None, table).is_err_and(|error| {
+                    error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                })) => {
             let t = scope.table_index(table)?;
             for (column, _) in scope
                 .defs
@@ -13082,6 +13098,68 @@ fn scope_column_type_mod(
 /// its shape is not statically known (surfaced loudly at projection time).
 pub(super) fn record_star_width(base: &Expr, scope: &QueryScope) -> Result<usize, SqlError> {
     Ok(super::exec::record_shape(base, &ScopeCols(scope), |_, _| {})?.unwrap_or(0))
+}
+
+/// Description offsets need the named type's fields, including without FROM.
+/// An unknown shape cannot silently reserve zero output columns.
+fn record_star_description_width(
+    base: &Expr<'_>,
+    scope: Option<&QueryScope<'_>>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
+    if let Some(scope) = scope {
+        let table = match base {
+            Expr::WholeRow(table) => Some(*table),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if scope
+                .find_column(None, name)
+                .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN) =>
+            {
+                Some(*name)
+            }
+            _ => None,
+        };
+        if let Some(table) = table
+            && scope.qualified_star_columns(table).is_ok()
+        {
+            return scope.qualified_star_columns(table);
+        }
+    }
+    let scoped;
+    let fromless;
+    let columns: &dyn super::exec::ColTypeResolver = match scope {
+        Some(scope) => {
+            scoped = CatalogScopeCols {
+                scope,
+                outer_scope: None,
+                storage,
+                txid,
+                arena,
+            };
+            &scoped
+        }
+        None => {
+            fromless = super::exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            };
+            &fromless
+        }
+    };
+    super::exec::record_shape_metadata(base, columns, |_, _| {})?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "row expansion is not supported on this expression"
+        )
+    })
 }
 
 fn infer_scope_type(expression: &Expr, scope: &QueryScope) -> Result<(i32, i16), SqlError> {

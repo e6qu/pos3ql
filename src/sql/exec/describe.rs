@@ -1206,10 +1206,12 @@ fn describe_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if output_aliases.contains(table)
-            || def.is_some_and(|d| {
-                crate::sql::eval::qualifier_answers_target(d, table_alias, table)
-            }) =>
+        } if (matches!(base, Expr::WholeRow(_))
+            || def.is_some_and(|definition| definition.column_index(table).is_none()))
+            && (output_aliases.contains(table)
+                || def.is_some_and(|d| {
+                    crate::sql::eval::qualifier_answers_target(d, table_alias, table)
+                })) =>
         {
             for c in def.expect("matched").columns() {
                 push(describe_column(c, storage, txid, arena)?)?;
@@ -2702,9 +2704,6 @@ pub fn visit_record_shape_metadata(
 pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<i32> {
     match base {
         Expr::Column { qualifier, name } => {
-            if columns.is_whole_row(name) {
-                return None;
-            }
             let handle = columns.record_column_handle(*qualifier, name)?;
             (handle >= 0).then_some(handle)
         }
@@ -3645,14 +3644,25 @@ fn record_shape_metadata_dyn(
         }
         Expr::WholeRow(table) => Ok(shape_from_columns_metadata(table, columns, visit)),
         Expr::Cast { type_name, .. } => columns.visit_named_composite_fields(type_name, visit),
-        Expr::Column { qualifier, name }
-            if matches!(columns.resolve(*qualifier, name), Ok(ColType::Composite(_))) =>
-        {
-            let ColType::Composite(slot) = columns.resolve(*qualifier, name)? else {
-                unreachable!()
-            };
-            Ok(columns.visit_composite_fields(slot, visit))
-        }
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
+            Ok(ColType::Composite(slot)) => Ok(columns.visit_composite_fields(slot, visit)),
+            Ok(ColType::Record) => match expr_record_handle(base, columns) {
+                Some(handle) => Ok(visit_record_shape_metadata(handle, visit)),
+                None if qualifier.is_none() && columns.is_whole_row(name) => {
+                    Ok(shape_from_columns_metadata(name, columns, visit))
+                }
+                None => Ok(None),
+            },
+            Ok(_) => Ok(None),
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && columns.is_whole_row(name) =>
+            {
+                Ok(shape_from_columns_metadata(name, columns, visit))
+            }
+            Err(error) => Err(error),
+        },
         Expr::Field { base, field }
             if matches!(
                 record_field_type(base, field, columns),
@@ -3686,16 +3696,12 @@ fn record_shape_metadata_dyn(
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
-        Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
+        Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
             Ok(visit_record_shape_metadata(
                 expr_record_handle(base, columns).expect("record shape was selected"),
                 visit,
             ))
         }
-        Expr::Column {
-            qualifier: None,
-            name,
-        } if columns.is_whole_row(name) => Ok(shape_from_columns_metadata(name, columns, visit)),
         _ => Ok(None),
     }
 }
@@ -3863,21 +3869,30 @@ pub fn record_field_metadata(
             }
         }
         Expr::WholeRow(table) => columns.column_meta(Some(table), field),
-        Expr::Column {
-            qualifier: None,
-            name,
-        } if columns.is_whole_row(name) => columns.column_meta(Some(name), field),
-        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name).ok() {
-            Some(ColType::Composite(slot)) => {
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
+            Ok(ColType::Composite(slot)) => {
                 // A named type uses the selected catalog definition, including
                 // edits made after statement-local anonymous shapes were built.
                 return columns
                     .composite_field(slot, field)
                     .ok_or_else(|| could_not_identify(field));
             }
-            _ => columns
-                .record_column_handle(*qualifier, name)
-                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+            Ok(ColType::Record) => match expr_record_handle(base, columns) {
+                Some(handle) => record_shape_field_metadata(handle, field).map(|value| value.0),
+                None if qualifier.is_none() && columns.is_whole_row(name) => {
+                    columns.column_meta(Some(name), field)
+                }
+                None => None,
+            },
+            Ok(_) => None,
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && columns.is_whole_row(name) =>
+            {
+                columns.column_meta(Some(name), field)
+            }
+            Err(error) => return Err(error),
         },
         Expr::Field {
             base: inner,

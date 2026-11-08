@@ -13,6 +13,8 @@ Include empty-query descriptions, saved local-record fields and the saved
 advisory-call position across a concurrent index command's internal commits.
 Two record fields with a text domain must remain comparable to each other.
 Metadata discovery must preserve whole-row alias resolution in procedural SQL.
+Dependency capture must resolve whole rows, selected fields and schema-qualified
+columns while retaining the columns actually required by later schema changes.
 Fixed function-timing capacity must fail explicitly and return entries after
 early errors or unwinding; silently disabling requested tracking is a defect.
 Record an entry here only with its reproducer, observed behavior and exact

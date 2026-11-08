@@ -93,6 +93,7 @@ jobs:
             concurrent_reindex_preserves_unbuilt_ \
             concurrent_reindex_receipts_preserve_each_ concurrent_index_receipts_keep_exact_ \
             procedural_locals_initialize_ procedural_declared_records_ control_capacity_is_admitted_ \
+            whole_row_dependencies_keep_ \
             output_control_admission_ diagnostic_directory_admission_ \
             diagnostic_payload_exhaustion_ nested_diagnostic_calls_ caught_diagnostics_ \
             unhandled_diagnostic_details_ \
@@ -192,11 +193,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/278_declared_record_types.sql" fixture-278.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/279_advisory_unlock_warnings.sql" fixture-279.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/280_transition_write_dependencies.sql" fixture-280.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/281_whole_row_dependencies.sql" fixture-281.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280; do
+          for fixture in 265 266 267 268 269 270 271 272 273 274 275 276 277 278 279 280 281; do
             docker exec "$POSTGRES_CONTAINER" createdb -U postgres "fixture_$fixture"
             fixture_status=0
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
@@ -225,6 +227,7 @@ jobs:
               (278, 't|1|text|text|t'),
               (279, 'f|f|f|f|t'),
               (280, '1|13'),
+              (281, '7|seven|7|7|7|7|7|seven'),
           ]:
               output = Path(f'stdout-{fixture}.txt').read_text().splitlines()
               errors = Path(f'stderr-{fixture}.txt').read_text()

@@ -97,6 +97,8 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   ordinary record fields as well as trigger records, including NULL fields.
   Comparisons between two text-domain fields must also keep their collation.
   Preserve whole-row aliases such as `(t).*` in procedural query planning.
+  Track expanded columns and selected fields in saved-query dependencies,
+  preserving column precedence when its name matches a table alias.
 - Cancellation, timeout, rollback, connection closure and successful completion
   release owners. A handled timeout stays consumed if its handler waits.
   Memory remains inside the existing startup pools, with named exhaustion and

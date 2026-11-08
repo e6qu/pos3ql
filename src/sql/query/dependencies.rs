@@ -3515,6 +3515,7 @@ struct RelationSource<'a> {
     class: DependencyClass,
     slot: usize,
     exposed: &'a str,
+    qualified: Option<&'a str>,
     columns: [&'a str; MAX_COLUMNS],
     n_columns: usize,
 }
@@ -3538,6 +3539,7 @@ fn record_relation_column_references<'a>(
             class: DependencyClass::Table,
             slot: 0,
             exposed: "",
+            qualified: None,
             columns: [""; MAX_COLUMNS],
             n_columns: 0,
         })
@@ -3559,6 +3561,16 @@ fn record_relation_column_references<'a>(
         match relation {
             ResolvedRelation::Table(slot) => {
                 let definition = storage.table_def(slot, txid);
+                if table.alias.is_none() {
+                    let name = crate::stack_format!(
+                        130,
+                        "{}.{}",
+                        table.schema.unwrap_or(definition.schema.as_str()),
+                        table.table
+                    );
+                    source.qualified =
+                        Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?);
+                }
                 source.class = DependencyClass::Table;
                 source.slot = slot;
                 source.n_columns = definition.columns().len();
@@ -3580,6 +3592,17 @@ fn record_relation_column_references<'a>(
                 source.class = DependencyClass::View;
                 source.slot = slot;
                 let view_image = storage.view(slot);
+                if table.alias.is_none() {
+                    let schema = view_image.schema_for(txid);
+                    let name = crate::stack_format!(
+                        130,
+                        "{}.{}",
+                        table.schema.unwrap_or(schema.as_str()),
+                        table.table
+                    );
+                    source.qualified =
+                        Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?);
+                }
                 let columns = view_image.columns_for(txid);
                 source.n_columns = columns.len();
                 for (column, name) in columns.names().iter().enumerate() {
@@ -3635,47 +3658,119 @@ fn record_relation_column_references<'a>(
     Ok(())
 }
 
+/// Preserve reference kinds until the selected namespace resolves them. A
+/// whole-row alias is not a column, and `(row).field` may name just one column.
+fn visit_column_dependencies<'a>(
+    expression: &Expr<'a>,
+    visit: &mut impl FnMut(&Expr<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    match expression {
+        Expr::Column { .. } | Expr::SchemaColumn { .. } | Expr::WholeRow(_) => visit(expression),
+        Expr::Field { base, .. }
+            if matches!(
+                **base,
+                Expr::WholeRow(_)
+                    | Expr::Column {
+                        qualifier: None,
+                        ..
+                    }
+            ) =>
+        {
+            visit(expression)
+        }
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+            Ok(())
+        }
+        _ => super::walk_children(expression, &mut |child| {
+            visit_column_dependencies(child, visit)
+        }),
+    }
+}
+
+fn find_relation_column(
+    sources: &[RelationSource<'_>],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<Option<(usize, usize)>, SqlError> {
+    let mut found = None;
+    for (source_index, source) in sources.iter().enumerate() {
+        if qualifier.is_some_and(|qualifier| {
+            qualifier != source.exposed && source.qualified != Some(qualifier)
+        }) {
+            continue;
+        }
+        if let Some(column) = source.columns[..source.n_columns]
+            .iter()
+            .position(|column| *column == name)
+        {
+            if found.is_some() {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}\" is ambiguous",
+                    name
+                ));
+            }
+            found = Some((source_index, column));
+        }
+    }
+    Ok(found)
+}
+
 fn record_relation_expression(
     expression: &Expr<'_>,
     sources: &[RelationSource<'_>],
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
-    let mut failure = None;
-    expression.for_each_column_reference(&mut |qualifier, name| {
-        if failure.is_some() {
-            return;
-        }
-        let mut found = None;
-        for (source_index, source) in sources.iter().enumerate() {
-            if qualifier.is_some_and(|qualifier| qualifier != source.exposed) {
-                continue;
+    visit_column_dependencies(expression, &mut |reference| {
+        let qualified;
+        let (qualifier, name) = match reference {
+            Expr::Column { qualifier, name } => (*qualifier, *name),
+            Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            } => {
+                qualified = crate::stack_format!(130, "{}.{}", schema, table);
+                (Some(qualified.as_str()), *name)
             }
-            if let Some(column) = source.columns[..source.n_columns]
-                .iter()
-                .position(|column| *column == name)
-            {
-                if found.is_some() {
-                    failure = Some(sql_err!(
-                        sqlstate::AMBIGUOUS_COLUMN,
-                        "column reference \"{}\" is ambiguous",
-                        name
-                    ));
-                    return;
+            Expr::WholeRow(table) => {
+                for source in sources
+                    .iter()
+                    .filter(|source| source.exposed == *table || source.qualified == Some(*table))
+                {
+                    for column in 0..source.n_columns {
+                        dependencies.mark_referenced_column(source.class, source.slot, column)?;
+                    }
                 }
-                found = Some((source_index, column));
+                return Ok(());
+            }
+            Expr::Field { base, field } => match &**base {
+                Expr::WholeRow(table) => (Some(*table), *field),
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if find_relation_column(sources, None, name)?.is_some() => (None, *name),
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } => (Some(*name), *field),
+                _ => unreachable!("dependency walk selects simple record bases"),
+            },
+            _ => unreachable!("dependency walk selects references"),
+        };
+        if let Some((source_index, column)) = find_relation_column(sources, qualifier, name)? {
+            let source = &sources[source_index];
+            return dependencies.mark_referenced_column(source.class, source.slot, column);
+        }
+        if qualifier.is_none() {
+            for source in sources.iter().filter(|source| source.exposed == name) {
+                for column in 0..source.n_columns {
+                    dependencies.mark_referenced_column(source.class, source.slot, column)?;
+                }
             }
         }
-        if let Some((source_index, column)) = found
-            && let Err(error) = dependencies.mark_referenced_column(
-                sources[source_index].class,
-                sources[source_index].slot,
-                column,
-            )
-        {
-            failure = Some(error);
-        }
-    });
-    failure.map_or(Ok(()), Err)
+        Ok(())
+    })
 }
 
 fn record_column_references(
@@ -3684,39 +3779,89 @@ fn record_column_references(
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'_>,
 ) -> Result<(), SqlError> {
-    let mut failure = None;
-    expression.for_each_column_reference(&mut |qualifier, name| {
-        if failure.is_some() {
-            return;
-        }
-        match context.transition_column(qualifier, name) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                failure = Some(error);
-                return;
+    visit_column_dependencies(expression, &mut |reference| {
+        let qualified;
+        let (qualifier, name) = match reference {
+            Expr::Column { qualifier, name } => (*qualifier, *name),
+            Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            } => {
+                qualified = crate::stack_format!(130, "{}.{}", schema, table);
+                (Some(qualified.as_str()), *name)
             }
+            Expr::WholeRow(table) => {
+                let count = match scope.qualified_star_columns(table) {
+                    Ok(count) => count,
+                    Err(_)
+                        if context
+                            .transition
+                            .is_some_and(|columns| columns.is_whole_row(table)) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
+                for index in 0..count {
+                    mark_resolved_column(
+                        scope,
+                        scope.qualified_star_entry(table, index)?,
+                        dependencies,
+                    )?;
+                }
+                return Ok(());
+            }
+            Expr::Field { base, field } => match &**base {
+                Expr::WholeRow(table) => (Some(*table), *field),
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if scope
+                    .find_column(None, name)
+                    .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
+                    && scope.qualified_star_columns(name).is_ok() =>
+                {
+                    (Some(*name), *field)
+                }
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } => (None, *name),
+                _ => unreachable!("dependency walk selects simple record bases"),
+            },
+            _ => unreachable!("dependency walk selects references"),
+        };
+        if context.transition_column(qualifier, name)? {
+            return Ok(());
         }
-        let resolved = match scope.find_column(qualifier, name) {
-            Ok(resolved) => resolved,
+        match scope.find_column(qualifier, name) {
+            Ok(resolved) => mark_resolved_column(scope, resolved, dependencies),
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && scope.qualified_star_columns(name).is_ok() =>
+            {
+                for index in 0..scope.qualified_star_columns(name)? {
+                    mark_resolved_column(
+                        scope,
+                        scope.qualified_star_entry(name, index)?,
+                        dependencies,
+                    )?;
+                }
+                Ok(())
+            }
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) && context.outer_column(qualifier, name) =>
             {
-                return;
+                Ok(())
             }
-            Err(error) => {
-                failure = Some(error);
-                return;
-            }
-        };
-        if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
-            failure = Some(error);
+            Err(error) => Err(error),
         }
-    });
-    failure.map_or(Ok(()), Err)
+    })
 }
 
 fn mark_resolved_column(

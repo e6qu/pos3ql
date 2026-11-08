@@ -64,7 +64,19 @@ BEGIN
         AND pg_typeof(copied.id)='record_positive'::regtype
         AND pg_typeof(copied.label)='record_label'::regtype;
 END$$;
+CREATE FUNCTION check_following_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE result record;
+BEGIN
+    EXECUTE 'SELECT (ROW(7,''seven'')::record_pair).*,(SELECT NULL::record_positive) AS tail,((ARRAY(SELECT ROW(7,''seven'')::record_pair))[1]).id AS array_id' INTO result;
+    RETURN result.id=7 AND result.label='seven' AND result.tail IS NULL
+        AND result.array_id=7
+        AND pg_typeof(result.id)='record_positive'::regtype
+        AND pg_typeof(result.label)='record_label'::regtype
+        AND pg_typeof(result.tail)='record_positive'::regtype
+        AND pg_typeof(result.array_id)='record_positive'::regtype;
+END$$;
 SELECT check_declared_record_types(),(SELECT count(*) FROM record_source),
     pg_typeof(q.f1),pg_typeof(q.f2),
     q.f1 IS NULL AND check_unknown_record_output() AND check_null_record_fields()
+        AND check_following_record_fields()
 FROM (SELECT (ROW(NULL::text,'text'::text)).* FROM record_source) q;

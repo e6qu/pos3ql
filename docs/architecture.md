@@ -511,6 +511,16 @@ saved query reading an ordinary local record. For example, `SELECT result.id`
 must recognize the field and retain its domain when `result.id` is NULL.
 Cast descriptions, record expansion and array subscripts keep the SQL type;
 only the final wire description selects its PostgreSQL base representation.
+Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,
+from selecting one field, such as `(t).id`. The first keeps every expanded
+column; the second keeps the selected column. A real column named `t` takes
+precedence over the table alias in `(t).field`, following
+[PostgreSQL's projection analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_func.c#L1868-L1886).
+The same precedence applies to expansion. A scalar column named `t` cannot be
+expanded as `(t).*` just because the table also has alias `t`. Description offsets
+use catalog-aware expansion widths, so a later subquery keeps its own column
+and declared domain. Fields selected from an array of named records retain
+their logical types and collations as well.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
 Comparing a named text field such as `settings."TimeZone"` uses its text
 collation, including after a procedural pause.

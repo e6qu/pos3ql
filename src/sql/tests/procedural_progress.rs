@@ -1926,6 +1926,30 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
 }
 
 #[test]
+fn whole_row_dependencies_keep_expanded_and_selected_columns() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("whole-row-dependencies-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!("../../../tests/external/differential/281_whole_row_dependencies.sql"),
+                true,
+            )),
+            ["7|seven|7|7|7|7|7|seven"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

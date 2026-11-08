@@ -2547,9 +2547,15 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
     assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
     let mut inspected = false;
     let mut completed = false;
-    for _ in 0..16 {
+    let mut receipts = [None; 16];
+    for receipt in &mut receipts {
         let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
         if matches!(step, Step::Continue) {
+            assert!(
+                !has_message(builder.send.readable(), wire::MSG_ERROR_RESPONSE),
+                "{}",
+                String::from_utf8_lossy(builder.send.readable())
+            );
             completed = true;
             break;
         }
@@ -2563,6 +2569,7 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
             .staged_commit()
             .expect("index phase awaits its receipt")
             .target;
+        *receipt = Some(target);
         if matches!(
             target,
             crate::sql::txn::CommitTarget::ConcurrentIndex {
@@ -2584,7 +2591,13 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
         }
         engine.commit_wal().unwrap();
     }
-    assert!(inspected && completed);
+    assert!(
+        inspected && completed,
+        "inspected={inspected}, completed={completed}, receipts={receipts:?}, transaction {:?}, response {}, fatal {:?}",
+        builder.txn.mode,
+        String::from_utf8_lossy(builder.send.readable()),
+        engine.fatal_commit_failure()
+    );
     assert_eq!(
         command_completion_in(builder.send.readable()),
         Some("REINDEX")

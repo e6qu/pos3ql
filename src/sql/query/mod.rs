@@ -3562,27 +3562,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         }
     }
 
-    fn unlock_advisory_lock(
-        &self,
-        class_id: u32,
-        object_id: u32,
-        object_sub_id: i16,
-        shared: bool,
-    ) -> Result<bool, SqlError> {
-        self.storage.unlock_advisory_session(
-            crate::sql::lock::AdvisoryKey {
-                class_id,
-                object_id,
-                object_sub_id,
-            },
-            if shared {
-                crate::sql::lock::AdvisoryMode::Shared
-            } else {
-                crate::sql::lock::AdvisoryMode::Exclusive
-            },
-        )
-    }
-
     fn unlock_all_advisory_locks(&self) -> Result<(), SqlError> {
         self.storage.unlock_all_advisory_session()
     }

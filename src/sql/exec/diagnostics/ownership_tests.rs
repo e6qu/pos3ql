@@ -17,7 +17,13 @@ fn pending_errors_own_metadata_before_cleanup_and_release_it_after_handler_captu
             Some(StackStr::from_str("original é detail")),
             Some(StackStr::from_str("")),
         );
-        let error = PendingError::capture(sql_err!("PZ003", "original error"), &pool);
+        let error = PendingError::capture(
+            sql_err!(
+                crate::sql::eval::InternalControl::RoutineInvocation.diagnostic_code(),
+                "original error"
+            ),
+            &pool,
+        );
         assert!(crate::sql::eval::take_diagnostic().is_none());
         crate::sql::eval::stash_diagnostic(
             Some(StackStr::from_str("cleanup detail")),
@@ -56,7 +62,10 @@ fn publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata
             Some(StackStr::from_str("saved detail")),
             Some(StackStr::from_str("saved hint")),
         );
-        let error = PendingError::capture(sql_err!("22012", "original error"), &pool);
+        let error = PendingError::capture(
+            sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"),
+            &pool,
+        );
         crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("other work")), None);
         let error = error.publish();
         assert_eq!(error.sqlstate, "22012");
@@ -65,7 +74,10 @@ fn publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata
         assert_eq!(diagnostic.hint.unwrap().as_str(), "saved hint");
         assert_eq!(pool.lease::<u8>(1024).unwrap().capacity(), 1024);
 
-        let error = PendingError::capture(sql_err!("22003", "without metadata"), &pool);
+        let error = PendingError::capture(
+            sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "without metadata"),
+            &pool,
+        );
         crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("stale detail")), None);
         assert_eq!(error.publish().sqlstate, "22003");
         assert!(crate::sql::eval::take_diagnostic().is_none());
@@ -87,7 +99,10 @@ fn pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse() {
         let _ = crate::sql::eval::take_diagnostic();
         let held = pool.lease::<u8>(1024).unwrap();
         crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("original detail")), None);
-        let pending = PendingError::capture(sql_err!("22012", "original error"), &pool);
+        let pending = PendingError::capture(
+            sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"),
+            &pool,
+        );
         assert_eq!(pending.error.sqlstate, "22012");
         let error = pending.publish();
         assert_eq!(error.sqlstate, "54000");
@@ -95,7 +110,7 @@ fn pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse() {
         assert!(crate::sql::eval::take_diagnostic().is_none());
         drop(held);
         crate::sql::eval::stash_diagnostic(None, Some(StackStr::from_str("")));
-        let error = PendingError::capture(sql_err!("22012", "retry"), &pool);
+        let error = PendingError::capture(sql_err!(sqlstate::DIVISION_BY_ZERO, "retry"), &pool);
         let error = error.publish();
         assert_eq!(error.sqlstate, "22012");
         let diagnostic = crate::sql::eval::take_diagnostic().unwrap();

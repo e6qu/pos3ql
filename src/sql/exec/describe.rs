@@ -33,16 +33,6 @@ impl DescriptionTarget {
         txid: u32,
     ) -> Result<(), SqlError> {
         for column in columns {
-            // Query output resolves untyped NULL/string fields to text. Inner
-            // record expressions keep their own selected field metadata.
-            if column.type_oid == oid::UNKNOWN {
-                column.type_oid = oid::TEXT;
-                column.typlen = -1;
-                column.type_mod = -1;
-                if column.collation == crate::sql::ast::Collation::None {
-                    *column = column.with_collation(crate::sql::ast::Collation::Default);
-                }
-            }
             if let Self::Wire = self
                 && let Some(storage) = storage
             {

@@ -1474,18 +1474,6 @@ pub trait CatalogAccess {
             "advisory locks are unavailable"
         ))
     }
-    fn unlock_advisory_lock(
-        &self,
-        _class_id: u32,
-        _object_id: u32,
-        _object_sub_id: i16,
-        _shared: bool,
-    ) -> Result<bool, SqlError> {
-        Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "advisory locks are unavailable"
-        ))
-    }
     fn unlock_all_advisory_locks(&self) -> Result<(), SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,

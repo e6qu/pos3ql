@@ -2209,10 +2209,10 @@ fn collect_select<'a>(
                             for table in 0..scope.n {
                                 for column in 0..scope.defs.get(table).expect("resolved").n_columns
                                 {
-                                    dependencies.mark_referenced_column(
-                                        DependencyClass::Table,
-                                        scope.slots[table],
-                                        column,
+                                    mark_resolved_column(
+                                        &scope,
+                                        super::ResolvedColumn::Table(table, column),
+                                        dependencies,
                                     )?;
                                 }
                             }
@@ -3727,6 +3727,8 @@ fn mark_resolved_column(
     let mut mark = |table: usize, column| {
         let (class, slot) = match scope.view_accesses[table] {
             Some(view) => (DependencyClass::View, usize::from(view)),
+            // Materialized rows have an execution owner, not a catalog slot.
+            None if scope.slots[table] == usize::MAX => return Ok(()),
             None => (DependencyClass::Table, scope.slots[table]),
         };
         dependencies.mark_referenced_column(class, slot, column)

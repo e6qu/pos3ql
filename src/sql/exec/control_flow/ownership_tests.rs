@@ -29,7 +29,7 @@ fn terminal_errors_keep_original_details_without_an_unneeded_control_image() {
         let _ = crate::sql::eval::take_diagnostic();
         crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(&detail)), None);
         let error = frames
-            .begin_error(sql_err!("P0001", "original error"), &pool)
+            .begin_error(sql_err!(sqlstate::RAISE_EXCEPTION, "original error"), &pool)
             .unwrap_err();
         assert_eq!(error.sqlstate, "P0001");
         assert_eq!(error.message.as_str(), "original error");
@@ -56,7 +56,10 @@ fn execution_waits_require_private_provenance_and_exclude_consumer_completion() 
                 "user error"
             )));
         }
-        assert!(!is_execution_wait(&sql_err!("57014", "user cancellation")));
+        assert!(!is_execution_wait(&sql_err!(
+            sqlstate::QUERY_CANCELED,
+            "user cancellation"
+        )));
     });
 }
 
@@ -104,7 +107,10 @@ fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
             Some(StackStr::from_str("original hint")),
         );
         frames.progress = ExecutionProgress::Error(PendingError::capture(
-            sql_err!("PZ002", "original error"),
+            sql_err!(
+                crate::sql::eval::InternalControl::IoWait.diagnostic_code(),
+                "original error"
+            ),
             &controls,
         ));
         execution.suspend().ok().unwrap()

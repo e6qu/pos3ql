@@ -33,6 +33,20 @@ BEGIN
     END LOOP;
     RETURN true;
 END$$;
+CREATE FUNCTION check_unknown_record_output() RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE result record; code text; message text;
+BEGIN
+    BEGIN
+        EXECUTE 'SELECT (ROW(NULL,''text'')).*' INTO result;
+        RAISE EXCEPTION 'unknown record expansion was accepted';
+    EXCEPTION WHEN SQLSTATE 'XX000' THEN
+        GET STACKED DIAGNOSTICS code=RETURNED_SQLSTATE,message=MESSAGE_TEXT;
+        IF message<>'failed to find conversion function from unknown to text' THEN
+            RAISE EXCEPTION 'unknown record expansion returned the wrong error: %',message;
+        END IF;
+    END;
+    RETURN code='XX000';
+END$$;
 SELECT check_declared_record_types(),(SELECT count(*) FROM record_source),
-    pg_typeof(q.f1),pg_typeof(q.f2),q.f1 IS NULL
-FROM (SELECT (ROW(NULL,'text')).* FROM record_source) q;
+    pg_typeof(q.f1),pg_typeof(q.f2),q.f1 IS NULL AND check_unknown_record_output()
+FROM (SELECT (ROW(NULL::text,'text'::text)).* FROM record_source) q;

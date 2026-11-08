@@ -1417,10 +1417,76 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
             assert!(error_sqlstates(writer.send.readable()).is_empty());
             assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
             assert!(!writer.transaction.has_pending_write_completion());
+            let inspected = writer.success(&mut engine, inspect, true);
             assert_eq!(
-                data_rows(&writer.success(&mut engine, inspect, true)),
+                data_rows(&inspected),
                 ["one,two,three|6|3|t|f|t|t|t|f|t|f"],
                 "{mode:?}"
+            );
+            assert_eq!(
+                message_types(&inspected)
+                    .iter()
+                    .filter(|kind| **kind == b'N')
+                    .count(),
+                3
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_write_completion_distinguishes_transition_rows_from_catalog_dependencies() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("transition-write-dependencies-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../../tests/external/differential/280_transition_write_dependencies.sql"),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["1|13"], "{mode:?}");
+    }
+}
+
+#[test]
+fn retained_write_completion_preserves_advisory_unlock_warnings_and_filtering() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("advisory-unlock-warnings-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../../tests/external/differential/279_advisory_unlock_warnings.sql"),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["", "t", "f|f|f|f|t", "f"]);
+        assert_eq!(
+            message_types(&output)
+                .iter()
+                .filter(|kind| **kind == b'N')
+                .count(),
+            4
+        );
+        let wire = String::from_utf8_lossy(&output);
+        for mode_name in ["ExclusiveLock", "ShareLock"] {
+            assert_eq!(
+                wire.matches(&format!(
+                    "SWARNING\0VWARNING\0C01000\0Myou don't own a lock of type {mode_name}\0"
+                ))
+                .count(),
+                2,
+                "{mode:?}: {wire}"
             );
         }
     }
@@ -1762,7 +1828,7 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
                 [types::oid::INT4, types::oid::TEXT],
             ),
             (
-                "SELECT (ROW(NULL,'text')).* FROM record_source",
+                "SELECT (ROW(NULL::text,'text'::text)).* FROM record_source",
                 [types::oid::TEXT, types::oid::TEXT],
             ),
         ] {
@@ -1770,6 +1836,38 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
             let executed = session.success(&mut engine, query, false);
             assert_eq!(row_description_type_oids(&described), types);
             assert_eq!(row_description_type_oids(&executed), types);
+        }
+        for query in [
+            "SELECT (ROW(NULL,'text')).* FROM record_source",
+            "SELECT (ROW(NULL,'text')).f1 FROM record_source",
+            "SELECT (ROW(NULL,'text')).f2 FROM record_source",
+        ] {
+            let mut describe_budget = Budget::new(budget.remaining());
+            let arena = Arena::new(&mut describe_budget, "record error describe", 2 << 20).unwrap();
+            let mut described = crate::mem::FixedBuf::new(
+                &mut describe_budget,
+                "record error description",
+                1 << 18,
+            )
+            .unwrap();
+            let accepted = engine
+                .describe(
+                    query,
+                    &arena,
+                    &session.transaction,
+                    None,
+                    &mut Responder::for_describe(
+                        &mut described,
+                        crate::pg::respond::ResultFmt::ALL_TEXT,
+                    ),
+                    &[],
+                )
+                .unwrap();
+            assert!(!accepted, "{query}");
+            let executed = session.execute(&mut engine, query, false);
+            assert_eq!(error_sqlstates(described.readable()), ["XX000"], "{query}");
+            assert_eq!(error_sqlstates(&executed), ["XX000"], "{query}");
+            assert!(command_tags(&executed).is_empty(), "{query}");
         }
     }
 }

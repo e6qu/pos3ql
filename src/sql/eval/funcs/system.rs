@@ -1093,21 +1093,40 @@ pub(crate) fn dispatch<'a>(
                 let Some(key) = advisory_key(name, args, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let unlocked = hooks
-                    .catalog
-                    .ok_or_else(|| {
+                let shared = name.ends_with("_shared");
+                let (function_oid, arguments, width) = match key.object_sub_id {
+                    1 => {
+                        let bits = (u64::from(key.class_id) << 32) | u64::from(key.object_id);
+                        (
+                            if shared { 2885 } else { 2884 },
+                            [Datum::Int8(bits as i64), Datum::Null],
+                            1,
+                        )
+                    }
+                    2 => (
+                        if shared { 2891 } else { 2890 },
+                        [
+                            Datum::Int4(key.class_id as i32),
+                            Datum::Int4(key.object_id as i32),
+                        ],
+                        2,
+                    ),
+                    _ => unreachable!("advisory key constructor selects its namespace"),
+                };
+                crate::sql::query::with_active_routine_invocations(|context| {
+                    let (invocations, statement_arena) = context.ok_or_else(|| {
                         sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
-                            "advisory locks are unavailable"
+                            "advisory unlock requires a resumable query executor"
                         )
-                    })?
-                    .unlock_advisory_lock(
-                        key.class_id,
-                        key.object_id,
-                        key.object_sub_id,
-                        name.ends_with("_shared"),
-                    )?;
-                Ok(Datum::Bool(unlocked))
+                    })?;
+                    invocations.resolve_intrinsic(
+                        function_oid,
+                        &arguments[..width],
+                        statement_arena,
+                        arena,
+                    )
+                })
             }
             "pg_advisory_unlock_all" => {
                 arity(0)?;

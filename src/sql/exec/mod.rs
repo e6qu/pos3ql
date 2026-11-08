@@ -22632,6 +22632,16 @@ where
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.collation(qualifier, name);
         }
+        if qualifier.is_some_and(|qualifier| self.local_index(qualifier).is_some()) {
+            return if self
+                .col_type(qualifier, name)
+                .is_some_and(ColType::is_collatable)
+            {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            };
+        }
         if qualifier.is_none()
             && let Some(variable) = self.variable(name)
         {

@@ -15655,6 +15655,7 @@ impl Engine {
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
+                    let mut unlock_warning = None;
                     let retained = work.with_remaining_retained_bytes(arena, |scratch| {
                         let encoded_arguments = pending.arguments(arena)?;
                         let arguments = scratch
@@ -15679,6 +15680,31 @@ impl Engine {
                             statistics::execute(oid, arguments, self, txn, scratch)
                         } else if logical_replication_intrinsic {
                             logical_replication::execute(oid, arguments, self, txn, scratch)
+                        } else if matches!(oid, 2884 | 2885 | 2890 | 2891) {
+                            let key = match (oid, &*arguments) {
+                                (2884 | 2885, [Datum::Int8(value)]) => {
+                                    lock::AdvisoryKey::from_bigint(*value)
+                                }
+                                (2890 | 2891, [Datum::Int4(first), Datum::Int4(second)]) => {
+                                    lock::AdvisoryKey::from_ints(*first, *second)
+                                }
+                                _ => {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "pending advisory unlock has invalid arguments"
+                                    ));
+                                }
+                            };
+                            let mode = if matches!(oid, 2885 | 2891) {
+                                lock::AdvisoryMode::Shared
+                            } else {
+                                lock::AdvisoryMode::Exclusive
+                            };
+                            let unlocked = self.storage.unlock_advisory_session(key, mode)?;
+                            if !unlocked {
+                                unlock_warning = Some(mode);
+                            }
+                            Ok(Datum::Bool(unlocked))
                         } else {
                             large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
                         }?;
@@ -15695,6 +15721,13 @@ impl Engine {
                             )));
                         }
                     };
+                    if let Some(mode) = unlock_warning {
+                        responder.warning(
+                            sqlstate::WARNING,
+                            stack_format!(96, "you don't own a lock of type {}", mode.name())
+                                .as_str(),
+                        )?;
+                    }
                     return Ok(invocations.complete(
                         query::OwnedRoutineResult::from_scalar_image(retained),
                         arena,

@@ -188,8 +188,12 @@ expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',
 current_setting('application_name') || '.', false))` appends one dot when the
 input finishes across those function handoffs. Simple builtin trees that cannot
-pause consume no retained input records. Engine-owned statistics, replication
-and large-object calls use the same explicit handoff classification.
+pause consume no retained input records. Engine-owned statistics, replication,
+large-object calls and advisory unlocks use the same explicit handoff
+classification. An advisory unlock's saved result also keeps a failed unlock's
+warning from being emitted twice. It uses the normal `client_min_messages`
+filter. Contexts without a resumable executor reject advisory unlocks with
+`0A000` rather than silently discarding their warning.
 The pending call stores checked handles for its encoded arguments and selected
 argument, parameter and result types. Those handles survive moving the owning
 arena or recycling its temporary front; reset or a different arena rejects
@@ -496,8 +500,14 @@ selected type IDs in checked storage within `cursor_query_bytes`; no extra pool
 is reserved. A `WITH HOLD` cursor releases its query and readers at commit while
 keeping those type IDs for later `FETCH` commands. `CLOSE` releases the metadata.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
-`SELECT (ROW(NULL, 'hello')).*` exposes two text columns, following
-[PostgreSQL 18.6 target analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_target.c).
+Comparing a named text field such as `settings."TimeZone"` uses its text
+collation, including after a procedural pause.
+Bare NULL and string output literals resolve to text. Expanding an untyped
+record, such as `SELECT (ROW(NULL, 'hello')).*`, instead returns `XX000`:
+PostgreSQL cannot convert its unknown field projection to text. Cast the fields
+explicitly: `SELECT (ROW(NULL::text, 'hello'::text)).*`. The distinction follows
+[PostgreSQL 18.6 target analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_target.c)
+and its [constant conversion rule](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_coerce.c).
 An unfinished `PERFORM` or `SELECT ... INTO` keeps completed function results,
 their selected inputs and receipt positions when the calling trigger pauses. For example,
 `PERFORM write_audit('one'), wait_for_lock(), write_audit('two')` must insert each
@@ -513,6 +523,10 @@ Unowned row phases still reject suspension with `0A000`; their full continuation
 remain required before enabling those waits. The remaining expression paths,
 unfinished function bodies and query positions also need complete ownership
 before their temporary memory can be released across a scheduler return.
+Dependency collection distinguishes catalog relations from materialized rows.
+For example, a trigger can `UPDATE orders FROM changed_rows` using its transition
+table without treating that temporary table as a catalog slot. Its actual target
+and stored sources still retain their column dependencies.
 Nested procedural updates and deletes own independent row-selection ranges in
 the shared row-work pool. They do not replace the caller's selection or borrow
 it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry

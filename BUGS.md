@@ -7,6 +7,8 @@ and failures of completion output, retained writes, instruction effects or their
 original undo boundaries, declared record types after cursor commit, and quoted
 SQL boundaries or completed function results lost with temporary query memory.
 This includes comparison fixtures and CI checks that prevent tests from running.
+Preserve PostgreSQL warnings and record-field types and collations as well as
+successful row values; expected diagnostics need exact comparison coverage.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.

@@ -499,6 +499,11 @@ also preserve declared domain identities inside records. Each cursor keeps its
 selected type IDs in checked storage within `cursor_query_bytes`; no extra pool
 is reserved. A `WITH HOLD` cursor releases its query and readers at commit while
 keeping those type IDs for later `FETCH` commands. `CLOSE` releases the metadata.
+The same declared identities must survive an empty `EXECUTE ... INTO` and a
+saved query reading an ordinary local record. For example, `SELECT result.id`
+must recognize the field and retain its domain when `result.id` is NULL.
+Cast descriptions, record expansion and array subscripts keep the SQL type;
+only the final wire description selects its PostgreSQL base representation.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
 Comparing a named text field such as `settings."TimeZone"` uses its text
 collation, including after a procedural pause.

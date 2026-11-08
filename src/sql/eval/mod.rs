@@ -550,6 +550,12 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// A record field retains its declared OID even when its value is NULL.
+    /// Resolve its physical representation through the catalog, not the datum.
+    fn column_type_oid(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
+        None
+    }
+
     /// Declared collation of a resolved column.  The default makes synthetic
     /// scalar contexts explicitly non-collatable instead of guessing from the
     /// datum after expression identity has already been erased.
@@ -621,6 +627,11 @@ pub(crate) fn expression_type_identity<'a>(
     }
     if let Expr::Collate { operand, .. } = expression {
         return expression_type_identity(operand, row, hooks);
+    }
+    if let Expr::Column { qualifier, name } = expression
+        && let Some(type_oid) = row.column_type_oid(*qualifier, name)
+    {
+        return Ok(ExpressionTypeIdentity::Known(type_oid));
     }
     if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
@@ -851,6 +862,17 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        if let Some(type_oid) = self.row.column_type_oid(qualifier, name) {
+            let ctype = constructor_type_from_oid(type_oid, &|oid| {
+                self.catalog?.domain_base_type(oid)
+            })?;
+            return Some(crate::sql::exec::StaticTypeMeta {
+                type_oid,
+                ctype,
+                type_mod: self.row.column_type_mod(qualifier, name),
+                collation: super::types::ColDesc::of_type(name, ctype).collation,
+            });
+        }
         let ctype = self.row.col_type(qualifier, name)?;
         let type_oid = match self.row.column_user_type(qualifier, name) {
             Some(identity) => self.catalog?.declared_user_type_oid(ctype, identity)?,
@@ -869,7 +891,10 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.row.resolve_column_type(qualifier, name)
+        match self.column_meta(qualifier, name) {
+            Some(metadata) => Ok(metadata.ctype),
+            None => self.row.resolve_column_type(qualifier, name),
+        }
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -1112,6 +1137,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        (**self).column_type_oid(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {

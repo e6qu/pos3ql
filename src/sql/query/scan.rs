@@ -4542,6 +4542,22 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
+    fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.column_type_oid(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer.and_then(|outer| outer.column_type_oid(q, name))
+            }
+            Err(_) => None,
+        }
+    }
+
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.inner.resolve_column_type(q, name) {
             Ok(_) => self.inner.collation(q, name),

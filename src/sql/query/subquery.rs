@@ -2523,9 +2523,20 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                 }) {
                     return Err(error);
                 }
-                self.outer
-                    .ok_or(error)?
-                    .resolve_column_type(qualifier, name)
+                let outer = self.outer.ok_or(error)?;
+                let catalog = super::storage_catalog(
+                    self.catalog.storage,
+                    self.catalog.arena,
+                    self.catalog.txid,
+                );
+                crate::sql::exec::ColTypeResolver::resolve(
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row: outer,
+                        catalog: Some(&catalog),
+                    },
+                    qualifier,
+                    name,
+                )
             }
             Err(error) => Err(error),
         }
@@ -2567,18 +2578,19 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
             return None;
         }
         let outer = self.outer?;
-        let ctype = outer.col_type(qualifier, name)?;
-        let type_oid = self.catalog.storage.routine_type_oid(
-            ctype,
-            outer.column_user_type(qualifier, name),
+        let catalog = super::storage_catalog(
+            self.catalog.storage,
+            self.catalog.arena,
             self.catalog.txid,
-        )?;
-        Some(crate::sql::exec::StaticTypeMeta {
-            ctype,
-            type_oid,
-            type_mod: -1,
-            collation: outer.collation(qualifier, name),
-        })
+        );
+        crate::sql::exec::ColTypeResolver::column_meta(
+            &crate::sql::eval::RuntimeColumnTypes {
+                row: outer,
+                catalog: Some(&catalog),
+            },
+            qualifier,
+            name,
+        )
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {

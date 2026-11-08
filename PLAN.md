@@ -82,12 +82,17 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   INTO behavior and its errors without overwriting an unchanged target.
   Preserve exact warnings and their message filtering across the same call
   handoffs; a failed advisory unlock returns false and its warning once.
+  Internal commits of a concurrent index command retain that command's saved
+  advisory-call position until its next execution attempt.
 - Failed capture leaves the live call usable; failed attachment preserves the
   saved owner and the caller. Recycling temporary memory cannot change saved
   text, arrays, records or NULL field types. Private waits bypass user error
   handlers; an application raising an identical diagnostic code remains an
   ordinary SQL error. Preserve remote savepoint boundaries when a foreign
   connection first opens inside nested procedural work.
+  Query descriptions retain domain identities through casts, record expansion,
+  field selection and array subscripting. Saved procedural queries expose
+  ordinary record fields as well as trigger records, including NULL fields.
 - Cancellation, timeout, rollback, connection closure and successful completion
   release owners. A handled timeout stays consumed if its handler waits.
   Memory remains inside the existing startup pools, with named exhaustion and

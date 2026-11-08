@@ -1827,12 +1827,34 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session =
             ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let fixture =
+            include_str!("../../../tests/external/differential/278_declared_record_types.sql");
+        let final_query = fixture.find("SELECT check_declared_record_types()").unwrap();
+        let (setup, final_query) = fixture.split_at(final_query);
+        session.success(&mut engine, setup, true);
+        for query in [
+            "SELECT * FROM record_source",
+            "SELECT t.* FROM record_source t",
+            "SELECT (t).* FROM record_source t",
+            "SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,'seven'::record_label)).* FROM record_source) q",
+            "SELECT record_return_positive() AS id,record_return_label() AS label",
+            "SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source",
+            "SELECT (record_return_pair()).* FROM record_source",
+            "SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source",
+            "UPDATE record_source SET id=id RETURNING *",
+            "UPDATE record_source SET id=id RETURNING (record_source).*",
+        ] {
+            let executed = session.success(&mut engine, query, false);
+            assert_eq!(data_rows(&executed), ["7|seven"], "{mode:?}: {query}");
+            assert_eq!(row_description_names(&executed), ["id", "label"], "{query}");
+            assert_eq!(
+                row_description_type_oids(&executed),
+                [types::oid::INT4, types::oid::TEXT],
+                "{query}"
+            );
+        }
         assert_eq!(
-            data_rows(&session.success(
-                &mut engine,
-                include_str!("../../../tests/external/differential/278_declared_record_types.sql"),
-                true
-            )),
+            data_rows(&session.success(&mut engine, final_query, true)),
             ["t|1|text|text|t"],
             "{mode:?}"
         );

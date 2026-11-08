@@ -5788,6 +5788,10 @@ impl<'o, 's, 'e, 'x, 'v, 'd> ColumnLookup<'v> for ExcludedCtx<'o, 's, 'e, 'x, 'v
 where
     's: 'v,
 {
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.outer?.column_type_oid(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -5830,6 +5834,12 @@ where
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        if self.column_type_oid(qualifier, name).is_some() {
+            return self
+                .outer
+                .expect("record field belongs to outer scope")
+                .lookup(qualifier, name);
+        }
         let src = if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("excluded")) {
             self.excluded
         } else if matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new"))
@@ -18369,7 +18379,9 @@ struct TriggerDmlScope<'t, 'r, 'v, 'd> {
 
 impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
@@ -18379,7 +18391,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.col_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.col_type(None, name)
@@ -18389,7 +18403,9 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.collation(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.collation(None, name)
@@ -18398,12 +18414,18 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
         }
     }
 
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.outer.column_type_oid(qualifier, name)
+    }
+
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.column_user_type(None, name)
@@ -18429,7 +18451,9 @@ where
     'v: 'value,
 {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.lookup(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.lookup(None, name)
@@ -18439,7 +18463,9 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.col_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.col_type(None, name)
@@ -18449,7 +18475,9 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.collation(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.collation(None, name)
@@ -18458,12 +18486,18 @@ where
         }
     }
 
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.outer.column_type_oid(qualifier, name)
+    }
+
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        if matches!(qualifier, Some("old" | "new")) {
+        if matches!(qualifier, Some("old" | "new"))
+            || self.outer.column_type_oid(qualifier, name).is_some()
+        {
             self.outer.column_user_type(qualifier, name)
         } else if qualifier.is_none() && self.row.col_type(None, name).is_none() {
             self.outer.column_user_type(None, name)
@@ -22433,6 +22467,16 @@ struct PlpgsqlVariable<'a> {
     user_type: Option<crate::storage::UserTypeName>,
 }
 
+impl<'a> PlpgsqlVariable<'a> {
+    fn record_field(self, name: &str) -> Option<RecordField<'a>> {
+        let fields = match self.value {
+            Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+            _ => return None,
+        };
+        fields.iter().find(|field| field.name == name).copied()
+    }
+}
+
 fn plpgsql_variable<'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
@@ -22568,6 +22612,15 @@ impl<'t, 'stored, 'value> ColumnLookup<'value> for TriggerLocalScope<'t, 'stored
 where
     'stored: 'value,
 {
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        if matches!(qualifier, Some("old" | "new")) {
+            return None;
+        }
+        self.variable(qualifier?)?
+            .record_field(name)
+            .map(|field| field.type_oid)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
@@ -22829,8 +22882,32 @@ impl<'stored, 'value> ColumnLookup<'value> for TriggerDmlSnapshot<'stored>
 where
     'stored: 'value,
 {
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        if matches!(qualifier, Some("old" | "new")) {
+            return None;
+        }
+        self.variable(qualifier?)?
+            .record_field(name)
+            .map(|field| field.type_oid)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if let Some(qualifier) = qualifier {
+            if !matches!(qualifier, "old" | "new")
+                && let Some(variable) = self.variable(qualifier)
+            {
+                return variable
+                    .record_field(name)
+                    .map(|field| field.value)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "record \"{}\" has no field \"{}\"",
+                            qualifier,
+                            name
+                        )
+                    });
+            }
             let (record, values) = if qualifier == "old" {
                 ("OLD", self.old)
             } else if qualifier == "new" {

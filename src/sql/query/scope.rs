@@ -428,6 +428,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
         self.0.column_user_type(qualifier, name)
     }
 
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.0.column_type_oid(qualifier, name)
+    }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }

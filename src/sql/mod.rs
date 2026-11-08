@@ -11802,7 +11802,9 @@ impl Engine {
                             });
                         }
                         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
-                            if txn.concurrent_index.is_none() {
+                            if txn.concurrent_index.is_some() {
+                                self.storage.preserve_advisory_statement();
+                            } else {
                                 sequence_scope.discard(guc.seq_session());
                             }
                             return Ok(ExecutionStatus::Blocked {
@@ -12456,7 +12458,9 @@ impl Engine {
                                     if txn.staged_commit().is_some()
                                         || txn.commit_admission().is_some()
                                     {
-                                        if txn.concurrent_index.is_none() {
+                                        if txn.concurrent_index.is_some() {
+                                            self.storage.preserve_advisory_statement();
+                                        } else {
                                             sequence_scope.discard(guc.seq_session());
                                         }
                                         return Ok(ExtendedExecutionStatus::Blocked {

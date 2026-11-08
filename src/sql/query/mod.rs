@@ -11772,15 +11772,18 @@ fn user_type_cast_description<'q>(
         None => (*type_name, false),
     };
     if let Some(slot) = storage.resolve_domain_slot(base_name, txid) {
-        let domain = storage.domain(slot);
+        let domain = storage.domain_for(slot, txid);
         return Some(if array {
             ColDesc::new(
                 name,
-                super::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation()),
+                super::types::oid::domain_array_oid(domain.creation()),
                 -1,
             )
         } else {
-            ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
+            ColDesc {
+                type_oid: super::types::oid::domain_oid(domain.creation()),
+                ..ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
+            }
         });
     }
     if let Some(slot) = storage.resolve_enum_slot(base_name, txid) {
@@ -12030,9 +12033,13 @@ fn user_type_expression_description<'q>(
                     .active_fields()
                     .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
                 return Some(
-                    ColDesc::of_type(name, field.ctype)
-                        .with_type_mod(field.type_mod)
-                        .with_collation(field.collation),
+                    ColDesc::new(
+                        name,
+                        storage.routine_type_oid(field.ctype, field.user_type, txid)?,
+                        field.ctype.typlen(),
+                    )
+                    .with_type_mod(field.type_mod)
+                    .with_collation(field.collation),
                 );
             }
         }
@@ -12078,7 +12085,10 @@ fn catalog_array_element_description<'q>(
             )
             .ok()?;
             let domain = storage.read_domain_definition(target, txid).ok()??;
-            Some(ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod))
+            Some(ColDesc {
+                type_oid: super::types::oid::domain_oid(domain.creation()),
+                ..ColDesc::of_type(name, domain.base).with_type_mod(domain.base_type_mod)
+            })
         }
         _ => None,
     }

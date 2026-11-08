@@ -2,6 +2,7 @@ CREATE DOMAIN record_positive AS integer CHECK(VALUE>0);
 CREATE DOMAIN record_label AS text;
 CREATE TYPE record_pair AS(id record_positive,label record_label);
 CREATE TABLE record_source(id record_positive,label record_label);
+CREATE TABLE record_field_copies(id record_positive,label record_label);
 INSERT INTO record_source VALUES(7,'seven');
 CREATE FUNCTION record_return_positive() RETURNS record_positive LANGUAGE sql
 AS $$SELECT 7::record_positive$$;
@@ -47,6 +48,18 @@ BEGIN
     END;
     RETURN code='XX000';
 END$$;
+CREATE FUNCTION check_null_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE result record; copied record;
+BEGIN
+    EXECUTE 'SELECT NULL::record_positive AS id,NULL::record_label AS label' INTO result;
+    SELECT result.id,result.label INTO copied;
+    INSERT INTO record_field_copies SELECT result.id,result.label;
+    UPDATE record_field_copies SET id=result.id,label=result.label;
+    RETURN copied.id IS NULL AND copied.label IS NULL
+        AND pg_typeof(copied.id)='record_positive'::regtype
+        AND pg_typeof(copied.label)='record_label'::regtype;
+END$$;
 SELECT check_declared_record_types(),(SELECT count(*) FROM record_source),
-    pg_typeof(q.f1),pg_typeof(q.f2),q.f1 IS NULL AND check_unknown_record_output()
+    pg_typeof(q.f1),pg_typeof(q.f2),
+    q.f1 IS NULL AND check_unknown_record_output() AND check_null_record_fields()
 FROM (SELECT (ROW(NULL::text,'text'::text)).* FROM record_source) q;

@@ -1238,7 +1238,7 @@ fn describe_record_star<'q>(
                             })
                             .and_then(|name| {
                                 push(
-                                    ColDesc::of_type(name, metadata.ctype)
+                                    ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
                                         .with_type_mod(metadata.type_mod)
                                         .with_collation(metadata.collation),
                                 )
@@ -1302,9 +1302,20 @@ fn describe_record_star<'q>(
                         )
                     })?;
                     push(
-                        ColDesc::of_type(name, field.ctype)
-                            .with_type_mod(field.type_mod)
-                            .with_collation(field.collation),
+                        ColDesc::new(
+                            name,
+                            storage
+                                .routine_type_oid(field.ctype, field.user_type, txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "output column's declared type is unavailable"
+                                    )
+                                })?,
+                            field.ctype.typlen(),
+                        )
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
                     )?;
                 }
                 return Ok(());
@@ -1328,7 +1339,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(error) = push(
-                            ColDesc::of_type(name, meta.ctype)
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {
@@ -1376,7 +1387,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(e) = push(
-                            ColDesc::of_type(name, meta.ctype)
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {

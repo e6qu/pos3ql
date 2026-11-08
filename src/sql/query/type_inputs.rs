@@ -52,10 +52,12 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        self.row.resolve_column_type(qualifier, name)
+        self.columns.resolve(qualifier, name)
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.row.col_type(qualifier, name)
+        self.columns
+            .column_meta(qualifier, name)
+            .map(|column| column.ctype)
     }
     fn column_user_type(
         &self,
@@ -63,6 +65,9 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         self.row.column_user_type(qualifier, name)
+    }
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.row.column_type_oid(qualifier, name)
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)

@@ -212,6 +212,78 @@ fn unfinished_returns_preserve_values_after_failed_capture_and_workspace_destruc
     });
 }
 
+#[test]
+fn suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "query attachment syntax", 16 << 10).unwrap();
+    let mut owner = Arena::new(&mut budget, "query receipt owner", 16 << 10).unwrap();
+    let foreign = Arena::new(&mut budget, "foreign query attachment", 16 << 10).unwrap();
+    let reparsing = Arena::new(&mut budget, "query attachment reparse", 16 << 10).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut execution = ExecutionFrame::new(&owner, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        execution
+            .status
+            .control_frames
+            .as_mut()
+            .unwrap()
+            .execution(&owner, &code)
+            .unwrap()
+            .start(program.body);
+        let calls = crate::sql::query::RoutineInvocationState::new(&owner);
+        calls
+            .complete(
+                crate::sql::query::OwnedRoutineResult::capture_scalar(Datum::Int4(73), &owner)
+                    .unwrap(),
+                &owner,
+                &owner,
+            )
+            .unwrap();
+        execution.status.pending_query = Some(calls);
+        execution.suspend().ok().unwrap()
+    });
+    drop(parsing);
+    crate::mem::guard::forbid_alloc(|| {
+        owner.recycle_front();
+        let (_, code) = saved.source().parse(&reparsing).unwrap();
+        let (saved, error) = saved.restore(&foreign, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "XX000");
+        assert_eq!(foreign.used(), 0);
+        let mut execution = saved.restore(&owner, &code).ok().unwrap();
+        let calls = execution.status.pending_query.take().unwrap();
+        calls.begin_attempt();
+        assert_eq!(
+            calls.resolve_intrinsic(42, &[], &owner, &foreign).unwrap(),
+            Datum::Int4(73)
+        );
+        drop((execution, code));
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+    });
+}
+
 fn parse_owned_program<'a>(
     text: &str,
     parsing: &'a Arena,

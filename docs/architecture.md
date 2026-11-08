@@ -493,13 +493,17 @@ wire descriptions. For example, after `FETCH` from a cursor selecting
 including when no row was fetched. Each cursor keeps only the selected type IDs
 in its existing `cursor_query_bytes` arena; no extra per-cursor pool is reserved.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
-An unfinished `PERFORM` keeps completed function results, their selected inputs
-and receipt positions when the calling trigger pauses. For example,
+An unfinished `PERFORM` or `SELECT ... INTO` keeps completed function results,
+their selected inputs and receipt positions when the calling trigger pauses. For example,
 `PERFORM write_audit('one'), wait_for_lock(), write_audit('two')` must insert each
 audit row once even if the lock waits repeatedly. Only an actual pause copies
 those typed values out of temporary query memory; ordinary completed queries
 release that memory together. New calls after resumption use the same retained
 owner while body evaluation uses separate temporary memory.
+Restoration checks the receipt owner's statement memory before attaching the
+procedural frame. A different arena returns an error without consuming the saved
+frame, so the original owner can still resume it. Resetting the original owner's
+arena invalidates its receipts explicitly.
 Unowned row phases still reject suspension with `0A000`; their full continuations
 remain required before enabling those waits. The remaining expression paths,
 unfinished function bodies and query positions also need complete ownership

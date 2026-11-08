@@ -15319,10 +15319,11 @@ impl Engine {
             })
         }) && let Some(continuation) = continuation
         {
-            let saved = if resumed {
+            let target = frame.retention_owner();
+            let saved = if owner.identity() == target.identity() {
                 Ok(invocations)
             } else {
-                invocations.relocate(owner, frame.retention_owner())
+                invocations.relocate(owner, target)
             };
             match saved {
                 Ok(saved) => *continuation = Some(saved),

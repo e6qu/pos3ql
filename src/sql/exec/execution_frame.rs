@@ -159,6 +159,11 @@ impl SuspendedExecutionFrame {
         arena: &'out Arena,
         program: &CompiledProgram<'_>,
     ) -> Result<ExecutionFrame<'out, 'out>, (Self, SqlError)> {
+        if let Some(query) = &self.pending_query
+            && let Err(error) = query.require_arena(arena.retention_owner())
+        {
+            return Err((self, error));
+        }
         let Self {
             locals,
             values,

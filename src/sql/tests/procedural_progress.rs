@@ -1333,86 +1333,96 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
 
 #[test]
 fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions() {
-    for mode in [
-        crate::config::TransactionMode::Mvcc,
-        crate::config::TransactionMode::Locking,
+    for (label, fixture) in [
+        (
+            "perform",
+            include_str!(
+                "../../../tests/external/differential/276_suspended_query_invocations.sql"
+            ),
+        ),
+        (
+            "select-into",
+            include_str!("../../../tests/external/differential/277_suspended_select_into.sql"),
+        ),
     ] {
-        let mut config = test_config(&format!("nested-expression-locks-{mode:?}"));
-        config.transaction_mode = mode;
-        config.execution_control_bytes = 64 << 10;
-        config.execution_control_leases = 64;
-        config.row_work_bytes = 128 << 10;
-        config.row_work_leases = 64;
-        let mut budget = test_engine_budget(&config, 1 << 29);
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-        let mut holder =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        let fixture = include_str!(
-            "../../../tests/external/differential/276_suspended_query_invocations.sql"
-        );
-        let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
-        let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
-        writer.success(&mut engine, setup, true);
-        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
-        let mut status = writer.execute_status(&mut engine, write, true);
-        for released in [false, false, true] {
-            let ExecutionStatus::Blocked {
-                completed_statements,
-                output_mark,
-                wait,
-            } = status
-            else {
-                panic!(
-                    "query failed to retain completed calls: {status:?}: {}",
-                    String::from_utf8_lossy(writer.send.readable())
-                );
-            };
-            assert_eq!(wait, StatementWait::Lock);
-            assert!(writer.transaction.has_pending_write_completion());
-            assert_eq!(
-                data_rows(&holder.success(
-                    &mut engine,
-                    "SELECT 40+2; SELECT last_value FROM nested_expression_sequence",
-                    true
-                )),
-                ["42", "2"]
-            );
-            if released {
-                holder.success(&mut engine, "COMMIT", true);
-            }
-            writer.send.truncate_to(output_mark);
-            writer.arena.recycle_front();
-            status = crate::mem::guard::forbid_alloc(|| {
-                engine.execute_simple_from(
-                    write,
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("nested-expression-locks-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+            let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+            writer.success(&mut engine, setup, true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
+            let mut status = writer.execute_status(&mut engine, write, true);
+            for released in [false, false, true] {
+                let ExecutionStatus::Blocked {
                     completed_statements,
-                    &writer.arena,
-                    &mut writer.transaction,
-                    &mut writer.pool,
-                    &mut writer.cursors,
-                    &writer.guc,
-                    &mut Responder::new(&mut writer.send),
-                    writer.connection_id,
-                    false,
-                )
-            })
-            .unwrap();
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "query failed to retain completed calls: {status:?}: {}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert!(writer.transaction.has_pending_write_completion());
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT 40+2; SELECT last_value FROM nested_expression_sequence",
+                        true
+                    )),
+                    ["42", "2"]
+                );
+                if released {
+                    holder.success(&mut engine, "COMMIT", true);
+                }
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        write,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
+            assert_eq!(
+                status,
+                ExecutionStatus::Complete,
+                "{mode:?}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert!(error_sqlstates(writer.send.readable()).is_empty());
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+            assert!(!writer.transaction.has_pending_write_completion());
+            assert_eq!(
+                data_rows(&writer.success(&mut engine, inspect, true)),
+                ["one,two,three|6|3|t|f|t|t|t|f|t|f"],
+                "{mode:?}"
+            );
         }
-        assert_eq!(
-            status,
-            ExecutionStatus::Complete,
-            "{mode:?}: {}",
-            String::from_utf8_lossy(writer.send.readable())
-        );
-        assert!(error_sqlstates(writer.send.readable()).is_empty());
-        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
-        assert!(!writer.transaction.has_pending_write_completion());
-        assert_eq!(
-            data_rows(&writer.success(&mut engine, inspect, true)),
-            ["one,two,three|6|3|t|f|t|t|t|f|t|f"],
-            "{mode:?}"
-        );
     }
 }
 

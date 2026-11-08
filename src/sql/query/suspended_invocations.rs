@@ -93,6 +93,19 @@ mod ownership_tests {
     fn suspended_invocations_relocate_values_and_pending_arguments_before_region_teardown() {
         let mut budget = Budget::new(128 << 10);
         let owner = Arena::new(&mut budget, "suspended call owner", 128 << 10).unwrap();
+        let mut routine = Box::new(crate::storage::RoutineDef::EMPTY);
+        routine.created_at = 1;
+        routine.argument_count = 1;
+        routine.arguments[0] = crate::storage::RoutineArgumentDef {
+            name: crate::storage::SqlName::parse("input").unwrap(),
+            ctype: ColType::Text,
+            user_type: None,
+        };
+        routine.parameter_count = 1;
+        routine.parameters[0].ctype = ColType::Text;
+        routine.kind = crate::storage::RoutineKind::Function {
+            result: crate::storage::RoutineResult::TEXT,
+        };
         let calls = crate::mem::guard::forbid_alloc(|| {
             owner
                 .with_remaining_region(|scratch| {
@@ -123,7 +136,15 @@ mod ownership_tests {
                         .unwrap();
                     calls.next.set(2);
                     let error = calls
-                        .resolve_intrinsic(17, &[Datum::Text(text)], scratch, scratch)
+                        .resolve(
+                            &routine,
+                            &[Datum::Text(text)],
+                            scratch,
+                            scratch,
+                            None,
+                            crate::sql::ast::Collation::Default,
+                            crate::sql::eval::RoutineCallAccess::Caller,
+                        )
                         .unwrap_err();
                     assert_eq!(
                         error.sqlstate,
@@ -164,6 +185,18 @@ mod ownership_tests {
                         Datum::Int4(73)
                     );
                     let pending = calls.take_pending().unwrap();
+                    let PendingRoutineTarget::Stored(contract) = pending.target else {
+                        panic!("stored call selection changed")
+                    };
+                    routine.arguments[0].ctype = ColType::Int4;
+                    routine.parameters[0].ctype = ColType::Int4;
+                    moved
+                        .retained(contract)
+                        .unwrap()
+                        .bind(&mut routine, &moved)
+                        .unwrap();
+                    assert_eq!(routine.arguments[0].ctype, ColType::Text);
+                    assert_eq!(routine.parameters[0].ctype, ColType::Text);
                     let arguments = pending.arguments(&moved).unwrap();
                     assert_eq!(
                         crate::sql::exec::decode_projected_col_record(arguments, 0, scratch)

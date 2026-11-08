@@ -27771,8 +27771,14 @@ fn execute_trigger_step<'a>(
             };
             let params = context.params;
             let txid = context.txn.txid;
+            let continuation =
+                if retained_parent && invocation.program_kind == PlpgsqlProgramKind::Trigger {
+                    Some(&mut status.pending_query)
+                } else {
+                    None
+                };
             let (selected, row_count) =
-                execute_procedural_query(context, None, |storage, sequence| {
+                execute_procedural_query(context, continuation, |storage, sequence| {
                     let mut selected = [Datum::Null; MAX_COLUMNS];
                     let mut found = false;
                     let mut row_count = 0usize;
@@ -28368,32 +28374,34 @@ fn execute_trigger_step<'a>(
                 let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
-                execute_procedural_query(
-                    &mut context,
-                    Some(&mut status.pending_query),
-                    |storage, sequence| {
-                        let mut row_count = 0u64;
-                        super::query::select_into_rows(
-                            storage,
-                            txid,
-                            query,
-                            arena,
-                            params,
-                            Some(&scope),
-                            Some(sequence),
-                            &mut |_| {
-                                row_count = row_count.checked_add(1).ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                        "PL/pgSQL query returned too many rows"
-                                    )
-                                })?;
-                                Ok(())
-                            },
-                        )?;
-                        Ok(row_count)
-                    },
-                )
+                let continuation =
+                    if retained_parent && invocation.program_kind == PlpgsqlProgramKind::Trigger {
+                        Some(&mut status.pending_query)
+                    } else {
+                        None
+                    };
+                execute_procedural_query(&mut context, continuation, |storage, sequence| {
+                    let mut row_count = 0u64;
+                    super::query::select_into_rows(
+                        storage,
+                        txid,
+                        query,
+                        arena,
+                        params,
+                        Some(&scope),
+                        Some(sequence),
+                        &mut |_| {
+                            row_count = row_count.checked_add(1).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "PL/pgSQL query returned too many rows"
+                                )
+                            })?;
+                            Ok(())
+                        },
+                    )?;
+                    Ok(row_count)
+                })
             });
             status.set_rows(row_count.map_err(|_| super::query::arena_full_pub())??)?;
 

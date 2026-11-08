@@ -288,3 +288,5 @@ mem::arena::retained_slice::tests::retained_region_transfers_keep_explicit_paren
 sql::query::suspended_invocations::ownership_tests::suspended_invocations_failed_admission_preserves_the_original_receipts
 sql::query::suspended_invocations::ownership_tests::suspended_invocations_relocate_values_and_pending_arguments_before_region_teardown
 sql::query::input_progress::saved::ownership_tests::suspended_input_frames_relocate_checked_values_and_selected_names
+sql::query::input_progress::tests::invocation_registry_relocates_checked_inputs_results_and_cast_selections
+sql::exec::control_flow::ownership_tests::suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena

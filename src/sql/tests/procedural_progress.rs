@@ -1244,6 +1244,32 @@ fn uninitialized_domain_locals_validate_null_before_body_effects() {
 }
 
 #[test]
+fn mixed_writes_bind_each_row_trigger_to_its_own_transition_tables() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("mixed-transition-tables-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/270_mixed_transition_tables.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["10|4|4|2|t|t|301"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn trigger_parameters_remain_separate_from_prepared_write_parameters() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

@@ -407,7 +407,7 @@ pub(crate) fn finish_replication_row(
             responder: context.responder,
         },
         depth,
-        None,
+        TransitionRowSets::EMPTY,
     )
 }
 
@@ -795,7 +795,7 @@ mod numeric_loops;
 mod set_rows;
 mod transition_rows;
 
-use transition_rows::{TransitionCapture, TransitionRows};
+use transition_rows::{TransitionCapture, TransitionRowSets, TransitionRows};
 
 use control_flow::{CompiledProgram, ControlFrames, ProgramSource};
 use set_rows::PlpgsqlSetResult;
@@ -29542,7 +29542,7 @@ fn execute_deferred_trigger_event<'a>(
 fn fire_statement_row_trigger_events<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     trigger_depth: u16,
-    transition_rows: Option<TransitionRows<'a>>,
+    transition_rows: TransitionRowSets<'a>,
 ) -> Result<(), SqlError> {
     let mut index = 0usize;
     while index < context.txn.deferred_trigger_events().len() {
@@ -29585,7 +29585,13 @@ fn fire_statement_row_trigger_events<'a>(
             index += 1;
             continue;
         };
-        execute_deferred_trigger_event(context, index, trigger_slot, table, transition_rows)?;
+        execute_deferred_trigger_event(
+            context,
+            index,
+            trigger_slot,
+            table,
+            transition_rows.for_event(event.event),
+        )?;
         index += 1;
     }
     Ok(())
@@ -30018,7 +30024,7 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
     definition: &crate::storage::TableDefinition<Definition0>,
     event: u8,
     updated_columns: ColumnSet,
-    rows: Option<TransitionRows<'a>>,
+    rows: TransitionRowSets<'a>,
 ) -> Result<(), SqlError> {
     let trigger_depth = context.txn.trigger_depth();
     fire_statement_row_trigger_events(&mut context, trigger_depth, rows)?;
@@ -30029,7 +30035,7 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
         event,
         false,
         updated_columns,
-        rows,
+        rows.for_event(event),
     )
 }
 
@@ -58049,7 +58055,11 @@ pub(crate) fn copy_statement_end(
         definition,
         TriggerEvents::INSERT,
         ColumnSet::EMPTY,
-        transition_capture.take().map(TransitionCapture::into_rows),
+        TransitionRowSets {
+            inserted: transition_capture.take().map(TransitionCapture::into_rows),
+            updated: None,
+            deleted: None,
+        },
     )
 }
 
@@ -63805,6 +63815,11 @@ pub(crate) fn merge<'a>(
         }
         source_index += 1;
     }
+    let transition_rows = TransitionRowSets {
+        inserted: insert_transitions.take().map(TransitionCapture::into_rows),
+        updated: update_transitions.take().map(TransitionCapture::into_rows),
+        deleted: delete_transitions.take().map(TransitionCapture::into_rows),
+    };
     for event in [
         TriggerEvents::INSERT,
         TriggerEvents::UPDATE,
@@ -63830,18 +63845,7 @@ pub(crate) fn merge<'a>(
                 } else {
                     ColumnSet::EMPTY
                 },
-                match event {
-                    TriggerEvents::INSERT => {
-                        insert_transitions.take().map(TransitionCapture::into_rows)
-                    }
-                    TriggerEvents::UPDATE => {
-                        update_transitions.take().map(TransitionCapture::into_rows)
-                    }
-                    TriggerEvents::DELETE => {
-                        delete_transitions.take().map(TransitionCapture::into_rows)
-                    }
-                    _ => None,
-                },
+                transition_rows,
             )
         {
             return sql_fail(error);
@@ -66010,6 +66014,13 @@ where
                 Err(error) => return sql_fail(error),
             }
         }
+        let transition_rows = TransitionRowSets {
+            inserted: transition_capture.take().map(TransitionCapture::into_rows),
+            updated: conflict_transition_capture
+                .take()
+                .map(TransitionCapture::into_rows),
+            deleted: None,
+        };
         if let Some(updated_columns) = conflict_update_columns
             && let Err(error) = fire_after_triggers_with_rows(
                 TriggerExecContext {
@@ -66026,9 +66037,7 @@ where
                 def,
                 2,
                 updated_columns,
-                conflict_transition_capture
-                    .take()
-                    .map(TransitionCapture::into_rows),
+                transition_rows,
             )
         {
             return sql_fail(error);
@@ -66048,7 +66057,7 @@ where
             def,
             1,
             ColumnSet::EMPTY,
-            transition_capture.take().map(TransitionCapture::into_rows),
+            transition_rows,
         ) {
             return sql_fail(error);
         }
@@ -66253,6 +66262,13 @@ where
             Err(error) => return sql_fail(error),
         }
     }
+    let transition_rows = TransitionRowSets {
+        inserted: transition_capture.take().map(TransitionCapture::into_rows),
+        updated: conflict_transition_capture
+            .take()
+            .map(TransitionCapture::into_rows),
+        deleted: None,
+    };
     if let Some(updated_columns) = conflict_update_columns
         && let Err(error) = fire_after_triggers_with_rows(
             TriggerExecContext {
@@ -66269,9 +66285,7 @@ where
             def,
             2,
             updated_columns,
-            conflict_transition_capture
-                .take()
-                .map(TransitionCapture::into_rows),
+            transition_rows,
         )
     {
         return sql_fail(error);
@@ -66291,7 +66305,7 @@ where
         def,
         1,
         ColumnSet::EMPTY,
-        transition_capture.take().map(TransitionCapture::into_rows),
+        transition_rows,
     ) {
         return sql_fail(error);
     }
@@ -67990,7 +68004,11 @@ pub(crate) fn update<'a>(
         def,
         2,
         updated_columns,
-        transition_capture.take().map(TransitionCapture::into_rows),
+        TransitionRowSets {
+            inserted: None,
+            updated: transition_capture.take().map(TransitionCapture::into_rows),
+            deleted: None,
+        },
     ) {
         return sql_fail(error);
     }
@@ -68585,7 +68603,11 @@ pub(crate) fn delete<'a>(
         def,
         4,
         ColumnSet::EMPTY,
-        transition_capture.take().map(TransitionCapture::into_rows),
+        TransitionRowSets {
+            inserted: None,
+            updated: None,
+            deleted: transition_capture.take().map(TransitionCapture::into_rows),
+        },
     ) {
         return sql_fail(error);
     }

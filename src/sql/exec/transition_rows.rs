@@ -4,12 +4,39 @@ use super::*;
 use crate::mem::lease_pool::SharedSlice;
 use std::sync::Arc;
 
-/// Statement triggers have no `OLD`/`NEW` image; their declared transition
-/// relations are bound only after the statement has produced its row sets.
+/// All rows produced by a statement for one operation. AFTER ROW and AFTER
+/// STATEMENT triggers bind only the transition aliases they declared.
 #[derive(Clone, Copy)]
 pub(super) struct TransitionRows<'a> {
     pub(super) old: &'a [&'a [u8]],
     pub(super) new: &'a [&'a [u8]],
+}
+
+/// A mixed command retains each operation's completed tables while its row
+/// events drain in their original order.
+#[derive(Clone, Copy)]
+pub(super) struct TransitionRowSets<'a> {
+    pub(super) inserted: Option<TransitionRows<'a>>,
+    pub(super) updated: Option<TransitionRows<'a>>,
+    pub(super) deleted: Option<TransitionRows<'a>>,
+}
+
+impl<'a> TransitionRowSets<'a> {
+    pub(super) const EMPTY: Self = Self {
+        inserted: None,
+        updated: None,
+        deleted: None,
+    };
+
+    pub(super) fn for_event(self, event: u8) -> Option<TransitionRows<'a>> {
+        match event {
+            TriggerEvents::INSERT => self.inserted,
+            TriggerEvents::UPDATE => self.updated,
+            TriggerEvents::DELETE => self.deleted,
+            TriggerEvents::TRUNCATE => None,
+            _ => unreachable!("trigger event validated at its parser boundary"),
+        }
+    }
 }
 
 /// Pre-sized transition row slots. Each DML path derives capacity from its

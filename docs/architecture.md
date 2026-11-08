@@ -361,6 +361,10 @@ saved transition images keep both lists in shared row-work memory. Restoration
 admits both lists together and borrows their immutable payloads; even a large
 row therefore needs only its list entry in resumption scratch. These images
 still need the enclosing-write handoff below.
+Mixed writes retain separate transition tables for inserts, updates and deletes.
+Their row triggers drain in the original event order, with each trigger reading
+its own operation's tables. For example, the insert trigger of an `ON CONFLICT`
+command must not receive the rows changed by its update branch.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges

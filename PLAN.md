@@ -80,6 +80,8 @@ writes, deferred triggers, COPY and replication apply. Compare visible rows,
 audit writes, sequence values and errors with PostgreSQL in both transaction
 modes, including repeated waits and empty-cache reads. Do not enable a rejected
 input by bypassing its constraint or by replaying already completed changes.
+Commands combining inserts, updates or deletes must retain separate transition
+tables for each operation while preserving their row-trigger firing order.
 
 Complete the same retained execution positions for the remaining function
 bodies, complex query plans, SQL cursors and results already sent to the client.

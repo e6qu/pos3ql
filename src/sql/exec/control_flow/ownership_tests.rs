@@ -476,11 +476,13 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
     crate::mem::guard::forbid_alloc(|| {
         let mut status =
             TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool, &pool).unwrap();
-        let mut retained = status.control_frames.take().unwrap();
-
-        let mut frames = retained.execution(&arena, &code).unwrap();
+        drop(status.control_frames.take().unwrap());
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
+            // Calls share the reusable numeric workspace, while each call has
+            // its own control stack and completion position.
+            let mut retained = ControlFrames::new(&arena, code.layout(), &pool).unwrap();
+            let mut frames = retained.execution(&arena, &code).unwrap();
             frames.start(program.body);
             let Step::Enter(frame) = start_numeric_loop(
                 outer,
@@ -543,7 +545,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }
-        status.control_frames = Some(retained);
     });
 }
 

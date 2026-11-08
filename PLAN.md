@@ -100,6 +100,9 @@ Retain an unfinished `RETURN`, loop exit or error cleanup as part of that call.
 Keep the original error detail and hint before cleanup can run other SQL or a
 different connection. A storage wait during rollback or release must retain its
 boundary and phase; a failed handler capture must return its capacity error.
+Force repeated real waits inside a protected numeric loop after earlier
+statements. Destroy the old temporary memory, preserve locals and once-only
+session effects, and verify wakeups before completing the same call.
 Capture ordinary declarations only when needed for a pause, and share that
 image through subsequent pauses. Preserve normal-call memory admission and
 keep each nested write's selection owner separate from the enclosing write.

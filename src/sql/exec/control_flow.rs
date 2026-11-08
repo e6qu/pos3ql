@@ -1094,8 +1094,9 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 }
             }
         }
-        // Capacity/error exits release every lexical owner before the caller can
-        // rewind statement memory. Transaction rollback remains the caller's job.
+        // Terminal exits release lexical owners before statement memory reuse.
+        // A private wait keeps those scopes for the caller's capture boundary.
+        // Transaction rollback remains the caller's job.
         if !paused {
             while frames.state.active != 0 {
                 let frame = frames.pop();
@@ -1238,3 +1239,6 @@ fn catch_diagnostic(
 
 #[cfg(test)]
 mod ownership_tests;
+
+#[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
+mod resumption_tests;

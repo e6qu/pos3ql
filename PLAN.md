@@ -60,6 +60,9 @@ operation without executing earlier rows or trigger statements again. Keep the
 original selected definitions, settings, statement snapshot and deadline.
 Cancellation or a real error must release retained owners and use the ordinary
 transaction rollback rules. A private wait must not be caught as a user error.
+Keep the caller's execution services through immediate and queued trigger
+dispatch. Trigger bodies cannot end the caller's transaction or inherit its
+SQL parameters; trigger arguments remain available through `TG_ARGV`.
 Preserve typed control ownership: an application raising the same diagnostic
 code must still return or catch its own error normally, including in functions
 returning rows and category handlers.

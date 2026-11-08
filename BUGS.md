@@ -4,7 +4,7 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix reproducible defects in the PR that finds them, including incidental defects
 and failures during admission, initialization, suspension, restoration, nested
-writes or cleanup.
+writes, trigger dispatch or cleanup.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.

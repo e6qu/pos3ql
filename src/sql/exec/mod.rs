@@ -396,7 +396,7 @@ pub(crate) fn finish_replication_row(
 ) -> Result<(), SqlError> {
     let depth = txn.trigger_depth();
     fire_statement_row_trigger_events(
-        TriggerExecContext {
+        &mut TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 seq_session: context.seq_session,
@@ -3900,6 +3900,8 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     new: &mut Option<&mut [Datum<'a>]>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
+    let mut firing = context.for_trigger();
+    let context = &mut firing;
     let (table_schema, table_name) = match target {
         crate::storage::TriggerTarget::Table(table) => {
             let target_definition = context
@@ -23102,6 +23104,26 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
+    /// A trigger can use the caller's execution services, but cannot end its
+    /// transaction or inherit the enclosing SQL command's positional parameters.
+    fn for_trigger(&mut self) -> TriggerExecContext<'_, 'a, 'b> {
+        let mut host = self.host.reborrow();
+        if let PlpgsqlExecHost::Routine {
+            transaction_context,
+            ..
+        } = &mut host
+        {
+            *transaction_context = PlpgsqlTransactionContext::Atomic;
+        }
+        TriggerExecContext {
+            host,
+            txn: self.txn,
+            arena: self.arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: self.responder,
+        }
+    }
+
     fn plan_owner(&self) -> Result<super::type_input_plans::Owner, SqlError> {
         match &self.host {
             PlpgsqlExecHost::Routine { .. } => super::type_input_plans::owner(),
@@ -29430,21 +29452,9 @@ fn fire_row_triggers<
                 .trigger(trigger_slot)
                 .name_to(context.txn.txid),
         );
-        let arena = context.arena;
-        let params = context.params;
-        let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
         if matches!(
             fire_row_trigger_slot(
-                TriggerExecContext {
-                    host: PlpgsqlExecHost::Atomic {
-                        storage,
-                        seq_session
-                    },
-                    txn,
-                    arena,
-                    params,
-                    responder,
-                },
+                context.for_trigger(),
                 target,
                 clone_table,
                 trigger_slot,
@@ -29470,36 +29480,29 @@ pub(crate) enum TriggerQueueBoundary {
     Constraints(Option<crate::sql::txn::ConstraintIdentity>),
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a queued trigger carries its complete typed execution context"
-)]
 fn execute_deferred_trigger_event<'a>(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    arena: &'a Arena,
-    seq_session: &crate::sql::guc::SeqSession,
-    responder: &mut Responder,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     index: usize,
     trigger_slot: u16,
     table: u16,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
-    let event = txn.deferred_trigger_events()[index];
+    let arena = context.arena;
+    let event = context.txn.deferred_trigger_events()[index];
     let old_bytes = event
         .old
-        .map(|tuple| txn.deferred_trigger_bytes(tuple))
+        .map(|tuple| context.txn.deferred_trigger_bytes(tuple))
         .map(|bytes| arena.alloc_slice_copy(bytes).map(|bytes| &*bytes))
         .transpose()
         .map_err(|_| super::query::arena_full_pub())?;
     let new_bytes = event
         .new
-        .map(|tuple| txn.deferred_trigger_bytes(tuple))
+        .map(|tuple| context.txn.deferred_trigger_bytes(tuple))
         .map(|bytes| arena.alloc_slice_copy(bytes).map(|bytes| &*bytes))
         .transpose()
         .map_err(|_| super::query::arena_full_pub())?;
     let table = usize::from(table);
-    let definition = (*storage.table_def(table, txn.txid)).clone();
+    let definition = (*context.storage().table_def(table, context.txn.txid)).clone();
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     definition.schema(&mut schema);
     let mut old_values = [Datum::Null; MAX_COLUMNS];
@@ -29510,24 +29513,14 @@ fn execute_deferred_trigger_event<'a>(
     if let Some(bytes) = new_bytes {
         rowenc::decode(bytes, &schema[..definition.n_columns], &mut new_values)?;
     }
-    let trigger = storage.trigger(usize::from(trigger_slot));
+    let trigger = context.storage().trigger(usize::from(trigger_slot));
     let old = old_bytes.map(|_| &old_values[..definition.n_columns]);
     let mut new = new_bytes.map(|_| &mut new_values[..definition.n_columns]);
     // Completion precedes execution so recursive SQL cannot refire this event;
     // statement and savepoint rewind restore the marker if execution fails.
-    txn.complete_deferred_trigger(index)?;
-    let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Atomic {
-            storage,
-            seq_session,
-        },
-        txn,
-        arena,
-        params: crate::sql::eval::NO_PARAMS,
-        responder,
-    };
+    context.txn.complete_deferred_trigger(index)?;
     execute_row_trigger_body(
-        &mut context,
+        context,
         &trigger,
         crate::storage::TriggerTarget::Table(table as u16),
         &definition,
@@ -29544,7 +29537,7 @@ fn execute_deferred_trigger_event<'a>(
 /// its AFTER STATEMENT triggers. Nested trigger SQL has an independent depth,
 /// so it cannot consume pending events from its caller.
 fn fire_statement_row_trigger_events<'a>(
-    mut context: TriggerExecContext<'_, 'a, '_>,
+    context: &mut TriggerExecContext<'_, 'a, '_>,
     trigger_depth: u16,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
@@ -29589,19 +29582,7 @@ fn fire_statement_row_trigger_events<'a>(
             index += 1;
             continue;
         };
-        let arena = context.arena;
-        let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-        execute_deferred_trigger_event(
-            storage,
-            txn,
-            arena,
-            seq_session,
-            responder,
-            index,
-            trigger_slot,
-            table,
-            transition_rows,
-        )?;
+        execute_deferred_trigger_event(context, index, trigger_slot, table, transition_rows)?;
         index += 1;
     }
     Ok(())
@@ -29668,11 +29649,16 @@ pub(crate) fn fire_constraint_triggers(
             }
         };
         execute_deferred_trigger_event(
-            storage,
-            txn,
-            arena,
-            seq_session,
-            responder,
+            &mut TriggerExecContext {
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    seq_session,
+                },
+                txn,
+                arena,
+                params: crate::sql::eval::NO_PARAMS,
+                responder,
+            },
             index,
             trigger_slot,
             table,
@@ -29961,6 +29947,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     updated_columns: ColumnSet,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
+    let mut context = context.for_trigger();
     let mut last_name: Option<SqlName> = None;
     while let Some(trigger) = {
         context
@@ -30109,23 +30096,7 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let trigger_depth = context.txn.trigger_depth();
-    let arena = context.arena;
-    let params = context.params;
-    let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
-    fire_statement_row_trigger_events(
-        TriggerExecContext {
-            host: PlpgsqlExecHost::Atomic {
-                storage,
-                seq_session,
-            },
-            txn,
-            arena,
-            params,
-            responder,
-        },
-        trigger_depth,
-        rows,
-    )?;
+    fire_statement_row_trigger_events(&mut context, trigger_depth, rows)?;
     fire_statement_triggers_with_rows(
         context,
         target,

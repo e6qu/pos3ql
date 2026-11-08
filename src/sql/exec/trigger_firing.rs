@@ -44,7 +44,54 @@ pub(super) struct TriggerFiring<'values, 'schema, 'rows> {
     code: CompiledProgram<'values>,
     execution: execution_frame::ExecutionFrame<'values, 'values>,
     binding: FiringBinding<'values, 'schema, 'rows>,
+    environment: FiringEnvironment,
     owner: FiringOwner,
+}
+
+pub(super) struct FiringEnvironment {
+    pub(super) config: Option<crate::sql::guc::RoutineConfigScope>,
+    pub(super) security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
+}
+
+struct SavedEnvironment {
+    security: Option<crate::storage::SessionIdentity>,
+    config: Option<SharedSlice<crate::sql::guc::RoutineConfigImage>>,
+}
+
+impl SavedEnvironment {
+    fn capture(
+        environment: &FiringEnvironment,
+        controls: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> Result<Self, SqlError> {
+        let config = environment
+            .config
+            .as_ref()
+            .map(|scope| {
+                controls
+                    .copy_slice(&[scope.save()?])
+                    .map_err(control_flow::execution_full)
+            })
+            .transpose()?;
+        Ok(Self {
+            security: environment
+                .security
+                .as_ref()
+                .map(|_| crate::sql::eval::funcs::system::current_identity()),
+            config,
+        })
+    }
+
+    fn enter(&self) -> Result<FiringEnvironment, SqlError> {
+        let security = self
+            .security
+            .map(crate::sql::eval::funcs::system::enter_current_user);
+        let config = self
+            .config
+            .as_ref()
+            .map(|image| image[0].enter())
+            .transpose()?;
+        Ok(FiringEnvironment { security, config })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +106,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
         code: CompiledProgram<'values>,
         locals: &'values [TriggerLocalDecl],
         binding: FiringBinding<'values, 'schema, 'rows>,
+        environment: FiringEnvironment,
     ) -> Result<Self, SqlError> {
         binding.validate()?;
         if code.kind() != PlpgsqlProgramKind::Trigger {
@@ -75,6 +123,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
             )?,
             code,
             binding,
+            environment,
             owner: FiringOwner {
                 identity: super::super::execution_identity(),
                 transaction: context.txn.txid,
@@ -149,7 +198,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
         if let Err(error) = self.require_context(context) {
             return Err((self, error));
         }
-        let saved = match SavedBinding::capture(&self.binding, context) {
+        let saved = match SavedBinding::capture(&self.binding, &self.environment, context) {
             Ok(saved) => saved,
             Err(error) => return Err((self, error)),
         };
@@ -157,18 +206,23 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
             code,
             execution,
             binding,
+            environment,
             owner,
         } = self;
         match execution.suspend() {
-            Ok(execution) => Ok(SuspendedTriggerFiring {
-                saved,
-                state: FiringState::Paused(execution),
-            }),
+            Ok(execution) => {
+                drop(environment);
+                Ok(SuspendedTriggerFiring {
+                    saved,
+                    state: FiringState::Paused(execution),
+                })
+            }
             Err((execution, error)) => Err((
                 Self {
                     code,
                     execution,
                     binding,
+                    environment,
                     owner,
                 },
                 error,
@@ -198,6 +252,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
 struct SavedBinding {
     metadata: SavedMetadata,
     values: local_values::SavedValues,
+    environment: SavedEnvironment,
 }
 
 struct SavedMetadata {
@@ -252,10 +307,12 @@ fn capture_values(
 impl SavedBinding {
     fn capture(
         binding: &FiringBinding<'_, '_, '_>,
+        environment: &FiringEnvironment,
         context: &TriggerExecContext<'_, '_, '_>,
     ) -> Result<Self, SqlError> {
         binding.validate()?;
         let storage = context.storage();
+        let environment = SavedEnvironment::capture(environment, &storage.execution_control)?;
         let definitions = storage.table_definition_images();
         let definition = definitions.retain_relation(&binding.definition)?;
         let mut aliases = [None, None];
@@ -339,6 +396,7 @@ impl SavedBinding {
                 transaction: context.txn.txid,
             },
             values,
+            environment,
         })
     }
 }
@@ -492,6 +550,7 @@ impl SuspendedTriggerFiring {
         let result = resume(
             &self.saved.metadata,
             &mut self.saved.values,
+            &mut self.saved.environment,
             frame,
             TriggerExecContext {
                 host: context.host.reborrow(),
@@ -541,9 +600,14 @@ impl SuspendedTriggerFiring {
 fn resume<'run>(
     metadata: &'run SavedMetadata,
     values: &mut local_values::SavedValues,
+    environment: &mut SavedEnvironment,
     frame: execution_frame::SuspendedExecutionFrame,
     mut context: TriggerExecContext<'_, 'run, '_>,
 ) -> Result<(FiringState, FiringProgress), ResumeError> {
+    let active_environment = match environment.enter() {
+        Ok(active) => active,
+        Err(error) => return Err(ResumeError::Unattached(frame, error)),
+    };
     let (parsed, code) = match frame.source().parse(context.arena) {
         Ok(parsed) => parsed,
         Err(error) => return Err(ResumeError::Unattached(frame, error)),
@@ -565,6 +629,7 @@ fn resume<'run>(
         code,
         execution,
         binding,
+        environment: active_environment,
         owner: FiringOwner {
             identity: metadata.identity,
             transaction: metadata.transaction,
@@ -573,14 +638,24 @@ fn resume<'run>(
     match firing.execute(&mut context) {
         Ok(accepted) => {
             capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
+            *environment = SavedEnvironment {
+                security: None,
+                config: None,
+            };
             Ok((FiringState::Complete, FiringProgress::Complete { accepted }))
         }
         Err(error) if control_flow::is_execution_wait(&error) => {
+            let saved_environment = SavedEnvironment::capture(
+                &firing.environment,
+                &context.storage().execution_control,
+            )
+            .map_err(ResumeError::Executed)?;
             capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
             let frame = firing
                 .execution
                 .suspend()
                 .map_err(|(_, error)| ResumeError::Executed(error))?;
+            *environment = saved_environment;
             Ok((FiringState::Paused(frame), FiringProgress::Waiting))
         }
         Err(error) => Err(ResumeError::Executed(error)),

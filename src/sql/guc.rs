@@ -1077,8 +1077,65 @@ pub(crate) struct RoutineConfigScope {
     guc: *const GucState,
     prior: GucValues,
     session: GucValues,
-    names: [crate::storage::SqlName; crate::storage::MAX_ROUTINE_CONFIGS],
-    count: usize,
+    owner: super::ExecutionIdentity,
+}
+
+/// Pointer-free settings retained with a paused invocation. The caller stores
+/// this image in its existing execution-control reservation.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineConfigImage {
+    prior: GucValues,
+    session: GucValues,
+    current: GucValues,
+    owner: super::ExecutionIdentity,
+}
+
+impl RoutineConfigScope {
+    pub(crate) fn save(&self) -> Result<RoutineConfigImage, SqlError> {
+        if self.owner != super::execution_identity() || ACTIVE_GUC.with(Cell::get) != self.guc {
+            return Err(routine_config_changed());
+        }
+        // SAFETY: the matching active evaluation still owns this scope.
+        let current = unsafe { &*self.guc }.store.borrow().current;
+        Ok(RoutineConfigImage {
+            prior: self.prior,
+            session: self.session,
+            current,
+            owner: self.owner,
+        })
+    }
+}
+
+impl RoutineConfigImage {
+    pub(crate) fn enter(&self) -> Result<RoutineConfigScope, SqlError> {
+        if self.owner != super::execution_identity() {
+            return Err(routine_config_changed());
+        }
+        with_active_state(|guc| {
+            let mut state = guc.store.borrow_mut();
+            let mut parent = self.prior;
+            merge_session_changes(&mut parent, &self.session, &state.transaction.session);
+            if !parent.same_settings(&state.current) {
+                return Err(routine_config_changed());
+            }
+            state.current = self.current;
+            drop(state);
+            guc.publish_owned_settings();
+            Ok(RoutineConfigScope {
+                guc: guc as *const GucState,
+                prior: self.prior,
+                session: self.session,
+                owner: self.owner,
+            })
+        })
+    }
+}
+
+fn routine_config_changed() -> SqlError {
+    sql_err!(
+        sqlstate::SERIALIZATION_FAILURE,
+        "saved routine settings belong to another execution or parent scope"
+    )
 }
 
 impl Drop for RoutineConfigScope {
@@ -1092,19 +1149,7 @@ impl Drop for RoutineConfigScope {
         merge_session_changes(&mut restored, &self.session, &changed);
         state.current = restored;
         drop(state);
-        for name in &self.names[..self.count] {
-            if let Some(value) = guc.get_owned(name.as_str()) {
-                let reset = guc.reset_owned(name.as_str()).unwrap_or(value);
-                crate::sql::eval::funcs::system::update_session_setting(
-                    name.as_str(),
-                    value,
-                    reset,
-                    guc.source(name.as_str()),
-                );
-            }
-        }
-        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
-        crate::sql::timezone::set_session(guc.timezone());
+        guc.publish_owned_settings();
     }
 }
 
@@ -2093,33 +2138,31 @@ impl GucState {
         }
         state.current = current;
         drop(state);
-        for config in configs {
-            if let Some(value) = self.get_owned(config.name.as_str()) {
-                let reset = self.reset_owned(config.name.as_str()).unwrap_or(value);
+        self.publish_owned_settings();
+        Ok(RoutineConfigScope {
+            guc: self as *const GucState,
+            prior,
+            session,
+            owner: super::execution_identity(),
+        })
+    }
+
+    fn publish_owned_settings(&self) {
+        // A routine can change settings absent from its SET clause. Publish
+        // the whole restored scope before another trigger observes it.
+        for &name in super::SETTING_NAMES {
+            if let Some(value) = self.get_owned(name) {
+                let reset = self.reset_owned(name).unwrap_or(value);
                 crate::sql::eval::funcs::system::update_session_setting(
-                    config.name.as_str(),
+                    name,
                     value,
                     reset,
-                    self.source(config.name.as_str()),
+                    self.source(name),
                 );
             }
         }
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
         crate::sql::timezone::set_session(self.timezone());
-        Ok(RoutineConfigScope {
-            guc: self as *const GucState,
-            prior,
-            session,
-            names: {
-                let mut names =
-                    [crate::storage::SqlName::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
-                for (index, config) in configs.iter().enumerate() {
-                    names[index] = config.name;
-                }
-                names
-            },
-            count: configs.len(),
-        })
     }
 }
 
@@ -3187,6 +3230,238 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
         param,
         v
     )
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn routine_exit_republishes_unlisted_local_settings_and_keeps_session_changes() {
+        let guc = GucState::new();
+        let mut budget =
+            Budget::new(super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1));
+        let mut txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+        let _evaluation = enter_eval_scope(&guc, &mut txn);
+        let configs = [crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("application_name").unwrap(),
+            value: StackStr::from_str("configured"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let names = ["application_name", "bytea_output", "client_min_messages"];
+            let initial = [
+                StackStr::from_str("outer"),
+                StackStr::from_str("hex"),
+                StackStr::from_str("notice"),
+            ];
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &initial,
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            guc.begin_transaction();
+            guc.set_config("application_name", Some("outer"), false)
+                .unwrap();
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.set_config("bytea_output", Some("escape"), true)
+                    .unwrap();
+                publish_active_setting(&guc, "bytea_output");
+                guc.set_config("client_min_messages", Some("warning"), false)
+                    .unwrap();
+                publish_active_setting(&guc, "client_min_messages");
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "escape"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+            }
+            for (name, expected) in names.into_iter().zip(["outer", "hex", "warning"]) {
+                assert_eq!(guc.get_owned(name).unwrap().as_str(), expected);
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting(name)
+                        .unwrap()
+                        .as_str(),
+                    expected
+                );
+            }
+            assert!(!active_render().unwrap().bytea_escape);
+        });
+    }
+
+    #[test]
+    fn saved_routine_settings_restore_after_worker_reuse_and_repeated_pauses() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+
+        let guc = GucState::new();
+        let other = GucState::new();
+        let mut budget = Budget::new(
+            2 * super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1)
+                + LeasePool::budget_bytes(16 << 10, 4),
+        );
+        let mut txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let mut other_txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let controls =
+            LeasePool::new(&mut budget, Purpose::EXECUTION_CONTROL, 16 << 10, 4).unwrap();
+        let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+        let _evaluation = enter_eval_scope(&guc, &mut txn);
+        let configs = [crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("application_name").unwrap(),
+            value: StackStr::from_str("configured"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let names = ["application_name", "bytea_output", "client_min_messages"];
+            let initial = [
+                StackStr::from_str("outer"),
+                StackStr::from_str("hex"),
+                StackStr::from_str("notice"),
+            ];
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &initial,
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            guc.begin_transaction();
+            guc.set_config("application_name", Some("outer"), false)
+                .unwrap();
+            let mut saved = {
+                let scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.set_config("bytea_output", Some("escape"), true)
+                    .unwrap();
+                publish_active_setting(&guc, "bytea_output");
+                guc.set_config("client_min_messages", Some("warning"), false)
+                    .unwrap();
+                publish_active_setting(&guc, "client_min_messages");
+                let held = controls.lease::<u8>(16 << 10).unwrap();
+                let image = scope.save().unwrap();
+                assert!(controls.copy_slice(&[image]).is_err());
+                assert_eq!(
+                    guc.get_owned("application_name").unwrap().as_str(),
+                    "configured"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+                drop(held);
+                controls.copy_slice(&[image]).unwrap()
+            };
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            assert!(!active_render().unwrap().bytea_escape);
+            // Recycling the worker's published values cannot change the image.
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &[StackStr::from_str("other connection"); 3],
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            {
+                let prior_owner = super::super::execution_identity();
+                super::super::set_execution_connection_id(
+                    prior_owner.connection_id.wrapping_add(1),
+                );
+                let _other_evaluation = enter_eval_scope(&other, &mut other_txn);
+                other
+                    .set_config("application_name", Some("other connection"), false)
+                    .unwrap();
+                assert_eq!(
+                    saved[0].enter().err().unwrap().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                assert_eq!(
+                    other.get_owned("application_name").unwrap().as_str(),
+                    "other connection"
+                );
+                super::super::publish_execution_identity(prior_owner);
+            }
+            // Parent settings must still match before any saved value is installed.
+            guc.set_config("application_name", Some("unrelated"), true)
+                .unwrap();
+            assert_eq!(
+                saved[0].enter().err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                guc.get_owned("application_name").unwrap().as_str(),
+                "unrelated"
+            );
+            guc.set_config("application_name", Some("outer"), true)
+                .unwrap();
+            let mut expected_application = "configured";
+            let mut expected_messages = "warning";
+            for iteration in 0..3 {
+                let scope = saved[0].enter().unwrap();
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("application_name")
+                        .unwrap()
+                        .as_str(),
+                    expected_application
+                );
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "escape"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+                if iteration == 0 {
+                    guc.set_config("application_name", Some("continued"), true)
+                        .unwrap();
+                    publish_active_setting(&guc, "application_name");
+                    expected_application = "continued";
+                }
+                if iteration == 1 {
+                    guc.set_config("client_min_messages", Some("error"), false)
+                        .unwrap();
+                    publish_active_setting(&guc, "client_min_messages");
+                    expected_messages = "error";
+                }
+                let next = controls.copy_slice(&[scope.save().unwrap()]).unwrap();
+                drop(scope);
+                saved = next;
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("application_name")
+                        .unwrap()
+                        .as_str(),
+                    "outer"
+                );
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "hex"
+                );
+                assert_eq!(
+                    guc.get_owned("client_min_messages").unwrap().as_str(),
+                    expected_messages
+                );
+                assert!(!active_render().unwrap().bytea_escape);
+            }
+            drop(other);
+            drop(controls);
+            let error: Result<(), SqlError> = (|| {
+                let _scope = saved[0].enter()?;
+                assert!(active_render().unwrap().bytea_escape);
+                Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"))
+            })();
+            assert_eq!(error.unwrap_err().sqlstate, sqlstate::DIVISION_BY_ZERO);
+            assert_eq!(
+                crate::sql::eval::funcs::system::session_setting("bytea_output")
+                    .unwrap()
+                    .as_str(),
+                "hex"
+            );
+            assert!(!active_render().unwrap().bytea_escape);
+        });
+    }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

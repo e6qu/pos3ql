@@ -2443,10 +2443,63 @@ pub fn transaction_micros() -> i64 {
 
 /// `clock_timestamp()`: the actual wall clock, read afresh each call.
 pub fn now_micros() -> i64 {
+    #[cfg(test)]
+    if let Some(at) = test_clock::current() {
+        return at;
+    }
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970");
     dur.as_micros() as i64 - PG_EPOCH_SECS * 1_000_000
+}
+
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static NOW: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Scope {
+        prior: Option<i64>,
+        thread: core::marker::PhantomData<*mut ()>,
+    }
+
+    pub(crate) fn enter(at: i64) -> Scope {
+        Scope {
+            prior: NOW.with(|value| value.replace(Some(at))),
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    pub(super) fn current() -> Option<i64> {
+        NOW.with(Cell::get)
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            NOW.with(|value| value.set(self.prior));
+        }
+    }
+
+    #[test]
+    fn explicit_wall_clock_scopes_restore_after_nested_calls_and_errors() {
+        let prior = current();
+        crate::mem::guard::forbid_alloc(|| {
+            let outer = enter(812_345_678_901_234);
+            assert_eq!(super::now_micros(), 812_345_678_901_234);
+            let failed: Result<(), ()> = (|| {
+                let _inner = enter(812_345_678_901_235);
+                assert_eq!(super::now_micros(), 812_345_678_901_235);
+                Err(())
+            })();
+            assert!(failed.is_err());
+            assert_eq!(super::now_micros(), 812_345_678_901_234);
+            drop(outer);
+            assert_eq!(current(), prior);
+        });
+    }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

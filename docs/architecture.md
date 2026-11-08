@@ -387,9 +387,14 @@ column image and preserves transition aliases and declared type OIDs. Restored
 transition rows borrow immutable saved bytes; modified `NEW` values are encoded
 before temporary memory is released. Admission errors retain the previous owner,
 and attachment checks connection, database, transaction and storage ownership.
-Normal calls keep borrowing their row context. The enclosing write, routine
-settings/security context and unfinished input work still need the scheduler
-integration described above; this owner does not enable rejected checked inputs.
+Normal calls keep borrowing their row context. A configured routine's current
+settings, original restoration baseline and effective security-definer user are
+saved with the firing. Settings images use the existing execution-control pool;
+no worker pointer survives suspension. Attachment checks the parent settings
+before installing the image, and its guards restore the caller after another
+pause, an error or completion. The enclosing write, remaining statement
+environment and unfinished input work still need the scheduler integration
+described above; this owner does not enable rejected checked inputs.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.
@@ -502,6 +507,11 @@ For example, `set_config('search_path', 'orders,public', false)` preserves that
 spelling, while `SET search_path TO orders, public` stores a formatted SQL list.
 Both validate the list before lookup. Routine scopes and transaction rollback
 restore the stored value without parsing it again as SQL.
+Leaving a configured routine republishes every restored setting, including
+settings changed in its body but absent from its `SET` clause. For example, if
+one trigger temporarily selects escape-format binary output, the next trigger's
+`current_setting()`, `pg_settings` and binary rendering must all see the restored
+hex format. Explicit session-wide changes survive the routine's return.
 
 Scalar functions, table functions and procedures share input binding, while
 keeping PostgreSQL's distinct null and result rules. Typed structural copies

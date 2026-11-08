@@ -5,6 +5,7 @@ use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
 
 #[test]
 fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destruction() {
+    let _clock = crate::sql::datetime::test_clock::enter(812_345_678_901_234);
     let mut config = crate::storage::tests::test_config();
     config.max_tables = 1;
     config.max_catalog_versions_per_object = 1;
@@ -31,6 +32,20 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     let mut send = FixedBuf::new(&mut budget, "trigger firing output", 4096).unwrap();
     let mut responder = Responder::new(&mut send);
     let guc = GucState::new_with_capacities(&mut budget, 1, 4, config.transaction_mode).unwrap();
+    let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+    let _caller = crate::sql::eval::funcs::system::enter_current_user(
+        crate::storage::SessionIdentity::unauthenticated("caller"),
+    );
+    guc.begin_transaction();
+    guc.set_config("application_name", Some("outer"), false)
+        .unwrap();
+    crate::sql::eval::funcs::system::set_session_settings(
+        &["application_name"],
+        &[crate::util::StackStr::from_str("outer")],
+        &[crate::util::StackStr::new()],
+        &["session"],
+    )
+    .unwrap();
     let mut transaction = TxnState::new_with_config(&mut budget, &config).unwrap();
     transaction.txid = 100;
     transaction.mode = TxnMode::Explicit;
@@ -79,7 +94,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let source = "DECLARE n integer := 0; marker text := 'once'; BEGIN \
             n := n + 1; PERFORM pg_advisory_lock(41); \
             PERFORM pg_advisory_xact_lock(42); \
-            NEW.note := OLD.note || TG_ARGV[0] || marker; NEW.id := NEW.id + n; \
+            NEW.note := OLD.note || TG_ARGV[0] || marker || current_setting('application_name') || current_user; \
+            NEW.id := NEW.id + n; \
             RETURN NEW; END";
         let (program, code) = compile_plpgsql_execution(
             source,
@@ -134,6 +150,15 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             exception: None,
         };
         let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
+        let settings = guc
+            .enter_routine_configs(&[crate::storage::RoutineConfig {
+                name: SqlName::parse("application_name").unwrap(),
+                value: crate::util::StackStr::from_str("bound"),
+            }])
+            .unwrap();
+        let security = crate::sql::eval::funcs::system::enter_current_user(
+            crate::storage::SessionIdentity::bound(storage.capture_role_slot(0, 100).unwrap()),
+        );
         let mut context = TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage: &mut storage,
@@ -156,6 +181,10 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 level: TriggerLevel::Row,
                 before: true,
             },
+            FiringEnvironment {
+                security: Some(security),
+                config: Some(settings),
+            },
         )
         .unwrap();
         let error = firing.execute(&mut context).err().unwrap();
@@ -164,6 +193,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let (firing, error) = firing.suspend(&context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("row_work_bytes"));
+        assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "bound");
+        assert_eq!(
+            crate::sql::eval::funcs::system::current_identity().as_str(),
+            "postgres"
+        );
         drop(held);
         let available = controls
             .lease::<u8>(64 << 10)
@@ -192,6 +226,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     columns[1].ctype = ColType::Bool;
     drop(original);
     crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+        assert_eq!(
+            crate::sql::eval::funcs::system::current_identity().as_str(),
+            "caller"
+        );
         assert_eq!(saved.saved.metadata.header.routine_oid, 43);
         let definition = saved
             .saved
@@ -218,6 +257,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let error = saved.poll(&mut context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(small.used(), 0);
+        assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+        assert_eq!(
+            crate::sql::eval::funcs::system::current_identity().as_str(),
+            "caller"
+        );
         assert!(matches!(saved.state, FiringState::Paused(_)));
     });
     crate::mem::guard::forbid_alloc(|| {
@@ -303,6 +347,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 }
             );
             assert_eq!(resumed.used(), 0);
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            assert_eq!(
+                crate::sql::eval::funcs::system::current_identity().as_str(),
+                "caller"
+            );
             if released {
                 assert_eq!(
                     saved.poll(&mut context).err().unwrap().sqlstate,
@@ -322,9 +371,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let Datum::Text(note) = completed[1] else {
             panic!("restored NEW.note")
         };
-        assert_eq!(note.len(), 8197);
+        assert_eq!(note.len(), 8210);
         assert!(note[..8192].bytes().all(|byte| byte == b'x'));
-        assert_eq!(&note[8192..], "!once");
+        assert_eq!(&note[8192..], "!onceboundpostgres");
         let prefix = AdvisoryKey::from_bigint(41);
         assert!(
             storage

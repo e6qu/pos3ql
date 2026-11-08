@@ -1270,6 +1270,50 @@ fn adjacent_triggers_observe_restored_settings_and_preserved_session_changes() {
 }
 
 #[test]
+fn write_completion_preserves_empty_actions_captured_rows_and_one_reply() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("write-completion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!("../../../tests/external/differential/272_write_completion.sql");
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(data_rows(&output), ["2", "16|8|6|2|t|3|17"], "{mode:?}");
+        let writes: Vec<_> = command_tags(&output)
+            .into_iter()
+            .filter(|tag| {
+                ["INSERT ", "UPDATE ", "DELETE ", "MERGE ", "SELECT "]
+                    .iter()
+                    .any(|prefix| tag.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                "INSERT 0 0",
+                "UPDATE 0",
+                "DELETE 0",
+                "MERGE 0",
+                "MERGE 1",
+                "INSERT 0 1",
+                "SELECT 1",
+                "SELECT 1"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
 fn mixed_writes_bind_each_row_trigger_to_its_own_transition_tables() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -1287,11 +1331,13 @@ fn mixed_writes_bind_each_row_trigger_to_its_own_transition_tables() {
             ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
         let sql =
             include_str!("../../../tests/external/differential/270_mixed_transition_tables.sql");
-        assert_eq!(
-            data_rows(&session.success(&mut engine, sql, true)),
-            ["10|4|4|2|t|t|301"],
-            "{mode:?}"
-        );
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(data_rows(&output), ["10|4|4|2|t|t|301"], "{mode:?}");
+        let writes: Vec<_> = command_tags(&output)
+            .into_iter()
+            .filter(|tag| tag.starts_with("INSERT ") || tag.starts_with("MERGE "))
+            .collect();
+        assert_eq!(writes, ["INSERT 0 3", "INSERT 0 2", "MERGE 3"], "{mode:?}");
     }
 }
 

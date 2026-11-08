@@ -795,6 +795,7 @@ mod numeric_loops;
 mod set_rows;
 mod transition_rows;
 mod trigger_firing;
+mod write_completion;
 
 use transition_rows::{TransitionCapture, TransitionRowSets, TransitionRows};
 
@@ -3915,6 +3916,39 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         }
         crate::storage::TriggerTarget::View(_) => (definition.schema, definition.name),
     };
+    let mut firing = prepare_trigger_firing(
+        context,
+        trigger,
+        TriggerRelationIdentity {
+            target,
+            schema: table_schema,
+            name: table_name,
+        },
+        crate::storage::RelationDefinition::from_definition(definition),
+        event,
+        before,
+        old,
+        new.as_deref_mut(),
+        transition_rows,
+    )?;
+    firing.execute(context)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selected trigger construction carries its exact row and relation bindings"
+)]
+fn prepare_trigger_firing<'values, 'schema, 'rows>(
+    context: &TriggerExecContext<'_, 'values, '_>,
+    trigger: &crate::storage::TriggerDef,
+    relation: TriggerRelationIdentity,
+    definition: crate::storage::RelationDefinition<'schema>,
+    event: u8,
+    before: bool,
+    old: Option<&'rows [Datum<'values>]>,
+    new: Option<&'rows mut [Datum<'values>]>,
+    transition_rows: Option<TransitionRows<'values>>,
+) -> Result<trigger_firing::TriggerFiring<'values, 'schema, 'rows>, SqlError> {
     let routine = context
         .storage()
         .routine_for(usize::from(trigger.function), context.txn.txid);
@@ -3932,11 +3966,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     let invocation = TriggerInvocation::new(
         context.storage(),
         trigger,
-        TriggerRelationIdentity {
-            target,
-            schema: table_schema,
-            name: table_name,
-        },
+        relation,
         event,
         before,
         &routine,
@@ -3963,7 +3993,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         context.storage(),
         context.txn.txid,
         trigger,
-        crate::storage::RelationDefinition::from_definition(definition),
+        definition,
         transition_rows,
         context.arena,
     )?;
@@ -3971,21 +4001,20 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         materialized_relations: transition_relations,
         ..invocation
     };
-    let mut firing = trigger_firing::TriggerFiring::new(
+    trigger_firing::TriggerFiring::new(
         context,
         code,
         program.locals,
         trigger_firing::FiringBinding {
             invocation,
-            definition: crate::storage::RelationDefinition::from_definition(definition),
+            definition,
             old,
-            new: new.as_deref_mut(),
-            level: TriggerLevel::Row,
+            new,
+            level: trigger.level,
             before,
         },
         trigger_firing::FiringEnvironment::new(config, security),
-    )?;
-    firing.execute(context)
+    )
 }
 
 #[expect(
@@ -29886,75 +29915,20 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         if !row_trigger_when_passes(&context, &trigger, definition, None, None)? {
             continue;
         }
-        let routine = context
-            .storage()
-            .routine_for(usize::from(trigger.function), context.txn.txid);
-        let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(
-            routine.ownership.owner_to(context.txn.txid).into(),
-            context.txn.txid,
-        )?);
-        let security = routine
-            .attributes
-            .security_definer
-            .then(|| super::eval::funcs::system::enter_current_user(owner));
-        let config = (!routine.configs().is_empty())
-            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
-            .transpose()?;
-        let invocation = TriggerInvocation::new(
-            context.storage(),
+        let mut firing = prepare_trigger_firing(
+            &context,
             &trigger,
             TriggerRelationIdentity {
                 target,
                 schema: definition.schema,
                 name: definition.name,
             },
+            crate::storage::RelationDefinition::from_definition(definition),
             event,
             before,
-            &routine,
-            context.arena,
-        )?;
-        let (program, code) = compile_plpgsql_execution(
-            routine.body.as_str(),
-            PlpgsqlProgramKind::Trigger,
-            context.storage(),
-            context.txn.txid,
-            context.arena,
-            &|name| {
-                routine
-                    .parameters()
-                    .iter()
-                    .any(|parameter| parameter.name == name)
-                    || routine.result_columns[..routine.result_column_count]
-                        .iter()
-                        .any(|column| column.name == name)
-            },
-        )?;
-        let invocation = invocation.with_input_sites(program.input_sites);
-        let transition_relations = trigger_transition_relations(
-            context.storage(),
-            context.txn.txid,
-            &trigger,
-            crate::storage::RelationDefinition::from_definition(definition),
+            None,
+            None,
             rows,
-            context.arena,
-        )?;
-        let invocation = TriggerInvocation {
-            materialized_relations: transition_relations,
-            ..invocation
-        };
-        let mut firing = trigger_firing::TriggerFiring::new(
-            &context,
-            code,
-            program.locals,
-            trigger_firing::FiringBinding {
-                invocation,
-                definition: crate::storage::RelationDefinition::from_definition(definition),
-                old: None,
-                new: None,
-                level: TriggerLevel::Statement,
-                before,
-            },
-            trigger_firing::FiringEnvironment::new(config, security),
         )?;
         firing.execute(&mut context)?;
     }
@@ -63763,46 +63737,32 @@ pub(crate) fn merge<'a>(
         updated: update_transitions.take().map(TransitionCapture::into_rows),
         deleted: delete_transitions.take().map(TransitionCapture::into_rows),
     };
-    for event in [
-        TriggerEvents::INSERT,
-        TriggerEvents::UPDATE,
-        TriggerEvents::DELETE,
-    ] {
-        if merge_events & event != 0
-            && let Err(error) = fire_after_triggers_with_rows(
-                TriggerExecContext {
-                    host: PlpgsqlExecHost::Atomic {
-                        storage,
-                        seq_session,
-                    },
-                    txn,
-                    arena,
-                    params: crate::sql::eval::NO_PARAMS,
-                    responder,
-                },
-                table_index.into(),
-                def,
-                event,
-                if event == TriggerEvents::UPDATE {
-                    merge_update_columns
-                } else {
-                    ColumnSet::EMPTY
-                },
-                transition_rows,
-            )
-        {
-            return sql_fail(error);
-        }
+    write_completion::WriteCompletion::Merge {
+        rows: affected_count,
+        insert: merge_events & TriggerEvents::INSERT != 0,
+        update: (merge_events & TriggerEvents::UPDATE != 0).then_some(merge_update_columns),
+        delete: merge_events & TriggerEvents::DELETE != 0,
     }
-    if capturing {
-        responder.set_affected_rows(affected_count);
-    } else {
-        responder.command_complete_rows(
-            stack_format!(32, "MERGE {}", affected_count).as_str(),
-            affected_count,
-        )?;
-    }
-    sql_ok()
+    .finish(
+        TriggerExecContext {
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                seq_session,
+            },
+            txn,
+            arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder,
+        },
+        table_index.into(),
+        def,
+        transition_rows,
+        if capturing {
+            write_completion::CompletionReply::CountOnly
+        } else {
+            write_completion::CompletionReply::Command
+        },
+    )
 }
 
 fn lock_merge_row(
@@ -65964,28 +65924,11 @@ where
                 .map(TransitionCapture::into_rows),
             deleted: None,
         };
-        if let Some(updated_columns) = conflict_update_columns
-            && let Err(error) = fire_after_triggers_with_rows(
-                TriggerExecContext {
-                    host: PlpgsqlExecHost::Atomic {
-                        storage,
-                        seq_session,
-                    },
-                    txn,
-                    arena,
-                    params: crate::sql::eval::NO_PARAMS,
-                    responder,
-                },
-                table_index.into(),
-                def,
-                2,
-                updated_columns,
-                transition_rows,
-            )
-        {
-            return sql_fail(error);
+        return write_completion::WriteCompletion::Insert {
+            rows: inserted,
+            conflict_update: conflict_update_columns,
         }
-        if let Err(error) = fire_after_triggers_with_rows(
+        .finish(
             TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage,
@@ -65998,19 +65941,13 @@ where
             },
             table_index.into(),
             def,
-            1,
-            ColumnSet::EMPTY,
             transition_rows,
-        ) {
-            return sql_fail(error);
-        }
-        let tag = stack_format!(48, "INSERT 0 {}", inserted);
-        if capturing {
-            responder.set_affected_rows(inserted);
-        } else {
-            responder.command_complete_rows(tag.as_str(), inserted)?;
-        }
-        return sql_ok();
+            if capturing {
+                write_completion::CompletionReply::CountOnly
+            } else {
+                write_completion::CompletionReply::Command
+            },
+        );
     }
     if matches!(source, InsertSource::MaterializedSelect { .. }) {
         return sql_fail(sql_err!(
@@ -66212,28 +66149,11 @@ where
             .map(TransitionCapture::into_rows),
         deleted: None,
     };
-    if let Some(updated_columns) = conflict_update_columns
-        && let Err(error) = fire_after_triggers_with_rows(
-            TriggerExecContext {
-                host: PlpgsqlExecHost::Atomic {
-                    storage,
-                    seq_session,
-                },
-                txn,
-                arena,
-                params: crate::sql::eval::NO_PARAMS,
-                responder,
-            },
-            table_index.into(),
-            def,
-            2,
-            updated_columns,
-            transition_rows,
-        )
-    {
-        return sql_fail(error);
+    write_completion::WriteCompletion::Insert {
+        rows: inserted,
+        conflict_update: conflict_update_columns,
     }
-    if let Err(error) = fire_after_triggers_with_rows(
+    .finish(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
@@ -66246,19 +66166,13 @@ where
         },
         table_index.into(),
         def,
-        1,
-        ColumnSet::EMPTY,
         transition_rows,
-    ) {
-        return sql_fail(error);
-    }
-    let tag = stack_format!(48, "INSERT 0 {}", inserted);
-    if capturing {
-        responder.set_affected_rows(inserted);
-    } else {
-        responder.command_complete_rows(tag.as_str(), inserted)?;
-    }
-    sql_ok()
+        if capturing {
+            write_completion::CompletionReply::CountOnly
+        } else {
+            write_completion::CompletionReply::Command
+        },
+    )
 }
 
 /// Projects `values` through `items` and emits one DataRow.
@@ -67932,7 +67846,11 @@ pub(crate) fn update<'a>(
         }
         updated += 1;
     }
-    if let Err(error) = fire_after_triggers_with_rows(
+    write_completion::WriteCompletion::Update {
+        rows: updated,
+        columns: updated_columns,
+    }
+    .finish(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
@@ -67945,23 +67863,17 @@ pub(crate) fn update<'a>(
         },
         table_index.into(),
         def,
-        2,
-        updated_columns,
         TransitionRowSets {
             inserted: None,
             updated: transition_capture.take().map(TransitionCapture::into_rows),
             deleted: None,
         },
-    ) {
-        return sql_fail(error);
-    }
-    let tag = stack_format!(48, "UPDATE {}", updated);
-    if capturing {
-        responder.set_affected_rows(updated);
-    } else {
-        responder.command_complete_rows(tag.as_str(), updated)?;
-    }
-    sql_ok()
+        if capturing {
+            write_completion::CompletionReply::CountOnly
+        } else {
+            write_completion::CompletionReply::Command
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -68531,7 +68443,7 @@ pub(crate) fn delete<'a>(
         }
         deleted += 1;
     }
-    if let Err(error) = fire_after_triggers_with_rows(
+    write_completion::WriteCompletion::Delete { rows: deleted }.finish(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage,
@@ -68544,23 +68456,17 @@ pub(crate) fn delete<'a>(
         },
         table_index.into(),
         def,
-        4,
-        ColumnSet::EMPTY,
         TransitionRowSets {
             inserted: None,
             updated: None,
             deleted: transition_capture.take().map(TransitionCapture::into_rows),
         },
-    ) {
-        return sql_fail(error);
-    }
-    let tag = stack_format!(48, "DELETE {}", deleted);
-    if capturing {
-        responder.set_affected_rows(deleted);
-    } else {
-        responder.command_complete_rows(tag.as_str(), deleted)?;
-    }
-    sql_ok()
+        if capturing {
+            write_completion::CompletionReply::CountOnly
+        } else {
+            write_completion::CompletionReply::Command
+        },
+    )
 }
 
 /// TRUNCATE: removes every visible row of the listed tables through the

@@ -162,12 +162,14 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         .unwrap();
         let source = "DECLARE n integer := 0; marker text := 'once'; \
             anchor timestamp with time zone := statement_timestamp(); BEGIN \
+            BEGIN PERFORM $1; RAISE EXCEPTION 'enclosing SQL parameters leaked'; \
+                EXCEPTION WHEN SQLSTATE '42P02' THEN NULL; END; \
             n := n + 1; PERFORM set_config('application_name', 'changed', true); \
             PERFORM pg_advisory_lock(41); \
             PERFORM pg_advisory_xact_lock(42); \
             IF statement_timestamp() <> anchor OR transaction_timestamp() <> anchor THEN \
                 RAISE EXCEPTION 'trigger clocks changed'; END IF; \
-            NEW.note := OLD.note || TG_ARGV[0] || marker || current_setting('application_name') || current_user; \
+            NEW.note := OLD.note || (TG_ARGV[0] || marker || current_setting('application_name') || current_user); \
             NEW.id := NEW.id + n; \
             RETURN NEW; END";
         let (program, code) = compile_plpgsql_execution(
@@ -239,7 +241,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             },
             txn: &mut transaction,
             arena: &original,
-            params: crate::sql::eval::NO_PARAMS,
+            params: &[Datum::Int4(99)],
             responder: &mut responder,
         };
         let mut firing = TriggerFiring::new(

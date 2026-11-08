@@ -172,6 +172,8 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
         &mut self,
         context: &mut TriggerExecContext<'_, 'values, '_>,
     ) -> Result<bool, SqlError> {
+        let mut firing_context = context.for_trigger();
+        let context = &mut firing_context;
         self.require_context(context)?;
         self.execution.initialize(
             context,

@@ -56,6 +56,7 @@ jobs:
             transition_columns_keep_declared_types_ \
             trigger_parameters_remain_separate_ \
             mixed_writes_bind_each_row_trigger_ \
+            write_completion_preserves_ \
             adjacent_triggers_observe_restored_ guc::ownership_tests datetime::test_clock:: \
             saved_output_scopes_reuse_ \
             nested_static_and_dynamic_writes_ routine_calls:: procedural_subtransactions:: \
@@ -129,11 +130,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/269_trigger_parameter_scope.sql" fixture-269.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/270_mixed_transition_tables.sql" fixture-270.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/271_trigger_setting_scope.sql" fixture-271.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/272_write_completion.sql" fixture-272.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267 268 269 270 271; do
+          for fixture in 265 266 267 268 269 270 271 272; do
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
               < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
@@ -148,10 +150,12 @@ jobs:
               (269, '6|2|2|2|t|t|15'),
               (270, '10|4|4|2|t|t|301'),
               (271, '10|5|t|t|t|t|t|outer|hex|warning|t'),
+              (272, '16|8|6|2|t|3|17'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()
               print(f'PostgreSQL 18.6 fixture {fixture}: {expected}')
+          assert Path('stdout-272.txt').read_text().splitlines().count('2') == 1
           PY
           sha256sum fixture-*.sql revision server-version.txt image-id stdout-*.txt stderr-*.txt > SHA256SUMS
       - name: Retain PostgreSQL reference

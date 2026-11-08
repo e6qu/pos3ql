@@ -87,7 +87,10 @@ SELECT count(*),
             old_total = 30 AND new_total = 0 AND old_count = 1 AND new_count = 0
         ELSE false END),
     (SELECT operation = 'INSERT' AND row_id = 3 FROM mixed_audit WHERE ordinal = 1)
-        AND (SELECT operation = 'UPDATE' AND row_id = 1 FROM mixed_audit WHERE ordinal = 2),
+        AND (SELECT operation = 'UPDATE' AND row_id = 1 FROM mixed_audit WHERE ordinal = 2)
+        AND (SELECT operation = 'DELETE' AND row_id = 0 FROM mixed_audit WHERE ordinal = 8)
+        AND (SELECT operation = 'UPDATE' AND row_id = 0 FROM mixed_audit WHERE ordinal = 9)
+        AND (SELECT operation = 'INSERT' AND row_id = 0 FROM mixed_audit WHERE ordinal = 10),
     (SELECT sum(amount) FROM mixed_orders)
 FROM mixed_audit;
 DROP TABLE mixed_orders;

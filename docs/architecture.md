@@ -380,7 +380,19 @@ has restored. A memory error preserves all images and reservations, including
 when a child borrows the destination; the child's live bytes remain valid.
 This frame owner alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.
-Row and statement trigger execution now combines the compiled program, lexical
+Table INSERT, UPDATE, DELETE and MERGE share the end of a write: drain its row events,
+run the matching AFTER statement triggers in order, then send one completion or
+return its affected-row count to the caller. INSERT with an update on conflict
+runs UPDATE statement triggers before INSERT statement triggers. MERGE runs
+AFTER statement triggers in DELETE, UPDATE, INSERT order, for its listed actions;
+its BEFORE statement triggers run in INSERT, UPDATE, DELETE order. This follows
+PostgreSQL's [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c).
+This common path does not yet retain the enclosing row loop through a scheduler return.
+Row and statement triggers share construction of the selected routine and its
+scoped settings, security and row metadata. A trigger cannot commit or roll back
+its caller's transaction or inherit the enclosing command's SQL parameters.
+These rules apply on every entry, including resumed calls.
+Trigger execution combines the compiled program, lexical
 frame, arguments and row binding in one firing owner. Saving a firing copies its
 `OLD`/`NEW` payloads and arguments into shared row-work memory, retains the selected
 column image and preserves transition aliases and declared type OIDs. Restored

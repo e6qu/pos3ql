@@ -330,8 +330,8 @@ call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
 descriptions and value-slot arrays in the control pool. Each call pairs its
 resolved ordinary declarations, value slots and execution status together.
-Calls without row transitions use an empty borrowed table-definition view,
-keeping unused maximum-width column and constraint arrays off that path.
+Procedural calls consume a row schema. Calls without row transitions use an
+explicit empty schema, keeping unused table metadata off that path.
 Initialization records whether the next variable needs expression evaluation or
 conversion. Its evaluated value is saved before conversion can pause, and the
 compiled source supplies the initializer expressions directly.
@@ -343,12 +343,18 @@ A declaration explicitly marked `NOT NULL` needs an initializer; routine
 definition validation rejects its omission with `22004`, as PostgreSQL's
 [declaration grammar](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_gram.y#L507-L516) requires.
 The internal interpreter also retains whether it is executing statements,
-finishing a return or loop exit, or finding an error handler. Before cleanup,
-an error takes its detail and hint out of the worker-local diagnostic slot into
-the shared execution control pool. Cleanup cannot replace those fields with
-another command's error. Pending return payloads join the saved row-work images
+finishing a return or loop exit, or finding an error handler. Before rollback
+cleanup can run SQL, an error takes its detail and hint out of the worker-local
+diagnostic slot into the shared execution control pool. Cleanup cannot replace
+those fields with another command's error. Pending return payloads join the saved row-work images
 only when a call pauses. These internal owners still need the enclosing write
 and scheduler handoff described below; they do not enable checked trigger inputs.
+An error with no protected block to roll back returns its original diagnostic
+directly, without reserving another image in the control pool.
+Transition tables retain copied, interned column metadata
+and declared type OIDs. For example, `pg_typeof(new_rows.amount)` keeps the
+column's domain type when a statement trigger reads inserted rows, including NULL
+values; it does not infer that type from the stored integer value.
 Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges

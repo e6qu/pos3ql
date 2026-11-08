@@ -24,6 +24,13 @@ pub struct RelationDefinition<'a> {
 }
 
 impl<'a> RelationDefinition<'a> {
+    pub(crate) const EMPTY: Self = Self {
+        schema: super::SqlName::EMPTY,
+        name: super::SqlName::EMPTY,
+        n_columns: 0,
+        columns: &[],
+    };
+
     pub fn from_definition<B: super::DefinitionBacking>(
         definition: &'a super::TableDefinition<B>,
     ) -> Self {

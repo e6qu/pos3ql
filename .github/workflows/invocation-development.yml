@@ -41,9 +41,11 @@ jobs:
             procedural_locals_initialize_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \
             diagnostic_payload_exhaustion_ nested_diagnostic_calls_ caught_diagnostics_ \
+            unhandled_diagnostic_details_ \
             procedural_control_frames_ numeric_loop_frames_ custom_sqlstates_ \
             expired_procedural_blocks_ owned_set_results_ input_validation_ \
             uninitialized_domain_locals_ parameter_names_and_shadowed_ \
+            transition_columns_keep_declared_types_ \
             saved_output_scopes_reuse_ \
             nested_static_and_dynamic_writes_ routine_calls:: procedural_subtransactions:: \
             shared_row_work:: dml_target_ pgoutput_ subscription_copy_transition_values_ \
@@ -112,11 +114,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/265_trigger_input_visibility.sql" fixture-265.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/266_nested_write_selection.sql" fixture-266.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/267_domain_local_initialization.sql" fixture-267.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/268_transition_column_types.sql" fixture-268.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267; do
+          for fixture in 265 266 267 268; do
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
               < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
@@ -127,6 +130,7 @@ jobs:
               (265, '1|3|1|1|1|1|8193|2'),
               (266, '63|396|123|141|10|0|2|3|8193|3|4'),
               (267, '23502|23514|23502|23502|22004|0|7:true|2'),
+              (268, '8|2|2|2|2|4|t'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()

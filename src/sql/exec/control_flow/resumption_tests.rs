@@ -35,6 +35,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
         let mut budget =
             Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(&config) + (32 << 20));
         let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        storage.configure_collation(&config, &mut budget).unwrap();
         let mut transaction = TxnState::new_with_config(&mut budget, &config).unwrap();
         transaction.txid = 100;
         transaction.mode = TxnMode::Explicit;
@@ -96,15 +97,13 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 params: crate::sql::eval::NO_PARAMS,
                 responder: &mut responder,
             };
-            let definition = crate::storage::TableDefView::empty();
+            let definition = crate::storage::RelationDefinition::EMPTY;
             execution
                 .initialize(
                     &mut context,
                     invocation,
                     TriggerTransition {
-                        definition: crate::storage::RelationDefinition::from_definition(
-                            &definition,
-                        ),
+                        definition,
                         old: None,
                         new: None,
                     },
@@ -115,7 +114,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             let error = execution
                 .execute_block(
                     &mut context,
-                    &definition,
+                    definition,
                     invocation,
                     None,
                     &mut None,
@@ -188,10 +187,10 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     params: crate::sql::eval::NO_PARAMS,
                     responder: &mut responder,
                 };
-                let definition = crate::storage::TableDefView::empty();
+                let definition = crate::storage::RelationDefinition::EMPTY;
                 let outcome = execution.execute_block(
                     &mut context,
-                    &definition,
+                    definition,
                     invocation,
                     None,
                     &mut None,
@@ -219,7 +218,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 let error = execution
                     .execute_block(
                         &mut context,
-                        &definition,
+                        definition,
                         invocation,
                         None,
                         &mut None,

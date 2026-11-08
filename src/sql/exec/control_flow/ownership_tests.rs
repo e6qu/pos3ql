@@ -2,6 +2,45 @@ use super::*;
 use crate::mem::budget::Budget;
 
 #[test]
+fn terminal_errors_keep_original_details_without_an_unneeded_control_image() {
+    let mut budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "terminal error syntax", 8192).unwrap();
+    let workspace = Arena::new(&mut budget, "terminal error workspace", 1).unwrap();
+    let detail = "z".repeat(8192);
+    crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &pool,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut retained = ControlFrames::new(&workspace, code.layout(), &pool).unwrap();
+        let mut frames = retained.execution(&workspace, &code).unwrap();
+        frames.start(program.body);
+        let free = pool.lease::<u8>(8192).err().unwrap().free_bytes;
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(&detail)), None);
+        let error = frames
+            .begin_error(sql_err!("P0001", "original error"), &pool)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "P0001");
+        assert_eq!(error.message.as_str(), "original error");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert_eq!(diagnostic.detail.unwrap().as_str(), detail);
+        assert!(diagnostic.hint.is_none());
+        assert_eq!(pool.lease::<u8>(8192).err().unwrap().free_bytes, free);
+    });
+}
+
+#[test]
 fn execution_waits_require_private_provenance_and_exclude_consumer_completion() {
     use crate::sql::eval::InternalControl;
     crate::mem::guard::forbid_alloc(|| {

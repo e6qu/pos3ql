@@ -100,6 +100,8 @@ Retain an unfinished `RETURN`, loop exit or error cleanup as part of that call.
 Keep the original error detail and hint before cleanup can run other SQL or a
 different connection. A storage wait during rollback or release must retain its
 boundary and phase; a failed handler capture must return its capacity error.
+Errors needing no rollback callback must preserve their original code and detail
+without reserving an unnecessary control image.
 Force repeated real waits inside a protected numeric loop after earlier
 statements. Destroy the old temporary memory, preserve locals and once-only
 session effects, and verify wakeups before completing the same call.
@@ -142,6 +144,8 @@ writes and sequence effects once; qualify the same SQL in both transaction modes
 and against PostgreSQL. Preserve
 handler variables in rewritten local and NEW-row assignments, including JSON
 subscripts. Keep trigger context types and undefined-name errors compatible.
+`OLD TABLE` and `NEW TABLE` must retain each column's declared domain, enum,
+composite and array types, including when its value is NULL.
 
 Retain current input, call, diagnostic and result ownership checks described in
 the [architecture](docs/architecture.md#the-request-path): moved/reset/foreign

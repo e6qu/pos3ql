@@ -3953,8 +3953,14 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
         },
     )?;
     let invocation = invocation.with_input_sites(program.input_sites);
-    let transition_relations =
-        trigger_transition_relations(trigger, definition, transition_rows, context.arena)?;
+    let transition_relations = trigger_transition_relations(
+        context.storage(),
+        context.txn.txid,
+        trigger,
+        crate::storage::RelationDefinition::from_definition(definition),
+        transition_rows,
+        context.arena,
+    )?;
     let invocation = TriggerInvocation {
         materialized_relations: transition_relations,
         ..invocation
@@ -3980,7 +3986,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     )?;
     match execution.execute_block(
         context,
-        definition,
+        crate::storage::RelationDefinition::from_definition(definition),
         invocation,
         old,
         new,
@@ -21307,7 +21313,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         arena,
         &|_| false,
     )?;
-    let definition = crate::storage::TableDefView::empty();
+    let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::anonymous()?.with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -21334,7 +21340,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &mut context,
         invocation,
         TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            definition,
             old: None,
             new: None,
         },
@@ -21344,7 +21350,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     let mut no_new = None;
     match execution.execute_block(
         &mut context,
-        &definition,
+        definition,
         invocation,
         None,
         &mut no_new,
@@ -21391,7 +21397,7 @@ pub(crate) fn execute_event_trigger<'a>(
                     .any(|column| column.name == name)
         },
     )?;
-    let definition = crate::storage::TableDefView::empty();
+    let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21419,7 +21425,7 @@ pub(crate) fn execute_event_trigger<'a>(
         &mut context,
         invocation,
         TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            definition,
             old: None,
             new: None,
         },
@@ -21429,7 +21435,7 @@ pub(crate) fn execute_event_trigger<'a>(
     let mut no_new = None;
     match execution.execute_block(
         &mut context,
-        &definition,
+        definition,
         invocation,
         None,
         &mut no_new,
@@ -21549,7 +21555,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = crate::storage::TableDefView::empty();
+    let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::procedure(routine, input_collation, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21577,7 +21583,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &mut context,
         invocation,
         TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            definition,
             old: None,
             new: None,
         },
@@ -21588,7 +21594,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     let mut no_new = None;
     match execution.execute_block(
         &mut context,
-        &definition,
+        definition,
         invocation,
         None,
         &mut no_new,
@@ -21727,7 +21733,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = crate::storage::TableDefView::empty();
+    let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::function(routine, program_kind, input_collation, arena)?
         .with_input_sites(program.input_sites);
     let mut context = TriggerExecContext {
@@ -21755,7 +21761,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         &mut context,
         invocation,
         TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            definition,
             old: None,
             new: None,
         },
@@ -21766,7 +21772,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     let mut no_new = None;
     match execution.execute_block(
         &mut context,
-        &definition,
+        definition,
         invocation,
         None,
         &mut no_new,
@@ -21905,7 +21911,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declaration_count += 1;
     }
     let locals = &declarations[..declaration_count];
-    let definition = crate::storage::TableDefView::empty();
+    let definition = crate::storage::RelationDefinition::EMPTY;
     let invocation = TriggerInvocation::function(
         routine,
         PlpgsqlProgramKind::SetFunction,
@@ -21961,7 +21967,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         &mut context,
         invocation,
         TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(&definition),
+            definition,
             old: None,
             new: None,
         },
@@ -21976,7 +21982,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     let mut no_new = None;
     match execution.execute_block(
         &mut context,
-        &definition,
+        definition,
         invocation,
         None,
         &mut no_new,
@@ -26291,10 +26297,10 @@ fn trigger_notice_to_sql(_: WireFull) -> SqlError {
     clippy::too_many_arguments,
     reason = "a trigger condition evaluates against the complete typed firing context"
 )]
-fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
+fn trigger_condition<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
-    definition: &crate::storage::TableDefinition<Definition0>,
+    definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: Option<&[Datum<'a>]>,
@@ -26311,7 +26317,7 @@ fn trigger_condition<'a, Definition0: crate::storage::DefinitionBacking>(
             found,
             invocation,
             transition: &TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new,
             },
@@ -26747,9 +26753,9 @@ fn prepare_static_plpgsql_statement<'a>(
     clippy::too_many_arguments,
     reason = "a trigger block carries the complete typed firing context"
 )]
-fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
+fn execute_trigger_step<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
-    definition: &crate::storage::TableDefinition<Definition0>,
+    definition: crate::storage::RelationDefinition<'_>,
     invocation: TriggerInvocation<'a>,
     old: Option<&[Datum<'a>]>,
     new: &mut Option<&mut [Datum<'a>]>,
@@ -26765,7 +26771,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
     super::query::check_timeout()?;
     let (statement, input_plan) = {
         let transition = TriggerTransition {
-            definition: crate::storage::RelationDefinition::from_definition(definition),
+            definition,
             old,
             new: new.as_deref(),
         };
@@ -26804,9 +26810,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     let values = match expression {
                         Some(expression) => {
                             let transition = TriggerTransition {
-                                definition: crate::storage::RelationDefinition::from_definition(
-                                    definition,
-                                ),
+                                definition,
                                 old,
                                 new: new.as_deref(),
                             };
@@ -26865,7 +26869,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => query,
             };
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -26915,7 +26919,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -26953,7 +26957,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 TriggerReturn::Void => TriggerReturnValue::Void,
                 TriggerReturn::Value(expression) => {
                     let transition = TriggerTransition {
-                        definition: crate::storage::RelationDefinition::from_definition(definition),
+                        definition,
                         old,
                         new: new.as_deref(),
                     };
@@ -26993,7 +26997,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 ));
             }
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -27049,7 +27053,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -27129,7 +27133,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                         }
                     };
                     let transition = TriggerTransition {
-                        definition: crate::storage::RelationDefinition::from_definition(definition),
+                        definition,
                         old,
                         new: new.as_deref(),
                     };
@@ -27534,7 +27538,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => statement.query,
             };
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -27673,7 +27677,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 targets[index] = trigger_local_index(locals, *target)?;
             }
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -27927,7 +27931,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28023,7 +28027,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                     None => query,
                 };
                 let transition = TriggerTransition {
-                    definition: crate::storage::RelationDefinition::from_definition(definition),
+                    definition,
                     old,
                     new: new.as_deref(),
                 };
@@ -28079,7 +28083,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 return Ok(None);
             }
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28120,7 +28124,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }),
         TriggerStatement::Raise(TriggerRaise::Message(raise)) => execute_trigger_statement(|| {
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28267,7 +28271,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => statement,
             };
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28404,7 +28408,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => statement,
             };
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28495,7 +28499,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                 None => statement,
             };
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -28563,7 +28567,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
             } = program.source
             {
                 let transition = TriggerTransition {
-                    definition: crate::storage::RelationDefinition::from_definition(definition),
+                    definition,
                     old,
                     new: new.as_deref(),
                 };
@@ -28638,9 +28642,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                                     None => query,
                                 };
                                 let transition = TriggerTransition {
-                                    definition: crate::storage::RelationDefinition::from_definition(
-                                        definition,
-                                    ),
+                                    definition,
                                     old,
                                     new: new.as_deref(),
                                 };
@@ -28670,9 +28672,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                             }
                             TriggerForSource::DynamicQuery(query) => {
                                 let transition = TriggerTransition {
-                                    definition: crate::storage::RelationDefinition::from_definition(
-                                        definition,
-                                    ),
+                                    definition,
                                     old,
                                     new: new.as_deref(),
                                 };
@@ -28692,9 +28692,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                             }
                             TriggerForSource::Array { expression, slice } => {
                                 let transition = TriggerTransition {
-                                    definition: crate::storage::RelationDefinition::from_definition(
-                                        definition,
-                                    ),
+                                    definition,
                                     old,
                                     new: new.as_deref(),
                                 };
@@ -28833,9 +28831,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
                             found: status.found,
                             invocation,
                             transition: &TriggerTransition {
-                                definition: crate::storage::RelationDefinition::from_definition(
-                                    definition,
-                                ),
+                                definition,
                                 old,
                                 new: new.as_deref(),
                             },
@@ -28860,7 +28856,7 @@ fn execute_trigger_step<'a, Definition0: crate::storage::DefinitionBacking>(
         }
         TriggerStatement::Case(program) => {
             let transition = TriggerTransition {
-                definition: crate::storage::RelationDefinition::from_definition(definition),
+                definition,
                 old,
                 new: new.as_deref(),
             };
@@ -29856,8 +29852,11 @@ impl<'a> TransitionCapture<'a> {
     }
 }
 
-fn transition_relation<'a, Definition0: crate::storage::DefinitionBacking>(
-    definition: &crate::storage::TableDefinition<Definition0>,
+fn transition_relation<'a>(
+    storage: &Storage,
+    txid: u32,
+    name: SqlName,
+    definition: crate::storage::RelationDefinition<'_>,
     rows: &'a [&'a [u8]],
     arena: &'a Arena,
 ) -> Result<&'a crate::sql::ast::MaterializedCte<'a>, SqlError> {
@@ -29871,31 +29870,45 @@ fn transition_relation<'a, Definition0: crate::storage::DefinitionBacking>(
         .alloc_slice_copy(&names[..definition.n_columns])
         .map_err(|_| super::query::arena_full_pub())?;
     let types = arena
-        .alloc_slice_with(definition.n_columns, |column| {
-            let meta = &definition.columns()[column];
-            (meta.ctype.oid(), meta.ctype.typlen(), meta.type_mod)
-        })
+        .alloc_slice_with(definition.n_columns, |_| (0, 0, -1))
         .map_err(|_| super::query::arena_full_pub())?;
+    for (output, column) in types.iter_mut().zip(definition.columns()) {
+        *output = (
+            storage.declared_column_type(column, txid)?.catalog_oid(),
+            column.ctype.typlen(),
+            column.type_mod,
+        );
+    }
     let collations = arena
         .alloc_slice_with(definition.n_columns, |column| {
             definition.columns()[column].collation
         })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let columns = arena
+        .alloc_interned_slice(definition.columns())
         .map_err(|_| super::query::arena_full_pub())?;
     arena
         .alloc(crate::sql::ast::MaterializedCte {
             column_names: names,
             column_types: types,
             column_collations: collations,
-            definition: None,
+            definition: Some(crate::storage::RelationDefinition {
+                schema: SqlName::EMPTY,
+                name,
+                n_columns: definition.n_columns,
+                columns,
+            }),
             source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
         .map_err(|_| super::query::arena_full_pub())
 }
 
-fn trigger_transition_relations<'a, Definition0: crate::storage::DefinitionBacking>(
+fn trigger_transition_relations<'a>(
+    storage: &Storage,
+    txid: u32,
     trigger: &crate::storage::TriggerDef,
-    definition: &crate::storage::TableDefinition<Definition0>,
+    definition: crate::storage::RelationDefinition<'_>,
     rows: Option<TransitionRows<'a>>,
     arena: &'a Arena,
 ) -> Result<Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>, SqlError> {
@@ -29907,7 +29920,9 @@ fn trigger_transition_relations<'a, Definition0: crate::storage::DefinitionBacki
             arena
                 .alloc_str(name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
-            Some(transition_relation(definition, rows.old, arena)?),
+            Some(transition_relation(
+                storage, txid, name, definition, rows.old, arena,
+            )?),
         );
         relation_count += 1;
     }
@@ -29916,7 +29931,9 @@ fn trigger_transition_relations<'a, Definition0: crate::storage::DefinitionBacki
             arena
                 .alloc_str(name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
-            Some(transition_relation(definition, rows.new, arena)?),
+            Some(transition_relation(
+                storage, txid, name, definition, rows.new, arena,
+            )?),
         );
         relation_count += 1;
     }
@@ -30026,8 +30043,14 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
             },
         )?;
         let invocation = invocation.with_input_sites(program.input_sites);
-        let transition_relations =
-            trigger_transition_relations(&trigger, definition, rows, context.arena)?;
+        let transition_relations = trigger_transition_relations(
+            context.storage(),
+            context.txn.txid,
+            &trigger,
+            crate::storage::RelationDefinition::from_definition(definition),
+            rows,
+            context.arena,
+        )?;
         let invocation = TriggerInvocation {
             materialized_relations: transition_relations,
             ..invocation
@@ -30054,7 +30077,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
         )?;
         match execution.execute_block(
             &mut context,
-            definition,
+            crate::storage::RelationDefinition::from_definition(definition),
             invocation,
             None,
             &mut no_new,

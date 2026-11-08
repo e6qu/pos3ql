@@ -482,6 +482,32 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             .expect("active procedural frame")
     }
 
+    fn begin_error(
+        &mut self,
+        error: SqlError,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        let cleanup = self.state.slots[..self.state.active]
+            .iter()
+            .flatten()
+            .any(|frame| {
+                matches!(
+                    frame.continuation,
+                    Continuation::Protected {
+                        releasing: false,
+                        ..
+                    }
+                )
+            });
+        if !cleanup {
+            // Releasing lexical resources runs no SQL. The original diagnostic
+            // can go straight to the caller without reserving a second image.
+            return Err(error);
+        }
+        self.state.progress = ExecutionProgress::Error(PendingError::capture(error, pool));
+        Ok(())
+    }
+
     fn scope<'s>(
         &'s mut self,
         locals: &'s [TriggerLocalDecl],
@@ -756,10 +782,10 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         clippy::too_many_arguments,
         reason = "the interpreter retains the complete typed firing context"
     )]
-    pub(super) fn execute_block<Definition0: crate::storage::DefinitionBacking>(
+    pub(super) fn execute_block(
         &mut self,
         context: &mut TriggerExecContext<'_, 'a, '_>,
-        definition: &crate::storage::TableDefinition<Definition0>,
+        definition: crate::storage::RelationDefinition<'_>,
         invocation: TriggerInvocation<'a>,
         old: Option<&[Datum<'a>]>,
         new: &mut Option<&mut [Datum<'a>]>,
@@ -834,11 +860,12 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                     paused = true;
                                     break 'execute;
                                 }
-                                frames.state.progress =
-                                    ExecutionProgress::Error(PendingError::capture(
-                                        error,
-                                        &context.storage().execution_control,
-                                    ));
+                                if let Err(error) =
+                                    frames.begin_error(error, &context.storage().execution_control)
+                                {
+                                    outcome = Err(error);
+                                    break 'execute;
+                                }
                                 break;
                             }
                         }
@@ -850,7 +877,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                     }
                     continue;
                 }
-                ExecutionProgress::Error(mut error) => {
+                ExecutionProgress::Error(error) => {
                     let mut handler = None;
                     while frames.state.active != 0 {
                         if let Continuation::Protected {
@@ -880,10 +907,17 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                     break 'execute;
                                 }
                                 Err(rollback_error) => {
-                                    error = PendingError::capture(
+                                    let frame = frames.pop();
+                                    frames.finish(frame, locals, values, status, false);
+                                    drop(error);
+                                    if let Err(error) = frames.begin_error(
                                         rollback_error,
                                         &context.storage().execution_control,
-                                    );
+                                    ) {
+                                        outcome = Err(error);
+                                        break 'execute;
+                                    }
+                                    continue 'execute;
                                 }
                             }
                         }
@@ -908,17 +942,10 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             FrameSource::Handler,
                         ),
                         Err(error) => {
-                            frames.state.progress = ExecutionProgress::Error(
-                                PendingError::capture(error, &context.storage().execution_control),
-                            );
-                            if frames.state.active == 0 {
-                                let ExecutionProgress::Error(error) = core::mem::replace(
-                                    &mut frames.state.progress,
-                                    ExecutionProgress::Complete,
-                                ) else {
-                                    unreachable!()
-                                };
-                                outcome = Err(error.publish());
+                            if let Err(error) =
+                                frames.begin_error(error, &context.storage().execution_control)
+                            {
+                                outcome = Err(error);
                                 break;
                             }
                         }
@@ -1087,10 +1114,12 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                     break;
                 }
                 Err(error) => {
-                    frames.state.progress = ExecutionProgress::Error(PendingError::capture(
-                        error,
-                        &context.storage().execution_control,
-                    ));
+                    if let Err(error) =
+                        frames.begin_error(error, &context.storage().execution_control)
+                    {
+                        outcome = Err(error);
+                        break;
+                    }
                 }
             }
         }

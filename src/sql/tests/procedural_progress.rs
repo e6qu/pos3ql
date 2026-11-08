@@ -1242,3 +1242,76 @@ fn uninitialized_domain_locals_validate_null_before_body_effects() {
         );
     }
 }
+
+#[test]
+fn transition_columns_keep_declared_types_for_old_new_and_null_values() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("transition-column-types-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/268_transition_column_types.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["8|2|2|2|2|4|t"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn unhandled_diagnostic_details_preserve_original_errors_at_small_control_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("unhandled-diagnostic-details-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 4096;
+        config.execution_control_leases = 16;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(
+            &mut engine,
+            "CREATE TABLE unhandled_error_audit(n integer)",
+            true,
+        );
+        session.success(&mut engine, "CREATE FUNCTION unhandled_detail(p text) RETURNS void LANGUAGE plpgsql AS $$BEGIN INSERT INTO unhandled_error_audit VALUES (1); RAISE EXCEPTION 'original error' USING DETAIL = p; END$$", true);
+        let detail = "z".repeat(8192);
+        for _ in 0..2 {
+            let error = session.execute(
+                &mut engine,
+                "SELECT unhandled_detail(repeat('z',8192))",
+                true,
+            );
+            assert_eq!(error_sqlstates(&error), ["P0001"], "{mode:?}");
+            let text = String::from_utf8_lossy(&error);
+            assert!(text.contains("original error"), "{mode:?}: {text}");
+            assert!(
+                text.contains(&detail),
+                "{mode:?}: original detail must survive"
+            );
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT count(*) FROM unhandled_error_audit",
+                    true,
+                )),
+                ["0"],
+                "{mode:?}: the failed call must roll back its write"
+            );
+        }
+    }
+}

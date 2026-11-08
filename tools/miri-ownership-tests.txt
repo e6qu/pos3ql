@@ -269,3 +269,4 @@ sql::exec::diagnostics::ownership_tests::pending_errors_own_metadata_before_clea
 sql::exec::diagnostics::ownership_tests::publishing_pending_errors_restores_their_metadata_and_clears_cleanup_metadata
 sql::exec::diagnostics::ownership_tests::pending_error_capture_reports_exhaustion_and_returns_capacity_for_reuse
 sql::exec::control_flow::ownership_tests::suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse
+sql::exec::control_flow::ownership_tests::terminal_errors_keep_original_details_without_an_unneeded_control_image

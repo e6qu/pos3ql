@@ -11175,11 +11175,19 @@ fn describe_scope_column<'q>(
     arena: &'q Arena,
 ) -> Result<ColDesc<'q>, SqlError> {
     let metadata = scope_column_metadata(scope, entry, storage, txid).ok_or_else(|| {
-        sql_err!(sqlstate::UNDEFINED_OBJECT, "output column's declared type is unavailable")
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "output column's declared type is unavailable"
+        )
     })?;
-    let name = arena.alloc_str(scope.output_name(entry)).map_err(|_| arena_full())?;
-    Ok(ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
-        .with_type_mod(metadata.type_mod).with_collation(metadata.collation))
+    let name = arena
+        .alloc_str(scope.output_name(entry))
+        .map_err(|_| arena_full())?;
+    Ok(
+        ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
+            .with_type_mod(metadata.type_mod)
+            .with_collation(metadata.collation),
+    )
 }
 
 /// Column descriptions across the whole scope (wildcards expand every
@@ -12255,8 +12263,13 @@ fn describe_scope_record_star<'q>(
             super::exec::record_shape_metadata(base, &resolver, |_, meta| {
                 if error.is_none() {
                     error = push(
-                        ColDesc::new(super::exec::RECORD_FIELD_NAMES[index], meta.type_oid, meta.ctype.typlen())
-                            .with_type_mod(meta.type_mod).with_collation(meta.collation),
+                        ColDesc::new(
+                            super::exec::RECORD_FIELD_NAMES[index],
+                            meta.type_oid,
+                            meta.ctype.typlen(),
+                        )
+                        .with_type_mod(meta.type_mod)
+                        .with_collation(meta.collation),
                         &mut n,
                     )
                     .err();
@@ -12283,7 +12296,13 @@ fn describe_scope_record_star<'q>(
                 .enumerate()
             {
                 push(
-                    describe_scope_column(scope, ResolvedColumn::Table(t, column), storage, txid, arena)?,
+                    describe_scope_column(
+                        scope,
+                        ResolvedColumn::Table(t, column),
+                        storage,
+                        txid,
+                        arena,
+                    )?,
                     &mut n,
                 )?;
             }
@@ -12402,8 +12421,14 @@ fn describe_scope_record_star<'q>(
                         )
                     })?;
                 for field in definition.active_fields() {
-                    let type_oid = storage.routine_type_oid(field.ctype, field.user_type, txid)
-                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "record field's declared type is unavailable"))?;
+                    let type_oid = storage
+                        .routine_type_oid(field.ctype, field.user_type, txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "record field's declared type is unavailable"
+                            )
+                        })?;
                     push(
                         ColDesc::new(field.name.as_str(), type_oid, field.ctype.typlen())
                             .with_type_mod(field.type_mod)

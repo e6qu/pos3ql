@@ -79,11 +79,16 @@ impl CursorQuery {
     }
 
     pub(crate) fn result_type_oids(&self) -> Result<Option<&[i32]>, SqlError> {
-        self.result_type_oids.map(|handle| {
-            self.arena.retained_slice(handle).map_err(|_| sql_err!(
-                sqlstate::INTERNAL_ERROR, "cursor SQL result types are inactive"
-            ))
-        }).transpose()
+        self.result_type_oids
+            .map(|handle| {
+                self.arena.retained_slice(handle).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor SQL result types are inactive"
+                    )
+                })
+            })
+            .transpose()
     }
 
     pub(crate) fn finish_source(&mut self) {
@@ -268,9 +273,13 @@ impl CursorQuery {
                 .arena
                 .retain_slice_with(count, |index| types[index])
                 .map_err(|_| query_full())?;
-            self.result_type_oids = Some(self.arena.freeze_retained_slice(types).map_err(|_| {
-                sql_err!(sqlstate::INTERNAL_ERROR, "cursor SQL result types are inactive")
-            })?);
+            self.result_type_oids =
+                Some(self.arena.freeze_retained_slice(types).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor SQL result types are inactive"
+                    )
+                })?);
         }
         let CursorStatement::Select(statement) = bound.statement else {
             return Ok(false);
@@ -455,9 +464,21 @@ mod tests {
         let mut budget = Budget::new(8192);
         let mut query = CursorQuery::new(&mut budget, 8192).unwrap();
         let (query, saved) = crate::mem::guard::forbid_alloc(|| {
-            query.bind("SELECT 1", &[], &[], &[], crate::sql::type_input_plans::Owner::Unlocated, |_| Ok(())).unwrap();
+            query
+                .bind(
+                    "SELECT 1",
+                    &[],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Unlocated,
+                    |_| Ok(()),
+                )
+                .unwrap();
             query.arena.alloc_slice_with(512, |_| 0xccu8).unwrap();
-            let types = query.arena.retain_slice_with(2, |index| [23, 123456][index]).unwrap();
+            let types = query
+                .arena
+                .retain_slice_with(2, |index| [23, 123456][index])
+                .unwrap();
             let types = query.arena.freeze_retained_slice(types).unwrap();
             query.result_type_oids = Some(types);
             let before = query.arena.used();

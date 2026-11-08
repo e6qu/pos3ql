@@ -83,9 +83,13 @@ fn describe_column<'a>(
         Some(storage) => storage.routine_type_oid(column.ctype, column.user_type, txid),
         None if column.user_type.is_none() => Some(column.ctype.oid()),
         None => None,
-    }.ok_or_else(|| sql_err!(
-        sqlstate::UNDEFINED_OBJECT, "output column's declared type is unavailable"
-    ))?;
+    }
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "output column's declared type is unavailable"
+        )
+    })?;
     Ok(ColDesc::new(name, type_oid, column.ctype.typlen())
         .with_type_mod(column.type_mod)
         .with_collation(column.collation))
@@ -304,9 +308,7 @@ fn describe_items_with_output_aliases<'q>(
                 } else if let Some(meta) = field_meta {
                     description.collation = meta.collation;
                 }
-                if collatable
-                    && description.collation_derivation == CollationDerivation::None
-                {
+                if collatable && description.collation_derivation == CollationDerivation::None {
                     description.collation = crate::sql::ast::Collation::Default;
                     description.collation_derivation = CollationDerivation::Implicit;
                 }

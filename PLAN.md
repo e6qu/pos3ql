@@ -70,14 +70,18 @@ Keep the firing's arguments, `OLD`/`NEW`, selected row columns and transition
 descriptions with its execution position. Failed capture keeps the live firing;
 failed attachment keeps its saved images. Only a complete attachment may resume
 the body, and completed firings cannot run again.
-Restore all settings changed inside a configured routine before the next trigger
-observes them. A temporary `bytea_output = 'escape'` must not leave
-`current_setting()` or `pg_settings` reporting escape after rendering returns to
-hex; explicit session-wide changes must still survive the routine's return.
+Match PostgreSQL's setting scopes before the next trigger observes them. Restore
+settings named in the routine's `SET` clause; preserve unlisted `SET LOCAL`
+changes until transaction end. An explicit session-wide `SET` overrides routine
+restoration even when it assigns the same value as before. `current_setting()`,
+`pg_settings` and rendered values must agree throughout.
 Keep the configured routine's current values and restoration baseline in the
 same startup-reserved owner while it waits. Reject another connection or a
 changed parent scope before installing those values. Restore the caller's
 settings and effective user after failed attachment, another pause or completion.
+Preserve the original statement and transaction timestamps and deadline while
+the worker serves other connections; a wakeup must not renew the timer or repeat
+a timeout already consumed by its transaction.
 Retain nested SQL's command and read snapshot together. Resuming it must not
 issue another command identity or restore another connection's visibility;
 completion and another pause must restore the caller's context.

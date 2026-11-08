@@ -49,13 +49,39 @@ pub(super) struct TriggerFiring<'values, 'schema, 'rows> {
 }
 
 pub(super) struct FiringEnvironment {
-    pub(super) config: Option<crate::sql::guc::RoutineConfigScope>,
-    pub(super) security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
+    config: Option<crate::sql::guc::RoutineConfigScope>,
+    security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
+    prior_clock: Option<crate::sql::datetime::StatementClock>,
+    _deadline: Option<crate::sql::query::DeadlineScope>,
+}
+
+impl FiringEnvironment {
+    pub(super) fn new(
+        config: Option<crate::sql::guc::RoutineConfigScope>,
+        security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            prior_clock: None,
+            _deadline: None,
+        }
+    }
+}
+
+impl Drop for FiringEnvironment {
+    fn drop(&mut self) {
+        if let Some(clock) = self.prior_clock.take() {
+            crate::sql::datetime::restore_statement_clock(clock);
+        }
+    }
 }
 
 struct SavedEnvironment {
     security: Option<crate::storage::SessionIdentity>,
     config: Option<SharedSlice<crate::sql::guc::RoutineConfigImage>>,
+    clock: crate::sql::datetime::StatementClock,
+    deadline: i64,
 }
 
 impl SavedEnvironment {
@@ -78,10 +104,12 @@ impl SavedEnvironment {
                 .as_ref()
                 .map(|_| crate::sql::eval::funcs::system::current_identity()),
             config,
+            clock: crate::sql::datetime::stored_statement_clock(),
+            deadline: crate::sql::query::statement_deadline(),
         })
     }
 
-    fn enter(&self) -> Result<FiringEnvironment, SqlError> {
+    fn enter(&self, txn: &TxnState) -> Result<FiringEnvironment, SqlError> {
         let security = self
             .security
             .map(crate::sql::eval::funcs::system::enter_current_user);
@@ -90,7 +118,16 @@ impl SavedEnvironment {
             .as_ref()
             .map(|image| image[0].enter())
             .transpose()?;
-        Ok(FiringEnvironment { security, config })
+        let prior_clock = crate::sql::datetime::stored_statement_clock();
+        let deadline = crate::sql::query::enter_deadline_scope();
+        crate::sql::datetime::restore_statement_clock(self.clock);
+        txn.restore_statement_deadline(self.deadline);
+        Ok(FiringEnvironment {
+            config,
+            security,
+            prior_clock: Some(prior_clock),
+            _deadline: Some(deadline),
+        })
     }
 }
 
@@ -604,7 +641,7 @@ fn resume<'run>(
     frame: execution_frame::SuspendedExecutionFrame,
     mut context: TriggerExecContext<'_, 'run, '_>,
 ) -> Result<(FiringState, FiringProgress), ResumeError> {
-    let active_environment = match environment.enter() {
+    let active_environment = match environment.enter(context.txn) {
         Ok(active) => active,
         Err(error) => return Err(ResumeError::Unattached(frame, error)),
     };
@@ -638,10 +675,8 @@ fn resume<'run>(
     match firing.execute(&mut context) {
         Ok(accepted) => {
             capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
-            *environment = SavedEnvironment {
-                security: None,
-                config: None,
-            };
+            environment.security = None;
+            environment.config = None;
             Ok((FiringState::Complete, FiringProgress::Complete { accepted }))
         }
         Err(error) if control_flow::is_execution_wait(&error) => {

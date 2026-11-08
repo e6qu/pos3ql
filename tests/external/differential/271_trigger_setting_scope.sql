@@ -4,19 +4,24 @@ SET client_min_messages TO 'notice';
 CREATE TABLE trigger_setting_orders(id integer);
 CREATE TABLE trigger_setting_audit(
     configured boolean, app text, output text, rendered text, catalog_output text,
-    messages text
+    messages text, level_name text
 );
 CREATE FUNCTION trigger_setting_configured() RETURNS trigger LANGUAGE plpgsql
 SET application_name TO 'configured' AS $$
 BEGIN
+    PERFORM set_config('application_name', 'local configured', true);
     PERFORM set_config('bytea_output', 'escape', true);
     PERFORM set_config('client_min_messages', 'warning', false);
     INSERT INTO trigger_setting_audit VALUES (
         true, current_setting('application_name'), current_setting('bytea_output'),
         decode('61', 'hex')::text,
         (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'bytea_output'),
-        current_setting('client_min_messages')
+        current_setting('client_min_messages'), TG_LEVEL
     );
+    IF TG_LEVEL = 'STATEMENT' THEN
+        PERFORM set_config('application_name', 'outer', false);
+        PERFORM set_config('application_name', 'statement local', true);
+    END IF;
     IF TG_LEVEL = 'ROW' THEN RETURN NEW; END IF;
     RETURN NULL;
 END
@@ -27,7 +32,7 @@ BEGIN
         false, current_setting('application_name'), current_setting('bytea_output'),
         decode('61', 'hex')::text,
         (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'bytea_output'),
-        current_setting('client_min_messages')
+        current_setting('client_min_messages'), TG_LEVEL
     );
     IF TG_LEVEL = 'ROW' THEN RETURN NEW; END IF;
     RETURN NULL;
@@ -45,12 +50,15 @@ CREATE TRIGGER e_statement AFTER INSERT ON trigger_setting_orders
 FOR EACH STATEMENT EXECUTE FUNCTION trigger_setting_configured();
 CREATE TRIGGER f_statement AFTER INSERT ON trigger_setting_orders
 FOR EACH STATEMENT EXECUTE FUNCTION trigger_setting_observer();
+BEGIN;
 INSERT INTO trigger_setting_orders VALUES (1), (2);
+COMMIT;
 SELECT count(*),
     sum(CASE WHEN configured THEN 1 ELSE 0 END),
-    bool_and(app = CASE WHEN configured THEN 'configured' ELSE 'outer' END),
-    bool_and(output = CASE WHEN configured THEN 'escape' ELSE 'hex' END),
-    bool_and(rendered = CASE WHEN configured THEN 'a' ELSE '\x61' END),
+    bool_and(app = CASE WHEN configured THEN 'local configured'
+        WHEN level_name = 'STATEMENT' THEN 'statement local' ELSE 'outer' END),
+    bool_and(output = 'escape'),
+    bool_and(rendered = 'a'),
     bool_and(catalog_output = output),
     bool_and(messages = 'warning'),
     current_setting('application_name'), current_setting('bytea_output'),

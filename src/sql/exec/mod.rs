@@ -3983,10 +3983,7 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
             level: TriggerLevel::Row,
             before,
         },
-        trigger_firing::FiringEnvironment {
-            security: _security,
-            config: _config,
-        },
+        trigger_firing::FiringEnvironment::new(_config, _security),
     )?;
     firing.execute(context)
 }
@@ -29957,10 +29954,7 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
                 level: TriggerLevel::Statement,
                 before,
             },
-            trigger_firing::FiringEnvironment {
-                security: _security,
-                config: _config,
-            },
+            trigger_firing::FiringEnvironment::new(_config, _security),
         )?;
         firing.execute(&mut context)?;
     }

@@ -4,6 +4,73 @@ use crate::sql::guc::GucState;
 use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
 
 #[test]
+fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
+    use crate::mem::lease_pool::{LeasePool, Purpose};
+    use crate::sql::{datetime, query};
+
+    let _clock = datetime::test_clock::enter(812_345_678_901_234);
+    let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+    let _deadline = query::enter_deadline_scope();
+    let mut budget = crate::mem::Budget::new(
+        TxnState::budget_bytes_with_large_objects(1, 1, 1) + LeasePool::budget_bytes(64, 1),
+    );
+    let mut txn = TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+    let controls = LeasePool::new(&mut budget, Purpose::EXECUTION_CONTROL, 64, 1).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        datetime::begin_statement();
+        datetime::begin_transaction();
+        query::restore_statement_deadline(812_345_678_902_234);
+        let active = FiringEnvironment::new(None, None);
+        let saved = SavedEnvironment::capture(&active, &controls).unwrap();
+        drop(active);
+
+        let _worker_clock = datetime::test_clock::enter(812_345_678_901_634);
+        datetime::begin_statement();
+        datetime::begin_transaction();
+        query::restore_statement_deadline(812_345_678_901_233);
+        {
+            let _active = saved.enter(&txn).unwrap();
+            assert_eq!(datetime::statement_micros(), 812_345_678_901_234);
+            assert_eq!(datetime::transaction_micros(), 812_345_678_901_234);
+            assert_eq!(query::statement_deadline(), 812_345_678_902_234);
+            query::check_timeout_at(812_345_678_902_233).unwrap();
+            assert_eq!(
+                query::check_timeout_at(812_345_678_902_234)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+        }
+        assert_eq!(datetime::statement_micros(), 812_345_678_901_634);
+        assert_eq!(datetime::transaction_micros(), 812_345_678_901_634);
+        assert_eq!(query::statement_deadline(), 812_345_678_901_233);
+
+        query::restore_statement_deadline(812_345_678_902_234);
+        txn.catch_query_cancellation(812_345_678_902_234);
+        query::restore_statement_deadline(812_345_678_901_233);
+        {
+            let _active = saved.enter(&txn).unwrap();
+            assert_eq!(query::statement_deadline(), 0);
+            query::check_timeout_at(i64::MAX).unwrap();
+        }
+        assert_eq!(query::statement_deadline(), 812_345_678_901_233);
+
+        txn.enter_statement_timeout(crate::sql::StatementTimeoutEntry::Command { timeout_ms: 1 });
+        txn.catch_query_cancellation(812_345_678_901_634);
+        {
+            let _active = saved.enter(&txn).unwrap();
+            assert_eq!(query::statement_deadline(), 812_345_678_902_234);
+            assert_eq!(
+                query::check_timeout_at(812_345_678_902_234)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::QUERY_CANCELED
+            );
+        }
+    });
+}
+
+#[test]
 fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destruction() {
     let _clock = crate::sql::datetime::test_clock::enter(812_345_678_901_234);
     let mut config = crate::storage::tests::test_config();
@@ -33,6 +100,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     let mut responder = Responder::new(&mut send);
     let guc = GucState::new_with_capacities(&mut budget, 1, 4, config.transaction_mode).unwrap();
     let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+    crate::sql::datetime::begin_statement();
+    crate::sql::datetime::begin_transaction();
     let _caller = crate::sql::eval::funcs::system::enter_current_user(
         crate::storage::SessionIdentity::unauthenticated("caller"),
     );
@@ -63,7 +132,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     super::super::super::set_execution_connection_id(1);
     storage.begin_transaction_identity(100).unwrap();
     let _deadline = super::super::super::query::enter_deadline_scope();
-    super::super::super::query::disarm_timeout();
+    super::super::super::query::restore_statement_deadline(812_345_679_901_234);
     let mut columns = [crate::storage::ColumnMeta::EMPTY; 2];
     columns[0].name = SqlName::parse("id").unwrap();
     columns[0].ctype = ColType::Int4;
@@ -91,9 +160,12 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             &original,
         )
         .unwrap();
-        let source = "DECLARE n integer := 0; marker text := 'once'; BEGIN \
+        let source = "DECLARE n integer := 0; marker text := 'once'; \
+            anchor timestamp with time zone := statement_timestamp(); BEGIN \
             n := n + 1; PERFORM pg_advisory_lock(41); \
             PERFORM pg_advisory_xact_lock(42); \
+            IF statement_timestamp() <> anchor OR transaction_timestamp() <> anchor THEN \
+                RAISE EXCEPTION 'trigger clocks changed'; END IF; \
             NEW.note := OLD.note || TG_ARGV[0] || marker || current_setting('application_name') || current_user; \
             NEW.id := NEW.id + n; \
             RETURN NEW; END";
@@ -181,10 +253,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 level: TriggerLevel::Row,
                 before: true,
             },
-            FiringEnvironment {
-                security: Some(security),
-                config: Some(settings),
-            },
+            FiringEnvironment::new(Some(settings), Some(security)),
         )
         .unwrap();
         let error = firing.execute(&mut context).err().unwrap();
@@ -225,6 +294,10 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     columns[0].name = SqlName::parse("replaced_id").unwrap();
     columns[1].ctype = ColType::Bool;
     drop(original);
+    let _other_clock = crate::sql::datetime::test_clock::enter(812_345_678_961_234);
+    crate::sql::datetime::begin_statement();
+    crate::sql::datetime::begin_transaction();
+    super::super::super::query::restore_statement_deadline(812_345_678_901_233);
     crate::mem::guard::forbid_alloc(|| {
         assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
         assert_eq!(
@@ -240,6 +313,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             .unwrap();
         assert_eq!(definition.columns()[0].name.as_str(), "id");
         assert_eq!(definition.columns()[1].ctype, ColType::Text);
+        assert_ne!(definition.columns()[1].ctype, columns[1].ctype);
         let alias = saved.saved.metadata.aliases[0].as_ref().unwrap();
         assert_eq!(alias.types[0].0, 23);
         assert_eq!(alias.types[1].0, 25);
@@ -257,6 +331,15 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let error = saved.poll(&mut context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(small.used(), 0);
+        assert_eq!(
+            crate::sql::datetime::statement_micros(),
+            812_345_678_961_234
+        );
+        assert_eq!(
+            crate::sql::datetime::transaction_micros(),
+            812_345_678_961_234
+        );
+        assert_eq!(crate::sql::query::statement_deadline(), 812_345_678_901_233);
         assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
         assert_eq!(
             crate::sql::eval::funcs::system::current_identity().as_str(),
@@ -347,6 +430,15 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 }
             );
             assert_eq!(resumed.used(), 0);
+            assert_eq!(
+                crate::sql::datetime::statement_micros(),
+                812_345_678_961_234
+            );
+            assert_eq!(
+                crate::sql::datetime::transaction_micros(),
+                812_345_678_961_234
+            );
+            assert_eq!(crate::sql::query::statement_deadline(), 812_345_678_901_233);
             assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
             assert_eq!(
                 crate::sql::eval::funcs::system::current_identity().as_str(),

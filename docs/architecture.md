@@ -395,6 +395,10 @@ before installing the image, and its guards restore the caller after another
 pause, an error or completion. The enclosing write, remaining statement
 environment and unfinished input work still need the scheduler integration
 described above; this owner does not enable rejected checked inputs.
+Restoration also lends the firing its original statement and transaction
+timestamps and deadline. The transaction's consumed-timeout state prevents
+rearming a timeout already handled by the routine. Returning from a poll restores
+the worker's previous clock and timer, including after a failed attachment.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.
@@ -507,11 +511,18 @@ For example, `set_config('search_path', 'orders,public', false)` preserves that
 spelling, while `SET search_path TO orders, public` stores a formatted SQL list.
 Both validate the list before lookup. Routine scopes and transaction rollback
 restore the stored value without parsing it again as SQL.
-Leaving a configured routine republishes every restored setting, including
-settings changed in its body but absent from its `SET` clause. For example, if
-one trigger temporarily selects escape-format binary output, the next trigger's
-`current_setting()`, `pg_settings` and binary rendering must all see the restored
-hex format. Explicit session-wide changes survive the routine's return.
+Leaving a configured routine restores only settings named in its `SET` clause.
+For example, a trigger configured with `SET application_name = 'audit'` restores
+the caller's application name, but an unlisted `SET LOCAL bytea_output = 'escape'`
+remains in effect until transaction end. `current_setting()`, `pg_settings` and
+binary rendering see the same value. An explicit session-wide `SET` overrides
+routine restoration even when it assigns the previous value; subsequent local
+changes remain until commit. Fixed per-setting action stamps distinguish that
+case from an unchanged value, and rollback restores those stamps with settings.
+Their connection-wide counter never wraps: exhausting its 64-bit range returns
+`54000` with `session setting assignment counter exhausted` before changing a value.
+These rules follow PostgreSQL's [SET contract](https://www.postgresql.org/docs/18/sql-set.html)
+and [setting-stack implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/misc/guc.c).
 
 Scalar functions, table functions and procedures share input binding, while
 keeping PostgreSQL's distinct null and result rules. Typed structural copies

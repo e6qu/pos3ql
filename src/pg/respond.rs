@@ -198,26 +198,15 @@ fn write_wire_text(
         ]),
         Datum::Xml(text) => crate::sql::xml::write_output(text, |part| out(part.as_bytes())),
         Datum::Bytea(bytes) => {
-            if render.bytea_escape {
-                for byte in *bytes {
-                    match byte {
-                        b'\\' => out(b"\\\\"),
-                        0x20..=0x7e => out(&[*byte]),
-                        _ => out(&[
-                            b'\\',
-                            b'0' + (byte >> 6),
-                            b'0' + ((byte >> 3) & 7),
-                            b'0' + (byte & 7),
-                        ]),
-                    }
+            use core::fmt::Write as _;
+            let _ = write!(
+                Writer(out),
+                "{}",
+                crate::sql::types::PgByteaRendered {
+                    bytes,
+                    escape: render.bytea_escape,
                 }
-            } else {
-                out(b"\\x");
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                for byte in *bytes {
-                    out(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
-                }
-            }
+            );
         }
         Datum::Date(date) => out(
             crate::sql::datetime::format_date_styled(*date, render.datestyle)
@@ -437,15 +426,11 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
         | Datum::Bpchar(text)
         | Datum::Regtype { name: text, .. }
         | Datum::RegObject { name: text, .. } => text.len(),
-        Datum::Bytea(bytes) if render.bytea_escape => bytes
-            .iter()
-            .map(|byte| match byte {
-                b'\\' => 2,
-                0x20..=0x7e => 1,
-                _ => 4,
-            })
-            .sum(),
-        Datum::Bytea(bytes) => 2usize.saturating_add(bytes.len().saturating_mul(2)),
+        Datum::Bytea(bytes) => crate::sql::types::PgByteaRendered {
+            bytes,
+            escape: render.bytea_escape,
+        }
+        .text_len(),
         Datum::Numeric(number) => display_len(number),
         Datum::Float4(value) => display_len(crate::sql::types::PgFloat4Rendered(
             *value,

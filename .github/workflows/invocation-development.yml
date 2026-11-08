@@ -28,6 +28,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Verify ownership manifest guards
         run: python3 -m unittest tools/tests/test_miri_ownership_manifest.py
+      - name: Verify documentation and execution limits
+        run: |
+          python3 tools/check-docs.py
+          bash tools/check-bugs.sh
+          bash tools/check-ci-timeouts.sh
       - name: Compile library tests and exercise value ownership
         shell: bash
         run: |

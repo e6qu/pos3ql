@@ -9550,10 +9550,7 @@ impl Engine {
         }
         let result = match name {
             Some(name) => guc.reset(name),
-            None => {
-                guc.reset_all();
-                Ok(())
-            }
+            None => guc.reset_all(),
         };
         match result {
             Ok(()) => {

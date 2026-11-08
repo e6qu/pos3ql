@@ -107,6 +107,8 @@ Restore the whole frame before publishing it. If a later local value exceeds
 destination memory after earlier loop scopes have decoded, retain all original
 images and reservations without leaving references into the failed destination.
 Dropping a paused call must return both its control and row-work capacity.
+Restoring into memory lent to a child must return the named memory error without
+panicking, reclaiming the child's live bytes or losing the original call images.
 Retain an unfinished `RETURN`, loop exit or error cleanup as part of that call.
 Keep the original error detail and hint before cleanup can run other SQL or a
 different connection. A storage wait during rollback or release must retain its

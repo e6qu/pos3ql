@@ -33,7 +33,8 @@ jobs:
         run: |
           set -o pipefail
           cargo test --lib --locked --profile native-ci --jobs 1 -- \
-            inplace_conversion_ exec::control_flow::ownership_tests \
+            inplace_conversion_ cursor_owned_query_scratch_marks_ \
+            exec::control_flow::ownership_tests \
             exec::control_flow::resumption_tests \
             exec::local_values::ownership_tests exec::numeric_loops::ownership_tests \
             exec::diagnostics::ownership_tests \

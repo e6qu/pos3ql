@@ -376,9 +376,9 @@ original slot ranges. Only pausing captures the ordinary declarations into a
 control-pool image; normal calls borrow compiled declarations, and repeated
 pauses share the captured image. Restoration copies each saved row once and
 decodes all its columns in one pass. Images are released only after every scope
-has restored;
-destination exhaustion preserves all images and reservations. This frame owner
-alone does not yet retain the enclosing write or unfinished nested input work
+has restored. A memory error preserves all images and reservations, including
+when a child borrows the destination; the child's live bytes remain valid.
+This frame owner alone does not yet retain the enclosing write or unfinished nested input work
 through a scheduler return.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original

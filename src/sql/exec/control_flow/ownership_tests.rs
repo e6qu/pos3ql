@@ -1631,6 +1631,18 @@ fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destr
     parsing.reset();
     let (saved, source) = crate::mem::guard::forbid_alloc(|| {
         let (_, code) = saved.source().parse(&parsing).unwrap();
+        let saved = partial
+            .with_remaining_region(|child| {
+                let held = child.alloc_slice_with(64, |_| 0xa5_u8).unwrap();
+                let before = partial.used();
+                let (saved, error) = saved.restore(&partial, &code).err().unwrap();
+                assert_eq!(error.sqlstate, "54000");
+                assert_eq!(partial.used(), before);
+                assert!(held.iter().all(|byte| *byte == 0xa5));
+                saved
+            })
+            .unwrap();
+        assert_eq!(partial.used(), prefix.len());
         let (saved, error) = saved.restore(&partial, &code).err().unwrap();
         assert_eq!(error.sqlstate, "54000");
         // Both numeric images fitted before the ordinary 4096-byte local failed.

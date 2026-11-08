@@ -1377,42 +1377,50 @@ fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions(
 
 #[test]
 fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
-    for (event, seed, command, expected) in [
-        (
-            "UPDATE",
-            "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
-            "UPDATE nested_held_stock SET amount=amount+1;",
-            "2|3|2",
-        ),
-        (
-            "INSERT",
-            "",
-            "INSERT INTO nested_held_stock VALUES(3,0),(4,0);",
-            "2|7|0",
-        ),
-        (
-            "DELETE",
-            "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
-            "DELETE FROM nested_held_stock;",
-            "0|NULL|NULL",
-        ),
-    ] {
-        for mode in [
-            crate::config::TransactionMode::Mvcc,
-            crate::config::TransactionMode::Locking,
+    for dynamic in [false, true] {
+        for (event, seed, command, expected) in [
+            (
+                "UPDATE",
+                "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
+                "UPDATE nested_held_stock SET amount=amount+1;",
+                "2|3|2",
+            ),
+            (
+                "INSERT",
+                "",
+                "INSERT INTO nested_held_stock VALUES(3,0),(4,0);",
+                "2|7|0",
+            ),
+            (
+                "DELETE",
+                "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
+                "DELETE FROM nested_held_stock;",
+                "0|NULL|NULL",
+            ),
         ] {
-            let mut config = test_config(&format!("retained-nested-completion-{event}-{mode:?}"));
-            config.transaction_mode = mode;
-            config.execution_control_bytes = 64 << 10;
-            config.execution_control_leases = 64;
-            config.row_work_bytes = 128 << 10;
-            config.row_work_leases = 64;
-            let mut budget = test_engine_budget(&config, 1 << 29);
-            let mut engine = Engine::new(&config, &mut budget).unwrap();
-            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-            let mut holder =
-                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-            writer.success(&mut engine,
+            let command = if dynamic {
+                format!("EXECUTE $command${command}$command$;")
+            } else {
+                command.to_owned()
+            };
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let mut config = test_config(&format!(
+                    "retained-nested-completion-{event}-{mode:?}-{dynamic}"
+                ));
+                config.transaction_mode = mode;
+                config.execution_control_bytes = 64 << 10;
+                config.execution_control_leases = 64;
+                config.row_work_bytes = 128 << 10;
+                config.row_work_leases = 64;
+                let mut budget = test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut holder =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                writer.success(&mut engine,
             &format!("CREATE SEQUENCE nested_held_sequence; CREATE TABLE nested_held_orders(id integer); \
              CREATE TABLE nested_held_stock(id integer,amount integer); \
              CREATE TABLE nested_held_audit(kind text,id integer,n bigint,note text); \
@@ -1434,70 +1442,148 @@ fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
              INSERT INTO nested_held_audit VALUES('parent-after',NEW.id,changed,note||'!'); \
              RETURN NEW; END$$; CREATE TRIGGER nested_held_parent AFTER INSERT ON nested_held_orders \
              FOR EACH ROW EXECUTE FUNCTION nested_held_parent()"), true);
-            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
-            let sql = "INSERT INTO nested_held_orders VALUES(10) RETURNING id";
-            let mut status = writer.execute_status(&mut engine, sql, true);
-            for released in [false, false, true] {
-                let ExecutionStatus::Blocked {
-                    completed_statements,
-                    output_mark,
-                    wait,
-                } = status
-                else {
-                    panic!(
-                        "nested write did not retain its parent: {:?}: {}",
-                        status,
-                        String::from_utf8_lossy(writer.send.readable())
-                    );
-                };
-                assert_eq!(wait, StatementWait::Lock);
-                assert_eq!(data_rows(writer.send.readable()), ["10"]);
-                assert!(command_tags(writer.send.readable()).is_empty());
-                assert_eq!(
-                    data_rows(&holder.success(
-                        &mut engine,
-                        "SELECT last_value FROM nested_held_sequence; SELECT 40+2",
-                        true
-                    )),
-                    ["1", "42"]
-                );
-                if released {
-                    holder.success(&mut engine, "COMMIT", true);
-                }
-                writer.send.truncate_to(output_mark);
-                writer.arena.recycle_front();
-                status = crate::mem::guard::forbid_alloc(|| {
-                    engine.execute_simple_from(
-                        sql,
+                holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+                let sql = "INSERT INTO nested_held_orders VALUES(10) RETURNING id";
+                let mut status = writer.execute_status(&mut engine, sql, true);
+                for released in [false, false, true] {
+                    let ExecutionStatus::Blocked {
                         completed_statements,
-                        &writer.arena,
-                        &mut writer.transaction,
-                        &mut writer.pool,
-                        &mut writer.cursors,
-                        &writer.guc,
-                        &mut Responder::new(&mut writer.send),
-                        writer.connection_id,
-                        false,
-                    )
-                })
-                .unwrap();
-            }
-            assert_eq!(status, ExecutionStatus::Complete);
-            assert!(
-                error_sqlstates(writer.send.readable()).is_empty(),
-                "{}",
-                String::from_utf8_lossy(writer.send.readable())
-            );
-            assert_eq!(data_rows(writer.send.readable()), ["10"]);
-            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
-            assert_eq!(data_rows(&writer.success(&mut engine,
+                        output_mark,
+                        wait,
+                    } = status
+                    else {
+                        panic!(
+                            "nested write did not retain its parent: {:?}: {}",
+                            status,
+                            String::from_utf8_lossy(writer.send.readable())
+                        );
+                    };
+                    assert_eq!(wait, StatementWait::Lock);
+                    assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                    assert!(command_tags(writer.send.readable()).is_empty());
+                    assert_eq!(
+                        data_rows(&holder.success(
+                            &mut engine,
+                            "SELECT last_value FROM nested_held_sequence; SELECT 40+2",
+                            true
+                        )),
+                        ["1", "42"]
+                    );
+                    if released {
+                        holder.success(&mut engine, "COMMIT", true);
+                    }
+                    writer.send.truncate_to(output_mark);
+                    writer.arena.recycle_front();
+                    status = crate::mem::guard::forbid_alloc(|| {
+                        engine.execute_simple_from(
+                            sql,
+                            completed_statements,
+                            &writer.arena,
+                            &mut writer.transaction,
+                            &mut writer.pool,
+                            &mut writer.cursors,
+                            &writer.guc,
+                            &mut Responder::new(&mut writer.send),
+                            writer.connection_id,
+                            false,
+                        )
+                    })
+                    .unwrap();
+                }
+                assert_eq!(status, ExecutionStatus::Complete);
+                assert!(
+                    error_sqlstates(writer.send.readable()).is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+                assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+                assert_eq!(data_rows(&writer.success(&mut engine,
             "SELECT count(*),sum(id),sum(amount) FROM nested_held_stock; \
              SELECT kind,count(*),min(length(note)),max(length(note)) FROM nested_held_audit GROUP BY kind ORDER BY kind; \
              SELECT n FROM nested_held_audit WHERE kind='parent-after'; \
              SELECT last_value FROM nested_held_sequence", true)),
             [expected, "child-after|2|8193|8193", "child-before|2|8192|8192",
              "parent-after|1|8193|8193", "parent-before|1|8192|8192", "2", "2"]);
+            }
         }
+    }
+}
+
+#[test]
+fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings() {
+    let fixture =
+        include_str!("../../../tests/external/differential/273_dynamic_write_completion.sql");
+    let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+    let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("dynamic-nested-returning-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, setup, true);
+        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+        let mut status = writer.execute_status(&mut engine, write, true);
+        for released in [false, false, true] {
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!(
+                    "dynamic write failed to retain returned values: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            assert_eq!(data_rows(writer.send.readable()), ["10"]);
+            assert!(command_tags(writer.send.readable()).is_empty());
+            assert_eq!(data_rows(&holder.success(&mut engine,
+                "SELECT 40+2; SELECT (SELECT last_value FROM dynamic_held_bind),(SELECT last_value FROM dynamic_held_child)",true)),["42","1|1"]);
+            if released {
+                holder.success(&mut engine, "COMMIT", true);
+            }
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    write,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        assert_eq!(data_rows(writer.send.readable()), ["10"]);
+        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+        assert_eq!(
+            data_rows(&writer.success(&mut engine, inspect, true)),
+            ["1|1|1|1|1|1|1|16385|1|1|t|integer"]
+        );
     }
 }
 

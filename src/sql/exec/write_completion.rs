@@ -233,6 +233,12 @@ pub(crate) struct SuspendedWriteCompletion {
 pub(super) struct PendingNestedWrite {
     command: Option<super::super::txn::SuspendedTriggerSql>,
     completion: SuspendedWriteCompletion,
+    output: Option<NestedWriteOutput>,
+}
+
+pub(super) struct NestedWriteOutput {
+    pub(super) values: local_values::SavedValues,
+    pub(super) rows: u64,
 }
 
 impl PendingNestedWrite {
@@ -244,7 +250,33 @@ impl PendingNestedWrite {
         Self {
             command: Some(command),
             completion,
+            output: None,
         }
+    }
+
+    pub(super) fn save_output(
+        &mut self,
+        values: &[Datum<'_>],
+        rows: u64,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if self.output.is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "nested write output is already saved"
+            ));
+        }
+        let mut saved = local_values::SavedValues::new(pool)?;
+        saved.replace(values)?;
+        self.output = Some(NestedWriteOutput {
+            values: saved,
+            rows,
+        });
+        Ok(())
+    }
+
+    pub(super) fn take_output(&mut self) -> Option<NestedWriteOutput> {
+        self.output.take()
     }
 
     pub(super) fn poll(

@@ -70,9 +70,10 @@ resumes, it must see the same rows and local values, issue no extra order number
 or audit write, and keep the original timeout. Failed attachment must leave
 both the saved call and the caller's context usable.
 
-Static nested INSERT, UPDATE and DELETE now keep their command, read snapshot
-and unfinished AFTER work with the calling trigger. Extend that ownership to
-dynamic SQL, returned values and unfinished row phases. Resume the same command;
+Nested INSERT, UPDATE and DELETE keep their command, read snapshot and unfinished
+AFTER work with the calling trigger. Qualify dynamic SQL and returned-value
+ownership against PostgreSQL and repeated waits, including unchanged `FOUND` and
+once-only `USING` arguments. Finish retaining unfinished row phases. Resume the same command;
 completion and another pause must restore the caller's visibility. Triggers
 cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`
 continues to carry trigger arguments. Only completed row collections may become

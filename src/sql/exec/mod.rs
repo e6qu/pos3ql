@@ -23763,6 +23763,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
     query: BoundPlpgsqlCommand<'a>,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+    pending: &mut Option<write_completion::PendingNestedWrite>,
 ) -> Result<u64, SqlError> {
     let input_source = plpgsql_command_source(query.source, context.arena)?;
     super::type_input_plans::with_owner(query.owner, || {
@@ -23824,10 +23825,18 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     };
                     let arena = context.arena;
                     let params = query.arguments;
+                    let boundary = context.nested_write_boundary();
                     let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
 
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let parent_boundary = txn.write_completion_boundary;
+                    txn.write_completion_boundary =
+                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                            mark,
+                            command: txn.command_id(),
+                            depth: txn.trigger_depth(),
+                        });
                     responder.clear_affected_rows();
                     let outcome = responder.without_query_output(|responder| {
                         insert(
@@ -23852,15 +23861,40 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                             }),
                         )
                     });
+                    txn.write_completion_boundary = parent_boundary;
+                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                    {
+                        txn.pending_write_completion.take()
+                    } else {
+                        None
+                    };
+                    if let Some(completion) = completion {
+                        *pending = Some(write_completion::PendingNestedWrite::new(
+                            command.suspend(),
+                            completion,
+                        ));
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "nested dynamic write completion is pending"
+                        ));
+                    }
                     drop(command);
                     dynamic_dml_outcome(responder, outcome, "INSERT")
                 }
                 Stmt::Update(statement) => {
                     let arena = context.arena;
                     let params = query.arguments;
+                    let boundary = context.nested_write_boundary();
                     let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let parent_boundary = txn.write_completion_boundary;
+                    txn.write_completion_boundary =
+                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                            mark,
+                            command: txn.command_id(),
+                            depth: txn.trigger_depth(),
+                        });
                     let mut scratch = storage.row_work.lease(0).map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -23885,15 +23919,40 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                             None,
                         )
                     });
+                    txn.write_completion_boundary = parent_boundary;
+                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                    {
+                        txn.pending_write_completion.take()
+                    } else {
+                        None
+                    };
+                    if let Some(completion) = completion {
+                        *pending = Some(write_completion::PendingNestedWrite::new(
+                            command.suspend(),
+                            completion,
+                        ));
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "nested dynamic write completion is pending"
+                        ));
+                    }
                     drop(command);
                     dynamic_dml_outcome(responder, outcome, "UPDATE")
                 }
                 Stmt::Delete(statement) => {
                     let arena = context.arena;
                     let params = query.arguments;
+                    let boundary = context.nested_write_boundary();
                     let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
                     let mut command = txn.enter_trigger_sql(storage)?;
                     let txn = &mut *command;
+                    let parent_boundary = txn.write_completion_boundary;
+                    txn.write_completion_boundary =
+                        boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                            mark,
+                            command: txn.command_id(),
+                            depth: txn.trigger_depth(),
+                        });
                     let mut scratch = storage.row_work.lease(0).map_err(|error| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -23917,6 +23976,23 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                             None,
                         )
                     });
+                    txn.write_completion_boundary = parent_boundary;
+                    let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+                    {
+                        txn.pending_write_completion.take()
+                    } else {
+                        None
+                    };
+                    if let Some(completion) = completion {
+                        *pending = Some(write_completion::PendingNestedWrite::new(
+                            command.suspend(),
+                            completion,
+                        ));
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                            "nested dynamic write completion is pending"
+                        ));
+                    }
                     drop(command);
                     dynamic_dml_outcome(responder, outcome, "DELETE")
                 }
@@ -26809,13 +26885,64 @@ fn execute_trigger_step<'a>(
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     super::query::check_timeout()?;
     if status.pending_write.is_some() {
-        if !matches!(statement, TriggerStatement::Dml { .. }) {
+        if !matches!(
+            statement,
+            TriggerStatement::Dml { .. }
+                | TriggerStatement::DynamicQuery(_)
+                | TriggerStatement::DynamicSelectInto(_)
+        ) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "unfinished nested write belongs to a different instruction"
             ));
         }
-        return resume_nested_write(context, status).map(|()| control_flow::Step::complete());
+        let (rows, output) = resume_nested_write(context, status)?;
+        match statement {
+            TriggerStatement::Dml { .. } => {
+                if output.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "static write has unexpected returned values"
+                    ));
+                }
+                status.set_rows(rows)?;
+            }
+            TriggerStatement::DynamicQuery(_) => {
+                if output.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "discarded write has unexpected returned values"
+                    ));
+                }
+                status.set_row_count(rows)?;
+            }
+            TriggerStatement::DynamicSelectInto(statement) => {
+                let output = output.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "nested write lost its returned values"
+                    )
+                })?;
+                if output.rows != rows {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "nested write returned a different row count"
+                    ));
+                }
+                let selected = output.values.decode(context.arena)?;
+                finish_dynamic_into(
+                    context,
+                    locals,
+                    local_values,
+                    statement,
+                    selected,
+                    rows,
+                    status,
+                )?;
+            }
+            _ => unreachable!("nested write instruction was checked before resumption"),
+        }
+        return Ok(control_flow::Step::complete());
     }
     let retained_parent = context.txn.write_completion_boundary.is_some()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
@@ -27787,6 +27914,15 @@ fn execute_trigger_step<'a>(
                                 context.arena,
                             )?
                         }
+                        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if record_target => {
+                            describe_data_modification_columns(
+                                context.storage(),
+                                query.statement,
+                                context.arena,
+                                context.txn.txid,
+                                &mut columns,
+                            )?
+                        }
                         _ => 0,
                     };
                     let mut names = [StackStr::<63>::new(); MAX_PROJ];
@@ -27840,7 +27976,12 @@ fn execute_trigger_step<'a>(
                         }
                         found = true;
                     }
-                    row_count += 1;
+                    row_count = row_count.checked_add(1).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "dynamic query returned too many rows"
+                        )
+                    })?;
                     Ok(())
                 };
                 match query.statement {
@@ -27947,12 +28088,40 @@ fn execute_trigger_step<'a>(
                         execute_bound_plpgsql_dynamic_query(context, query, &mut capture)?;
                     }
                     Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                        let affected = execute_bound_plpgsql_dynamic_dml(
+                        let result = execute_bound_plpgsql_dynamic_dml(
                             context,
                             query,
                             transition_relations,
                             Some(&mut capture),
-                        )?;
+                            &mut status.pending_write,
+                        );
+                        let result = match result {
+                            Err(error)
+                                if control_flow::is_execution_wait(&error)
+                                    && status.pending_write.is_some() =>
+                            {
+                                resume_nested_write(context, status).map(|(rows, output)| {
+                                    debug_assert!(output.is_none());
+                                    rows
+                                })
+                            }
+                            result => result,
+                        };
+                        let affected = match result {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                if control_flow::is_execution_wait(&error)
+                                    && let Some(pending) = &mut status.pending_write
+                                {
+                                    pending.save_output(
+                                        &selected[..statement.targets.len()],
+                                        row_count as u64,
+                                        &context.storage().row_work,
+                                    )?;
+                                }
+                                return Err(error);
+                            }
+                        };
                         debug_assert_eq!(affected, row_count as u64);
                     }
                     _ => {
@@ -27962,33 +28131,15 @@ fn execute_trigger_step<'a>(
                         ));
                     }
                 }
-                status.set_row_count(row_count as u64)?;
-                if statement.strict {
-                    match row_count {
-                        0 => {
-                            return Err(sql_err!(
-                                sqlstate::NO_DATA_FOUND,
-                                "query returned no rows"
-                            ));
-                        }
-                        1 => {}
-                        _ => {
-                            return Err(sql_err!(
-                                sqlstate::TOO_MANY_ROWS,
-                                "query returned more than one row"
-                            ));
-                        }
-                    }
-                }
-                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
-                    assign_trigger_local(
-                        context,
-                        locals,
-                        local_values,
-                        statement.targets[index],
-                        selected[index],
-                    )?;
-                }
+                finish_dynamic_into(
+                    context,
+                    locals,
+                    local_values,
+                    statement,
+                    &selected[..statement.targets.len()],
+                    row_count as u64,
+                    status,
+                )?;
 
                 Ok(None)
             })
@@ -28025,12 +28176,24 @@ fn execute_trigger_step<'a>(
                         rows
                     }
                     Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                        execute_bound_plpgsql_dynamic_dml(
+                        let result = execute_bound_plpgsql_dynamic_dml(
                             context,
                             query,
                             transition_relations,
                             None,
-                        )?
+                            &mut status.pending_write,
+                        );
+                        match result {
+                            Err(error)
+                                if control_flow::is_execution_wait(&error)
+                                    && status.pending_write.is_some() =>
+                            {
+                                let (rows, output) = resume_nested_write(context, status)?;
+                                debug_assert!(output.is_none());
+                                rows
+                            }
+                            result => result?,
+                        }
                     }
                     Stmt::Explain { options, statement } => {
                         execute_plpgsql_dynamic_explain(
@@ -28441,7 +28604,9 @@ fn execute_trigger_step<'a>(
                     command.suspend(),
                     completion,
                 ));
-                resume_nested_write(context, status)?;
+                let (rows, output) = resume_nested_write(context, status)?;
+                debug_assert!(output.is_none());
+                status.set_rows(rows)?;
                 return Ok(None);
             }
             drop(command);
@@ -28555,7 +28720,9 @@ fn execute_trigger_step<'a>(
                     command.suspend(),
                     completion,
                 ));
-                resume_nested_write(context, status)?;
+                let (rows, output) = resume_nested_write(context, status)?;
+                debug_assert!(output.is_none());
+                status.set_rows(rows)?;
                 return Ok(None);
             }
             drop(command);
@@ -28668,7 +28835,9 @@ fn execute_trigger_step<'a>(
                     command.suspend(),
                     completion,
                 ));
-                resume_nested_write(context, status)?;
+                let (rows, output) = resume_nested_write(context, status)?;
+                debug_assert!(output.is_none());
+                status.set_rows(rows)?;
                 return Ok(None);
             }
             drop(command);
@@ -29385,10 +29554,49 @@ fn execute_trigger_statement<'a>(
     execute().map(control_flow::Step::Complete)
 }
 
+fn finish_dynamic_into<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    local_values: &mut [Datum<'a>],
+    statement: PlpgsqlDynamicSelectInto<'a>,
+    selected: &[Datum<'a>],
+    rows: u64,
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<(), SqlError> {
+    if selected.len() != statement.targets.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "saved EXECUTE INTO shape changed"
+        ));
+    }
+    status.set_row_count(rows)?;
+    if statement.strict {
+        match rows {
+            0 => return Err(sql_err!(sqlstate::NO_DATA_FOUND, "query returned no rows")),
+            1 => {}
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_ROWS,
+                    "query returned more than one row"
+                ));
+            }
+        }
+    }
+    for (target, value) in statement
+        .targets
+        .iter()
+        .copied()
+        .zip(selected.iter().copied())
+    {
+        assign_trigger_local(context, locals, local_values, target, value)?;
+    }
+    Ok(())
+}
+
 fn resume_nested_write(
     context: &mut TriggerExecContext<'_, '_, '_>,
     status: &mut TriggerExecutionStatus<'_>,
-) -> Result<(), SqlError> {
+) -> Result<(u64, Option<write_completion::NestedWriteOutput>), SqlError> {
     let mut pending = status.pending_write.take().ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -29404,7 +29612,7 @@ fn resume_nested_write(
                     "nested write completion lost its affected-row count"
                 ));
             }
-            status.set_rows(rows)
+            Ok((rows, pending.take_output()))
         }
         Err(error) if control_flow::is_execution_wait(&error) => {
             status.pending_write = Some(pending);

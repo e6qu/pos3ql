@@ -1538,7 +1538,21 @@ mod tests {
     #[test]
     fn retained_statement_position_restores_nested_advisory_receipts_atomically() {
         use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode, AdvisoryPositionTail};
-        let config = crate::storage::tests::test_config();
+        let mut config = crate::storage::tests::test_config();
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.txn_rows = 16;
+        config.max_ddl_per_transaction = 2;
+        config.row_history_slots = 16;
+        config.row_overlay_slots = 16;
+        config.catalog_history_bytes = 4096;
+        config.definition_image_slots = 4;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 64;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 64 << 10;
+        config.row_work_leases = 32;
         let mut budget = crate::storage::tests::test_budget(&config);
         let storage = Storage::new(&config, &mut budget, 0).unwrap();
         let arena = Arena::new(&mut budget, "combined statement receipts", 16 << 10).unwrap();
@@ -1555,7 +1569,7 @@ mod tests {
                 Some(storage.advisory_journal()),
             );
             let start = begin_replay_cursor().unwrap();
-            let advisory_start = storage.advisory_statement_position();
+            let advisory_start = storage.advisory_journal().position();
             let acquire = |key| {
                 assert_eq!(
                     storage

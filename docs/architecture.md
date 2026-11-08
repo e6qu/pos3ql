@@ -457,7 +457,7 @@ A selected statement-trigger definition has its own temporary reservation,
 released before that body starts; row-trigger selections retain only their
 queue positions. Idle connections carry the small arena owner, not a maximum
 trigger definition or an additional startup pool.
-BEFORE and INSTEAD OF work, nested row phases and dynamic writes, modifying CTEs, rewrite rules,
+BEFORE and INSTEAD OF work, unfinished nested row phases, modifying CTEs, rewrite rules,
 COPY and replication apply still need the same complete enclosing owner before
 their rejected checked inputs can be enabled. Cold object-store waiting and the
 full protocol paths remain qualification gates in the plan.
@@ -466,12 +466,19 @@ and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.
 It resumes the same command rather than issuing a new identity. Completing or
 pausing that scope restores the caller's visibility again.
-Static nested INSERT, UPDATE and DELETE transfer their unfinished AFTER work
+Static and dynamic nested INSERT, UPDATE and DELETE transfer their unfinished AFTER work
 into the calling firing. That firing owns the child's command scope and
 completion together, resumes the child before advancing its own instruction,
 and receives the affected-row count without emitting a second command tag.
-Unowned row phases and dynamic write waits still reject suspension with `0A000`;
-their full continuations remain required before enabling those waits.
+Dynamic `EXECUTE ... INTO` saves its returned values, including record field names
+and types, before a child trigger waits. Resumption assigns those saved values
+without evaluating the command text or `USING` arguments again. Dynamic execution
+updates `ROW_COUNT` while preserving `FOUND`; `STRICT` checks the completed row
+count. The saved values use the existing row-work pool.
+Unowned row phases still reject suspension with `0A000`; their full continuations
+remain required before enabling those waits. Completed function calls and query
+values also need complete ownership before their temporary query memory can be
+released across a scheduler return.
 Nested procedural updates and deletes own independent row-selection ranges in
 the shared row-work pool. They do not replace the caller's selection or borrow
 it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry

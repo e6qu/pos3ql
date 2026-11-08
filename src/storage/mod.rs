@@ -51510,14 +51510,6 @@ impl Storage {
         locks.advisory.begin_statement(connection_id, statement)
     }
 
-    pub(crate) fn advisory_statement_position(
-        &self,
-    ) -> crate::sql::lock::AdvisoryStatementPosition {
-        self.lock_state()
-            .advisory
-            .statement_position(self.current_connection_id())
-    }
-
     pub(crate) fn advisory_journal(&self) -> AdvisoryJournal {
         AdvisoryJournal {
             locks: std::sync::Arc::clone(&self.locks),

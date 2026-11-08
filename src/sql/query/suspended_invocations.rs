@@ -88,6 +88,7 @@ impl RoutineInvocationState {
 mod ownership_tests {
     use super::*;
     use crate::mem::Budget;
+    use crate::sql::type_input_plans::{Owner, with_owner};
 
     #[test]
     fn suspended_invocations_relocate_values_and_pending_arguments_before_region_teardown() {
@@ -135,8 +136,8 @@ mod ownership_tests {
                         .complete(OwnedRoutineResult::Rows(rows), scratch, scratch)
                         .unwrap();
                     calls.next.set(2);
-                    let error = calls
-                        .resolve(
+                    let error = with_owner(Owner::Backend, || {
+                        calls.resolve(
                             &routine,
                             &[Datum::Text(text)],
                             scratch,
@@ -145,7 +146,8 @@ mod ownership_tests {
                             crate::sql::ast::Collation::Default,
                             crate::sql::eval::RoutineCallAccess::Caller,
                         )
-                        .unwrap_err();
+                    })
+                    .unwrap_err();
                     assert_eq!(
                         error.sqlstate,
                         super::super::super::eval::sqlstate::INTERNAL_ROUTINE_INVOCATION
@@ -185,6 +187,7 @@ mod ownership_tests {
                         Datum::Int4(73)
                     );
                     let pending = calls.take_pending().unwrap();
+                    assert_eq!(pending.plan_owner, Owner::Backend);
                     let PendingRoutineTarget::Stored(contract) = pending.target else {
                         panic!("stored call selection changed")
                     };

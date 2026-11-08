@@ -331,6 +331,8 @@ Root-cause execution timeouts using step timings, logs, resource use, and the
 smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
+Every runner job declares its own bounded timeout. A shorter step timeout is
+additional protection; it never substitutes for another job's missing timeout.
 
 Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
 test jobs run that build's library test executable with the full native filter

@@ -61,12 +61,17 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-invocation-dependencies-${{ hashFiles('Cargo.lock') }}
       - name: Verify ownership manifest guards
-        run: python3 -m unittest tools/tests/test_miri_ownership_manifest.py
+        run: python3 -m unittest tools/tests/test_miri_ownership_manifest.py tools/tests/test_workflow_timeouts.py
       - name: Verify documentation and execution limits
         run: |
           python3 tools/check-docs.py
           bash tools/check-bugs.sh
           bash tools/check-ci-timeouts.sh
+      - name: Initialize development diagnostics
+        if: always()
+        run: |
+          printf 'revision=%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/invocation-development.log"
+          printf 'preflight=%s\n' '${{ job.status }}' >> "$RUNNER_TEMP/invocation-development.log"
       - name: Compile library tests and exercise value ownership
         shell: bash
         run: |
@@ -106,7 +111,7 @@ jobs:
             shared_row_work:: dml_target_ pgoutput_ subscription_copy_transition_values_ \
             streamed_copy_trigger_handlers_keep_ statement_files_streamed_copy_ \
             copy_from_ binary_copy_ \
-            --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/invocation-development.log"
+            --test-threads=1 --nocapture 2>&1 | tee -a "$RUNNER_TEMP/invocation-development.log"
       - name: Retain development diagnostics
         if: always()
         uses: actions/upload-artifact@v6
@@ -187,12 +192,16 @@ jobs:
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
           for fixture in 265 266 267 268 269 270 271 272 273 274 275 276 277 278; do
+            fixture_status=0
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
-              < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
+              < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt" || fixture_status=$?
+            printf '%s\n' "$fixture_status" > "exit-code-$fixture.txt"
           done
+          sha256sum fixture-*.sql revision server-version.txt image-id stdout-*.txt stderr-*.txt exit-code-*.txt > SHA256SUMS
           python3 - <<'PY'
           from pathlib import Path
+          failed = []
           for fixture, expected in [
               (265, '1|3|1|1|1|1|8193|2'),
               (266, '63|396|123|141|10|0|2|3|8193|3|4'),
@@ -209,12 +218,20 @@ jobs:
               (277, 'one,two,three|6|3|t|f|t|t|t|f|t|f'),
               (278, 't|1|text|text|t'),
           ]:
-              assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
-              assert not Path(f'stderr-{fixture}.txt').read_bytes()
-              print(f'PostgreSQL 18.6 fixture {fixture}: {expected}')
-          assert Path('stdout-272.txt').read_text().splitlines().count('2') == 1
+              output = Path(f'stdout-{fixture}.txt').read_text().splitlines()
+              errors = Path(f'stderr-{fixture}.txt').read_text()
+              status = Path(f'exit-code-{fixture}.txt').read_text().strip()
+              if status != '0' or errors or output.count(expected) != 1:
+                  failed.append(fixture)
+                  print(f'PostgreSQL 18.6 fixture {fixture}: FAILED (exit {status}); expected {expected}')
+                  print(errors)
+              else:
+                  print(f'PostgreSQL 18.6 fixture {fixture}: {expected}')
+          if Path('stdout-272.txt').read_text().splitlines().count('2') != 1:
+              failed.append(272)
+          if failed:
+              raise SystemExit(f'Failed PostgreSQL reference fixtures: {failed}')
           PY
-          sha256sum fixture-*.sql revision server-version.txt image-id stdout-*.txt stderr-*.txt > SHA256SUMS
       - name: Retain PostgreSQL reference
         if: always()
         uses: actions/upload-artifact@v6

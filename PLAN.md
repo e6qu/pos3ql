@@ -198,6 +198,8 @@ separately within unchanged job limits. Preserve assertions and all native targe
 while bounding compiler concurrency and debug-data work. Cancelled builds and
 skipped execution jobs are incomplete qualification. Run final qualification on
 the finished revision.
+Keep each runner job's timeout explicit and bounded independently of shorter
+step timeouts; a timeout on one job or step cannot cover another job.
 
 ### Share fixed memory and disk capacity according to demand
 

@@ -6,20 +6,9 @@ cd "$(dirname "$0")/.."
 
 limit=15
 failed=0
-job_count=$(grep -rniE '^[[:space:]]*runs-on:' .github/workflows --include='*.yml' | wc -l | tr -d '[:space:]')
-timeout_count=$(grep -rniE '^[[:space:]]*timeout-minutes:' .github/workflows --include='*.yml' | wc -l | tr -d '[:space:]')
-if (( job_count != timeout_count )); then
-    printf 'CI timeout guard: found %s jobs but %s timeout declarations\n' "$job_count" "$timeout_count" >&2
+if ! python3 tools/check-workflow-timeouts.py --limit "$limit" .github/workflows/*.yml; then
     failed=1
 fi
-while IFS=: read -r file_path line text; do
-    value=${text##*:}
-    value=$(printf '%s' "$value" | tr -d '[:space:]')
-    if ! [[ $value =~ ^[0-9]+$ ]] || (( value > limit )); then
-        printf '%s:%s: timeout-minutes must be an integer no greater than %s (got %q)\n' "$file_path" "$line" "$limit" "$value" >&2
-        failed=1
-    fi
-done < <(grep -rniE '^[[:space:]]*timeout-minutes:' .github/workflows --include='*.yml')
 
 # Coverage tracing and crash torture require separate release builds. A matrix
 # entry that combines their shards can exceed its bounded job ceiling.

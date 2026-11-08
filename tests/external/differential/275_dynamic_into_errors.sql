@@ -51,7 +51,7 @@ BEGIN
     END IF;
 END$$;
 CREATE FUNCTION into_edge_fetch() RETURNS void LANGUAGE plpgsql AS $$
-DECLARE utility record; held_cursor refcursor:='into_empty_cursor';
+DECLARE utility record; held_cursor refcursor:='into_empty_cursor'; saved_cursor refcursor:='into_held_cursor';
 BEGIN
     EXECUTE 'FETCH NEXT FROM into_held_cursor' INTO utility;
     IF utility.id<>9 OR pg_typeof(utility.id)<>'into_edge_positive'::regtype THEN
@@ -61,7 +61,7 @@ BEGIN
     IF utility.id IS NOT NULL OR pg_typeof(utility.id)<>'into_edge_positive'::regtype THEN
         RAISE EXCEPTION 'empty held FETCH domain description changed';
     END IF;
-    CLOSE into_held_cursor;
+    CLOSE saved_cursor;
     OPEN held_cursor FOR SELECT NULL::into_edge_positive AS id,NULL::text AS payload WHERE false;
     EXECUTE 'FETCH NEXT FROM into_empty_cursor' INTO utility;
     IF utility.id IS NOT NULL OR utility.payload IS NOT NULL

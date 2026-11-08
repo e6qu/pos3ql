@@ -3702,10 +3702,9 @@ fn shape_from_columns_metadata(
     (count != 0).then_some(count)
 }
 
-/// PostgreSQL cannot form the composite type of a `ROW(...)` that contains a
-/// bare unknown literal, so selecting a field of (or expanding) such a record
-/// fails — even for a well-typed sibling field. Mirror that so `(ROW(1,'x')).f1`
-/// errors exactly as PostgreSQL does.
+/// Star expansion exposes every row field as a projection. PostgreSQL cannot
+/// resolve an unknown field projection to text as it can a bare literal;
+/// explicit field casts make the expansion well typed.
 pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Result<(), SqlError> {
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,

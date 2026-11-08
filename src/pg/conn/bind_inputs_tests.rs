@@ -2080,6 +2080,7 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
         let mut cancelled = false;
         let mut completed = false;
         for _ in 0..16 {
+            let responses = server.hold_upload_responses();
             let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
             if matches!(step, Step::Continue) {
                 completed = true;
@@ -2124,6 +2125,7 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
                 assert!(builder.txn.staged_commit().is_some());
                 cancelled = true;
             }
+            drop(responses);
             engine.commit_wal().unwrap();
         }
         assert!(
@@ -2549,6 +2551,8 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
     let mut completed = false;
     let mut receipts = [None; 16];
     for receipt in &mut receipts {
+        // Keep the private catalog state observable even on a fast HTTP reply.
+        let responses = server.hold_upload_responses();
         let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
         if matches!(step, Step::Continue) {
             assert!(
@@ -2589,6 +2593,7 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
             );
             inspected = true;
         }
+        drop(responses);
         engine.commit_wal().unwrap();
     }
     assert!(
@@ -2867,6 +2872,7 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
             );
             builder.send.clear();
             assert!(builder.recv.append(&frontend(wire::FMSG_EXECUTE, &[0; 5])));
+            let registration = server.hold_upload_responses();
             for _ in 0..3 {
                 let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
                 assert!(
@@ -2893,9 +2899,11 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                 ));
                 assert!(builder.txn.staged_commit().is_some());
             }
+            drop(registration);
             engine.commit_wal().unwrap();
             let mut completed = false;
             for _ in 0..6 {
+                let responses = server.hold_upload_responses();
                 let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
                 if matches!(step, Step::Continue) {
                     completed = true;
@@ -2914,6 +2922,7 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                     builder.send.readable(),
                     wire::MSG_COMMAND_COMPLETE
                 ));
+                drop(responses);
                 engine.commit_wal().unwrap();
             }
             assert!(
@@ -2952,6 +2961,7 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                 );
                 builder.send.clear();
                 assert!(builder.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+                let completion = server.hold_upload_responses();
                 let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
                 assert!(
                     matches!(step, Step::Parked),
@@ -3003,6 +3013,7 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
                 assert!(crate::mem::guard::forbid_alloc(
                     || observer.cancel_parked(&mut engine)
                 ));
+                drop(completion);
                 engine.commit_wal().unwrap();
                 let step = crate::mem::guard::forbid_alloc(|| builder.process_message(&mut engine));
                 assert!(

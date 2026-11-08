@@ -334,6 +334,11 @@ runner is a scheduling delay, not evidence of an execution timeout.
 Every runner job declares its own bounded timeout. A shorter step timeout is
 additional protection; it never substitutes for another job's missing timeout.
 
+Tests inspecting an unfinished durable commit hold the HTTP fixture's upload
+responses until the inspection finishes. Release the hold before draining
+publication. A response that happens to arrive slowly is not a synchronization
+point; keep existing deadlines and phase limits.
+
 Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
 test jobs run that build's library test executable with the full native filter
 lists; each build, test and lint job retains its 15-minute ceiling. The artifact

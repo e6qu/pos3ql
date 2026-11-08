@@ -90,6 +90,7 @@ jobs:
             lock::tests::advisory_ \
             procedural_parameter_staging_ procedural_source_ \
             concurrent_reindex_preserves_unbuilt_ \
+            concurrent_reindex_receipts_preserve_each_ concurrent_index_receipts_keep_exact_ \
             procedural_locals_initialize_ procedural_declared_records_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \
             diagnostic_payload_exhaustion_ nested_diagnostic_calls_ caught_diagnostics_ \

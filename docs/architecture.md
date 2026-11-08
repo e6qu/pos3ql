@@ -490,9 +490,14 @@ count to diagnostics. These boundaries follow the
 SQL record descriptions retain declared types separately from the protocol's
 wire descriptions. For example, after `FETCH` from a cursor selecting
 `NULL::positive_integer`, `pg_typeof(result.id)` still names that domain,
-including when no row was fetched. Each cursor keeps only the selected type IDs
-in its existing `cursor_query_bytes` arena; no extra per-cursor pool is reserved.
+including when no row was fetched. Star expansion, composite fields and functions
+also preserve declared domain identities inside records. Each cursor keeps its
+selected type IDs in checked storage within `cursor_query_bytes`; no extra pool
+is reserved. A `WITH HOLD` cursor releases its query and readers at commit while
+keeping those type IDs for later `FETCH` commands. `CLOSE` releases the metadata.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
+`SELECT (ROW(NULL, 'hello')).*` exposes two text columns, following
+[PostgreSQL 18.6 target analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_target.c).
 An unfinished `PERFORM` or `SELECT ... INTO` keeps completed function results,
 their selected inputs and receipt positions when the calling trigger pauses. For example,
 `PERFORM write_audit('one'), wait_for_lock(), write_audit('two')` must insert each

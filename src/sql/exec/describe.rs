@@ -32,10 +32,20 @@ impl DescriptionTarget {
         storage: Option<&crate::storage::Storage>,
         txid: u32,
     ) -> Result<(), SqlError> {
-        if let Self::Wire = self
-            && let Some(storage) = storage
-        {
-            for column in columns {
+        for column in columns {
+            // Query output resolves untyped NULL/string fields to text. Inner
+            // record expressions keep their own selected field metadata.
+            if column.type_oid == oid::UNKNOWN {
+                column.type_oid = oid::TEXT;
+                column.typlen = -1;
+                column.type_mod = -1;
+                if column.collation == crate::sql::ast::Collation::None {
+                    *column = column.with_collation(crate::sql::ast::Collation::Default);
+                }
+            }
+            if let Self::Wire = self
+                && let Some(storage) = storage
+            {
                 *column = wire_column_description(*column, storage, txid)?;
             }
         }
@@ -59,6 +69,8 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
 /// Catalog names escape into the statement arena before their reader is released.
 fn describe_column<'a>(
     column: &ColumnMeta,
+    storage: Option<&crate::storage::Storage>,
+    txid: u32,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<ColDesc<'a>, SqlError> {
     let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
@@ -67,7 +79,14 @@ fn describe_column<'a>(
             "column description exceeds the statement arena"
         )
     })?;
-    Ok(ColDesc::of_type(name, column.ctype)
+    let type_oid = match storage {
+        Some(storage) => storage.routine_type_oid(column.ctype, column.user_type, txid),
+        None if column.user_type.is_none() => Some(column.ctype.oid()),
+        None => None,
+    }.ok_or_else(|| sql_err!(
+        sqlstate::UNDEFINED_OBJECT, "output column's declared type is unavailable"
+    ))?;
+    Ok(ColDesc::new(name, type_oid, column.ctype.typlen())
         .with_type_mod(column.type_mod)
         .with_collation(column.collation))
 }
@@ -185,7 +204,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 };
                 for c in def.columns() {
-                    push(describe_column(c, context.arena)?)?;
+                    push(describe_column(c, storage, txid, context.arena)?)?;
                 }
             }
             SelectItem::TableWildcard(q) => {
@@ -201,7 +220,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 }
                 for c in def.expect("matched").columns() {
-                    push(describe_column(c, context.arena)?)?;
+                    push(describe_column(c, storage, txid, context.arena)?)?;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -240,15 +259,15 @@ fn describe_items_with_output_aliases<'q>(
                 let name = alias.unwrap_or(derived_name(expression));
                 let field_meta = match expression {
                     Expr::Field { base, field } => {
-                        record_field_metadata(base, field, resolver).ok()
+                        Some(record_field_metadata(base, field, resolver)?)
                     }
                     _ => None,
                 };
                 if let Some(meta) = field_meta {
-                    type_oid = meta.ctype.oid();
+                    type_oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 } else if let Some(meta) = routine_result_metadata(expression, resolver) {
-                    type_oid = meta.ctype.oid();
+                    type_oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 }
                 let type_mod = field_meta.map_or_else(
@@ -261,7 +280,10 @@ fn describe_items_with_output_aliases<'q>(
                     |meta| meta.type_mod,
                 );
                 let mut description = ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod);
-                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable) {
+                let collatable = coltype_of_oid(type_oid)
+                    .or_else(|| resolver.domain_base_type(type_oid))
+                    .is_some_and(ColType::is_collatable);
+                if collatable {
                     let metadata = match def {
                         Some(definition) => described_expression_collation(
                             expression,
@@ -282,7 +304,7 @@ fn describe_items_with_output_aliases<'q>(
                 } else if let Some(meta) = field_meta {
                     description.collation = meta.collation;
                 }
-                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable)
+                if collatable
                     && description.collation_derivation == CollationDerivation::None
                 {
                     description.collation = crate::sql::ast::Collation::Default;
@@ -1198,7 +1220,7 @@ fn describe_record_star<'q>(
             }) =>
         {
             for c in def.expect("matched").columns() {
-                push(describe_column(c, arena)?)?;
+                push(describe_column(c, storage, txid, arena)?)?;
             }
             Ok(())
         }

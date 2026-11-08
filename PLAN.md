@@ -75,7 +75,8 @@ AFTER work with the calling trigger. Qualify dynamic SQL and returned-value
 ownership against PostgreSQL and repeated waits, including unchanged `FOUND`,
 once-only `USING` arguments, typed empty records and error/rollback boundaries.
 Keep declared record types separate from protocol representations, including
-domains returned by SELECT, RETURNING and empty or non-empty FETCH results.
+domains returned by SELECT, RETURNING, star expansion and record fields. Preserve
+empty and non-empty FETCH types after a held cursor's query ends at commit.
 Finish retaining unfinished row phases. Resume the same command;
 completion and another pause must restore the caller's visibility. Triggers
 cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`

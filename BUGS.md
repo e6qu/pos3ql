@@ -4,7 +4,7 @@ No known defects are blocked by an external dependency or an intractable problem
 
 Fix reproducible defects in the PR that finds them, including incidental defects
 and failures of completion output, retained writes, instruction effects or their
-original undo boundaries, declared types in returned or empty records, and quoted
+original undo boundaries, declared record types after cursor commit, and quoted
 SQL boundaries or completed function results lost with temporary query memory.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations

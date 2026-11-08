@@ -13,7 +13,39 @@ permissions:
 
 jobs:
   formatting:
-    uses: ./.github/workflows/formatting.yml
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check Rust formatting
+        timeout-minutes: 5
+        run: |
+          if ! { cargo fmt --check && rustfmt --check --edition 2024 src/storage/native_tests.rs; }; then
+            cargo fmt
+            rustfmt --edition 2024 src/storage/native_tests.rs
+            git diff --binary > "$RUNNER_TEMP/formatting.patch"
+            exit 1
+          fi
+      - name: Retain formatting correction
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: formatting-${{ github.sha }}
+          path: ${{ runner.temp }}/formatting.patch
+          if-no-files-found: ignore
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-source-check-dependencies-${{ hashFiles('Cargo.lock') }}
+      - name: Check all Rust targets on the same runner
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo clippy --locked --all-targets --keep-going --jobs 1 -- -Dwarnings
 
   ownership:
     needs: formatting
@@ -40,7 +72,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --lib --locked --profile native-ci --jobs 1 -- \
-            inplace_conversion_ cursor_owned_query_scratch_marks_ \
+            inplace_conversion_ cursor_owned_query_scratch_marks_ cursor_owned_query_releases_ \
             exec::control_flow::ownership_tests \
             exec::control_flow::resumption_tests \
             exec::local_values::ownership_tests exec::numeric_loops::ownership_tests \
@@ -52,7 +84,7 @@ jobs:
             sequence::tests::retained_statement_position_ \
             lock::tests::advisory_ \
             procedural_parameter_staging_ procedural_source_ \
-            procedural_locals_initialize_ control_capacity_is_admitted_ \
+            procedural_locals_initialize_ procedural_declared_records_ control_capacity_is_admitted_ \
             output_control_admission_ diagnostic_directory_admission_ \
             diagnostic_payload_exhaustion_ nested_diagnostic_calls_ caught_diagnostics_ \
             unhandled_diagnostic_details_ \
@@ -149,11 +181,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/tests/external/differential/275_dynamic_into_errors.sql" fixture-275.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/276_suspended_query_invocations.sql" fixture-276.sql
           cp "$GITHUB_WORKSPACE/tests/external/differential/277_suspended_select_into.sql" fixture-277.sql
+          cp "$GITHUB_WORKSPACE/tests/external/differential/278_declared_record_types.sql" fixture-278.sql
           git -C "$GITHUB_WORKSPACE" rev-parse HEAD > revision
           docker exec "$POSTGRES_CONTAINER" psql -U postgres -XAt -c 'SHOW server_version_num' > server-version.txt
           test "$(cat server-version.txt)" = 180006
           docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" > image-id
-          for fixture in 265 266 267 268 269 270 271 272 273 274 275 276 277; do
+          for fixture in 265 266 267 268 269 270 271 272 273 274 275 276 277 278; do
             docker exec -i -e PGOPTIONS='-c timezone=UTC -c standard_conforming_strings=on' \
               "$POSTGRES_CONTAINER" psql -U postgres -X -A -t -e -v ON_ERROR_STOP=1 \
               < "fixture-$fixture.sql" > "stdout-$fixture.txt" 2> "stderr-$fixture.txt"
@@ -174,6 +207,7 @@ jobs:
               (275, '0|3|0|1|1|42601/P0003/P0002|1|8193|t|integer'),
               (276, 'one,two,three|6|3|t|f|t|t|t|f|t|f'),
               (277, 'one,two,three|6|3|t|f|t|t|t|f|t|f'),
+              (278, 't|1|text|text|t'),
           ]:
               assert Path(f'stdout-{fixture}.txt').read_text().splitlines().count(expected) == 1
               assert not Path(f'stderr-{fixture}.txt').read_bytes()

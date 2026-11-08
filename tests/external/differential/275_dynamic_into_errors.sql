@@ -1,5 +1,8 @@
 CREATE SEQUENCE into_edge_sequence;
 CREATE DOMAIN into_edge_positive AS integer CHECK(VALUE>0);
+CREATE TABLE into_edge_held_values(id into_edge_positive);
+INSERT INTO into_edge_held_values VALUES(9);
+DECLARE into_held_cursor CURSOR WITH HOLD FOR SELECT * FROM into_edge_held_values;
 CREATE TABLE into_edge_orders(id integer);
 CREATE TABLE into_edge_stock(id integer,amount integer);
 CREATE TABLE into_edge_audit(stage text,n bigint,note text,error_code text,missing boolean,declared_type text);
@@ -50,6 +53,15 @@ END$$;
 CREATE FUNCTION into_edge_fetch() RETURNS void LANGUAGE plpgsql AS $$
 DECLARE utility record; held_cursor refcursor:='into_empty_cursor';
 BEGIN
+    EXECUTE 'FETCH NEXT FROM into_held_cursor' INTO utility;
+    IF utility.id<>9 OR pg_typeof(utility.id)<>'into_edge_positive'::regtype THEN
+        RAISE EXCEPTION 'held FETCH domain description changed';
+    END IF;
+    EXECUTE 'FETCH NEXT FROM into_held_cursor' INTO utility;
+    IF utility.id IS NOT NULL OR pg_typeof(utility.id)<>'into_edge_positive'::regtype THEN
+        RAISE EXCEPTION 'empty held FETCH domain description changed';
+    END IF;
+    CLOSE into_held_cursor;
     OPEN held_cursor FOR SELECT NULL::into_edge_positive AS id,NULL::text AS payload WHERE false;
     EXECUTE 'FETCH NEXT FROM into_empty_cursor' INTO utility;
     IF utility.id IS NOT NULL OR utility.payload IS NOT NULL

@@ -1732,6 +1732,29 @@ fn utility_descriptions_match_execution() {
 }
 
 #[test]
+fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
+    for mode in [crate::config::TransactionMode::Mvcc, crate::config::TransactionMode::Locking] {
+        let mut config = test_config(&format!("declared-record-types-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        assert_eq!(data_rows(&session.success(&mut engine,
+            include_str!("../../../tests/external/differential/278_declared_record_types.sql"), true)), ["t|1|text|text|t"], "{mode:?}");
+        for (query, types) in [
+            ("SELECT * FROM record_source", [types::oid::INT4, types::oid::TEXT]),
+            ("SELECT (record_return_pair()).* FROM record_source", [types::oid::INT4, types::oid::TEXT]),
+            ("SELECT (ROW(NULL,'text')).* FROM record_source", [types::oid::TEXT, types::oid::TEXT]),
+        ] {
+            let described = describe_with(&mut engine, &mut budget, query);
+            let executed = session.success(&mut engine, query, false);
+            assert_eq!(row_description_type_oids(&described), types);
+            assert_eq!(row_description_type_oids(&executed), types);
+        }
+    }
+}
+
+#[test]
 fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

@@ -858,7 +858,7 @@ impl CursorPool {
         })?;
         let slot = &self.slots[at];
         let count = description_columns(slot.description.readable(), names, type_oids)?;
-        let declared = slot.query.result_type_oids().ok_or_else(|| {
+        let declared = slot.query.result_type_oids()?.ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "cursor SQL result types are missing"
@@ -1063,7 +1063,7 @@ impl CursorPool {
 
     pub(crate) fn finish_hold_source(&mut self, at: usize) {
         let slot = &mut self.slots[at];
-        slot.query.clear();
+        slot.query.finish_source();
         slot.request = None;
     }
 

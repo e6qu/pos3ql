@@ -290,3 +290,4 @@ sql::query::suspended_invocations::ownership_tests::suspended_invocations_reloca
 sql::query::input_progress::saved::ownership_tests::suspended_input_frames_relocate_checked_values_and_selected_names
 sql::query::input_progress::tests::invocation_registry_relocates_checked_inputs_results_and_cast_selections
 sql::exec::control_flow::ownership_tests::suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena
+sql::cursor::query::tests::cursor_owned_query_releases_held_source_without_losing_declared_result_types

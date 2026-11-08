@@ -11166,6 +11166,22 @@ fn materialize_composite_outputs<'a>(
     Ok(())
 }
 
+/// One source column retains its declared SQL type before wire conversion.
+fn describe_scope_column<'q>(
+    scope: &QueryScope<'_>,
+    entry: ResolvedColumn,
+    storage: &Storage,
+    txid: u32,
+    arena: &'q Arena,
+) -> Result<ColDesc<'q>, SqlError> {
+    let metadata = scope_column_metadata(scope, entry, storage, txid).ok_or_else(|| {
+        sql_err!(sqlstate::UNDEFINED_OBJECT, "output column's declared type is unavailable")
+    })?;
+    let name = arena.alloc_str(scope.output_name(entry)).map_err(|_| arena_full())?;
+    Ok(ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
+        .with_type_mod(metadata.type_mod).with_collation(metadata.collation))
+}
+
 /// Column descriptions across the whole scope (wildcards expand every
 /// table).
 #[expect(
@@ -11195,19 +11211,7 @@ pub fn describe_scope_items<'q>(
                         ));
                     }
                     let entry = scope.qualified_star_entry(q, index)?;
-                    out[n] = ColDesc::of_type(
-                        arena
-                            .alloc_str(scope.output_name(entry))
-                            .map_err(|_| arena_full())?,
-                        scope.output_type(entry),
-                    )
-                    .with_type_mod(match entry {
-                        ResolvedColumn::Table(table, column) => {
-                            scope.defs.get(table).expect("resolved").columns[column].type_mod
-                        }
-                        ResolvedColumn::Merged(_) => -1,
-                    });
-                    out[n].collation = scope.output_collation(entry);
+                    out[n] = describe_scope_column(scope, entry, storage, txid, arena)?;
                     n += 1;
                 }
             }
@@ -11220,19 +11224,7 @@ pub fn describe_scope_items<'q>(
                         ));
                     }
                     let entry = scope.star_entry(k);
-                    out[n] = ColDesc::of_type(
-                        arena
-                            .alloc_str(scope.output_name(entry))
-                            .map_err(|_| arena_full())?,
-                        scope.output_type(entry),
-                    )
-                    .with_type_mod(match entry {
-                        ResolvedColumn::Table(t, c) => {
-                            scope.defs.get(t).expect("resolved").columns[c].type_mod
-                        }
-                        ResolvedColumn::Merged(_) => -1,
-                    });
-                    out[n].collation = scope.output_collation(entry);
+                    out[n] = describe_scope_column(scope, entry, storage, txid, arena)?;
                     n += 1;
                 }
             }
@@ -11275,17 +11267,17 @@ pub fn describe_scope_items<'q>(
                 // is -1 — the rule PostgreSQL follows.
                 let field_meta = match expression {
                     Expr::Field { base, field } if user_type.is_none() => {
-                        super::exec::record_field_metadata(base, field, &resolver).ok()
+                        Some(super::exec::record_field_metadata(base, field, &resolver)?)
                     }
                     _ => None,
                 };
                 if let Some(meta) = field_meta {
-                    oid = meta.ctype.oid();
+                    oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 } else if let Some(meta) =
                     super::exec::routine_result_metadata(expression, &resolver)
                 {
-                    oid = meta.ctype.oid();
+                    oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 }
                 let type_mod = match expression {
@@ -11299,6 +11291,7 @@ pub fn describe_scope_items<'q>(
                 out[n] = ColDesc::new(name, oid, typlen)
                     .with_type_mod(user_type.map_or(type_mod, |description| description.type_mod));
                 if let Some(ctype) = super::exec::coltype_of_oid(oid)
+                    .or_else(|| storage.domain_base_type_for_oid(oid, txid))
                     && ctype.is_collatable()
                 {
                     (out[n].collation, out[n].collation_derivation) =
@@ -12259,10 +12252,11 @@ fn describe_scope_record_star<'q>(
             super::exec::check_row_field_types(base, &resolver)?;
             let mut error = None;
             let mut index = 0usize;
-            super::exec::record_shape(base, &resolver, |_, ctype| {
+            super::exec::record_shape_metadata(base, &resolver, |_, meta| {
                 if error.is_none() {
                     error = push(
-                        ColDesc::of_type(super::exec::RECORD_FIELD_NAMES[index], ctype),
+                        ColDesc::new(super::exec::RECORD_FIELD_NAMES[index], meta.type_oid, meta.ctype.typlen())
+                            .with_type_mod(meta.type_mod).with_collation(meta.collation),
                         &mut n,
                     )
                     .err();
@@ -12280,7 +12274,7 @@ fn describe_scope_record_star<'q>(
             name: table,
         } if scope.table_index(table).is_ok() => {
             let t = scope.table_index(table)?;
-            for (column, c) in scope
+            for (column, _) in scope
                 .defs
                 .get(t)
                 .expect("resolved")
@@ -12289,9 +12283,7 @@ fn describe_scope_record_star<'q>(
                 .enumerate()
             {
                 push(
-                    ColDesc::of_type(scope.defs.column_name(t, column), c.ctype)
-                        .with_type_mod(c.type_mod)
-                        .with_collation(c.collation),
+                    describe_scope_column(scope, ResolvedColumn::Table(t, column), storage, txid, arena)?,
                     &mut n,
                 )?;
             }
@@ -12362,7 +12354,7 @@ fn describe_scope_record_star<'q>(
                 index,
             ) {
                 push(
-                    ColDesc::of_type(field_name.as_str(), meta.ctype)
+                    ColDesc::new(field_name.as_str(), meta.type_oid, meta.ctype.typlen())
                         .with_type_mod(meta.type_mod)
                         .with_collation(meta.collation),
                     &mut n,
@@ -12410,8 +12402,10 @@ fn describe_scope_record_star<'q>(
                         )
                     })?;
                 for field in definition.active_fields() {
+                    let type_oid = storage.routine_type_oid(field.ctype, field.user_type, txid)
+                        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "record field's declared type is unavailable"))?;
                     push(
-                        ColDesc::of_type(field.name.as_str(), field.ctype)
+                        ColDesc::new(field.name.as_str(), type_oid, field.ctype.typlen())
                             .with_type_mod(field.type_mod)
                             .with_collation(field.collation),
                         &mut n,
@@ -12431,7 +12425,7 @@ fn describe_scope_record_star<'q>(
                     return;
                 }
                 if let Err(error) = push(
-                    ColDesc::of_type(field_name, meta.ctype)
+                    ColDesc::new(field_name, meta.type_oid, meta.ctype.typlen())
                         .with_type_mod(meta.type_mod)
                         .with_collation(meta.collation),
                     &mut n,

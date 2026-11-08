@@ -14840,6 +14840,29 @@ struct LockState {
     sequence: u64,
 }
 
+pub(crate) struct AdvisoryPositionAdmission {
+    locks: std::sync::Arc<Mutex<LockState>>,
+    prior: Option<crate::sql::lock::AdvisoryPositionRestore>,
+}
+
+impl AdvisoryPositionAdmission {
+    pub(crate) fn commit(&mut self) {
+        self.prior = None;
+    }
+}
+
+impl Drop for AdvisoryPositionAdmission {
+    fn drop(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            self.locks
+                .lock()
+                .expect("lock state is not poisoned")
+                .advisory
+                .restore_position(prior);
+        }
+    }
+}
+
 impl LockState {
     fn next_sequence(&mut self) -> Result<u64, SqlError> {
         self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
@@ -51447,7 +51470,32 @@ impl Storage {
 
     pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
         let connection_id = self.current_connection_id();
-        self.lock_state().advisory.begin_statement(connection_id)
+        let mut locks = self.lock_state();
+        let statement = core::num::NonZeroU64::new(locks.next_sequence()?)
+            .expect("lock identities start at one");
+        locks.advisory.begin_statement(connection_id, statement)
+    }
+
+    pub(crate) fn advisory_statement_position(
+        &self,
+    ) -> crate::sql::lock::AdvisoryStatementPosition {
+        self.lock_state()
+            .advisory
+            .statement_position(self.current_connection_id())
+    }
+
+    pub(crate) fn resume_advisory_position(
+        &self,
+        saved: crate::sql::lock::AdvisoryStatementPosition,
+    ) -> Result<AdvisoryPositionAdmission, SqlError> {
+        let prior = self
+            .lock_state()
+            .advisory
+            .resume_position(saved, self.current_connection_id())?;
+        Ok(AdvisoryPositionAdmission {
+            locks: std::sync::Arc::clone(&self.locks),
+            prior: Some(prior),
+        })
     }
 
     pub(crate) fn advisory_statement_mark(&self) -> crate::sql::lock::AdvisoryStatementMark {

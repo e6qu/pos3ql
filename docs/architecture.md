@@ -417,6 +417,19 @@ sequence calls and input checks, together with the sequence selected by
 Attachment checks the original statement attempt and nested effect record before
 advancing their positions. A failed attachment restores the caller's previous
 position; another pause saves the new position without copying the record.
+Advisory-lock calls have a separate fixed journal. A saved firing retains its
+original statement identity and position in that connection's calls. Attachment
+skips completed calls only after every firing resource is available; a failed
+attachment restores the caller's position. New statements and reused connection
+identities reject old positions with `40001`. Other connections can release
+their journal slots without changing the retained call order.
+Write completion uses a cursor over queued row events followed by the selected
+AFTER STATEMENT triggers. It retains the row-event index, trigger depth,
+operation and last selected trigger name without syntax pointers. The same
+selectors serve the immediate trigger boundaries, COPY and ordinary write
+completion; nested trigger SQL cannot drain events from its caller's depth.
+This cursor is part of the remaining enclosing-write handoff; it does not yet
+make checked inputs in data-change triggers resumable.
 An internal nested-command owner also saves the command identity, nesting depth
 and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.

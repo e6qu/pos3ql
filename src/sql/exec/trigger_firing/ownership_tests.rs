@@ -142,6 +142,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     columns[1].ctype = ColType::Text;
     let effects = core::cell::Cell::new(0);
     let mut saved = crate::mem::guard::forbid_alloc(|| {
+        storage.begin_advisory_statement().unwrap();
         let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), false);
         sequence::statement_effect(
             sequence::StatementEffectKind::Cursor,
@@ -323,6 +324,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     crate::sql::datetime::begin_transaction();
     super::super::super::query::restore_statement_deadline(812_345_678_901_233);
     crate::mem::guard::forbid_alloc(|| {
+        storage.preserve_advisory_statement();
+        storage.begin_advisory_statement().unwrap();
         let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
         assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
         assert_eq!(
@@ -353,7 +356,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             params: crate::sql::eval::NO_PARAMS,
             responder: &mut responder,
         };
+        let advisory_mark = context.storage().advisory_statement_mark();
         let error = saved.poll(&mut context).err().unwrap();
+        assert_eq!(context.storage().advisory_statement_mark(), advisory_mark);
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert_eq!(small.used(), 0);
         assert!(matches!(
@@ -403,6 +408,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             .unwrap();
         resumed
             .with_remaining_region(|scratch| {
+                storage.preserve_advisory_statement();
+                storage.begin_advisory_statement().unwrap();
                 let _statement =
                     sequence::enter_statement(&statement_arena, guc.seq_session(), true);
                 let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
@@ -416,7 +423,9 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                     params: crate::sql::eval::NO_PARAMS,
                     responder: &mut responder,
                 };
+                let advisory_mark = context.storage().advisory_statement_mark();
                 let error = saved.poll(&mut context).err().unwrap();
+                assert_eq!(context.storage().advisory_statement_mark(), advisory_mark);
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 assert_eq!(scratch.used(), 0);
                 assert!(matches!(
@@ -436,6 +445,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             super::super::super::set_execution_connection_id(1);
         }
         crate::mem::guard::forbid_alloc(|| {
+            storage.preserve_advisory_statement();
+            storage.begin_advisory_statement().unwrap();
             let statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
             let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
             let mut context = TriggerExecContext {

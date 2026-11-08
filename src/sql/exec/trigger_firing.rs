@@ -293,6 +293,7 @@ struct SavedBinding {
     values: local_values::SavedValues,
     environment: SavedEnvironment,
     progress: crate::sql::sequence::SavedStatementPosition,
+    advisory: crate::sql::lock::AdvisoryStatementPosition,
 }
 
 struct SavedMetadata {
@@ -353,6 +354,7 @@ impl SavedBinding {
         binding.validate()?;
         let progress = crate::sql::sequence::SavedStatementPosition::capture()?;
         let storage = context.storage();
+        let advisory = storage.advisory_statement_position();
         let environment = SavedEnvironment::capture(environment, &storage.execution_control)?;
         let definitions = storage.table_definition_images();
         let definition = definitions.retain_relation(&binding.definition)?;
@@ -439,6 +441,7 @@ impl SavedBinding {
             values,
             environment,
             progress,
+            advisory,
         })
     }
 }
@@ -594,6 +597,7 @@ impl SuspendedTriggerFiring {
             &mut self.saved.values,
             &mut self.saved.environment,
             &mut self.saved.progress,
+            &mut self.saved.advisory,
             frame,
             TriggerExecContext {
                 host: context.host.reborrow(),
@@ -645,11 +649,16 @@ fn resume<'run>(
     values: &mut local_values::SavedValues,
     environment: &mut SavedEnvironment,
     progress: &mut crate::sql::sequence::SavedStatementPosition,
+    advisory: &mut crate::sql::lock::AdvisoryStatementPosition,
     frame: execution_frame::SuspendedExecutionFrame,
     mut context: TriggerExecContext<'_, 'run, '_>,
 ) -> Result<(FiringState, FiringProgress), ResumeError> {
     let prior = progress.take();
     let attached = prior.with_resume(frame, |frame, admission| {
+        let mut advisory_admission = match context.storage().resume_advisory_position(*advisory) {
+            Ok(admission) => admission,
+            Err(error) => return Err(ResumeError::Unattached(frame, error)),
+        };
         let active_environment = match environment.enter(context.txn) {
             Ok(active) => active,
             Err(error) => return Err(ResumeError::Unattached(frame, error)),
@@ -671,6 +680,7 @@ fn resume<'run>(
             Err((frame, error)) => return Err(ResumeError::Unattached(frame, error)),
         };
         admission.commit();
+        advisory_admission.commit();
         values.clear();
         let mut firing = TriggerFiring {
             code,
@@ -702,6 +712,7 @@ fn resume<'run>(
                     .map_err(|(_, error)| ResumeError::Executed(error))?;
                 *progress = crate::sql::sequence::SavedStatementPosition::capture()
                     .map_err(ResumeError::Executed)?;
+                *advisory = context.storage().advisory_statement_position();
                 *environment = saved_environment;
                 Ok((FiringState::Paused(frame), FiringProgress::Waiting))
             }

@@ -29542,55 +29542,15 @@ fn fire_statement_row_trigger_events<'a>(
     trigger_depth: u16,
     transition_rows: TransitionRowSets<'a>,
 ) -> Result<(), SqlError> {
-    let mut index = 0usize;
-    while index < context.txn.deferred_trigger_events().len() {
-        if context.txn.deferred_trigger_is_complete(index) {
-            index += 1;
-            continue;
-        }
-        let event = context.txn.deferred_trigger_events()[index];
-        let selected = match event.kind {
-            crate::sql::txn::DeferredTriggerKind::AfterRow {
-                trigger_slot,
-                effective_table,
-                trigger_depth: event_depth,
-            } if event_depth == trigger_depth => Some((trigger_slot, effective_table)),
-            crate::sql::txn::DeferredTriggerKind::Constraint {
-                identity,
-                effective_table,
-                trigger_depth: event_depth,
-            } if event_depth == trigger_depth => {
-                let Some(timing) =
-                    constraints::constraint_timing(context.storage(), identity, context.txn.txid)
-                else {
-                    context.txn.complete_deferred_trigger(index)?;
-                    index += 1;
-                    continue;
-                };
-                if context.txn.constraint_mode(identity, timing)
-                    != crate::sql::ast::ConstraintMode::Immediate
-                {
-                    None
-                } else if let crate::sql::txn::ConstraintIdentity::Trigger { slot, .. } = identity {
-                    Some((slot, effective_table))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        let Some((trigger_slot, table)) = selected else {
-            index += 1;
-            continue;
-        };
+    let mut cursor = write_completion::AfterRowCursor::new(trigger_depth);
+    while let Some(firing) = cursor.next(context)? {
         execute_deferred_trigger_event(
             context,
-            index,
-            trigger_slot,
-            table,
-            transition_rows.for_event(event.event),
+            firing.index,
+            firing.trigger_slot,
+            firing.table,
+            transition_rows.for_event(firing.event),
         )?;
-        index += 1;
     }
     Ok(())
 }
@@ -29876,62 +29836,50 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     updated_columns: ColumnSet,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
-    let mut context = context.for_trigger();
-    let mut last_name: Option<SqlName> = None;
-    while let Some(trigger) = {
-        context
-            .storage()
-            .triggers_for_target(target, context.txn.txid)
-            .filter(|(_, trigger)| {
-                last_name
-                    .is_none_or(|last| trigger.name_to(context.txn.txid).as_str() > last.as_str())
-            })
-            .min_by(|(_, left), (_, right)| {
-                left.name_to(context.txn.txid)
-                    .as_str()
-                    .cmp(right.name_to(context.txn.txid).as_str())
-            })
-            .map(|(_, trigger)| trigger)
-    } {
-        last_name = Some(trigger.name_to(context.txn.txid));
-        if !(if context.txn.replication_apply {
-            trigger.enabled_to(context.txn.txid).fires_for_replication()
-        } else {
-            trigger.enabled_to(context.txn.txid).fires_for_origin()
-        }) || !matches!(trigger.level, TriggerLevel::Statement)
-            || trigger.timing
-                != if before {
-                    TriggerTiming::Before
-                } else {
-                    TriggerTiming::After
-                }
-            || !trigger.events.contains(event)
-            || (event == 2
-                && !trigger.update_columns.is_empty()
-                && !trigger.update_columns.intersects(updated_columns))
-        {
-            continue;
-        }
-        if !row_trigger_when_passes(&context, &trigger, definition, None, None)? {
-            continue;
-        }
-        let mut firing = prepare_trigger_firing(
-            &context,
+    let mut cursor = write_completion::StatementTriggerCursor::new();
+    while let Some(trigger) = cursor.next(&context, target, event, before, updated_columns) {
+        execute_statement_trigger(
+            &mut context,
             &trigger,
-            TriggerRelationIdentity {
-                target,
-                schema: definition.schema,
-                name: definition.name,
-            },
-            crate::storage::RelationDefinition::from_definition(definition),
+            target,
+            definition,
             event,
             before,
-            None,
-            None,
             rows,
         )?;
-        firing.execute(&mut context)?;
     }
+    Ok(())
+}
+
+fn execute_statement_trigger<'a, Definition: crate::storage::DefinitionBacking>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    trigger: &crate::storage::TriggerDef,
+    target: crate::storage::TriggerTarget,
+    definition: &crate::storage::TableDefinition<Definition>,
+    event: u8,
+    before: bool,
+    rows: Option<TransitionRows<'a>>,
+) -> Result<(), SqlError> {
+    let mut context = context.for_trigger();
+    if !row_trigger_when_passes(&context, trigger, definition, None, None)? {
+        return Ok(());
+    }
+    let mut firing = prepare_trigger_firing(
+        &context,
+        trigger,
+        TriggerRelationIdentity {
+            target,
+            schema: definition.schema,
+            name: definition.name,
+        },
+        crate::storage::RelationDefinition::from_definition(definition),
+        event,
+        before,
+        None,
+        None,
+        rows,
+    )?;
+    firing.execute(&mut context)?;
     Ok(())
 }
 

@@ -60,37 +60,21 @@ operation without executing earlier rows or trigger statements again. Keep the
 original selected definitions, settings, statement snapshot and deadline.
 Cancellation or a real error must release retained owners and use the ordinary
 transaction rollback rules. A private wait must not be caught as a user error.
-Keep the caller's execution services through immediate and queued trigger
-dispatch. Trigger bodies cannot end the caller's transaction or inherit its
-SQL parameters; trigger arguments remain available through `TG_ARGV`.
-Publish transition tables only after collection ends. A paused write must own
-both row sets independently of recycled scratch; restoration must publish both
-directories together and preserve their bytes after a failed admission.
-Keep the firing's arguments, `OLD`/`NEW`, selected row columns and transition
-descriptions with its execution position. Failed capture keeps the live firing;
-failed attachment keeps its saved images. Only a complete attachment may resume
-the body, and completed firings cannot run again.
-Match PostgreSQL's setting scopes before the next trigger observes them. Restore
-settings named in the routine's `SET` clause; preserve unlisted `SET LOCAL`
-changes until transaction end. An explicit session-wide `SET` overrides routine
-restoration even when it assigns the same value as before. `current_setting()`,
-`pg_settings` and rendered values must agree throughout.
-Keep every supported writable setting readable, including `event_triggers` and
-`password_encryption`, with PostgreSQL's value types and privilege metadata.
-Keep the configured routine's current values and restoration baseline in the
-same startup-reserved owner while it waits. Reject another connection or a
-changed parent scope before installing those values. Restore the caller's
-settings and effective user after failed attachment, another pause or completion.
-Preserve the original statement and transaction timestamps and deadline while
-the worker serves other connections; a wakeup must not renew the timer or repeat
-a timeout already consumed by its transaction.
-Retain nested SQL's command and read snapshot together. Resuming it must not
-issue another command identity or restore another connection's visibility;
-completion and another pause must restore the caller's context.
-Keep the position of completed sequence calls and input checks with the saved
-firing. Reattach only to the original statement and nested effect record; failed
-attachment must leave the caller's position intact. A later statement or another
-connection must not inherit that progress.
+Connect the existing saved-call and transition-table owners to that write
+driver. Preserve their [ownership and setting-scope contracts](docs/architecture.md#the-request-path):
+arguments, `OLD`/`NEW`, selected definitions, completed input checks and sequence
+calls, advisory-lock holds, effective user, settings, timestamps and deadline.
+Another client must run while a cold object-store read waits. When the trigger
+resumes, it must see the same rows and local values, issue no extra order number
+or audit write, and keep the original timeout. Failed attachment must leave
+both the saved call and the caller's context usable.
+
+Retain nested SQL's command and read snapshot together. Resume its unfinished
+write and return its actual result to the trigger without issuing a new command.
+Completion and another pause must restore the caller's visibility. Triggers
+cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`
+continues to carry trigger arguments. Only completed row collections may become
+transition tables, and each operation in a mixed write keeps its own tables.
 Preserve typed control ownership: an application raising the same diagnostic
 code must still return or catch its own error normally, including in functions
 returning rows and category handlers.

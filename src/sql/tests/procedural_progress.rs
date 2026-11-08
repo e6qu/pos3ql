@@ -1829,7 +1829,9 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
             ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
         let fixture =
             include_str!("../../../tests/external/differential/278_declared_record_types.sql");
-        let final_query = fixture.find("SELECT check_declared_record_types()").unwrap();
+        let final_query = fixture
+            .find("SELECT check_declared_record_types()")
+            .unwrap();
         let (setup, final_query) = fixture.split_at(final_query);
         session.success(&mut engine, setup, true);
         for query in [

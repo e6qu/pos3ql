@@ -863,9 +863,8 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         name: &str,
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
         if let Some(type_oid) = self.row.column_type_oid(qualifier, name) {
-            let ctype = constructor_type_from_oid(type_oid, &|oid| {
-                self.catalog?.domain_base_type(oid)
-            })?;
+            let ctype =
+                constructor_type_from_oid(type_oid, &|oid| self.catalog?.domain_base_type(oid))?;
             return Some(crate::sql::exec::StaticTypeMeta {
                 type_oid,
                 ctype,
@@ -5532,6 +5531,23 @@ fn expression_collation<'a>(
             None => expression_collation(operand, row, catalog),
         },
         Expr::Column { qualifier, name } => {
+            if row.column_type_oid(*qualifier, name).is_some() {
+                let metadata = super::exec::ColTypeResolver::column_meta(
+                    &RuntimeColumnTypes { row, catalog },
+                    *qualifier,
+                    name,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "record field's declared type is unavailable"
+                    )
+                })?;
+                return Ok(DerivedCollation::implicit(
+                    metadata.collation,
+                    metadata.ctype.is_collatable(),
+                ));
+            }
             let value = row.collation(*qualifier, name);
             Ok(DerivedCollation::implicit(
                 value,

@@ -49,13 +49,15 @@ BEGIN
     RETURN code='XX000';
 END$$;
 CREATE FUNCTION check_null_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
-DECLARE result record; copied record;
+DECLARE result record; copied record; matched boolean;
 BEGIN
     EXECUTE 'SELECT NULL::record_positive AS id,NULL::record_label AS label' INTO result;
     SELECT result.id,result.label INTO copied;
     INSERT INTO record_field_copies SELECT result.id,result.label;
     UPDATE record_field_copies SET id=result.id,label=result.label;
-    RETURN copied.id IS NULL AND copied.label IS NULL
+    EXECUTE 'SELECT 7::record_positive AS id,''seven''::record_label AS label' INTO result;
+    SELECT result.label=result.label INTO matched;
+    RETURN matched AND copied.id IS NULL AND copied.label IS NULL
         AND pg_typeof(copied.id)='record_positive'::regtype
         AND pg_typeof(copied.label)='record_label'::regtype;
 END$$;

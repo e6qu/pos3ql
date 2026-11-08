@@ -924,6 +924,20 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .column_type_oid(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -2578,11 +2592,8 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
             return None;
         }
         let outer = self.outer?;
-        let catalog = super::storage_catalog(
-            self.catalog.storage,
-            self.catalog.arena,
-            self.catalog.txid,
-        );
+        let catalog =
+            super::storage_catalog(self.catalog.storage, self.catalog.arena, self.catalog.txid);
         crate::sql::exec::ColTypeResolver::column_meta(
             &crate::sql::eval::RuntimeColumnTypes {
                 row: outer,

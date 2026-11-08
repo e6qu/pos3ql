@@ -11504,13 +11504,10 @@ fn patch_array_subquery_field_types<'q>(
                 if let Some(metadata) =
                     array_subquery_field_type(expression, outer_scope, storage, txid, arena)?
                 {
-                    out[column] = ColDesc::new(
-                        out[column].name,
-                        metadata.type_oid,
-                        metadata.ctype.typlen(),
-                    )
-                    .with_type_mod(metadata.type_mod)
-                    .with_collation(metadata.collation);
+                    out[column] =
+                        ColDesc::new(out[column].name, metadata.type_oid, metadata.ctype.typlen())
+                            .with_type_mod(metadata.type_mod)
+                            .with_collation(metadata.collation);
                 }
                 column += 1;
             }
@@ -12284,9 +12281,10 @@ fn describe_scope_record_star<'q>(
             name: table,
         } if scope.table_index(table).is_ok()
             && (matches!(base, Expr::WholeRow(_))
-                || scope.find_column(None, table).is_err_and(|error| {
-                    error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                })) => {
+                || scope
+                    .find_column(None, table)
+                    .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)) =>
+        {
             let t = scope.table_index(table)?;
             for (column, _) in scope
                 .defs

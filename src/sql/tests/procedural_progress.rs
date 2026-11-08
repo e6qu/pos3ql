@@ -1209,13 +1209,13 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
             let mut holder =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
             let wait = if combined {
-                "PERFORM pg_advisory_lock(41), pg_advisory_xact_lock(42);"
+                "PERFORM pg_advisory_lock(41), nextval('held_expression_sequence'), pg_advisory_xact_lock(42);"
             } else {
                 "PERFORM pg_advisory_lock(41); PERFORM pg_advisory_xact_lock(42);"
             };
             writer.success(
             &mut engine,
-            &format!("CREATE SEQUENCE held_trigger_sequence; CREATE TABLE held_trigger_rows(id integer); \
+            &format!("CREATE SEQUENCE held_trigger_sequence; CREATE SEQUENCE held_expression_sequence; CREATE TABLE held_trigger_rows(id integer); \
              CREATE TABLE held_trigger_audit(stage text,id integer,n bigint,note text); \
              CREATE FUNCTION held_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
              DECLARE n bigint:=nextval('held_trigger_sequence'); saved text:=repeat('x',8192); \
@@ -1313,6 +1313,7 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
                     &mut engine,
                     "SELECT stage,id,n,length(note) FROM held_trigger_audit ORDER BY n,stage; \
              SELECT last_value FROM held_trigger_sequence; \
+            SELECT last_value,is_called FROM held_expression_sequence; \
              SELECT pg_advisory_unlock(41),pg_advisory_unlock(41),pg_advisory_unlock(41)",
                     true
                 )),
@@ -1322,10 +1323,55 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
                     "after|2|2|8193",
                     "before|2|2|8192",
                     "2",
+                    if combined { "2|t" } else { "1|f" },
                     "t|t|f"
                 ]
             );
         }
+    }
+}
+
+#[test]
+fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-expression-locks-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine,
+            "CREATE SEQUENCE nested_expression_sequence; CREATE TABLE nested_expression_rows(id integer); \
+             CREATE TABLE nested_expression_audit(label text,n bigint); \
+             CREATE FUNCTION nested_expression_call(label text) RETURNS bigint LANGUAGE plpgsql AS $$ \
+             DECLARE n bigint:=nextval('nested_expression_sequence'); BEGIN \
+             PERFORM pg_advisory_lock(44); INSERT INTO nested_expression_audit VALUES(label,n); \
+             RETURN n; END$$; \
+             CREATE FUNCTION nested_expression_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM pg_advisory_lock(41),nested_expression_call('one'), \
+             nested_expression_call('two'),pg_advisory_lock(42); RETURN NEW; END$$; \
+             CREATE TRIGGER nested_expression_trigger AFTER INSERT ON nested_expression_rows \
+             FOR EACH ROW EXECUTE FUNCTION nested_expression_trigger(); \
+             INSERT INTO nested_expression_rows VALUES(1)", true);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                "SELECT label,n FROM nested_expression_audit ORDER BY n; \
+             SELECT last_value FROM nested_expression_sequence; \
+             SELECT pg_advisory_unlock(41),pg_advisory_unlock(41), \
+             pg_advisory_unlock(44),pg_advisory_unlock(44),pg_advisory_unlock(44), \
+             pg_advisory_unlock(42),pg_advisory_unlock(42)",
+                true
+            )),
+            ["one|1", "two|2", "2", "t|f|t|t|f|t|f"],
+            "{mode:?}"
+        );
     }
 }
 

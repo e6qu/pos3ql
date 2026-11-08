@@ -143,7 +143,12 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     let effects = core::cell::Cell::new(0);
     let mut saved = crate::mem::guard::forbid_alloc(|| {
         storage.begin_advisory_statement().unwrap();
-        let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), false);
+        let _statement = sequence::enter_statement(
+            &statement_arena,
+            guc.seq_session(),
+            false,
+            Some(storage.advisory_journal()),
+        );
         sequence::statement_effect(
             sequence::StatementEffectKind::Cursor,
             &[Datum::Text("before firing")],
@@ -184,8 +189,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             BEGIN PERFORM $1; RAISE EXCEPTION 'enclosing SQL parameters leaked'; \
                 EXCEPTION WHEN SQLSTATE '42P02' THEN NULL; END; \
             n := n + 1; PERFORM set_config('application_name', 'changed', true); \
-            PERFORM pg_advisory_lock(41); \
-            PERFORM pg_advisory_xact_lock(42); \
+            PERFORM pg_advisory_lock(41), pg_advisory_xact_lock(42); \
             IF statement_timestamp() <> anchor OR transaction_timestamp() <> anchor THEN \
                 RAISE EXCEPTION 'trigger clocks changed'; END IF; \
             NEW.note := OLD.note || (TG_ARGV[0] || marker || current_setting('application_name') || current_user); \
@@ -326,7 +330,12 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
     crate::mem::guard::forbid_alloc(|| {
         storage.preserve_advisory_statement();
         storage.begin_advisory_statement().unwrap();
-        let _statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
+        let _statement = sequence::enter_statement(
+            &statement_arena,
+            guc.seq_session(),
+            true,
+            Some(storage.advisory_journal()),
+        );
         assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
         assert_eq!(
             crate::sql::eval::funcs::system::current_identity().as_str(),
@@ -410,8 +419,12 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             .with_remaining_region(|scratch| {
                 storage.preserve_advisory_statement();
                 storage.begin_advisory_statement().unwrap();
-                let _statement =
-                    sequence::enter_statement(&statement_arena, guc.seq_session(), true);
+                let _statement = sequence::enter_statement(
+                    &statement_arena,
+                    guc.seq_session(),
+                    true,
+                    Some(storage.advisory_journal()),
+                );
                 let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
@@ -447,7 +460,12 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         crate::mem::guard::forbid_alloc(|| {
             storage.preserve_advisory_statement();
             storage.begin_advisory_statement().unwrap();
-            let statement = sequence::enter_statement(&statement_arena, guc.seq_session(), true);
+            let statement = sequence::enter_statement(
+                &statement_arena,
+                guc.seq_session(),
+                true,
+                Some(storage.advisory_journal()),
+            );
             let _settings = super::super::super::guc::enter_eval_scope(&guc, &mut transaction);
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {

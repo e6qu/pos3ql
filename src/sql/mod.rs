@@ -11706,6 +11706,7 @@ impl Engine {
                     arena,
                     guc.seq_session(),
                     txn.suspended_statement_context().is_some(),
+                    Some(self.storage.advisory_journal()),
                 );
                 let output_mark = responder.buffer.mark();
                 let statement_mark =
@@ -12253,6 +12254,7 @@ impl Engine {
                             arena,
                             guc.seq_session(),
                             txn.suspended_statement_context().is_some(),
+                            Some(self.storage.advisory_journal()),
                         );
                         let statement_mark = txn.statement_mark(
                             self.wal.stage_mark(txn.txid),
@@ -12884,6 +12886,7 @@ impl Engine {
                         arena,
                         guc.seq_session(),
                         progress.waiting.is_some(),
+                        Some(self.storage.advisory_journal()),
                     );
                     let output_mark = responder.buffer.mark();
                     let result = if lock_timeout_expired {
@@ -13119,7 +13122,12 @@ impl Engine {
                 Ok(descriptors) => descriptors,
                 Err(error) => return Ok(Err(error)),
             };
-            let scope = sequence::enter_statement(arena, guc.seq_session(), resumed);
+            let scope = sequence::enter_statement(
+                arena,
+                guc.seq_session(),
+                resumed,
+                Some(self.storage.advisory_journal()),
+            );
             let output_mark = responder.buffer.mark();
             let effect_reads = self
                 .ckpt
@@ -18613,6 +18621,7 @@ impl Engine {
             arena,
             guc.seq_session(),
             txn.suspended_statement_context().is_some(),
+            Some(self.storage.advisory_journal()),
         );
         let routine_transaction_context = txn
             .suspended_statement_context()

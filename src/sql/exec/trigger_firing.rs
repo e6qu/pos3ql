@@ -302,7 +302,6 @@ struct SavedBinding {
     values: local_values::SavedValues,
     environment: SavedEnvironment,
     progress: crate::sql::sequence::SavedStatementPosition,
-    advisory: crate::sql::lock::AdvisoryStatementPosition,
 }
 
 struct SavedMetadata {
@@ -362,7 +361,6 @@ impl SavedBinding {
         binding.validate()?;
         let progress = crate::sql::sequence::SavedStatementPosition::capture()?;
         let storage = context.storage();
-        let advisory = storage.advisory_statement_position();
         let environment = SavedEnvironment::capture(environment, &storage.execution_control)?;
         let definitions = storage.table_definition_images();
         let definition = definitions.retain_relation(&binding.definition)?;
@@ -448,7 +446,6 @@ impl SavedBinding {
             values,
             environment,
             progress,
-            advisory,
         })
     }
 }
@@ -607,7 +604,6 @@ impl SuspendedTriggerFiring {
             &mut self.saved.values,
             &mut self.saved.environment,
             &mut self.saved.progress,
-            &mut self.saved.advisory,
             frame,
             TriggerExecContext {
                 host: context.host.reborrow(),
@@ -660,81 +656,78 @@ fn resume<'run>(
     values: &mut local_values::SavedValues,
     environment: &mut SavedEnvironment,
     progress: &mut crate::sql::sequence::SavedStatementPosition,
-    advisory: &mut crate::sql::lock::AdvisoryStatementPosition,
     frame: execution_frame::SuspendedExecutionFrame,
     mut context: TriggerExecContext<'_, 'run, '_>,
 ) -> Result<(FiringState, FiringProgress), ResumeError> {
     let prior = progress.take();
-    let attached = prior.with_resume(frame, |frame, admission| {
-        let mut advisory_admission = match context.storage().resume_advisory_position(*advisory) {
-            Ok(admission) => admission,
-            Err(error) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        let active_environment = match environment.enter(context.txn) {
-            Ok(active) => active,
-            Err(error) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        let (parsed, code) = match frame.source().parse(context.arena) {
-            Ok(parsed) => parsed,
-            Err(error) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        let decoded = match values.decode(context.arena) {
-            Ok(decoded) => decoded,
-            Err(error) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        let binding = match metadata.bind(decoded, parsed.input_sites, context.arena) {
-            Ok(binding) => binding,
-            Err(error) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        let execution = match frame.restore(context.arena, &code) {
-            Ok(execution) => execution,
-            Err((frame, error)) => return Err(ResumeError::Unattached(frame, error)),
-        };
-        admission.commit();
-        advisory_admission.commit();
-        values.clear();
-        let mut firing = TriggerFiring {
-            code,
-            execution,
-            binding,
-            environment: active_environment,
-            owner: metadata.owner,
-        };
-        match firing.execute(&mut context) {
-            Ok(accepted) => {
-                capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
-                environment.security = None;
-                environment.config = None;
-                Ok((FiringState::Complete, FiringProgress::Complete { accepted }))
-            }
-            Err(error) if control_flow::is_execution_wait(&error) => {
-                let saved_environment = SavedEnvironment::capture(
-                    &firing.environment,
-                    &context.storage().execution_control,
-                )
-                .map_err(ResumeError::Executed)?;
-                capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
-                let frame = firing
-                    .execution
-                    .suspend()
-                    .map_err(|(_, error)| ResumeError::Executed(error))?;
-                *progress = crate::sql::sequence::SavedStatementPosition::capture()
+    let attached = prior.with_resume(
+        frame,
+        crate::sql::lock::AdvisoryPositionTail::Unchanged,
+        |frame, admission| {
+            let active_environment = match environment.enter(context.txn) {
+                Ok(active) => active,
+                Err(error) => return Err(ResumeError::Unattached(frame, error)),
+            };
+            let (parsed, code) = match frame.source().parse(context.arena) {
+                Ok(parsed) => parsed,
+                Err(error) => return Err(ResumeError::Unattached(frame, error)),
+            };
+            let decoded = match values.decode(context.arena) {
+                Ok(decoded) => decoded,
+                Err(error) => return Err(ResumeError::Unattached(frame, error)),
+            };
+            let binding = match metadata.bind(decoded, parsed.input_sites, context.arena) {
+                Ok(binding) => binding,
+                Err(error) => return Err(ResumeError::Unattached(frame, error)),
+            };
+            let execution = match frame.restore(context.arena, &code) {
+                Ok(execution) => execution,
+                Err((frame, error)) => return Err(ResumeError::Unattached(frame, error)),
+            };
+            admission.commit();
+            values.clear();
+            let mut firing = TriggerFiring {
+                code,
+                execution,
+                binding,
+                environment: active_environment,
+                owner: metadata.owner,
+            };
+            match firing.execute(&mut context) {
+                Ok(accepted) => {
+                    capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
+                    environment.security = None;
+                    environment.config = None;
+                    Ok((FiringState::Complete, FiringProgress::Complete { accepted }))
+                }
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    let saved_environment = SavedEnvironment::capture(
+                        &firing.environment,
+                        &context.storage().execution_control,
+                    )
                     .map_err(ResumeError::Executed)?;
-                *advisory = context.storage().advisory_statement_position();
-                *environment = saved_environment;
-                Ok((
-                    FiringState::Paused(frame),
-                    FiringProgress::Waiting {
-                        control: error
-                            .sqlstate
-                            .internal_control()
-                            .expect("execution wait is private control"),
-                    },
-                ))
+                    capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
+                    let frame = firing
+                        .execution
+                        .suspend()
+                        .map_err(|(_, error)| ResumeError::Executed(error))?;
+                    *progress = crate::sql::sequence::SavedStatementPosition::capture()
+                        .map_err(ResumeError::Executed)?;
+                    *environment = saved_environment;
+                    Ok((
+                        FiringState::Paused(frame),
+                        FiringProgress::Waiting {
+                            control: error
+                                .sqlstate
+                                .internal_control()
+                                .expect("execution wait is private control"),
+                        },
+                    ))
+                }
+                Err(error) => Err(ResumeError::Executed(error)),
             }
-            Err(error) => Err(ResumeError::Executed(error)),
-        }
-    });
+        },
+    );
     let result = match attached {
         Ok(result) => result,
         Err((frame, error)) => Err(ResumeError::Unattached(frame, error)),

@@ -17970,6 +17970,7 @@ struct TriggerExecutionStatus<'a> {
     set_result: Option<PlpgsqlSetResult>,
     outputs: MutableSlice<OutputBinding>,
     pending_write: Option<write_completion::PendingNestedWrite>,
+    pending_statement: Option<super::sequence::SavedStatementPosition>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -18002,6 +18003,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             set_result: None,
             outputs,
             pending_write: None,
+            pending_statement: None,
         })
     }
     fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
@@ -26832,6 +26834,20 @@ fn execute_trigger_step<'a>(
         };
         prepare_static_plpgsql_statement(context, statement, &row)?
     };
+    let position = match status.pending_statement.take() {
+        Some(position) => {
+            if let Err(((), error)) = position.with_resume(
+                (),
+                super::lock::AdvisoryPositionTail::Appended,
+                |(), admission| admission.commit(),
+            ) {
+                status.pending_statement = Some(position);
+                return Err(error);
+            }
+            position
+        }
+        None => super::sequence::SavedStatementPosition::capture()?,
+    };
     let mut execute = || match statement {
         TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
         TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
@@ -29065,6 +29081,10 @@ fn execute_trigger_step<'a>(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "nested write cannot wait without retaining its unfinished operation"
         ));
+    }
+    if status.pending_write.is_none() && result.as_ref().is_err_and(control_flow::is_execution_wait)
+    {
+        status.pending_statement = Some(position);
     }
     result
 }

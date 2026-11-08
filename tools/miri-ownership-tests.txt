@@ -136,6 +136,7 @@ sql::query::invocation_results::ownership_tests::failed_result_directory_growth_
 sql::query::routine_contract_tests::pending_routine_contract_survives_front_rewind_and_rejects_a_reused_identity
 sql::sequence::tests::cached_value_cursors_skip_exact_effect_ranges_and_restore_sparse_sessions
 sql::sequence::tests::retained_statement_position_admission_keeps_receipts_and_owners
+sql::sequence::tests::retained_statement_position_restores_nested_advisory_receipts_atomically
 sql::sequence::tests::compact_ready_inputs_mix_with_full_errors_waits_and_scoped_cursors
 sql::sequence::tests::cursor_only_statements_keep_exact_identity_across_waits_and_finish
 sql::sequence::tests::cursor_owned_query_sequence_positions_reject_reset_or_replaced_arena

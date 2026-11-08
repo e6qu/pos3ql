@@ -423,6 +423,13 @@ skips completed calls only after every firing resource is available; a failed
 attachment restores the caller's position. New statements and reused connection
 identities reject old positions with `40001`. Other connections can release
 their journal slots without changing the retained call order.
+An unfinished procedural instruction retains its own earlier position, after
+input preparation. For example, if `PERFORM pg_advisory_lock(41),
+pg_advisory_xact_lock(42)` waits on the second lock, resumption reuses the first
+lock call's receipt rather than taking another hold. Sequence calls use the
+same instruction boundary. Attachment validates both journals before publishing
+either position. A completed instruction discards this boundary; the firing's
+outer position continues to skip earlier instructions.
 Write completion uses a cursor over queued row events followed by the selected
 AFTER STATEMENT triggers. It retains the row-event index, trigger depth,
 operation and last selected trigger name without syntax pointers. The same
@@ -450,7 +457,7 @@ A selected statement-trigger definition has its own temporary reservation,
 released before that body starts; row-trigger selections retain only their
 queue positions. Idle connections carry the small arena owner, not a maximum
 trigger definition or an additional startup pool.
-BEFORE and INSTEAD OF work, nested write handoffs, modifying CTEs, rewrite rules,
+BEFORE and INSTEAD OF work, nested row phases and dynamic writes, modifying CTEs, rewrite rules,
 COPY and replication apply still need the same complete enclosing owner before
 their rejected checked inputs can be enabled. Cold object-store waiting and the
 full protocol paths remain qualification gates in the plan.

@@ -1511,7 +1511,7 @@ mod tests {
         let invocations = RoutineInvocationState::new(&statement);
         let actions = Cell::new(0);
         crate::mem::guard::forbid_alloc(|| {
-            let scope = sequence::enter_statement(&statement, guc.seq_session(), false);
+            let scope = sequence::enter_statement(&statement, guc.seq_session(), false, None);
             let start = sequence::begin_replay_cursor().unwrap();
             with_routine_invocation_scope(
                 Some(RoutineInvocationContext::new(&invocations, &statement)),

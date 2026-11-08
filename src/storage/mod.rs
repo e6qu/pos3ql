@@ -14845,6 +14845,40 @@ pub(crate) struct AdvisoryPositionAdmission {
     prior: Option<crate::sql::lock::AdvisoryPositionRestore>,
 }
 
+/// Keeps the connection's existing lock registry available while the engine
+/// mutably borrows storage. Cloning the handle allocates no registry or pool.
+pub(crate) struct AdvisoryJournal {
+    locks: std::sync::Arc<Mutex<LockState>>,
+    connection_id: i32,
+}
+
+impl AdvisoryJournal {
+    pub(crate) fn position(&self) -> crate::sql::lock::AdvisoryStatementPosition {
+        self.locks
+            .lock()
+            .expect("lock state is not poisoned")
+            .advisory
+            .statement_position(self.connection_id)
+    }
+
+    pub(crate) fn resume_position(
+        &self,
+        saved: crate::sql::lock::AdvisoryStatementPosition,
+        tail: crate::sql::lock::AdvisoryPositionTail,
+    ) -> Result<AdvisoryPositionAdmission, SqlError> {
+        let prior = self
+            .locks
+            .lock()
+            .expect("lock state is not poisoned")
+            .advisory
+            .resume_position(saved, self.connection_id, tail)?;
+        Ok(AdvisoryPositionAdmission {
+            locks: std::sync::Arc::clone(&self.locks),
+            prior: Some(prior),
+        })
+    }
+}
+
 impl AdvisoryPositionAdmission {
     pub(crate) fn commit(&mut self) {
         self.prior = None;
@@ -51484,18 +51518,11 @@ impl Storage {
             .statement_position(self.current_connection_id())
     }
 
-    pub(crate) fn resume_advisory_position(
-        &self,
-        saved: crate::sql::lock::AdvisoryStatementPosition,
-    ) -> Result<AdvisoryPositionAdmission, SqlError> {
-        let prior = self
-            .lock_state()
-            .advisory
-            .resume_position(saved, self.current_connection_id())?;
-        Ok(AdvisoryPositionAdmission {
+    pub(crate) fn advisory_journal(&self) -> AdvisoryJournal {
+        AdvisoryJournal {
             locks: std::sync::Arc::clone(&self.locks),
-            prior: Some(prior),
-        })
+            connection_id: self.current_connection_id(),
+        }
     }
 
     pub(crate) fn advisory_statement_mark(&self) -> crate::sql::lock::AdvisoryStatementMark {

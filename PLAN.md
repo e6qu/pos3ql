@@ -70,9 +70,10 @@ resumes, it must see the same rows and local values, issue no extra order number
 or audit write, and keep the original timeout. Failed attachment must leave
 both the saved call and the caller's context usable.
 
-Finish retaining nested SQL's command and read snapshot together. Resume its unfinished
-write and return its actual result to the trigger without issuing a new command.
-Completion and another pause must restore the caller's visibility. Triggers
+Static nested INSERT, UPDATE and DELETE now keep their command, read snapshot
+and unfinished AFTER work with the calling trigger. Extend that ownership to
+dynamic SQL, returned values and unfinished row phases. Resume the same command;
+completion and another pause must restore the caller's visibility. Triggers
 cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`
 continues to carry trigger arguments. Only completed row collections may become
 transition tables, and each operation in a mixed write keeps its own tables.
@@ -105,6 +106,10 @@ Some function-body waits currently reject earlier non-repeatable effects with
 `0A000`. Preserve those effects instead of enlarging retry or memory limits.
 Keep the original command deadline, settings, identity, snapshot and clocks
 while binding inputs, waiting, running handlers or crossing internal commits.
+Keep the unfinished instruction's receipt position separate from the firing's
+completed instructions. A sequence or advisory-lock call before a wait in the
+same SQL expression must not run twice. Extend this ownership to the remaining
+expression values and query positions before allowing their object-store waits.
 Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-request-path),
 including buffered replies, error recovery and protected commit receipts.
 A caught timeout must not be delivered again or replay completed work when its

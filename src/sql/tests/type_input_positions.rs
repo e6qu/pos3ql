@@ -425,7 +425,7 @@ fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() 
         let session = connection.guc.seq_session();
         crate::mem::guard::forbid_alloc(|| {
             {
-                let _scope = crate::sql::sequence::enter_statement(&arena, session, false);
+                let _scope = crate::sql::sequence::enter_statement(&arena, session, false, None);
                 let values = crate::sql::sequence::statement_effect(
                     crate::sql::sequence::StatementEffectKind::Cursor,
                     &[Datum::Text("fetch")],
@@ -451,7 +451,7 @@ fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() 
             }
             arena.recycle_front();
             {
-                let scope = crate::sql::sequence::enter_statement(&arena, session, true);
+                let scope = crate::sql::sequence::enter_statement(&arena, session, true, None);
                 let values = crate::sql::sequence::statement_effect(
                     crate::sql::sequence::StatementEffectKind::Cursor,
                     &[Datum::Text("fetch")],

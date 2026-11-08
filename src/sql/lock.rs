@@ -471,6 +471,12 @@ pub(crate) struct AdvisoryStatementPosition {
     progress: Option<(core::num::NonZeroU64, usize, usize)>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AdvisoryPositionTail {
+    Unchanged,
+    Appended,
+}
+
 #[derive(Debug)]
 pub(crate) struct AdvisoryPositionRestore {
     connection_id: i32,
@@ -612,22 +618,28 @@ impl AdvisoryLockManager {
         &mut self,
         saved: AdvisoryStatementPosition,
         connection_id: i32,
+        tail: AdvisoryPositionTail,
     ) -> Result<AdvisoryPositionRestore, SqlError> {
         let current = self.statement_position(connection_id);
-        if saved.connection_id != connection_id
-            || saved
-                .progress
-                .map(|(statement, actions, _)| (statement, actions))
-                != current
-                    .progress
-                    .map(|(statement, actions, _)| (statement, actions))
-        {
+        let matches = match (saved.progress, current.progress) {
+            (None, None) => true,
+            (Some((statement, actions, position)), Some((live, count, _))) => {
+                statement == live
+                    && position <= actions
+                    && match tail {
+                        AdvisoryPositionTail::Unchanged => actions == count,
+                        AdvisoryPositionTail::Appended => actions <= count,
+                    }
+            }
+            _ => false,
+        };
+        if saved.connection_id != connection_id || !matches {
             return Err(sql_err!(
                 sqlstate::SERIALIZATION_FAILURE,
                 "advisory lock statement changed while its invocation was suspended"
             ));
         }
-        let prior = if let Some((statement, actions, position)) = saved.progress {
+        let prior = if let Some((statement, _, position)) = saved.progress {
             let state = self
                 .replay_states
                 .iter_mut()
@@ -635,7 +647,7 @@ impl AdvisoryLockManager {
                 .expect("validated advisory statement exists");
             let prior = Some((statement, state.cursor, state.replay_count));
             state.cursor = position;
-            state.replay_count = actions;
+            state.replay_count = current.progress.expect("validated statement exists").1;
             prior
         } else {
             None
@@ -1213,7 +1225,9 @@ mod tests {
                 )
                 .unwrap();
             advisory.begin_statement(11, id(2)).unwrap();
-            let error = advisory.resume_position(absent, 11).unwrap_err();
+            let error = advisory
+                .resume_position(absent, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
             advisory
                 .acquire(
@@ -1230,17 +1244,24 @@ mod tests {
             // Another connection can remove earlier global receipt slots.
             advisory.begin_statement(22, id(3)).unwrap();
             assert_eq!(
-                advisory.resume_position(saved, 22).unwrap_err().sqlstate,
+                advisory
+                    .resume_position(saved, 22, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             advisory.preserve_statement(11);
             advisory.begin_statement(11, id(4)).unwrap();
             let caller = advisory.statement_mark(11);
-            let prior = advisory.resume_position(saved, 11).unwrap();
+            let prior = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
             assert_ne!(advisory.statement_mark(11), caller);
             advisory.restore_position(prior);
             assert_eq!(advisory.statement_mark(11), caller);
-            let _committed = advisory.resume_position(saved, 11).unwrap();
+            let _committed = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
             advisory
                 .acquire(
                     AdvisoryKey::from_bigint(3),
@@ -1254,9 +1275,30 @@ mod tests {
                 .unwrap();
             let later = advisory.statement_position(11);
             assert_eq!(
-                advisory.resume_position(saved, 11).unwrap_err().sqlstate,
+                advisory
+                    .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
+            let caller = advisory.statement_mark(11);
+            let prior = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Appended)
+                .unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(3),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    4,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_eq!(advisory.statement_position(11).progress, later.progress);
+            advisory.restore_position(prior);
+            assert_eq!(advisory.statement_mark(11), caller);
             advisory.preserve_statement(11);
             advisory.begin_statement(11, id(5)).unwrap();
             advisory
@@ -1273,7 +1315,9 @@ mod tests {
             let middle = advisory.statement_position(11);
             advisory.preserve_statement(11);
             advisory.begin_statement(11, id(8)).unwrap();
-            let _committed = advisory.resume_position(middle, 11).unwrap();
+            let _committed = advisory
+                .resume_position(middle, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
             advisory
                 .acquire(
                     AdvisoryKey::from_bigint(3),
@@ -1285,7 +1329,9 @@ mod tests {
                     &mut graph,
                 )
                 .unwrap();
-            let _committed = advisory.resume_position(later, 11).unwrap();
+            let _committed = advisory
+                .resume_position(later, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
             assert!(
                 advisory
                     .unlock_session(
@@ -1329,18 +1375,27 @@ mod tests {
             let finished = advisory.statement_position(11);
             advisory.cancel_statement(11, &mut graph);
             assert_eq!(
-                advisory.resume_position(finished, 11).unwrap_err().sqlstate,
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             advisory.begin_statement(11, id(6)).unwrap();
             assert_eq!(
-                advisory.resume_position(finished, 11).unwrap_err().sqlstate,
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
             advisory.drop_connection(11);
             advisory.begin_statement(11, id(7)).unwrap();
             assert_eq!(
-                advisory.resume_position(finished, 11).unwrap_err().sqlstate,
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
                 sqlstate::SERIALIZATION_FAILURE
             );
         });

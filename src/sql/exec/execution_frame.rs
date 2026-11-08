@@ -56,6 +56,7 @@ pub(super) struct SuspendedExecutionFrame {
     set_result: Option<PlpgsqlSetResult>,
     outputs: MutableSlice<OutputBinding>,
     pending_write: Option<write_completion::PendingNestedWrite>,
+    pending_statement: Option<super::super::sequence::SavedStatementPosition>,
     initialization: Initialization,
 }
 
@@ -121,6 +122,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             set_result,
             outputs,
             pending_write,
+            pending_statement,
         } = self.status;
         Ok(SuspendedExecutionFrame {
             locals,
@@ -134,6 +136,7 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             set_result,
             outputs,
             pending_write,
+            pending_statement,
             initialization: self.initialization,
         })
     }
@@ -163,6 +166,7 @@ impl SuspendedExecutionFrame {
             set_result,
             outputs,
             pending_write,
+            pending_statement,
             initialization,
         } = self;
         let mark = arena.mark();
@@ -180,6 +184,7 @@ impl SuspendedExecutionFrame {
                         set_result,
                         outputs,
                         pending_write,
+                        pending_statement,
                         initialization,
                     },
                     error,
@@ -198,6 +203,7 @@ impl SuspendedExecutionFrame {
                 set_result,
                 outputs,
                 pending_write,
+                pending_statement,
                 initialization,
             };
             // SAFETY: suspension removed all references created while decoding.
@@ -220,6 +226,7 @@ impl SuspendedExecutionFrame {
                 set_result,
                 outputs,
                 pending_write,
+                pending_statement,
             },
             initialization,
         })

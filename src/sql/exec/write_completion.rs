@@ -445,10 +445,6 @@ impl WriteCompletionState {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "write resumption uses the original connection execution services"
-)]
 pub(in crate::sql) fn resume(
     engine: &mut super::super::Engine,
     txn: &mut TxnState,

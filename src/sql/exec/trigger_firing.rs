@@ -634,7 +634,8 @@ impl SuspendedTriggerFiring {
         result
     }
 
-    pub(super) fn new_values<'out>(
+    #[cfg(test)]
+    fn new_values<'out>(
         &self,
         arena: &'out Arena,
     ) -> Result<Option<&'out [Datum<'out>]>, SqlError> {

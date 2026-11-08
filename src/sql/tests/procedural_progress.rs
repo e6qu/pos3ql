@@ -1192,62 +1192,96 @@ fn checked_array_inputs_in_row_triggers_keep_inserted_rows_and_prior_effects() {
 
 #[test]
 fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lock_waits() {
-    for mode in [
-        crate::config::TransactionMode::Mvcc,
-        crate::config::TransactionMode::Locking,
-    ] {
-        let mut config = test_config(&format!("retained-write-completion-{mode:?}"));
-        config.transaction_mode = mode;
-        config.execution_control_bytes = 64 << 10;
-        config.execution_control_leases = 64;
-        config.row_work_bytes = 128 << 10;
-        config.row_work_leases = 64;
-        let mut budget = test_engine_budget(&config, 1 << 29);
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
-        let mut holder =
-            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-        writer.success(
+    for combined in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("retained-write-completion-{mode:?}-{combined}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let wait = if combined {
+                "PERFORM pg_advisory_lock(41), pg_advisory_xact_lock(42);"
+            } else {
+                "PERFORM pg_advisory_lock(41); PERFORM pg_advisory_xact_lock(42);"
+            };
+            writer.success(
             &mut engine,
-            "CREATE SEQUENCE held_trigger_sequence; CREATE TABLE held_trigger_rows(id integer); \
+            &format!("CREATE SEQUENCE held_trigger_sequence; CREATE TABLE held_trigger_rows(id integer); \
              CREATE TABLE held_trigger_audit(stage text,id integer,n bigint,note text); \
              CREATE FUNCTION held_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
              DECLARE n bigint:=nextval('held_trigger_sequence'); saved text:=repeat('x',8192); \
              BEGIN INSERT INTO held_trigger_audit VALUES('before',NEW.id,n,saved); \
-             PERFORM pg_advisory_lock(41); PERFORM pg_advisory_xact_lock(42); \
+             {wait} \
              saved:=saved||'!'; INSERT INTO held_trigger_audit VALUES('after',NEW.id,n,saved); \
              RETURN NEW; END$$; CREATE TRIGGER held_trigger AFTER INSERT ON held_trigger_rows \
-             FOR EACH ROW EXECUTE FUNCTION held_trigger()",
+             FOR EACH ROW EXECUTE FUNCTION held_trigger()"),
             true,
         );
-        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
-        let sql = "INSERT INTO held_trigger_rows VALUES(1),(2) RETURNING id";
-        let mut status = writer.execute_status(&mut engine, sql, true);
-        for _ in 0..2 {
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
+            let sql = "INSERT INTO held_trigger_rows VALUES(1),(2) RETURNING id";
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            for _ in 0..2 {
+                let ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "trigger did not retain its write: {:?}: {}",
+                        status,
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert!(writer.transaction.has_pending_write_completion());
+                assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
+                assert!(command_tags(writer.send.readable()).is_empty());
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT 40+2; SELECT last_value FROM held_trigger_sequence",
+                        true
+                    )),
+                    ["42", "1"]
+                );
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        sql,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
             let ExecutionStatus::Blocked {
                 completed_statements,
                 output_mark,
                 wait,
             } = status
             else {
-                panic!(
-                    "trigger did not retain its write: {:?}: {}",
-                    status,
-                    String::from_utf8_lossy(writer.send.readable())
-                );
+                panic!("trigger stopped waiting before its lock was released");
             };
             assert_eq!(wait, StatementWait::Lock);
-            assert!(writer.transaction.has_pending_write_completion());
-            assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
-            assert!(command_tags(writer.send.readable()).is_empty());
-            assert_eq!(
-                data_rows(&holder.success(
-                    &mut engine,
-                    "SELECT 40+2; SELECT last_value FROM held_trigger_sequence",
-                    true
-                )),
-                ["42", "1"]
-            );
+            holder.success(&mut engine, "COMMIT", true);
             writer.send.truncate_to(output_mark);
             writer.arena.recycle_front();
             status = crate::mem::guard::forbid_alloc(|| {
@@ -1265,60 +1299,33 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
                 )
             })
             .unwrap();
-        }
-        let ExecutionStatus::Blocked {
-            completed_statements,
-            output_mark,
-            wait,
-        } = status
-        else {
-            panic!("trigger stopped waiting before its lock was released");
-        };
-        assert_eq!(wait, StatementWait::Lock);
-        holder.success(&mut engine, "COMMIT", true);
-        writer.send.truncate_to(output_mark);
-        writer.arena.recycle_front();
-        status = crate::mem::guard::forbid_alloc(|| {
-            engine.execute_simple_from(
-                sql,
-                completed_statements,
-                &writer.arena,
-                &mut writer.transaction,
-                &mut writer.pool,
-                &mut writer.cursors,
-                &writer.guc,
-                &mut Responder::new(&mut writer.send),
-                writer.connection_id,
-                false,
-            )
-        })
-        .unwrap();
-        assert_eq!(status, ExecutionStatus::Complete, "{mode:?}");
-        assert!(
-            error_sqlstates(writer.send.readable()).is_empty(),
-            "{}",
-            String::from_utf8_lossy(writer.send.readable())
-        );
-        assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
-        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 2"]);
-        assert!(!writer.transaction.has_pending_write_completion());
-        assert_eq!(
-            data_rows(&writer.success(
-                &mut engine,
-                "SELECT stage,id,n,length(note) FROM held_trigger_audit ORDER BY n,stage; \
+            assert_eq!(status, ExecutionStatus::Complete, "{mode:?}");
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 2"]);
+            assert!(!writer.transaction.has_pending_write_completion());
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT stage,id,n,length(note) FROM held_trigger_audit ORDER BY n,stage; \
              SELECT last_value FROM held_trigger_sequence; \
              SELECT pg_advisory_unlock(41),pg_advisory_unlock(41),pg_advisory_unlock(41)",
-                true
-            )),
-            [
-                "after|1|1|8193",
-                "before|1|1|8192",
-                "after|2|2|8193",
-                "before|2|2|8192",
-                "2",
-                "t|t|f"
-            ]
-        );
+                    true
+                )),
+                [
+                    "after|1|1|8193",
+                    "before|1|1|8192",
+                    "after|2|2|8193",
+                    "before|2|2|8192",
+                    "2",
+                    "t|t|f"
+                ]
+            );
+        }
     }
 }
 
@@ -1421,7 +1428,7 @@ fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
              SELECT kind,count(*),min(length(note)),max(length(note)) FROM nested_held_audit GROUP BY kind ORDER BY kind; \
              SELECT n FROM nested_held_audit WHERE kind='parent-after'; \
              SELECT last_value FROM nested_held_sequence", true)),
-            ["1|1", "2|1", "child-after|2|8193|8193", "child-before|2|8192|8192", 
+            ["1|1", "2|1", "child-after|2|8193|8193", "child-before|2|8192|8192",
              "parent-after|1|8193|8193", "parent-before|1|8192|8192", "2", "2"]);
     }
 }

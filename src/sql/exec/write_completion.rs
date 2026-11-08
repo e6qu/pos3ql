@@ -230,6 +230,77 @@ pub(crate) struct SuspendedWriteCompletion {
     state: MutableSlice<WriteCompletionState>,
 }
 
+pub(super) struct PendingNestedWrite {
+    command: Option<super::super::txn::SuspendedTriggerSql>,
+    completion: SuspendedWriteCompletion,
+}
+
+impl PendingNestedWrite {
+    pub(super) fn new(
+        command: super::super::txn::SuspendedTriggerSql,
+        mut completion: SuspendedWriteCompletion,
+    ) -> Self {
+        completion.state[0].cursor.reply = CompletionReply::CountOnly;
+        Self {
+            command: Some(command),
+            completion,
+        }
+    }
+
+    pub(super) fn poll(
+        &mut self,
+        context: &mut TriggerExecContext<'_, '_, '_>,
+    ) -> Result<u64, SqlError> {
+        let command = self.command.take().ok_or_else(|| {
+            sql_err!(sqlstate::INTERNAL_ERROR, "nested write is already finished")
+        })?;
+        let mut command = match command.resume(context.txn) {
+            Ok(command) => command,
+            Err((command, error)) => {
+                self.command = Some(command);
+                return Err(error);
+            }
+        };
+        let prior = command.write_completion_boundary;
+        command.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+            mark: self.completion.boundary(),
+            command: command.command_id(),
+            depth: command.trigger_depth(),
+        });
+        let result = self.completion.poll(&mut TriggerExecContext {
+            host: context.host.reborrow(),
+            txn: &mut command,
+            arena: context.arena,
+            params: crate::sql::eval::NO_PARAMS,
+            responder: context.responder,
+        });
+        command.write_completion_boundary = prior;
+        let result = result.map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "nested write response exceeded the output buffer"
+            )
+        })?;
+        match result {
+            Ok(()) => {
+                drop(command);
+                Ok(self.completion.state[0].cursor.completion.rows())
+            }
+            Err(error) if control_flow::is_execution_wait(&error) => {
+                self.command = Some(command.suspend());
+                Err(error)
+            }
+            Err(error) => {
+                drop(command);
+                if let PlpgsqlExecHost::Routine { engine, .. } = &mut context.host {
+                    engine.rollback_waiting_statement(context.txn, self.completion.boundary());
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
 struct WriteCompletionState {
     cursor: CompletionCursor,
     selected: Option<SavedAfterFiring>,
@@ -393,6 +464,12 @@ pub(in crate::sql) fn resume(
             "write resumption has no unfinished command"
         ));
     };
+    let prior = txn.write_completion_boundary;
+    txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+        mark: completion.boundary(),
+        command: txn.command_id(),
+        depth: txn.trigger_depth(),
+    });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
             engine,
@@ -406,6 +483,7 @@ pub(in crate::sql) fn resume(
         params: crate::sql::eval::NO_PARAMS,
         responder,
     });
+    txn.write_completion_boundary = prior;
     if result.is_err()
         || matches!(&result, Ok(Err(error)) if control_flow::is_execution_wait(error))
     {
@@ -580,6 +658,14 @@ impl CompletionCursor {
 }
 
 impl WriteCompletion {
+    fn rows(&self) -> u64 {
+        match self {
+            Self::Insert { rows, .. }
+            | Self::Update { rows, .. }
+            | Self::Delete { rows }
+            | Self::Merge { rows, .. } => *rows,
+        }
+    }
     fn events(&self) -> [Option<(u8, ColumnSet)>; 3] {
         match self {
             Self::Insert {

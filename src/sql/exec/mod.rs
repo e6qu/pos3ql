@@ -17969,6 +17969,7 @@ struct TriggerExecutionStatus<'a> {
     row_count: i64,
     set_result: Option<PlpgsqlSetResult>,
     outputs: MutableSlice<OutputBinding>,
+    pending_write: Option<write_completion::PendingNestedWrite>,
 }
 
 impl<'a> TriggerExecutionStatus<'a> {
@@ -18000,6 +18001,7 @@ impl<'a> TriggerExecutionStatus<'a> {
             row_count: 0,
             set_result: None,
             outputs,
+            pending_write: None,
         })
     }
     fn collect_set_rows(&mut self, result: PlpgsqlSetResult) {
@@ -23107,6 +23109,16 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
+    fn nested_write_boundary(&self) -> Option<super::txn::StatementMark> {
+        self.txn.write_completion_boundary?;
+        let PlpgsqlExecHost::Routine { engine, .. } = &self.host else {
+            return None;
+        };
+        Some(self.txn.statement_mark(
+            engine.wal.stage_mark(self.txn.txid),
+            engine.storage.lock_mark(),
+        ))
+    }
     /// A trigger can use the caller's execution services, but cannot end its
     /// transaction or inherit the enclosing SQL command's positional parameters.
     fn for_trigger(&mut self) -> TriggerExecContext<'_, 'a, 'b> {
@@ -26794,6 +26806,17 @@ fn execute_trigger_step<'a>(
     exception: Option<diagnostics::CaughtDiagnostic<'_>>,
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     super::query::check_timeout()?;
+    if status.pending_write.is_some() {
+        if !matches!(statement, TriggerStatement::Dml { .. }) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unfinished nested write belongs to a different instruction"
+            ));
+        }
+        return resume_nested_write(context, status).map(|()| control_flow::Step::complete());
+    }
+    let retained_parent = context.txn.write_completion_boundary.is_some()
+        && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
     let (statement, input_plan) = {
         let transition = TriggerTransition {
             definition,
@@ -28354,10 +28377,18 @@ fn execute_trigger_step<'a>(
             };
             let arena = context.arena;
             let params = context.params;
+            let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
 
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
             responder.clear_affected_rows();
             let outcome = responder.without_command_complete(|responder| {
                 insert(
@@ -28382,6 +28413,21 @@ fn execute_trigger_step<'a>(
                     }),
                 )
             });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                resume_nested_write(context, status)?;
+                return Ok(None);
+            }
             drop(command);
             match outcome {
                 Ok(Ok(())) => status.set_rows(
@@ -28446,9 +28492,17 @@ fn execute_trigger_step<'a>(
             };
             let arena = context.arena;
             let params = context.params;
+            let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -28473,6 +28527,21 @@ fn execute_trigger_step<'a>(
                     Some(&scope),
                 )
             });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                resume_nested_write(context, status)?;
+                return Ok(None);
+            }
             drop(command);
             match outcome {
                 Ok(Ok(())) => status.set_rows(
@@ -28537,9 +28606,17 @@ fn execute_trigger_step<'a>(
             };
             let arena = context.arena;
             let params = context.params;
+            let boundary = context.nested_write_boundary();
             let (storage, txn, responder, seq_session) = context.dml_parts_with_sequence();
             let mut command = txn.enter_trigger_sql(storage)?;
             let txn = &mut *command;
+            let parent_boundary = txn.write_completion_boundary;
+            txn.write_completion_boundary =
+                boundary.map(|mark| super::txn::WriteCompletionBoundary {
+                    mark,
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -28563,6 +28640,21 @@ fn execute_trigger_step<'a>(
                     Some(&scope),
                 )
             });
+            txn.write_completion_boundary = parent_boundary;
+            let completion = if matches!(&outcome, Ok(Err(error)) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION)
+            {
+                txn.pending_write_completion.take()
+            } else {
+                None
+            };
+            if let Some(completion) = completion {
+                status.pending_write = Some(write_completion::PendingNestedWrite::new(
+                    command.suspend(),
+                    completion,
+                ));
+                resume_nested_write(context, status)?;
+                return Ok(None);
+            }
             drop(command);
             match outcome {
                 Ok(Ok(())) => status.set_rows(
@@ -28953,12 +29045,28 @@ fn execute_trigger_step<'a>(
             }
         }
     };
-    match input_plan {
+    let result = match input_plan {
         Some((site, prepared)) => super::type_input_plans::with_owner(prepared.owner, || {
             super::type_inputs::with_source(prepared.source, site.text, prepared.bindings, execute)
         }),
         None => execute(),
+    };
+    if retained_parent
+        && status.pending_write.is_none()
+        && matches!(
+            statement,
+            TriggerStatement::Dml { .. }
+                | TriggerStatement::DynamicQuery(_)
+                | TriggerStatement::DynamicSelectInto(_)
+        )
+        && result.as_ref().is_err_and(control_flow::is_execution_wait)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "nested write cannot wait without retaining its unfinished operation"
+        ));
     }
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -29255,6 +29363,35 @@ fn execute_trigger_statement<'a>(
     execute: impl FnOnce() -> Result<Option<TriggerFlow<'a>>, SqlError>,
 ) -> Result<control_flow::Step<'a, 'a>, SqlError> {
     execute().map(control_flow::Step::Complete)
+}
+
+fn resume_nested_write(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    status: &mut TriggerExecutionStatus<'_>,
+) -> Result<(), SqlError> {
+    let mut pending = status.pending_write.take().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "nested write has no unfinished command"
+        )
+    })?;
+    match pending.poll(context) {
+        Ok(rows) => {
+            let published = context.responder.take_affected_rows();
+            if published != Some(rows) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "nested write completion lost its affected-row count"
+                ));
+            }
+            status.set_rows(rows)
+        }
+        Err(error) if control_flow::is_execution_wait(&error) => {
+            status.pending_write = Some(pending);
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[expect(

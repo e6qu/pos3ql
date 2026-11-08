@@ -459,6 +459,12 @@ and read visibility before restoring its caller. Attachment checks the original
 connection, database, transaction and parent command before changing any state.
 It resumes the same command rather than issuing a new identity. Completing or
 pausing that scope restores the caller's visibility again.
+Static nested INSERT, UPDATE and DELETE transfer their unfinished AFTER work
+into the calling firing. That firing owns the child's command scope and
+completion together, resumes the child before advancing its own instruction,
+and receives the affected-row count without emitting a second command tag.
+Unowned row phases and dynamic write waits still reject suspension with `0A000`;
+their full continuations remain required before enabling those waits.
 Nested procedural updates and deletes own independent row-selection ranges in
 the shared row-work pool. They do not replace the caller's selection or borrow
 it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry

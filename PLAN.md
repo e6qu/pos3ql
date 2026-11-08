@@ -70,7 +70,7 @@ resumes, it must see the same rows and local values, issue no extra order number
 or audit write, and keep the original timeout. Failed attachment must leave
 both the saved call and the caller's context usable.
 
-Retain nested SQL's command and read snapshot together. Resume its unfinished
+Finish retaining nested SQL's command and read snapshot together. Resume its unfinished
 write and return its actual result to the trigger without issuing a new command.
 Completion and another pause must restore the caller's visibility. Triggers
 cannot end the caller's transaction or inherit its SQL parameters; `TG_ARGV`

@@ -1323,6 +1323,110 @@ fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lo
 }
 
 #[test]
+fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("retained-nested-completion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine,
+            "CREATE SEQUENCE nested_held_sequence; CREATE TABLE nested_held_orders(id integer); \
+             CREATE TABLE nested_held_stock(id integer,amount integer); \
+             CREATE TABLE nested_held_audit(kind text,id integer,n bigint,note text); \
+             INSERT INTO nested_held_stock VALUES(1,0),(2,0); \
+             CREATE FUNCTION nested_held_child() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE n bigint:=nextval('nested_held_sequence'); note text:=repeat('c',8192); \
+             BEGIN INSERT INTO nested_held_audit VALUES('child-before',NEW.id,n,note); \
+             PERFORM pg_advisory_xact_lock(43); \
+             INSERT INTO nested_held_audit VALUES('child-after',NEW.id,n,note||'!'); RETURN NEW; END$$; \
+             CREATE TRIGGER nested_held_child AFTER UPDATE ON nested_held_stock \
+             FOR EACH ROW EXECUTE FUNCTION nested_held_child(); \
+             CREATE FUNCTION nested_held_parent() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE changed bigint; note text:=repeat('p',8192); BEGIN \
+             INSERT INTO nested_held_audit VALUES('parent-before',NEW.id,0,note); \
+             UPDATE nested_held_stock SET amount=amount+1; \
+             GET DIAGNOSTICS changed=ROW_COUNT; \
+             IF changed<>2 OR NOT FOUND THEN RAISE EXCEPTION 'nested write count changed'; END IF; \
+             INSERT INTO nested_held_audit VALUES('parent-after',NEW.id,changed,note||'!'); \
+             RETURN NEW; END$$; CREATE TRIGGER nested_held_parent AFTER INSERT ON nested_held_orders \
+             FOR EACH ROW EXECUTE FUNCTION nested_held_parent()", true);
+        holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+        let sql = "INSERT INTO nested_held_orders VALUES(10) RETURNING id";
+        let mut status = writer.execute_status(&mut engine, sql, true);
+        for released in [false, false, true] {
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!(
+                    "nested write did not retain its parent: {:?}: {}",
+                    status,
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            assert_eq!(data_rows(writer.send.readable()), ["10"]);
+            assert!(command_tags(writer.send.readable()).is_empty());
+            assert_eq!(
+                data_rows(&holder.success(
+                    &mut engine,
+                    "SELECT last_value FROM nested_held_sequence; SELECT 40+2",
+                    true
+                )),
+                ["1", "42"]
+            );
+            if released {
+                holder.success(&mut engine, "COMMIT", true);
+            }
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        assert_eq!(data_rows(writer.send.readable()), ["10"]);
+        assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+        assert_eq!(data_rows(&writer.success(&mut engine,
+            "SELECT id,amount FROM nested_held_stock ORDER BY id; \
+             SELECT kind,count(*),min(length(note)),max(length(note)) FROM nested_held_audit GROUP BY kind ORDER BY kind; \
+             SELECT n FROM nested_held_audit WHERE kind='parent-after'; \
+             SELECT last_value FROM nested_held_sequence", true)),
+            ["1|1", "2|1", "child-after|2|8193|8193", "child-before|2|8192|8192", 
+             "parent-after|1|8193|8193", "parent-before|1|8192|8192", "2", "2"]);
+    }
+}
+
+#[test]
 fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

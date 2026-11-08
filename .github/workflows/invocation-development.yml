@@ -63,6 +63,7 @@ jobs:
             write_completion_preserves_ \
             checked_array_inputs_in_row_triggers_ checked_before_trigger_inputs_ \
             retained_write_completion_keeps_ \
+            retained_nested_write_completion_ \
             adjacent_triggers_observe_restored_ guc::ownership_tests datetime::test_clock:: \
             saved_output_scopes_reuse_ \
             nested_static_and_dynamic_writes_ routine_calls:: procedural_subtransactions:: \

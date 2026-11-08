@@ -1541,7 +1541,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     }),
                 );
             }
-            self.select(select, None, Some(targets))?;
+            // The source inherits procedural variables, not the target table's
+            // columns. Its own FROM entries still resolve in the inner scope.
+            self.select(select, outer, Some(targets))?;
         }
         if let Stmt::Merge(merge) = statement {
             self.expression(merge.on, &columns, &row)?;

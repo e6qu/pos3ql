@@ -7782,11 +7782,20 @@ pub(crate) fn describe_select<'a>(
         );
     }
     if let Some(outer) = outer {
-        let scope = sel.from.as_ref()
+        let scope = sel
+            .from
+            .as_ref()
             .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, Some(outer)))
             .transpose()?;
         return describe_contextual_items(
-            sel.items, scope.as_ref(), outer, storage, txid, arena, out, description_target,
+            sel.items,
+            scope.as_ref(),
+            outer,
+            storage,
+            txid,
+            arena,
+            out,
+            description_target,
         );
     }
     match &sel.from {
@@ -7814,7 +7823,10 @@ pub(crate) fn describe_select<'a>(
     }
 }
 
-#[expect(clippy::too_many_arguments, reason = "procedural output uses the execution scope and explicit type boundary")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "procedural output uses the execution scope and explicit type boundary"
+)]
 fn describe_contextual_items<'a>(
     items: &[SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
@@ -7830,36 +7842,58 @@ fn describe_contextual_items<'a>(
         scope,
         outer: Some(outer),
         catalog: super::exec::CatalogCols {
-            definition: None, alias: None, output_aliases: &[], storage, txid, arena,
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
         },
     };
     let schema = scope.map(ScopeSchema);
     let empty = super::eval::NoColumns;
     let row = Chained {
-        inner: schema.as_ref().map_or(&empty as &dyn ColumnLookup<'a>, |schema| schema),
+        inner: schema
+            .as_ref()
+            .map_or(&empty as &dyn ColumnLookup<'a>, |schema| schema),
         outer: Some(outer),
     };
     let catalog = storage_catalog(storage, arena, txid);
     let mut count = 0;
     for item in items {
         if matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)) {
-            let scope = scope.ok_or_else(|| sql_err!(
-                sqlstate::SYNTAX_ERROR, "SELECT * with no tables specified is not valid"
-            ))?;
+            let scope = scope.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "SELECT * with no tables specified is not valid"
+                )
+            })?;
             count += describe_scope_items(
-                core::slice::from_ref(item), scope, None, storage, txid, arena,
-                &mut out[count..], super::exec::DescriptionTarget::Sql,
+                core::slice::from_ref(item),
+                scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+                super::exec::DescriptionTarget::Sql,
             )?;
             continue;
         }
         let mut push = |name: &str, metadata: super::exec::StaticTypeMeta| {
             if count == out.len() {
-                return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "target lists can have at most 1664 entries"));
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "target lists can have at most 1664 entries"
+                ));
             }
             out[count] = ColDesc::new(
                 arena.alloc_str(name).map_err(|_| arena_full())?,
-                metadata.type_oid, metadata.ctype.typlen(),
-            ).with_type_mod(metadata.type_mod).with_collation(metadata.collation);
+                metadata.type_oid,
+                metadata.ctype.typlen(),
+            )
+            .with_type_mod(metadata.type_mod)
+            .with_collation(metadata.collation);
             count += 1;
             Ok(())
         };
@@ -7871,30 +7905,55 @@ fn describe_contextual_items<'a>(
                     if error.is_none() {
                         error = push(name, metadata).err();
                     }
-                })?.ok_or_else(|| super::exec::could_not_identify("*"))?;
-                if let Some(error) = error { return Err(error); }
+                })?
+                .ok_or_else(|| super::exec::could_not_identify("*"))?;
+                if let Some(error) = error {
+                    return Err(error);
+                }
             }
             SelectItem::Expr { expression, alias } => {
                 let type_oid = super::exec::infer_routine_argument_oid(expression, &columns)?;
-                let type_oid = if type_oid == super::types::oid::UNKNOWN { super::types::oid::TEXT } else { type_oid };
-                let ctype = super::eval::constructor_type_from_oid(type_oid, &|oid| columns.domain_base_type(oid))
-                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "output column's declared type is unavailable"))?;
+                let type_oid = if type_oid == super::types::oid::UNKNOWN {
+                    super::types::oid::TEXT
+                } else {
+                    type_oid
+                };
+                let ctype = super::eval::constructor_type_from_oid(type_oid, &|oid| {
+                    columns.domain_base_type(oid)
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "output column's declared type is unavailable"
+                    )
+                })?;
                 let metadata = match expression {
                     Expr::Column { qualifier, name } => columns.column_meta(*qualifier, name),
-                    Expr::Field { base, field } => Some(super::exec::record_field_metadata(base, field, &columns)?),
+                    Expr::Field { base, field } => {
+                        Some(super::exec::record_field_metadata(base, field, &columns)?)
+                    }
                     _ => super::exec::routine_result_metadata(expression, &columns),
                 };
                 let type_mod = match expression {
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => metadata.map_or(-1, |metadata| metadata.type_mod),
                 };
-                let collation = super::eval::described_expression_collation(expression, &row, Some(&catalog))?;
-                push(alias.unwrap_or(super::exec::derived_name(expression)), super::exec::StaticTypeMeta {
-                    ctype, type_oid, type_mod, collation: collation.0,
-                })?;
+                let collation =
+                    super::eval::described_expression_collation(expression, &row, Some(&catalog))?;
+                push(
+                    alias.unwrap_or(super::exec::derived_name(expression)),
+                    super::exec::StaticTypeMeta {
+                        ctype,
+                        type_oid,
+                        type_mod,
+                        collation: collation.0,
+                    },
+                )?;
                 out[count - 1].collation_derivation = collation.1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => unreachable!("wildcards were described"),
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                unreachable!("wildcards were described")
+            }
         }
     }
     description_target.finish(&mut out[..count], Some(storage), txid)?;
@@ -10316,7 +10375,8 @@ fn select_into_rows_mode<'a>(
                 outer,
             );
         }
-        let (mut rows, _target, n) = setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
+        let (mut rows, _target, n) =
+            setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
         let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
         let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
         // A trailing ORDER BY needs one final sort over the combined multiset.

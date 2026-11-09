@@ -1106,7 +1106,13 @@ fn describe_leaf_inner<'a>(
     }
     if outer.is_some() {
         let count = super::describe_select(
-            s, storage, txid, arena, columns, crate::sql::exec::DescriptionTarget::Sql, outer,
+            s,
+            storage,
+            txid,
+            arena,
+            columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+            outer,
         )?;
         for (output, column) in type_oids.iter_mut().zip(&columns[..count]) {
             *output = column.type_oid;
@@ -1313,7 +1319,8 @@ fn register_first_leaf_record_shapes(
         return Ok(());
     }
     let mark = arena.mark();
-    let result = register_record_shapes_inner(storage, statement, txid, arena, columns, count, outer);
+    let result =
+        register_record_shapes_inner(storage, statement, txid, arena, columns, count, outer);
     // Record fields live in the arena's persistent tail; descriptors retain handles only.
     unsafe {
         arena.rewind_to(mark);
@@ -1340,7 +1347,12 @@ fn register_record_shapes_inner(
         scope,
         outer,
         catalog: exec::CatalogCols {
-            definition: None, alias: None, output_aliases: &[], storage, txid, arena,
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
         },
     };
     let mut slot = 0usize;
@@ -1440,7 +1452,9 @@ fn eval_set_tree<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
-        SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, sequences, target, outer),
+        SetTree::Select(s) => {
+            eval_set_leaf(s, storage, txid, arena, params, sequences, target, outer)
+        }
         SetTree::Op {
             operator,
             all,
@@ -1449,12 +1463,10 @@ fn eval_set_tree<'a>(
             ..
         } => {
             let l = eval_set_tree(
-                left, storage, txid, arena, params, sequences, target, collations,
-                outer,
+                left, storage, txid, arena, params, sequences, target, collations, outer,
             )?;
             let r = eval_set_tree(
-                right, storage, txid, arena, params, sequences, target, collations,
-                outer,
+                right, storage, txid, arena, params, sequences, target, collations, outer,
             )?;
             combine_sets(storage, txid, collations, *operator, *all, l, r, arena)
         }
@@ -1465,7 +1477,10 @@ fn eval_set_tree<'a>(
 /// then each column's type is unified across every leaf (same count required).
 /// On success `columns[..n]` carries the final unified OIDs/lengths. Shared by the
 /// derived-table, subquery, and INSERT-source paths.
-#[expect(clippy::too_many_arguments, reason = "set output uses the same outer scope as execution")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set output uses the same outer scope as execution"
+)]
 pub(crate) fn describe_set_body<'a>(
     storage: &'a Storage,
     tree: &'a SetTree<'a>,
@@ -1652,7 +1667,8 @@ pub(crate) fn materialize_set_body<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
-    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params, sequences, None)?;
+    let materialized =
+        materialize_set_body_tied(storage, txid, tree, arena, params, sequences, None)?;
     // `materialize_set_body_tied` ties all inputs to one lifetime because the
     // row executor may temporarily decode datums borrowed from storage. None
     // of those datums escape: every output row is projected-encoded into
@@ -1716,7 +1732,10 @@ pub(super) fn materialize_set_body_tied<'a>(
     Ok((rows, target, n))
 }
 
-#[expect(clippy::too_many_arguments, reason = "set leaf carries its execution scope")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "set leaf carries its execution scope"
+)]
 fn eval_set_leaf<'a>(
     s: &'a Select<'a>,
     storage: &'a Storage,

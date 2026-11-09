@@ -1963,7 +1963,7 @@ fn whole_row_dependencies_keep_expanded_and_selected_columns() {
                 include_str!("../../../tests/external/differential/281_whole_row_dependencies.sql"),
                 true,
             )),
-            ["7|seven|7|7|7|7|7|seven|7|7|99"],
+            ["7|seven|7|7|7|7|7|seven|7|7|99|9|8"],
             "{mode:?}"
         );
     }

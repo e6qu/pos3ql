@@ -2632,9 +2632,13 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         let scope = self.scope?;
         CatalogScopeCols {
-            scope, outer_scope: None, storage: self.catalog.storage,
-            txid: self.catalog.txid, arena: self.catalog.arena,
-        }.whole_row_field(name, index)
+            scope,
+            outer_scope: None,
+            storage: self.catalog.storage,
+            txid: self.catalog.txid,
+            arena: self.catalog.arena,
+        }
+        .whole_row_field(name, index)
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {

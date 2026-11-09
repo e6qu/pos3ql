@@ -26,6 +26,12 @@ SELECT (ROW((t).*)).f1 AS id FROM whole_dep_constructor_source t;
 CREATE VIEW whole_dep_constructor_prefix AS
 SELECT (ROW(-1,(t).*,99)).f2 AS id,(ROW(-1,(t).*,99)).f4 AS tail
 FROM whole_dep_constructor_source t;
+CREATE TABLE whole_dep_assignment(a integer,b integer);
+INSERT INTO whole_dep_assignment VALUES(0,0);
+UPDATE whole_dep_assignment SET(a,b)=(
+    WITH whole_dep_source AS(SELECT 9 AS a,8 AS b)
+    SELECT a,b FROM whole_dep_source
+);
 DO $$BEGIN
     BEGIN
         ALTER TABLE whole_dep_constructor_source DROP COLUMN spare;
@@ -57,5 +63,6 @@ SELECT n.id,n.label,(SELECT id FROM whole_dep_qualified),
     (SELECT id FROM whole_dep_derived),(SELECT id FROM whole_dep_field),
     (SELECT id FROM whole_dep_schema_field),(SELECT id FROM whole_dep_record_field),
     (SELECT b FROM whole_dep_record_star),(SELECT id FROM whole_dep_constructor),
-    (SELECT id FROM whole_dep_constructor_prefix),(SELECT tail FROM whole_dep_constructor_prefix)
+    (SELECT id FROM whole_dep_constructor_prefix),(SELECT tail FROM whole_dep_constructor_prefix),
+    (SELECT a FROM whole_dep_assignment),(SELECT b FROM whole_dep_assignment)
 FROM whole_dep_nested n;

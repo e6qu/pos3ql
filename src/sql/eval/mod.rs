@@ -4933,7 +4933,10 @@ fn eval_full_inner<'a>(
                 crate::sql::exec::record_field_metadata(
                     base,
                     field,
-                    &RuntimeColumnTypes { row, catalog: hooks.catalog },
+                    &RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
                 )?;
             }
             let b = eval_full(base, arena, params, row, hooks)?;
@@ -5578,7 +5581,8 @@ fn expression_collation<'a>(
             } if name.eq_ignore_ascii_case("row") => {
                 let Some(mut position) = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
-                    .position(|name| name.eq_ignore_ascii_case(field)) else {
+                    .position(|name| name.eq_ignore_ascii_case(field))
+                else {
                     return Ok(None);
                 };
                 for argument in *args {
@@ -5591,14 +5595,20 @@ fn expression_collation<'a>(
                         let mut index = 0;
                         let mut selected = None;
                         let width = crate::sql::exec::record_shape_metadata(
-                            base, &RuntimeColumnTypes { row, catalog }, |_, metadata| {
-                                if index == position { selected = Some(metadata); }
+                            base,
+                            &RuntimeColumnTypes { row, catalog },
+                            |_, metadata| {
+                                if index == position {
+                                    selected = Some(metadata);
+                                }
                                 index += 1;
                             },
-                        )?.ok_or_else(|| crate::sql::exec::could_not_identify("*"))?;
+                        )?
+                        .ok_or_else(|| crate::sql::exec::could_not_identify("*"))?;
                         if let Some(metadata) = selected {
                             return Ok(DerivedCollation::implicit(
-                                metadata.collation, metadata.ctype.is_collatable(),
+                                metadata.collation,
+                                metadata.ctype.is_collatable(),
                             ));
                         }
                         position -= width;

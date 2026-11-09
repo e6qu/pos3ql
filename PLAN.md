@@ -106,7 +106,8 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   WITH clauses must also expand when the outer query has none. SELECT INTO
   descriptions use the same local scope as execution, including NULL domain
   fields, table-backed queries and set-operation branches. ROW constructors
-  resolve field positions after embedded whole rows have expanded.
+  resolve field positions after embedded whole rows have expanded. Bind query
+  sources inside multi-column assignments through the same substitution walk.
   Distinguish sequence-only SQL helpers from programs that need mutable catalog
   execution; trigger source queries keep their active sequence session.
   Count expanded record fields consistently in sorting, grouping, window

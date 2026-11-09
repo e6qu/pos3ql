@@ -130,9 +130,10 @@ pub(crate) fn expand_stored_expression<'a>(
 
 fn expression_contains_with(expression: &Expr<'_>) -> bool {
     let nested = match expression {
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-            select_contains_with(select)
-        }
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => select_contains_with(select),
         Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
             select_contains_with(select)
         }
@@ -153,9 +154,13 @@ fn expression_contains_with(expression: &Expr<'_>) -> bool {
 fn table_contains_with(table: &TableRef<'_>) -> bool {
     table.subquery.is_some_and(select_contains_with)
         || table.func_args.is_some_and(|arguments| {
-            arguments.iter().any(|argument| expression_contains_with(argument))
+            arguments
+                .iter()
+                .any(|argument| expression_contains_with(argument))
         })
-        || table.rows_from.is_some_and(|tables| tables.iter().any(table_contains_with))
+        || table
+            .rows_from
+            .is_some_and(|tables| tables.iter().any(table_contains_with))
         || table.sample.is_some_and(|sample| {
             expression_contains_with(sample.percentage)
                 || sample.repeatable.is_some_and(expression_contains_with)
@@ -184,15 +189,25 @@ fn select_contains_with(select: &Select<'_>) -> bool {
         })
         || select.where_clause.is_some_and(expression_contains_with)
         || select.having.is_some_and(expression_contains_with)
-        || select.group_by.iter().any(|expression| expression_contains_with(expression))
-        || select.distinct_on.iter().any(|expression| expression_contains_with(expression))
-        || select.order_by.iter().any(|order| expression_contains_with(order.expression))
+        || select
+            .group_by
+            .iter()
+            .any(|expression| expression_contains_with(expression))
+        || select
+            .distinct_on
+            .iter()
+            .any(|expression| expression_contains_with(expression))
+        || select
+            .order_by
+            .iter()
+            .any(|order| expression_contains_with(order.expression))
         || select.limit.is_some_and(expression_contains_with)
         || select.offset.is_some_and(expression_contains_with)
         || select.from.is_some_and(|from| {
             table_contains_with(&from.base)
                 || from.joins.iter().any(|join| {
-                    table_contains_with(&join.table) || join.on.is_some_and(expression_contains_with)
+                    table_contains_with(&join.table)
+                        || join.on.is_some_and(expression_contains_with)
                 })
         })
         || select.set_body.is_some_and(set_tree_contains_with)
@@ -2166,7 +2181,7 @@ fn split_view_predicate<'a>(
             and_where(left_keep, right_keep, arena)?,
         ));
     }
-    if expr_has_subquery(predicate)
+    if predicate.contains_subquery()
         || super::expr_has_aggregate(predicate, context.storage, context.txid, safety.columns)?
         || super::expr_has_window(predicate)
         || !view_predicate_columns_safe(
@@ -2733,7 +2748,11 @@ pub(crate) fn expand_set_tree<'a>(
     dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && !set_tree_contains_with(tree) && dependencies.is_none() && !storage.has_any_view() {
+    if with.is_empty()
+        && !set_tree_contains_with(tree)
+        && dependencies.is_none()
+        && !storage.has_any_view()
+    {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
@@ -3121,7 +3140,10 @@ fn set_tree_references(tree: &SetTree, name: &str) -> usize {
 /// Number of references to `name` inside expression subqueries of `e`.
 fn expr_references(e: &Expr, name: &str) -> usize {
     match e {
-        Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
+        Expr::Subquery(s)
+        | Expr::Exists(s)
+        | Expr::ArraySubquery(s)
+        | Expr::RowSubquery { select: s, .. } => select_references(s, name),
         Expr::InSubquery {
             operand, select, ..
         }
@@ -3270,7 +3292,10 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
             qualifier: written,
             name: written_name,
         } => *written_name == name && written.is_none_or(|written| written == qualifier),
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => {
             select_mentions_column(select, qualifier, name)
         }
         Expr::InSubquery {
@@ -5925,7 +5950,7 @@ fn subst_expr_slice<'a>(
         && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
-        && !xs.iter().any(|x| expr_has_subquery(x))
+        && !xs.iter().any(|x| x.contains_subquery())
     {
         return Ok(xs);
     }
@@ -5935,100 +5960,6 @@ fn subst_expr_slice<'a>(
             .map_err(|_| arena_full())?;
     }
     Ok(tmp.as_slice())
-}
-
-/// True if `e` contains a subquery anywhere (so it needs rebuilding when CTEs
-/// are substituted). Leaves and subquery-free trees are returned unchanged.
-fn expr_has_subquery(e: &Expr) -> bool {
-    match e {
-        Expr::Subquery(_)
-        | Expr::InSubquery { .. }
-        | Expr::QuantifiedSubquery { .. }
-        | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => true,
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::BoundDefault {
-            expression: operand,
-            ..
-        }
-        | Expr::Collate { operand, .. }
-        | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
-        Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::Call {
-            args,
-            order_by,
-            over,
-            filter,
-            ..
-        } => {
-            args.iter().any(|a| expr_has_subquery(a))
-                || order_by.iter().any(|o| expr_has_subquery(o.expression))
-                || filter.is_some_and(expr_has_subquery)
-                || over.is_some_and(|window| {
-                    window
-                        .partition_by
-                        .iter()
-                        .any(|expression| expr_has_subquery(expression))
-                        || window
-                            .order_by
-                            .iter()
-                            .any(|order| expr_has_subquery(order.expression))
-                        || window.frame.is_some_and(|frame| {
-                            frame_bound_has_subquery(frame.start)
-                                || frame_bound_has_subquery(frame.end)
-                        })
-                })
-        }
-        Expr::InList { operand, list, .. } => {
-            expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
-        }
-        Expr::Like {
-            operand,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_has_subquery(operand)
-                || expr_has_subquery(pattern)
-                || escape.is_some_and(expr_has_subquery)
-        }
-        Expr::Match {
-            operand, pattern, ..
-        } => expr_has_subquery(operand) || expr_has_subquery(pattern),
-        Expr::Case {
-            operand,
-            whens,
-            otherwise,
-            ..
-        } => {
-            operand.is_some_and(expr_has_subquery)
-                || whens
-                    .iter()
-                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
-                || otherwise.is_some_and(expr_has_subquery)
-        }
-        Expr::Array(items) => items.iter().any(|item| expr_has_subquery(item)),
-        Expr::Subscript { base, index } => expr_has_subquery(base) || expr_has_subquery(index),
-        Expr::Slice { base, lower, upper } => {
-            expr_has_subquery(base)
-                || lower.is_some_and(expr_has_subquery)
-                || upper.is_some_and(expr_has_subquery)
-        }
-        Expr::Field { base, .. } => expr_has_subquery(base),
-        Expr::AnyAll { operand, array, .. } => {
-            expr_has_subquery(operand) || expr_has_subquery(array)
-        }
-        _ => false,
-    }
-}
-
-fn frame_bound_has_subquery(bound: crate::sql::ast::FrameBound<'_>) -> bool {
-    match bound {
-        crate::sql::ast::FrameBound::Preceding(expression)
-        | crate::sql::ast::FrameBound::Following(expression) => expr_has_subquery(expression),
-        _ => false,
-    }
 }
 
 fn subst_frame_bound<'a>(
@@ -6518,12 +6449,20 @@ fn subst_expr<'a>(
         && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
-        && !expr_has_subquery(e)
+        && !e.contains_subquery()
     {
         return Ok(e);
     }
     let rebuilt = match e {
         Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
+        Expr::RowSubquery { select, arity } => Expr::RowSubquery {
+            select: subst_select(select, context, arena)?,
+            arity: *arity,
+        },
+        Expr::RecordFieldIndex { base, index } => Expr::RecordFieldIndex {
+            base: subst_expr(base, context, arena)?,
+            index: *index,
+        },
         Expr::ArraySubquery(s) => Expr::ArraySubquery(subst_select(s, context, arena)?),
         Expr::Exists(s) => Expr::Exists(subst_select(s, context, arena)?),
         Expr::InSubquery {
@@ -6835,7 +6774,7 @@ fn subst_expr<'a>(
                 name,
             },
         },
-        // Leaves never reach here (guarded by expr_has_subquery above).
+        // Subquery-free leaves keep their values through substitution.
         other => *other,
     };
     Ok(&*arena.alloc(rebuilt).map_err(|_| arena_full())?)

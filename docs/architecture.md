@@ -226,6 +226,12 @@ and restores it on resumption, so another client's work is not charged as its
 child. Tracking still counts one completed call.
 For example, after writing an audit row and issuing an order number, a function
 waiting for an advisory lock continues with the same local text and number.
+Declaration initializers and their type checks retain separate query receipts
+and replay positions. If an initializer calls a function that writes an audit
+row before waiting, that child resumes once; checking a domain afterward cannot
+re-evaluate the initializer. A completed value stays owned while its conversion
+waits. Expression positions without a retained invocation log still return
+`0A000` before a scheduler return could lose completed child work.
 The same saved environment restores the selected search path and its published
 schema names, as well as settings, effective user, timestamps and original
 statement deadline. A failed reattachment restores the caller's environment.

@@ -711,6 +711,40 @@ pub(super) fn start_row_loop<'syntax, 'a>(
     )))
 }
 
+fn initialize_phase<'s, 'a, 'b, T>(
+    status: &mut TriggerExecutionStatus<'a>,
+    context: &mut TriggerExecContext<'s, 'a, 'b>,
+    evaluate: impl FnOnce(
+        &mut TriggerExecContext<'s, 'a, 'b>,
+        Option<&mut Option<super::super::query::RoutineInvocationState>>,
+    ) -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    let retained = context.txn.write_completion_boundary.is_some()
+        && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
+    if !retained {
+        return evaluate(context, None);
+    }
+    let position = match status.pending_statement.take() {
+        Some(position) => {
+            if let Err(((), error)) = position.with_resume(
+                (),
+                super::super::lock::AdvisoryPositionTail::Appended,
+                |(), admission| admission.commit(),
+            ) {
+                status.pending_statement = Some(position);
+                return Err(error);
+            }
+            position
+        }
+        None => super::super::sequence::SavedStatementPosition::capture()?,
+    };
+    let result = evaluate(context, Some(&mut status.pending_query));
+    if result.as_ref().is_err_and(is_execution_wait) {
+        status.pending_statement = Some(position);
+    }
+    result
+}
+
 impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
     pub(super) fn initialize(
         &mut self,
@@ -761,7 +795,13 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             invocation,
                             transition: &transition,
                         };
-                        Some(eval_procedural_expression(context, initial, &scope)?)
+                        Some(initialize_phase(
+                            &mut self.status,
+                            context,
+                            |context, continuation| {
+                                eval_procedural_expression(context, initial, &scope, continuation)
+                            },
+                        )?)
                     } else {
                         // A declared domain can reject its implicit NULL just
                         // as it rejects an explicitly supplied initial value.
@@ -777,7 +817,15 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                 self.values[index] = value;
                 self.initialization = Initialization::Coerce(index);
             }
-            self.values[index] = coerce_plpgsql_local(context, local, self.values[index])?;
+            let value = self.values[index];
+            self.values[index] =
+                initialize_phase(&mut self.status, context, |context, continuation| {
+                    let txid = context.txn.txid;
+                    let arena = context.arena;
+                    execute_procedural_query(context, continuation, |storage, sequences| {
+                        coerce_plpgsql_local(local, value, storage, txid, arena, sequences)
+                    })
+                })?;
             self.initialization = Initialization::Value(index + 1);
         }
     }

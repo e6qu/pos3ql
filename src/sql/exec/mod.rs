@@ -23027,6 +23027,7 @@ fn eval_procedural_expression<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     expression: &'a Expr<'a>,
     row: &TriggerLocalScope<'_, 'a>,
+    mut continuation: Option<&mut Option<super::query::RoutineInvocationState>>,
 ) -> Result<Datum<'a>, SqlError> {
     let arena = context.arena;
     let params = context.params;
@@ -23125,7 +23126,7 @@ fn eval_procedural_expression<'a>(
         engine
             .execute_retained_expression(
                 arena,
-                None,
+                continuation.as_deref_mut(),
                 snapshot,
                 context.txn,
                 sqlprep,
@@ -23186,7 +23187,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     scope: &TriggerLocalScope<'_, 'a>,
     kind: DynamicCommandKind,
 ) -> Result<BoundPlpgsqlCommand<'a>, SqlError> {
-    let command = eval_procedural_expression(context, query.command, scope)?;
+    let command = eval_procedural_expression(context, query.command, scope, None)?;
     if command.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -23220,7 +23221,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     }
     for (index, expression) in query.arguments.iter().copied().enumerate() {
         arguments[index] = detached_trigger_datum(
-            eval_procedural_expression(context, expression, scope)?,
+            eval_procedural_expression(context, expression, scope, None)?,
             context.arena,
         )?;
     }
@@ -25943,18 +25944,16 @@ fn trigger_local_index(locals: &[TriggerLocalDecl], name: SqlName) -> Result<usi
 }
 
 fn coerce_plpgsql_local<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
     local: TriggerLocalDecl,
     value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     let value = match local.record_shape {
         Some(PlpgsqlRecordShape::Table(slot)) => {
-            coerce_plpgsql_table_rowtype(context, slot, value)?
+            coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
         }
         Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
             value,
@@ -25963,13 +25962,13 @@ fn coerce_plpgsql_local<'a>(
                 ctype: local.ctype,
                 user_type: local.user_type,
             },
-            context.storage(),
-            context.txn.txid,
-            context.arena,
-            Some(&sequences),
+            storage,
+            txid,
+            arena,
+            Some(sequences),
         )?,
     };
-    let value = apply_typmod(value, local.ctype, local.type_mod, context.arena)?;
+    let value = apply_typmod(value, local.ctype, local.type_mod, arena)?;
     if local.not_null && value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -25981,15 +25980,13 @@ fn coerce_plpgsql_local<'a>(
 }
 
 fn coerce_plpgsql_table_rowtype<'a>(
-    context: &TriggerExecContext<'_, 'a, '_>,
     slot: u16,
     value: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
-    let sequences = crate::sql::sequence::SeqEval::new(
-        context.storage(),
-        context.seq_session(),
-        context.txn.txid,
-    );
     if value.is_null() {
         return Ok(Datum::Null);
     }
@@ -26002,9 +25999,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
             ));
         }
     };
-    let definition = context
-        .storage()
-        .table_def(usize::from(slot), context.txn.txid);
+    let definition = storage.table_def(usize::from(slot), txid);
     if fields.len() != definition.n_columns {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -26019,16 +26014,9 @@ fn coerce_plpgsql_table_rowtype<'a>(
         value: Datum::Null,
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
-        let cast = prepare_assignment_cast(
-            source.type_oid,
-            column,
-            context.storage(),
-            context.txn.txid,
-            context.arena,
-        )?;
+        let cast = prepare_assignment_cast(source.type_oid, column, storage, txid, arena)?;
         coerced[index] = RecordField {
-            name: context
-                .arena
+            name: arena
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             type_oid: column.ctype.oid(),
@@ -26040,15 +26028,14 @@ fn coerce_plpgsql_table_rowtype<'a>(
                     defined: cast.as_ref(),
                     site: None,
                 },
-                context.storage(),
-                context.txn.txid,
-                context.arena,
-                Some(&sequences),
+                storage,
+                txid,
+                arena,
+                Some(sequences),
             )?,
         };
     }
-    let fields = context
-        .arena
+    let fields = arena
         .alloc_slice_copy(&coerced[..definition.n_columns])
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(Datum::Record(&*fields))
@@ -26069,7 +26056,19 @@ fn assign_trigger_local<'a>(
             locals[index].name.as_str()
         ));
     }
-    values[index] = coerce_plpgsql_local(context, locals[index], value)?;
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    values[index] = coerce_plpgsql_local(
+        locals[index],
+        value,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        &sequences,
+    )?;
     Ok(())
 }
 
@@ -26093,7 +26092,7 @@ fn trigger_format_message<'a>(
             let _ = message.write_char('%');
             continue;
         }
-        let value = eval_procedural_expression(context, arguments[argument], scope)?;
+        let value = eval_procedural_expression(context, arguments[argument], scope, None)?;
         argument += 1;
         if value.is_null() {
             let _ = message.write_str("<NULL>");
@@ -26115,7 +26114,7 @@ fn trigger_diagnostic_text<'a, const N: usize>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     scope: &TriggerLocalScope<'_, 'a>,
 ) -> Result<StackStr<N>, SqlError> {
-    let value = eval_procedural_expression(context, expression, scope)?;
+    let value = eval_procedural_expression(context, expression, scope, None)?;
     if value.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
@@ -26183,6 +26182,7 @@ fn trigger_condition<'a>(
                 new,
             },
         },
+        None,
     )? {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
@@ -26779,7 +26779,12 @@ fn execute_trigger_step<'a>(
                                 invocation,
                                 transition: &transition,
                             };
-                            match eval_procedural_expression(&mut context, expression, &scope)? {
+                            match eval_procedural_expression(
+                                &mut context,
+                                expression,
+                                &scope,
+                                None,
+                            )? {
                                 Datum::Record(fields) => {
                                     if fields.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                                         return Err(sql_err!(
@@ -26927,7 +26932,7 @@ fn execute_trigger_step<'a>(
                         transition: &transition,
                     };
                     TriggerReturnValue::Value(eval_procedural_expression(
-                        context, expression, &scope,
+                        context, expression, &scope, None,
                     )?)
                 }
             };
@@ -26987,7 +26992,7 @@ fn execute_trigger_step<'a>(
                 &scope,
                 hooks.catalog,
             )?;
-            let value = eval_procedural_expression(context, assignment.expression, &scope)?;
+            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
             let value = coerce_assignment(
                 value,
                 &definition.columns()[column],
@@ -27022,7 +27027,7 @@ fn execute_trigger_step<'a>(
                 invocation,
                 transition: &transition,
             };
-            let value = eval_procedural_expression(context, assignment.expression, &scope)?;
+            let value = eval_procedural_expression(context, assignment.expression, &scope, None)?;
             if locals.iter().any(|local| local.name == assignment.name) {
                 assign_trigger_local(context, locals, local_values, assignment.name, value)?;
             } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
@@ -28195,7 +28200,7 @@ fn execute_trigger_step<'a>(
             };
             let message = match assertion.message {
                 Some(message) => {
-                    let value = eval_procedural_expression(context, message, &scope)?;
+                    let value = eval_procedural_expression(context, message, &scope, None)?;
                     if value.is_null() {
                         stack_format!(192, "assertion failed")
                     } else {
@@ -28754,17 +28759,17 @@ fn execute_trigger_step<'a>(
                     transition: &transition,
                 };
                 let lower = trigger_loop_integer(
-                    eval_procedural_expression(context, lower, &scope)?,
+                    eval_procedural_expression(context, lower, &scope, None)?,
                     context.arena,
                     "lower bound",
                 )?;
                 let upper = trigger_loop_integer(
-                    eval_procedural_expression(context, upper, &scope)?,
+                    eval_procedural_expression(context, upper, &scope, None)?,
                     context.arena,
                     "upper bound",
                 )?;
                 let step = trigger_loop_integer(
-                    eval_procedural_expression(context, step, &scope)?,
+                    eval_procedural_expression(context, step, &scope, None)?,
                     context.arena,
                     "BY value",
                 )?;
@@ -28881,8 +28886,12 @@ fn execute_trigger_step<'a>(
                                     invocation,
                                     transition: &transition,
                                 };
-                                let array =
-                                    eval_procedural_expression(&mut context, expression, &scope)?;
+                                let array = eval_procedural_expression(
+                                    &mut context,
+                                    expression,
+                                    &scope,
+                                    None,
+                                )?;
                                 let Datum::Array { element, raw } = array else {
                                     if array.is_null() {
                                         return Err(sql_err!(
@@ -29014,6 +29023,7 @@ fn execute_trigger_step<'a>(
                                 new: new.as_deref(),
                             },
                         },
+                        None,
                     )? {
                         Datum::Bool(value) => value,
                         Datum::Null => false,
@@ -29047,11 +29057,11 @@ fn execute_trigger_step<'a>(
             };
             let operand = program
                 .operand
-                .map(|expression| eval_procedural_expression(context, expression, &scope))
+                .map(|expression| eval_procedural_expression(context, expression, &scope, None))
                 .transpose()?;
             let mut selected = None;
             for branch in program.branches {
-                let value = eval_procedural_expression(context, branch.when, &scope)?;
+                let value = eval_procedural_expression(context, branch.when, &scope, None)?;
                 let matches = match operand {
                     Some(operand) => {
                         let catalog = crate::sql::query::storage_catalog(

@@ -15355,6 +15355,22 @@ impl Engine {
                 }
             }
         })();
+        if continuation.is_none()
+            && txn.write_completion_boundary.is_some()
+            && result.as_ref().is_ok_and(|outcome| {
+                outcome.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.sqlstate.internal_control(),
+                        Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
+                    )
+                })
+            })
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "expression wait requires an owned invocation log"
+            )));
+        }
         if result.as_ref().is_ok_and(|outcome| {
             outcome.as_ref().is_err_and(|error| {
                 error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT

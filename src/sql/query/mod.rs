@@ -1835,12 +1835,12 @@ pub(crate) fn routine_program_access(program: &RoutineFunctionProgram<'_>) -> Ro
                     || query.order_by.iter().any(|order| {
                         cte::expression_contains_function(order.expression, &needs_sequences)
                     })
-                    || query
-                        .limit
-                        .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
-                    || query
-                        .offset
-                        .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+                    || query.limit.is_some_and(|expr| {
+                        cte::expression_contains_function(expr, &needs_sequences)
+                    })
+                    || query.offset.is_some_and(|expr| {
+                        cte::expression_contains_function(expr, &needs_sequences)
+                    })
             }
         };
         if sequences {

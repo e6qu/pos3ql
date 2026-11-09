@@ -2223,7 +2223,10 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
 }
 
 impl<'storage> DependencyTypes<'_, '_, 'storage> {
-    fn output_definition(&self, name: &str) -> Option<crate::storage::RelationDefinition<'storage>> {
+    fn output_definition(
+        &self,
+        name: &str,
+    ) -> Option<crate::storage::RelationDefinition<'storage>> {
         if let Some((definition, aliases)) = self.returning_output
             && aliases.contains(&name)
         {
@@ -3797,7 +3800,11 @@ fn record_column_references(
                     && let ReferenceScope::Excluded { slot, definition } = references
                 {
                     for column in 0..definition.n_columns {
-                        dependencies.mark_referenced_column(DependencyClass::Table, slot, column)?;
+                        dependencies.mark_referenced_column(
+                            DependencyClass::Table,
+                            slot,
+                            column,
+                        )?;
                     }
                     return Ok(());
                 }
@@ -3880,7 +3887,9 @@ fn record_column_references(
             Err(error)
                 if qualifier.is_none()
                     && error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                    && scope.qualified_star_columns(references.qualifier(name)).is_ok() =>
+                    && scope
+                        .qualified_star_columns(references.qualifier(name))
+                        .is_ok() =>
             {
                 let table = references.qualifier(name);
                 for index in 0..scope.qualified_star_columns(table)? {

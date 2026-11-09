@@ -138,7 +138,7 @@ jobs:
           native_test_binary=$(python3 tools/native-test-artifact.py verify \
             "$RUNNER_TEMP/native-test-artifact" "$GITHUB_SHA" "$NATIVE_TARGET")
           python3 tools/test_command.py "$native_test_binary" \
-            routine_calls:: procedural_progress:: procedural_subtransactions:: \
+            routine_calls:: procedural_progress:: function_progress:: procedural_subtransactions:: \
             protocol_deadlines_survive_message_boundaries_without_leaking_to_other_connections \
             streamed_copy_trigger_handlers_keep_the_owning_session_in_text_and_binary \
             object_reads::http_object_fixture_preserves_missing_keys_conditions_ranges_and_listing \

@@ -128,6 +128,7 @@ pub(crate) struct DefinitionImageId {
 struct Image {
     next: Option<usize>,
     serial: u64,
+    references: AtomicUsize,
     payload: ImagePayload,
 }
 
@@ -136,8 +137,8 @@ struct ImageCell {
 }
 
 // SAFETY: allocation is serialized. A cell is written only when unoccupied,
-// after its previous owner's release. Published payloads are immutable until
-// their owning TableDefinitionImages drops; references borrow that owner.
+// after its last owner's release. Published payloads are immutable; schema pins
+// keep a cell alive independently of the chain that originally captured it.
 unsafe impl Sync for ImageCell {}
 
 pub(super) struct TableDefinitionImagePool {
@@ -162,6 +163,7 @@ impl ImageReservation<'_> {
             (*self.pool.cells[self.index].image.get()).write(Image {
                 next,
                 serial: self.serial,
+                references: AtomicUsize::new(1),
                 payload,
             })
         };
@@ -183,6 +185,18 @@ impl Drop for ImageReservation<'_> {
 }
 
 impl TableDefinitionImagePool {
+    fn release(&self, index: usize) {
+        let cell = &self.cells[index];
+        // SAFETY: each chain entry and independent pin owns one reference.
+        let image = unsafe { (*cell.image.get()).assume_init_ref() };
+        if image.references.fetch_sub(1, Ordering::Release) == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            // The last reference releases metadata before publishing a free cell.
+            unsafe { (*cell.image.get()).assume_init_drop() };
+            self.occupied[index].store(false, Ordering::Release);
+        }
+    }
+
     fn capacity(config: &Config) -> usize {
         config.definition_image_slots
     }
@@ -291,6 +305,28 @@ pub(crate) struct TableDefinitionImages {
     head: Cell<Option<usize>>,
 }
 
+/// One immutable schema stays in its original configured cell across handoffs.
+pub(crate) struct PinnedRelationDefinition {
+    pool: Arc<TableDefinitionImagePool>,
+    identity: DefinitionImageId,
+}
+
+impl PinnedRelationDefinition {
+    pub(crate) fn relation(&self) -> RelationDefinition<'_> {
+        // SAFETY: this pin prevents release and reuse of its original image.
+        let image =
+            unsafe { (*self.pool.cells[self.identity.index].image.get()).assume_init_ref() };
+        debug_assert_eq!(image.serial, self.identity.serial);
+        image.payload.relation()
+    }
+}
+
+impl Drop for PinnedRelationDefinition {
+    fn drop(&mut self) {
+        self.pool.release(self.identity.index);
+    }
+}
+
 impl Storage {
     /// Consume a copied definition after the live catalog guards release.
     /// Returned values cannot borrow the temporary definition owner.
@@ -395,6 +431,35 @@ impl TableDefinitionImages {
             slot = image.next;
         }
         None
+    }
+
+    pub(crate) fn pin_relation(
+        &self,
+        identity: DefinitionImageId,
+    ) -> Result<PinnedRelationDefinition, SqlError> {
+        if self.retained_relation(identity).is_none() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "schema pin does not belong to its definition owner"
+            ));
+        }
+        // The borrowed chain owner keeps this cell published while adding a pin.
+        let image = unsafe { (*self.pool.cells[identity.index].image.get()).assume_init_ref() };
+        image
+            .references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < isize::MAX as usize).then(|| count + 1)
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table definition image reference capacity is exhausted"
+                )
+            })?;
+        Ok(PinnedRelationDefinition {
+            pool: Arc::clone(&self.pool),
+            identity,
+        })
     }
 
     /// Read a captured image without reacquiring the live table identity.
@@ -525,12 +590,9 @@ impl Drop for TableDefinitionImages {
         let mut slot = self.head.get();
         while let Some(index) = slot {
             let cell = &self.pool.cells[index];
-            // SAFETY: Drop has exclusive access to the owner, so all returned
-            // references are finished before its cells become reusable.
+            // SAFETY: this chain owns a reference to each immutable link.
             slot = unsafe { (*cell.image.get()).assume_init_ref().next };
-            // Release schema pins before this cell can be reserved again.
-            unsafe { (*cell.image.get()).assume_init_drop() };
-            self.pool.occupied[index].store(false, Ordering::Release);
+            self.pool.release(index);
         }
     }
 }
@@ -554,6 +616,145 @@ mod tests {
         config.definition_image_slots = slots;
         let mut budget = Budget::new(TableDefinitionImagePool::budget_bytes(&config));
         TableDefinitionImagePool::new(&config, &mut budget, metadata).unwrap()
+    }
+
+    #[test]
+    fn relation_pins_share_one_cell_and_reject_stale_or_foreign_owners() {
+        use crate::storage::{ColumnMeta, SqlName};
+        let metadata = metadata_pool(size_of::<ColumnMeta>(), 1);
+        let pool = image_pool(&metadata, 1);
+        let foreign_pool = image_pool(&metadata, 1);
+        let columns = [ColumnMeta::EMPTY];
+        let relation = RelationDefinition {
+            schema: SqlName::EMPTY,
+            name: SqlName::parse("pinned").unwrap(),
+            n_columns: 1,
+            columns: &columns,
+        };
+        crate::mem::guard::forbid_alloc(|| {
+            let images = TableDefinitionImages::new(&pool);
+            let identity = images.retain_relation(&relation).unwrap();
+            let foreign = TableDefinitionImages::new(&foreign_pool);
+            assert_eq!(
+                foreign.pin_relation(identity).err().unwrap().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            let first = images.pin_relation(identity).unwrap();
+            let second = images.pin_relation(identity).unwrap();
+            let cell = unsafe { (*pool.cells[identity.index].image.get()).assume_init_ref() };
+            assert_eq!(cell.references.load(Ordering::Relaxed), 3);
+            cell.references
+                .store(isize::MAX as usize, Ordering::Relaxed);
+            assert_eq!(
+                images.pin_relation(identity).err().unwrap().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            cell.references.store(3, Ordering::Relaxed);
+            drop(images);
+            assert_eq!(first.relation().name.as_str(), "pinned");
+            assert_eq!(second.relation().columns.len(), 1);
+            assert!(pool.reserve().is_err());
+            drop(first);
+            assert!(pool.reserve().is_err());
+            drop(second);
+            assert!(!pool.occupied[0].load(Ordering::Acquire));
+            let images = TableDefinitionImages::new(&pool);
+            let replacement = images.retain_relation(&relation).unwrap();
+            assert_ne!(replacement, identity);
+            assert_eq!(
+                images.pin_relation(identity).err().unwrap().sqlstate,
+                sqlstate::INTERNAL_ERROR
+            );
+            let pin = images.pin_relation(replacement).unwrap();
+            drop(pin);
+            assert_eq!(
+                images.retained_relation(replacement).unwrap().columns.len(),
+                1
+            );
+            drop(images);
+            let reclaimed = metadata.lease::<u8>(metadata.max_entries::<u8>()).unwrap();
+            drop(reclaimed);
+        });
+    }
+
+    #[test]
+    fn relation_pin_does_not_keep_or_follow_recycled_chain_links() {
+        use crate::storage::{ColumnMeta, SqlName};
+        let metadata = metadata_pool(2 * size_of::<ColumnMeta>().div_ceil(64) * 64, 2);
+        let pool = image_pool(&metadata, 2);
+        let columns = [ColumnMeta::EMPTY];
+        crate::mem::guard::forbid_alloc(|| {
+            let images = TableDefinitionImages::new(&pool);
+            let mut relation = RelationDefinition {
+                schema: SqlName::EMPTY,
+                name: SqlName::parse("tail").unwrap(),
+                n_columns: 1,
+                columns: &columns,
+            };
+            images.retain_relation(&relation).unwrap();
+            relation.name = SqlName::parse("head").unwrap();
+            let head = images.retain_relation(&relation).unwrap();
+            let pin = images.pin_relation(head).unwrap();
+            drop(images);
+            let replacement = TableDefinitionImages::new(&pool);
+            relation.name = SqlName::parse("replacement").unwrap();
+            let replaced = replacement.retain_relation(&relation).unwrap();
+            assert_ne!(replaced.index, head.index);
+            assert_eq!(pin.relation().name.as_str(), "head");
+            drop(pin);
+            assert_eq!(
+                replacement
+                    .retained_relation(replaced)
+                    .unwrap()
+                    .name
+                    .as_str(),
+                "replacement"
+            );
+            drop(replacement);
+            assert!(
+                pool.occupied
+                    .iter()
+                    .all(|flag| !flag.load(Ordering::Acquire))
+            );
+        });
+    }
+
+    #[test]
+    fn relation_pins_release_concurrently_after_the_chain_and_pool_owner_drop() {
+        use crate::storage::{ColumnMeta, SqlName};
+        let metadata = metadata_pool(size_of::<ColumnMeta>(), 1);
+        let pool = image_pool(&metadata, 1);
+        let images = TableDefinitionImages::new(&pool);
+        let columns = [ColumnMeta::EMPTY];
+        let identity = images
+            .retain_relation(&RelationDefinition {
+                schema: SqlName::EMPTY,
+                name: SqlName::parse("concurrent").unwrap(),
+                n_columns: 1,
+                columns: &columns,
+            })
+            .unwrap();
+        let pins = [
+            images.pin_relation(identity).unwrap(),
+            images.pin_relation(identity).unwrap(),
+        ];
+        let barrier = std::sync::Barrier::new(2);
+        drop(images);
+        drop(pool);
+        std::thread::scope(|threads| {
+            for pin in pins {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    assert_eq!(pin.relation().name.as_str(), "concurrent");
+                    barrier.wait();
+                    crate::mem::guard::forbid_alloc(|| drop(pin));
+                });
+            }
+        });
+        crate::mem::guard::forbid_alloc(|| {
+            let reclaimed = metadata.lease::<u8>(metadata.max_entries::<u8>()).unwrap();
+            drop(reclaimed);
+        });
     }
 
     #[test]
@@ -777,8 +978,12 @@ mod tests {
         assert_eq!(retained.name.as_str(), "shared_shape");
         assert_eq!(retained.columns()[0].name.as_str(), "value");
         let pool = Arc::clone(&images.pool);
+        let pin = images.pin_relation(identity).unwrap();
         drop(images);
         crate::mem::guard::forbid_alloc(|| {
+            assert!(pool.occupied[0].load(Ordering::Acquire));
+            assert_eq!(pin.relation().columns()[0].name.as_str(), "value");
+            drop(pin);
             assert!(!pool.occupied[0].load(Ordering::Acquire));
             let reused = TableDefinitionImages::new(&pool);
             assert!(reused.retained_relation(identity).is_none());

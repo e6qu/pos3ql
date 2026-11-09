@@ -1052,7 +1052,11 @@ creation identity and schema revision; reusing a name or slot cannot redirect it
 images pin stored definitions; synthetic catalog images retain actual columns,
 including their hidden suffix, in a separate typed payload. Image identifiers
 include their owning pool and generation, so a stale or foreign identifier cannot
-select another schema. CTEs, table functions
+select another schema. A paused trigger pins its completion's existing image;
+it does not reserve another cell for the same schema. Each chain entry and
+independent pin holds one counted reference. The last release drops metadata
+before marking the cell free, including when releases occur on different threads.
+CTEs, table functions
 and trigger descriptions use borrowed column descriptors and actual statement
 memory. They do not put owning schema leases or maximum-width definitions in
 arenas that do not run destructors. Joined-row decoding also reserves only the

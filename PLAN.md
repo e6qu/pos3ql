@@ -92,7 +92,9 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   handlers; an application raising an identical diagnostic code remains an
   ordinary SQL error. Preserve remote savepoint boundaries when a foreign
   connection first opens inside nested procedural work.
-  Completion reuses a captured table's matching row schema. Exhaustion and
+  Completion and a paused trigger share the captured table's matching row
+  schema, with independent pins inside the original configured image cell.
+  Exhaustion and
   repeated nested-write retries must work within the configured image slots.
   Query descriptions retain domain identities through casts, record expansion,
   named columns, field selection and array subscripting, including columns

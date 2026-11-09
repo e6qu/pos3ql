@@ -615,7 +615,9 @@ fn run_selected_firing<'run>(
     match firing.execute(&mut context) {
         Ok(_) => Ok(None),
         Err(error) if control_flow::is_execution_wait(&error) => {
-            let saved = firing.suspend(&context).map_err(|(_, error)| error)?;
+            let saved = firing
+                .suspend(&context, definitions)
+                .map_err(|(_, error)| error)?;
             Ok(Some((saved, error)))
         }
         Err(error) => Err(error),

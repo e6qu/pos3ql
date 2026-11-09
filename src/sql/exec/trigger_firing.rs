@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::mem::lease_pool::SharedSlice;
-use crate::storage::{DefinitionImageId, RelationDefinition, TableDefinitionImages};
+use crate::storage::{PinnedRelationDefinition, RelationDefinition, TableDefinitionImages};
 
 pub(super) struct FiringBinding<'values, 'schema, 'rows> {
     pub(super) invocation: TriggerInvocation<'values>,
@@ -243,14 +243,16 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
     pub(super) fn suspend(
         self,
         context: &TriggerExecContext<'_, 'values, '_>,
+        definitions: &TableDefinitionImages,
     ) -> Result<SuspendedTriggerFiring, (Self, SqlError)> {
         if let Err(error) = self.require_context(context) {
             return Err((self, error));
         }
-        let saved = match SavedBinding::capture(&self.binding, &self.environment, context) {
-            Ok(saved) => saved,
-            Err(error) => return Err((self, error)),
-        };
+        let saved =
+            match SavedBinding::capture(&self.binding, &self.environment, context, definitions) {
+                Ok(saved) => saved,
+                Err(error) => return Err((self, error)),
+            };
         let Self {
             code,
             execution,
@@ -306,8 +308,7 @@ struct SavedBinding {
 
 struct SavedMetadata {
     header: TriggerInvocation<'static>,
-    definitions: TableDefinitionImages,
-    definition: DefinitionImageId,
+    definition: PinnedRelationDefinition,
     old_width: Option<usize>,
     new_width: Option<usize>,
     aliases: [Option<SavedAlias>; 2],
@@ -357,13 +358,14 @@ impl SavedBinding {
         binding: &FiringBinding<'_, '_, '_>,
         environment: &FiringEnvironment,
         context: &TriggerExecContext<'_, '_, '_>,
+        definitions: &TableDefinitionImages,
     ) -> Result<Self, SqlError> {
         binding.validate()?;
         let progress = crate::sql::sequence::SavedStatementPosition::capture()?;
         let storage = context.storage();
         let environment = SavedEnvironment::capture(environment, &storage.execution_control)?;
-        let definitions = storage.table_definition_images();
-        let definition = definitions.retain_relation(&binding.definition)?;
+        let identity = definitions.retain_relation(&binding.definition)?;
+        let definition = definitions.pin_relation(identity)?;
         let mut aliases = [None, None];
         if let Some(relations) = binding.invocation.materialized_relations {
             if relations.len() > aliases.len() {
@@ -434,7 +436,6 @@ impl SavedBinding {
         Ok(Self {
             metadata: SavedMetadata {
                 header,
-                definitions,
                 definition,
                 old_width: binding.old.map(|row| row.len()),
                 new_width: binding.new.as_deref().map(|row| row.len()),
@@ -457,10 +458,7 @@ impl SavedMetadata {
         sites: &'run [super::super::plpgsql_inputs::Site<'run>],
         arena: &'run Arena,
     ) -> Result<FiringBinding<'run, 'run, 'run>, SqlError> {
-        let definition = self
-            .definitions
-            .retained_relation(self.definition)
-            .ok_or_else(changed)?;
+        let definition = self.definition.relation();
         let width = HEADER_VALUES + self.old_width.unwrap_or(0) + self.new_width.unwrap_or(0);
         if values.len() != width {
             return Err(invalid("saved trigger firing value width changed"));

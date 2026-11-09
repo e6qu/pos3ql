@@ -40,7 +40,9 @@ columns while retaining the columns actually required by later schema changes.
 Fixed function-timing capacity must fail explicitly and return entries after
 early errors or unwinding; silently disabling requested tracking is a defect.
 Write completion must reuse a captured table's identical row schema instead of
-reserving a second image. Capacity errors must roll back and permit repeated
+reserving a second image. A paused firing pins that same cell while completion
+retains it; independent pin release cannot recycle another owner's schema.
+Capacity errors must roll back and permit repeated
 nested-trigger retries without increasing the configured image pool.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations

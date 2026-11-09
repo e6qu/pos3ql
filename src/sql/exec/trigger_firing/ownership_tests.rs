@@ -257,6 +257,8 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let security = crate::sql::eval::funcs::system::enter_current_user(
             crate::storage::SessionIdentity::bound(storage.capture_role_slot(0, 100).unwrap()),
         );
+        let definitions = storage.table_definition_images();
+        definitions.retain_relation(&definition).unwrap();
         let mut context = TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage: &mut storage,
@@ -285,7 +287,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let error = firing.execute(&mut context).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
         let held = rows.lease::<u8>(64 << 10).unwrap();
-        let (firing, error) = firing.suspend(&context).err().unwrap();
+        let (firing, error) = firing.suspend(&context, &definitions).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("row_work_bytes"));
         assert_eq!(
@@ -306,7 +308,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         for slot in &mut held[..available - 1] {
             *slot = Some(controls.lease::<u8>(1).unwrap());
         }
-        let (firing, error) = firing.suspend(&context).err().unwrap();
+        let (firing, error) = firing.suspend(&context, &definitions).err().unwrap();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("execution_control_leases"));
         assert_eq!(
@@ -318,7 +320,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             1
         );
         drop(held);
-        firing.suspend(&context).ok().unwrap()
+        firing.suspend(&context, &definitions).ok().unwrap()
     });
     columns[0].name = SqlName::parse("replaced_id").unwrap();
     columns[1].ctype = ColType::Bool;

@@ -1195,7 +1195,10 @@ mod tests {
         let invocations = crate::mem::guard::forbid_alloc(|| {
             owner
                 .with_remaining_region(|query| {
-                    let invocations = RoutineInvocationState::new(query);
+                    let invocations = RoutineInvocationState::new(
+                        query,
+                        crate::sql::query::RoutineExecution::Synchronous,
+                    );
                     with_routine_invocation_scope(
                         Some(RoutineInvocationContext::new(&invocations, query)),
                         || {
@@ -1292,7 +1295,10 @@ mod tests {
         let original = Arena::new(&mut budget, "movable invocation owner", 32 << 10).unwrap();
         let mut work = Arena::new(&mut budget, "movable invocation scratch", 16 << 10).unwrap();
         let wrong = Arena::new(&mut budget, "foreign invocation owner", 16 << 10).unwrap();
-        let invocations = RoutineInvocationState::new(&original);
+        let invocations = RoutineInvocationState::new(
+            &original,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         crate::mem::guard::forbid_alloc(|| {
             with_routine_invocation_scope(
                 Some(RoutineInvocationContext::new(&invocations, &original)),
@@ -1564,7 +1570,10 @@ mod tests {
     fn input_suspension_uses_retained_storage_while_the_parent_front_is_lent() {
         let mut budget = Budget::new(16 << 10);
         let statement = Arena::new(&mut budget, "parent input owner", 16 << 10).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -1646,7 +1655,10 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
-            let invocations = RoutineInvocationState::new(&other);
+            let invocations = RoutineInvocationState::new(
+                &other,
+                crate::sql::query::RoutineExecution::Synchronous,
+            );
             let mut frames = ArenaList::new(&other);
             frames.push(AttemptFrame::Saved(frame)).unwrap();
             let attempt = InputAttempt {
@@ -1675,7 +1687,10 @@ mod tests {
         let statement = Arena::new(&mut budget, "input effect replay", 32 << 10).unwrap();
         let mut work = Arena::new(&mut budget, "input effect scratch", 16 << 10).unwrap();
         let guc = crate::sql::guc::GucState::new();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         let actions = Cell::new(0);
         crate::mem::guard::forbid_alloc(|| {
             let scope = sequence::enter_statement(&statement, guc.seq_session(), false, None);
@@ -1864,7 +1879,10 @@ mod tests {
         let mut budget = Budget::new(32768);
         let statement = Arena::new(&mut budget, "cast input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "cast input work", 8192).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -1927,7 +1945,10 @@ mod tests {
             let mut budget = Budget::new(32768);
             let statement = Arena::new(&mut budget, "cast key statement", 16384).unwrap();
             let mut work = Arena::new(&mut budget, "cast key work", 8192).unwrap();
-            let invocations = RoutineInvocationState::new(&statement);
+            let invocations = RoutineInvocationState::new(
+                &statement,
+                crate::sql::query::RoutineExecution::Synchronous,
+            );
             with_routine_invocation_scope(
                 Some(RoutineInvocationContext::new(&invocations, &statement)),
                 || {
@@ -1978,7 +1999,10 @@ mod tests {
         let mut budget = Budget::new(32768);
         let statement = Arena::new(&mut budget, "input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "input work", 8192).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2046,7 +2070,10 @@ mod tests {
         let mut budget = Budget::new(32768);
         let statement = Arena::new(&mut budget, "tagged input statement", 16384).unwrap();
         let mut work = Arena::new(&mut budget, "tagged input work", 8192).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2115,7 +2142,10 @@ mod tests {
         let mut budget = Budget::new(8192);
         let statement = Arena::new(&mut budget, "nested input statement", 2048).unwrap();
         let work = Arena::new(&mut budget, "nested input scratch", 4096).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2162,7 +2192,10 @@ mod tests {
         let mut budget = Budget::new(8192);
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let mut work = Arena::new(&mut budget, "input work", 4096).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2192,7 +2225,10 @@ mod tests {
         let mut budget = Budget::new(40960);
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let work = Arena::new(&mut budget, "input work", 32768).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2229,7 +2265,10 @@ mod tests {
         let mut budget = Budget::new(4096);
         let statement = Arena::new(&mut budget, "input statement", 1024).unwrap();
         let work = Arena::new(&mut budget, "input work", 2048).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2257,7 +2296,10 @@ mod tests {
         use super::super::super::eval::ExpressionEvaluation::{Immutable, Runtime};
         let mut budget = Budget::new(4096);
         let statement = Arena::new(&mut budget, "input planning", 4096).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2333,7 +2375,10 @@ mod tests {
         let mut budget = Budget::new(8192);
         let statement = Arena::new(&mut budget, "input statement", 1).unwrap();
         let work = Arena::new(&mut budget, "input work", 4096).unwrap();
-        let invocations = RoutineInvocationState::new(&statement);
+        let invocations = RoutineInvocationState::new(
+            &statement,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         with_routine_invocation_scope(
             Some(RoutineInvocationContext::new(&invocations, &statement)),
             || {
@@ -2382,7 +2427,10 @@ mod tests {
         ] {
             statement.reset();
             work.reset();
-            let invocations = RoutineInvocationState::new(&statement);
+            let invocations = RoutineInvocationState::new(
+                &statement,
+                crate::sql::query::RoutineExecution::Synchronous,
+            );
             let pending = crate::mem::guard::forbid_alloc(|| {
                 type_input_plans::with_owner(owner, || {
                     let expression =

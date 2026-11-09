@@ -15185,7 +15185,10 @@ impl Engine {
             // A rejected shape owns no retained reader or arena description.
             unsafe { arena.rewind_to(mark) };
         }
-        let invocations = query::RoutineInvocationState::new(arena);
+        let invocations = query::RoutineInvocationState::new(
+            arena,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
@@ -15262,7 +15265,13 @@ impl Engine {
         } else {
             frame
         };
-        let invocations = saved.unwrap_or_else(|| query::RoutineInvocationState::new(owner));
+        let policy = if continuation.is_some() {
+            query::RoutineExecution::Retained
+        } else {
+            query::RoutineExecution::Synchronous
+        };
+        let invocations =
+            saved.unwrap_or_else(|| query::RoutineInvocationState::new(owner, policy));
         if let Err(error) = invocations.require_arena(owner) {
             if let Some(continuation) = continuation {
                 *continuation = Some(invocations);
@@ -15274,6 +15283,21 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         let result = (|| {
+            let unfinished = invocations.suspended.borrow().is_some();
+            if unfinished
+                && let Err(error) = self.resume_pending_function(
+                    &invocations,
+                    owner,
+                    frame,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )?
+            {
+                return Ok(Err(error));
+            }
             loop {
                 if let Err(error) = sequence::rewind_replay_cursor(replay) {
                     return Ok(Err(error));
@@ -15333,7 +15357,10 @@ impl Engine {
             };
             match saved {
                 Ok(saved) => *continuation = Some(saved),
-                Err(error) => return Ok(Err(error)),
+                Err((original, error)) => {
+                    *continuation = Some(original);
+                    return Ok(Err(error));
+                }
             }
         }
         result
@@ -15500,7 +15527,10 @@ impl Engine {
         {
             return Ok(Err(error));
         }
-        let invocations = query::RoutineInvocationState::new(arena);
+        let invocations = query::RoutineInvocationState::new(
+            arena,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
@@ -15759,6 +15789,8 @@ impl Engine {
                 }
                 guc::TrackFunctions::All => true,
             };
+            let snapshot = self.storage.read_snapshot();
+            let mut suspended = None;
             let timed = match statistics::begin_function_timing(track) {
                 Ok(timed) => timed,
                 Err(error) => return Ok(Err(error)),
@@ -15785,8 +15817,18 @@ impl Engine {
                 if set_returning {
                     let rows = self
                         .execute_pending_table_routine(
-                            pending, arena, slot, &routine, scratch, txn, sqlprep, cursors, guc,
+                            pending,
+                            arena,
+                            slot,
+                            &routine,
+                            scratch,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
                             responder,
+                            invocations.execution,
+                            &mut suspended,
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
@@ -15794,8 +15836,18 @@ impl Engine {
                 } else {
                     let value = self
                         .execute_pending_scalar_routine(
-                            pending, arena, slot, &routine, scratch, txn, sqlprep, cursors, guc,
+                            pending,
+                            arena,
+                            slot,
+                            &routine,
+                            scratch,
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
                             responder,
+                            invocations.execution,
+                            &mut suspended,
                         )
                         .map_err(BodyError::Wire)?
                         .map_err(BodyError::Sql)?;
@@ -15810,6 +15862,20 @@ impl Engine {
                     error
                 ))),
             };
+            if matches!(&executed, Err(BodyError::Sql(error)) if matches!(error.sqlstate.internal_control(), Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)))
+                && let Some(body) = suspended
+            {
+                *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
+                    body,
+                    timing: timed.pause(),
+                    plan_owner: pending.plan_owner,
+                    snapshot,
+                });
+                let Err(BodyError::Sql(error)) = executed else {
+                    unreachable!()
+                };
+                return Ok(Err(error));
+            }
             let succeeded = executed.is_ok();
             if let Some((total, own)) = timed.finish()
                 && succeeded
@@ -15834,6 +15900,119 @@ impl Engine {
             };
             Ok(invocations.complete(retained, arena, work))
         });
+        self.restore_routine_environment(outcome, guc, txn)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a paused call resumes against the same query, transaction and execution services"
+    )]
+    fn resume_pending_function(
+        &mut self,
+        invocations: &query::RoutineInvocationState,
+        owner: &Arena,
+        work: &Arena,
+        transaction: &mut TxnState,
+        prepared: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        settings: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let Some(call) = invocations.suspended.borrow_mut().take() else {
+            return Ok(Err(query::inactive_pending_call()));
+        };
+        let query::SuspendedRoutineCall {
+            mut body,
+            timing,
+            plan_owner,
+            snapshot,
+        } = call;
+        let timed = match timing.resume() {
+            Ok(timed) => timed,
+            Err((timing, error)) => {
+                *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
+                    body,
+                    timing,
+                    plan_owner,
+                    snapshot,
+                });
+                return Ok(Err(error));
+            }
+        };
+        let oid = body.oid();
+        let outcome = type_input_plans::with_owner(plan_owner, || {
+            self.storage.set_read_snapshot(snapshot);
+            let retained = work.with_remaining_retained_bytes(owner, |scratch| {
+                match body.poll(
+                    self,
+                    transaction,
+                    prepared,
+                    cursors,
+                    settings,
+                    scratch,
+                    responder,
+                )? {
+                    exec::FunctionOutput::Scalar(value) => {
+                        let value = eval::cast_to(
+                            exec::detach_routine_datum(value, scratch)?,
+                            body.result_type(),
+                            scratch,
+                        )?;
+                        exec::encode_projected_pub(&[value], scratch)
+                    }
+                    exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
+                }
+            });
+            let retained = match retained {
+                Ok(retained) => retained,
+                Err(error) => Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine body exceeds statement memory: {}",
+                    error
+                )),
+            };
+            if retained.as_ref().is_err_and(|error| {
+                matches!(
+                    error.sqlstate.internal_control(),
+                    Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)
+                )
+            }) {
+                *invocations.suspended.borrow_mut() = Some(query::SuspendedRoutineCall {
+                    body,
+                    timing: timed.pause(),
+                    plan_owner,
+                    snapshot,
+                });
+                return Ok(retained.map(|_| ()));
+            }
+            if let Some((total, own)) = timed.finish()
+                && retained.is_ok()
+                && let Err(error) =
+                    self.storage
+                        .record_function_call(transaction.txid, oid, total, own)
+            {
+                return Ok(Err(error));
+            }
+            let retained = match retained {
+                Ok(retained) => retained,
+                Err(error) => return Ok(Err(error)),
+            };
+            let value = if body.is_set_returning() {
+                query::OwnedRoutineResult::from_row_image(retained)
+            } else {
+                query::OwnedRoutineResult::from_scalar_image(retained)
+            };
+            Ok(invocations.complete(value, owner, work))
+        });
+        self.restore_routine_environment(outcome, settings, transaction)
+    }
+
+    fn restore_routine_environment(
+        &self,
+        outcome: Result<Result<(), SqlError>, WireFull>,
+        guc: &GucState,
+        txn: &TxnState,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
             role.refresh(&self.storage, txn.txid)
@@ -15932,7 +16111,10 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
-        let nested_invocations = query::RoutineInvocationState::new(arena);
+        let nested_invocations = query::RoutineInvocationState::new(
+            arena,
+            crate::sql::query::RoutineExecution::Synchronous,
+        );
         nested_invocations.begin_attempt();
         query::with_routine_invocation_scope(
             Some(query::RoutineInvocationContext::new(
@@ -17064,6 +17246,8 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
+        execution: query::RoutineExecution,
+        suspended: &mut Option<exec::SuspendedFunction>,
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
         let Some(result_type) = routine.kind.function_result() else {
             return Ok(Err(sql_err!(
@@ -17092,14 +17276,15 @@ impl Engine {
             Ok(role) => crate::storage::SessionIdentity::bound(role),
             Err(error) => return Ok(Err(error)),
         };
-        let _security = routine
+        let security = routine
             .attributes
             .security_definer
             .then(|| eval::funcs::system::enter_current_user(owner));
-        let _config = match guc.enter_routine_configs(routine.configs()) {
+        let config = match guc.enter_routine_configs(routine.configs()) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
+        let environment = exec::CallEnvironment::new(Some(config), security);
         let _formal_scope = match exec::enter_routine_parameter_types(
             routine.arguments(),
             Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
@@ -17157,9 +17342,18 @@ impl Engine {
                     &arguments[..pending.argument_count],
                     arena,
                     responder,
+                    &environment,
+                    execution,
+                    suspended,
                 )
             }) {
-                Ok(value) => value,
+                Ok(exec::FunctionOutput::Scalar(value)) => value,
+                Ok(exec::FunctionOutput::Rows(_)) => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "scalar function produced a row set"
+                    )));
+                }
                 Err(error) => return Ok(Err(error)),
             };
             let value = match exec::detach_routine_datum(value, arena) {
@@ -17258,6 +17452,8 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         responder: &mut Responder,
+        execution: query::RoutineExecution,
+        suspended: &mut Option<exec::SuspendedFunction>,
     ) -> Result<Result<&'a [&'a [u8]], SqlError>, WireFull> {
         if !routine.kind.is_set_returning() {
             return Ok(Err(sql_err!(
@@ -17275,14 +17471,15 @@ impl Engine {
             Ok(role) => crate::storage::SessionIdentity::bound(role),
             Err(error) => return Ok(Err(error)),
         };
-        let _security = routine
+        let security = routine
             .attributes
             .security_definer
             .then(|| eval::funcs::system::enter_current_user(owner));
-        let _config = match guc.enter_routine_configs(routine.configs()) {
+        let config = match guc.enter_routine_configs(routine.configs()) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
+        let environment = exec::CallEnvironment::new(Some(config), security);
         let _formal_scope = match exec::enter_routine_parameter_types(
             routine.arguments(),
             Some(&query::storage_catalog(&self.storage, arena, txn.txid)),
@@ -17339,7 +17536,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
             return Ok(type_input_plans::with_owner(instance, || {
-                exec::execute_plpgsql_table_function(
+                exec::execute_plpgsql_function(
                     self,
                     txn,
                     sqlprep,
@@ -17350,7 +17547,17 @@ impl Engine {
                     &*inputs,
                     arena,
                     responder,
+                    &environment,
+                    execution,
+                    suspended,
                 )
+                .and_then(|output| match output {
+                    exec::FunctionOutput::Rows(rows) => Ok(rows),
+                    exec::FunctionOutput::Scalar(_) => Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "set function produced a scalar value"
+                    )),
+                })
             }));
         }
         let body = match arena.alloc_str(routine.body.as_str()) {
@@ -17432,7 +17639,10 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         };
                 }
-                let nested_invocations = query::RoutineInvocationState::new(arena);
+                let nested_invocations = query::RoutineInvocationState::new(
+                    arena,
+                    crate::sql::query::RoutineExecution::Synchronous,
+                );
                 nested_invocations.begin_attempt();
                 query::with_routine_invocation_scope(
                     Some(query::RoutineInvocationContext::new(

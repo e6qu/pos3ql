@@ -50,9 +50,24 @@ impl PendingRoutineInvocation {
 impl RoutineInvocationState {
     /// Source receipts remain usable if admission fails. Only actual values and
     /// selected definitions move; no arena identity or borrowed syntax is copied.
-    pub(crate) fn relocate(&self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed relocation returns the original invocation owner"
+    )]
+    pub(crate) fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, (Self, SqlError)> {
+        let copied = self.copy_receipts(source, target);
+        match copied {
+            Ok(mut output) => {
+                output.suspended = RefCell::new(self.suspended.into_inner());
+                Ok(output)
+            }
+            Err(error) => Err((self, error)),
+        }
+    }
+
+    fn copy_receipts(&self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
         self.require_arena(source)?;
-        let output = Self::new(target);
+        let output = Self::new(target, self.execution);
         output.next.set(self.next.get());
         output.pending.set(
             self.pending
@@ -110,7 +125,10 @@ mod ownership_tests {
         let calls = crate::mem::guard::forbid_alloc(|| {
             owner
                 .with_remaining_region(|scratch| {
-                    let calls = RoutineInvocationState::new(scratch);
+                    let calls = RoutineInvocationState::new(
+                        scratch,
+                        crate::sql::query::RoutineExecution::Retained,
+                    );
                     let text = scratch.alloc_str("completed value").unwrap();
                     let fields = [
                         super::super::super::types::RecordField {
@@ -152,7 +170,7 @@ mod ownership_tests {
                         error.sqlstate,
                         super::super::super::eval::sqlstate::INTERNAL_ROUTINE_INVOCATION
                     );
-                    calls.relocate(scratch, &owner).unwrap()
+                    calls.relocate(scratch, &owner).ok().unwrap()
                 })
                 .unwrap()
         });
@@ -220,7 +238,8 @@ mod ownership_tests {
         let short = Arena::new(&mut budget, "short receipt target", 16).unwrap();
         let target = Arena::new(&mut budget, "admitted receipts", 8192).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            let calls = RoutineInvocationState::new(&source);
+            let calls =
+                RoutineInvocationState::new(&source, crate::sql::query::RoutineExecution::Retained);
             calls
                 .complete(
                     OwnedRoutineResult::capture_scalar(Datum::Text("kept receipt"), &source)
@@ -229,12 +248,14 @@ mod ownership_tests {
                     &source,
                 )
                 .unwrap();
-            assert!(calls.relocate(&source, &short).is_err());
-            assert!(calls.relocate(&target, &source).is_err());
-            let moved = calls.relocate(&source, &target).unwrap();
+            let (calls, _) = calls.relocate(&source, &short).err().unwrap();
+            let (calls, _) = calls.relocate(&target, &source).err().unwrap();
             assert_eq!(calls.results.borrow().len(), 1);
+            let moved = calls.relocate(&source, &target).ok().unwrap();
             assert_eq!(moved.results.borrow().len(), 1);
-            for (calls, arena) in [(&calls, &source), (&moved, &target)] {
+            {
+                let calls = &moved;
+                let arena = &target;
                 let saved =
                     invocation_results::result_at(&calls.results.borrow(), arena, 0).unwrap();
                 let OwnedRoutineResult::Scalar(value) = saved.value else {

@@ -173,7 +173,8 @@ mod ownership_tests {
         let source = Arena::new(&mut budget, "callback source", 4096).unwrap();
         let owner = Arena::new(&mut budget, "callback result owner", 4096).unwrap();
         let output = Arena::new(&mut budget, "independent callback result", 8192).unwrap();
-        let invocations = RoutineInvocationState::new(&owner);
+        let invocations =
+            RoutineInvocationState::new(&owner, crate::sql::query::RoutineExecution::Synchronous);
         let (scalar, rows) = crate::mem::guard::forbid_alloc(|| {
             let value = Datum::Text(source.alloc_str("independent text").unwrap());
             let scalar = ResultBytes::capture_scalar(value, &owner).unwrap();

@@ -1,5 +1,6 @@
 //! A firing keeps its lexical execution and row context under one owner.
 
+use super::call_environment::{CallEnvironment, SavedCallEnvironment};
 use super::*;
 use crate::mem::lease_pool::SharedSlice;
 use crate::storage::{PinnedRelationDefinition, RelationDefinition, TableDefinitionImages};
@@ -44,91 +45,8 @@ pub(super) struct TriggerFiring<'values, 'schema, 'rows> {
     code: CompiledProgram<'values>,
     execution: execution_frame::ExecutionFrame<'values, 'values>,
     binding: FiringBinding<'values, 'schema, 'rows>,
-    environment: FiringEnvironment,
+    environment: CallEnvironment,
     owner: FiringOwner,
-}
-
-pub(super) struct FiringEnvironment {
-    config: Option<crate::sql::guc::RoutineConfigScope>,
-    security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
-    prior_clock: Option<crate::sql::datetime::StatementClock>,
-    _deadline: Option<crate::sql::query::DeadlineScope>,
-}
-
-impl FiringEnvironment {
-    pub(super) fn new(
-        config: Option<crate::sql::guc::RoutineConfigScope>,
-        security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
-    ) -> Self {
-        Self {
-            config,
-            security,
-            prior_clock: None,
-            _deadline: None,
-        }
-    }
-}
-
-impl Drop for FiringEnvironment {
-    fn drop(&mut self) {
-        if let Some(clock) = self.prior_clock.take() {
-            crate::sql::datetime::restore_statement_clock(clock);
-        }
-    }
-}
-
-struct SavedEnvironment {
-    security: Option<crate::storage::SessionIdentity>,
-    config: Option<SharedSlice<crate::sql::guc::RoutineConfigImage>>,
-    clock: crate::sql::datetime::StatementClock,
-    deadline: i64,
-}
-
-impl SavedEnvironment {
-    fn capture(
-        environment: &FiringEnvironment,
-        controls: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
-    ) -> Result<Self, SqlError> {
-        let config = environment
-            .config
-            .as_ref()
-            .map(|scope| {
-                controls
-                    .copy_slice(&[scope.save()?])
-                    .map_err(control_flow::execution_full)
-            })
-            .transpose()?;
-        Ok(Self {
-            security: environment
-                .security
-                .as_ref()
-                .map(|_| crate::sql::eval::funcs::system::current_identity()),
-            config,
-            clock: crate::sql::datetime::stored_statement_clock(),
-            deadline: crate::sql::query::statement_deadline(),
-        })
-    }
-
-    fn enter(&self, txn: &TxnState) -> Result<FiringEnvironment, SqlError> {
-        let security = self
-            .security
-            .map(crate::sql::eval::funcs::system::enter_current_user);
-        let config = self
-            .config
-            .as_ref()
-            .map(|image| image[0].enter())
-            .transpose()?;
-        let prior_clock = crate::sql::datetime::stored_statement_clock();
-        let deadline = crate::sql::query::enter_deadline_scope();
-        crate::sql::datetime::restore_statement_clock(self.clock);
-        txn.restore_statement_deadline(self.deadline);
-        Ok(FiringEnvironment {
-            config,
-            security,
-            prior_clock: Some(prior_clock),
-            _deadline: Some(deadline),
-        })
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,7 +74,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
         code: CompiledProgram<'values>,
         locals: &'values [TriggerLocalDecl],
         binding: FiringBinding<'values, 'schema, 'rows>,
-        environment: FiringEnvironment,
+        environment: CallEnvironment,
     ) -> Result<Self, SqlError> {
         binding.validate()?;
         if code.kind() != PlpgsqlProgramKind::Trigger {
@@ -302,7 +220,7 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
 struct SavedBinding {
     metadata: SavedMetadata,
     values: local_values::SavedValues,
-    environment: SavedEnvironment,
+    environment: SavedCallEnvironment,
     progress: crate::sql::sequence::SavedStatementPosition,
 }
 
@@ -356,14 +274,14 @@ fn capture_values(
 impl SavedBinding {
     fn capture(
         binding: &FiringBinding<'_, '_, '_>,
-        environment: &FiringEnvironment,
+        environment: &CallEnvironment,
         context: &TriggerExecContext<'_, '_, '_>,
         definitions: &TableDefinitionImages,
     ) -> Result<Self, SqlError> {
         binding.validate()?;
         let progress = crate::sql::sequence::SavedStatementPosition::capture()?;
         let storage = context.storage();
-        let environment = SavedEnvironment::capture(environment, &storage.execution_control)?;
+        let environment = SavedCallEnvironment::capture(environment, &storage.execution_control)?;
         let identity = definitions.retain_relation(&binding.definition)?;
         let definition = definitions.pin_relation(identity)?;
         let mut aliases = [None, None];
@@ -652,7 +570,7 @@ impl SuspendedTriggerFiring {
 fn resume<'run>(
     metadata: &'run SavedMetadata,
     values: &mut local_values::SavedValues,
-    environment: &mut SavedEnvironment,
+    environment: &mut SavedCallEnvironment,
     progress: &mut crate::sql::sequence::SavedStatementPosition,
     frame: execution_frame::SuspendedExecutionFrame,
     mut context: TriggerExecContext<'_, 'run, '_>,
@@ -694,12 +612,11 @@ fn resume<'run>(
             match firing.execute(&mut context) {
                 Ok(accepted) => {
                     capture_values(values, &firing.binding).map_err(ResumeError::Executed)?;
-                    environment.security = None;
-                    environment.config = None;
+                    environment.complete();
                     Ok((FiringState::Complete, FiringProgress::Complete { accepted }))
                 }
                 Err(error) if control_flow::is_execution_wait(&error) => {
-                    let saved_environment = SavedEnvironment::capture(
+                    let saved_environment = SavedCallEnvironment::capture(
                         &firing.environment,
                         &context.storage().execution_control,
                     )

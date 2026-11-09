@@ -7,8 +7,10 @@ fn invocation_callback_scopes_restore_outer_owners_after_nested_and_failed_calls
     let mut budget = Budget::new(2048);
     let mut outer = Arena::new(&mut budget, "outer callback owner", 1024).unwrap();
     let mut inner = Arena::new(&mut budget, "inner callback owner", 1024).unwrap();
-    let outer_calls = RoutineInvocationState::new(&outer);
-    let inner_calls = RoutineInvocationState::new(&inner);
+    let outer_calls =
+        RoutineInvocationState::new(&outer, crate::sql::query::RoutineExecution::Synchronous);
+    let inner_calls =
+        RoutineInvocationState::new(&inner, crate::sql::query::RoutineExecution::Synchronous);
     crate::mem::guard::forbid_alloc(|| {
         with_active_routine_invocations(|context| assert!(context.is_none()));
         with_routine_invocation_scope(
@@ -301,7 +303,8 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
     let mut budget = Budget::new(32 << 10);
     let statement = Arena::new(&mut budget, "completed invocation log", 16 << 10).unwrap();
     let mut work = Arena::new(&mut budget, "completed invocation body", 16 << 10).unwrap();
-    let invocations = RoutineInvocationState::new(&statement);
+    let invocations =
+        RoutineInvocationState::new(&statement, crate::sql::query::RoutineExecution::Synchronous);
     crate::mem::guard::forbid_alloc(|| {
         work.with_remaining_region(|body| {
             let name = body.alloc_str("body_value").unwrap();

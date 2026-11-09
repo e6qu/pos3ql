@@ -43,10 +43,12 @@ commit publication does not require serializing every query or independent
 upload. Keep synchronous protection on each path until its unfinished work has
 an owner that survives returning to the scheduler.
 
-The active implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
+The implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
 completion, trigger frames and completed calls within unfinished `PERFORM` and
-`SELECT ... INTO`. These mechanisms still need final qualification with the
-remaining paths below. The [request path](docs/architecture.md#the-request-path)
+`SELECT ... INTO`. The current PR extends those owned expressions to unfinished
+PL/pgSQL scalar and table-function bodies, including saved arguments, locals,
+control flow and function timing. Repeated-wait and cleanup qualification is
+in progress; this is not yet a completed execution milestone. The [request path](docs/architecture.md#the-request-path)
 owns their detailed contracts and regression evidence.
 
 Complete these connected execution paths:

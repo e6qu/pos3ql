@@ -210,8 +210,18 @@ even an older mutable handle cannot reopen that allocation for writing.
 Callback lookup exposes the invocation log only inside a scoped closure. Its
 installer keeps the restoring guard private and restores the previous owner on
 success, errors or unwinding.
-This owns the call's inputs. The running body and enclosing write still need
-complete ownership across a scheduler return.
+Owned procedural expressions also retain an unfinished PL/pgSQL scalar or
+set-returning body. Its source, arguments, local values, pending child work,
+statement position and call environment survive recycling temporary query memory.
+Moving a call log transfers its unfinished body once; failed relocation preserves
+the original owner. A paused function removes its timing entry from the worker
+and restores it on resumption, so another client's work is not charged as its
+child. Tracking still counts one completed call.
+For example, after writing an audit row and issuing an order number, a function
+waiting for an advisory lock continues with the same local text and number.
+General SQL-language bodies, return checks that can wait, other expression
+positions and the enclosing write still need complete ownership before their
+synchronous storage protection can be removed.
 Completed scalar values and table-source rows keep their encoded bytes in
 checked arena allocations too. Their result directory stores handles and effect
 receipts, rather than references to returned values or row slices. For example,

@@ -21,8 +21,8 @@ fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
         datetime::begin_statement();
         datetime::begin_transaction();
         query::restore_statement_deadline(812_345_678_902_234);
-        let active = FiringEnvironment::new(None, None);
-        let saved = SavedEnvironment::capture(&active, &controls).unwrap();
+        let active = CallEnvironment::new(None, None);
+        let saved = SavedCallEnvironment::capture(&active, &controls).unwrap();
         drop(active);
 
         let _worker_clock = datetime::test_clock::enter(812_345_678_901_634);
@@ -281,7 +281,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 level: TriggerLevel::Row,
                 before: true,
             },
-            FiringEnvironment::new(Some(settings), Some(security)),
+            CallEnvironment::new(Some(settings), Some(security)),
         )
         .unwrap();
         let error = firing.execute(&mut context).err().unwrap();

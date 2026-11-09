@@ -169,6 +169,7 @@ fn spooled_column_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1038,6 +1039,7 @@ fn subquery_collations<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
@@ -1072,6 +1074,7 @@ fn subquery_collations<'a>(
             arena,
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
             *slot = column.collation;
@@ -1165,6 +1168,7 @@ fn row_subquery_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
@@ -1192,6 +1196,7 @@ fn row_subquery_witness<'a>(
             arena,
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             fields[index] = RecordField {
@@ -2604,6 +2609,34 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         )
     }
 
+    fn visit_composite_fields(
+        &self,
+        creation: Option<crate::storage::TypeCreation>,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        self.catalog.visit_composite_fields(creation, visit)
+    }
+
+    fn visit_named_composite_fields(
+        &self,
+        name: &str,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Result<Option<usize>, SqlError> {
+        self.catalog.visit_named_composite_fields(name, visit)
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let scope = self.scope?;
+        CatalogScopeCols {
+            scope, outer_scope: None, storage: self.catalog.storage,
+            txid: self.catalog.txid, arena: self.catalog.arena,
+        }.whole_row_field(name, index)
+    }
+
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.catalog.domain_base_type(type_oid)
     }
@@ -2657,7 +2690,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope
-            .is_some_and(|scope| scope.table_index(name).is_ok())
+            .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -2671,17 +2704,8 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let scope = self.scope?;
-        let entry = scope.find_column(qualifier, name).ok()?;
-        if scope.output_type(entry) != ColType::Record {
-            return None;
-        }
-        match entry {
-            crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs.get(table)?.columns[column].type_mod)
-            }
-            crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
-        }
+        let metadata = self.column_meta(qualifier, name)?;
+        (metadata.ctype == ColType::Record && metadata.type_mod >= 0).then_some(metadata.type_mod)
     }
 }
 

@@ -18,7 +18,9 @@ derived tables as well as direct table reads and wildcard expansion.
 Expanded records must occupy their actual output width in ordering, grouping,
 window queries, set operations and deferred evaluation after sorting.
 Derived-table descriptions must resolve their own WITH names before column
-lookup, including CTEs that shadow a trigger's transition table.
+lookup, including CTEs that shadow a trigger's transition table. An empty outer
+WITH clause cannot bypass nested bindings. SELECT INTO descriptions must retain
+local record-field types; ROW field positions count expanded fields.
 RETURNING, ordinary write expressions and conflict-update expressions share
 the same reference-kind walk, with explicit old/new and excluded namespaces.
 Sequence-only SQL helpers called inside trigger source queries must use the

@@ -128,6 +128,76 @@ pub(crate) fn expand_stored_expression<'a>(
     )
 }
 
+fn expression_contains_with(expression: &Expr<'_>) -> bool {
+    let nested = match expression {
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+            select_contains_with(select)
+        }
+        Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
+            select_contains_with(select)
+        }
+        _ => false,
+    };
+    if nested {
+        return true;
+    }
+    let mut found = false;
+    super::walk_children(expression, &mut |child| {
+        found |= expression_contains_with(child);
+        Ok(())
+    })
+    .expect("WITH discovery cannot fail");
+    found
+}
+
+fn table_contains_with(table: &TableRef<'_>) -> bool {
+    table.subquery.is_some_and(select_contains_with)
+        || table.func_args.is_some_and(|arguments| {
+            arguments.iter().any(|argument| expression_contains_with(argument))
+        })
+        || table.rows_from.is_some_and(|tables| tables.iter().any(table_contains_with))
+        || table.sample.is_some_and(|sample| {
+            expression_contains_with(sample.percentage)
+                || sample.repeatable.is_some_and(expression_contains_with)
+        })
+}
+
+fn set_tree_contains_with(tree: &SetTree<'_>) -> bool {
+    match tree {
+        SetTree::Select(select) => select_contains_with(select),
+        SetTree::Op { left, right, .. } => {
+            set_tree_contains_with(left) || set_tree_contains_with(right)
+        }
+    }
+}
+
+// A query without an outer WITH may still contain one in a derived table,
+// expression subquery, or set-operation branch. Only skip a complete rewrite
+// when every query level is free of WITH bindings.
+fn select_contains_with(select: &Select<'_>) -> bool {
+    !select.with.is_empty()
+        || select.items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expression_contains_with(expression)
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        })
+        || select.where_clause.is_some_and(expression_contains_with)
+        || select.having.is_some_and(expression_contains_with)
+        || select.group_by.iter().any(|expression| expression_contains_with(expression))
+        || select.distinct_on.iter().any(|expression| expression_contains_with(expression))
+        || select.order_by.iter().any(|order| expression_contains_with(order.expression))
+        || select.limit.is_some_and(expression_contains_with)
+        || select.offset.is_some_and(expression_contains_with)
+        || select.from.is_some_and(|from| {
+            table_contains_with(&from.base)
+                || from.joins.iter().any(|join| {
+                    table_contains_with(&join.table) || join.on.is_some_and(expression_contains_with)
+                })
+        })
+        || select.set_body.is_some_and(set_tree_contains_with)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_ctes_with_path<'a>(
     sel: &'a Select<'a>,
@@ -140,7 +210,7 @@ fn expand_ctes_with_path<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
-    if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
+    if !select_contains_with(sel) && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
     with_schema_context(
@@ -388,7 +458,7 @@ pub fn expand_ctes_exec<'a>(
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
-    if sel.with.is_empty() && !storage.has_any_view() {
+    if !select_contains_with(sel) && !storage.has_any_view() {
         return Ok(sel);
     }
     with_exec_context(
@@ -1899,6 +1969,7 @@ fn filter_set_view_conjunct<'a>(
                 arena,
                 columns,
                 crate::sql::exec::DescriptionTarget::Sql,
+                None,
             )?;
             if count != definition.n_columns {
                 return Err(sql_err!(
@@ -2578,6 +2649,7 @@ fn materialize_query_cte<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     if aliases.len() > ncols {
         return Err(sql_err!(
@@ -2645,6 +2717,7 @@ pub fn describe_set_query<'a>(
         arena,
         None,
         description_target,
+        None,
     )
 }
 
@@ -2660,7 +2733,7 @@ pub(crate) fn expand_set_tree<'a>(
     dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
+    if with.is_empty() && !set_tree_contains_with(tree) && dependencies.is_none() && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
@@ -2680,7 +2753,7 @@ pub(super) fn expand_set_tree_exec<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && !storage.has_any_view() {
+    if with.is_empty() && !set_tree_contains_with(tree) && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
@@ -3772,6 +3845,7 @@ fn reject_recursive_name_collision<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     Err(sql_err!(
         sqlstate::SYNTAX_ERROR,
@@ -4156,6 +4230,7 @@ fn describe_recursive_materialized<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
@@ -4283,6 +4358,7 @@ fn external_recursive_tree(
                 })
                 .expect("recursive work table has a block store")
         },
+        None,
     )?;
     storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
@@ -4539,6 +4615,7 @@ fn materialize_recursive<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
@@ -4695,6 +4772,7 @@ fn materialize_recursive<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?;
         let expected_step_columns = ncols + decoration.state_types.len();
         if stepn != expected_step_columns {
@@ -4843,6 +4921,7 @@ fn materialize_recursive<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     let expected_step_columns = ncols + decoration.state_types.len();
     if stepn != expected_step_columns {

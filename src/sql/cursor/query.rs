@@ -248,6 +248,7 @@ impl CursorQuery {
                                         scratch,
                                         &mut columns,
                                         crate::sql::exec::DescriptionTarget::Sql,
+                                        None,
                                     )?
                                 }
                                 CursorStatement::SetQuery(query) => {

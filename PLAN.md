@@ -102,7 +102,11 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   preserving column precedence when its name matches a table alias.
   Apply the same reference-kind rules to RETURNING and write expressions,
   including old/new aliases and excluded conflict rows. Bind local WITH names
-  before describing a derived table inside procedural input analysis.
+  before describing a derived table inside procedural input analysis. Nested
+  WITH clauses must also expand when the outer query has none. SELECT INTO
+  descriptions use the same local scope as execution, including NULL domain
+  fields, table-backed queries and set-operation branches. ROW constructors
+  resolve field positions after embedded whole rows have expanded.
   Distinguish sequence-only SQL helpers from programs that need mutable catalog
   execution; trigger source queries keep their active sequence session.
   Count expanded record fields consistently in sorting, grouping, window

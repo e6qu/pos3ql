@@ -26598,6 +26598,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     arena,
                     &mut columns,
                     crate::sql::exec::DescriptionTarget::Sql,
+                    None,
                 )?,
                 Stmt::SetQuery(set_query) => super::query::describe_set_query(
                     context.storage(),
@@ -26699,6 +26700,7 @@ where
         query_arena,
         &mut columns,
         crate::sql::exec::DescriptionTarget::Sql,
+        Some(scope),
     )?;
     let mut rows = ArenaList::new(result_arena);
     super::query::select_into_rows(
@@ -27838,6 +27840,7 @@ fn execute_trigger_step<'a>(
                     arena,
                     &mut columns,
                     crate::sql::exec::DescriptionTarget::Sql,
+                    Some(&scope),
                 )?;
                 for (field, column) in fields.iter_mut().zip(&columns[..width]) {
                     *field = (
@@ -28036,6 +28039,7 @@ fn execute_trigger_step<'a>(
                                 context.arena,
                                 &mut columns,
                                 crate::sql::exec::DescriptionTarget::Sql,
+                                None,
                             )?,
                             Stmt::SetQuery(set_query) if record_target => {
                                 super::query::describe_set_query(
@@ -65243,6 +65247,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                     arena,
                     &mut source_columns,
                     crate::sql::exec::DescriptionTarget::Sql,
+                    None,
                 ) {
                     Ok(count) => count,
                     Err(error) => return sql_fail(error),

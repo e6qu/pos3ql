@@ -62,17 +62,26 @@ BEGIN
     RETURN code='XX000' AND result.value='text';
 END$$;
 CREATE FUNCTION check_null_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
-DECLARE result record; copied record; matched boolean;
+DECLARE result record; copied record; from_copied record; set_copied record; matched boolean;
 BEGIN
     EXECUTE 'SELECT NULL::record_positive AS id,NULL::record_label AS label' INTO result;
     SELECT result.id,result.label INTO copied;
+    SELECT result.id,result.label INTO from_copied FROM record_source;
+    SELECT result.id,result.label INTO set_copied
+        UNION ALL SELECT result.id,result.label WHERE false;
     INSERT INTO record_field_copies SELECT result.id,result.label;
     UPDATE record_field_copies SET id=result.id,label=result.label;
     EXECUTE 'SELECT 7::record_positive AS id,''seven''::record_label AS label' INTO result;
     SELECT result.label=result.label INTO matched;
     RETURN matched AND copied.id IS NULL AND copied.label IS NULL
         AND pg_typeof(copied.id)='record_positive'::regtype
-        AND pg_typeof(copied.label)='record_label'::regtype;
+        AND pg_typeof(copied.label)='record_label'::regtype
+        AND from_copied.id IS NULL AND from_copied.label IS NULL
+        AND pg_typeof(from_copied.id)='record_positive'::regtype
+        AND pg_typeof(from_copied.label)='record_label'::regtype
+        AND set_copied.id IS NULL AND set_copied.label IS NULL
+        AND pg_typeof(set_copied.id)='record_positive'::regtype
+        AND pg_typeof(set_copied.label)='record_label'::regtype;
 END$$;
 CREATE FUNCTION check_following_record_fields() RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE result record;

@@ -4923,25 +4923,18 @@ fn eval_full_inner<'a>(
                     "row expansion via \"*\" is not supported here"
                 ));
             }
-            // A direct ROW(...) resolves its f1..fn — unless the selected
-            // field is a bare unknown literal, which PostgreSQL cannot
-            // coerce (XX000). A typed sibling of an unknown field is fine.
             if let Expr::Call {
                 kind: super::ast::CallKind::SqlSyntax,
                 name,
-                args,
                 ..
             } = base
                 && name.eq_ignore_ascii_case("row")
-                && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(field))
-                && matches!(args.get(position), Some(Expr::Str(_)))
             {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "failed to find conversion function from unknown to text"
-                ));
+                crate::sql::exec::record_field_metadata(
+                    base,
+                    field,
+                    &RuntimeColumnTypes { row, catalog: hooks.catalog },
+                )?;
             }
             let b = eval_full(base, arena, params, row, hooks)?;
             // A record arriving indirectly — CASE, a scalar subquery, an
@@ -5583,13 +5576,39 @@ fn expression_collation<'a>(
                 args,
                 ..
             } if name.eq_ignore_ascii_case("row") => {
-                let position = crate::sql::exec::RECORD_FIELD_NAMES
+                let Some(mut position) = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
-                    .position(|name| name.eq_ignore_ascii_case(field));
-                match position.and_then(|position| args.get(position)) {
-                    Some(argument) => expression_collation(argument, row, catalog),
-                    None => Ok(None),
+                    .position(|name| name.eq_ignore_ascii_case(field)) else {
+                    return Ok(None);
+                };
+                for argument in *args {
+                    let expansion = match argument {
+                        Expr::WholeRow(_) => Some(*argument),
+                        Expr::Field { base, field: "*" } => Some(*base),
+                        _ => None,
+                    };
+                    if let Some(base) = expansion {
+                        let mut index = 0;
+                        let mut selected = None;
+                        let width = crate::sql::exec::record_shape_metadata(
+                            base, &RuntimeColumnTypes { row, catalog }, |_, metadata| {
+                                if index == position { selected = Some(metadata); }
+                                index += 1;
+                            },
+                        )?.ok_or_else(|| crate::sql::exec::could_not_identify("*"))?;
+                        if let Some(metadata) = selected {
+                            return Ok(DerivedCollation::implicit(
+                                metadata.collation, metadata.ctype.is_collatable(),
+                            ));
+                        }
+                        position -= width;
+                    } else if position == 0 {
+                        return expression_collation(argument, row, catalog);
+                    } else {
+                        position -= 1;
+                    }
                 }
+                Ok(None)
             }
             Expr::WholeRow(table) => {
                 let value = row.collation(Some(table), field);

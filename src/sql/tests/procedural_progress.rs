@@ -1875,6 +1875,17 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
             );
             session.success(&mut engine, &procedural, true);
         }
+        for query in [
+            "SELECT check_unknown_record_output()",
+            "SELECT check_null_record_fields()",
+            "SELECT check_following_record_fields()",
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, query, true)),
+                ["t"],
+                "{mode:?}: {query}"
+            );
+        }
         assert_eq!(
             data_rows(&session.success(&mut engine, final_query, true)),
             ["t|1|text|text|t"],
@@ -1952,7 +1963,7 @@ fn whole_row_dependencies_keep_expanded_and_selected_columns() {
                 include_str!("../../../tests/external/differential/281_whole_row_dependencies.sql"),
                 true,
             )),
-            ["7|seven|7|7|7|7|7|seven|7"],
+            ["7|seven|7|7|7|7|7|seven|7|7|99"],
             "{mode:?}"
         );
     }

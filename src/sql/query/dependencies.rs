@@ -1753,6 +1753,7 @@ pub(crate) fn visit_projection_types(
                 arena,
                 Some(&mut oids),
                 crate::sql::exec::DescriptionTarget::Sql,
+                outer,
             )?;
             for (oid, column) in oids[..count].iter().zip(&columns[..count]) {
                 visit(*oid, column.collation)?;

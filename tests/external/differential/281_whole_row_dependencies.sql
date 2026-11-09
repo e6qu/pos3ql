@@ -23,6 +23,9 @@ CREATE TABLE whole_dep_constructor_source(id integer,spare text);
 INSERT INTO whole_dep_constructor_source VALUES(7,'needed by expansion');
 CREATE VIEW whole_dep_constructor AS
 SELECT (ROW((t).*)).f1 AS id FROM whole_dep_constructor_source t;
+CREATE VIEW whole_dep_constructor_prefix AS
+SELECT (ROW(-1,(t).*,99)).f2 AS id,(ROW(-1,(t).*,99)).f4 AS tail
+FROM whole_dep_constructor_source t;
 DO $$BEGIN
     BEGIN
         ALTER TABLE whole_dep_constructor_source DROP COLUMN spare;
@@ -53,5 +56,6 @@ END$$;
 SELECT n.id,n.label,(SELECT id FROM whole_dep_qualified),
     (SELECT id FROM whole_dep_derived),(SELECT id FROM whole_dep_field),
     (SELECT id FROM whole_dep_schema_field),(SELECT id FROM whole_dep_record_field),
-    (SELECT b FROM whole_dep_record_star),(SELECT id FROM whole_dep_constructor)
+    (SELECT b FROM whole_dep_record_star),(SELECT id FROM whole_dep_constructor),
+    (SELECT id FROM whole_dep_constructor_prefix),(SELECT tail FROM whole_dep_constructor_prefix)
 FROM whole_dep_nested n;

@@ -2312,6 +2312,7 @@ pub(crate) fn describe_derived_definition<'a>(
             arena,
             Some(&mut type_oids),
             crate::sql::exec::DescriptionTarget::Sql,
+            None,
         )?,
         None => match &sub.from {
             Some(f) => {

@@ -516,6 +516,10 @@ keeping those type IDs for later `FETCH` commands. `CLOSE` releases the metadata
 The same declared identities must survive an empty `EXECUTE ... INTO` and a
 saved query reading an ordinary local record. For example, `SELECT result.id`
 must recognize the field and retain its domain when `result.id` is NULL.
+`SELECT result.id INTO copied` describes its output with the same local scope
+used to execute it, including table-backed queries and set-operation branches.
+A nested `WITH orders AS (...)` binds its local name even when the outer query
+has no WITH clause; it must not read a durable `orders` table instead.
 Cast descriptions, record expansion and array subscripts keep the SQL type;
 only the final wire description selects its PostgreSQL base representation.
 Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,
@@ -527,7 +531,9 @@ The same precedence applies to expansion. A scalar column named `t` cannot be
 expanded as `(t).*` just because the table also has alias `t`. Description offsets
 use catalog-aware expansion widths, so a later subquery keeps its own column
 and declared domain. Fields selected from an array of named records retain
-their logical types and collations as well.
+their logical types and collations as well. A constructor such as
+`ROW(0,(orders).*,99)` counts the expanded order fields before assigning its
+`f1`, `f2`, and later field positions.
 `SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
 Comparing a named text field such as `settings."TimeZone"` uses its text
 collation, including after a procedural pause.

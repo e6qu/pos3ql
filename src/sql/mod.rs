@@ -9945,6 +9945,7 @@ impl Engine {
                             arena,
                             &mut result_columns,
                             crate::sql::exec::DescriptionTarget::Wire,
+                            None,
                         )
                     }),
                 Stmt::SetQuery(query) => query::describe_set_query(
@@ -13511,6 +13512,7 @@ impl Engine {
                     arena,
                     &mut columns,
                     exec::DescriptionTarget::Wire,
+                    None,
                 );
                 match described {
                     Ok(n) => {

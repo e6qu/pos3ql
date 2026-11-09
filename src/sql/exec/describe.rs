@@ -3726,19 +3726,20 @@ pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Resu
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,
         name,
-        args,
         ..
     } = base
         && name.eq_ignore_ascii_case("row")
     {
-        for arg in *args {
-            if infer_type_res(arg, columns)?.0 == oid::UNKNOWN && !matches!(arg, Expr::Cast { .. })
-            {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "failed to find conversion function from unknown to text"
-                ));
-            }
+        let mut unknown = false;
+        record_shape_metadata(base, columns, |_, metadata| {
+            unknown |= metadata.type_oid == oid::UNKNOWN;
+        })?
+        .ok_or_else(|| could_not_identify("*"))?;
+        if unknown {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "failed to find conversion function from unknown to text"
+            ));
         }
     }
     Ok(())
@@ -3763,33 +3764,26 @@ pub fn record_field_metadata(
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,
         name,
-        args,
         ..
     } = base
         && name.eq_ignore_ascii_case("row")
-        && let Some(position) = RECORD_FIELD_NAMES
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(field))
-        && let Some(arg) = args.get(position)
-        && infer_type_res(arg, columns)?.0 == oid::UNKNOWN
-        && !matches!(arg, Expr::Cast { .. })
     {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "failed to find conversion function from unknown to text"
-        ));
+        let mut selected = None;
+        record_shape_metadata(base, columns, |name, metadata| {
+            if name.eq_ignore_ascii_case(field) {
+                selected = Some(metadata);
+            }
+        })?;
+        let metadata = selected.ok_or_else(|| could_not_identify(field))?;
+        if metadata.type_oid == oid::UNKNOWN {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "failed to find conversion function from unknown to text"
+            ));
+        }
+        return Ok(metadata);
     }
     let precise = match base {
-        Expr::Call {
-            kind: crate::sql::ast::CallKind::SqlSyntax,
-            name,
-            args,
-            ..
-        } if name.eq_ignore_ascii_case("row") => RECORD_FIELD_NAMES
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(field))
-            .and_then(|position| args.get(position))
-            .and_then(|argument| expression_static_metadata(argument, columns)),
         Expr::Call { args, .. } if builtin_expand_array_call(base, columns)? => {
             if field.eq_ignore_ascii_case("x") {
                 expand_array_element_metadata(args, columns)

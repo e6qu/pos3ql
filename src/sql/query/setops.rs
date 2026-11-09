@@ -9,7 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
+use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, compare_datums_collated, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum};
@@ -22,12 +22,13 @@ use super::{
 };
 
 #[derive(Clone, Copy)]
-struct ExternalSetContext<'a> {
+struct ExternalSetContext<'scope, 'a> {
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &'a [Datum<'a>],
-    sequences: Option<&'a dyn SequenceAccess>,
+    params: &'scope [Datum<'a>],
+    sequences: Option<&'scope dyn SequenceAccess>,
+    outer: Option<&'scope dyn ColumnLookup<'a>>,
 }
 
 /// Executes a set-operation query (UNION / INTERSECT / EXCEPT). Each SELECT
@@ -77,6 +78,7 @@ pub fn set_query<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Wire,
+        None,
     ) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
@@ -120,6 +122,7 @@ pub fn set_query<'a>(
         sequences,
         &target[..n_cols],
         &collations[..n_cols],
+        None,
     ) {
         Ok(r) => r,
         Err(e) => return sql_fail(e),
@@ -227,6 +230,7 @@ pub(crate) fn set_query_into_rows<'a>(
             params,
             sequences,
             emit,
+            None,
         );
     }
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -238,6 +242,7 @@ pub(crate) fn set_query_into_rows<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        None,
     )?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
@@ -262,6 +267,7 @@ pub(crate) fn set_query_into_rows<'a>(
         sequences,
         &target[..column_count],
         &collations[..column_count],
+        None,
     )?;
     sort_set_rows(
         storage,
@@ -454,7 +460,7 @@ fn push_run(
 
 fn external_set_leaf<'a>(
     select: &'a Select<'a>,
-    context: ExternalSetContext<'a>,
+    context: ExternalSetContext<'_, 'a>,
     target: &[ColType],
     sorted: bool,
 ) -> Result<Option<ExternalRun>, SqlError> {
@@ -471,7 +477,7 @@ fn external_set_leaf<'a>(
         select,
         context.arena,
         context.params,
-        None,
+        context.outer,
         context.sequences,
         &mut |values| {
             if values.len() != target.len() {
@@ -505,7 +511,7 @@ fn external_set_leaf<'a>(
 
 fn external_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    context: ExternalSetContext<'a>,
+    context: ExternalSetContext<'_, 'a>,
     target: &[ColType],
     sorted: bool,
 ) -> Result<Option<ExternalRun>, SqlError> {
@@ -697,6 +703,7 @@ pub(crate) fn external_set_body_into<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
     let bound_catalog = super::storage_catalog(storage, arena, txid);
     let bound_queries = super::ProceduralSubqueries { storage, txid };
@@ -716,6 +723,7 @@ pub(crate) fn external_set_body_into<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        outer,
     )?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
@@ -738,6 +746,7 @@ pub(crate) fn external_set_body_into<'a>(
             arena,
             params,
             sequences,
+            outer,
         },
         &target[..column_count],
         false,
@@ -845,6 +854,7 @@ fn external_set_query<'a>(
             arena,
             params,
             sequences,
+            outer: None,
         },
         target,
         false,
@@ -1051,10 +1061,11 @@ fn describe_leaf<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let count = describe_leaf_inner(storage, s, txid, columns, arena, type_oids)?;
+        let count = describe_leaf_inner(storage, s, txid, columns, arena, type_oids, outer)?;
         let mut names = [crate::storage::SqlName::EMPTY; MAX_PROJ];
         for (name, column) in names.iter_mut().zip(&columns[..count]) {
             *name = crate::storage::SqlName::parse(column.name)?;
@@ -1079,6 +1090,7 @@ fn describe_leaf_inner<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
     if let Some(tree) = s.set_body {
         return describe_set_body(
@@ -1089,7 +1101,17 @@ fn describe_leaf_inner<'a>(
             arena,
             Some(type_oids),
             crate::sql::exec::DescriptionTarget::Sql,
+            outer,
         );
+    }
+    if outer.is_some() {
+        let count = super::describe_select(
+            s, storage, txid, arena, columns, crate::sql::exec::DescriptionTarget::Sql, outer,
+        )?;
+        for (output, column) in type_oids.iter_mut().zip(&columns[..count]) {
+            *output = column.type_oid;
+        }
+        return Ok(count);
     }
     match &s.from {
         None => {
@@ -1282,6 +1304,7 @@ fn register_first_leaf_record_shapes(
     arena: &Arena,
     columns: &mut [ColDesc],
     count: usize,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<(), SqlError> {
     if !columns[..count]
         .iter()
@@ -1290,7 +1313,7 @@ fn register_first_leaf_record_shapes(
         return Ok(());
     }
     let mark = arena.mark();
-    let result = register_record_shapes_inner(storage, statement, txid, arena, columns, count);
+    let result = register_record_shapes_inner(storage, statement, txid, arena, columns, count, outer);
     // Record fields live in the arena's persistent tail; descriptors retain handles only.
     unsafe {
         arena.rewind_to(mark);
@@ -1305,13 +1328,21 @@ fn register_record_shapes_inner(
     arena: &Arena,
     columns: &mut [ColDesc],
     count: usize,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<(), SqlError> {
     let scope = statement
         .from
         .as_ref()
-        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, outer))
         .transpose()?;
     let scope = scope.as_ref();
+    let resolver = super::subquery::SubqueryColumns {
+        scope,
+        outer,
+        catalog: exec::CatalogCols {
+            definition: None, alias: None, output_aliases: &[], storage, txid, arena,
+        },
+    };
     let mut slot = 0usize;
     for item in statement.items {
         match item {
@@ -1322,35 +1353,12 @@ fn register_record_shapes_inner(
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
-                slot += super::record_star_width(base, scope, storage, txid, arena)?;
+                slot += exec::record_shape_metadata(base, &resolver, |_, _| {})?
+                    .ok_or_else(|| exec::could_not_identify("*"))?;
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < count && columns[slot].type_oid == crate::sql::types::oid::RECORD {
-                    let handle = match scope {
-                        Some(scope) => crate::sql::exec::register_shape_for(
-                            expression,
-                            &super::CatalogScopeCols {
-                                scope,
-                                outer_scope: None,
-                                storage,
-                                txid,
-                                arena,
-                            },
-                            arena,
-                        )?,
-                        None => crate::sql::exec::register_shape_for(
-                            expression,
-                            &crate::sql::exec::CatalogCols {
-                                definition: None,
-                                alias: None,
-                                output_aliases: &[],
-                                storage,
-                                txid,
-                                arena,
-                            },
-                            arena,
-                        )?,
-                    };
+                    let handle = exec::register_shape_for(expression, &resolver, arena)?;
                     if let Some(handle) = handle {
                         columns[slot].type_mod = handle;
                     }
@@ -1429,9 +1437,10 @@ fn eval_set_tree<'a>(
     sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
     collations: &[Collation],
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     match tree {
-        SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, sequences, target),
+        SetTree::Select(s) => eval_set_leaf(s, storage, txid, arena, params, sequences, target, outer),
         SetTree::Op {
             operator,
             all,
@@ -1441,9 +1450,11 @@ fn eval_set_tree<'a>(
         } => {
             let l = eval_set_tree(
                 left, storage, txid, arena, params, sequences, target, collations,
+                outer,
             )?;
             let r = eval_set_tree(
                 right, storage, txid, arena, params, sequences, target, collations,
+                outer,
             )?;
             combine_sets(storage, txid, collations, *operator, *all, l, r, arena)
         }
@@ -1454,6 +1465,7 @@ fn eval_set_tree<'a>(
 /// then each column's type is unified across every leaf (same count required).
 /// On success `columns[..n]` carries the final unified OIDs/lengths. Shared by the
 /// derived-table, subquery, and INSERT-source paths.
+#[expect(clippy::too_many_arguments, reason = "set output uses the same outer scope as execution")]
 pub(crate) fn describe_set_body<'a>(
     storage: &'a Storage,
     tree: &'a SetTree<'a>,
@@ -1462,14 +1474,15 @@ pub(crate) fn describe_set_body<'a>(
     arena: &'a Arena,
     type_oids: Option<&mut [i32]>,
     description_target: crate::sql::exec::DescriptionTarget,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<usize, SqlError> {
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();
     let leaf0 = leaves.first().copied().expect(">=1 leaf");
     let mut leaf_types = [0; MAX_PROJ];
-    let n_cols = describe_leaf(storage, leaf0, txid, columns, arena, &mut leaf_types)?;
-    register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
+    let n_cols = describe_leaf(storage, leaf0, txid, columns, arena, &mut leaf_types, outer)?;
+    register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols, outer)?;
     let leaf_collations = arena
         .alloc_slice_with(leaves.len() * n_cols, |_| SetColumnCollation::NONE)
         .map_err(|_| arena_full())?;
@@ -1509,7 +1522,7 @@ pub(crate) fn describe_set_body<'a>(
     }
     for (leaf_index, leaf) in leaves[1..].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types)?;
+        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types, outer)?;
         if ln != n_cols {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
@@ -1639,7 +1652,7 @@ pub(crate) fn materialize_set_body<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
-    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params, sequences)?;
+    let materialized = materialize_set_body_tied(storage, txid, tree, arena, params, sequences, None)?;
     // `materialize_set_body_tied` ties all inputs to one lifetime because the
     // row executor may temporarily decode datums borrowed from storage. None
     // of those datums escape: every output row is projected-encoded into
@@ -1649,13 +1662,14 @@ pub(crate) fn materialize_set_body<'a>(
     Ok(unsafe { core::mem::transmute::<MaterializedSet<'_>, MaterializedSet<'a>>(materialized) })
 }
 
-fn materialize_set_body_tied<'a>(
+pub(super) fn materialize_set_body_tied<'a>(
     storage: &'a Storage,
     txid: u32,
     tree: &'a SetTree<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<MaterializedSet<'a>, SqlError> {
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let n = describe_set_body(
@@ -1666,6 +1680,7 @@ fn materialize_set_body_tied<'a>(
         arena,
         None,
         crate::sql::exec::DescriptionTarget::Sql,
+        outer,
     )?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
@@ -1696,10 +1711,12 @@ fn materialize_set_body_tied<'a>(
         sequences,
         target,
         &collations[..n],
+        outer,
     )?;
     Ok((rows, target, n))
 }
 
+#[expect(clippy::too_many_arguments, reason = "set leaf carries its execution scope")]
 fn eval_set_leaf<'a>(
     s: &'a Select<'a>,
     storage: &'a Storage,
@@ -1708,6 +1725,7 @@ fn eval_set_leaf<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
     target: &[ColType],
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a mut [&'a [u8]], SqlError> {
     let mut rows = ArenaList::new_persistent(arena);
     let n = target.len();
@@ -1717,7 +1735,7 @@ fn eval_set_leaf<'a>(
         s,
         arena,
         params,
-        None,
+        outer,
         sequences,
         &mut |vals| {
             if vals.len() != n {

@@ -245,3 +245,95 @@ fn paused_functions_keep_the_selected_body_handler_loop_and_settings() {
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+#[test]
+fn paused_function_capacity_failure_rolls_back_and_returns_its_reservations() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("function-body-exhaustion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "CREATE SEQUENCE exhausted_function_numbers; \
+            CREATE TABLE exhausted_function_root(id integer); CREATE TABLE exhausted_function_audit(n bigint); \
+            CREATE FUNCTION exhausted_function() RETURNS bigint LANGUAGE plpgsql AS $$ \
+            DECLARE n bigint:=nextval('exhausted_function_numbers'); BEGIN \
+                INSERT INTO exhausted_function_audit VALUES(n); PERFORM pg_advisory_xact_lock(107); RETURN n; END$$; \
+            CREATE FUNCTION exhausted_function_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+            BEGIN PERFORM exhausted_function(); RETURN NEW; END$$; \
+            CREATE TRIGGER exhausted_function_trigger AFTER INSERT ON exhausted_function_root \
+            FOR EACH ROW EXECUTE FUNCTION exhausted_function_trigger()", true);
+        let controls = std::sync::Arc::clone(&engine.storage.execution_control);
+        for call in 1..=2 {
+            holder.success(
+                &mut engine,
+                "BEGIN; SELECT pg_advisory_xact_lock(107)",
+                true,
+            );
+            let sql = "INSERT INTO exhausted_function_root VALUES(1)";
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = writer.execute_status(&mut engine, sql, true)
+            else {
+                panic!("function did not wait before exhaustion");
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            let mut pressure = Vec::with_capacity(config.execution_control_leases);
+            crate::mem::guard::forbid_alloc(|| {
+                while let Ok(lease) = controls.lease::<u8>(1) {
+                    assert!(pressure.len() < pressure.capacity());
+                    pressure.push(lease);
+                }
+            });
+            assert!(!pressure.is_empty());
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            let status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert_eq!(
+                error_sqlstates(writer.send.readable()),
+                ["54000"],
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert!(String::from_utf8_lossy(writer.send.readable()).contains("execution_control"));
+            drop(pressure);
+            holder.success(&mut engine, "COMMIT", true);
+            assert_eq!(data_rows(&writer.success(&mut engine, "SELECT count(*) FROM exhausted_function_root; SELECT count(*) FROM exhausted_function_audit; SELECT last_value FROM exhausted_function_numbers", true)), ["0".to_owned(), "0".to_owned(), call.to_string()]);
+        }
+        writer.success(
+            &mut engine,
+            "INSERT INTO exhausted_function_root VALUES(2)",
+            true,
+        );
+        assert_eq!(data_rows(&writer.success(&mut engine, "SELECT id FROM exhausted_function_root; SELECT n FROM exhausted_function_audit; SELECT last_value FROM exhausted_function_numbers", true)), ["2", "3", "3"]);
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}

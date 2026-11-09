@@ -407,6 +407,16 @@ Timeouts accept at most 2,147,483,647 milliseconds; invalid text and larger valu
 return `22023`. Disabled-only timeout settings accept equivalent zero values such
 as `0ms`; enabling them returns `0A000`.
 
+An owned `PERFORM` or `SELECT ... INTO` can resume a PL/pgSQL scalar or table
+function inside retained AFTER-trigger work. Its arguments, locals, loop and
+handler positions, completed writes and issued sequence values survive a wait.
+A call outside an owned query returns `0A000` with
+`function wait requires an owned enclosing query` if its body needs to yield;
+SQL-language bodies and other expression positions still need retained progress.
+Storage waits remain synchronous on protected paths until that work is complete.
+Cancellation and capacity errors roll back SQL writes; sequence numbers already
+issued remain consumed, as in PostgreSQL.
+
 Application-defined error codes are ordinary SQL errors, including `PZ001`
 through `PZ004`. For example, `RAISE SQLSTATE 'PZ001'` can be caught by
 `WHEN SQLSTATE 'PZ001'`, `WHEN SQLSTATE 'PZ000'` or `WHEN OTHERS`; an uncaught

@@ -45,22 +45,19 @@ an owner that survives returning to the scheduler.
 
 The implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
 completion, trigger frames and completed calls within unfinished `PERFORM` and
-`SELECT ... INTO`. The current PR extends those owned expressions to unfinished
-PL/pgSQL scalar and table-function bodies, including saved arguments, locals,
-control flow and function timing. Repeated-wait and cleanup qualification is
-in progress; this is not yet a completed execution milestone. The [request path](docs/architecture.md#the-request-path)
-owns their detailed contracts and regression evidence.
+`SELECT ... INTO`, including unfinished PL/pgSQL scalar and table-function
+bodies inside those owned expressions. The [request path](docs/architecture.md#the-request-path)
+owns their contracts and regression evidence. General function and query
+execution still needs the remaining ownership work below.
 
 Complete these connected execution paths:
 
-- Retain a function paused inside its body, including arguments, local values,
-  loops, handlers, completed writes, pending child calls and unfinished return
-  conversion. SQL-language functions also need their position between body
-  statements. A completed body must not run again if checking its return value
-  waits. Scalar and table functions need the same guarantees; result width is
-  independent of the input-argument limit.
-  Preserve one timing count across pauses; an active timer must release its
-  fixed-stack entry on failure and report exhaustion rather than omit tracking.
+- Extend function resumption to callers and expression positions without an
+  owned query. SQL-language functions need their position between body
+  statements. Preserve completed bodies before return conversion that can
+  wait. Scalar and table functions need the same guarantees, including one
+  timing count per completed call; output width is independent of the
+  input-argument limit.
 - Finish write phases before and around AFTER work: BEFORE/INSTEAD triggers,
   source scans, row locks, partitions, constraints and transition collection.
   Include combined commands, rules, data-modifying common table expressions,
@@ -76,57 +73,21 @@ Complete these connected execution paths:
   [visibility milestone](#finish-transaction-visibility-and-keep-maintenance-moving)
   owns the overlapping reader and cleanup requirements.
 
-Acceptance applies across every path, rather than as separate roadmap projects:
+Acceptance applies across every path:
 
 - Keep the originally selected definitions, checked inputs, values, settings,
   effective user, command visibility, timestamps and deadline. Completed
   sequence calls, advisory-lock holds, input checks, cursor operations, audit
   writes and already delivered rows happen once, including repeated waits and
-  a new call after resumption. Preserve PostgreSQL's distinct static/dynamic
-  INTO behavior and its errors without overwriting an unchanged target.
-  Preserve exact warnings and their message filtering across the same call
-  handoffs; a failed advisory unlock returns false and its warning once.
-  Internal commits of a concurrent index command retain that command's saved
-  advisory-call position until its next execution attempt.
+  a new call after resumption.
 - Failed capture leaves the live call usable; failed attachment preserves the
-  saved owner and the caller. Recycling temporary memory cannot change saved
-  text, arrays, records or NULL field types. Private waits bypass user error
-  handlers; an application raising an identical diagnostic code remains an
-  ordinary SQL error. Preserve remote savepoint boundaries when a foreign
-  connection first opens inside nested procedural work.
-  Completion and a paused trigger share the captured table's matching row
-  schema, with independent pins inside the original configured image cell.
-  Assignment input discovery borrows its enclosing write's selected scope
-  instead of resolving the same target again. Exhaustion and
-  repeated nested-write retries must work within the configured image slots.
-  Query descriptions retain domain identities through casts, record expansion,
-  named columns, field selection and array subscripting, including columns
-  selected from derived tables. Saved procedural queries expose
-  ordinary record fields as well as trigger records, including NULL fields.
-  Comparisons between two text-domain fields must also keep their collation.
-  Preserve whole-row aliases such as `(t).*` in procedural query planning.
-  Track expanded columns and selected fields in saved-query dependencies,
-  preserving column precedence when its name matches a table alias.
-  Apply the same reference-kind rules to RETURNING and write expressions,
-  including old/new aliases and excluded conflict rows. Bind local WITH names
-  before describing a derived table inside procedural input analysis. Bind the
-  expression actually executed after checked-input restoration, including
-  declaration initializers that read transition tables. Nested
-  WITH clauses must also expand when the outer query has none. SELECT INTO
-  descriptions use the same local scope as execution, including NULL domain
-  fields, table-backed queries and set-operation branches. ROW constructors
-  resolve field positions after embedded whole rows have expanded, including
-  runtime type identity and wire descriptions. Parse INTO targets at identifier
-  boundaries so set operations remain in their source query. Type-only query
-  contexts preserve whole-row field names, declared types, modifiers and
-  collations without reading row values. Bind query
-  sources inside multi-column assignments through the same substitution walk.
-  Their field projections share one rewritten query, preserving once-only effects.
-  Distinguish sequence-only SQL helpers from programs that need mutable catalog
-  execution; trigger source queries keep their active sequence session.
-  Count expanded record fields consistently in sorting, grouping, window
-  queries and deferred output. For example, after a two-field record expands,
-  `ORDER BY 3` selects the following output column, including without `FROM`.
+  saved owner and caller. Recycling temporary memory cannot change saved text,
+  arrays, records or NULL field types. Private waits bypass user error handlers.
+  Preserve local and remote savepoint boundaries and originally selected row
+  and type definitions without extra full-size copies. Existing metadata,
+  warnings, checked-input and expression-binding regressions remain mandatory;
+  their contracts belong in the [architecture](docs/architecture.md) and
+  [compatibility guide](docs/postgresql-18-compatibility.md).
 - Cancellation, timeout, rollback, connection closure and successful completion
   release owners. A handled timeout stays consumed if its handler waits.
   Memory remains inside the existing startup pools, with named exhaustion and

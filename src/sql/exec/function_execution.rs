@@ -256,6 +256,14 @@ impl SuspendedFunction {
         arena: &'a Arena,
         responder: &mut Responder<'_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
+        if !std::sync::Arc::ptr_eq(self.state.pool(), &engine.storage.execution_control)
+            || !std::sync::Arc::ptr_eq(
+                self.state[0].binding.inputs.pool(),
+                &engine.storage.row_work,
+            )
+        {
+            return Err(changed());
+        }
         let state = &mut self.state[0];
         let mut context = TriggerExecContext {
             host: PlpgsqlExecHost::Routine {
@@ -588,6 +596,30 @@ pub(crate) fn execute<'a>(
         count += 1;
     }
     let locals = &declarations[..count];
+    // Select declared types before any initializer or body effect can run.
+    let type_sources = engine.storage.select_type_definition_graph(
+        routine
+            .arguments()
+            .iter()
+            .filter_map(|argument| argument.user_type)
+            .chain(locals.iter().filter_map(|local| local.user_type))
+            .chain(
+                routine.result_columns[..routine.result_column_count]
+                    .iter()
+                    .filter_map(|output| output.user_type),
+            )
+            .chain(
+                routine
+                    .function_result_contract()
+                    .and_then(|result| result.user_type),
+            ),
+        transaction.txid,
+        arena,
+    )?;
+    let _types = type_sources
+        .as_ref()
+        .map(|sources| sources.enter())
+        .transpose()?;
     let returns = ReturnBinding::select(routine, kind, locals, &engine.storage, transaction.txid)?;
     let invocation = TriggerInvocation::function(routine, kind, collation, arena)?
         .with_input_sites(program.input_sites);
@@ -677,25 +709,6 @@ pub(crate) fn execute<'a>(
             let environment =
                 SavedCallEnvironment::capture(environment, &storage.execution_control)?;
             let owner = FunctionOwner::capture(&context);
-            let type_sources = storage.select_type_definition_graph(
-                routine
-                    .arguments()
-                    .iter()
-                    .filter_map(|argument| argument.user_type)
-                    .chain(execution.locals.iter().filter_map(|local| local.user_type))
-                    .chain(
-                        routine.result_columns[..routine.result_column_count]
-                            .iter()
-                            .filter_map(|output| output.user_type),
-                    )
-                    .chain(
-                        routine
-                            .function_result_contract()
-                            .and_then(|result| result.user_type),
-                    ),
-                context.txn.txid,
-                arena,
-            )?;
             let progress = super::super::sequence::SavedStatementPosition::capture()?;
             let execution = execution.suspend().map_err(|(_, error)| error)?;
             state

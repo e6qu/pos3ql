@@ -6946,8 +6946,14 @@ fn check_key_types<'a>(
         }
     }
     for order in statement.order_by {
-        let target =
-            resolve_order_target(order.expression, statement.items, scope, arena, storage, txid)?;
+        let target = resolve_order_target(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+            storage,
+            txid,
+        )?;
         if let Some(ctype) = noncomparable(target) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -7126,7 +7132,13 @@ pub(super) fn resolve_order_target<'a>(
     txid: u32,
 ) -> Result<&'a Expr<'a>, SqlError> {
     resolve_position_target(
-        expression, items, Some(scope), arena, storage, txid, "ORDER BY",
+        expression,
+        items,
+        Some(scope),
+        arena,
+        storage,
+        txid,
+        "ORDER BY",
     )
 }
 
@@ -7313,10 +7325,11 @@ fn resolve_position_target<'a>(
                         txid,
                         arena,
                     };
-                    let columns: &dyn super::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
-                        &empty_columns as &dyn super::exec::ColTypeResolver,
-                        |columns| columns,
-                    );
+                    let columns: &dyn super::exec::ColTypeResolver =
+                        scoped_columns.as_ref().map_or(
+                            &empty_columns as &dyn super::exec::ColTypeResolver,
+                            |columns| columns,
+                        );
                     super::exec::record_shape_metadata(base, columns, |name, _| {
                         if result.is_none() && index == target {
                             result =

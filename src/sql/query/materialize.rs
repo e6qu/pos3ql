@@ -2133,8 +2133,14 @@ pub(crate) fn materialized_rows_into<'a>(
 ) -> Result<u64, SqlError> {
     let mut order_collations = [Collation::None; MAX_PROJ];
     for (index, order) in statement.order_by.iter().enumerate() {
-        let expression =
-            resolve_order_target(order.expression, statement.items, scope, arena, storage, txid)?;
+        let expression = resolve_order_target(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+            storage,
+            txid,
+        )?;
         order_collations[index] = scope.expression_collation(storage, arena, expression)?;
     }
     let mut emitted = 0u64;

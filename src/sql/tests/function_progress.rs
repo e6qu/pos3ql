@@ -337,3 +337,92 @@ fn paused_function_capacity_failure_rolls_back_and_returns_its_reservations() {
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+#[test]
+fn paused_positional_functions_keep_record_array_and_null_domain_arguments() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("function-argument-progress-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "CREATE TYPE function_pair AS(id integer,message text); \
+            CREATE DOMAIN function_domain AS text; CREATE TABLE function_arguments_root(id integer); \
+            CREATE TABLE function_arguments_audit(answer text); \
+            CREATE FUNCTION positional_function(function_pair,integer[],function_domain) RETURNS text LANGUAGE plpgsql AS $$ \
+            BEGIN PERFORM pg_advisory_xact_lock(114); \
+                RETURN ($1).message||':'||$2[3]::text||':'||pg_typeof($3)::text; END$$; \
+            CREATE FUNCTION function_arguments_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+            DECLARE answer text; BEGIN SELECT positional_function(ROW(7,'payload')::function_pair,ARRAY[1,NULL,3],NULL::function_domain) INTO answer; \
+                INSERT INTO function_arguments_audit VALUES(answer); RETURN NEW; END$$; \
+            CREATE TRIGGER function_arguments_trigger AFTER INSERT ON function_arguments_root \
+                FOR EACH ROW EXECUTE FUNCTION function_arguments_trigger()", true);
+        holder.success(
+            &mut engine,
+            "BEGIN; SELECT pg_advisory_xact_lock(114)",
+            true,
+        );
+        let sql = "INSERT INTO function_arguments_root VALUES(1)";
+        let mut status = writer.execute_status(&mut engine, sql, true);
+        for release in [false, true] {
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!(
+                    "positional function did not retain arguments: {status:?}: {}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            if release {
+                holder.success(&mut engine, "COMMIT", true);
+            }
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+        }
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT answer FROM function_arguments_audit",
+                true
+            )),
+            ["payload:3:function_domain"]
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}

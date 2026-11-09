@@ -104,6 +104,9 @@ error's source location and the arena's requested, remaining and capacity bytes
 without allocating. Failed success assertions include those values, whether a
 temporary region was active, and wire output. Distinguish genuine exhaustion
 from an allocation blocked by a temporary borrow before changing a limit. This diagnostic is test-only and keeps client errors unchanged.
+The definition-image retry regression also prints the failing capture's caller,
+transaction mode and retry number. Its caller record uses fixed thread-local
+test storage; the client-visible error stays unchanged.
 
 Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a

@@ -4186,8 +4186,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        super::ScopeSchema(self.scope).whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        super::ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
     }
     fn resolve_column_type(
         &self,
@@ -4415,12 +4420,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         if self.inner.whole_row_type(table).is_some() {
-            self.inner.whole_row_column(table, index)
+            self.inner.whole_row_field_metadata(table, index, catalog)
         } else {
             self.outer
-                .and_then(|outer| outer.whole_row_column(table, index))
+                .and_then(|outer| outer.whole_row_field_metadata(table, index, catalog))
         }
     }
 

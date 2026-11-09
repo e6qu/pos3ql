@@ -6165,8 +6165,9 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
             let output = run_with(&mut engine, &mut budget, &statement);
             assert!(
                 !String::from_utf8_lossy(&output).contains("ERROR"),
-                "{}",
-                String::from_utf8_lossy(&output)
+                "{mode:?} retry {id}: {}; image capacity request: {:?}",
+                String::from_utf8_lossy(&output),
+                crate::storage::last_definition_image_exhaustion(),
             );
             let definitions = engine.storage.table_definition_images();
             definitions.definition(&engine.storage, table, 0).unwrap();

@@ -514,7 +514,12 @@ pub trait ColumnLookup<'a> {
     }
 
     /// Declared fields by position, without reading or evaluating row values.
-    fn whole_row_column(&self, _table: &str, _index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        _table: &str,
+        _index: usize,
+        _catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         None
     }
 
@@ -806,6 +811,25 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
     pub(crate) catalog: Option<&'row dyn CatalogAccess>,
 }
 
+pub(crate) fn stored_row_field_metadata(
+    column: &crate::storage::ColumnMeta,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+    let type_oid = match column.user_type {
+        Some(identity) => catalog?.declared_user_type_oid(column.ctype, identity)?,
+        None => column.ctype.oid(),
+    };
+    Some((
+        StackStr::from_str(column.name.as_str()),
+        crate::sql::exec::StaticTypeMeta {
+            type_oid,
+            ctype: column.ctype,
+            type_mod: column.type_mod,
+            collation: column.collation,
+        },
+    ))
+}
+
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         self.catalog
@@ -904,22 +928,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         name: &str,
         index: usize,
     ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let column = self.row.whole_row_column(name, index)?;
-        let type_oid = match column.user_type {
-            Some(identity) => self
-                .catalog?
-                .declared_user_type_oid(column.ctype, identity)?,
-            None => column.ctype.oid(),
-        };
-        Some((
-            StackStr::from_str(column.name.as_str()),
-            crate::sql::exec::StaticTypeMeta {
-                type_oid,
-                ctype: column.ctype,
-                type_mod: column.type_mod,
-                collation: column.collation,
-            },
-        ))
+        self.row.whole_row_field_metadata(name, index, self.catalog)
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -1107,8 +1116,13 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).whole_row_present(table)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        (**self).whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        (**self).whole_row_field_metadata(table, index, catalog)
     }
 
     fn whole_row_fields(

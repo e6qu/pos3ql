@@ -4057,6 +4057,16 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        ColTypeResolver::is_whole_row(self, table).then_some(())?;
+        crate::sql::eval::stored_row_field_metadata(self.0.columns().get(index)?, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.column_meta(qualifier, name)
             .map_or(-1, |column| column.type_mod)
@@ -4162,6 +4172,16 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        ColTypeResolver::is_whole_row(self, table).then_some(())?;
+        crate::sql::eval::stored_row_field_metadata(self.definition.columns().get(index)?, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.column_meta(qualifier, name)
             .map_or(-1, |column| column.type_mod)

@@ -22,8 +22,6 @@ BEGIN
         'SELECT public.record_source.id,public.record_source.label FROM public.record_source',
         'SELECT t.* FROM record_source t',
         'SELECT (t).* FROM record_source t',
-        'SELECT (ROW((t).*)).f1 AS id,(ROW((t).*)).f2 AS label FROM record_source t',
-        'SELECT (ROW(0,(t).*,NULL::record_positive)).f2 AS id,(ROW(0,(t).*,NULL::record_positive)).f3 AS label FROM record_source t',
         'SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,''seven''::record_label)).* FROM record_source) q',
         'SELECT record_return_positive() AS id,record_return_label() AS label',
         'SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source',
@@ -95,6 +93,21 @@ BEGIN
         AND pg_typeof(result.label)='record_label'::regtype
         AND pg_typeof(result.tail)='record_positive'::regtype
         AND pg_typeof(result.array_id)='record_positive'::regtype;
+END$$;
+DO $$
+DECLARE result record; command text;
+BEGIN
+    FOREACH command IN ARRAY ARRAY[
+        'SELECT (ROW((t).*)).f1 AS id,(ROW((t).*)).f2 AS label FROM record_source t',
+        'SELECT (ROW(0,(t).*,NULL::record_positive)).f2 AS id,(ROW(0,(t).*,NULL::record_positive)).f3 AS label FROM record_source t'
+    ] LOOP
+        EXECUTE command INTO STRICT result;
+        IF pg_typeof(result.id)<>'record_positive'::regtype
+            OR pg_typeof(result.label)<>'record_label'::regtype
+            OR result.id<>7 OR result.label<>'seven' THEN
+            RAISE EXCEPTION 'expanded record types changed: %',command;
+        END IF;
+    END LOOP;
 END$$;
 SELECT check_declared_record_types(),(SELECT count(*) FROM record_source),
     pg_typeof(q.f1),pg_typeof(q.f2),

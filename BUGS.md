@@ -27,6 +27,8 @@ retain one shared source rather than repeating its effects for each field.
 INTO target parsing must preserve following set operations and quoted commas.
 Runtime ROW field identities and wire descriptions use expanded metadata rather
 than indexing the unexpanded constructor arguments.
+Type-only query contexts must forward complete whole-row metadata, including
+subquery collation analysis and postponed output after sorting.
 RETURNING, ordinary write expressions and conflict-update expressions share
 the same reference-kind walk, with explicit old/new and excluded namespaces.
 Sequence-only SQL helpers called inside trigger source queries must use the

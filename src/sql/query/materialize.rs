@@ -36,6 +36,15 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
@@ -388,18 +397,29 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             .map_or(-1, |column| column.type_mod)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         let entry = self.0.qualified_star_entry(table, index).ok()?;
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs.get(table)?.columns().get(column).copied()
+                super::super::eval::stored_row_field_metadata(
+                    self.0.defs.get(table)?.columns().get(column)?,
+                    catalog,
+                )
             }
-            super::scope::ResolvedColumn::Merged(_) => Some(crate::storage::ColumnMeta {
-                name: crate::storage::SqlName::parse(self.0.output_name(entry)).ok()?,
-                ctype: self.0.output_type(entry),
-                collation: self.0.output_collation(entry),
-                ..crate::storage::ColumnMeta::EMPTY
-            }),
+            super::scope::ResolvedColumn::Merged(_) => Some((
+                crate::util::StackStr::from_str(self.0.output_name(entry)),
+                crate::sql::exec::StaticTypeMeta {
+                    type_oid: self.0.output_type(entry).oid(),
+                    ctype: self.0.output_type(entry),
+                    type_mod: -1,
+                    collation: self.0.output_collation(entry),
+                },
+            )),
         }
     }
 

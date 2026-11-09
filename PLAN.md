@@ -112,7 +112,9 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   fields, table-backed queries and set-operation branches. ROW constructors
   resolve field positions after embedded whole rows have expanded, including
   runtime type identity and wire descriptions. Parse INTO targets at identifier
-  boundaries so set operations remain in their source query. Bind query
+  boundaries so set operations remain in their source query. Type-only query
+  contexts preserve whole-row field names, declared types, modifiers and
+  collations without reading row values. Bind query
   sources inside multi-column assignments through the same substitution walk.
   Their field projections share one rewritten query, preserving once-only effects.
   Distinguish sequence-only SQL helpers from programs that need mutable catalog

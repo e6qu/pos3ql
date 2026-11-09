@@ -2246,6 +2246,24 @@ impl<'storage> DependencyTypes<'_, '_, 'storage> {
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        _catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        ColTypeResolver::whole_row_field(self, table, index)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        ColTypeResolver::whole_row_scalar_type(self, table)
+            .or_else(|| ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record))
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        ColTypeResolver::whole_row_scalar_type(self, table).is_some()
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.column_meta(qualifier, name)
             .map_or(-1, |column| column.type_mod)

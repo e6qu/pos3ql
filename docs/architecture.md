@@ -533,6 +533,9 @@ Cast descriptions, record expansion and array subscripts keep the SQL type;
 only the final wire description selects its PostgreSQL base representation.
 ROW field types use the expanded layout: `(ROW(0,(o).*)).f2` selects the first
 column of `o`, including its declared domain type.
+Type-only query contexts forward those field names, types, modifiers and
+collations without reading values, including during subquery collation analysis
+and postponed output after sorting.
 Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,
 from selecting one field, such as `(t).id`. The first keeps every expanded
 column; the second keeps the selected column. A real column named `t` takes

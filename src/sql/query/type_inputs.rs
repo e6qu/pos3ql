@@ -33,8 +33,13 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
             .map_or(-1, |column| column.type_mod)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        self.row.whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
     }
 
     fn lookup(

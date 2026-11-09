@@ -81,6 +81,8 @@ pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 pub(crate) use definition_images::DefinitionImageId;
 pub(crate) use definition_images::RelationDefinition;
+#[cfg(test)]
+pub(crate) use definition_images::last_definition_image_exhaustion;
 mod definition_pool;
 mod index_bindings;
 mod index_statistics;

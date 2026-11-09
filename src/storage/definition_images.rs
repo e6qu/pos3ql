@@ -14,6 +14,17 @@ use crate::sql_err;
 
 static NEXT_IMAGE_POOL: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+std::thread_local! {
+    static LAST_EXHAUSTION: Cell<Option<&'static core::panic::Location<'static>>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_definition_image_exhaustion() -> Option<&'static core::panic::Location<'static>>
+{
+    LAST_EXHAUSTION.with(Cell::get)
+}
+
 /// Borrowed columns for query schemas; hidden fields may follow the visible prefix.
 #[derive(Debug, Clone, Copy)]
 pub struct RelationDefinition<'a> {
@@ -234,7 +245,10 @@ impl TableDefinitionImagePool {
             })
     }
 
+    #[cfg_attr(test, track_caller)]
     fn reserve(&self) -> Result<ImageReservation<'_>, SqlError> {
+        #[cfg(test)]
+        let caller = core::panic::Location::caller();
         let mut allocation = self
             .allocation
             .lock()
@@ -244,6 +258,8 @@ impl TableDefinitionImagePool {
             .iter()
             .position(|flag| !flag.load(Ordering::Acquire))
             .ok_or_else(|| {
+                #[cfg(test)]
+                LAST_EXHAUSTION.with(|last| last.set(Some(caller)));
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table definition image pool is exhausted (capacity {})",
@@ -278,6 +294,7 @@ pub(crate) struct TableDefinitionImages {
 impl Storage {
     /// Consume a copied definition after the live catalog guards release.
     /// Returned values cannot borrow the temporary definition owner.
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn with_retained_table_definition<R>(
         &self,
         table: usize,
@@ -312,6 +329,7 @@ impl TableDefinitionImages {
         })
     }
 
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn retain_relation(
         &self,
         relation: &RelationDefinition<'_>,
@@ -416,6 +434,7 @@ impl TableDefinitionImages {
         None
     }
 
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn selection<'a>(
         &'a self,
         storage: &Storage,
@@ -438,6 +457,7 @@ impl TableDefinitionImages {
         unreachable!("definition capture installs its source before returning")
     }
 
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn definition<'a>(
         &'a self,
         storage: &Storage,
@@ -741,10 +761,13 @@ mod tests {
                     ..relation
                 },
             ] {
-                assert_eq!(
-                    images.retain_relation(&different).unwrap_err().sqlstate,
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                );
+                let before = line!();
+                let error = images.retain_relation(&different).unwrap_err();
+                let after = line!();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED,);
+                let caller = super::super::last_definition_image_exhaustion().unwrap();
+                assert_eq!(caller.file(), file!());
+                assert!((before..=after).contains(&caller.line()));
                 assert_eq!(images.retain_relation(&relation).unwrap(), identity);
             }
             identity

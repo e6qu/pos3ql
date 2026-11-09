@@ -461,9 +461,14 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         .column_type_mod(qualifier, name)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
         if crate::sql::eval::qualifier_answers_target(self.def, self.alias, table) {
-            self.def.columns().get(index).copied()
+            super::eval::stored_row_field_metadata(self.def.columns().get(index)?, catalog)
         } else {
             None
         }
@@ -640,6 +645,16 @@ impl<'v> ReturningLookup<'_, 'v> {
 }
 
 impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.whole_row_type(table)?;
+        super::eval::stored_row_field_metadata(self.definition.columns().get(index)?, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         let aliases = [self.old_name, self.new_name];
         describe::AliasedDefCols {
@@ -18143,6 +18158,16 @@ impl<'d, 's, 'stored, 'value> ColumnLookup<'value> for TriggerTransition<'d, 's,
 where
     'stored: 'value,
 {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        self.whole_row_type(table)?;
+        super::eval::stored_row_field_metadata(self.definition.columns().get(index)?, catalog)
+    }
+
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (table == "old" || table == "new").then_some(ColType::Record)
     }

@@ -1793,47 +1793,81 @@ fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     })
 }
 
-/// Whether a scalar routine needs the engine-owned executor rather than the
-/// read-only evaluator bridge. This is a property of the parsed program, not
-/// a spelling heuristic at an individual call site.
-pub(crate) fn routine_program_requires_mutable_execution(
-    program: &RoutineFunctionProgram<'_>,
-) -> bool {
+/// SQL queries may need the current session's sequence state without needing
+/// mutable catalog/DML execution. Keep those capabilities distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RoutineProgramAccess {
+    ReadOnly,
+    Sequences,
+    Engine,
+}
+
+pub(crate) fn routine_program_access(program: &RoutineFunctionProgram<'_>) -> RoutineProgramAccess {
     let needs_sequences = |name: &str, _arguments: usize| {
-        matches!(name, "nextval" | "currval" | "lastval" | "setval")
+        matches!(
+            name,
+            "nextval"
+                | "currval"
+                | "lastval"
+                | "setval"
+                | "pg_catalog.nextval"
+                | "pg_catalog.currval"
+                | "pg_catalog.lastval"
+                | "pg_catalog.setval"
+        )
     };
-    let query_needs_engine = |query: &RoutineQuery<'_>| match query {
-        RoutineQuery::Select(select) => cte::select_contains_function(select, &needs_sequences),
-        RoutineQuery::Set(query) => {
-            query
-                .with
-                .iter()
-                .any(|cte| cte::select_contains_function(cte.query, &needs_sequences))
-                || cte::set_tree_contains_function(query.body, &needs_sequences)
-                || query.order_by.iter().any(|order| {
-                    cte::expression_contains_function(order.expression, &needs_sequences)
-                })
-                || query
-                    .limit
-                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
-                || query
-                    .offset
-                    .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+    let query_access = |query: &RoutineQuery<'_>| {
+        let with = match query {
+            RoutineQuery::Select(select) => select.with,
+            RoutineQuery::Set(query) => query.with,
+        };
+        if with.iter().any(|cte| cte.dml.is_some()) {
+            return RoutineProgramAccess::Engine;
+        }
+        let sequences = match query {
+            RoutineQuery::Select(select) => cte::select_contains_function(select, &needs_sequences),
+            RoutineQuery::Set(query) => {
+                query
+                    .with
+                    .iter()
+                    .any(|cte| cte::select_contains_function(cte.query, &needs_sequences))
+                    || cte::set_tree_contains_function(query.body, &needs_sequences)
+                    || query.order_by.iter().any(|order| {
+                        cte::expression_contains_function(order.expression, &needs_sequences)
+                    })
+                    || query
+                        .limit
+                        .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+                    || query
+                        .offset
+                        .is_some_and(|expr| cte::expression_contains_function(expr, &needs_sequences))
+            }
+        };
+        if sequences {
+            RoutineProgramAccess::Sequences
+        } else {
+            RoutineProgramAccess::ReadOnly
         }
     };
-    let statement_needs_engine = |statement: &Stmt<'_>| match statement {
-        Stmt::Select(select) => query_needs_engine(&RoutineQuery::Select(select)),
-        Stmt::SetQuery(query) => query_needs_engine(&RoutineQuery::Set(query)),
-        _ => true,
+    let statement_access = |statement: &Stmt<'_>| match statement {
+        Stmt::Select(select) => query_access(&RoutineQuery::Select(select)),
+        Stmt::SetQuery(query) => query_access(&RoutineQuery::Set(query)),
+        _ => RoutineProgramAccess::Engine,
     };
-    program.preceding.iter().any(|step| match step {
-        RoutinePrelude::Statement(statement) => statement_needs_engine(statement),
-        RoutinePrelude::Forbidden(_) => true,
-    }) || match program.result {
-        RoutineFunctionResult::Query(query) => query_needs_engine(query),
-        RoutineFunctionResult::Void(statement) => statement_needs_engine(statement),
-        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => true,
+    let mut access = match program.result {
+        RoutineFunctionResult::Query(query) => query_access(query),
+        RoutineFunctionResult::Void(statement) => statement_access(statement),
+        RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => {
+            RoutineProgramAccess::Engine
+        }
+    };
+    for step in program.preceding {
+        access = access.max(match step {
+            RoutinePrelude::Statement(statement) => statement_access(statement),
+            RoutinePrelude::Forbidden(_) => RoutineProgramAccess::Engine,
+        });
     }
+    access
 }
 
 pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
@@ -3285,12 +3319,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
         )?;
-        if routine_program_requires_mutable_execution(&function_program) {
+        let program_access = routine_program_access(&function_program);
+        if program_access == RoutineProgramAccess::Engine {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "data-modifying SQL functions require a resumable query executor"
             ));
         }
+
         let track = matches!(
             super::guc::active_track_functions(),
             super::guc::TrackFunctions::All
@@ -3300,7 +3336,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
             self.storage
                 .ensure_function_statistics(crate::storage::routine_oid(routine))?;
         }
-        let output = (|| -> Result<Option<Datum<'a>>, SqlError> {
+        let output = super::sequence::with_statement_context(|context| {
+            if program_access == RoutineProgramAccess::Sequences && context.is_none() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SQL sequence functions require an active statement session"
+                ));
+            }
+            let live_sequences = context.map(|(_, session)| {
+                super::sequence::SeqEval::new(self.storage, session, self.txid)
+            });
+            let sequences = live_sequences
+                .as_ref()
+                .map(|sequences| sequences as &dyn SequenceAccess);
             let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
             for (slot, argument) in arguments.iter().enumerate() {
                 let encoded =
@@ -3332,7 +3380,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     self.routine_workspace,
                     &parameters[..arguments.len()],
                     true,
-                    None,
+                    sequences,
                     &mut |_| Ok(()),
                 )?;
             }
@@ -3365,7 +3413,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         self.routine_workspace,
                         &parameters[..arguments.len()],
                         true,
-                        None,
+                        sequences,
                         &mut |_| Ok(()),
                     )?;
                     return Ok(Some(Datum::Text("")));
@@ -3383,7 +3431,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 self.routine_workspace,
                 &parameters[..arguments.len()],
                 true,
-                None,
+                sequences,
                 &mut |values| {
                     if result.is_none() {
                         result = Some(result_shape.capture(values, arena)?);
@@ -3399,13 +3447,13 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 Ok(Some(result))
             } else {
                 if matches!(result_type, ColType::Composite(_)) {
-                    self.coerce_result(result, result_contract, arena, None)
+                    self.coerce_result(result, result_contract, arena, sequences)
                         .map(Some)
                 } else {
                     super::eval::cast_to(result, result_type, arena).map(Some)
                 }
             }
-        })();
+        });
         if let Some((total, own)) = timed.finish()
             && output.is_ok()
         {

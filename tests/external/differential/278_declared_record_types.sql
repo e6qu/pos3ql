@@ -3,7 +3,9 @@ CREATE DOMAIN record_label AS text;
 CREATE TYPE record_pair AS(id record_positive,label record_label);
 CREATE TABLE record_source(id record_positive,label record_label);
 CREATE TABLE record_field_copies(id record_positive,label record_label);
+CREATE TABLE record_conflict(id record_positive PRIMARY KEY,label record_label);
 INSERT INTO record_source VALUES(7,'seven');
+INSERT INTO record_conflict VALUES(7,'seven');
 CREATE FUNCTION record_return_positive() RETURNS record_positive LANGUAGE sql
 AS $$SELECT 7::record_positive$$;
 CREATE FUNCTION record_return_label() RETURNS record_label LANGUAGE sql
@@ -28,7 +30,12 @@ BEGIN
         'SELECT (record_return_pair()).* FROM record_source',
         'SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source',
         'UPDATE record_source SET id=id RETURNING *',
-        'UPDATE record_source SET id=id RETURNING (record_source).*'
+        'UPDATE record_source SET id=id RETURNING (record_source).*',
+        'UPDATE record_source AS s SET id=s.id RETURNING (s).*',
+        'UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (before_row).*',
+        'UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (after_row).*',
+        'INSERT INTO record_field_copies VALUES(7,''seven'') RETURNING (record_field_copies).*',
+        'INSERT INTO record_conflict VALUES(7,''seven'') ON CONFLICT(id) DO UPDATE SET label=excluded.label RETURNING (record_conflict).*'
     ] LOOP
         EXECUTE command INTO STRICT result;
         IF pg_typeof(result.id)<>'record_positive'::regtype

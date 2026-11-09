@@ -397,7 +397,7 @@ fn effect_full() -> SqlError {
     )
 }
 
-fn with_statement_context<R>(
+pub(crate) fn with_statement_context<R>(
     execute: impl for<'scope> FnOnce(Option<(&'scope Arena, &'scope SeqSession)>) -> R,
 ) -> R {
     let arena = STATEMENT_ARENA.with(Cell::get);

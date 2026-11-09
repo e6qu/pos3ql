@@ -1850,6 +1850,11 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
             "SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source",
             "UPDATE record_source SET id=id RETURNING *",
             "UPDATE record_source SET id=id RETURNING (record_source).*",
+            "UPDATE record_source AS s SET id=s.id RETURNING (s).*",
+            "UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (before_row).*",
+            "UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (after_row).*",
+            "INSERT INTO record_field_copies VALUES(7,'seven') RETURNING (record_field_copies).*",
+            "INSERT INTO record_conflict VALUES(7,'seven') ON CONFLICT(id) DO UPDATE SET label=excluded.label RETURNING (record_conflict).*",
         ] {
             let executed = session.success(&mut engine, query, false);
             assert_eq!(data_rows(&executed), ["7|seven"], "{mode:?}: {query}");
@@ -1973,7 +1978,7 @@ fn record_projection_layout_keeps_sort_group_window_and_deferred_slots() {
                 ),
                 true,
             )),
-            ["t|t|t|t|t|t|t|t|t", "2"],
+            ["t|t|t|t|t|t|t|t|t|t", "2"],
             "{mode:?}"
         );
     }

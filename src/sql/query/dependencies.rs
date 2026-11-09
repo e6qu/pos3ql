@@ -649,7 +649,10 @@ fn collect_statement(
                 context,
             )?;
             if let Some(scope) = $scope {
-                record_dml_column_references($expression, scope, $excluded, dependencies, context)?;
+                let references = $excluded.map_or(ReferenceScope::Query, |(slot, definition)| {
+                    ReferenceScope::Excluded { slot, definition }
+                });
+                record_column_references($expression, scope, dependencies, context, references)?;
             }
             collect_dml_routine_calls(
                 $expression,
@@ -1121,34 +1124,16 @@ fn collect_returning_expression<'a>(
         context,
     )?;
     let aliases = [returning.old_name(), returning.new_name()];
-    let mut failure = None;
-    expression.for_each_column_reference(&mut |qualifier, name| {
-        if failure.is_some() {
-            return;
-        }
-        let resolved = if qualifier.is_some_and(|qualifier| aliases.contains(&qualifier)) {
-            scope.find_column(Some(target_qualifier), name)
-        } else {
-            scope.find_column(qualifier, name)
-        };
-        match resolved {
-            Ok(resolved) => {
-                if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
-                    failure = Some(error);
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                ) && !qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))
-                    && context.outer_column(qualifier, name) => {}
-            Err(error) => failure = Some(error),
-        }
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
+    record_column_references(
+        expression,
+        scope,
+        dependencies,
+        context,
+        ReferenceScope::Returning {
+            target: target_qualifier,
+            aliases,
+        },
+    )?;
     collect_dml_routine_calls_with_output(
         expression,
         storage,
@@ -1160,66 +1145,6 @@ fn collect_returning_expression<'a>(
         Some((target, aliases)),
         arena,
     )
-}
-
-fn record_dml_column_references(
-    expression: &Expr<'_>,
-    scope: &super::QueryScope<'_>,
-    excluded: Option<(usize, crate::storage::RelationDefinition<'_>)>,
-    dependencies: &mut StoredQueryDependencies,
-    context: CollectionContext<'_>,
-) -> Result<(), SqlError> {
-    let mut failure = None;
-    expression.for_each_column_reference(&mut |qualifier, name| {
-        if failure.is_some() {
-            return;
-        }
-        match context.transition_column(qualifier, name) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                failure = Some(error);
-                return;
-            }
-        }
-        if qualifier == Some("excluded")
-            && let Some((slot, definition)) = excluded
-        {
-            let Some(column) = definition.column_index(name) else {
-                failure = Some(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column excluded.{} does not exist",
-                    name
-                ));
-                return;
-            };
-            if let Err(error) =
-                dependencies.mark_referenced_column(DependencyClass::Table, slot, column)
-            {
-                failure = Some(error);
-            }
-            return;
-        }
-        let resolved = match scope.find_column(qualifier, name) {
-            Ok(resolved) => resolved,
-            Err(error)
-                if matches!(
-                    error.sqlstate.as_str(),
-                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
-                ) && context.outer_column(qualifier, name) =>
-            {
-                return;
-            }
-            Err(error) => {
-                failure = Some(error);
-                return;
-            }
-        };
-        if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
-            failure = Some(error);
-        }
-    });
-    failure.map_or(Ok(()), Err)
 }
 
 /// Check declared assignment types before row selection, triggers, or defaults
@@ -2203,7 +2128,13 @@ fn collect_select<'a>(
                     match item {
                         SelectItem::Expr { expression, .. }
                         | SelectItem::RecordStar(expression) => {
-                            record_column_references(expression, &scope, dependencies, context)?;
+                            record_column_references(
+                                expression,
+                                &scope,
+                                dependencies,
+                                context,
+                                ReferenceScope::Query,
+                            )?;
                         }
                         SelectItem::Wildcard => {
                             for table in 0..scope.n {
@@ -2240,7 +2171,13 @@ fn collect_select<'a>(
                     .chain(select.offset)
                     .chain(from.joins.iter().filter_map(|join| join.on))
                 {
-                    record_column_references(expression, &scope, dependencies, context)?;
+                    record_column_references(
+                        expression,
+                        &scope,
+                        dependencies,
+                        context,
+                        ReferenceScope::Query,
+                    )?;
                 }
             }
             record_relation_column_references(
@@ -2282,6 +2219,20 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         [&'definition str; 2],
     )>,
     arena: &'storage Arena,
+}
+
+impl<'storage> DependencyTypes<'_, '_, 'storage> {
+    fn output_definition(&self, name: &str) -> Option<crate::storage::RelationDefinition<'storage>> {
+        if let Some((definition, aliases)) = self.returning_output
+            && aliases.contains(&name)
+        {
+            return Some(definition);
+        }
+        if name == "excluded" {
+            return self.excluded;
+        }
+        None
+    }
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for DependencyTypes<'_, '_, '_> {
@@ -2634,8 +2585,10 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        self.transition
-            .is_some_and(|transition| transition.is_whole_row(name))
+        self.output_definition(name).is_some()
+            || self
+                .transition
+                .is_some_and(|transition| transition.is_whole_row(name))
             || self
                 .scope
                 .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
@@ -2648,6 +2601,9 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
+        if let Some(definition) = self.output_definition(name) {
+            return Some(definition.columns());
+        }
         if let Some(columns) = self
             .transition
             .and_then(|transition| transition.table_columns(name))
@@ -2664,9 +2620,25 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if let Some(definition) = self.output_definition(name) {
+            let column = definition.columns().get(index)?;
+            return Some((
+                crate::util::StackStr::from_str(column.name.as_str()),
+                self.column_meta(Some(name), column.name.as_str())?,
+            ));
+        }
         self.transition
             .and_then(|transition| transition.whole_row_field(name, index))
-            .or_else(|| super::ScopeCols(self.scope?).whole_row_field(name, index))
+            .or_else(|| {
+                super::CatalogScopeCols {
+                    scope: self.scope?,
+                    outer_scope: None,
+                    storage: self.storage,
+                    txid: self.txid,
+                    arena: self.arena,
+                }
+                .whole_row_field(name, index)
+            })
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -3773,11 +3745,37 @@ fn record_relation_expression(
     })
 }
 
+#[derive(Clone, Copy)]
+enum ReferenceScope<'a> {
+    Query,
+    Returning {
+        target: &'a str,
+        aliases: [&'a str; 2],
+    },
+    Excluded {
+        slot: usize,
+        definition: crate::storage::RelationDefinition<'a>,
+    },
+}
+
+impl<'a> ReferenceScope<'a> {
+    fn qualifier<'name>(self, name: &'name str) -> &'name str
+    where
+        'a: 'name,
+    {
+        match self {
+            Self::Returning { target, aliases } if aliases.contains(&name) => target,
+            _ => name,
+        }
+    }
+}
+
 fn record_column_references(
     expression: &Expr<'_>,
     scope: &super::QueryScope<'_>,
     dependencies: &mut StoredQueryDependencies,
     context: CollectionContext<'_>,
+    references: ReferenceScope<'_>,
 ) -> Result<(), SqlError> {
     visit_column_dependencies(expression, &mut |reference| {
         let qualified;
@@ -3792,6 +3790,15 @@ fn record_column_references(
                 (Some(qualified.as_str()), *name)
             }
             Expr::WholeRow(table) => {
+                let table = references.qualifier(table);
+                if table == "excluded"
+                    && let ReferenceScope::Excluded { slot, definition } = references
+                {
+                    for column in 0..definition.n_columns {
+                        dependencies.mark_referenced_column(DependencyClass::Table, slot, column)?;
+                    }
+                    return Ok(());
+                }
                 let count = match scope.qualified_star_columns(table) {
                     Ok(count) => count,
                     Err(_)
@@ -3813,16 +3820,20 @@ fn record_column_references(
                 return Ok(());
             }
             Expr::Field { base, field } => match &**base {
-                Expr::WholeRow(table) => (Some(*table), *field),
+                Expr::WholeRow(table) => (Some(references.qualifier(table)), *field),
                 Expr::Column {
                     qualifier: None,
                     name,
                 } if scope
                     .find_column(None, name)
                     .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
-                    && scope.qualified_star_columns(name).is_ok() =>
+                    && (scope
+                        .qualified_star_columns(references.qualifier(name))
+                        .is_ok()
+                        || (matches!(references, ReferenceScope::Excluded { .. })
+                            && *name == "excluded")) =>
                 {
-                    (Some(*name), *field)
+                    (Some(references.qualifier(name)), *field)
                 }
                 Expr::Column {
                     qualifier: None,
@@ -3832,6 +3843,19 @@ fn record_column_references(
             },
             _ => unreachable!("dependency walk selects references"),
         };
+        let qualifier = qualifier.map(|name| references.qualifier(name));
+        if qualifier == Some("excluded")
+            && let ReferenceScope::Excluded { slot, definition } = references
+        {
+            let column = definition.column_index(name).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column excluded.{} does not exist",
+                    name
+                )
+            })?;
+            return dependencies.mark_referenced_column(DependencyClass::Table, slot, column);
+        }
         if context.transition_column(qualifier, name)? {
             return Ok(());
         }
@@ -3840,12 +3864,27 @@ fn record_column_references(
             Err(error)
                 if qualifier.is_none()
                     && error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                    && scope.qualified_star_columns(name).is_ok() =>
+                    && matches!(references, ReferenceScope::Excluded { .. })
+                    && name == "excluded" =>
             {
-                for index in 0..scope.qualified_star_columns(name)? {
+                let ReferenceScope::Excluded { slot, definition } = references else {
+                    unreachable!("excluded namespace was checked");
+                };
+                for column in 0..definition.n_columns {
+                    dependencies.mark_referenced_column(DependencyClass::Table, slot, column)?;
+                }
+                Ok(())
+            }
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && scope.qualified_star_columns(references.qualifier(name)).is_ok() =>
+            {
+                let table = references.qualifier(name);
+                for index in 0..scope.qualified_star_columns(table)? {
                     mark_resolved_column(
                         scope,
-                        scope.qualified_star_entry(name, index)?,
+                        scope.qualified_star_entry(table, index)?,
                         dependencies,
                     )?;
                 }

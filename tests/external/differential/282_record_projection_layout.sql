@@ -3,6 +3,9 @@ CREATE TABLE layout_source(id integer,label text,grp integer);
 INSERT INTO layout_source VALUES(2,'two',1),(1,'one',1),(3,'three',2);
 CREATE SEQUENCE layout_counter;
 SELECT
+    ARRAY(SELECT q.id FROM (
+        WITH layout_source AS (SELECT 9 AS id) SELECT id FROM layout_source
+    ) q)=ARRAY[9],
     ARRAY(SELECT tail FROM (
         SELECT (ROW(id,label)::layout_pair).*,id+10 AS tail
         FROM layout_source ORDER BY 3 DESC

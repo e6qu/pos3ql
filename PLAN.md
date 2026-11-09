@@ -100,6 +100,11 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   Preserve whole-row aliases such as `(t).*` in procedural query planning.
   Track expanded columns and selected fields in saved-query dependencies,
   preserving column precedence when its name matches a table alias.
+  Apply the same reference-kind rules to RETURNING and write expressions,
+  including old/new aliases and excluded conflict rows. Bind local WITH names
+  before describing a derived table inside procedural input analysis.
+  Distinguish sequence-only SQL helpers from programs that need mutable catalog
+  execution; trigger source queries keep their active sequence session.
   Count expanded record fields consistently in sorting, grouping, window
   queries and deferred output. For example, after a two-field record expands,
   `ORDER BY 3` selects the following output column, including without `FROM`.
@@ -118,8 +123,9 @@ Audit PostgreSQL 18 built-ins by signature and executable behavior; catalog
 presence alone is not support. Keep real SQLAlchemy, Alembic, psycopg2 and other
 client comparisons. Complete all four full workflows on the finished revision,
 including Linux amd64/arm64 and macOS arm64. Cancelled builds and skipped tests
-are incomplete qualification. Remove temporary development workflows first,
-then qualify the final head.
+are incomplete qualification. The native macOS mutex gate runs all ownership
+cases and a direct Apple API control with ThreadSanitizer. Qualify the final
+head using the permanent workflows.
 
 Preserve explicit coverage/native profiles, assertions and all native targets.
 Measure build and execution separately within unchanged job limits; bound

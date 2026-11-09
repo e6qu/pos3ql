@@ -94113,11 +94113,12 @@ fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
 }
 
 #[test]
-fn type_reference_moves_sequence_programs_use_engine_execution() {
+fn type_reference_moves_sequence_programs_require_session_execution() {
     let mut budget = Budget::new(1 << 20);
     let arena = Arena::new(&mut budget, "routine sequence classification", 1 << 20).unwrap();
     for body in [
         "SELECT nextval('s')",
+        "SELECT pg_catalog.nextval('s')",
         "SELECT currval('s')",
         "SELECT lastval()",
         "SELECT setval('s', 9)",
@@ -94133,8 +94134,25 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         let program =
             query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
                 .unwrap();
-        assert!(
-            query::routine_program_requires_mutable_execution(&program),
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::Sequences,
+            "{body}"
+        );
+    }
+    for body in [
+        "INSERT INTO t VALUES(1) RETURNING 1",
+        "UPDATE t SET id=1 RETURNING id",
+        "DELETE FROM t RETURNING 1",
+        "SELECT nextval('s'); INSERT INTO t VALUES(1) RETURNING 1",
+        "WITH changed AS(INSERT INTO t VALUES(1) RETURNING id) SELECT id FROM changed",
+    ] {
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::Engine,
             "{body}"
         );
     }
@@ -94142,8 +94160,9 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         let program =
             query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
                 .unwrap();
-        assert!(
-            !query::routine_program_requires_mutable_execution(&program),
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::ReadOnly,
             "{body}"
         );
     }

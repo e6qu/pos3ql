@@ -198,24 +198,34 @@ jobs:
   macos-lock-ownership:
     needs: formatting
     name: macOS mutex ownership
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 15
     env:
-      MIRIFLAGS: -Zmiri-preemption-rate=1
+      RUSTFLAGS: -Zsanitizer=thread
+      TSAN_OPTIONS: halt_on_error=1
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: miri
-      - run: cargo miri setup --target aarch64-apple-darwin
+          components: rust-src
+      - name: Verify native sanitizer target
+        run: test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
       - name: Native mutex movement, contention and unwinding
         shell: bash
         run: |
-          cargo miri test --package pos3ql-mutex-model --lib --locked \
-            --target aarch64-apple-darwin -- mem::mutex::tests --test-threads=1 \
+          cargo test --package pos3ql-mutex-model --lib --locked --jobs 1 \
+            -Zbuild-std --target aarch64-apple-darwin -- core_mutex_ --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/macos-mutex.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
             "$RUNNER_TEMP/macos-mutex.log"
+      - name: Retain native mutex diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-mutex-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-mutex.log
+          if-no-files-found: warn
+          retention-days: 1
 
   heap-aliasing:
     needs: formatting

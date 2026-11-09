@@ -86,6 +86,19 @@ build work; native test artifacts still require a completed build of the checked
 revision. Keep the 15-minute build limit and require both native execution jobs;
 a cancelled producer and its skipped tests do not qualify as passing CI.
 
+The macOS mutex gate runs the core ownership tests and a direct Apple API
+control on macOS arm64 under ThreadSanitizer. It rebuilds the standard library
+with the same instrumentation, uses no race suppressions, and retains its log.
+To compare the foreign-target Miri model with direct Apple calls, run
+`cargo miri test -p pos3ql-mutex-model --lib --target aarch64-apple-darwin -- core_mutex_direct_native_api`.
+The November 9 nightly, rustc `5b7b37aef`, emulates an unlocked unfair lock by
+[writing zero atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L410)
+and later [reading it non-atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L127).
+The failing [run](https://github.com/e6qu/pos3ql/actions/runs/42578259095/job/129034044286)
+records that access inside the emulated API. Native instrumentation validates
+the actual Apple primitive; the production lock is unchanged. Linux memory
+ownership remains checked with Miri.
+
 The configured SQL-session test harness records the most recent query-memory
 error's source location and the arena's requested, remaining and capacity bytes
 without allocating. Failed success assertions include those values, whether a

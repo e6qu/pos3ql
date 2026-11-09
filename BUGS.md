@@ -17,6 +17,14 @@ Selecting a column by name must preserve its declared domain type through
 derived tables as well as direct table reads and wildcard expansion.
 Expanded records must occupy their actual output width in ordering, grouping,
 window queries, set operations and deferred evaluation after sorting.
+Derived-table descriptions must resolve their own WITH names before column
+lookup, including CTEs that shadow a trigger's transition table.
+RETURNING, ordinary write expressions and conflict-update expressions share
+the same reference-kind walk, with explicit old/new and excluded namespaces.
+Sequence-only SQL helpers called inside trigger source queries must use the
+active statement session and preserve assignment order and once-only effects.
+Platform lock checks must exercise the actual native API with race detection;
+preserve direct-API controls and source provenance for foreign-emulation errors.
 Dependency capture must resolve whole rows, selected fields and schema-qualified
 columns while retaining the columns actually required by later schema changes.
 Fixed function-timing capacity must fail explicitly and return entries after

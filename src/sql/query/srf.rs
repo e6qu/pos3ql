@@ -2289,6 +2289,13 @@ pub(crate) fn describe_derived_definition<'a>(
     arena: &'a Arena,
     outer: Option<&QueryScope<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
+    let sub = if sub.with.is_empty() {
+        sub
+    } else {
+        // Its local WITH names must be bound before resolving this table's
+        // columns, including during procedural input/dependency analysis.
+        super::expand_ctes(sub, storage, txid, arena)?
+    };
     let outer_schema = outer.map(super::ScopeSchema);
     let outer_columns = outer_schema
         .as_ref()
@@ -5959,7 +5966,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     super::validate_stored_type_inputs(parser, storage, txid, dependencies.view())
                 },
             )?;
-            if super::routine_program_requires_mutable_execution(&program) {
+            let access = super::routine_program_access(&program);
+            let sequences = hooks.sequences;
+            if access == super::RoutineProgramAccess::Engine
+                || (access == super::RoutineProgramAccess::Sequences && sequences.is_none())
+            {
                 let resolve = |invocations: &super::RoutineInvocationState,
                                statement_arena: &Arena| {
                     invocations
@@ -6019,7 +6030,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     arena,
                     &routine_params[..routine.argument_count],
                     false,
-                    None,
+                    sequences,
                     &mut |_| Ok(()),
                 )?;
             }
@@ -6046,7 +6057,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     arena,
                     &routine_params[..routine.argument_count],
                     false,
-                    None,
+                    sequences,
                     &mut |_| Ok(()),
                 )?;
                 return Ok(&[]);
@@ -6064,7 +6075,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 arena,
                 &routine_params[..routine.argument_count],
                 false,
-                None,
+                sequences,
                 &mut |values| {
                     let expected_columns = table_columns.map_or(1, <[_]>::len);
                     if values.len() != expected_columns {

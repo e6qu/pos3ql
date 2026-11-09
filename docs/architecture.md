@@ -156,6 +156,13 @@ query. Expanded views retain their original schema and name while aliases
 control which names SQL can reference. `RETURNING` adds the target's old/new
 names without adding duplicate sources of unqualified columns.
 
+Parse, Bind and Describe each restore the connection's user, search path and
+timezone after selecting its database. Another client's work cannot lend them
+its lookup context. Describing a statement neither issues a new command nor
+renews the deadline. For example, after `SET search_path = orders_app, public`,
+a parameterized `INSERT INTO orders VALUES ($1) RETURNING id` describes the
+`orders_app` table even when another connection uses a different search path.
+
 Protocol preparation distinguishes starting a command from executing a block of
 commands. A JDBC client can prepare and bind a standalone `COMMIT PREPARED`
 without making it an explicit transaction. An earlier execution before `Sync`,

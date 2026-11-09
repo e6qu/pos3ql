@@ -13028,6 +13028,22 @@ impl Engine {
         })
     }
 
+    /// Database selection and other backends can replace the worker's lookup
+    /// context between protocol messages. Restore this session without issuing
+    /// a command, taking a new snapshot or renewing its deadline.
+    pub(crate) fn restore_protocol_session(
+        &self,
+        txn: &TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        guc.refresh_identities(&self.storage, txn.txid);
+        eval::funcs::system::set_session_user(guc.session_identity());
+        eval::funcs::system::set_current_user(guc.current_identity());
+        self.publish_session_context(guc, txn, guc.current_role().as_str())?;
+        timezone::set_session(guc.timezone());
+        Ok(())
+    }
+
     pub(crate) fn begin_extended_parse(
         &mut self,
         txn: &mut TxnState,
@@ -13044,6 +13060,7 @@ impl Engine {
         }
         txn.begin_statement_clock();
         self.ensure_txn(txn, TxnMode::Implicit, guc)?;
+        self.restore_protocol_session(txn, guc)?;
         self.begin_command_snapshot(
             txn,
             matches!(statement, ProtocolStatement::Query),
@@ -13072,11 +13089,7 @@ impl Engine {
         }
         txn.begin_statement_clock();
         self.ensure_txn(txn, TxnMode::Implicit, guc)?;
-        guc.refresh_identities(&self.storage, txn.txid);
-        eval::funcs::system::set_session_user(guc.session_identity());
-        eval::funcs::system::set_current_user(guc.current_identity());
-        self.publish_session_context(guc, txn, guc.current_role().as_str())?;
-        timezone::set_session(guc.timezone());
+        self.restore_protocol_session(txn, guc)?;
         if lock_timeout_expired {
             return Err(sql_err!(
                 sqlstate::LOCK_NOT_AVAILABLE,

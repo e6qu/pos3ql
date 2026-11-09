@@ -3727,6 +3727,15 @@ impl Conn {
             return ext_err(&mut self.send, &mut self.phase, code, what);
         };
 
+        engine.bind_query_connection(self.id);
+        if let Err(error) = engine.restore_protocol_session(&self.txn, &self.guc) {
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                error.sqlstate,
+                error.message.as_str(),
+            );
+        }
         self.arena.reset();
         let n_params = self.prepared[slot].n_params;
         let text = self.prepared[slot].query();

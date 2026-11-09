@@ -491,13 +491,16 @@ pub(crate) fn execute<'a>(
     settings: &super::super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     collation: crate::sql::ast::Collation,
-    inputs: &'a [Datum<'a>],
+    inputs: &[Datum<'a>],
     arena: &'a Arena,
     responder: &mut Responder<'_>,
     environment: &CallEnvironment,
     policy: super::super::query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
 ) -> Result<FunctionOutput<'a>, SqlError> {
+    let inputs = arena
+        .alloc_slice_copy(inputs)
+        .map_err(|_| super::super::query::arena_full_pub())?;
     let kind = plpgsql_function_program_kind(routine);
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),

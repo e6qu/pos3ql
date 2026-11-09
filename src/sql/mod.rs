@@ -17507,15 +17507,6 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
             }
-            let inputs = match arena.alloc_slice_copy(&arguments[..pending.argument_count]) {
-                Ok(inputs) => inputs,
-                Err(_) => {
-                    return Ok(Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "statement arena exhausted while invoking PL/pgSQL table function"
-                    )));
-                }
-            };
             let instance = match self.plpgsql_instance_owner(
                 routine,
                 pending.input_collation,
@@ -17535,7 +17526,7 @@ impl Engine {
                     guc,
                     routine,
                     pending.input_collation,
-                    &*inputs,
+                    &arguments[..pending.argument_count],
                     arena,
                     responder,
                     &environment,

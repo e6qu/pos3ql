@@ -426,3 +426,85 @@ fn paused_positional_functions_keep_record_array_and_null_domain_arguments() {
         std::fs::remove_dir_all(config.data_dir).unwrap();
     }
 }
+
+#[test]
+fn paused_function_converts_its_return_before_restoring_the_callers_timezone() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("function-return-timezone-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(&mut engine, "SET timezone='UTC'; CREATE TABLE function_timezone_root(id integer); \
+            CREATE TABLE function_timezone_audit(answer timestamptz); \
+            CREATE FUNCTION function_timezone() RETURNS timestamptz LANGUAGE plpgsql SET timezone='Europe/Bucharest' AS $$ \
+            DECLARE answer text:='2026-01-01 00:00:00'; BEGIN PERFORM pg_advisory_xact_lock(115); RETURN answer; END$$; \
+            CREATE FUNCTION function_timezone_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+            DECLARE answer timestamptz; BEGIN SELECT function_timezone() INTO answer; INSERT INTO function_timezone_audit VALUES(answer); RETURN NEW; END$$; \
+            CREATE TRIGGER function_timezone_trigger AFTER INSERT ON function_timezone_root FOR EACH ROW EXECUTE FUNCTION function_timezone_trigger()", true);
+        holder.success(
+            &mut engine,
+            "BEGIN; SELECT pg_advisory_xact_lock(115)",
+            true,
+        );
+        let sql = "INSERT INTO function_timezone_root VALUES(1)";
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            output_mark,
+            wait,
+        } = writer.execute_status(&mut engine, sql, true)
+        else {
+            panic!("timezone function did not retain its body");
+        };
+        assert_eq!(wait, StatementWait::Lock);
+        holder.success(&mut engine, "COMMIT", true);
+        writer.send.truncate_to(output_mark);
+        writer.arena.recycle_front();
+        let status = crate::mem::guard::forbid_alloc(|| {
+            engine.execute_simple_from(
+                sql,
+                completed_statements,
+                &writer.arena,
+                &mut writer.transaction,
+                &mut writer.pool,
+                &mut writer.cursors,
+                &writer.guc,
+                &mut Responder::new(&mut writer.send),
+                writer.connection_id,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(status, ExecutionStatus::Complete);
+        assert!(
+            error_sqlstates(writer.send.readable()).is_empty(),
+            "{}",
+            String::from_utf8_lossy(writer.send.readable())
+        );
+        writer.success(
+            &mut engine,
+            "INSERT INTO function_timezone_root VALUES(2)",
+            true,
+        );
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT answer FROM function_timezone_audit ORDER BY answer; SHOW timezone",
+                true
+            )),
+            ["2025-12-31 22:00:00+00", "2025-12-31 22:00:00+00", "UTC"]
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}

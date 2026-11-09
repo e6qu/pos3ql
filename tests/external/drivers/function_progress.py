@@ -20,10 +20,17 @@ def exercise(host, port, user, protocol, shape):
         admin.execute("CREATE SCHEMA function_progress_driver")
         for connection in (admin, writer):
             connection.execute("SET search_path=function_progress_driver,public")
+            connection.execute("SET timezone='UTC'")
         admin.execute("CREATE SEQUENCE issued")
         admin.execute("CREATE TABLE orders(id integer,payload text)")
         admin.execute("CREATE TABLE audit(stage text,n bigint,payload text)")
-        if shape == "scalar":
+        settings = ""
+        if shape == "timezone":
+            signature = "RETURNS timestamptz"
+            settings = "SET timezone='Europe/Bucharest'"
+            finish = "RETURN substr('2026-01-01 00:00:00',1);"
+            call = "SELECT waiting(NEW.payload) INTO answer"
+        elif shape == "scalar":
             signature = "RETURNS text"
             finish = "RETURN saved||':'||n::text;"
             call = "SELECT waiting(NEW.payload) INTO answer"
@@ -31,7 +38,7 @@ def exercise(host, port, user, protocol, shape):
             signature = "RETURNS TABLE(payload text)"
             finish = "payload:=saved; RETURN NEXT; payload:=saved||':'||n::text; RETURN NEXT; RETURN;"
             call = "SELECT string_agg(payload,',') INTO answer FROM waiting(NEW.payload)"
-        admin.execute(f"""CREATE FUNCTION waiting(p text) {signature} LANGUAGE plpgsql AS $$
+        admin.execute(f"""CREATE FUNCTION waiting(p text) {signature} LANGUAGE plpgsql {settings} AS $$
             DECLARE n bigint:=nextval('issued'); saved text:=p;
             BEGIN
                 INSERT INTO audit VALUES('before',n,saved);
@@ -88,11 +95,14 @@ def exercise(host, port, user, protocol, shape):
                         admin.execute("SELECT pg_cancel_backend(%s)", (pid,))
                         worker.join(timeout=5)
             writer.execute("INSERT INTO orders VALUES(%s,%s)", (3, "fresh"))
-            expected_length = 8194 if shape == "scalar" else 16387
-            expected_fresh = 7 if shape == "scalar" else 13
+            expected_length = {"scalar": 8194, "table": 16387, "timezone": 22}[shape]
+            expected_fresh = {"scalar": 7, "table": 13, "timezone": 22}[shape]
             audit = admin.execute("SELECT stage,n,length(payload) FROM audit ORDER BY n,stage").fetchall()
             assert audit == [("after", 1, 8192), ("before", 1, 8192), ("caller", 1, expected_length),
                              ("after", 3, 5), ("before", 3, 5), ("caller", 3, expected_fresh)], audit
+            if shape == "timezone":
+                assert admin.execute("SELECT payload FROM audit WHERE stage='caller' ORDER BY n").fetchall() == [
+                    ("2025-12-31 22:00:00+00",), ("2025-12-31 22:00:00+00",)]
             assert admin.execute("SELECT id FROM orders ORDER BY id").fetchall() == [(1,), (3,)]
             assert admin.execute("SELECT last_value FROM issued").fetchone() == (3,)
             print(json.dumps(dict(protocol=protocol, shape=shape, outcomes=transcript, audit=audit), sort_keys=True))
@@ -108,7 +118,7 @@ def main():
     parser.add_argument("--user", required=True)
     args = parser.parse_args()
     for protocol in ("simple", "extended"):
-        for shape in ("scalar", "table"):
+        for shape in ("scalar", "table", "timezone"):
             exercise(args.host, args.port, args.user, protocol, shape)
 
 

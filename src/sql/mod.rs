@@ -15953,11 +15953,6 @@ impl Engine {
                     responder,
                 )? {
                     exec::FunctionOutput::Scalar(value) => {
-                        let value = eval::cast_to(
-                            exec::detach_routine_datum(value, scratch)?,
-                            body.result_type(),
-                            scratch,
-                        )?;
                         exec::encode_projected_pub(&[value], scratch)
                     }
                     exec::FunctionOutput::Rows(rows) => exec::pack_projected_rows(rows, scratch),
@@ -17356,11 +17351,7 @@ impl Engine {
                 }
                 Err(error) => return Ok(Err(error)),
             };
-            let value = match exec::detach_routine_datum(value, arena) {
-                Ok(value) => value,
-                Err(error) => return Ok(Err(error)),
-            };
-            return Ok(eval::cast_to(value, result_type, arena));
+            return Ok(Ok(value));
         }
         let body = match arena.alloc_str(routine.body.as_str()) {
             Ok(body) => body,

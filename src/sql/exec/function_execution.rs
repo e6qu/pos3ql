@@ -86,9 +86,10 @@ impl ReturnBinding {
         &self,
         execution: &execution_frame::ExecutionFrame<'_, 'a>,
         flow: Option<TriggerFlow<'a>>,
+        result_type: ColType,
         arena: &'a Arena,
     ) -> Result<FunctionOutput<'a>, SqlError> {
-        match (self, flow) {
+        let output = match (self, flow) {
             (
                 Self::Value | Self::OutputValue(_) | Self::OutputRecord(_),
                 Some(TriggerFlow::Return(TriggerReturnValue::Value(value))),
@@ -141,6 +142,14 @@ impl ReturnBinding {
                 "control reached end of function without RETURN"
             )),
             _ => Err(unsupported_trigger_body()),
+        }?;
+        match output {
+            FunctionOutput::Scalar(value) => Ok(FunctionOutput::Scalar(cast_to(
+                detach_routine_datum(value, arena)?,
+                result_type,
+                arena,
+            )?)),
+            FunctionOutput::Rows(rows) => Ok(FunctionOutput::Rows(rows)),
         }
     }
 }
@@ -234,9 +243,6 @@ impl FunctionBinding {
 impl SuspendedFunction {
     pub(crate) fn oid(&self) -> i32 {
         self.state[0].binding.oid
-    }
-    pub(crate) fn result_type(&self) -> ColType {
-        self.state[0].binding.result_type
     }
     pub(crate) fn is_set_returning(&self) -> bool {
         self.state[0].binding.kind == PlpgsqlProgramKind::SetFunction
@@ -370,7 +376,10 @@ impl SuspendedFunctionState {
         );
         match result {
             Ok(flow) => {
-                let output = self.binding.returns.finish(&execution, flow, arena);
+                let output =
+                    self.binding
+                        .returns
+                        .finish(&execution, flow, self.binding.result_type, arena);
                 self.binding.environment.complete();
                 Ok(output)
             }
@@ -687,7 +696,12 @@ pub(crate) fn execute<'a>(
     );
     drop(seeded);
     match result {
-        Ok(flow) => returns.finish(&execution, flow, arena),
+        Ok(flow) => returns.finish(
+            &execution,
+            flow,
+            routine.kind.function_result().ok_or_else(changed)?,
+            arena,
+        ),
         Err(error) if control_flow::is_execution_wait(&error) => {
             if policy == super::super::query::RoutineExecution::Synchronous {
                 return Err(sql_err!(

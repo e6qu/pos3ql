@@ -1,9 +1,10 @@
-//! Name-resolution pass for durable stored-query dependencies.
+//! Bind catalog dependencies for stored definitions and runtime query plans.
 //!
 //! Views keep their SQL text for execution, but dependency decisions must not
-//! reparse that text after catalog objects have moved. This pass runs once at
-//! CREATE time and records the exact relation, user type, and sequence slots
-//! selected under the creator's search path.
+//! reparse that text after catalog objects have moved. Definition creation and
+//! runtime plan admission record the selected relations, types and sequences.
+//! Executor-owned transition rows contribute their schema without acquiring
+//! fictitious catalog identities.
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{

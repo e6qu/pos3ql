@@ -1,7 +1,7 @@
 //! The runtime bridge for `nextval`/`currval`/`lastval`/`setval`.
 //!
-//! Sequence functions are volatile and side-effecting, yet the expression
-//! evaluator is a pure `&`-only pass. [`SeqEval`] reconciles the two: it holds a
+//! Sequence functions are volatile and side-effecting, while expression
+//! evaluation receives shared references. [`SeqEval`] holds a
 //! shared `&Storage` and advances a generator through the [`SequenceDef`]'s
 //! `Cell` value state (allocation-free interior mutability), recording
 //! `currval`/`lastval` in the per-connection [`SeqSession`]. It implements the

@@ -56,15 +56,17 @@ def exercise(host, port, user, protocol, shape):
             for cancel, order in [(False, 1), (True, 2)]:
                 admin.execute("SELECT pg_advisory_lock(846201)")
                 outcome = []
+                diagnostics = []
 
                 def insert():
                     try:
                         with writer.cursor() as cursor:
-                            cursor.execute("INSERT INTO orders VALUES(%s,%s) RETURNING id",
-                                           (order, "x" * 8192))
+                            cursor.execute("INSERT INTO orders VALUES(%s,repeat(%s,8192)) RETURNING id",
+                                           (order, "x"))
                             outcome.append(("rows", cursor.fetchall()))
                     except psycopg.Error as error:
                         outcome.append(("error", error.sqlstate))
+                        diagnostics.append(str(error))
 
                 worker = threading.Thread(target=insert, daemon=True)
                 worker.start()
@@ -74,7 +76,7 @@ def exercise(host, port, user, protocol, shape):
                         blockers = admin.execute("SELECT pg_blocking_pids(%s)", (pid,)).fetchone()[0]
                         if blockers:
                             break
-                        assert worker.is_alive(), outcome
+                        assert worker.is_alive(), (outcome, diagnostics)
                         time.sleep(0.01)
                     else:
                         raise AssertionError("function never reached its held lock")
@@ -87,7 +89,7 @@ def exercise(host, port, user, protocol, shape):
                         assert admin.execute("SELECT pg_advisory_unlock(846201)").fetchone() == (True,)
                     worker.join(timeout=5)
                     assert not worker.is_alive(), "function did not finish after release/cancellation"
-                    assert outcome == ([("error", "57014")] if cancel else [("rows", [(order,)])]), outcome
+                    assert outcome == ([("error", "57014")] if cancel else [("rows", [(order,)])]), (outcome, diagnostics)
                     transcript.append(outcome)
                 finally:
                     admin.execute("SELECT pg_advisory_unlock_all()")

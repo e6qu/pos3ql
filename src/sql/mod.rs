@@ -15187,7 +15187,7 @@ impl Engine {
         }
         let invocations = query::RoutineInvocationState::new(
             arena,
-            crate::sql::query::RoutineExecution::Synchronous,
+            crate::sql::query::RoutineExecution::StatementReplay,
         );
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
@@ -15268,7 +15268,7 @@ impl Engine {
         let policy = if continuation.is_some() {
             query::RoutineExecution::Retained
         } else {
-            query::RoutineExecution::Synchronous
+            query::RoutineExecution::StatementReplay
         };
         let invocations =
             saved.unwrap_or_else(|| query::RoutineInvocationState::new(owner, policy));
@@ -15529,7 +15529,7 @@ impl Engine {
         }
         let invocations = query::RoutineInvocationState::new(
             arena,
-            crate::sql::query::RoutineExecution::Synchronous,
+            crate::sql::query::RoutineExecution::StatementReplay,
         );
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
@@ -16108,7 +16108,7 @@ impl Engine {
     ) -> Result<Result<Datum<'a>, SqlError>, WireFull> {
         let nested_invocations = query::RoutineInvocationState::new(
             arena,
-            crate::sql::query::RoutineExecution::Synchronous,
+            crate::sql::query::RoutineExecution::StatementReplay,
         );
         nested_invocations.begin_attempt();
         query::with_routine_invocation_scope(
@@ -17623,7 +17623,7 @@ impl Engine {
                 }
                 let nested_invocations = query::RoutineInvocationState::new(
                     arena,
-                    crate::sql::query::RoutineExecution::Synchronous,
+                    crate::sql::query::RoutineExecution::StatementReplay,
                 );
                 nested_invocations.begin_attempt();
                 query::with_routine_invocation_scope(

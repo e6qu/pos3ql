@@ -1319,7 +1319,9 @@ impl<'a> RoutineResultShape<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutineExecution {
-    Synchronous,
+    /// The command's effect journal must approve restarting an unfinished body.
+    StatementReplay,
+    /// The caller retains this query and the unfinished function body together.
     Retained,
 }
 

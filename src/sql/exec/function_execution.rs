@@ -706,11 +706,8 @@ pub(crate) fn execute<'a>(
             arena,
         ),
         Err(error) if control_flow::is_execution_wait(&error) => {
-            if policy == super::super::query::RoutineExecution::Synchronous {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "function wait requires an owned enclosing query"
-                ));
+            if policy == super::super::query::RoutineExecution::StatementReplay {
+                return Err(error);
             }
             let storage = context.storage();
             let mut state = storage

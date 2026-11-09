@@ -275,7 +275,7 @@ mod tests {
                 }
                 let invocations = crate::sql::query::RoutineInvocationState::new(
                     work,
-                    crate::sql::query::RoutineExecution::Synchronous,
+                    crate::sql::query::RoutineExecution::StatementReplay,
                 );
                 invocations.begin_attempt();
                 if !query.evaluate_predicate(storage, txid, work, None, &invocations, work)? {

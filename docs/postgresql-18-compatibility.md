@@ -410,10 +410,12 @@ as `0ms`; enabling them returns `0A000`.
 An owned `PERFORM` or `SELECT ... INTO` can resume a PL/pgSQL scalar or table
 function inside retained AFTER-trigger work. Its arguments, locals, loop and
 handler positions, completed writes and issued sequence values survive a wait.
-A call outside an owned query returns `0A000` with
-`function wait requires an owned enclosing query` if its body needs to yield;
-SQL-language bodies and other expression positions still need retained progress.
-Storage waits remain synchronous on protected paths until that work is complete.
+Outside an owned query, the command's effect journal must approve restarting
+an unfinished call. Checked inputs, caught input errors and issued sequence
+values keep their original receipts; a command with unrecorded effects returns
+`0A000` instead of repeating them. SQL-language bodies and other expression
+positions still need retained progress. Storage waits remain synchronous on
+protected paths until that work is complete.
 Cancellation and capacity errors roll back SQL writes; sequence numbers already
 issued remain consumed, as in PostgreSQL.
 

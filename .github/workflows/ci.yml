@@ -209,7 +209,8 @@ jobs:
         with:
           components: rust-src
       - name: Verify native sanitizer target
-        run: test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
       - name: Native mutex movement, contention and unwinding
         shell: bash
         run: |

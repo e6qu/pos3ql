@@ -14595,7 +14595,7 @@ impl VisibilityContext {
     }
 }
 
-fn execution_path() -> PathContext {
+pub(crate) fn execution_path() -> PathContext {
     EXECUTION_PATH.with(Cell::get)
 }
 
@@ -14605,7 +14605,7 @@ pub(crate) fn information_schema_on_path() -> bool {
         .contains(&PathEntry::InformationSchema)
 }
 
-fn replace_execution_path(path: PathContext) -> PathContext {
+pub(crate) fn replace_execution_path(path: PathContext) -> PathContext {
     EXECUTION_PATH.with(|current| current.replace(path))
 }
 

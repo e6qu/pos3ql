@@ -21,6 +21,11 @@ fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
         datetime::begin_statement();
         datetime::begin_transaction();
         query::restore_statement_deadline(812_345_678_902_234);
+        let mut schemas = crate::sql::eval::funcs::system::session_schemas();
+        schemas.names[0] = crate::util::StackStr::from_str("function_schema");
+        schemas.n = 1;
+        crate::sql::eval::funcs::system::set_session_schemas(schemas);
+        let saved_path = crate::storage::execution_path();
         let active = CallEnvironment::new(None, None);
         let saved = SavedCallEnvironment::capture(&active, &controls).unwrap();
         drop(active);
@@ -29,8 +34,18 @@ fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
         datetime::begin_statement();
         datetime::begin_transaction();
         query::restore_statement_deadline(812_345_678_901_233);
+        schemas.names[0] = crate::util::StackStr::from_str("other_client");
+        crate::sql::eval::funcs::system::set_session_schemas(schemas);
         {
             let _active = saved.enter(&txn).unwrap();
+            assert_eq!(
+                crate::storage::execution_path().entries(),
+                saved_path.entries()
+            );
+            assert_eq!(
+                crate::sql::eval::funcs::system::session_schemas().names[0].as_str(),
+                "function_schema"
+            );
             assert_eq!(datetime::statement_micros(), 812_345_678_901_234);
             assert_eq!(datetime::transaction_micros(), 812_345_678_901_234);
             assert_eq!(query::statement_deadline(), 812_345_678_902_234);
@@ -42,6 +57,10 @@ fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
                 sqlstate::QUERY_CANCELED
             );
         }
+        assert_eq!(
+            crate::sql::eval::funcs::system::session_schemas().names[0].as_str(),
+            "other_client"
+        );
         assert_eq!(datetime::statement_micros(), 812_345_678_901_634);
         assert_eq!(datetime::transaction_micros(), 812_345_678_901_634);
         assert_eq!(query::statement_deadline(), 812_345_678_901_233);

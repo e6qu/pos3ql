@@ -462,8 +462,14 @@ mod ownership_tests {
                 let _clock = test_clock::enter(1_140);
                 parent.pause()
             };
-            let parent = parent.resume().ok().unwrap();
-            let child = child.resume().ok().unwrap();
+            let parent = {
+                let _clock = test_clock::enter(1_141);
+                parent.resume().ok().unwrap()
+            };
+            let child = {
+                let _clock = test_clock::enter(1_142);
+                child.resume().ok().unwrap()
+            };
             {
                 let _clock = test_clock::enter(1_150);
                 assert_eq!(child.finish(), Some((140, 140)));

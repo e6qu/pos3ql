@@ -7,6 +7,10 @@ pub(in crate::sql) struct CallEnvironment {
     config: Option<crate::sql::guc::RoutineConfigScope>,
     security: Option<crate::sql::eval::funcs::system::CurrentUserScope>,
     prior_clock: Option<crate::sql::datetime::StatementClock>,
+    prior_namespace: Option<(
+        crate::storage::PathContext,
+        crate::sql::eval::funcs::system::SessionSchemas,
+    )>,
     _deadline: Option<crate::sql::query::DeadlineScope>,
 }
 
@@ -19,6 +23,7 @@ impl CallEnvironment {
             config,
             security,
             prior_clock: None,
+            prior_namespace: None,
             _deadline: None,
         }
     }
@@ -26,6 +31,10 @@ impl CallEnvironment {
 
 impl Drop for CallEnvironment {
     fn drop(&mut self) {
+        if let Some((path, schemas)) = self.prior_namespace.take() {
+            crate::storage::replace_execution_path(path);
+            crate::sql::eval::funcs::system::set_session_schemas(schemas);
+        }
         if let Some(clock) = self.prior_clock.take() {
             crate::sql::datetime::restore_statement_clock(clock);
         }
@@ -35,6 +44,8 @@ impl Drop for CallEnvironment {
 pub(super) struct SavedCallEnvironment {
     security: Option<crate::storage::SessionIdentity>,
     config: Option<SharedSlice<crate::sql::guc::RoutineConfigImage>>,
+    path: crate::storage::PathContext,
+    schemas: crate::sql::eval::funcs::system::SessionSchemas,
     clock: crate::sql::datetime::StatementClock,
     deadline: i64,
 }
@@ -64,6 +75,8 @@ impl SavedCallEnvironment {
                 .as_ref()
                 .map(|_| crate::sql::eval::funcs::system::current_identity()),
             config,
+            path: crate::storage::execution_path(),
+            schemas: crate::sql::eval::funcs::system::session_schemas(),
             clock: crate::sql::datetime::stored_statement_clock(),
             deadline: crate::sql::query::statement_deadline(),
         })
@@ -78,6 +91,11 @@ impl SavedCallEnvironment {
             .as_ref()
             .map(|image| image[0].enter())
             .transpose()?;
+        let prior_namespace = (
+            crate::storage::replace_execution_path(self.path),
+            crate::sql::eval::funcs::system::session_schemas(),
+        );
+        crate::sql::eval::funcs::system::set_session_schemas(self.schemas);
         let prior_clock = crate::sql::datetime::stored_statement_clock();
         let deadline = crate::sql::query::enter_deadline_scope();
         crate::sql::datetime::restore_statement_clock(self.clock);
@@ -86,6 +104,7 @@ impl SavedCallEnvironment {
             config,
             security,
             prior_clock: Some(prior_clock),
+            prior_namespace: Some(prior_namespace),
             _deadline: Some(deadline),
         })
     }

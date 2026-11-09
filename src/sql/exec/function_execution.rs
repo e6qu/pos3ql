@@ -219,7 +219,7 @@ impl FunctionBinding {
             input_collation: self.input_collation,
             input_sites,
             materialized_relations: None,
-            nargs: self.parameters.len() as i32,
+            nargs: i32::try_from(self.parameters.len()).expect("bounded routine argument count"),
             when: "",
             level: "",
             operation: "",
@@ -275,75 +275,14 @@ impl SuspendedFunction {
         }
         let prior = state.progress.take();
         let frame = state.execution.take().ok_or_else(changed)?;
-        let attached = super::super::type_input_plans::with_owner(
-            state.binding.input_owner,
-            || {
-                prior.with_resume(frame, super::super::lock::AdvisoryPositionTail::Unchanged, |frame, admission| {
-            let _types = match state.binding.type_sources.as_ref().map(|sources| sources.enter()).transpose() {
-                Ok(scope) => scope,
-                Err(error) => return Err((frame, error)),
-            };
-            let environment = match state.binding.environment.enter(context.txn) {
-                Ok(environment) => environment,
-                Err(error) => return Err((frame, error)),
-            };
-            let (parsed, code) = match frame.source().parse(arena) {
-                Ok(parsed) => parsed,
-                Err(error) => return Err((frame, error)),
-            };
-            let inputs = match state.binding.inputs.decode(arena) {
-                Ok(inputs) => inputs,
-                Err(error) => return Err((frame, error)),
-            };
-            let invocation = match state.binding.invocation(parsed.input_sites, arena) {
-                Ok(invocation) => invocation,
-                Err(error) => return Err((frame, error)),
-            };
-            let catalog = super::super::query::storage_catalog(context.storage(), arena, context.txn.txid);
-            let _formal = match enter_routine_parameter_types(&state.binding.parameters, Some(&catalog), state.binding.input_collation) {
-                Ok(formal) => formal,
-                Err(error) => return Err((frame, error)),
-            };
-            let seeded = match seeded_arguments(&state.binding.parameters, inputs, arena) {
-                Ok(seeded) => seeded,
-                Err(error) => return Err((frame, error)),
-            };
-            let mut execution = match frame.restore(arena, &code) {
-                Ok(execution) => execution,
-                Err(error) => return Err(error),
-            };
-            admission.commit();
-            context.params = inputs;
-            let result = run_body(&mut execution, &code, invocation, &mut context, seeded, Some(state.binding.boundary));
-            match result {
-                Ok(flow) => {
-                    let output = state.binding.returns.finish(&execution, flow, arena);
-                    state.binding.environment.complete();
-                    Ok(output)
-                }
-                Err(error) if control_flow::is_execution_wait(&error) => {
-                    let captured = SavedCallEnvironment::capture(&environment, &context.storage().execution_control)
-                        .and_then(|environment| {
-                            execution.suspend().map(|frame| (frame, environment)).map_err(|(_, error)| error)
-                        });
-                    match captured {
-                        Ok((frame, environment)) => {
-                            state.binding.environment = environment;
-                            state.execution = Some(frame);
-                            match super::super::sequence::SavedStatementPosition::capture() {
-                                Ok(progress) => state.progress = progress,
-                                Err(error) => return Ok(Err(error)),
-                            }
-                            Ok(Err(error))
-                        }
-                        Err(error) => Ok(Err(error)),
-                    }
-                }
-                Err(error) => Ok(Err(error)),
-            }
-        })
-            },
-        );
+        let attached =
+            super::super::type_input_plans::with_owner(state.binding.input_owner, || {
+                prior.with_resume(
+                    frame,
+                    super::super::lock::AdvisoryPositionTail::Unchanged,
+                    |frame, admission| state.resume_body(frame, admission, &mut context),
+                )
+            });
         match attached {
             Ok(Ok(result)) => result,
             Ok(Err((frame, error))) | Err((frame, error)) => {
@@ -351,6 +290,107 @@ impl SuspendedFunction {
                 state.progress = prior;
                 Err(error)
             }
+        }
+    }
+}
+
+impl SuspendedFunctionState {
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed attachment returns the original function execution without allocation"
+    )]
+    fn resume_body<'a>(
+        &mut self,
+        frame: execution_frame::SuspendedExecutionFrame,
+        admission: &mut super::super::sequence::StatementPositionAdmission<'_>,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+    ) -> Result<
+        Result<FunctionOutput<'a>, SqlError>,
+        (execution_frame::SuspendedExecutionFrame, SqlError),
+    > {
+        let arena = context.arena;
+        let _types = match self
+            .binding
+            .type_sources
+            .as_ref()
+            .map(|sources| sources.enter())
+            .transpose()
+        {
+            Ok(scope) => scope,
+            Err(error) => return Err((frame, error)),
+        };
+        let environment = match self.binding.environment.enter(context.txn) {
+            Ok(environment) => environment,
+            Err(error) => return Err((frame, error)),
+        };
+        let (parsed, code) = match frame.source().parse(arena) {
+            Ok(parsed) => parsed,
+            Err(error) => return Err((frame, error)),
+        };
+        let inputs = match self.binding.inputs.decode(arena) {
+            Ok(inputs) => inputs,
+            Err(error) => return Err((frame, error)),
+        };
+        let invocation = match self.binding.invocation(parsed.input_sites, arena) {
+            Ok(invocation) => invocation,
+            Err(error) => return Err((frame, error)),
+        };
+        let catalog =
+            super::super::query::storage_catalog(context.storage(), arena, context.txn.txid);
+        let _formal = match enter_routine_parameter_types(
+            &self.binding.parameters,
+            Some(&catalog),
+            self.binding.input_collation,
+        ) {
+            Ok(formal) => formal,
+            Err(error) => return Err((frame, error)),
+        };
+        let seeded = match seeded_arguments(&self.binding.parameters, inputs, arena) {
+            Ok(seeded) => seeded,
+            Err(error) => return Err((frame, error)),
+        };
+        let mut execution = frame.restore(arena, &code)?;
+        admission.commit();
+        context.params = inputs;
+        let result = run_body(
+            &mut execution,
+            &code,
+            invocation,
+            context,
+            seeded,
+            Some(self.binding.boundary),
+        );
+        match result {
+            Ok(flow) => {
+                let output = self.binding.returns.finish(&execution, flow, arena);
+                self.binding.environment.complete();
+                Ok(output)
+            }
+            Err(error) if control_flow::is_execution_wait(&error) => {
+                let captured = SavedCallEnvironment::capture(
+                    &environment,
+                    &context.storage().execution_control,
+                )
+                .and_then(|environment| {
+                    execution
+                        .suspend()
+                        .map(|frame| (frame, environment))
+                        .map_err(|(_, error)| error)
+                });
+                match captured {
+                    Ok((frame, environment)) => {
+                        self.binding.environment = environment;
+                        self.execution = Some(frame);
+                        match super::super::sequence::SavedStatementPosition::capture() {
+                            Ok(progress) => self.progress = progress,
+                            Err(error) => return Ok(Err(error)),
+                        }
+                        Ok(Err(error))
+                    }
+                    Err(error) => Ok(Err(error)),
+                }
+            }
+            Err(error) => Ok(Err(error)),
         }
     }
 }

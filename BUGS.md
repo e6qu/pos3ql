@@ -24,6 +24,9 @@ the executable initializer as well as its discovery tree. SELECT INTO descriptio
 local record-field types; ROW field positions count expanded fields. Multi-column
 assignment subqueries participate in the same binding and dependency walk and
 retain one shared source rather than repeating its effects for each field.
+INTO target parsing must preserve following set operations and quoted commas.
+Runtime ROW field identities and wire descriptions use expanded metadata rather
+than indexing the unexpanded constructor arguments.
 RETURNING, ordinary write expressions and conflict-update expressions share
 the same reference-kind walk, with explicit old/new and excluded namespaces.
 Sequence-only SQL helpers called inside trigger source queries must use the
@@ -34,6 +37,9 @@ Dependency capture must resolve whole rows, selected fields and schema-qualified
 columns while retaining the columns actually required by later schema changes.
 Fixed function-timing capacity must fail explicitly and return entries after
 early errors or unwinding; silently disabling requested tracking is a defect.
+Write completion must reuse a captured table's identical row schema instead of
+reserving a second image. Capacity errors must roll back and permit repeated
+nested-trigger retries without increasing the configured image pool.
 Record an entry here only with its reproducer, observed behavior and exact
 external blocker or reason it cannot be repaired. Keep resolved investigations
 with their fixing code, tests and retained reference evidence.

@@ -373,7 +373,6 @@ impl SuspendedWriteCompletion {
             .map_err(control_flow::execution_full)?;
         let selected = SavedAfterFiring::capture(selected, &context.storage().execution_control)?;
         let definitions = context.storage().table_definition_images();
-        let definition = definitions.retain_relation(&definition)?;
         let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
         while let Some(firing) = row_cursor.next(context)? {
             definitions.definition(
@@ -382,6 +381,8 @@ impl SuspendedWriteCompletion {
                 context.txn.txid,
             )?;
         }
+        // The selected table can also supply the completion's identical row schema.
+        let definition = definitions.retain_relation(&definition)?;
         let transitions = transition_rows::SavedTransitionRowSets::capture(
             transitions,
             &context.storage().row_work,

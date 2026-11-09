@@ -6106,78 +6106,85 @@ fn query_definition_ownership_record_witnesses_and_describe_names() {
 
 #[test]
 fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
-    let mut config = test_config("definition-image-exhaustion");
-    config.max_tables = 2;
-    config.max_catalog_versions_per_object = 1;
-    config.definition_image_slots = 6;
-    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
-    let mut engine = Engine::new(&config, &mut budget).unwrap();
-    for statement in [
-        "CREATE TABLE image_target (id integer)",
-        "CREATE TABLE image_audit (id integer)",
-        "CREATE FUNCTION image_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO image_audit VALUES (NEW.id); RETURN NEW; END $$",
-        "CREATE TRIGGER image_record AFTER INSERT ON image_target FOR EACH ROW EXECUTE FUNCTION image_record()",
+    for (mode, suffix) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc"),
+        (crate::config::TransactionMode::Locking, "locking"),
     ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert!(
-            !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{statement}: {}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-    let table = engine
-        .storage
-        .find_visible("public", "image_target", 0)
-        .unwrap();
-    let capacity = config.definition_image_slots;
-    let mut owners = Vec::with_capacity(capacity - 1);
-    for _ in 1..capacity {
-        let definitions = engine.storage.table_definition_images();
-        definitions.definition(&engine.storage, table, 0).unwrap();
-        owners.push(definitions);
-    }
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO image_target VALUES (1)",
-    );
-    assert!(
-        String::from_utf8_lossy(&output).contains("table definition image pool is exhausted"),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    for table in ["image_target", "image_audit"] {
-        assert_eq!(
-            data_rows(&run_with(
-                &mut engine,
-                &mut budget,
-                &format!("SELECT count(*) FROM {table}")
-            )),
-            ["0"]
-        );
-    }
-    drop(owners.pop().unwrap());
-    for id in 1..=2 {
-        let output = run_with(
-            &mut engine,
-            &mut budget,
-            &format!("INSERT INTO image_target VALUES ({id})"),
-        );
-        assert!(
-            !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-    for table in ["image_target", "image_audit"] {
-        assert_eq!(
-            data_rows(&run_with(
-                &mut engine,
-                &mut budget,
-                &format!("SELECT id FROM {table} ORDER BY id")
-            )),
-            ["1", "2"]
-        );
+        let mut config = test_config(&format!("definition-image-exhaustion-{suffix}"));
+        config.transaction_mode = mode;
+        config.max_tables = 2;
+        config.max_catalog_versions_per_object = 1;
+        config.definition_image_slots = 6;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for statement in [
+            "CREATE TABLE image_target (id integer)",
+            "CREATE TABLE image_audit (id integer)",
+            "CREATE FUNCTION image_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO image_audit VALUES (NEW.id); RETURN NEW; END $$",
+            "CREATE TRIGGER image_record AFTER INSERT ON image_target FOR EACH ROW EXECUTE FUNCTION image_record()",
+        ] {
+            let output = run_with(&mut engine, &mut budget, statement);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let table = engine
+            .storage
+            .find_visible("public", "image_target", 0)
+            .unwrap();
+        let capacity = config.definition_image_slots;
+        let mut owners = Vec::with_capacity(capacity - 1);
+        for _ in 1..capacity {
+            let definitions = engine.storage.table_definition_images();
+            definitions.definition(&engine.storage, table, 0).unwrap();
+            owners.push(definitions);
+        }
+        for id in 1..=2 {
+            let statement = format!("INSERT INTO image_target VALUES ({id})");
+            let output = run_with(&mut engine, &mut budget, &statement);
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+            assert!(
+                String::from_utf8_lossy(&output)
+                    .contains("table definition image pool is exhausted (capacity 6)"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            for name in ["image_target", "image_audit"] {
+                assert_eq!(
+                    data_rows(&run_with(
+                        &mut engine,
+                        &mut budget,
+                        &format!("SELECT count(*) FROM {name}")
+                    )),
+                    [format!("{}", id - 1)]
+                );
+            }
+            drop(owners.pop().unwrap());
+            let output = run_with(&mut engine, &mut budget, &statement);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            let definitions = engine.storage.table_definition_images();
+            definitions.definition(&engine.storage, table, 0).unwrap();
+            owners.push(definitions);
+        }
+        for table in ["image_target", "image_audit"] {
+            assert_eq!(
+                data_rows(&run_with(
+                    &mut engine,
+                    &mut budget,
+                    &format!("SELECT id FROM {table} ORDER BY id")
+                )),
+                ["1", "2"]
+            );
+        }
+        drop(owners);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
 }
 

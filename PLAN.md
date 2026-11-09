@@ -92,6 +92,8 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   handlers; an application raising an identical diagnostic code remains an
   ordinary SQL error. Preserve remote savepoint boundaries when a foreign
   connection first opens inside nested procedural work.
+  Completion reuses a captured table's matching row schema. Exhaustion and
+  repeated nested-write retries must work within the configured image slots.
   Query descriptions retain domain identities through casts, record expansion,
   named columns, field selection and array subscripting, including columns
   selected from derived tables. Saved procedural queries expose
@@ -108,7 +110,9 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   WITH clauses must also expand when the outer query has none. SELECT INTO
   descriptions use the same local scope as execution, including NULL domain
   fields, table-backed queries and set-operation branches. ROW constructors
-  resolve field positions after embedded whole rows have expanded. Bind query
+  resolve field positions after embedded whole rows have expanded, including
+  runtime type identity and wire descriptions. Parse INTO targets at identifier
+  boundaries so set operations remain in their source query. Bind query
   sources inside multi-column assignments through the same substitution walk.
   Their field projections share one rewritten query, preserving once-only effects.
   Distinguish sequence-only SQL helpers from programs that need mutable catalog

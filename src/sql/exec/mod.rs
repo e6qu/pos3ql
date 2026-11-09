@@ -19006,33 +19006,49 @@ fn parse_trigger_select_into<'a>(
         return Ok(None);
     };
     let after_into = &statement[into_at + 4..];
-    let mut clause_at = None;
-    for keyword in [
-        "from", "where", "group", "having", "order", "limit", "offset", "fetch",
-    ] {
-        if let Some(at) = trigger_top_level_keyword(after_into, keyword, arena)? {
-            clause_at = Some(clause_at.map_or(at, |prior: usize| prior.min(at)));
-        }
-    }
-    let (target_source, tail) = clause_at
-        .map(|at| (&after_into[..at], &after_into[at..]))
-        .unwrap_or((after_into, ""));
-    let (strict, target_source) = match strip_trigger_keyword(target_source.trim(), "strict") {
-        Some(targets) => (true, targets.trim()),
-        None => (false, target_source.trim()),
-    };
     let mut targets = [SqlName::EMPTY; MAX_COLUMNS];
-    let mut count = 0usize;
-    for target in target_source.split(',') {
-        if count == targets.len() || target.trim().is_empty() {
-            return Err(unsupported_trigger_body());
-        }
-        targets[count] = parse_plpgsql_identifier(target.trim(), arena)?.name;
-        count += 1;
-    }
-    if count == 0 {
-        return Err(unsupported_trigger_body());
-    }
+    let (count, strict, end) = arena
+        .with_remaining_region(|scratch| {
+            use crate::sql::lexer::{Lexer, Tok};
+            let mut lexer = Lexer::new(after_into, scratch);
+            let mut token = lexer
+                .next_token()
+                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let strict = matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("strict"));
+            if strict {
+                token = lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            }
+            let mut count = 0usize;
+            loop {
+                if count == targets.len() {
+                    return Err(unsupported_trigger_body());
+                }
+                targets[count] = match token {
+                    Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "expected a PL/pgSQL identifier"
+                        ));
+                    }
+                };
+                count += 1;
+                let end = lexer.token_end();
+                token = lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                if !matches!(token, Tok::Op(",")) {
+                    return Ok((count, strict, end));
+                }
+                token = lexer
+                    .next_token()
+                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            }
+        })
+        .map_err(|_| super::query::arena_full_pub())??;
+    let tail = &after_into[end..];
     let mut source = StackStr::<ROUTINE_SQL_MAX>::new();
     use core::fmt::Write as _;
     let _ = write!(source, "{} {}", statement[..into_at].trim_end(), tail);
@@ -22029,6 +22045,54 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
 mod trigger_program_tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn select_into_targets_end_at_identifier_boundaries() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "PL/pgSQL INTO targets", 1 << 16).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for (sql, names, strict, set) in [
+                (
+                    "SELECT 1 INTO value UNION ALL SELECT 2",
+                    &["value"][..],
+                    false,
+                    true,
+                ),
+                (
+                    "SELECT 1 INTO STRICT value INTERSECT SELECT 1",
+                    &["value"][..],
+                    true,
+                    true,
+                ),
+                (
+                    "SELECT 1,2 INTO first,second EXCEPT SELECT 3,4",
+                    &["first", "second"][..],
+                    false,
+                    true,
+                ),
+                (
+                    "SELECT 1 INTO /* target */ STRICT \"value,part\" UNION ALL SELECT 2",
+                    &["value,part"][..],
+                    true,
+                    true,
+                ),
+                (
+                    "SELECT 1 INTO \"strict\" ORDER BY 1",
+                    &["strict"][..],
+                    false,
+                    false,
+                ),
+            ] {
+                let parsed = parse_trigger_select_into(sql, &arena).unwrap().unwrap();
+                assert_eq!(parsed.targets.len(), names.len(), "{sql}");
+                for (target, expected) in parsed.targets.iter().zip(names) {
+                    assert_eq!(target.as_str(), *expected, "{sql}");
+                }
+                assert_eq!(parsed.strict, strict, "{sql}");
+                assert_eq!(parsed.query.set_body.is_some(), set, "{sql}");
+            }
+        });
+    }
 
     #[test]
     fn scalar_function_returns_a_typed_expression() {

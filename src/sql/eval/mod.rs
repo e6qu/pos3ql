@@ -664,21 +664,6 @@ pub(crate) fn expression_type_identity<'a>(
                 )
             });
     }
-    if let Expr::Field { base, field } = expression
-        && let Expr::Call {
-            kind: super::ast::CallKind::SqlSyntax,
-            name,
-            args,
-            ..
-        } = &**base
-        && name.eq_ignore_ascii_case("row")
-        && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
-            .iter()
-            .position(|candidate| candidate.eq_ignore_ascii_case(field))
-        && let Some(argument) = args.get(position)
-    {
-        return expression_type_identity(argument, row, hooks);
-    }
     if let Expr::Array(elements) = expression {
         let plan = array_constructor_type(
             elements,

@@ -476,6 +476,9 @@ trigger order and final response. A trigger that waits saves its active firing;
 the frontend retains earlier `RETURNING` rows and resumes that owner without
 redoing the insert, update or delete. Real errors use the original undo boundary.
 The existing control arena reserves the completion state only for active writes.
+Completion uses a captured table image as its matching row schema, without a
+second reservation for those columns. Different names, visible widths or hidden
+fields still require distinct schema images.
 A selected statement-trigger definition has its own temporary reservation,
 released before that body starts; row-trigger selections retain only their
 queue positions. Idle connections carry the small arena owner, not a maximum
@@ -518,6 +521,9 @@ saved query reading an ordinary local record. For example, `SELECT result.id`
 must recognize the field and retain its domain when `result.id` is NULL.
 `SELECT result.id INTO copied` describes its output with the same local scope
 used to execute it, including table-backed queries and set-operation branches.
+INTO targets end at identifier boundaries: `SELECT 1 INTO result UNION ALL SELECT 2`
+keeps the union in the source query, and a quoted name such as `"order,total"`
+remains one variable.
 A nested `WITH orders AS (...)` binds its local name even when the outer query
 has no WITH clause; it must not read a durable `orders` table instead.
 A trigger initializer such as `DECLARE n bigint := (SELECT count(*) FROM new_orders)`
@@ -525,6 +531,8 @@ uses the current statement's saved rows during both type checking and execution,
 including when restoring checked inputs has replaced its expression tree.
 Cast descriptions, record expansion and array subscripts keep the SQL type;
 only the final wire description selects its PostgreSQL base representation.
+ROW field types use the expanded layout: `(ROW(0,(o).*)).f2` selects the first
+column of `o`, including its declared domain type.
 Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,
 from selecting one field, such as `(t).id`. The first keeps every expanded
 column; the second keeps the selected column. A real column named `t` takes

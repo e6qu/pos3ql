@@ -12325,22 +12325,7 @@ fn user_type_expression_description<'q>(
         }
         _ => {}
     }
-    let Expr::Field { base, field } = expression else {
-        return None;
-    };
-    let Expr::Call {
-        name: row, args, ..
-    } = &**base
-    else {
-        return None;
-    };
-    if !row.eq_ignore_ascii_case("row") {
-        return None;
-    }
-    let position = super::exec::RECORD_FIELD_NAMES
-        .iter()
-        .position(|candidate| candidate.eq_ignore_ascii_case(field))?;
-    user_type_cast_description(args.get(position)?, name, storage, txid)
+    None
 }
 
 fn catalog_array_element_description<'q>(

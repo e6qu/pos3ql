@@ -22,6 +22,8 @@ BEGIN
         'SELECT public.record_source.id,public.record_source.label FROM public.record_source',
         'SELECT t.* FROM record_source t',
         'SELECT (t).* FROM record_source t',
+        'SELECT (ROW((t).*)).f1 AS id,(ROW((t).*)).f2 AS label FROM record_source t',
+        'SELECT (ROW(0,(t).*,NULL::record_positive)).f2 AS id,(ROW(0,(t).*,NULL::record_positive)).f3 AS label FROM record_source t',
         'SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,''seven''::record_label)).* FROM record_source) q',
         'SELECT record_return_positive() AS id,record_return_label() AS label',
         'SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source',

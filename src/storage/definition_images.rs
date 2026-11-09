@@ -88,6 +88,25 @@ enum ImagePayload {
     },
 }
 
+impl ImagePayload {
+    fn relation(&self) -> RelationDefinition<'_> {
+        match self {
+            Self::Table { definition, .. } => RelationDefinition::from_definition(definition),
+            Self::Relation {
+                schema,
+                name,
+                n_columns,
+                columns,
+            } => RelationDefinition {
+                schema: *schema,
+                name: *name,
+                n_columns: *n_columns,
+                columns: columns.as_slice(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DefinitionImageId {
     pool: u64,
@@ -308,16 +327,11 @@ impl TableDefinitionImages {
         while let Some(index) = slot {
             // SAFETY: this owner pins the chain, including any previously retained schema.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if let ImagePayload::Relation {
-                schema,
-                name,
-                n_columns,
-                columns,
-            } = &image.payload
-                && *schema == relation.schema
-                && *name == relation.name
-                && *n_columns == relation.n_columns
-                && columns.as_slice() == relation.columns
+            let captured = image.payload.relation();
+            if captured.schema == relation.schema
+                && captured.name == relation.name
+                && captured.n_columns == relation.n_columns
+                && captured.columns == relation.columns
             {
                 return Ok(DefinitionImageId {
                     pool: self.pool.identity,
@@ -357,21 +371,8 @@ impl TableDefinitionImages {
         while let Some(index) = slot {
             // SAFETY: references borrow the owner that keeps this entire chain occupied.
             let image = unsafe { (*self.pool.cells[index].image.get()).assume_init_ref() };
-            if index == identity.index
-                && image.serial == identity.serial
-                && let ImagePayload::Relation {
-                    schema,
-                    name,
-                    n_columns,
-                    columns,
-                } = &image.payload
-            {
-                return Some(RelationDefinition {
-                    schema: *schema,
-                    name: *name,
-                    n_columns: *n_columns,
-                    columns: columns.as_slice(),
-                });
+            if index == identity.index && image.serial == identity.serial {
+                return Some(image.payload.relation());
             }
             slot = image.next;
         }
@@ -683,6 +684,92 @@ mod tests {
                     .contains("reservation identities exhausted")
             );
             assert!(!pool.occupied[0].load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn captured_tables_share_exact_relation_shapes_at_one_image_capacity() {
+        use crate::storage::tests::{make_def, test_budget, test_config};
+        use crate::storage::{ColType, ColumnMeta, SqlName};
+        let mut config = test_config();
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.query_workspace_slots = 1;
+        config.definition_image_slots = 1;
+        config.table_metadata_bytes = 64 << 10;
+        config.table_metadata_leases = 128;
+        let mut budget = test_budget(&config);
+        let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
+        let table = storage
+            .create_table(make_def("shared_shape", &[("value", ColType::Int4, false)]))
+            .unwrap();
+        let images = storage.table_definition_images();
+        let identity = crate::mem::guard::forbid_alloc(|| {
+            let definition = images.definition(&storage, table, 0).unwrap();
+            let relation = RelationDefinition::from_definition(definition);
+            let identity = images.retain_relation(&relation).unwrap();
+            assert_eq!(images.retain_relation(&relation).unwrap(), identity);
+            assert!(core::ptr::eq(
+                images.retained_relation(identity).unwrap().columns,
+                relation.columns,
+            ));
+            let mut hidden = [ColumnMeta::EMPTY; 2];
+            hidden[0] = relation.columns[0];
+            hidden[1].name = SqlName::parse("tableoid").unwrap();
+            hidden[1].ctype = ColType::Oid;
+            let mut changed = [relation.columns[0]];
+            changed[0].name = SqlName::parse("renamed_value").unwrap();
+            for different in [
+                RelationDefinition {
+                    schema: SqlName::parse("another_schema").unwrap(),
+                    ..relation
+                },
+                RelationDefinition {
+                    name: SqlName::parse("another_name").unwrap(),
+                    ..relation
+                },
+                RelationDefinition {
+                    n_columns: 0,
+                    ..relation
+                },
+                RelationDefinition {
+                    columns: &changed,
+                    ..relation
+                },
+                RelationDefinition {
+                    columns: &hidden,
+                    ..relation
+                },
+            ] {
+                assert_eq!(
+                    images.retain_relation(&different).unwrap_err().sqlstate,
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                );
+                assert_eq!(images.retain_relation(&relation).unwrap(), identity);
+            }
+            identity
+        });
+        drop(storage);
+        let retained = images.retained_relation(identity).unwrap();
+        assert_eq!(retained.name.as_str(), "shared_shape");
+        assert_eq!(retained.columns()[0].name.as_str(), "value");
+        let pool = Arc::clone(&images.pool);
+        drop(images);
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(!pool.occupied[0].load(Ordering::Acquire));
+            let reused = TableDefinitionImages::new(&pool);
+            assert!(reused.retained_relation(identity).is_none());
+            let columns = [ColumnMeta::EMPTY];
+            let replacement = reused
+                .retain_relation(&RelationDefinition {
+                    schema: SqlName::EMPTY,
+                    name: SqlName::parse("replacement").unwrap(),
+                    n_columns: 1,
+                    columns: &columns,
+                })
+                .unwrap();
+            assert_ne!(replacement, identity);
+            assert!(reused.retained_relation(identity).is_none());
         });
     }
 

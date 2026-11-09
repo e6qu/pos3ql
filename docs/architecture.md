@@ -216,7 +216,8 @@ immutable before publication. Execution reads their stored bytes directly;
 even an older mutable handle cannot reopen that allocation for writing.
 Callback lookup exposes the invocation log only inside a scoped closure. Its
 installer keeps the restoring guard private and restores the previous owner on
-success, errors or unwinding.
+success, errors or unwinding. Resumed expression evaluation uses that saved
+owner, rather than rebinding the log to its new temporary workspace.
 Owned procedural expressions also retain an unfinished PL/pgSQL scalar or
 set-returning body. Its source, arguments, local values, pending child work,
 statement position and call environment survive recycling temporary query memory.

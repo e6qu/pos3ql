@@ -23133,24 +23133,18 @@ fn eval_procedural_expression<'a>(
                 cursors,
                 guc,
                 context.responder,
-                |storage, _work, sequences, invocations, _cursors| {
-                    super::query::with_routine_invocation_scope(
-                        Some(super::query::RoutineInvocationContext::new(
-                            invocations,
-                            arena,
-                        )),
-                        || {
-                            let catalog = super::query::storage_catalog(storage, arena, txid);
-                            let subqueries = super::query::ProceduralSubqueries { storage, txid };
-                            let hooks = EvalHooks {
-                                catalog: Some(&catalog),
-                                sequences: Some(sequences),
-                                subquery_executor: Some(&subqueries),
-                                ..NO_HOOKS
-                            };
-                            eval_full(expression, arena, params, row, &hooks)
-                        },
-                    )
+                |storage, _work, sequences, _invocations, _cursors| {
+                    // The engine installs the invocation log's actual owner,
+                    // which can differ from this workspace after a wait.
+                    let catalog = super::query::storage_catalog(storage, arena, txid);
+                    let subqueries = super::query::ProceduralSubqueries { storage, txid };
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(sequences),
+                        subquery_executor: Some(&subqueries),
+                        ..NO_HOOKS
+                    };
+                    eval_full(expression, arena, params, row, &hooks)
                 },
             )
             .map_err(|_| {

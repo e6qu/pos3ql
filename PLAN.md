@@ -46,7 +46,8 @@ an owner that survives returning to the scheduler.
 The implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
 completion, trigger frames and completed calls within unfinished `PERFORM` and
 `SELECT ... INTO`, including unfinished PL/pgSQL scalar and table-function
-bodies inside those owned expressions. The [request path](docs/architecture.md#the-request-path)
+bodies inside those owned expressions, declaration initializers and their type
+checks. The [request path](docs/architecture.md#the-request-path)
 owns their contracts and regression evidence. General function and query
 execution still needs the remaining ownership work below.
 

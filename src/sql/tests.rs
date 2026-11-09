@@ -6162,7 +6162,9 @@ fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
                 );
             }
             drop(owners.pop().unwrap());
-            let output = run_with(&mut engine, &mut budget, &statement);
+            let output = crate::storage::with_definition_image_exhaustion_trace(|| {
+                run_with(&mut engine, &mut budget, &statement)
+            });
             assert!(
                 !String::from_utf8_lossy(&output).contains("ERROR"),
                 "{mode:?} retry {id}: {}; image capacity request: {:?}",

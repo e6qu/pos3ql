@@ -224,6 +224,10 @@ Schema handoffs must pin the existing configured image cell. Cover physical and
 synthetic shapes, stale and foreign identifiers, last release after the chain
 and storage drop, recycled chain links, concurrent releases and unchanged
 nested-trigger exhaustion pressure in both transaction modes.
+The retry regression enables a bounded native call trace only around its
+expected-success attempt. It uses the allocator guard's native tracing API,
+without Rust heap allocation; Miri keeps the source-location diagnostic and
+does not invoke foreign backtrace functions.
 Reject a replacement image even if its text is identical; preserve workspace
 identity checks while active local values borrow its memory. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.

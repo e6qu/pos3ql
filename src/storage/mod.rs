@@ -84,6 +84,8 @@ pub(crate) use definition_images::PinnedRelationDefinition;
 pub(crate) use definition_images::RelationDefinition;
 #[cfg(test)]
 pub(crate) use definition_images::last_definition_image_exhaustion;
+#[cfg(test)]
+pub(crate) use definition_images::with_definition_image_exhaustion_trace;
 mod definition_pool;
 mod index_bindings;
 mod index_statistics;

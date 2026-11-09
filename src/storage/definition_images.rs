@@ -17,6 +17,34 @@ static NEXT_IMAGE_POOL: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
 std::thread_local! {
     static LAST_EXHAUSTION: Cell<Option<&'static core::panic::Location<'static>>> = const { Cell::new(None) };
+    static TRACE_EXHAUSTION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_definition_image_exhaustion_trace<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TRACE_EXHAUSTION.with(|trace| trace.set(self.0));
+        }
+    }
+    let _restore = Restore(TRACE_EXHAUSTION.with(|trace| trace.replace(true)));
+    run()
+}
+
+#[cfg(all(test, not(miri)))]
+fn trace_exhaustion() {
+    if !TRACE_EXHAUSTION.with(Cell::get) {
+        return;
+    }
+    // Match the allocator guard's bounded native trace without Rust allocations.
+    unsafe {
+        let message = b"table definition image exhaustion call chain:\n";
+        libc::write(2, message.as_ptr().cast(), message.len());
+        let mut frames = [core::ptr::null_mut::<libc::c_void>(); 64];
+        let count = libc::backtrace(frames.as_mut_ptr(), frames.len() as i32);
+        libc::backtrace_symbols_fd(frames.as_ptr(), count, 2);
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +302,8 @@ impl TableDefinitionImagePool {
             .ok_or_else(|| {
                 #[cfg(test)]
                 LAST_EXHAUSTION.with(|last| last.set(Some(caller)));
+                #[cfg(all(test, not(miri)))]
+                trace_exhaustion();
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "table definition image pool is exhausted (capacity {})",
@@ -963,7 +993,10 @@ mod tests {
                 },
             ] {
                 let before = line!();
-                let error = images.retain_relation(&different).unwrap_err();
+                let error = super::super::with_definition_image_exhaustion_trace(|| {
+                    images.retain_relation(&different)
+                })
+                .unwrap_err();
                 let after = line!();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED,);
                 let caller = super::super::last_definition_image_exhaustion().unwrap();

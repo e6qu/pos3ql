@@ -3295,9 +3295,7 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
         Expr::Subquery(select)
         | Expr::Exists(select)
         | Expr::ArraySubquery(select)
-        | Expr::RowSubquery { select, .. } => {
-            select_mentions_column(select, qualifier, name)
-        }
+        | Expr::RowSubquery { select, .. } => select_mentions_column(select, qualifier, name),
         Expr::InSubquery {
             operand, select, ..
         }

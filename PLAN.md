@@ -94,7 +94,8 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   connection first opens inside nested procedural work.
   Completion and a paused trigger share the captured table's matching row
   schema, with independent pins inside the original configured image cell.
-  Exhaustion and
+  Assignment input discovery borrows its enclosing write's selected scope
+  instead of resolving the same target again. Exhaustion and
   repeated nested-write retries must work within the configured image slots.
   Query descriptions retain domain identities through casts, record expansion,
   named columns, field selection and array subscripting, including columns

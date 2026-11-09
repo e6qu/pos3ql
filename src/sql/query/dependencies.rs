@@ -1596,7 +1596,6 @@ pub(super) fn visit_dml_assignment_contexts(
         txid,
         arena,
         outer,
-        false,
         &mut |group, columns| {
             for assignment in group {
                 if !matches!(assignment.expression, Expr::DefaultMarker) {
@@ -1619,24 +1618,12 @@ pub(super) struct AssignmentInput<'a> {
 type AssignmentGroupVisit<'visit> =
     dyn FnMut(&[AssignmentInput<'_>], &dyn ColTypeResolver) -> Result<(), SqlError> + 'visit;
 
-pub(super) fn visit_dml_assignment_groups(
-    statement: &Stmt<'_>,
-    storage: &Storage,
-    txid: u32,
-    arena: &Arena,
-    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
-    visit: &mut AssignmentGroupVisit<'_>,
-) -> Result<(), SqlError> {
-    visit_dml_assignment_inputs(statement, storage, txid, arena, outer, true, visit)
-}
-
 fn visit_dml_assignment_inputs(
     statement: &Stmt<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
-    grouped: bool,
     visit: &mut AssignmentGroupVisit<'_>,
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
@@ -1661,8 +1648,40 @@ fn visit_dml_assignment_inputs(
             }
             _ => return Ok(()),
         };
-        let target_name = target.name;
         let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena)?;
+        visit_resolved_dml_assignment_inputs(
+            statement, storage, txid, arena, outer, &scope, false, visit,
+        )
+    })();
+    // Only Copy cast snapshots, allocated in the persistent tail, may escape.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+// Assignment discovery borrows the target already selected by its enclosing
+// walk. Resolving it again would require another image while that scope is live.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "assignment discovery carries its selected scope, row context and grouping policy"
+)]
+pub(super) fn visit_resolved_dml_assignment_inputs(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+    scope: &super::QueryScope<'_>,
+    grouped: bool,
+    visit: &mut AssignmentGroupVisit<'_>,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let target_name = match statement {
+            Stmt::Insert(insert) => insert.table.name,
+            Stmt::Update(update) => update.table.name,
+            Stmt::Merge(merge) => merge.target.name,
+            _ => return Ok(()),
+        };
         let target = scope.defs.get(0).expect("assignment target resolved");
         let catalog = super::storage_catalog(storage, arena, txid);
         let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
@@ -1670,7 +1689,7 @@ fn visit_dml_assignment_inputs(
             catalog: Some(&catalog),
         });
         let columns = DependencyTypes {
-            scope: Some(&scope),
+            scope: Some(scope),
             excluded: Some(target),
             transition: transition
                 .as_ref()

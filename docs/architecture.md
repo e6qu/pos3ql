@@ -479,6 +479,9 @@ The existing control arena reserves the completion state only for active writes.
 Completion uses a captured table image as its matching row schema, without a
 second reservation for those columns. Different names, visible widths or hidden
 fields still require distinct schema images.
+Write input discovery also uses its already selected target/source scope for
+assignment checks. It does not retain a second target image while describing
+INSERT values, conflict updates, UPDATE or MERGE assignments.
 A selected statement-trigger definition has its own temporary reservation,
 released before that body starts; row-trigger selections retain only their
 queue positions. Idle connections carry the small arena owner, not a maximum

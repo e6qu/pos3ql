@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn write_input_analysis_reuses_its_target_at_one_image_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("assignment-scope-capacity-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.definition_image_slots = 1;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE scoped_assignments(id integer PRIMARY KEY,value integer)",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        let mut arena = Arena::new(&mut budget, "assignment scope", 4 << 20).unwrap();
+        for _ in 0..2 {
+            for sql in [
+                "INSERT INTO scoped_assignments VALUES(1,abs(-7)),(2,abs(-9))",
+                "INSERT INTO scoped_assignments VALUES(1,2) ON CONFLICT(id) DO UPDATE SET value=abs(excluded.value) RETURNING value",
+                "UPDATE scoped_assignments AS target SET value=abs(target.value) WHERE target.id=1 RETURNING value",
+                "MERGE INTO scoped_assignments AS target USING (SELECT 1 AS id,9 AS value) AS source ON target.id=source.id WHEN MATCHED THEN UPDATE SET value=abs(source.value) WHEN NOT MATCHED THEN INSERT(id,value) VALUES(source.id,abs(source.value))",
+                "DELETE FROM scoped_assignments AS target WHERE target.id=1 RETURNING abs(target.value)",
+            ] {
+                crate::mem::guard::forbid_alloc(|| {
+                    let mut parser = Parser::new(sql, &arena).unwrap();
+                    parser.capture_type_inputs();
+                    let statement = parser.next_stmt().unwrap().unwrap();
+                    let mut visits = 0;
+                    query::visit_planner_calls(
+                        &statement,
+                        &engine.storage,
+                        0,
+                        &arena,
+                        None,
+                        &mut |expression, columns, _assignment| {
+                            exec::infer_routine_argument_oid(expression, columns)?;
+                            visits += 1;
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert!(visits > 0, "{mode:?}: {sql}");
+                });
+                arena.reset();
+            }
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT count(*) FROM scoped_assignments"
+            )),
+            ["0"]
+        );
+        drop((arena, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn planner_analysis_precedes_folding_and_unreached_conditions_stay_unevaluated() {
     for mode in [
         crate::config::TransactionMode::Mvcc,

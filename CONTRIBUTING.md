@@ -224,6 +224,9 @@ Schema handoffs must pin the existing configured image cell. Cover physical and
 synthetic shapes, stale and foreign identifiers, last release after the chain
 and storage drop, recycled chain links, concurrent releases and unchanged
 nested-trigger exhaustion pressure in both transaction modes.
+Assignment planning also has a one-image regression for repeated INSERT,
+conflict UPDATE, ordinary UPDATE, MERGE and DELETE descriptions, with no heap
+allocation or writes during discovery.
 The retry regression enables a bounded native call trace only around its
 expected-success attempt. It uses the allocator guard's native tracing API,
 without Rust heap allocation; Miri keeps the source-location diagnostic and

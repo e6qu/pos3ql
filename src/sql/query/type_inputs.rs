@@ -1573,12 +1573,14 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         if let Stmt::Merge(merge) = statement {
             self.expression(merge.on, &columns, &row)?;
         }
-        super::dependencies::visit_dml_assignment_groups(
+        super::dependencies::visit_resolved_dml_assignment_inputs(
             statement,
             storage,
             txid,
             arena,
             outer,
+            &scope,
+            true,
             &mut |group, assignment_columns| {
                 let row = MetadataOnly {
                     row: &row,

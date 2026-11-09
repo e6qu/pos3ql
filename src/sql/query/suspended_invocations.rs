@@ -170,7 +170,11 @@ mod ownership_tests {
                         error.sqlstate,
                         super::super::super::eval::sqlstate::INTERNAL_ROUTINE_INVOCATION
                     );
-                    calls.relocate(scratch, &owner).ok().unwrap()
+                    calls
+                        .relocate(scratch, &owner)
+                        .unwrap_or_else(|(_, error)| {
+                            panic!("invocation relocation failed: {error:?}")
+                        })
                 })
                 .unwrap()
         });
@@ -251,7 +255,9 @@ mod ownership_tests {
             let (calls, _) = calls.relocate(&source, &short).err().unwrap();
             let (calls, _) = calls.relocate(&target, &source).err().unwrap();
             assert_eq!(calls.results.borrow().len(), 1);
-            let moved = calls.relocate(&source, &target).ok().unwrap();
+            let moved = calls
+                .relocate(&source, &target)
+                .unwrap_or_else(|(_, error)| panic!("invocation relocation failed: {error:?}"));
             assert_eq!(moved.results.borrow().len(), 1);
             {
                 let calls = &moved;

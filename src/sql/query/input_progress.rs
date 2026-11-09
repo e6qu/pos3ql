@@ -1236,7 +1236,11 @@ mod tests {
                             .unwrap();
                         },
                     );
-                    invocations.relocate(query, &owner).unwrap()
+                    invocations
+                        .relocate(query, &owner)
+                        .unwrap_or_else(|(_, error)| {
+                            panic!("invocation relocation failed: {error:?}")
+                        })
                 })
                 .unwrap()
         });

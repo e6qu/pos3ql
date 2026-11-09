@@ -396,6 +396,15 @@ struct ScopeTypes<'s, 'd>(&'s QueryScope<'d>);
 struct OuterColumnTypes<'s, 'row>(&'s dyn ColumnLookup<'row>);
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.0.whole_row_field_metadata(table, index, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.0.column_type_mod(qualifier, name)
     }
@@ -428,6 +437,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
         self.0.column_user_type(qualifier, name)
     }
 
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.0.column_type_oid(qualifier, name)
+    }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }
@@ -438,6 +451,15 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        super::ScopeSchema(self.0).whole_row_field_metadata(table, index, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         super::ScopeSchema(self.0).column_type_mod(qualifier, name)
     }

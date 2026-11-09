@@ -570,6 +570,101 @@ impl<T> MutableSlice<T> {
         Ok(())
     }
 
+    /// Convert owned elements while retaining the same byte and descriptor
+    /// reservation. A panic drops the converted prefix and untouched suffix.
+    pub(crate) fn map_in_place<U>(self, mut convert: impl FnMut(T) -> U) -> MutableSlice<U> {
+        const {
+            assert!(size_of::<T>() != 0);
+            assert!(size_of::<T>() == size_of::<U>());
+            assert!(align_of::<T>() == align_of::<U>());
+        }
+        struct Conversion<T, U> {
+            source: ManuallyDrop<MutableSlice<T>>,
+            converted: usize,
+            consumed: usize,
+            complete: bool,
+            output: PhantomData<U>,
+        }
+        impl<T, U> Drop for Conversion<T, U> {
+            fn drop(&mut self) {
+                if self.complete {
+                    return;
+                }
+                let source = &mut *self.source;
+                let len = core::mem::take(&mut source.len);
+                source.capacity = 0;
+                if let Some(reservation) = source.reservation.take() {
+                    let prior = source.pool.references[reservation.slot].swap(0, Ordering::Relaxed);
+                    debug_assert_eq!(prior, 1);
+                    let reclaim = Reclaim {
+                        pool: &source.pool,
+                        reservation,
+                    };
+                    // The callback owns the consumed element, including while
+                    // unwinding. Only the two disjoint initialized ranges remain.
+                    unsafe {
+                        core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                            source.pool.pointer::<U>(reservation.range),
+                            self.converted,
+                        ));
+                        core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                            source
+                                .pool
+                                .pointer::<T>(reservation.range)
+                                .add(self.consumed),
+                            len - self.consumed,
+                        ));
+                    }
+                    drop(reclaim);
+                }
+                // ManuallyDrop suppressed the original owner's destructor.
+                unsafe { core::ptr::drop_in_place(&mut source.pool) };
+            }
+        }
+        let mut conversion = Conversion::<T, U> {
+            source: ManuallyDrop::new(self),
+            converted: 0,
+            consumed: 0,
+            complete: false,
+            output: PhantomData,
+        };
+        for index in 0..conversion.source.len {
+            let reservation = conversion
+                .source
+                .reservation
+                .expect("initialized elements have a reserved range");
+            // Each input moves out before its equally aligned output is written.
+            let input = unsafe {
+                conversion
+                    .source
+                    .pool
+                    .pointer::<T>(reservation.range)
+                    .add(index)
+                    .read()
+            };
+            conversion.consumed = index + 1;
+            let output = convert(input);
+            unsafe {
+                conversion
+                    .source
+                    .pool
+                    .pointer::<U>(reservation.range)
+                    .add(index)
+                    .write(output)
+            };
+            conversion.converted = index + 1;
+        }
+        let output = MutableSlice {
+            pool: unsafe { core::ptr::read(&conversion.source.pool) },
+            reservation: conversion.source.reservation,
+            len: conversion.source.len,
+            capacity: conversion.source.capacity,
+            value: PhantomData,
+        };
+        conversion.complete = true;
+        output
+    }
+
     pub(crate) fn freeze(self) -> SharedSlice<T> {
         if self.len == 0 {
             return SharedSlice::EMPTY;
@@ -753,6 +848,104 @@ mod tests {
         let pool = LeasePool::new(&mut budget, Purpose::ROW_WORK, bytes, leases).unwrap();
         assert_eq!(budget.remaining(), 0);
         pool
+    }
+
+    #[test]
+    fn inplace_conversion_keeps_reserved_slots_and_removes_input_borrows() {
+        let pool = pool(128, 4);
+        let bytes = Box::new([7u8; 8]);
+        crate::mem::guard::forbid_alloc(|| {
+            let mut source = pool.lease::<Option<&[u8]>>(4).unwrap();
+            source.push_reserved(Some(&bytes[..])).unwrap();
+            source.push_reserved(None).unwrap();
+            let address = source.as_ptr() as usize;
+            let slot = source.slot();
+            let mapped: MutableSlice<Option<&'static [u8]>> = source.map_in_place(|_| None);
+            drop(bytes);
+            assert_eq!(mapped.as_ptr() as usize, address);
+            assert_eq!(mapped.slot(), slot);
+            assert_eq!((mapped.len(), mapped.capacity()), (2, 4));
+            assert!(mapped.iter().all(Option::is_none));
+            assert_eq!(pool.lease::<u8>(128).unwrap_err().free_bytes, 64);
+            drop(mapped);
+            assert_eq!(pool.lease::<u8>(128).unwrap().capacity(), 128);
+        });
+    }
+
+    #[test]
+    fn inplace_conversion_keeps_empty_reserved_capacity_without_running_callback() {
+        let pool = pool(128, 2);
+        crate::mem::guard::forbid_alloc(|| {
+            let source = pool.lease::<u64>(8).unwrap();
+            let slot = source.slot();
+            let mut called = false;
+            let mapped = source.map_in_place(|_| {
+                called = true;
+                0i64
+            });
+            assert!(!called);
+            assert_eq!(
+                (mapped.len(), mapped.capacity(), mapped.slot()),
+                (0, 8, slot)
+            );
+            assert_eq!(pool.lease::<u8>(128).unwrap_err().free_bytes, 64);
+            drop(mapped);
+            assert_eq!(pool.lease::<u8>(128).unwrap().capacity(), 128);
+        });
+    }
+
+    #[test]
+    fn inplace_conversion_unwinds_both_types_and_allows_recursive_pool_use() {
+        struct Before<'a> {
+            index: usize,
+            count: &'a AtomicUsize,
+            pool: Arc<LeasePool>,
+        }
+        impl Drop for Before<'_> {
+            fn drop(&mut self) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                drop(self.pool.lease::<u8>(64).unwrap());
+            }
+        }
+        struct After<'a> {
+            index: usize,
+            count: &'a AtomicUsize,
+            pool: Arc<LeasePool>,
+        }
+        impl Drop for After<'_> {
+            fn drop(&mut self) {
+                assert!(self.index < 2);
+                self.count.fetch_add(1, Ordering::Relaxed);
+                drop(self.pool.lease::<u8>(64).unwrap());
+            }
+        }
+        let pool = pool(256, 4);
+        let before = AtomicUsize::new(0);
+        let after = AtomicUsize::new(0);
+        let mut source = pool.lease(4).unwrap();
+        for index in 0..4 {
+            source
+                .push_reserved(Before {
+                    index,
+                    count: &before,
+                    pool: pool.clone(),
+                })
+                .unwrap();
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.map_in_place(|input| {
+                assert_ne!(input.index, 2, "stop after two converted elements");
+                After {
+                    index: input.index,
+                    count: &after,
+                    pool: input.pool.clone(),
+                }
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(before.load(Ordering::Relaxed), 4);
+        assert_eq!(after.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.lease::<u8>(256).unwrap().capacity(), 256);
     }
 
     #[test]

@@ -19,6 +19,15 @@ struct MetadataColumns<'a> {
 }
 
 impl<'a> crate::sql::eval::ColumnLookup<'a> for MetadataColumns<'_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        _catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.columns.whole_row_field(table, index)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.columns
             .column_meta(qualifier, name)

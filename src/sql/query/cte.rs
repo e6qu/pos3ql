@@ -128,6 +128,91 @@ pub(crate) fn expand_stored_expression<'a>(
     )
 }
 
+fn expression_contains_with(expression: &Expr<'_>) -> bool {
+    let nested = match expression {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => select_contains_with(select),
+        Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
+            select_contains_with(select)
+        }
+        _ => false,
+    };
+    if nested {
+        return true;
+    }
+    let mut found = false;
+    super::walk_children(expression, &mut |child| {
+        found |= expression_contains_with(child);
+        Ok(())
+    })
+    .expect("WITH discovery cannot fail");
+    found
+}
+
+fn table_contains_with(table: &TableRef<'_>) -> bool {
+    table.subquery.is_some_and(select_contains_with)
+        || table.func_args.is_some_and(|arguments| {
+            arguments
+                .iter()
+                .any(|argument| expression_contains_with(argument))
+        })
+        || table
+            .rows_from
+            .is_some_and(|tables| tables.iter().any(table_contains_with))
+        || table.sample.is_some_and(|sample| {
+            expression_contains_with(sample.percentage)
+                || sample.repeatable.is_some_and(expression_contains_with)
+        })
+}
+
+fn set_tree_contains_with(tree: &SetTree<'_>) -> bool {
+    match tree {
+        SetTree::Select(select) => select_contains_with(select),
+        SetTree::Op { left, right, .. } => {
+            set_tree_contains_with(left) || set_tree_contains_with(right)
+        }
+    }
+}
+
+// A query without an outer WITH may still contain one in a derived table,
+// expression subquery, or set-operation branch. Only skip a complete rewrite
+// when every query level is free of WITH bindings.
+fn select_contains_with(select: &Select<'_>) -> bool {
+    !select.with.is_empty()
+        || select.items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expression_contains_with(expression)
+            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        })
+        || select.where_clause.is_some_and(expression_contains_with)
+        || select.having.is_some_and(expression_contains_with)
+        || select
+            .group_by
+            .iter()
+            .any(|expression| expression_contains_with(expression))
+        || select
+            .distinct_on
+            .iter()
+            .any(|expression| expression_contains_with(expression))
+        || select
+            .order_by
+            .iter()
+            .any(|order| expression_contains_with(order.expression))
+        || select.limit.is_some_and(expression_contains_with)
+        || select.offset.is_some_and(expression_contains_with)
+        || select.from.is_some_and(|from| {
+            table_contains_with(&from.base)
+                || from.joins.iter().any(|join| {
+                    table_contains_with(&join.table)
+                        || join.on.is_some_and(expression_contains_with)
+                })
+        })
+        || select.set_body.is_some_and(set_tree_contains_with)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_ctes_with_path<'a>(
     sel: &'a Select<'a>,
@@ -140,7 +225,7 @@ fn expand_ctes_with_path<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
-    if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
+    if !select_contains_with(sel) && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
     with_schema_context(
@@ -388,7 +473,7 @@ pub fn expand_ctes_exec<'a>(
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
-    if sel.with.is_empty() && !storage.has_any_view() {
+    if !select_contains_with(sel) && !storage.has_any_view() {
         return Ok(sel);
     }
     with_exec_context(
@@ -1639,6 +1724,8 @@ pub(crate) fn filter_view_rows<'a>(
                 select.items,
                 scope.as_ref(),
                 arena,
+                storage,
+                txid,
                 "view output",
             )?)
             .map_err(|_| arena_full())?;
@@ -1703,6 +1790,8 @@ pub(crate) fn filter_view_rows<'a>(
                     select.items,
                     scope.as_ref(),
                     arena,
+                    storage,
+                    txid,
                     "DISTINCT ON",
                 )? == **expression;
             }
@@ -1888,7 +1977,15 @@ fn filter_set_view_conjunct<'a>(
             let columns = arena
                 .alloc_slice_with(definition.n_columns, |_| ColDesc::new("", 0, 0))
                 .map_err(|_| arena_full())?;
-            let count = super::describe_select(select, storage, txid, arena, columns)?;
+            let count = super::describe_select(
+                select,
+                storage,
+                txid,
+                arena,
+                columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?;
             if count != definition.n_columns {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -2084,7 +2181,7 @@ fn split_view_predicate<'a>(
             and_where(left_keep, right_keep, arena)?,
         ));
     }
-    if expr_has_subquery(predicate)
+    if predicate.contains_subquery()
         || super::expr_has_aggregate(predicate, context.storage, context.txid, safety.columns)?
         || super::expr_has_window(predicate)
         || !view_predicate_columns_safe(
@@ -2559,7 +2656,16 @@ fn materialize_query_cte<'a>(
         .alloc(SetTree::Select(query))
         .map_err(|_| arena_full())?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, tree, txid, &mut described, arena, None)?;
+    let ncols = describe_set_body(
+        storage,
+        tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )?;
     if aliases.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -2615,9 +2721,19 @@ pub fn describe_set_query<'a>(
     q: &'a SetQuery<'a>,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
+    description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
     let body = expand_set_tree(q.with, q.body, storage, txid, None, None, arena)?;
-    describe_set_body(storage, body, txid, columns, arena, None)
+    describe_set_body(
+        storage,
+        body,
+        txid,
+        columns,
+        arena,
+        None,
+        description_target,
+        None,
+    )
 }
 
 /// Expands WITH CTEs and view references across a whole set-operation tree
@@ -2632,7 +2748,11 @@ pub(crate) fn expand_set_tree<'a>(
     dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
+    if with.is_empty()
+        && !set_tree_contains_with(tree)
+        && dependencies.is_none()
+        && !storage.has_any_view()
+    {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
@@ -2652,7 +2772,7 @@ pub(super) fn expand_set_tree_exec<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a SetTree<'a>, SqlError> {
-    if with.is_empty() && !storage.has_any_view() {
+    if with.is_empty() && !set_tree_contains_with(tree) && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
@@ -3020,7 +3140,10 @@ fn set_tree_references(tree: &SetTree, name: &str) -> usize {
 /// Number of references to `name` inside expression subqueries of `e`.
 fn expr_references(e: &Expr, name: &str) -> usize {
     match e {
-        Expr::Subquery(s) | Expr::Exists(s) | Expr::ArraySubquery(s) => select_references(s, name),
+        Expr::Subquery(s)
+        | Expr::Exists(s)
+        | Expr::ArraySubquery(s)
+        | Expr::RowSubquery { select: s, .. } => select_references(s, name),
         Expr::InSubquery {
             operand, select, ..
         }
@@ -3169,9 +3292,10 @@ fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> b
             qualifier: written,
             name: written_name,
         } => *written_name == name && written.is_none_or(|written| written == qualifier),
-        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-            select_mentions_column(select, qualifier, name)
-        }
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => select_mentions_column(select, qualifier, name),
         Expr::InSubquery {
             operand, select, ..
         }
@@ -3736,7 +3860,16 @@ fn reject_recursive_name_collision<'a>(
         arena,
     )?;
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    describe_set_body(storage, rewritten, txid, &mut columns, arena, None)?;
+    describe_set_body(
+        storage,
+        rewritten,
+        txid,
+        &mut columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )?;
     Err(sql_err!(
         sqlstate::SYNTAX_ERROR,
         "{} column name \"{}\" already used in WITH query column list",
@@ -4053,6 +4186,7 @@ fn describe_dml_materialized<'a>(
         arena,
         txid,
         &mut described,
+        crate::sql::exec::DescriptionTarget::Sql,
     )?;
     if cte.columns.len() > count {
         return Err(sql_err!(
@@ -4111,7 +4245,16 @@ fn describe_recursive_materialized<'a>(
     let (base_tree, recursive_tree, _) = recursive_parts(cte.query, cte.name)?;
     let base_tree = subst_set_tree(base_tree, outer, arena)?;
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None)?;
+    let ncols = describe_set_body(
+        storage,
+        base_tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -4238,6 +4381,7 @@ fn external_recursive_tree(
                 })
                 .expect("recursive work table has a block store")
         },
+        None,
     )?;
     storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
@@ -4486,7 +4630,16 @@ fn materialize_recursive<'a>(
     // Column names and types come from the non-recursive term, with the CTE's
     // rename list applied.
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena, None)?;
+    let ncols = describe_set_body(
+        storage,
+        base_tree,
+        txid,
+        &mut described,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )?;
     if cte.columns.len() > ncols {
         return Err(sql_err!(
             sqlstate::INVALID_COLUMN_REFERENCE,
@@ -4634,7 +4787,16 @@ fn materialize_recursive<'a>(
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None)?;
+        let stepn = describe_set_body(
+            storage,
+            step_tree,
+            txid,
+            &mut step_desc,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         let expected_step_columns = ncols + decoration.state_types.len();
         if stepn != expected_step_columns {
             return Err(sql_err!(
@@ -4774,7 +4936,16 @@ fn materialize_recursive<'a>(
     };
     let step_tree = subst_set_tree(recursive_tree, context, arena)?;
     let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena, None)?;
+    let stepn = describe_set_body(
+        storage,
+        step_tree,
+        txid,
+        &mut step_desc,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )?;
     let expected_step_columns = ncols + decoration.state_types.len();
     if stepn != expected_step_columns {
         return Err(sql_err!(
@@ -5104,9 +5275,38 @@ fn subst_assignments<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
     let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(arena);
+    // A multi-column assignment projects several fields from one query node.
+    // Preserve that node identity so subquery evaluation runs its effects once.
+    let mut row_sources: ArenaList<'a, (&'a Expr<'a>, &'a Expr<'a>)> = ArenaList::new(arena);
     for (column, expression) in source.iter().copied() {
+        let expression = match expression {
+            Expr::RecordFieldIndex { base, index } => {
+                let rewritten = row_sources
+                    .as_slice()
+                    .iter()
+                    .find(|(original, _)| core::ptr::eq(*original, *base))
+                    .map(|(_, rewritten)| *rewritten);
+                let base = match rewritten {
+                    Some(base) => base,
+                    None => {
+                        let rewritten = subst_expr(base, context, arena)?;
+                        row_sources
+                            .push((*base, rewritten))
+                            .map_err(|_| arena_full())?;
+                        rewritten
+                    }
+                };
+                &*arena
+                    .alloc(Expr::RecordFieldIndex {
+                        base,
+                        index: *index,
+                    })
+                    .map_err(|_| arena_full())?
+            }
+            _ => subst_expr(expression, context, arena)?,
+        };
         assignments
-            .push((column, subst_expr(expression, context, arena)?))
+            .push((column, expression))
             .map_err(|_| arena_full())?;
     }
     Ok(assignments.as_slice())
@@ -5777,7 +5977,7 @@ fn subst_expr_slice<'a>(
         && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
-        && !xs.iter().any(|x| expr_has_subquery(x))
+        && !xs.iter().any(|x| x.contains_subquery())
     {
         return Ok(xs);
     }
@@ -5787,100 +5987,6 @@ fn subst_expr_slice<'a>(
             .map_err(|_| arena_full())?;
     }
     Ok(tmp.as_slice())
-}
-
-/// True if `e` contains a subquery anywhere (so it needs rebuilding when CTEs
-/// are substituted). Leaves and subquery-free trees are returned unchanged.
-fn expr_has_subquery(e: &Expr) -> bool {
-    match e {
-        Expr::Subquery(_)
-        | Expr::InSubquery { .. }
-        | Expr::QuantifiedSubquery { .. }
-        | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => true,
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::BoundDefault {
-            expression: operand,
-            ..
-        }
-        | Expr::Collate { operand, .. }
-        | Expr::IsNull { operand, .. } => expr_has_subquery(operand),
-        Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::Call {
-            args,
-            order_by,
-            over,
-            filter,
-            ..
-        } => {
-            args.iter().any(|a| expr_has_subquery(a))
-                || order_by.iter().any(|o| expr_has_subquery(o.expression))
-                || filter.is_some_and(expr_has_subquery)
-                || over.is_some_and(|window| {
-                    window
-                        .partition_by
-                        .iter()
-                        .any(|expression| expr_has_subquery(expression))
-                        || window
-                            .order_by
-                            .iter()
-                            .any(|order| expr_has_subquery(order.expression))
-                        || window.frame.is_some_and(|frame| {
-                            frame_bound_has_subquery(frame.start)
-                                || frame_bound_has_subquery(frame.end)
-                        })
-                })
-        }
-        Expr::InList { operand, list, .. } => {
-            expr_has_subquery(operand) || list.iter().any(|a| expr_has_subquery(a))
-        }
-        Expr::Like {
-            operand,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_has_subquery(operand)
-                || expr_has_subquery(pattern)
-                || escape.is_some_and(expr_has_subquery)
-        }
-        Expr::Match {
-            operand, pattern, ..
-        } => expr_has_subquery(operand) || expr_has_subquery(pattern),
-        Expr::Case {
-            operand,
-            whens,
-            otherwise,
-            ..
-        } => {
-            operand.is_some_and(expr_has_subquery)
-                || whens
-                    .iter()
-                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
-                || otherwise.is_some_and(expr_has_subquery)
-        }
-        Expr::Array(items) => items.iter().any(|item| expr_has_subquery(item)),
-        Expr::Subscript { base, index } => expr_has_subquery(base) || expr_has_subquery(index),
-        Expr::Slice { base, lower, upper } => {
-            expr_has_subquery(base)
-                || lower.is_some_and(expr_has_subquery)
-                || upper.is_some_and(expr_has_subquery)
-        }
-        Expr::Field { base, .. } => expr_has_subquery(base),
-        Expr::AnyAll { operand, array, .. } => {
-            expr_has_subquery(operand) || expr_has_subquery(array)
-        }
-        _ => false,
-    }
-}
-
-fn frame_bound_has_subquery(bound: crate::sql::ast::FrameBound<'_>) -> bool {
-    match bound {
-        crate::sql::ast::FrameBound::Preceding(expression)
-        | crate::sql::ast::FrameBound::Following(expression) => expr_has_subquery(expression),
-        _ => false,
-    }
 }
 
 fn subst_frame_bound<'a>(
@@ -6370,12 +6476,20 @@ fn subst_expr<'a>(
         && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
-        && !expr_has_subquery(e)
+        && !e.contains_subquery()
     {
         return Ok(e);
     }
     let rebuilt = match e {
         Expr::Subquery(s) => Expr::Subquery(subst_select(s, context, arena)?),
+        Expr::RowSubquery { select, arity } => Expr::RowSubquery {
+            select: subst_select(select, context, arena)?,
+            arity: *arity,
+        },
+        Expr::RecordFieldIndex { base, index } => Expr::RecordFieldIndex {
+            base: subst_expr(base, context, arena)?,
+            index: *index,
+        },
         Expr::ArraySubquery(s) => Expr::ArraySubquery(subst_select(s, context, arena)?),
         Expr::Exists(s) => Expr::Exists(subst_select(s, context, arena)?),
         Expr::InSubquery {
@@ -6687,7 +6801,7 @@ fn subst_expr<'a>(
                 name,
             },
         },
-        // Leaves never reach here (guarded by expr_has_subquery above).
+        // Subquery-free leaves keep their values through substitution.
         other => *other,
     };
     Ok(&*arena.alloc(rebuilt).map_err(|_| arena_full())?)

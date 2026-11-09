@@ -6106,78 +6106,88 @@ fn query_definition_ownership_record_witnesses_and_describe_names() {
 
 #[test]
 fn table_definition_images_nested_trigger_exhaustion_rolls_back_and_retries() {
-    let mut config = test_config("definition-image-exhaustion");
-    config.max_tables = 2;
-    config.max_catalog_versions_per_object = 1;
-    config.definition_image_slots = 6;
-    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
-    let mut engine = Engine::new(&config, &mut budget).unwrap();
-    for statement in [
-        "CREATE TABLE image_target (id integer)",
-        "CREATE TABLE image_audit (id integer)",
-        "CREATE FUNCTION image_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO image_audit VALUES (NEW.id); RETURN NEW; END $$",
-        "CREATE TRIGGER image_record AFTER INSERT ON image_target FOR EACH ROW EXECUTE FUNCTION image_record()",
+    for (mode, suffix) in [
+        (crate::config::TransactionMode::Mvcc, "mvcc"),
+        (crate::config::TransactionMode::Locking, "locking"),
     ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert!(
-            !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{statement}: {}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-    let table = engine
-        .storage
-        .find_visible("public", "image_target", 0)
-        .unwrap();
-    let capacity = config.definition_image_slots;
-    let mut owners = Vec::with_capacity(capacity - 1);
-    for _ in 1..capacity {
-        let definitions = engine.storage.table_definition_images();
-        definitions.definition(&engine.storage, table, 0).unwrap();
-        owners.push(definitions);
-    }
-    let output = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO image_target VALUES (1)",
-    );
-    assert!(
-        String::from_utf8_lossy(&output).contains("table definition image pool is exhausted"),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
-    for table in ["image_target", "image_audit"] {
-        assert_eq!(
-            data_rows(&run_with(
-                &mut engine,
-                &mut budget,
-                &format!("SELECT count(*) FROM {table}")
-            )),
-            ["0"]
-        );
-    }
-    drop(owners.pop().unwrap());
-    for id in 1..=2 {
-        let output = run_with(
-            &mut engine,
-            &mut budget,
-            &format!("INSERT INTO image_target VALUES ({id})"),
-        );
-        assert!(
-            !String::from_utf8_lossy(&output).contains("ERROR"),
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
-    }
-    for table in ["image_target", "image_audit"] {
-        assert_eq!(
-            data_rows(&run_with(
-                &mut engine,
-                &mut budget,
-                &format!("SELECT id FROM {table} ORDER BY id")
-            )),
-            ["1", "2"]
-        );
+        let mut config = test_config(&format!("definition-image-exhaustion-{suffix}"));
+        config.transaction_mode = mode;
+        config.max_tables = 2;
+        config.max_catalog_versions_per_object = 1;
+        config.definition_image_slots = 6;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        for statement in [
+            "CREATE TABLE image_target (id integer)",
+            "CREATE TABLE image_audit (id integer)",
+            "CREATE FUNCTION image_record() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO image_audit VALUES (NEW.id); RETURN NEW; END $$",
+            "CREATE TRIGGER image_record AFTER INSERT ON image_target FOR EACH ROW EXECUTE FUNCTION image_record()",
+        ] {
+            let output = run_with(&mut engine, &mut budget, statement);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let table = engine
+            .storage
+            .find_visible("public", "image_target", 0)
+            .unwrap();
+        let capacity = config.definition_image_slots;
+        let mut owners = Vec::with_capacity(capacity - 1);
+        for _ in 1..capacity {
+            let definitions = engine.storage.table_definition_images();
+            definitions.definition(&engine.storage, table, 0).unwrap();
+            owners.push(definitions);
+        }
+        for id in 1..=2 {
+            let statement = format!("INSERT INTO image_target VALUES ({id})");
+            let output = run_with(&mut engine, &mut budget, &statement);
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+            assert!(
+                String::from_utf8_lossy(&output)
+                    .contains("table definition image pool is exhausted (capacity 6)"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            for name in ["image_target", "image_audit"] {
+                assert_eq!(
+                    data_rows(&run_with(
+                        &mut engine,
+                        &mut budget,
+                        &format!("SELECT count(*) FROM {name}")
+                    )),
+                    [format!("{}", id - 1)]
+                );
+            }
+            drop(owners.pop().unwrap());
+            let output = crate::storage::with_definition_image_exhaustion_trace(|| {
+                run_with(&mut engine, &mut budget, &statement)
+            });
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{mode:?} retry {id}: {}; image capacity request: {:?}",
+                String::from_utf8_lossy(&output),
+                crate::storage::last_definition_image_exhaustion(),
+            );
+            let definitions = engine.storage.table_definition_images();
+            definitions.definition(&engine.storage, table, 0).unwrap();
+            owners.push(definitions);
+        }
+        for table in ["image_target", "image_audit"] {
+            assert_eq!(
+                data_rows(&run_with(
+                    &mut engine,
+                    &mut budget,
+                    &format!("SELECT id FROM {table} ORDER BY id")
+                )),
+                ["1", "2"]
+            );
+        }
+        drop(owners);
+        drop(engine);
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
     }
 }
 
@@ -19146,7 +19156,6 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -77891,7 +77900,6 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         engine.subscription_confirmed_lsn("apply_changes").unwrap(),
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let relation = [
@@ -78240,7 +78248,6 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         &config,
         121,
         no_origin_behavior,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     begin[8] = 130;
@@ -78319,15 +78326,7 @@ fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
         .unwrap()
         .1
         .behavior;
-    let mut apply = SubscriptionApply::new(
-        &mut budget,
-        stream,
-        &config,
-        0,
-        behavior,
-        std::sync::Arc::clone(&engine.storage.row_work),
-    )
-    .unwrap();
+    let mut apply = SubscriptionApply::new(&mut budget, stream, &config, 0, behavior).unwrap();
     let relation = [
         b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b's', b't', b'r', b'e', b'a',
         b'm', b'e', b'd', b'_', b'r', b'o', b'w', b's', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0,
@@ -78600,7 +78599,6 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     assert_eq!(
@@ -91763,7 +91761,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
     );
     session.transaction.begin_command().unwrap();
     let capture_arena = Arena::new(&mut budget, "retained DML test", 1 << 20).unwrap();
-    let mut scratch = engine.row_work_pool().lease(0).unwrap();
+    let mut scratch = engine.storage.row_work.lease(0).unwrap();
     let images = crate::mem::guard::forbid_alloc(|| {
         crate::sql::exec::collect_matches(
             &engine.storage,
@@ -92650,7 +92648,7 @@ fn alter_rewrite_sources_keep_selected_pending_and_saved_bytes_after_rollback_an
         session.success(&mut engine,
             "BEGIN; UPDATE alter_source SET amount = amount + 100 WHERE id = 2; DELETE FROM alter_source WHERE id = 3", true);
         let table = engine.storage.find_table("public", "alter_source").unwrap();
-        let mut scratch = engine.row_work_pool().lease(0).unwrap();
+        let mut scratch = engine.storage.row_work.lease(0).unwrap();
         let arena = Arena::new(&mut budget, "alter selected source", 2 << 20).unwrap();
         let source = crate::mem::guard::forbid_alloc(|| {
             exec::capture_alter_rewrite_rows(
@@ -92740,7 +92738,7 @@ fn alter_rewrite_sources_release_failed_capture_and_allow_fixed_capacity_retry()
     )
     .unwrap();
     let mut short = short_pool.lease(0).unwrap();
-    let mut complete = engine.row_work_pool().lease(0).unwrap();
+    let mut complete = engine.storage.row_work.lease(0).unwrap();
     crate::mem::guard::forbid_alloc(|| {
         let error = exec::capture_alter_rewrite_rows(
             &engine.storage,
@@ -92920,7 +92918,6 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     let schema = SqlName::parse("public").unwrap();
@@ -93471,7 +93468,6 @@ fn pgoutput_descriptors_refresh_after_local_ddl_without_new_relation_frames() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(&engine.storage.row_work),
     )
     .unwrap();
     receive(
@@ -94127,11 +94123,12 @@ fn type_reference_moves_composite_names_survive_prepared_checkpoint_recovery() {
 }
 
 #[test]
-fn type_reference_moves_sequence_programs_use_engine_execution() {
+fn type_reference_moves_sequence_programs_require_session_execution() {
     let mut budget = Budget::new(1 << 20);
     let arena = Arena::new(&mut budget, "routine sequence classification", 1 << 20).unwrap();
     for body in [
         "SELECT nextval('s')",
+        "SELECT pg_catalog.nextval('s')",
         "SELECT currval('s')",
         "SELECT lastval()",
         "SELECT setval('s', 9)",
@@ -94147,8 +94144,25 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         let program =
             query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
                 .unwrap();
-        assert!(
-            query::routine_program_requires_mutable_execution(&program),
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::Sequences,
+            "{body}"
+        );
+    }
+    for body in [
+        "INSERT INTO t VALUES(1) RETURNING 1",
+        "UPDATE t SET id=1 RETURNING id",
+        "DELETE FROM t RETURNING 1",
+        "SELECT nextval('s'); INSERT INTO t VALUES(1) RETURNING 1",
+        "WITH changed AS(INSERT INTO t VALUES(1) RETURNING id) SELECT id FROM changed",
+    ] {
+        let program =
+            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
+                .unwrap();
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::Engine,
             "{body}"
         );
     }
@@ -94156,8 +94170,9 @@ fn type_reference_moves_sequence_programs_use_engine_execution() {
         let program =
             query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
                 .unwrap();
-        assert!(
-            !query::routine_program_requires_mutable_execution(&program),
+        assert_eq!(
+            query::routine_program_access(&program),
+            query::RoutineProgramAccess::ReadOnly,
             "{body}"
         );
     }

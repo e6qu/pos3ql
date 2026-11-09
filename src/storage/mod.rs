@@ -80,7 +80,12 @@ mod column_maps;
 pub(crate) use column_maps::{RelationColumnMap, RelationRowDecoder};
 mod definition_images;
 pub(crate) use definition_images::DefinitionImageId;
+pub(crate) use definition_images::PinnedRelationDefinition;
 pub(crate) use definition_images::RelationDefinition;
+#[cfg(test)]
+pub(crate) use definition_images::last_definition_image_exhaustion;
+#[cfg(test)]
+pub(crate) use definition_images::with_definition_image_exhaustion_trace;
 mod definition_pool;
 mod index_bindings;
 mod index_statistics;
@@ -14618,6 +14623,25 @@ pub(crate) struct ReadSnapshotScope {
     thread: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
+/// Saved visibility contains no worker borrow; its transaction retains the
+/// reader lease while execution is parked.
+pub(crate) struct SavedReadSnapshot(VisibilityContext);
+
+impl ReadSnapshotScope {
+    pub(crate) fn capture_current(&self) -> SavedReadSnapshot {
+        SavedReadSnapshot(execution_visibility())
+    }
+}
+
+impl SavedReadSnapshot {
+    pub(crate) fn resume(self) -> ReadSnapshotScope {
+        ReadSnapshotScope {
+            previous: replace_execution_visibility(self.0),
+            thread: core::marker::PhantomData,
+        }
+    }
+}
+
 impl Drop for ReadSnapshotScope {
     fn drop(&mut self) {
         replace_execution_visibility(self.previous);
@@ -14819,6 +14843,63 @@ struct LockState {
     row: crate::sql::lock::LockManager,
     advisory: crate::sql::lock::AdvisoryLockManager,
     sequence: u64,
+}
+
+pub(crate) struct AdvisoryPositionAdmission {
+    locks: std::sync::Arc<Mutex<LockState>>,
+    prior: Option<crate::sql::lock::AdvisoryPositionRestore>,
+}
+
+/// Keeps the connection's existing lock registry available while the engine
+/// mutably borrows storage. Cloning the handle allocates no registry or pool.
+pub(crate) struct AdvisoryJournal {
+    locks: std::sync::Arc<Mutex<LockState>>,
+    connection_id: i32,
+}
+
+impl AdvisoryJournal {
+    pub(crate) fn position(&self) -> crate::sql::lock::AdvisoryStatementPosition {
+        self.locks
+            .lock()
+            .expect("lock state is not poisoned")
+            .advisory
+            .statement_position(self.connection_id)
+    }
+
+    pub(crate) fn resume_position(
+        &self,
+        saved: crate::sql::lock::AdvisoryStatementPosition,
+        tail: crate::sql::lock::AdvisoryPositionTail,
+    ) -> Result<AdvisoryPositionAdmission, SqlError> {
+        let prior = self
+            .locks
+            .lock()
+            .expect("lock state is not poisoned")
+            .advisory
+            .resume_position(saved, self.connection_id, tail)?;
+        Ok(AdvisoryPositionAdmission {
+            locks: std::sync::Arc::clone(&self.locks),
+            prior: Some(prior),
+        })
+    }
+}
+
+impl AdvisoryPositionAdmission {
+    pub(crate) fn commit(&mut self) {
+        self.prior = None;
+    }
+}
+
+impl Drop for AdvisoryPositionAdmission {
+    fn drop(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            self.locks
+                .lock()
+                .expect("lock state is not poisoned")
+                .advisory
+                .restore_position(prior);
+        }
+    }
 }
 
 impl LockState {
@@ -51428,7 +51509,17 @@ impl Storage {
 
     pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
         let connection_id = self.current_connection_id();
-        self.lock_state().advisory.begin_statement(connection_id)
+        let mut locks = self.lock_state();
+        let statement = core::num::NonZeroU64::new(locks.next_sequence()?)
+            .expect("lock identities start at one");
+        locks.advisory.begin_statement(connection_id, statement)
+    }
+
+    pub(crate) fn advisory_journal(&self) -> AdvisoryJournal {
+        AdvisoryJournal {
+            locks: std::sync::Arc::clone(&self.locks),
+            connection_id: self.current_connection_id(),
+        }
     }
 
     pub(crate) fn advisory_statement_mark(&self) -> crate::sql::lock::AdvisoryStatementMark {
@@ -56750,10 +56841,10 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    pub(super) fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         let mut c = Config::default_dev();
         c.memtable_bytes = 1 << 16;
         c.max_connections = 2;
@@ -56768,7 +56859,7 @@ mod tests {
         c
     }
 
-    pub(super) fn test_budget(config: &Config) -> Budget {
+    pub(crate) fn test_budget(config: &Config) -> Budget {
         Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 

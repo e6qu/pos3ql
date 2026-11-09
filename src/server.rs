@@ -989,7 +989,6 @@ impl Server {
                         config,
                         0,
                         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-                        std::sync::Arc::clone(engine.row_work_pool()),
                     )?,
                     sql: crate::pg::replication_client::ReplicationClient::new_unbound(
                         budget,

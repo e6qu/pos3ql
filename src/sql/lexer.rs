@@ -60,6 +60,10 @@ impl LexErrorKind {
 
 pub type StackStrMsg = &'static str;
 
+pub(crate) fn is_identifier_continue(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == '$'
+}
+
 #[derive(Clone)]
 pub struct Lexer<'a> {
     text: &'a str,
@@ -214,7 +218,7 @@ impl<'a> Lexer<'a> {
 
         let len = rest
             .char_indices()
-            .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '$'))
+            .find(|(_, c)| !is_identifier_continue(*c))
             .map_or(rest.len(), |(i, _)| i);
         self.at += len;
         let word = &self.text[start..self.at];

@@ -86,11 +86,27 @@ build work; native test artifacts still require a completed build of the checked
 revision. Keep the 15-minute build limit and require both native execution jobs;
 a cancelled producer and its skipped tests do not qualify as passing CI.
 
+The macOS mutex gate runs the core ownership tests and a direct Apple API
+control on macOS arm64 under ThreadSanitizer. It rebuilds the standard library
+with the same instrumentation, uses no race suppressions, and retains its log.
+To compare the foreign-target Miri model with direct Apple calls, run
+`cargo miri test -p pos3ql-mutex-model --lib --target aarch64-apple-darwin -- core_mutex_direct_native_api`.
+The November 9 nightly, rustc `5b7b37aef`, emulates an unlocked unfair lock by
+[writing zero atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L410)
+and later [reading it non-atomically](https://github.com/rust-lang/rust/blob/5b7b37aef/src/tools/miri/src/shims/unix/macos/sync.rs#L127).
+The failing [run](https://github.com/e6qu/pos3ql/actions/runs/42578259095/job/129034044286)
+records that access inside the emulated API. Native instrumentation validates
+the actual Apple primitive; the production lock is unchanged. Linux memory
+ownership remains checked with Miri.
+
 The configured SQL-session test harness records the most recent query-memory
 error's source location and the arena's requested, remaining and capacity bytes
 without allocating. Failed success assertions include those values, whether a
 temporary region was active, and wire output. Distinguish genuine exhaustion
 from an allocation blocked by a temporary borrow before changing a limit. This diagnostic is test-only and keeps client errors unchanged.
+The definition-image retry regression also prints the failing capture's caller,
+transaction mode and retry number. Its caller record uses fixed thread-local
+test storage; the client-visible error stays unchanged.
 
 Each build or test workflow first calls the shared Rust source checks.
 A formatting failure keeps its test matrix from starting and retains a
@@ -204,6 +220,17 @@ initialization. Frame positions and resources must have one owner, without an
 address-based pairing check. Prove numeric layout scratch can be dropped while
 its owned scopes remain usable. Bind the immutable source owner and the original
 execution workspace explicitly when rebuilding syntax in separate parsing memory.
+Schema handoffs must pin the existing configured image cell. Cover physical and
+synthetic shapes, stale and foreign identifiers, last release after the chain
+and storage drop, recycled chain links, concurrent releases and unchanged
+nested-trigger exhaustion pressure in both transaction modes.
+Assignment planning also has a one-image regression for repeated INSERT,
+conflict UPDATE, ordinary UPDATE, MERGE and DELETE descriptions, with no heap
+allocation or writes during discovery.
+The retry regression enables a bounded native call trace only around its
+expected-success attempt. It uses the allocator guard's native tracing API,
+without Rust heap allocation; Miri keeps the source-location diagnostic and
+does not invoke foreign backtrace functions.
 Reject a replacement image even if its text is identical; preserve workspace
 identity checks while active local values borrow its memory. Keep deadline ownership proofs
 independent of the host clock under Miri isolation.
@@ -331,6 +358,13 @@ Root-cause execution timeouts using step timings, logs, resource use, and the
 smallest reproducer. Fix the slow work, deadlock, resource contention, or workload
 partitioning; do not increase timeout durations. A job waiting without an assigned
 runner is a scheduling delay, not evidence of an execution timeout.
+Every runner job declares its own bounded timeout. A shorter step timeout is
+additional protection; it never substitutes for another job's missing timeout.
+
+Tests inspecting an unfinished durable commit hold the HTTP fixture's upload
+responses until the inspection finishes. Release the hold before draining
+publication. A response that happens to arrive slowly is not a synchronization
+point; keep existing deadlines and phase limits.
 
 Native Linux arm64 and macOS arm64 builds compile all targets once. Separate
 test jobs run that build's library test executable with the full native filter
@@ -390,8 +424,10 @@ catalog and wire contracts; they do not select pos3ql's object block layout.
 
 CI also exercises shared heap publication and saved row and index file ownership with
 Miri, alongside allocation-forbidden concurrent regressions.
-`tools/test-miri-ownership.sh LOG` runs the shared ownership gate on a suitable
-runner. The explicit `miri-ownership` Cargo feature omits unrelated test modules
+`tools/test-miri-ownership.sh LOG GROUP` runs an ownership group on a suitable
+runner. Run both explicit groups, `memory-sql` and `storage`. Each has a
+15-minute job budget and shares one interpreter startup. The explicit
+`miri-ownership` Cargo feature omits unrelated test modules
 only under Miri; native builds retain their full test set. This avoids spending
 interpreter time constructing test descriptions that the ownership gate never
 runs. Miri without that feature keeps the broader test harness available.
@@ -401,10 +437,13 @@ owner through `type_input_plans::with_owner`, as the command executor does.
 Keep missing production ownership an error.
 List every selected case by its complete Rust name in
 `tools/miri-ownership-tests.txt`; its module must stay enabled in ownership mode.
-The script checks that every listed proof passes, with none missing, failed or
-ignored. Preserve the full proof set when reducing interpreter startup work.
+Every manifest entry belongs to exactly one group. Both jobs must finish
+successfully; a cancelled job does not qualify even if its last test passed.
+The script checks that every selected proof passes exactly once, with none
+missing, failed or ignored, and retains the group's manifest beside its log.
+Preserve the full proof set when reducing interpreter startup work.
 Polling tests release each snapshot before reusing its fixed scratch arena,
-even when writers are slow. All selected proofs share one interpreter startup.
+even when writers are slow.
 Coverage stops at a failed build or instrumentation setup and retains its
 diagnostics; it must never run a cached executable after that failure.
 Native test shards preserve failed exit codes and resolve allocation-abort

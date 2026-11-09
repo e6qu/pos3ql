@@ -46,7 +46,7 @@ impl ProgramSource {
             )
         })?;
         let program = parse_plpgsql_program(text, parsing, self.kind)?;
-        let code = CompiledProgram::new(self.clone(), program.body, parsing)?;
+        let code = CompiledProgram::new(self.clone(), program.body, program.locals, parsing)?;
         Ok((program, code))
     }
 }
@@ -69,12 +69,14 @@ pub(in crate::sql::exec) struct ProgramLayout {
 pub(in crate::sql::exec) struct CompiledProgram<'a> {
     blocks: &'a [TriggerBlock<'a>],
     layout: ProgramLayout,
+    pub(in crate::sql::exec) declarations: &'a [ParsedTriggerLocalDecl<'a>],
 }
 
 impl<'a> CompiledProgram<'a> {
     fn new(
         source: ProgramSource,
         block: TriggerBlock<'a>,
+        declarations: &'a [ParsedTriggerLocalDecl<'a>],
         arena: &'a Arena,
     ) -> Result<Self, SqlError> {
         fn layout(block: TriggerBlock<'_>) -> (usize, usize, usize) {
@@ -109,6 +111,7 @@ impl<'a> CompiledProgram<'a> {
                 depth,
                 handlers,
             },
+            declarations,
         })
     }
 
@@ -118,6 +121,10 @@ impl<'a> CompiledProgram<'a> {
 
     pub(in crate::sql::exec) fn source(&self) -> &ProgramSource {
         &self.layout.source
+    }
+
+    pub(in crate::sql::exec) fn kind(&self) -> PlpgsqlProgramKind {
+        self.layout.source.kind
     }
 
     pub(in crate::sql::exec) fn root(&self) -> TriggerBlock<'a> {

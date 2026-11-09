@@ -1,6 +1,295 @@
 use super::*;
 use crate::mem::budget::Budget;
 
+#[test]
+fn terminal_errors_keep_original_details_without_an_unneeded_control_image() {
+    let mut budget = Budget::new(32 << 10);
+    let pool = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "terminal error syntax", 8192).unwrap();
+    let workspace = Arena::new(&mut budget, "terminal error workspace", 1).unwrap();
+    let detail = "z".repeat(8192);
+    crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &pool,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut retained = ControlFrames::new(&workspace, code.layout(), &pool).unwrap();
+        let mut frames = retained.execution(&workspace, &code).unwrap();
+        frames.start(program.body);
+        let free = pool.lease::<u8>(8192).err().unwrap().free_bytes;
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(&detail)), None);
+        let error = frames
+            .begin_error(sql_err!(sqlstate::RAISE_EXCEPTION, "original error"), &pool)
+            .unwrap_err();
+        assert_eq!(error.sqlstate, "P0001");
+        assert_eq!(error.message.as_str(), "original error");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert_eq!(diagnostic.detail.unwrap().as_str(), detail);
+        assert!(diagnostic.hint.is_none());
+        assert_eq!(pool.lease::<u8>(8192).err().unwrap().free_bytes, free);
+    });
+}
+
+#[test]
+fn execution_waits_require_private_provenance_and_exclude_consumer_completion() {
+    use crate::sql::eval::InternalControl;
+    crate::mem::guard::forbid_alloc(|| {
+        for (control, waiting) in [
+            (InternalControl::LockWait, true),
+            (InternalControl::IoWait, true),
+            (InternalControl::RoutineInvocation, true),
+            (InternalControl::QueryConsumerComplete, false),
+        ] {
+            assert_eq!(is_execution_wait(&sql_err!(control, "control")), waiting);
+            assert!(!is_execution_wait(&sql_err!(
+                control.diagnostic_code(),
+                "user error"
+            )));
+        }
+        assert!(!is_execution_wait(&sql_err!(
+            sqlstate::QUERY_CANCELED,
+            "user cancellation"
+        )));
+    });
+}
+
+#[test]
+fn suspended_error_cleanup_keeps_its_original_diagnostic_after_worker_reuse() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "pending error syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "pending error original", 8192).unwrap();
+    let restored_syntax = Arena::new(&mut budget, "pending error reparse", 16 << 10).unwrap();
+    let output = Arena::new(&mut budget, "pending error restored", 64).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        frames
+            .execution(&workspace, &code)
+            .unwrap()
+            .start(program.body);
+        let _ = crate::sql::eval::take_diagnostic();
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str("original detail")),
+            Some(StackStr::from_str("original hint")),
+        );
+        frames.progress = ExecutionProgress::Error(PendingError::capture(
+            sql_err!(
+                crate::sql::eval::InternalControl::IoWait.diagnostic_code(),
+                "original error"
+            ),
+            &controls,
+        ));
+        execution.suspend().ok().unwrap()
+    });
+    drop((parsing, workspace));
+    crate::mem::guard::forbid_alloc(|| {
+        crate::sql::eval::stash_diagnostic(Some(StackStr::from_str("another connection")), None);
+        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let mut execution = saved.restore(&output, &code).ok().unwrap();
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        assert_eq!(frames.active, 1);
+        assert_eq!(frames.slots[0].as_ref().unwrap().next, 0);
+        let ExecutionProgress::Error(error) =
+            core::mem::replace(&mut frames.progress, ExecutionProgress::Complete)
+        else {
+            panic!("unfinished error cleanup")
+        };
+        let error = error.publish();
+        assert_eq!(error.sqlstate, "PZ002");
+        assert!(error.sqlstate.internal_control().is_none());
+        assert_eq!(error.message.as_str(), "original error");
+        let diagnostic = crate::sql::eval::take_diagnostic().unwrap();
+        assert_eq!(diagnostic.detail.unwrap().as_str(), "original detail");
+        assert_eq!(diagnostic.hint.unwrap().as_str(), "original hint");
+        drop((execution, code));
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+    });
+}
+
+#[test]
+fn unfinished_returns_preserve_values_after_failed_capture_and_workspace_destruction() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "pending return syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "pending return original", 8192).unwrap();
+    let tiny = Arena::new(&mut budget, "pending return failed restore", 64).unwrap();
+    let output = Arena::new(&mut budget, "pending return output", 8192).unwrap();
+    let restored_syntax = Arena::new(&mut budget, "pending return reparse", 16 << 10).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN RETURN 'original'; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Function,
+        )
+        .unwrap();
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        let frames = execution.status.control_frames.as_mut().unwrap();
+        frames
+            .execution(&workspace, &code)
+            .unwrap()
+            .start(program.body);
+        let text = workspace.alloc_slice_with(1024, |_| b'r').unwrap();
+        frames.progress = ExecutionProgress::Flow(TriggerFlow::Return(TriggerReturnValue::Value(
+            Datum::Text(core::str::from_utf8(text).unwrap()),
+        )));
+        let held = rows.lease::<u8>(1024).unwrap();
+        let (execution, error) = execution.suspend().err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        let frames = execution.status.control_frames.as_ref().unwrap();
+        assert_eq!(frames.active, 1);
+        assert!(
+            matches!(frames.progress.return_value(), Some(Datum::Text(value)) if value.len() == 1024)
+        );
+        assert!(frames.saved_return.is_none());
+        drop(held);
+        execution.suspend().ok().unwrap()
+    });
+    drop((parsing, workspace));
+    crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = saved.source().parse(&restored_syntax).unwrap();
+        let (saved, error) = saved.restore(&tiny, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert_eq!(tiny.used(), 0);
+        let execution = saved.restore(&output, &code).ok().unwrap();
+        let frames = execution.status.control_frames.as_ref().unwrap();
+        assert_eq!(frames.active, 1);
+        assert!(frames.saved_return.is_none());
+        let Some(Datum::Text(value)) = frames.progress.return_value() else {
+            panic!("pending return value")
+        };
+        assert_eq!(value.len(), 1024);
+        assert!(value.bytes().all(|byte| byte == b'r'));
+        let saved = execution.suspend().ok().unwrap();
+        drop((saved, code));
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+    });
+}
+
+#[test]
+fn suspended_query_attachment_keeps_receipts_after_rejecting_a_foreign_arena() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        8192,
+        16,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "query attachment syntax", 16 << 10).unwrap();
+    let mut owner = Arena::new(&mut budget, "query receipt owner", 16 << 10).unwrap();
+    let foreign = Arena::new(&mut budget, "foreign query attachment", 16 << 10).unwrap();
+    let reparsing = Arena::new(&mut budget, "query attachment reparse", 16 << 10).unwrap();
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let mut execution = ExecutionFrame::new(&owner, &code, &[], 0, &controls, &rows).unwrap();
+        execution.initialization = execution_frame::Initialization::Complete;
+        execution
+            .status
+            .control_frames
+            .as_mut()
+            .unwrap()
+            .execution(&owner, &code)
+            .unwrap()
+            .start(program.body);
+        let calls = crate::sql::query::RoutineInvocationState::new(&owner);
+        calls
+            .complete(
+                crate::sql::query::OwnedRoutineResult::capture_scalar(Datum::Int4(73), &owner)
+                    .unwrap(),
+                &owner,
+                &owner,
+            )
+            .unwrap();
+        execution.status.pending_query = Some(calls);
+        execution.suspend().ok().unwrap()
+    });
+    drop(parsing);
+    crate::mem::guard::forbid_alloc(|| {
+        owner.recycle_front();
+        let (_, code) = saved.source().parse(&reparsing).unwrap();
+        let (saved, error) = saved.restore(&foreign, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "XX000");
+        assert_eq!(foreign.used(), 0);
+        let mut execution = saved.restore(&owner, &code).ok().unwrap();
+        let calls = execution.status.pending_query.take().unwrap();
+        calls.begin_attempt();
+        assert_eq!(
+            calls.resolve_intrinsic(42, &[], &owner, &foreign).unwrap(),
+            Datum::Int4(73)
+        );
+        drop((execution, code));
+        assert_eq!(controls.lease::<u8>(8192).unwrap().capacity(), 8192);
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+    });
+}
+
 fn parse_owned_program<'a>(
     text: &str,
     parsing: &'a Arena,
@@ -37,7 +326,7 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
     let free = pool.lease::<u8>(4096).err().unwrap().free_bytes;
     crate::mem::guard::forbid_alloc(|| {
         let held = pool.lease::<u8>(64).unwrap();
-        let error = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool)
+        let error = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool)
             .err()
             .unwrap();
         assert_eq!(error.sqlstate, "54000");
@@ -45,7 +334,8 @@ fn output_binding_admission_returns_control_leases_after_failure_and_owner_drop(
         drop(held);
         assert_eq!(pool.lease::<u8>(free).unwrap().capacity(), free);
 
-        let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool).unwrap();
         status.set_output_locals(&[0], locals.len());
         assert_eq!(status.outputs[0].local, 0);
         assert_eq!(pool.lease::<u8>(1).err().unwrap().available_leases, 0);
@@ -195,7 +485,8 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
         ctype: ColType::Text,
         ..empty_plpgsql_local()
     }];
-    let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool).unwrap();
+    let mut status =
+        TriggerExecutionStatus::new(&workspace, &code, &locals, 1, &pool, &pool).unwrap();
     status.set_output_locals(&[0], locals.len());
     crate::mem::guard::forbid_alloc(|| {
         let text = temporary.alloc_str("original output").unwrap();
@@ -220,11 +511,11 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
     temporary.reset();
     crate::mem::guard::forbid_alloc(|| {
         temporary.alloc_slice_with(2048, |_| 0xffu8).unwrap();
-        let first = status.outputs[0].value.read(&output).unwrap();
+        let first = status.outputs[0].value.read(0, &output).unwrap();
         assert_eq!(first, Datum::Text("original output"));
         status.unshadow_output_local(0);
         assert_eq!(status.outputs[0].shadow_depth, 1);
-        assert_eq!(status.outputs[0].value.read(&output).unwrap(), first);
+        assert_eq!(status.outputs[0].value.read(0, &output).unwrap(), first);
         status.unshadow_output_local(0);
         source
             .with_remaining_region(|scratch| {
@@ -236,7 +527,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
             .unwrap();
         assert_eq!(status.outputs[0].shadow_depth, 0);
         assert_eq!(
-            status.outputs[0].value.read(&output).unwrap(),
+            status.outputs[0].value.read(0, &output).unwrap(),
             Datum::Text("new output")
         );
         let used = workspace.used();
@@ -251,7 +542,7 @@ fn output_bindings_own_outer_values_through_nested_shadows_and_source_reuse() {
             "54000"
         );
         assert_eq!(status.outputs[0].shadow_depth, u8::MAX);
-        assert!(status.outputs[0].value.read(&output).unwrap().is_null());
+        assert!(status.outputs[0].value.read(0, &output).unwrap().is_null());
         assert_eq!(workspace.used(), used);
         assert_eq!(first, Datum::Text("original output"));
         for _ in 0..u8::MAX {
@@ -300,12 +591,15 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
         panic!("inner loop")
     };
     crate::mem::guard::forbid_alloc(|| {
-        let mut status = TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool).unwrap();
-        let mut retained = status.control_frames.take().unwrap();
-
-        let mut frames = retained.execution(&arena, &code).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&arena, &code, &locals, 0, &pool, &pool).unwrap();
+        drop(status.control_frames.take().unwrap());
         let mut values = [Datum::Text("outside"), Datum::Int4(0)];
         for success in [false, true] {
+            // Calls share the reusable numeric workspace, while each call has
+            // its own control stack and completion position.
+            let mut retained = ControlFrames::new(&arena, code.layout(), &pool).unwrap();
+            let mut frames = retained.execution(&arena, &code).unwrap();
             frames.start(program.body);
             let Step::Enter(frame) = start_numeric_loop(
                 outer,
@@ -368,7 +662,6 @@ fn numeric_positions_restore_parent_values_and_release_all_scope_references() {
             assert!(workspace.values.iter().all(Datum::is_null));
             status.numeric_frames.restore(workspace);
         }
-        status.control_frames = Some(retained);
     });
 }
 
@@ -408,7 +701,8 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     .unwrap();
     let (mut status, retained, mut values) = crate::mem::guard::forbid_alloc(|| {
         let (program, code) = source.parse(&parsing).unwrap();
-        let mut status = TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool).unwrap();
+        let mut status =
+            TriggerExecutionStatus::new(&workspace, &code, &locals, 0, &pool, &pool).unwrap();
         let mut retained = status.control_frames.take().unwrap();
 
         let mut values = [Datum::Text("outside counter"), Datum::Text("before")];
@@ -1226,12 +1520,8 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                             ..empty_plpgsql_local()
                         })
                         .unwrap();
-                    let initializers = scratch
-                        .alloc_slice_with(parsed.locals.len(), |index| parsed.locals[index].initial)
-                        .unwrap();
                     let program = TriggerProgram {
                         locals,
-                        initializers,
                         body: parsed.body,
                         input_sites: parsed.input_sites,
                     };
@@ -1291,5 +1581,386 @@ fn procedural_lexical_exhaustion_is_a_resource_error_and_releases_scan_memory() 
         assert_eq!(error.sqlstate, "54000");
         assert_eq!(scan.used(), 0);
         assert_eq!(split_trigger_statements("NULL", &scan).unwrap(), ["NULL"]);
+    });
+}
+
+#[test]
+fn suspended_execution_preserves_scopes_and_failed_restore_after_workspace_destruction() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(512 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        32 << 10,
+        64,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        64 << 10,
+        16,
+    )
+    .unwrap();
+    let mut original = Arena::new(&mut budget, "suspended original syntax", 64 << 10).unwrap();
+    let mut workspace = Arena::new(&mut budget, "suspended original values", 32 << 10).unwrap();
+    let mut parsing = Arena::new(&mut budget, "restored syntax", 64 << 10).unwrap();
+    let partial = Arena::new(&mut budget, "partial value restoration", 1024).unwrap();
+    let prefix = partial.alloc_str("preserve").unwrap();
+    let output = Arena::new(&mut budget, "restored execution values", 32 << 10).unwrap();
+    const SOURCE: &str =
+        "BEGIN FOR x IN 1..3 LOOP FOR y IN 1..2 LOOP NULL; END LOOP; END LOOP; END";
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        let (program, code) =
+            parse_owned_program(SOURCE, &original, &controls, PlpgsqlProgramKind::Anonymous)
+                .unwrap();
+        let locals = [
+            TriggerLocalDecl {
+                name: SqlName::parse("x").unwrap(),
+                ctype: ColType::Text,
+                constant: true,
+                ..empty_plpgsql_local()
+            },
+            TriggerLocalDecl {
+                name: SqlName::parse("marker").unwrap(),
+                ctype: ColType::Text,
+                not_null: true,
+                type_mod: 4128,
+                ..empty_plpgsql_local()
+            },
+        ];
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &locals, 1, &controls, &rows).unwrap();
+        execution.status.set_output_locals(&[0], locals.len());
+        execution.values[0] = Datum::Text(workspace.alloc_str("outside counter").unwrap());
+        let large = workspace.alloc_slice_with(4096, |_| b'z').unwrap();
+        execution.values[1] = Datum::Text(core::str::from_utf8(large).unwrap());
+        execution.status.found = Some(true);
+        execution.status.row_count = 37;
+        execution.initialization = execution_frame::Initialization::Complete;
+        let mut retained = execution.status.control_frames.take().unwrap();
+        {
+            let mut frames = retained.execution(&workspace, &code).unwrap();
+            frames.start(program.body);
+            let TriggerStatement::For(outer) = program.body.statements[0] else {
+                panic!("outer numeric loop")
+            };
+            let Step::Enter(entry) = start_numeric_loop(
+                outer,
+                1,
+                3,
+                1,
+                false,
+                PlpgsqlScope::frame(2),
+                &execution.locals,
+                &execution.values,
+                &mut execution.status,
+            )
+            .unwrap() else {
+                panic!("outer entry")
+            };
+            frames.enter(entry);
+            let TriggerStatement::For(inner) = outer.block.statements[0] else {
+                panic!("inner numeric loop")
+            };
+            let (locals, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            let changed = workspace.alloc_slice_with(128, |_| b'a').unwrap();
+            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            let Step::Enter(entry) = start_numeric_loop(
+                inner,
+                1,
+                2,
+                1,
+                false,
+                PlpgsqlScope::frame(3),
+                locals,
+                values,
+                &mut execution.status,
+            )
+            .unwrap() else {
+                panic!("inner entry")
+            };
+            frames.enter(entry);
+            let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            let changed = workspace.alloc_slice_with(256, |_| b'b').unwrap();
+            values[1] = Datum::Text(core::str::from_utf8(changed).unwrap());
+            frames.last_mut().next = 1;
+        }
+        execution.status.control_frames = Some(retained);
+        execution.suspend().ok().unwrap()
+    });
+    original.reset();
+    workspace.reset();
+    original.alloc_slice_with(4096, |_| 0xffu8).unwrap();
+    workspace.alloc_slice_with(8192, |_| 0xffu8).unwrap();
+    drop((original, workspace));
+    let saved = crate::mem::guard::forbid_alloc(|| {
+        // An identical replacement image still cannot change the selected body.
+        let (_, replacement) =
+            parse_owned_program(SOURCE, &parsing, &controls, PlpgsqlProgramKind::Anonymous)
+                .unwrap();
+        let before = partial.used();
+        let (unchanged, error) = saved.restore(&partial, &replacement).err().unwrap();
+        assert_eq!(error.sqlstate, "40001");
+        assert_eq!(partial.used(), before);
+        drop(replacement);
+        unchanged
+    });
+    parsing.reset();
+    let (saved, source) = crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = saved.source().parse(&parsing).unwrap();
+        let saved = partial
+            .with_remaining_region(|child| {
+                let held = child.alloc_slice_with(64, |_| 0xa5_u8).unwrap();
+                let before = partial.used();
+                let (saved, error) = saved.restore(&partial, &code).err().unwrap();
+                assert_eq!(error.sqlstate, "54000");
+                assert_eq!(partial.used(), before);
+                assert!(held.iter().all(|byte| *byte == 0xa5));
+                saved
+            })
+            .unwrap();
+        assert_eq!(partial.used(), prefix.len());
+        let (saved, error) = saved.restore(&partial, &code).err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        // Both numeric images fitted before the ordinary 4096-byte local failed.
+        assert!(partial.high_water() > 256);
+        assert_eq!(partial.used(), prefix.len());
+        assert_eq!(prefix, "preserve");
+        let source = saved.source().clone();
+        (saved, source)
+    });
+    parsing.reset();
+    crate::mem::guard::forbid_alloc(|| {
+        parsing.alloc_slice_with(1024, |_| 0xaau8).unwrap();
+        let (_, code) = source.parse(&parsing).unwrap();
+        let mut execution = saved.restore(&output, &code).ok().unwrap();
+        assert!(execution.locals[0].constant);
+        assert!(execution.locals[1].not_null);
+        assert_eq!(execution.locals[1].type_mod, 4128);
+        assert_eq!(execution.values[0], Datum::Text("outside counter"));
+        assert!(
+            matches!(execution.values[1], Datum::Text(value) if value.len() == 4096 && value.bytes().all(|byte| byte == b'z'))
+        );
+        assert_eq!(
+            execution.initialization,
+            execution_frame::Initialization::Complete
+        );
+        assert_eq!(execution.status.found, Some(true));
+        assert_eq!(execution.status.row_count, 37);
+        assert_eq!(execution.status.outputs[0].shadow_depth, 1);
+        assert_eq!(
+            execution.status.outputs[0].value.read(0, &output).unwrap(),
+            Datum::Text("outside counter")
+        );
+        // Restored values borrow the destination, not the released saved images.
+        let mut overwritten = rows.lease::<u8>(64 << 10).unwrap();
+        overwritten.extend_from_slice(&[0xff; 4096]).unwrap();
+        drop(overwritten);
+        let mut retained = execution.status.control_frames.take().unwrap();
+        let mut frames = retained.execution(&output, &code).unwrap();
+        assert_eq!(frames.state.active, 3);
+        assert_eq!(frames.last().next, 1);
+        let (_, current, _) = frames.scope(&execution.locals, &mut execution.values);
+        assert_eq!(current[0], Datum::Int4(1));
+        assert_eq!(current[2], Datum::Int4(1));
+        assert!(
+            matches!(current[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+        );
+        let inner = frames.pop();
+        frames.finish(
+            inner,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        let outer = frames.pop();
+        frames.finish(
+            outer,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        assert_eq!(execution.values[0], Datum::Text("outside counter"));
+        assert!(
+            matches!(execution.values[1], Datum::Text(value) if value.len() == 256 && value.bytes().all(|byte| byte == b'b'))
+        );
+        let root = frames.pop();
+        frames.finish(
+            root,
+            &execution.locals,
+            &mut execution.values,
+            &mut execution.status,
+            true,
+        );
+        execution.status.control_frames = Some(retained);
+        drop((execution, code, source));
+        assert_eq!(controls.lease::<u8>(32 << 10).unwrap().capacity(), 32 << 10);
+        assert_eq!(rows.lease::<u8>(64 << 10).unwrap().capacity(), 64 << 10);
+    });
+}
+
+#[test]
+fn failed_frame_capture_preserves_live_scopes_and_drop_returns_paused_capacity() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(256 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        16 << 10,
+        32,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        2048,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "failed capture syntax", 64 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "failed capture values", 16 << 10).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let (program, code) = parse_owned_program(
+            "BEGIN FOR x IN 1..2 LOOP NULL; END LOOP; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let locals = [
+            TriggerLocalDecl {
+                name: SqlName::parse("x").unwrap(),
+                ctype: ColType::Text,
+                ..empty_plpgsql_local()
+            },
+            TriggerLocalDecl {
+                name: SqlName::parse("marker").unwrap(),
+                ctype: ColType::Text,
+                ..empty_plpgsql_local()
+            },
+        ];
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &locals, 0, &controls, &rows).unwrap();
+        execution.values[0] = Datum::Text("outside counter");
+        execution.values[1] = Datum::Text("ordinary value");
+        execution.initialization = execution_frame::Initialization::Complete;
+        let mut retained = execution.status.control_frames.take().unwrap();
+        {
+            let mut frames = retained.execution(&workspace, &code).unwrap();
+            frames.start(program.body);
+            let TriggerStatement::For(program) = program.body.statements[0] else {
+                panic!("numeric loop")
+            };
+            let Step::Enter(entry) = start_numeric_loop(
+                program,
+                1,
+                2,
+                1,
+                false,
+                PlpgsqlScope::frame(2),
+                &execution.locals,
+                &execution.values,
+                &mut execution.status,
+            )
+            .unwrap() else {
+                panic!("numeric entry")
+            };
+            frames.enter(entry);
+            let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            let marker = workspace.alloc_slice_with(512, |_| b'q').unwrap();
+            values[1] = Datum::Text(core::str::from_utf8(marker).unwrap());
+        }
+        execution.status.control_frames = Some(retained);
+        let held = rows.lease::<u8>(1536).unwrap();
+        let (mut execution, error) = execution.suspend().err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("row_work_bytes"));
+        assert_eq!(rows.lease::<u8>(512).unwrap().capacity(), 512);
+        assert_eq!(execution.values[0], Datum::Text("outside counter"));
+        assert_eq!(execution.values[1], Datum::Text("ordinary value"));
+        let mut retained = execution.status.control_frames.take().unwrap();
+        {
+            let mut frames = retained.execution(&workspace, &code).unwrap();
+            assert_eq!(frames.state.active, 2);
+            let (_, values, _) = frames.scope(&execution.locals, &mut execution.values);
+            assert_eq!(values[0], Datum::Int4(1));
+            assert!(
+                matches!(values[1], Datum::Text(value) if value.len() == 512 && value.bytes().all(|byte| byte == b'q'))
+            );
+        }
+        execution.status.control_frames = Some(retained);
+        drop(held);
+        let saved = execution.suspend().ok().unwrap();
+        assert!(rows.lease::<u8>(2048).is_err());
+        drop((saved, code));
+        assert_eq!(controls.lease::<u8>(16 << 10).unwrap().capacity(), 16 << 10);
+        assert_eq!(rows.lease::<u8>(2048).unwrap().capacity(), 2048);
+    });
+}
+
+#[test]
+fn declaration_capture_is_failure_preserving_and_repeated_pauses_share_metadata() {
+    use super::super::execution_frame::ExecutionFrame;
+    let mut budget = Budget::new(128 << 10);
+    let controls = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::EXECUTION_CONTROL,
+        4096,
+        8,
+    )
+    .unwrap();
+    let rows = LeasePool::new(
+        &mut budget,
+        crate::mem::lease_pool::Purpose::ROW_WORK,
+        4096,
+        8,
+    )
+    .unwrap();
+    let parsing = Arena::new(&mut budget, "declaration capture syntax", 16 << 10).unwrap();
+    let workspace = Arena::new(&mut budget, "declaration capture values", 8192).unwrap();
+    let output = Arena::new(&mut budget, "declaration capture output", 8192).unwrap();
+    crate::mem::guard::forbid_alloc(|| {
+        let (_, code) = parse_owned_program(
+            "BEGIN NULL; END",
+            &parsing,
+            &controls,
+            PlpgsqlProgramKind::Anonymous,
+        )
+        .unwrap();
+        let declarations = [TriggerLocalDecl {
+            name: SqlName::parse("selected").unwrap(),
+            ctype: ColType::Text,
+            constant: true,
+            ..empty_plpgsql_local()
+        }];
+        let mut execution =
+            ExecutionFrame::new(&workspace, &code, &declarations, 0, &controls, &rows).unwrap();
+        execution.values[0] = Datum::Text(workspace.alloc_str("live value").unwrap());
+        execution.initialization = execution_frame::Initialization::Coerce(0);
+        let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
+        let held = controls.lease::<u8>(free).unwrap();
+        let (execution, error) = execution.suspend().err().unwrap();
+        assert_eq!(error.sqlstate, "54000");
+        assert!(error.message.as_str().contains("execution_control_bytes"));
+        assert_eq!(execution.values[0], Datum::Text("live value"));
+        assert_eq!(rows.lease::<u8>(4096).unwrap().capacity(), 4096);
+        drop(held);
+        let saved = execution.suspend().ok().unwrap();
+        let execution = saved.restore(&output, &code).ok().unwrap();
+        assert!(execution.locals[0].constant);
+        assert_eq!(
+            execution.initialization,
+            execution_frame::Initialization::Coerce(0)
+        );
+        assert_eq!(execution.values[0], Datum::Text("live value"));
+        let free = controls.lease::<u8>(4096).err().unwrap().free_bytes;
+        let saved = execution.suspend().ok().unwrap();
+        assert_eq!(controls.lease::<u8>(4096).err().unwrap().free_bytes, free);
+        drop((saved, code));
+        assert_eq!(controls.lease::<u8>(4096).unwrap().capacity(), 4096);
+        assert_eq!(rows.lease::<u8>(4096).unwrap().capacity(), 4096);
     });
 }

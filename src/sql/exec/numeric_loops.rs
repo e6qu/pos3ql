@@ -1,11 +1,32 @@
 //! Numeric loop locals use one reusable frame per active nesting level.
 
+use super::local_values::LocalValues;
 use super::*;
 
 pub(super) struct NumericLoopWorkspace<'a> {
     depth: usize,
     pub(super) locals: MutableSlice<TriggerLocalDecl>,
-    pub(super) values: MutableSlice<Datum<'a>>,
+    pub(super) values: LocalValues<'a>,
+}
+
+impl NumericLoopWorkspace<'_> {
+    pub(super) fn suspend(self) -> NumericLoopWorkspace<'static> {
+        NumericLoopWorkspace {
+            depth: self.depth,
+            locals: self.locals,
+            values: self.values.suspend(),
+        }
+    }
+}
+
+impl NumericLoopWorkspace<'static> {
+    pub(super) fn rebind<'out>(self) -> NumericLoopWorkspace<'out> {
+        NumericLoopWorkspace {
+            depth: self.depth,
+            locals: self.locals,
+            values: self.values.rebind_saved(),
+        }
+    }
 }
 
 pub(super) struct NumericLoopFrames<'a> {
@@ -19,6 +40,7 @@ impl<'a> NumericLoopFrames<'a> {
         block: TriggerBlock<'_>,
         locals: &[TriggerLocalDecl],
         pool: &std::sync::Arc<LeasePool>,
+        rows: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
         let depth = numeric_depth(block);
         if depth == 0 {
@@ -41,7 +63,7 @@ impl<'a> NumericLoopFrames<'a> {
                             .push_reserved(empty_plpgsql_local())
                             .map_err(control_flow::execution_full)?;
                     }
-                    let values = allocate_plpgsql_local_values(pool, count)?;
+                    let values = LocalValues::new(pool, rows, count)?;
                     slots
                         .push_reserved(Some(NumericLoopWorkspace {
                             depth,
@@ -53,6 +75,19 @@ impl<'a> NumericLoopFrames<'a> {
                 Ok(Self { slots, active: 0 })
             })
             .map_err(|_| frame_full())?
+    }
+
+    pub(super) fn suspend(self) -> NumericLoopFrames<'static> {
+        NumericLoopFrames {
+            slots: self.slots.map_in_place(|slot| {
+                slot.map(|workspace| NumericLoopWorkspace {
+                    depth: workspace.depth,
+                    locals: workspace.locals,
+                    values: workspace.values.suspend_unused(),
+                })
+            }),
+            active: self.active,
+        }
     }
 
     pub(super) fn take(&mut self) -> Result<NumericLoopWorkspace<'a>, SqlError> {
@@ -75,6 +110,21 @@ impl<'a> NumericLoopFrames<'a> {
         workspace.values.fill(Datum::Null);
         self.active -= 1;
         self.slots[depth] = Some(workspace);
+    }
+}
+
+impl NumericLoopFrames<'static> {
+    pub(super) fn rebind<'out>(self) -> NumericLoopFrames<'out> {
+        NumericLoopFrames {
+            slots: self.slots.map_in_place(|slot| {
+                slot.map(|workspace| NumericLoopWorkspace {
+                    depth: workspace.depth,
+                    locals: workspace.locals,
+                    values: workspace.values.rebind_unused(),
+                })
+            }),
+            active: self.active,
+        }
     }
 }
 

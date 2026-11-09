@@ -291,9 +291,9 @@ pub(crate) fn description_type_oids(
     description_columns(description, &mut names, output)
 }
 
-/// Extracts names and type OIDs from one captured RowDescription for typed
-/// PL/pgSQL record assignment at the cursor-pool boundary.
-pub(crate) fn description_columns<'a>(
+/// Decodes one protocol description. SQL records use the cursor's separately
+/// retained declared type identities rather than these wire type OIDs.
+fn description_columns<'a>(
     description: &'a [u8],
     names: &mut [Option<&'a str>],
     type_oids: &mut [i32],
@@ -843,6 +843,37 @@ impl CursorPool {
         Some(slot.description.readable())
     }
 
+    pub(crate) fn record_columns<'a>(
+        &'a self,
+        name: &str,
+        names: &mut [Option<&'a str>],
+        type_oids: &mut [i32],
+    ) -> Result<usize, SqlError> {
+        let at = self.find(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            )
+        })?;
+        let slot = &self.slots[at];
+        let count = description_columns(slot.description.readable(), names, type_oids)?;
+        let declared = slot.query.result_type_oids()?.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor SQL result types are missing"
+            )
+        })?;
+        if declared.len() != count {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor SQL result shape changed"
+            ));
+        }
+        type_oids[..count].copy_from_slice(declared);
+        Ok(count)
+    }
+
     pub fn fetch_description(
         &self,
         name: &str,
@@ -1032,7 +1063,7 @@ impl CursorPool {
 
     pub(crate) fn finish_hold_source(&mut self, at: usize) {
         let slot = &mut self.slots[at];
-        slot.query.clear();
+        slot.query.finish_source();
         slot.request = None;
     }
 

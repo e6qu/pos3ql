@@ -29,6 +29,100 @@ struct Span {
     len: usize,
 }
 
+/// Cleanup can call SQL or wait on storage before the original error reaches
+/// its handler. Its detail and hint must leave the worker-local mailbox first.
+pub(super) struct PendingError {
+    pub(super) error: SqlError,
+    diagnostic: Result<Option<PendingDiagnostic>, SqlError>,
+}
+
+struct PendingDiagnostic {
+    bytes: MutableSlice<u8>,
+    detail: Option<Span>,
+    hint: Option<Span>,
+}
+
+impl PendingDiagnostic {
+    fn text(&self, span: Option<Span>) -> Option<&str> {
+        span.map(|span| {
+            core::str::from_utf8(&self.bytes[span.start..span.start + span.len])
+                .expect("pending diagnostics copy complete UTF-8 strings")
+        })
+    }
+}
+
+impl PendingError {
+    pub(super) fn capture(error: SqlError, pool: &std::sync::Arc<LeasePool>) -> Self {
+        Self {
+            error,
+            diagnostic: Self::capture_diagnostic(pool),
+        }
+    }
+
+    fn capture_diagnostic(
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<Option<PendingDiagnostic>, SqlError> {
+        let Some(diagnostic) = crate::sql::eval::take_diagnostic() else {
+            return Ok(None);
+        };
+        let detail = diagnostic.detail.as_ref().map(StackStr::as_str);
+        let hint = diagnostic.hint.as_ref().map(StackStr::as_str);
+        let length = detail.map_or(0, str::len) + hint.map_or(0, str::len);
+        let mut bytes = pool.lease(length).map_err(exhausted)?;
+        let mut copy = |text: Option<&str>| -> Result<Option<Span>, SqlError> {
+            text.map(|text| {
+                let span = Span {
+                    start: bytes.len(),
+                    len: text.len(),
+                };
+                bytes
+                    .extend_from_slice(text.as_bytes())
+                    .map_err(exhausted)?;
+                Ok(span)
+            })
+            .transpose()
+        };
+        let detail = copy(detail)?;
+        let hint = copy(hint)?;
+        Ok(Some(PendingDiagnostic {
+            bytes,
+            detail,
+            hint,
+        }))
+    }
+
+    pub(super) fn catch(
+        self,
+        buffers: &mut DiagnosticBuffers,
+        context: &str,
+    ) -> Result<(), SqlError> {
+        // Select and unwind the original error's block first. If its image
+        // could not be saved, fail outside that block rather than entering its
+        // handler with an unrelated capacity error.
+        let diagnostic = self.diagnostic?;
+        let detail = diagnostic.as_ref().and_then(|d| d.text(d.detail));
+        let hint = diagnostic.as_ref().and_then(|d| d.text(d.hint));
+        buffers.capture_fields(&self.error, detail, hint, context)
+    }
+
+    pub(super) fn publish(self) -> SqlError {
+        // A returned error becomes the next mailbox owner. Discard diagnostics
+        // left by cleanup, including when the original error had none.
+        let _ = crate::sql::eval::take_diagnostic();
+        let diagnostic = match self.diagnostic {
+            Ok(diagnostic) => diagnostic,
+            Err(capacity_error) => return capacity_error,
+        };
+        if let Some(diagnostic) = diagnostic {
+            crate::sql::eval::stash_diagnostic(
+                diagnostic.text(diagnostic.detail).map(StackStr::from_str),
+                diagnostic.text(diagnostic.hint).map(StackStr::from_str),
+            );
+        }
+        self.error
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct CaughtDiagnostic<'text> {
     pub(super) sqlstate: crate::sql::eval::SqlState,
@@ -113,10 +207,26 @@ impl DiagnosticBuffers {
         Ok(Self { slots, active: 0 })
     }
 
+    #[cfg(test)]
     pub(super) fn capture(
         &mut self,
         error: &SqlError,
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
+        context: &str,
+    ) -> Result<(), SqlError> {
+        self.capture_fields(
+            error,
+            diagnostic.and_then(|value| value.detail.as_ref().map(StackStr::as_str)),
+            diagnostic.and_then(|value| value.hint.as_ref().map(StackStr::as_str)),
+            context,
+        )
+    }
+
+    fn capture_fields(
+        &mut self,
+        error: &SqlError,
+        detail: Option<&str>,
+        hint: Option<&str>,
         context: &str,
     ) -> Result<(), SqlError> {
         let slot = self.slots.get_mut(self.active).ok_or_else(|| {
@@ -128,8 +238,8 @@ impl DiagnosticBuffers {
         let fields = [
             Some(error.sqlstate.as_str()),
             Some(error.message.as_str()),
-            diagnostic.and_then(|value| value.detail.as_ref().map(StackStr::as_str)),
-            diagnostic.and_then(|value| value.hint.as_ref().map(StackStr::as_str)),
+            detail,
+            hint,
             Some(context),
         ];
         let length = fields.iter().try_fold(0usize, |total, value| {

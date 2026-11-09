@@ -144,6 +144,13 @@ The type-only pass releases its arena and temporary record descriptions while
 preserving descriptions owned by the enclosing statement. SQL `EXECUTE` carries
 declared parameter types through planning and execution, even for NULL values.
 Metadata adapters carry declared sizes, collations and anonymous record shapes.
+SQL output descriptions preserve a column's declared domain type when it is
+selected by name, through a derived table or with `*`; protocol output converts
+domains to the base representation expected by clients. Record expansion uses
+catalog field counts for sorting, grouping, window queries and deferred output.
+For example, after a two-field `(record_value).*`, `ORDER BY 3` refers to the
+following result. Expanded fields also keep their text comparison rules during
+duplicate elimination.
 For example, `(q).f1` remains usable when `q` comes from `ROW(7)` in a nested
 query. Expanded views retain their original schema and name while aliases
 control which names SQL can reference. `RETURNING` adds the target's old/new
@@ -188,8 +195,12 @@ expressions, conversions, defaults and nested calls in the statement arena.
 For example, `save_order(set_config('application_name',
 current_setting('application_name') || '.', false))` appends one dot when the
 input finishes across those function handoffs. Simple builtin trees that cannot
-pause consume no retained input records. Engine-owned statistics, replication
-and large-object calls use the same explicit handoff classification.
+pause consume no retained input records. Engine-owned statistics, replication,
+large-object calls and advisory unlocks use the same explicit handoff
+classification. An advisory unlock's saved result also keeps a failed unlock's
+warning from being emitted twice. It uses the normal `client_min_messages`
+filter. Contexts without a resumable executor reject advisory unlocks with
+`0A000` rather than silently discarding their warning.
 The pending call stores checked handles for its encoded arguments and selected
 argument, parameter and result types. Those handles survive moving the owning
 arena or recycling its temporary front; reset or a different arena rejects
@@ -247,6 +258,13 @@ or session changes, the command fails explicitly with `0A000` and rolls back;
 it does not silently repeat or discard those effects. Retaining the remaining
 function-body execution position is still a roadmap item.
 
+With `SET track_functions = 'all'`, function statistics separate time spent in
+the function from time spent in its children. An active timer owns its entry
+in a fixed 1,024-entry stack on the SQL execution thread. Completing the call,
+returning an error or unwinding releases that entry; exhaustion returns `54000`
+and names the function timing stack. Saving timing across a function-body pause
+remains part of retaining that unfinished call.
+
 Numeric `FOR` loops reserve reusable local-variable frames before running a
 call's local initializers. The reservation follows maximum simultaneous loop
 nesting, rather than iteration count or the number of separate loops in the
@@ -254,7 +272,8 @@ source. Layout checks every branch and reserves only the largest local scope
 needed at each depth; shadowed counters reuse their existing local slot.
 Entering a loop copies its current scope into that depth's frame; leaving
 copies back assignments while restoring the shadowed counter. Returning
-the frame clears references into completed temporary work. Their local descriptions and value-slot arrays own ranges in the startup
+the frame clears references into completed temporary work. Local descriptions
+and value-slot arrays own ranges in the startup
 execution control pool; `54000` names insufficient capacity. Variable-length
 values in active local slots may still refer to statement memory.
 This prevents repeated inner-loop entry from consuming fresh local buffers.
@@ -281,6 +300,11 @@ local defaults once in declaration order. For example, a later local can use
 an earlier constant initialized by `nextval`, and a loop counter must restore
 the initialized local that it shadows.
 Procedural declarations and target names cross the SQL lexer before lookup.
+Clause, control, assignment, range and argument boundaries use that lexer too.
+For example, `INTO` in `EXECUTE $sql$INSERT INTO orders VALUES(1)$sql$` belongs
+to the command string. Commas inside strings, array subscripts or comments do
+not introduce `USING` arguments. Lexical errors retain their SQL error codes;
+temporary token text is released before statement directories are allocated.
 Unquoted `MixedCase` becomes `mixedcase`; quoted `"MixedCase"` remains distinct.
 Local variables, record fields and built-in handler/status/context names compare
 those normalized names exactly, so `SQLERRM` and `"SQLERRM"` are different.
@@ -327,21 +351,248 @@ its saved values own separate byte ranges in the same pool. The same owner holds
 the position and resource directories, so they cannot be rebound to a different
 call's buffers. An entry owns its control data and required resource in one enum
 before publishing them to their indexed slots. Numeric scopes own both local
-descriptions and value-slot arrays in the control pool. Ordinary local-value and
-parameter-slot arrays use that pool too; parameter staging reserves named
+descriptions and value-slot arrays in the control pool. Each call pairs its
+resolved ordinary declarations, value slots and execution status together.
+Procedural calls consume a row schema. Calls without row transitions use an
+explicit empty schema, keeping unused table metadata off that path.
+Initialization records whether the next variable needs expression evaluation or
+conversion. Its evaluated value is saved before conversion can pause, and the
+compiled source supplies the initializer expressions directly.
+An omitted initializer still validates a domain's initial NULL before the body.
+For example, declaring a variable of an integer domain marked `NOT NULL`
+returns `23502` before a later `nextval()` can run. PostgreSQL 18.6 implements
+that check at [block entry](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c#L1608-L1628).
+A declaration explicitly marked `NOT NULL` needs an initializer; routine
+definition validation rejects its omission with `22004`, as PostgreSQL's
+[declaration grammar](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_gram.y#L507-L516) requires.
+The internal interpreter also retains whether it is executing statements,
+finishing a return or loop exit, or finding an error handler. Before rollback
+cleanup can run SQL, an error takes its detail and hint out of the worker-local
+diagnostic slot into the shared execution control pool. Cleanup cannot replace
+those fields with another command's error. Pending return payloads join the saved row-work images
+only when a call pauses. These internal owners still need the enclosing write
+and scheduler handoff described below; they do not enable checked trigger inputs.
+An error with no protected block to roll back returns its original diagnostic
+directly, without reserving another image in the control pool.
+Transition tables retain copied, interned column metadata
+and declared type OIDs. For example, `pg_typeof(new_rows.amount)` keeps the
+column's domain type when a statement trigger reads inserted rows, including NULL
+values; it does not infer that type from the stored integer value.
+Collection ends before a transition table becomes readable: publishing consumes
+its writer, so later capture cannot change the published row list. Internal
+saved transition images keep both lists in shared row-work memory. Restoration
+admits both lists together and borrows their immutable payloads; even a large
+row therefore needs only its list entry in resumption scratch. These images
+still need the enclosing-write handoff below.
+Mixed writes retain separate transition tables for inserts, updates and deletes.
+Their row triggers drain in the original event order, with each trigger reading
+its own operation's tables. For example, the insert trigger of an `ON CONFLICT`
+command must not receive the rows changed by its update branch.
+Parameter-slot arrays use that pool too; parameter staging reserves named
 parameters only and releases its range after initialization. Numeric layout
 scratch is released before entering the body. Taking a scope keeps its ranges
 owned until that scope is returned or dropped.
-These value slots may still borrow variable-length payloads in statement memory;
-owning the arrays does not yet preserve those payloads through a scheduler return.
+Active value slots borrow variable-length payloads in statement memory. Internal
+frame suspension saves ordinary and active numeric values as typed rows in the
+shared row-work pool, then clears every borrowed reference while retaining the
+original slot ranges. Only pausing captures the ordinary declarations into a
+control-pool image; normal calls borrow compiled declarations, and repeated
+pauses share the captured image. Restoration copies each saved row once and
+decodes all its columns in one pass. Images are released only after every scope
+has restored. A memory error preserves all images and reservations, including
+when a child borrows the destination; the child's live bytes remain valid.
+This frame owner alone does not yet retain the enclosing write or unfinished nested input work
+through a scheduler return.
+Table INSERT, UPDATE, DELETE and MERGE share the end of a write: drain its row events,
+run the matching AFTER statement triggers in order, then send one completion or
+return its affected-row count to the caller. INSERT with an update on conflict
+runs UPDATE statement triggers before INSERT statement triggers. MERGE runs
+AFTER statement triggers in DELETE, UPDATE, INSERT order, for its listed actions;
+its BEFORE statement triggers run in INSERT, UPDATE, DELETE order. This follows
+PostgreSQL's [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c).
+This common path does not yet retain the enclosing row loop through a scheduler return.
+Row and statement triggers share construction of the selected routine and its
+scoped settings, security and row metadata. A trigger cannot commit or roll back
+its caller's transaction or inherit the enclosing command's SQL parameters.
+These rules apply on every entry, including resumed calls.
+Trigger execution combines the compiled program, lexical
+frame, arguments and row binding in one firing owner. Saving a firing copies its
+`OLD`/`NEW` payloads and arguments into shared row-work memory, retains the selected
+column image and preserves transition aliases and declared type OIDs. Restored
+transition rows borrow immutable saved bytes; modified `NEW` values are encoded
+before temporary memory is released. Admission errors retain the previous owner,
+and attachment checks connection, database, transaction and storage ownership.
+Normal calls keep borrowing their row context. A configured routine's current
+settings, original restoration baseline and effective security-definer user are
+saved with the firing. Settings images use the existing execution-control pool;
+no worker pointer survives suspension. Attachment checks the parent settings
+before installing the image, and its guards restore the caller after another
+pause, an error or completion. The enclosing write, remaining statement
+environment and unfinished input work still need the scheduler integration
+described above; this owner does not enable rejected checked inputs.
+Restoration also lends the firing its original statement and transaction
+timestamps and deadline. The transaction's consumed-timeout state prevents
+rearming a timeout already handled by the routine. Returning from a poll restores
+the worker's previous clock and timer, including after a failed attachment.
+Saving a firing also records its position among the statement's completed
+sequence calls and input checks, together with the sequence selected by
+`lastval()`. The connection retains that record and its sequence session.
+Attachment checks the original statement attempt and nested effect record before
+advancing their positions. A failed attachment restores the caller's previous
+position; another pause saves the new position without copying the record.
+Advisory-lock calls have a separate fixed journal. A saved firing retains its
+original statement identity and position in that connection's calls. Attachment
+skips completed calls only after every firing resource is available; a failed
+attachment restores the caller's position. New statements and reused connection
+identities reject old positions with `40001`. Other connections can release
+their journal slots without changing the retained call order.
+An unfinished procedural instruction retains its own earlier position, after
+input preparation. For example, if `PERFORM pg_advisory_lock(41),
+pg_advisory_xact_lock(42)` waits on the second lock, resumption reuses the first
+lock call's receipt rather than taking another hold. Sequence calls use the
+same instruction boundary. Attachment validates both journals before publishing
+either position. A completed instruction discards this boundary; the firing's
+outer position continues to skip earlier instructions.
+Write completion uses a cursor over queued row events followed by the selected
+AFTER STATEMENT triggers. It retains the row-event index, trigger depth,
+operation and last selected trigger name without syntax pointers. The same
+selectors serve the immediate trigger boundaries, COPY and ordinary write
+completion; nested trigger SQL cannot drain events from its caller's depth.
+The cursor also owns the affected-row count and choice of client response or
+internal count. It rejects completion before AFTER work ends and rejects a
+second completion. A full output buffer removes the unfinished completion frame
+and leaves the previous count intact; a retry can publish the new count and
+complete message together. Saved firings also check their original command
+identity and trigger depth before changing any execution context.
+Mixed-write transition images keep INSERT, UPDATE and DELETE tables under one
+owner. Restoration reserves all row directories in one allocation, so a failed
+admission publishes none and cannot rewind an active child's memory. Payloads
+stay in the existing row-work pool after the original collection arena drops;
+failed capture releases any operation images already reserved.
+Direct table writes without rewrite rules transfer their AFTER completion to
+the engine after releasing the write's storage borrow. The retained owner keeps
+the original undo boundary, physical definitions, transition images, remaining
+trigger order and final response. A trigger that waits saves its active firing;
+the frontend retains earlier `RETURNING` rows and resumes that owner without
+redoing the insert, update or delete. Real errors use the original undo boundary.
+The existing control arena reserves the completion state only for active writes.
+Completion uses a captured table image as its matching row schema, without a
+second reservation for those columns. Different names, visible widths or hidden
+fields still require distinct schema images.
+Write input discovery also uses its already selected target/source scope for
+assignment checks. It does not retain a second target image while describing
+INSERT values, conflict updates, UPDATE or MERGE assignments.
+A selected statement-trigger definition has its own temporary reservation,
+released before that body starts; row-trigger selections retain only their
+queue positions. Idle connections carry the small arena owner, not a maximum
+trigger definition or an additional startup pool.
+BEFORE and INSTEAD OF work, unfinished nested row phases, modifying CTEs, rewrite rules,
+COPY and replication apply still need the same complete enclosing owner before
+their rejected checked inputs can be enabled. Cold object-store waiting and the
+full protocol paths remain qualification gates in the plan.
+An internal nested-command owner also saves the command identity, nesting depth
+and read visibility before restoring its caller. Attachment checks the original
+connection, database, transaction and parent command before changing any state.
+It resumes the same command rather than issuing a new identity. Completing or
+pausing that scope restores the caller's visibility again.
+Static and dynamic nested INSERT, UPDATE and DELETE transfer their unfinished AFTER work
+into the calling firing. That firing owns the child's command scope and
+completion together, resumes the child before advancing its own instruction,
+and receives the affected-row count without emitting a second command tag.
+Dynamic `EXECUTE ... INTO` saves its returned values, including record field names
+and types, before a child trigger waits. Resumption assigns those saved values
+without evaluating the command text or `USING` arguments again. Dynamic execution
+updates `ROW_COUNT` while preserving `FOUND`; `STRICT` checks the completed row
+count. The saved values use the existing row-work pool.
+An `EXECUTE 'UPDATE orders ...' INTO result` needs `RETURNING` to supply values.
+Without it, SQLSTATE `42601` follows the command and its triggers; a surrounding
+exception block rolls back their writes, while issued sequence values remain
+issued. Empty results keep their field names and declared types with NULL values.
+`STRICT` errors preserve the target's earlier value and expose the completed row
+count to diagnostics. These boundaries follow the
+[PostgreSQL 18.6 executor](https://github.com/postgres/postgres/blob/REL_18_6/src/pl/plpgsql/src/pl_exec.c).
+SQL record descriptions retain declared types separately from the protocol's
+wire descriptions. For example, after `FETCH` from a cursor selecting
+`NULL::positive_integer`, `pg_typeof(result.id)` still names that domain,
+including when no row was fetched. Star expansion, composite fields and functions
+also preserve declared domain identities inside records. Each cursor keeps its
+selected type IDs in checked storage within `cursor_query_bytes`; no extra pool
+is reserved. A `WITH HOLD` cursor releases its query and readers at commit while
+keeping those type IDs for later `FETCH` commands. `CLOSE` releases the metadata.
+The same declared identities must survive an empty `EXECUTE ... INTO` and a
+saved query reading an ordinary local record. For example, `SELECT result.id`
+must recognize the field and retain its domain when `result.id` is NULL.
+`SELECT result.id INTO copied` describes its output with the same local scope
+used to execute it, including table-backed queries and set-operation branches.
+INTO targets end at identifier boundaries: `SELECT 1 INTO result UNION ALL SELECT 2`
+keeps the union in the source query, and a quoted name such as `"order,total"`
+remains one variable.
+A nested `WITH orders AS (...)` binds its local name even when the outer query
+has no WITH clause; it must not read a durable `orders` table instead.
+A trigger initializer such as `DECLARE n bigint := (SELECT count(*) FROM new_orders)`
+uses the current statement's saved rows during both type checking and execution,
+including when restoring checked inputs has replaced its expression tree.
+Cast descriptions, record expansion and array subscripts keep the SQL type;
+only the final wire description selects its PostgreSQL base representation.
+ROW field types use the expanded layout: `(ROW(0,(o).*)).f2` selects the first
+column of `o`, including its declared domain type.
+Type-only query contexts forward those field names, types, modifiers and
+collations without reading values, including during subquery collation analysis
+and postponed output after sorting.
+Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,
+from selecting one field, such as `(t).id`. The first keeps every expanded
+column; the second keeps the selected column. A real column named `t` takes
+precedence over the table alias in `(t).field`, following
+[PostgreSQL's projection analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_func.c#L1868-L1886).
+The same precedence applies to expansion. A scalar column named `t` cannot be
+expanded as `(t).*` just because the table also has alias `t`. Description offsets
+use catalog-aware expansion widths, so a later subquery keeps its own column
+and declared domain. Fields selected from an array of named records retain
+their logical types and collations as well. A constructor such as
+`ROW(0,(orders).*,99)` counts the expanded order fields before assigning its
+`f1`, `f2`, and later field positions.
+`SHOW`, `SHOW ALL` and `EXPLAIN` also supply named text columns to dynamic records.
+Comparing a named text field such as `settings."TimeZone"` uses its text
+collation, including after a procedural pause.
+Bare NULL and string output literals resolve to text. Expanding an untyped
+record, such as `SELECT (ROW(NULL, 'hello')).*`, instead returns `XX000`:
+PostgreSQL cannot convert its unknown field projection to text. Cast the fields
+explicitly: `SELECT (ROW(NULL::text, 'hello'::text)).*`. The distinction follows
+[PostgreSQL 18.6 target analysis](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_target.c)
+and its [constant conversion rule](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/parser/parse_coerce.c).
+An unfinished `PERFORM` or `SELECT ... INTO` keeps completed function results,
+their selected inputs and receipt positions when the calling trigger pauses. For example,
+`PERFORM write_audit('one'), wait_for_lock(), write_audit('two')` must insert each
+audit row once even if the lock waits repeatedly. Only an actual pause copies
+those typed values out of temporary query memory; ordinary completed queries
+release that memory together. New calls after resumption use the same retained
+owner while body evaluation uses separate temporary memory.
+Restoration checks the receipt owner's statement memory before attaching the
+procedural frame. A different arena returns an error without consuming the saved
+frame, so the original owner can still resume it. Resetting the original owner's
+arena invalidates its receipts explicitly.
+Unowned row phases still reject suspension with `0A000`; their full continuations
+remain required before enabling those waits. The remaining expression paths,
+unfinished function bodies and query positions also need complete ownership
+before their temporary memory can be released across a scheduler return.
+Dependency collection distinguishes catalog relations from materialized rows.
+For example, a trigger can `UPDATE orders FROM changed_rows` using its transition
+table without treating that temporary table as a catalog slot. Its actual target
+and stored sources still retain their column dependencies.
+Nested procedural updates and deletes own independent row-selection ranges in
+the shared row-work pool. They do not replace the caller's selection or borrow
+it through a raw pointer. Inserts, merges, COPY and trigger dispatch do not carry
+an unused row-selection workspace. For example, a trigger updating another table
+must leave its caller's remaining target rows intact even when it catches an
+error and rolls back a nested delete.
 Binding a view checks the source owner and execution workspace before entering
 the body. A different source image, even with identical text, or a foreign/reset
 workspace returns `40001`. Source capture returns `54000` naming the execution
 control settings on exhaustion. Rebuilding syntax copies the owned text into
 explicit parsing memory; exhausting that destination names statement memory.
 The source survives destruction of its input arena, parsing scratch and external
-pool handles. This preserves original text and program kind, not the invocation's
-selected definitions or session settings; those still need retained owners. An active
+pool handles. Source images preserve text and program kind; the invocation's
+selected definitions and settings require their own retained owners. An active
 numeric loop can bind rebuilt syntax without resetting its range, local values,
 shadowed counter or next statement, provided its value owner remains alive.
 Loop conditions and handler syntax resolve through the bound view; loop values
@@ -371,9 +622,9 @@ For example, saving the first `SQLERRM` in a 4,096-iteration error loop must
 keep that message after later catches reuse the handler buffer. Missing stacked
 fields return empty text. The [PostgreSQL reference](https://github.com/e6qu/pos3ql/blob/main/tests/external/reference/2026-11-06-caught-diagnostics/README.md)
 records repeated catches, nested handlers and rethrow.
-Variable-length payloads in ordinary and numeric local slots still borrow statement memory;
-saved control positions, source owners and diagnostics do not yet let the whole invocation survive
-returning to the connection scheduler during a storage wait.
+The complete invocation still needs the enclosing write, selected definitions,
+settings and unfinished query/input work to survive returning to the connection
+scheduler during a storage wait.
 Materialized query and array loop inputs own their encoded values in
 `row_work_bytes`/`row_work_leases`, shared with other foreground row work.
 Source query work and nested invocation receipts use one scoped arena and are
@@ -435,6 +686,18 @@ For example, `set_config('search_path', 'orders,public', false)` preserves that
 spelling, while `SET search_path TO orders, public` stores a formatted SQL list.
 Both validate the list before lookup. Routine scopes and transaction rollback
 restore the stored value without parsing it again as SQL.
+Leaving a configured routine restores only settings named in its `SET` clause.
+For example, a trigger configured with `SET application_name = 'audit'` restores
+the caller's application name, but an unlisted `SET LOCAL bytea_output = 'escape'`
+remains in effect until transaction end. `current_setting()`, `pg_settings` and
+binary rendering see the same value. An explicit session-wide `SET` overrides
+routine restoration even when it assigns the previous value; subsequent local
+changes remain until commit. Fixed per-setting action stamps distinguish that
+case from an unchanged value, and rollback restores those stamps with settings.
+Their connection-wide counter never wraps: exhausting its 64-bit range returns
+`54000` with `session setting assignment counter exhausted` before changing a value.
+These rules follow PostgreSQL's [SET contract](https://www.postgresql.org/docs/18/sql-set.html)
+and [setting-stack implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/misc/guc.c).
 
 Scalar functions, table functions and procedures share input binding, while
 keeping PostgreSQL's distinct null and result rules. Typed structural copies
@@ -680,13 +943,14 @@ an update and a long report compete for this same budget, rather than each
 reserving a maximum array for every potential table.
 
 `execution_control_bytes` reserves shared memory for procedural positions,
-resource directories, local-value slots, source images, named-output bindings,
+resource directories, resolved local declarations, local-value slots, source images, named-output bindings,
 saved output bytes and caught error directories and text.
 `execution_control_leases` bounds simultaneously owned ranges. A call reserves
 one immutable byte range for its actual source text, shared by compiled syntax
 and retained positions. It also reserves two ranges for its position and
 resource directories, sized to maximum lexical nesting, plus a range for
-nonempty local-value arrays. Set-returning
+nonempty local-value arrays. Pausing also captures actual ordinary declarations;
+resuming and pausing again share that image. Set-returning
 functions with named outputs also reserve their output-binding range. Numeric
 loops reserve a scope directory and two ranges per maximum active nesting level:
 local descriptions and value slots. Calls with exception handlers reserve one
@@ -791,7 +1055,11 @@ creation identity and schema revision; reusing a name or slot cannot redirect it
 images pin stored definitions; synthetic catalog images retain actual columns,
 including their hidden suffix, in a separate typed payload. Image identifiers
 include their owning pool and generation, so a stale or foreign identifier cannot
-select another schema. CTEs, table functions
+select another schema. A paused trigger pins its completion's existing image;
+it does not reserve another cell for the same schema. Each chain entry and
+independent pin holds one counted reference. The last release drops metadata
+before marking the cell free, including when releases occur on different threads.
+CTEs, table functions
 and trigger descriptions use borrowed column descriptors and actual statement
 memory. They do not put owning schema leases or maximum-width definitions in
 arenas that do not run destructors. Joined-row decoding also reserves only the

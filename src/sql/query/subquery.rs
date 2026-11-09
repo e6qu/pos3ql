@@ -161,7 +161,16 @@ fn spooled_column_witness<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
+        super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
         {
@@ -916,6 +925,39 @@ struct SubqueryCollationLookup<'scope, 'definition, 'outer, 'row> {
 }
 
 impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .column_type_oid(qualifier, name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -1008,8 +1050,16 @@ fn subquery_collations<'a>(
     let mut output = [Collation::None; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count =
-            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
+        let count = super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         if count == 1
             && let Some((ColType::Composite(slot), _)) =
                 crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1036,7 +1086,15 @@ fn subquery_collations<'a>(
         .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::describe_select(select, storage, txid, arena, &mut columns)?;
+        let count = super::describe_select(
+            select,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         for (slot, column) in output.iter_mut().zip(&columns[..count]) {
             *slot = column.collation;
         }
@@ -1121,8 +1179,16 @@ fn row_subquery_witness<'a>(
     }; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count =
-            super::setops::describe_set_body(storage, tree, txid, &mut columns, arena, None)?;
+        let count = super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
             fields[index] = RecordField {
@@ -1142,7 +1208,15 @@ fn row_subquery_witness<'a>(
         .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
-        let count = super::describe_select(select, storage, txid, arena, &mut columns)?;
+        let count = super::describe_select(
+            select,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
         for (index, column) in columns[..count].iter().enumerate() {
             fields[index] = RecordField {
                 name: column.name,
@@ -2487,9 +2561,20 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
                 }) {
                     return Err(error);
                 }
-                self.outer
-                    .ok_or(error)?
-                    .resolve_column_type(qualifier, name)
+                let outer = self.outer.ok_or(error)?;
+                let catalog = super::storage_catalog(
+                    self.catalog.storage,
+                    self.catalog.arena,
+                    self.catalog.txid,
+                );
+                crate::sql::exec::ColTypeResolver::resolve(
+                    &crate::sql::eval::RuntimeColumnTypes {
+                        row: outer,
+                        catalog: Some(&catalog),
+                    },
+                    qualifier,
+                    name,
+                )
             }
             Err(error) => Err(error),
         }
@@ -2531,18 +2616,40 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
             return None;
         }
         let outer = self.outer?;
-        let ctype = outer.col_type(qualifier, name)?;
-        let type_oid = self.catalog.storage.routine_type_oid(
-            ctype,
-            outer.column_user_type(qualifier, name),
-            self.catalog.txid,
-        )?;
-        Some(crate::sql::exec::StaticTypeMeta {
-            ctype,
-            type_oid,
-            type_mod: -1,
-            collation: outer.collation(qualifier, name),
-        })
+        let catalog =
+            super::storage_catalog(self.catalog.storage, self.catalog.arena, self.catalog.txid);
+        crate::sql::exec::ColTypeResolver::column_meta(
+            &crate::sql::eval::RuntimeColumnTypes {
+                row: outer,
+                catalog: Some(&catalog),
+            },
+            qualifier,
+            name,
+        )
+    }
+
+    fn visit_composite_fields(
+        &self,
+        creation: Option<crate::storage::TypeCreation>,
+        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
+    ) -> Option<usize> {
+        self.catalog.visit_composite_fields(creation, visit)
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        let scope = self.scope?;
+        CatalogScopeCols {
+            scope,
+            outer_scope: None,
+            storage: self.catalog.storage,
+            txid: self.catalog.txid,
+            arena: self.catalog.arena,
+        }
+        .whole_row_field(name, index)
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -2598,7 +2705,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope
-            .is_some_and(|scope| scope.table_index(name).is_ok())
+            .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -2612,17 +2719,8 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let scope = self.scope?;
-        let entry = scope.find_column(qualifier, name).ok()?;
-        if scope.output_type(entry) != ColType::Record {
-            return None;
-        }
-        match entry {
-            crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs.get(table)?.columns[column].type_mod)
-            }
-            crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
-        }
+        let metadata = self.column_meta(qualifier, name)?;
+        (metadata.ctype == ColType::Record && metadata.type_mod >= 0).then_some(metadata.type_mod)
     }
 }
 

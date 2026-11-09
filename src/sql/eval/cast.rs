@@ -1250,20 +1250,12 @@ pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str
         // bpchar-to-text strips the padding (`c || 'x'` sees "hi", not "hi   ").
         Datum::Bpchar(s) => Ok(s.trim_end_matches(' ')),
         Datum::Bool(b) => Ok(if b { "true" } else { "false" }),
-        Datum::Bytea(b) => {
-            // 2 + 2 bytes per input byte, straight into the arena.
-            let out = arena
-                .alloc_slice_with(2 + b.len() * 2, |_| 0u8)
-                .map_err(|_| arena_full())?;
-            out[0] = b'\\';
-            out[1] = b'x';
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            for (i, byte) in b.iter().enumerate() {
-                out[2 + i * 2] = HEX[(byte >> 4) as usize];
-                out[3 + i * 2] = HEX[(byte & 0xf) as usize];
-            }
-            Ok(unsafe { core::str::from_utf8_unchecked(out) })
-        }
+        Datum::Bytea(b) => arena
+            .alloc_str_display(crate::sql::types::PgByteaRendered {
+                bytes: b,
+                escape: crate::sql::guc::active_render().is_some_and(|render| render.bytea_escape),
+            })
+            .map_err(|_| arena_full()),
         other => arena.alloc_str_display(other).map_err(|_| arena_full()),
     }
 }

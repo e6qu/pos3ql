@@ -4956,8 +4956,48 @@ impl<'a> Datum<'a> {
     }
 }
 
-/// Text-format rendering per PostgreSQL output conventions: booleans as
-/// `t`/`f`, floats via Rust's shortest-roundtrip formatting.
+/// Binary-value output shared by SQL casts, nested values and wire replies.
+pub(crate) struct PgByteaRendered<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) escape: bool,
+}
+
+impl PgByteaRendered<'_> {
+    pub(crate) fn text_len(&self) -> usize {
+        if self.escape {
+            self.bytes.iter().fold(0usize, |size, byte| {
+                size.saturating_add(match byte {
+                    b'\\' => 2,
+                    0x20..=0x7e => 1,
+                    _ => 4,
+                })
+            })
+        } else {
+            2usize.saturating_add(self.bytes.len().saturating_mul(2))
+        }
+    }
+}
+
+impl fmt::Display for PgByteaRendered<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.escape {
+            for &byte in self.bytes {
+                match byte {
+                    b'\\' => f.write_str("\\\\")?,
+                    0x20..=0x7e => f.write_char(char::from(byte))?,
+                    _ => write!(f, "\\{byte:03o}")?,
+                }
+            }
+        } else {
+            f.write_str("\\x")?;
+            for byte in self.bytes {
+                write!(f, "{byte:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// PostgreSQL's `float8out`: shortest round-trip digits, fixed notation
 /// only while the decimal exponent lies in [-4, 15), scientific otherwise
 /// with a signed, at-least-two-digit exponent (`1e+15`, `1e-05`). Rust's
@@ -5218,13 +5258,11 @@ impl fmt::Display for Datum<'_> {
                 }
                 Ok(())
             }
-            Datum::Bytea(b) => {
-                f.write_str("\\x")?;
-                for byte in *b {
-                    write!(f, "{byte:02x}")?;
-                }
-                Ok(())
+            Datum::Bytea(b) => PgByteaRendered {
+                bytes: b,
+                escape: super::guc::active_render().is_some_and(|render| render.bytea_escape),
             }
+            .fmt(f),
             Datum::Numeric(n) => write!(f, "{n}"),
             Datum::Enum { label, .. } => f.write_str(label),
             Datum::Inet(net) => super::net::format_addr(net, false, f),
@@ -5393,7 +5431,7 @@ pub struct ColDesc<'a> {
 }
 
 impl<'a> ColDesc<'a> {
-    pub fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
+    pub const fn new(name: &'a str, type_oid: i32, typlen: i16) -> Self {
         Self {
             name,
             type_oid,

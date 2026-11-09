@@ -635,6 +635,7 @@ fn describing_typed_routine_arguments_uses_complete_catalog_metadata_without_che
             0,
             &arena,
             &mut columns,
+            crate::sql::exec::DescriptionTarget::Wire,
         )
         .unwrap();
         assert_eq!(count, 3);

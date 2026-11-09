@@ -21,6 +21,7 @@ pub(crate) struct CursorQuery {
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
+    result_type_oids: Option<crate::mem::arena::FrozenArenaSliceHandle<i32>>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
 }
@@ -59,6 +60,7 @@ impl CursorQuery {
         Ok(Self {
             bound: None,
             retained: None,
+            result_type_oids: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
         })
@@ -66,6 +68,7 @@ impl CursorQuery {
 
     pub(crate) fn clear(&mut self) {
         self.retained = None;
+        self.result_type_oids = None;
         self.bound = None;
         self.arena.reset();
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
@@ -73,6 +76,28 @@ impl CursorQuery {
 
     pub(crate) fn is_bound(&self) -> bool {
         self.bound.is_some()
+    }
+
+    pub(crate) fn result_type_oids(&self) -> Result<Option<&[i32]>, SqlError> {
+        self.result_type_oids
+            .map(|handle| {
+                self.arena.retained_slice(handle).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor SQL result types are inactive"
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn finish_source(&mut self) {
+        self.retained = None;
+        self.bound = None;
+        // Held rows keep their declared types after the query and its readers
+        // end. Their checked tail storage survives front reclamation.
+        self.arena.recycle_front();
+        self.owner = crate::sql::type_input_plans::Owner::Unlocated;
     }
 
     pub(crate) fn bind(
@@ -202,6 +227,61 @@ impl CursorQuery {
         responder: &mut crate::pg::respond::Responder<'_>,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
+        if self.result_type_oids.is_none() {
+            let mut types = [0; crate::sql::MAX_PROJ];
+            let count = self
+                .arena
+                .with_remaining_region(|scratch| {
+                    crate::sql::type_input_plans::with_owner(self.owner, || {
+                        crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+                            let mut columns =
+                                [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
+                            let count = match bound.statement {
+                                CursorStatement::Select(select) => {
+                                    let select = crate::sql::query::expand_ctes(
+                                        select, storage, txid, scratch,
+                                    )?;
+                                    crate::sql::query::describe_select(
+                                        select,
+                                        storage,
+                                        txid,
+                                        scratch,
+                                        &mut columns,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                        None,
+                                    )?
+                                }
+                                CursorStatement::SetQuery(query) => {
+                                    crate::sql::query::describe_set_query(
+                                        storage,
+                                        txid,
+                                        query,
+                                        &mut columns,
+                                        scratch,
+                                        crate::sql::exec::DescriptionTarget::Sql,
+                                    )?
+                                }
+                            };
+                            for (target, column) in types.iter_mut().zip(&columns[..count]) {
+                                *target = column.type_oid;
+                            }
+                            Ok::<_, SqlError>(count)
+                        })
+                    })
+                })
+                .map_err(|_| query_full())??;
+            let types = self
+                .arena
+                .retain_slice_with(count, |index| types[index])
+                .map_err(|_| query_full())?;
+            self.result_type_oids =
+                Some(self.arena.freeze_retained_slice(types).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor SQL result types are inactive"
+                    )
+                })?);
+        }
         let CursorStatement::Select(statement) = bound.statement else {
             return Ok(false);
         };
@@ -379,6 +459,48 @@ impl CursorQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_owned_query_releases_held_source_without_losing_declared_result_types() {
+        let mut budget = Budget::new(8192);
+        let mut query = CursorQuery::new(&mut budget, 8192).unwrap();
+        let (query, saved) = crate::mem::guard::forbid_alloc(|| {
+            query
+                .bind(
+                    "SELECT 1",
+                    &[],
+                    &[],
+                    &[],
+                    crate::sql::type_input_plans::Owner::Unlocated,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            query.arena.alloc_slice_with(512, |_| 0xccu8).unwrap();
+            let types = query
+                .arena
+                .retain_slice_with(2, |index| [23, 123456][index])
+                .unwrap();
+            let types = query.arena.freeze_retained_slice(types).unwrap();
+            query.result_type_oids = Some(types);
+            let before = query.arena.used();
+            query.finish_source();
+            assert!(!query.is_bound());
+            assert!(query.retained.is_none());
+            assert_eq!(query.result_type_oids().unwrap(), Some(&[23, 123456][..]));
+            assert!(query.arena.used() < before);
+            assert!(query.arena.used() <= Arena::retained_slice_capacity::<i32>(2).unwrap());
+            (query, types)
+        });
+        let mut moved = query;
+        crate::mem::guard::forbid_alloc(|| {
+            moved.arena.alloc_slice_with(512, |_| 0xddu8).unwrap();
+            assert_eq!(moved.result_type_oids().unwrap(), Some(&[23, 123456][..]));
+            moved.clear();
+            assert!(moved.result_type_oids().unwrap().is_none());
+            assert!(moved.arena.retained_slice(saved).is_err());
+            assert_eq!(moved.arena.used(), 0);
+        });
+    }
 
     #[test]
     fn cursor_owned_query_keeps_source_parameters_and_nested_records_after_moves() {

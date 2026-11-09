@@ -514,7 +514,12 @@ pub trait ColumnLookup<'a> {
     }
 
     /// Declared fields by position, without reading or evaluating row values.
-    fn whole_row_column(&self, _table: &str, _index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        _table: &str,
+        _index: usize,
+        _catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         None
     }
 
@@ -547,6 +552,12 @@ pub trait ColumnLookup<'a> {
     /// Static column type, if known — used to unify CASE branch types so a
     /// column reference contributes its declared type. Defaults to unknown.
     fn col_type(&self, _qualifier: Option<&str>, _name: &str) -> Option<ColType> {
+        None
+    }
+
+    /// A record field retains its declared OID even when its value is NULL.
+    /// Resolve its physical representation through the catalog, not the datum.
+    fn column_type_oid(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
         None
     }
 
@@ -623,6 +634,11 @@ pub(crate) fn expression_type_identity<'a>(
         return expression_type_identity(operand, row, hooks);
     }
     if let Expr::Column { qualifier, name } = expression
+        && let Some(type_oid) = row.column_type_oid(*qualifier, name)
+    {
+        return Ok(ExpressionTypeIdentity::Known(type_oid));
+    }
+    if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
     {
         return hooks
@@ -652,21 +668,6 @@ pub(crate) fn expression_type_identity<'a>(
                     "evaluated user-type cast has no catalog identity"
                 )
             });
-    }
-    if let Expr::Field { base, field } = expression
-        && let Expr::Call {
-            kind: super::ast::CallKind::SqlSyntax,
-            name,
-            args,
-            ..
-        } = &**base
-        && name.eq_ignore_ascii_case("row")
-        && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
-            .iter()
-            .position(|candidate| candidate.eq_ignore_ascii_case(field))
-        && let Some(argument) = args.get(position)
-    {
-        return expression_type_identity(argument, row, hooks);
     }
     if let Expr::Array(elements) = expression {
         let plan = array_constructor_type(
@@ -810,6 +811,25 @@ pub(crate) struct RuntimeColumnTypes<'row, 'datum> {
     pub(crate) catalog: Option<&'row dyn CatalogAccess>,
 }
 
+pub(crate) fn stored_row_field_metadata(
+    column: &crate::storage::ColumnMeta,
+    catalog: Option<&dyn CatalogAccess>,
+) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+    let type_oid = match column.user_type {
+        Some(identity) => catalog?.declared_user_type_oid(column.ctype, identity)?,
+        None => column.ctype.oid(),
+    };
+    Some((
+        StackStr::from_str(column.name.as_str()),
+        crate::sql::exec::StaticTypeMeta {
+            type_oid,
+            ctype: column.ctype,
+            type_mod: column.type_mod,
+            collation: column.collation,
+        },
+    ))
+}
+
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         self.catalog
@@ -851,6 +871,16 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::sql::exec::StaticTypeMeta> {
+        if let Some(type_oid) = self.row.column_type_oid(qualifier, name) {
+            let ctype =
+                constructor_type_from_oid(type_oid, &|oid| self.catalog?.domain_base_type(oid))?;
+            return Some(crate::sql::exec::StaticTypeMeta {
+                type_oid,
+                ctype,
+                type_mod: self.row.column_type_mod(qualifier, name),
+                collation: super::types::ColDesc::of_type(name, ctype).collation,
+            });
+        }
         let ctype = self.row.col_type(qualifier, name)?;
         let type_oid = match self.row.column_user_type(qualifier, name) {
             Some(identity) => self.catalog?.declared_user_type_oid(ctype, identity)?,
@@ -869,7 +899,18 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.row.resolve_column_type(qualifier, name)
+        if self.row.column_type_oid(qualifier, name).is_some() {
+            self.column_meta(qualifier, name)
+                .map(|metadata| metadata.ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "record field's declared type is unavailable"
+                    )
+                })
+        } else {
+            self.row.resolve_column_type(qualifier, name)
+        }
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
@@ -887,22 +928,7 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         name: &str,
         index: usize,
     ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let column = self.row.whole_row_column(name, index)?;
-        let type_oid = match column.user_type {
-            Some(identity) => self
-                .catalog?
-                .declared_user_type_oid(column.ctype, identity)?,
-            None => column.ctype.oid(),
-        };
-        Some((
-            StackStr::from_str(column.name.as_str()),
-            crate::sql::exec::StaticTypeMeta {
-                type_oid,
-                ctype: column.ctype,
-                type_mod: column.type_mod,
-                collation: column.collation,
-            },
-        ))
+        self.row.whole_row_field_metadata(name, index, self.catalog)
     }
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
@@ -1090,8 +1116,13 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).whole_row_present(table)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        (**self).whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        (**self).whole_row_field_metadata(table, index, catalog)
     }
 
     fn whole_row_fields(
@@ -1112,6 +1143,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        (**self).column_type_oid(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
@@ -1468,18 +1503,6 @@ pub trait CatalogAccess {
         _shared: bool,
         _transaction_scope: bool,
         _try_only: bool,
-    ) -> Result<bool, SqlError> {
-        Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "advisory locks are unavailable"
-        ))
-    }
-    fn unlock_advisory_lock(
-        &self,
-        _class_id: u32,
-        _object_id: u32,
-        _object_sub_id: i16,
-        _shared: bool,
     ) -> Result<bool, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2415,7 +2438,7 @@ pub trait CatalogAccess {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpressionEvaluation {
     Immutable,
     Runtime,
@@ -4899,25 +4922,21 @@ fn eval_full_inner<'a>(
                     "row expansion via \"*\" is not supported here"
                 ));
             }
-            // A direct ROW(...) resolves its f1..fn — unless the selected
-            // field is a bare unknown literal, which PostgreSQL cannot
-            // coerce (XX000). A typed sibling of an unknown field is fine.
             if let Expr::Call {
                 kind: super::ast::CallKind::SqlSyntax,
                 name,
-                args,
                 ..
             } = base
                 && name.eq_ignore_ascii_case("row")
-                && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
-                    .iter()
-                    .position(|n| n.eq_ignore_ascii_case(field))
-                && matches!(args.get(position), Some(Expr::Str(_)))
             {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "failed to find conversion function from unknown to text"
-                ));
+                crate::sql::exec::record_field_metadata(
+                    base,
+                    field,
+                    &RuntimeColumnTypes {
+                        row,
+                        catalog: hooks.catalog,
+                    },
+                )?;
             }
             let b = eval_full(base, arena, params, row, hooks)?;
             // A record arriving indirectly — CASE, a scalar subquery, an
@@ -5515,6 +5534,23 @@ fn expression_collation<'a>(
             None => expression_collation(operand, row, catalog),
         },
         Expr::Column { qualifier, name } => {
+            if row.column_type_oid(*qualifier, name).is_some() {
+                let metadata = super::exec::ColTypeResolver::column_meta(
+                    &RuntimeColumnTypes { row, catalog },
+                    *qualifier,
+                    name,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "record field's declared type is unavailable"
+                    )
+                })?;
+                return Ok(DerivedCollation::implicit(
+                    metadata.collation,
+                    metadata.ctype.is_collatable(),
+                ));
+            }
             let value = row.collation(*qualifier, name);
             Ok(DerivedCollation::implicit(
                 value,
@@ -5542,13 +5578,46 @@ fn expression_collation<'a>(
                 args,
                 ..
             } if name.eq_ignore_ascii_case("row") => {
-                let position = crate::sql::exec::RECORD_FIELD_NAMES
+                let Some(mut position) = crate::sql::exec::RECORD_FIELD_NAMES
                     .iter()
-                    .position(|name| name.eq_ignore_ascii_case(field));
-                match position.and_then(|position| args.get(position)) {
-                    Some(argument) => expression_collation(argument, row, catalog),
-                    None => Ok(None),
+                    .position(|name| name.eq_ignore_ascii_case(field))
+                else {
+                    return Ok(None);
+                };
+                for argument in *args {
+                    let expansion = match argument {
+                        Expr::WholeRow(_) => Some(*argument),
+                        Expr::Field { base, field: "*" } => Some(*base),
+                        _ => None,
+                    };
+                    if let Some(base) = expansion {
+                        let mut index = 0;
+                        let mut selected = None;
+                        let width = crate::sql::exec::record_shape_metadata(
+                            base,
+                            &RuntimeColumnTypes { row, catalog },
+                            |_, metadata| {
+                                if index == position {
+                                    selected = Some(metadata);
+                                }
+                                index += 1;
+                            },
+                        )?
+                        .ok_or_else(|| crate::sql::exec::could_not_identify("*"))?;
+                        if let Some(metadata) = selected {
+                            return Ok(DerivedCollation::implicit(
+                                metadata.collation,
+                                metadata.ctype.is_collatable(),
+                            ));
+                        }
+                        position -= width;
+                    } else if position == 0 {
+                        return expression_collation(argument, row, catalog);
+                    } else {
+                        position -= 1;
+                    }
                 }
+                Ok(None)
             }
             Expr::WholeRow(table) => {
                 let value = row.collation(Some(table), field);

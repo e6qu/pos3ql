@@ -2704,7 +2704,8 @@ pub(crate) fn ordered_index_access_plan<'a>(
     let mut order_columns = [None; MAX_INDEX_COLS];
     let mut order_targets = [&Expr::Null; MAX_INDEX_COLS];
     for (position, requested) in order.iter().enumerate() {
-        let expression = super::resolve_order_target(requested.expression, items, scope, arena)?;
+        let expression =
+            super::resolve_order_target(requested.expression, items, scope, arena, storage, txid)?;
         order_targets[position] = expression;
         order_columns[position] = resolve_column(expression).map(|column| column as u16);
     }
@@ -4185,8 +4186,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        super::ScopeSchema(self.scope).whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        super::ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
     }
     fn resolve_column_type(
         &self,
@@ -4414,12 +4420,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         if self.inner.whole_row_type(table).is_some() {
-            self.inner.whole_row_column(table, index)
+            self.inner.whole_row_field_metadata(table, index, catalog)
         } else {
             self.outer
-                .and_then(|outer| outer.whole_row_column(table, index))
+                .and_then(|outer| outer.whole_row_field_metadata(table, index, catalog))
         }
     }
 
@@ -4537,6 +4548,22 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                     .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
             {
                 self.outer.and_then(|outer| outer.column_user_type(q, name))
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
+        match self.inner.resolve_column_type(q, name) {
+            Ok(_) => self.inner.column_type_oid(q, name),
+            Err(error)
+                if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                ) && !q
+                    .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
+            {
+                self.outer.and_then(|outer| outer.column_type_oid(q, name))
             }
             Err(_) => None,
         }

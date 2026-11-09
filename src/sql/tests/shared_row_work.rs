@@ -9,7 +9,7 @@ fn assert_idle(engine: &Engine, bytes: usize) {
             .all(|lease| lease.capacity() == 0)
     );
     crate::mem::guard::forbid_alloc(|| {
-        assert!(engine.row_work_pool().lease::<u8>(bytes).is_ok());
+        assert!(engine.storage.row_work.lease::<u8>(bytes).is_ok());
     });
 }
 
@@ -38,7 +38,8 @@ fn foreground_write_leases_release_on_success_sql_error_and_wire_exhaustion() {
     );
     assert_idle(&engine, config.row_work_bytes);
     let held = engine
-        .row_work_pool()
+        .storage
+        .row_work
         .lease::<u8>(config.row_work_bytes)
         .unwrap();
     let output = session.execute(&mut engine, "DELETE FROM shared_release", true);
@@ -169,7 +170,6 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
         &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
-        std::sync::Arc::clone(engine.row_work_pool()),
     )
     .unwrap();
     assert_eq!(
@@ -194,7 +194,8 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
         let held = engine
-            .row_work_pool()
+            .storage
+            .row_work
             .lease::<u8>(config.row_work_bytes)
             .unwrap();
         let error = worker.copy_line(&mut engine, &setup, b"1").unwrap_err();

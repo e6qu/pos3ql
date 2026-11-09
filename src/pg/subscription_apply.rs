@@ -7,7 +7,6 @@ use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
-use crate::mem::lease_pool::LeasePool;
 use crate::pg::pginput::{CopyData, Message, Relation, ReplicaIdentity};
 use crate::pg::respond::Responder;
 use crate::sql::ast::ExplainSerialize;
@@ -16,7 +15,6 @@ use crate::sql::guc::GucState;
 use crate::sql::txn::TxnState;
 use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, SqlName, Storage};
-use std::sync::Arc;
 
 /// Internal trigger execution never exposes query output to the publisher.
 /// This fixed buffer only retains protocol framing required by the shared
@@ -286,7 +284,6 @@ pub struct SubscriptionApply {
     relations: RelationMap,
     arena: Arena,
     trigger_response: FixedBuf,
-    trigger_scratch: crate::sql::exec::DmlScratch,
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     remote: RemoteTransaction,
     confirmed_lsn: u64,
@@ -315,7 +312,6 @@ impl SubscriptionApply {
         config: &crate::config::Config,
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
-        row_work: Arc<LeasePool>,
     ) -> Result<Self, BudgetError> {
         let guc = GucState::new_with_capacities(
             budget,
@@ -340,9 +336,6 @@ impl SubscriptionApply {
                 "subscription_trigger_response",
                 TRIGGER_RESPONSE_BYTES,
             )?,
-            trigger_scratch: row_work
-                .lease(0)
-                .expect("empty worker write lease needs no capacity"),
             copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
                 config.txn_rows,
@@ -360,7 +353,6 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         operation: impl FnOnce(&mut Self, &mut crate::sql::Engine) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
-        self.trigger_scratch.clear();
         let _published = crate::sql::eval::funcs::system::retain_session_evaluation();
         engine.select_database(self.stream.database_oid())?;
         if !self.txn.is_active() {
@@ -378,7 +370,6 @@ impl SubscriptionApply {
         );
         let prior_owner = engine.replace_read_owner(Some(owner));
         let result = operation(self, engine);
-        self.trigger_scratch.clear();
         if result.is_err() || !self.txn.is_active() || self.txn.staged_commit().is_some() {
             engine.cancel_read_owner(owner);
         }
@@ -545,15 +536,13 @@ impl SubscriptionApply {
             let setup = engine.subscription_copy_setup(schema, table, columns, worker.txn.txid)?;
             worker.copy_transition_scratch.clear();
             worker.trigger_response.clear();
-            worker.trigger_scratch.clear();
             let mut responder = Responder::new(&mut worker.trigger_response);
-            engine.subscription_copy_start(
+            engine.copy_start(
                 &setup,
                 &mut worker.txn,
                 &worker.guc,
                 &worker.arena,
                 &mut responder,
-                &mut worker.trigger_scratch,
             )?;
             Ok(setup)
         })
@@ -573,12 +562,11 @@ impl SubscriptionApply {
                 .copy_row_line(
                     setup,
                     line,
-                    crate::sql::CopyRowContext::for_subscription_worker(
+                    crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,
                         &worker.arena,
                         &mut responder,
-                        &mut worker.trigger_scratch,
                         &mut worker.copy_transition_scratch,
                     ),
                 )
@@ -602,12 +590,11 @@ impl SubscriptionApply {
                 .copy_row_binary(
                     setup,
                     row,
-                    crate::sql::CopyRowContext::for_subscription_worker(
+                    crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,
                         &worker.arena,
                         &mut responder,
-                        &mut worker.trigger_scratch,
                         &mut worker.copy_transition_scratch,
                     ),
                 )
@@ -632,7 +619,6 @@ impl SubscriptionApply {
                 &mut responder,
                 crate::sql::SubscriptionCopyWorkspace::new(
                     &mut worker.arena,
-                    &mut worker.trigger_scratch,
                     &worker.copy_transition_scratch,
                 ),
             );
@@ -691,7 +677,6 @@ impl SubscriptionApply {
         self.relations.clear();
         self.arena.reset();
         self.trigger_response.clear();
-        self.trigger_scratch.clear();
         self.copy_transition_scratch.clear();
         Ok(())
     }
@@ -704,7 +689,6 @@ impl SubscriptionApply {
         self.relations.clear();
         self.arena.reset();
         self.trigger_response.clear();
-        self.trigger_scratch.clear();
         self.copy_transition_scratch.clear();
     }
 
@@ -720,7 +704,6 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
-        self.trigger_scratch.clear();
         engine.cancel_read_owner(crate::store::ReadOwner(
             (2u128 << 96)
                 | ((self.stream.database_oid().get() as u32 as u128) << 64)
@@ -913,14 +896,12 @@ impl SubscriptionApply {
                     ));
                 }
                 self.trigger_response.clear();
-                self.trigger_scratch.clear();
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
                     let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
                         self.guc.seq_session(),
                         &mut responder,
-                        &mut self.trigger_scratch,
                     );
                     let binding = engine.resolve_subscription_relation(
                         &mut self.relations,
@@ -963,14 +944,12 @@ impl SubscriptionApply {
                     ));
                 }
                 self.trigger_response.clear();
-                self.trigger_scratch.clear();
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
                     let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
                         self.guc.seq_session(),
                         &mut responder,
-                        &mut self.trigger_scratch,
                     );
                     let binding = engine.resolve_subscription_relation(
                         &mut self.relations,
@@ -1012,14 +991,12 @@ impl SubscriptionApply {
                     ));
                 }
                 self.trigger_response.clear();
-                self.trigger_scratch.clear();
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
                     let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
                         self.guc.seq_session(),
                         &mut responder,
-                        &mut self.trigger_scratch,
                     );
                     let binding = engine.resolve_subscription_relation(
                         &mut self.relations,

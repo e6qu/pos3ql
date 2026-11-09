@@ -134,6 +134,27 @@ pub(super) struct OwnedInputFrame {
 }
 
 impl OwnedInputFrame {
+    pub(super) fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
+        source
+            .with_remaining_region(|scratch| {
+                let mut frame = self.load(source, scratch)?;
+                if let InputState::Value { value, .. } = &mut frame.state
+                    && let InputValue::Retained(handle) = *value
+                {
+                    let bytes = {
+                        let bytes = source.retained_slice_mut(handle).map_err(|_| changed())?;
+                        scratch.alloc_slice_copy(&bytes).map_err(|_| full())?
+                    };
+                    let decoded =
+                        super::super::super::exec::decode_projected_col_record(bytes, 0, scratch)?;
+                    let decoded = scratch.alloc(decoded).map_err(|_| full())?;
+                    *value = InputValue::Evaluated(decoded);
+                }
+                Self::capture(frame, target)
+            })
+            .map_err(|_| full())?
+    }
+
     pub(super) fn capture(frame: InputFrame<'_>, arena: &Arena) -> Result<Self, SqlError> {
         let site = frame
             .site
@@ -243,5 +264,80 @@ impl OwnedInputFrame {
             )),
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::mem::Budget;
+
+    #[test]
+    fn suspended_input_frames_relocate_checked_values_and_selected_names() {
+        let mut budget = Budget::new(32 << 10);
+        let source = Arena::new(&mut budget, "selected input source", 8192).unwrap();
+        let short = Arena::new(&mut budget, "short input image", 16).unwrap();
+        let target = Arena::new(&mut budget, "selected input target", 8192).unwrap();
+        let image = crate::mem::guard::forbid_alloc(|| {
+            let saved = source
+                .with_remaining_region(|scratch| {
+                    let datum = Datum::Text(scratch.alloc_str("checked input").unwrap());
+                    let frame = InputFrame {
+                        site: InputPosition::Call {
+                            name: scratch.alloc_str("selected_function").unwrap(),
+                            kind: crate::sql::ast::CallKind::Routine,
+                            bound_oid: Some(73),
+                            arity: 2,
+                            variadic: false,
+                        },
+                        state: InputState::Value {
+                            value: InputValue::Evaluated(&datum),
+                            next_input: 7,
+                            next_invocation: 3,
+                            next_call: 9,
+                            replay: None,
+                        },
+                    };
+                    OwnedInputFrame::capture(frame, &source).unwrap()
+                })
+                .unwrap();
+            assert!(saved.relocate(&source, &short).is_err());
+            saved.relocate(&source, &target).unwrap()
+        });
+        drop(source);
+        crate::mem::guard::forbid_alloc(|| {
+            target
+                .with_remaining_region(|scratch| {
+                    let frame = image.load(&target, scratch).unwrap();
+                    assert_eq!(
+                        frame.site,
+                        InputPosition::Call {
+                            name: "selected_function",
+                            kind: crate::sql::ast::CallKind::Routine,
+                            bound_oid: Some(73),
+                            arity: 2,
+                            variadic: false,
+                        }
+                    );
+                    let InputState::Value {
+                        value: InputValue::Retained(bytes),
+                        next_input,
+                        next_invocation,
+                        next_call,
+                        replay,
+                    } = frame.state
+                    else {
+                        panic!("input state changed")
+                    };
+                    assert_eq!((next_input, next_invocation, next_call), (7, 3, 9));
+                    assert!(replay.is_none());
+                    let bytes = target.retained_slice_mut(bytes).unwrap();
+                    assert_eq!(
+                        crate::sql::exec::decode_projected_col_record(&bytes, 0, scratch).unwrap(),
+                        Datum::Text("checked input")
+                    );
+                })
+                .unwrap();
+        });
     }
 }

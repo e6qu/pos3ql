@@ -518,6 +518,7 @@ impl Arena {
     /// Recycles front allocations after `mark`. Owning-arena tail allocations
     /// stay live; a borrowed region also preserves the prefix containing its
     /// retained values until that region ends.
+    /// An unchanged frontier needs no rewind, even while a child region lives.
     ///
     /// # Safety
     ///
@@ -526,7 +527,6 @@ impl Arena {
     /// per-row value before rewinding; long-lived AST/scope state is allocated
     /// below the mark.
     pub(crate) unsafe fn rewind_to(&self, mark: ArenaMark) {
-        assert!(!self.region_active.get(), "arena region is still borrowed");
         assert!(
             mark.identity != 0 && mark.identity == self.retention_identity,
             "arena mark was reset or replaced"
@@ -536,6 +536,10 @@ impl Arena {
             "arena mark is ahead of the frontier"
         );
         let offset = mark.offset.max(self.retained_front.get());
+        if offset == self.offset.get() {
+            return;
+        }
+        assert!(!self.region_active.get(), "arena region is still borrowed");
         while let Some(cached) = self.interned.get() {
             // Entries remain initialized until the frontier moves below them.
             let cached = unsafe { cached.as_ref() };
@@ -1265,6 +1269,24 @@ mod tests {
             assert_eq!(moved.used(), stable_used);
             assert_eq!(moved.retained(value), Some(7));
         });
+        let before_child = moved.mark();
+        moved
+            .with_remaining_region(|child| {
+                let held = child.alloc_slice_with(32, |_| 0xa5_u8).unwrap();
+                let used = moved.used();
+                let unchanged = moved.mark();
+                crate::mem::guard::forbid_alloc(|| unsafe {
+                    moved.rewind_to(unchanged);
+                });
+                let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    moved.rewind_to(before_child);
+                }));
+                assert!(error.is_err());
+                assert_eq!(moved.used(), used);
+                assert!(held.iter().all(|byte| *byte == 0xa5));
+            })
+            .unwrap();
+        assert_eq!(moved.used(), stable_used);
         let wrong = other.mark();
         let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             moved.rewind_to(wrong);

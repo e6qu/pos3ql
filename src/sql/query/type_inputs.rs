@@ -21,9 +21,9 @@ type PlannerVisit<'a> = dyn FnMut(
 
 // Discovery can borrow storage briefly even when caller values live for the
 // entire execution. This adapter exposes the same declared identities only.
-struct MetadataOnly<'s, 'v> {
-    row: &'s dyn ColumnLookup<'v>,
-    columns: &'s dyn ColTypeResolver,
+pub(super) struct MetadataOnly<'s, 'v> {
+    pub(super) row: &'s dyn ColumnLookup<'v>,
+    pub(super) columns: &'s dyn ColTypeResolver,
 }
 
 impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
@@ -33,8 +33,13 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
             .map_or(-1, |column| column.type_mod)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
-        self.row.whole_row_column(table, index)
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
     }
 
     fn lookup(
@@ -52,10 +57,27 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        self.row.resolve_column_type(qualifier, name)
+        // A column descriptor cannot replace whole-row alias resolution.
+        // Only saved record OIDs need catalog-backed physical type lookup.
+        if self.row.column_type_oid(qualifier, name).is_some() {
+            self.col_type(qualifier, name).ok_or_else(|| {
+                sql_err!(
+                    super::sqlstate::UNDEFINED_OBJECT,
+                    "record field's declared type is unavailable"
+                )
+            })
+        } else {
+            self.row.resolve_column_type(qualifier, name)
+        }
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.row.col_type(qualifier, name)
+        if let Some(type_oid) = self.row.column_type_oid(qualifier, name) {
+            crate::sql::eval::constructor_type_from_oid(type_oid, &|oid| {
+                self.columns.domain_base_type(oid)
+            })
+        } else {
+            self.row.col_type(qualifier, name)
+        }
     }
     fn column_user_type(
         &self,
@@ -63,6 +85,9 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         self.row.column_user_type(qualifier, name)
+    }
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.row.column_type_oid(qualifier, name)
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)
@@ -1541,17 +1566,21 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     }),
                 );
             }
-            self.select(select, None, Some(targets))?;
+            // The source inherits procedural variables, not the target table's
+            // columns. Its own FROM entries still resolve in the inner scope.
+            self.select(select, outer, Some(targets))?;
         }
         if let Stmt::Merge(merge) = statement {
             self.expression(merge.on, &columns, &row)?;
         }
-        super::dependencies::visit_dml_assignment_groups(
+        super::dependencies::visit_resolved_dml_assignment_inputs(
             statement,
             storage,
             txid,
             arena,
             outer,
+            &scope,
+            true,
             &mut |group, assignment_columns| {
                 let row = MetadataOnly {
                     row: &row,

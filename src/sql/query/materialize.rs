@@ -36,6 +36,15 @@ struct EncodedRawRow<'s, 'd, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
@@ -388,18 +397,29 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             .map_or(-1, |column| column.type_mod)
     }
 
-    fn whole_row_column(&self, table: &str, index: usize) -> Option<crate::storage::ColumnMeta> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         let entry = self.0.qualified_star_entry(table, index).ok()?;
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs.get(table)?.columns().get(column).copied()
+                super::super::eval::stored_row_field_metadata(
+                    self.0.defs.get(table)?.columns().get(column)?,
+                    catalog,
+                )
             }
-            super::scope::ResolvedColumn::Merged(_) => Some(crate::storage::ColumnMeta {
-                name: crate::storage::SqlName::parse(self.0.output_name(entry)).ok()?,
-                ctype: self.0.output_type(entry),
-                collation: self.0.output_collation(entry),
-                ..crate::storage::ColumnMeta::EMPTY
-            }),
+            super::scope::ResolvedColumn::Merged(_) => Some((
+                crate::util::StackStr::from_str(self.0.output_name(entry)),
+                crate::sql::exec::StaticTypeMeta {
+                    type_oid: self.0.output_type(entry).oid(),
+                    ctype: self.0.output_type(entry),
+                    type_mod: -1,
+                    collation: self.0.output_collation(entry),
+                },
+            )),
         }
     }
 
@@ -497,6 +517,8 @@ pub(crate) fn finalize_projected_row<'a>(
     deferred: Option<&PostponedProjection>,
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
@@ -526,7 +548,9 @@ pub(crate) fn finalize_projected_row<'a>(
             SelectItem::TableWildcard(q) => {
                 slot += scope.qualified_star_columns(q)?;
             }
-            SelectItem::RecordStar(base) => slot += record_star_width(base, scope)?,
+            SelectItem::RecordStar(base) => {
+                slot += record_star_width(base, Some(scope), storage, txid, arena)?;
+            }
             SelectItem::Expr { expression, .. } => {
                 if d.postponed[i] {
                     out[slot] = eval_full(expression, arena, params, &row, hooks)?;
@@ -565,6 +589,7 @@ pub(super) struct MaterializationPlan<'a> {
 
 fn projected_collations<'a>(
     storage: &Storage,
+    txid: u32,
     arena: &Arena,
     statement: &Select<'a>,
     scope: &QueryScope<'a>,
@@ -576,7 +601,9 @@ fn projected_collations<'a>(
             SelectItem::Expr { .. } => 1,
             SelectItem::Wildcard => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
-            SelectItem::RecordStar(_) => 0,
+            SelectItem::RecordStar(base) => {
+                record_star_width(base, Some(scope), storage, txid, arena)?
+            }
         };
         if width + remaining > MAX_PROJ {
             return Err(sql_err!(
@@ -602,7 +629,22 @@ fn projected_collations<'a>(
                     width += 1;
                 }
             }
-            SelectItem::RecordStar(_) => {}
+            SelectItem::RecordStar(base) => {
+                crate::sql::exec::record_shape_metadata(
+                    base,
+                    &super::CatalogScopeCols {
+                        scope,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                        arena,
+                    },
+                    |_, metadata| {
+                        collations[width] = metadata.collation;
+                        width += 1;
+                    },
+                )?;
+            }
         }
     }
     Ok(collations)
@@ -686,6 +728,8 @@ pub(super) fn prepare_materialization<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
             &order_exprs[..key],
         )?;
         key_collations[key] = scope.expression_collation(storage, arena, resolved.expression)?;
@@ -697,6 +741,8 @@ pub(super) fn prepare_materialization<'a>(
             statement.items,
             scope,
             arena,
+            storage,
+            txid,
             &order_exprs[..n_order + index],
         )?;
         if n_order > 0
@@ -733,7 +779,9 @@ pub(super) fn prepare_materialization<'a>(
         width += match item {
             SelectItem::Wildcard => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
-            SelectItem::RecordStar(base) => record_star_width(base, scope)?,
+            SelectItem::RecordStar(base) => {
+                record_star_width(base, Some(scope), storage, txid, arena)?
+            }
             SelectItem::Expr { .. } => 1,
         };
     }
@@ -905,7 +953,7 @@ pub(crate) fn materialized_rows<'a>(
     rank_window: Option<usize>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
-    let visible_collations = projected_collations(storage, arena, statement, scope)?;
+    let visible_collations = projected_collations(storage, txid, arena, statement, scope)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
     let MaterializationPlan {
         n_order,
@@ -1837,6 +1885,8 @@ pub(crate) fn external_materialized_into<'a>(
                                     deferred.as_ref(),
                                     statement,
                                     scope,
+                                    storage,
+                                    txid,
                                     arena,
                                     params,
                                     hooks,
@@ -2103,7 +2153,14 @@ pub(crate) fn materialized_rows_into<'a>(
 ) -> Result<u64, SqlError> {
     let mut order_collations = [Collation::None; MAX_PROJ];
     for (index, order) in statement.order_by.iter().enumerate() {
-        let expression = resolve_order_target(order.expression, statement.items, scope, arena)?;
+        let expression = resolve_order_target(
+            order.expression,
+            statement.items,
+            scope,
+            arena,
+            storage,
+            txid,
+        )?;
         order_collations[index] = scope.expression_collation(storage, arena, expression)?;
     }
     let mut emitted = 0u64;
@@ -2220,7 +2277,8 @@ pub(crate) fn materialized_rows_into<'a>(
             }
             let mut out = [Datum::Null; MAX_PROJ];
             finalize_projected_row(
-                row, width, deferred, statement, scope, arena, params, hooks, outer, &mut out,
+                row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,
+                &mut out,
             )?;
             if lookahead {
                 break;
@@ -2267,7 +2325,8 @@ pub(crate) fn materialized_rows_into<'a>(
     for (index, row) in rows.iter().take(projection_window).enumerate() {
         let mut out = [Datum::Null; MAX_PROJ];
         finalize_projected_row(
-            row, width, deferred, statement, scope, arena, params, hooks, outer, &mut out,
+            row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,
+            &mut out,
         )?;
         if (index as u64) >= offset && index < window {
             let keep_emitting = emit(&out[..width])?;

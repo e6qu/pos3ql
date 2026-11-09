@@ -6215,7 +6215,38 @@ impl Expr<'_> {
                 array: right,
                 ..
             } => left.contains_subquery() || right.contains_subquery(),
-            Expr::Call { args, .. } => args.iter().any(|a| a.contains_subquery()),
+            Expr::Call {
+                args,
+                order_by,
+                over,
+                filter,
+                ..
+            } => {
+                args.iter().any(|argument| argument.contains_subquery())
+                    || order_by
+                        .iter()
+                        .any(|order| order.expression.contains_subquery())
+                    || filter.is_some_and(Expr::contains_subquery)
+                    || over.is_some_and(|window| {
+                        window
+                            .partition_by
+                            .iter()
+                            .any(|expression| expression.contains_subquery())
+                            || window
+                                .order_by
+                                .iter()
+                                .any(|order| order.expression.contains_subquery())
+                            || window.frame.is_some_and(|frame| {
+                                [frame.start, frame.end].iter().any(|bound| match bound {
+                                    FrameBound::Preceding(expression)
+                                    | FrameBound::Following(expression) => {
+                                        expression.contains_subquery()
+                                    }
+                                    _ => false,
+                                })
+                            })
+                    })
+            }
             Expr::InList { operand, list, .. } => {
                 operand.contains_subquery() || list.iter().any(|e| e.contains_subquery())
             }

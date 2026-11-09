@@ -1,6 +1,70 @@
 use super::*;
 
 #[test]
+fn write_input_analysis_reuses_its_target_at_one_image_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("assignment-scope-capacity-{mode:?}"));
+        config.transaction_mode = mode;
+        config.max_tables = 1;
+        config.max_catalog_versions_per_object = 1;
+        config.definition_image_slots = 1;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE scoped_assignments(id integer PRIMARY KEY,value integer)",
+        );
+        assert!(error_sqlstates(&setup).is_empty());
+        let mut arena = Arena::new(&mut budget, "assignment scope", 4 << 20).unwrap();
+        for _ in 0..2 {
+            for sql in [
+                "INSERT INTO scoped_assignments VALUES(1,abs(-7)),(2,abs(-9))",
+                "INSERT INTO scoped_assignments VALUES(1,2) ON CONFLICT(id) DO UPDATE SET value=abs(excluded.value) RETURNING value",
+                "UPDATE scoped_assignments AS target SET value=abs(target.value) WHERE target.id=1 RETURNING value",
+                "MERGE INTO scoped_assignments AS target USING (SELECT 1 AS id,9 AS value) AS source ON target.id=source.id WHEN MATCHED THEN UPDATE SET value=abs(source.value) WHEN NOT MATCHED THEN INSERT(id,value) VALUES(source.id,abs(source.value))",
+                "DELETE FROM scoped_assignments AS target WHERE target.id=1 RETURNING abs(target.value)",
+            ] {
+                crate::mem::guard::forbid_alloc(|| {
+                    let mut parser = Parser::new(sql, &arena).unwrap();
+                    parser.capture_type_inputs();
+                    let statement = parser.next_stmt().unwrap().unwrap();
+                    let mut visits = 0;
+                    query::visit_planner_calls(
+                        &statement,
+                        &engine.storage,
+                        0,
+                        &arena,
+                        None,
+                        &mut |expression, columns, _assignment| {
+                            exec::infer_routine_argument_oid(expression, columns)?;
+                            visits += 1;
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert!(visits > 0, "{mode:?}: {sql}");
+                });
+                arena.reset();
+            }
+        }
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT count(*) FROM scoped_assignments"
+            )),
+            ["0"]
+        );
+        drop((arena, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
 fn planner_analysis_precedes_folding_and_unreached_conditions_stay_unevaluated() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
@@ -62,42 +126,63 @@ fn trigger_transition_relations_bind_before_atomic_type_analysis() {
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        let mut config = test_config(&format!("transition-input-analysis-{mode:?}"));
-        config.transaction_mode = mode;
-        let mut budget = test_engine_budget(&config, 1 << 29);
-        let mut engine = Engine::new(&config, &mut budget).unwrap();
-        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        session.success(&mut engine,
-            "CREATE DOMAIN unrelated_transition_domain AS integer CHECK(VALUE>=0); \
-             CREATE TABLE transition_input_source(id integer); \
-             CREATE TABLE transition_input_audit(kind text,rows bigint,total bigint); \
-             CREATE FUNCTION transition_input_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             DECLARE initial_count bigint := (SELECT count(*) FROM inserted_rows); current_count bigint; \
-             BEGIN SELECT count(*) INTO current_count FROM inserted_rows; \
-             IF initial_count<>current_count THEN RAISE EXCEPTION 'transition row count changed'; END IF; \
-             INSERT INTO transition_input_audit SELECT 'static',count(*),sum(id) FROM inserted_rows; \
-             EXECUTE 'INSERT INTO transition_input_audit SELECT ''dynamic'',count(*),sum(id) FROM inserted_rows'; \
-             INSERT INTO transition_input_audit SELECT 'shadow',count(*),sum(id) FROM \
-               (WITH inserted_rows AS (SELECT 9 AS id) SELECT id FROM inserted_rows) scoped; \
-             RETURN NULL; END$$; \
-             CREATE TRIGGER transition_input_trigger AFTER INSERT ON transition_input_source \
-             REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT \
-             EXECUTE FUNCTION transition_input_trigger()", true);
-        session.success(
-            &mut engine,
-            "INSERT INTO transition_input_source VALUES(1),(2)",
-            true,
-        );
-        assert_eq!(
-            data_rows(&session.success(
+        for checked_type in [false, true] {
+            let mut config = test_config(&format!(
+                "transition-input-analysis-{mode:?}-{checked_type}"
+            ));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            let initializer = if checked_type {
+                session.success(
+                    &mut engine,
+                    "CREATE DOMAIN transition_count_domain AS integer CHECK(VALUE>=0)",
+                    true,
+                );
+                "'0'::transition_count_domain+(SELECT count(*) FROM inserted_rows)"
+            } else {
+                "'0'::integer+(SELECT count(*) FROM inserted_rows)"
+            };
+            session.success(
                 &mut engine,
-                "SELECT kind,rows,total FROM transition_input_audit ORDER BY kind",
-                true
-            )),
-            ["dynamic|2|3", "shadow|1|9", "static|2|3"]
-        );
-        drop((session, engine));
-        std::fs::remove_dir_all(config.data_dir).unwrap();
+                &format!(
+                    "CREATE TABLE transition_input_source(id integer); \
+                     CREATE TABLE transition_input_audit(kind text,rows bigint,total bigint); \
+                     CREATE FUNCTION transition_input_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                     DECLARE initial_count bigint := (SELECT count(*) FROM inserted_rows); \
+                     checked_count bigint := {initializer}; current_count bigint; \
+                     BEGIN SELECT count(*) INTO current_count FROM inserted_rows; \
+                     IF initial_count<>current_count OR checked_count<>current_count THEN \
+                     RAISE EXCEPTION 'transition row count changed'; END IF; \
+                     INSERT INTO transition_input_audit SELECT 'static',count(*),sum(id) FROM inserted_rows; \
+                     EXECUTE 'INSERT INTO transition_input_audit SELECT ''dynamic'',count(*),sum(id) FROM inserted_rows'; \
+                     INSERT INTO transition_input_audit SELECT 'shadow',count(*),sum(id) FROM \
+                       (WITH inserted_rows AS (SELECT 9 AS id) SELECT id FROM inserted_rows) scoped; \
+                     RETURN NULL; END$$; \
+                     CREATE TRIGGER transition_input_trigger AFTER INSERT ON transition_input_source \
+                     REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT \
+                     EXECUTE FUNCTION transition_input_trigger()"
+                ),
+                true,
+            );
+            session.success(
+                &mut engine,
+                "INSERT INTO transition_input_source VALUES(1),(2)",
+                true,
+            );
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT kind,rows,total FROM transition_input_audit ORDER BY kind",
+                    true
+                )),
+                ["dynamic|2|3", "shadow|1|9", "static|2|3"],
+                "{mode:?}, checked type: {checked_type}"
+            );
+            drop((session, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
     }
 }
 
@@ -425,7 +510,7 @@ fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() 
         let session = connection.guc.seq_session();
         crate::mem::guard::forbid_alloc(|| {
             {
-                let _scope = crate::sql::sequence::enter_statement(&arena, session, false);
+                let _scope = crate::sql::sequence::enter_statement(&arena, session, false, None);
                 let values = crate::sql::sequence::statement_effect(
                     crate::sql::sequence::StatementEffectKind::Cursor,
                     &[Datum::Text("fetch")],
@@ -451,7 +536,7 @@ fn completed_cursor_receipts_restore_sparse_canonical_sequence_session_values() 
             }
             arena.recycle_front();
             {
-                let scope = crate::sql::sequence::enter_statement(&arena, session, true);
+                let scope = crate::sql::sequence::enter_statement(&arena, session, true, None);
                 let values = crate::sql::sequence::statement_effect(
                     crate::sql::sequence::StatementEffectKind::Cursor,
                     &[Datum::Text("fetch")],

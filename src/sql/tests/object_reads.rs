@@ -16,10 +16,28 @@ pub(crate) struct HttpObjectServer {
     pub(super) requests: Arc<AtomicUsize>,
     pub(super) uploads: Arc<AtomicUsize>,
     pub(super) hold_response: Arc<AtomicBool>,
+    hold_upload_response: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+pub(crate) struct HeldUploadResponses<'a> {
+    held: &'a AtomicBool,
+}
+
+impl Drop for HeldUploadResponses<'_> {
+    fn drop(&mut self) {
+        self.held.store(false, Ordering::Release);
+    }
+}
+
 impl HttpObjectServer {
+    pub(crate) fn hold_upload_responses(&self) -> HeldUploadResponses<'_> {
+        assert!(!self.hold_upload_response.swap(true, Ordering::AcqRel));
+        HeldUploadResponses {
+            held: &self.hold_upload_response,
+        }
+    }
+
     pub(crate) fn start(config: &mut Config) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -36,10 +54,12 @@ impl HttpObjectServer {
         let requests = Arc::new(AtomicUsize::new(0));
         let uploads = Arc::new(AtomicUsize::new(0));
         let hold_response = Arc::new(AtomicBool::new(false));
+        let hold_upload_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
         let server_uploads = Arc::clone(&uploads);
         let server_hold_response = Arc::clone(&hold_response);
+        let server_hold_upload_response = Arc::clone(&hold_upload_response);
         let server = std::thread::spawn(move || {
             let mut fixture_budget =
                 Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
@@ -141,6 +161,14 @@ impl HttpObjectServer {
                         match backing.put(key, &body, condition) {
                             Ok(tag) => {
                                 server_uploads.fetch_add(1, Ordering::Relaxed);
+                                while server_hold_upload_response.load(Ordering::Acquire)
+                                    && !server_stop.load(Ordering::Acquire)
+                                {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                if server_stop.load(Ordering::Acquire) {
+                                    break;
+                                }
                                 write!(stream, "HTTP/1.1 200 OK\r\nETag: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", tag.as_str()).unwrap();
                             }
                             Err(crate::object_store::Error::Status { code: 412, .. }) => {
@@ -174,6 +202,9 @@ impl HttpObjectServer {
                         {
                             std::thread::sleep(Duration::from_millis(1));
                         }
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         if let Some(range) = range {
                             let (first, last) = range
                                 .strip_prefix("bytes=")
@@ -204,6 +235,7 @@ impl HttpObjectServer {
             requests,
             uploads,
             hold_response,
+            hold_upload_response,
             thread: Some(server),
         }
     }

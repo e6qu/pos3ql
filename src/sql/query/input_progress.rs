@@ -365,6 +365,70 @@ pub(super) struct RoutineInputs {
 }
 
 impl RoutineInputs {
+    pub(super) fn relocate(&self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
+        let output = Self::new();
+        output.next.set(self.next.get());
+        let saved = self.saved.borrow();
+        for index in 0..saved.len() {
+            let entry = saved
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            let frames = source
+                .retained_slice_mut(entry.frames)
+                .map_err(|_| changed())?;
+            let copied = target
+                .retain_slice_with(frames.len(), |index| frames[index])
+                .map_err(|_| full())?;
+            for (index, handle) in frames.iter().copied().enumerate() {
+                let frame = source.retained(handle).ok_or_else(changed)?;
+                let frame = frame.relocate(source, target)?;
+                let frame = target.retain(frame).map_err(|_| full())?;
+                target.retained_slice_mut(copied).map_err(|_| changed())?[index] = frame;
+            }
+            output
+                .saved
+                .borrow_mut()
+                .push(
+                    target,
+                    SavedInputs {
+                        ordinal: entry.ordinal,
+                        frames: copied,
+                    },
+                )
+                .map_err(directory_error)?;
+        }
+        let evaluations = self.evaluations.borrow();
+        for index in 0..evaluations.len() {
+            let entry = evaluations
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            output
+                .evaluations
+                .borrow_mut()
+                .push(target, entry)
+                .map_err(directory_error)?;
+        }
+        let casts = self.cast_selections.borrow();
+        for index in 0..casts.len() {
+            let entry = casts
+                .get(source, index)
+                .map_err(|_| changed())?
+                .ok_or_else(changed)?;
+            let cast = entry
+                .value(source)?
+                .map(|cast| target.retain(cast).map_err(|_| full()))
+                .transpose()?;
+            output
+                .cast_selections
+                .borrow_mut()
+                .push(target, CastSelection { cast, ..entry })
+                .map_err(directory_error)?;
+        }
+        Ok(output)
+    }
+
     pub(super) fn new() -> Self {
         Self {
             next: Cell::new(0),
@@ -1124,6 +1188,105 @@ mod tests {
     use crate::mem::budget::Budget;
 
     #[test]
+    fn invocation_registry_relocates_checked_inputs_results_and_cast_selections() {
+        let mut budget = Budget::new(64 << 10);
+        let owner = Arena::new(&mut budget, "retained query receipts", 32 << 10).unwrap();
+        let mut work = Arena::new(&mut budget, "checked query inputs", 16 << 10).unwrap();
+        let invocations = crate::mem::guard::forbid_alloc(|| {
+            owner
+                .with_remaining_region(|query| {
+                    let invocations = RoutineInvocationState::new(query);
+                    with_routine_invocation_scope(
+                        Some(RoutineInvocationContext::new(&invocations, query)),
+                        || {
+                            let result = call(&work, || {
+                                let _input = enter();
+                                let text = work.alloc_str("saved input").unwrap();
+                                value(InputSite::Query(InputQuery::Scalar), &work, || {
+                                    Ok(Datum::Text(text))
+                                })?;
+                                Err::<(), _>(sql_err!(
+                                    sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                                    "input handoff"
+                                ))
+                            });
+                            assert_eq!(
+                                result.unwrap_err().sqlstate,
+                                sqlstate::INTERNAL_ROUTINE_INVOCATION
+                            );
+                            invocations
+                                .complete(
+                                    OwnedRoutineResult::capture_scalar(Datum::Int4(42), query)
+                                        .unwrap(),
+                                    query,
+                                    &work,
+                                )
+                                .unwrap();
+                            evaluation(77, crate::sql::eval::ExpressionEvaluation::Runtime)
+                                .unwrap();
+                            cast_selection(
+                                23,
+                                25,
+                                crate::sql::eval::DefinedCastContext::Explicit,
+                                || Ok(Some(captured_cast(99))),
+                            )
+                            .unwrap();
+                        },
+                    );
+                    invocations.relocate(query, &owner).unwrap()
+                })
+                .unwrap()
+        });
+        let mut moved = owner;
+        crate::mem::guard::forbid_alloc(|| {
+            moved.recycle_front();
+            moved.alloc_slice_with(4096, |_| 0xccu8).unwrap();
+            let retained = moved.used();
+            with_routine_invocation_scope(
+                Some(RoutineInvocationContext::new(&invocations, &moved)),
+                || {
+                    for _ in 0..8 {
+                        work.reset();
+                        invocations.begin_attempt();
+                        let result = call(&work, || {
+                            let _input = enter();
+                            value(InputSite::Query(InputQuery::Scalar), &work, || {
+                                panic!("checked input ran twice")
+                            })
+                        })
+                        .unwrap();
+                        assert_eq!(result, Datum::Text("saved input"));
+                        assert_eq!(
+                            invocations
+                                .resolve_intrinsic(42, &[], &moved, &work)
+                                .unwrap(),
+                            Datum::Int4(42)
+                        );
+                        assert_eq!(
+                            evaluation(77, crate::sql::eval::ExpressionEvaluation::Immutable)
+                                .unwrap(),
+                            crate::sql::eval::ExpressionEvaluation::Runtime
+                        );
+                        let cast = cast_selection(
+                            23,
+                            25,
+                            crate::sql::eval::DefinedCastContext::Explicit,
+                            || panic!("cast was selected again"),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(
+                            cast.definition.method,
+                            crate::storage::CastMethod::Function(99)
+                        );
+                        assert_eq!(moved.used(), retained);
+                    }
+                },
+            );
+        });
+    }
+
+    #[test]
     fn invocation_registry_keeps_inputs_results_and_selections_after_owner_move() {
         let mut budget = Budget::new(64 << 10);
         let original = Arena::new(&mut budget, "movable invocation owner", 32 << 10).unwrap();
@@ -1152,6 +1315,7 @@ mod tests {
                     invocations
                         .complete(
                             OwnedRoutineResult::capture_scalar(Datum::Int4(42), &original).unwrap(),
+                            &original,
                             &original,
                         )
                         .unwrap();
@@ -1224,7 +1388,10 @@ mod tests {
             let retained = OwnedRoutineResult::capture_scalar(Datum::Null, &moved).unwrap();
             moved.reset();
             assert_eq!(
-                invocations.complete(retained, &moved).unwrap_err().sqlstate,
+                invocations
+                    .complete(retained, &moved, &moved,)
+                    .unwrap_err()
+                    .sqlstate,
                 "XX000"
             );
         });
@@ -1511,7 +1678,7 @@ mod tests {
         let invocations = RoutineInvocationState::new(&statement);
         let actions = Cell::new(0);
         crate::mem::guard::forbid_alloc(|| {
-            let scope = sequence::enter_statement(&statement, guc.seq_session(), false);
+            let scope = sequence::enter_statement(&statement, guc.seq_session(), false, None);
             let start = sequence::begin_replay_cursor().unwrap();
             with_routine_invocation_scope(
                 Some(RoutineInvocationContext::new(&invocations, &statement)),
@@ -1564,6 +1731,7 @@ mod tests {
                             invocations
                                 .complete(
                                     OwnedRoutineResult::capture_scalar(body, &statement).unwrap(),
+                                    &statement,
                                     &statement,
                                 )
                                 .unwrap();

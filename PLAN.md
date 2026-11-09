@@ -32,152 +32,123 @@ and [what has actually been measured](docs/performance.md).
 
 ### Retain query progress and finish application compatibility
 
-**Example:** a query reads three orders, increments a session counter in its
-first result column and writes an audit row through a function in its second.
-It must produce three increments, three audit rows and three result rows,
-including when a function pauses. Completed columns must not run again.
+**Example:** inserting an order writes an audit row and issues an order number.
+A trigger then waits for storage or another connection's lock. Resuming must
+continue that order with the same local values, audit row and number. Another
+client must make progress while the storage response waits.
 
-Simple table scans already preserve completed expressions during mutable-function
-handoffs. Checked inputs, selected type descriptions and index/constraint
-identities now have passing allocation, recovery, native-platform and PostgreSQL
-comparison coverage. The [architecture](docs/architecture.md#the-request-path)
-and [compatibility guide](docs/postgresql-18-compatibility.md) own those current
-contracts. Keep that coverage while completing the following execution work.
-Preserve remote savepoint boundaries when the first foreign connection opens
-inside a procedural block, including after nested release or rollback.
+Object requests already overlap. The remaining execution work makes more SQL
+paths safe to pause; increasing request slots alone cannot do that. Ordered
+commit publication does not require serializing every query or independent
+upload. Keep synchronous protection on each path until its unfinished work has
+an owner that survives returning to the scheduler.
 
-Data-change triggers still reject reached domain-array literal checks with
-`0A000`. For example, an `AFTER INSERT` trigger that evaluates
-`'{1}'::positive_integer[]` must eventually run the domain constraint with the
-inserted rows visible. It must keep earlier trigger writes, local variables,
-branch and loop positions, `OLD`/`NEW` values and statement transition rows while
-input preparation waits. Undoing the insert before preparing the input would
-let the constraint inspect the wrong data.
+The active implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
+completion, trigger frames and completed calls within unfinished `PERFORM` and
+`SELECT ... INTO`. These mechanisms still need final qualification with the
+remaining paths below. The [request path](docs/architecture.md#the-request-path)
+owns their detailed contracts and regression evidence.
 
-Retain the enclosing row operation and procedural invocation together. Suspend
-only after releasing temporary storage borrows; resume the exact unfinished
-operation without executing earlier rows or trigger statements again. Keep the
-original selected definitions, settings, statement snapshot and deadline.
-Cancellation or a real error must release retained owners and use the ordinary
-transaction rollback rules. A private wait must not be caught as a user error.
-Preserve typed control ownership: an application raising the same diagnostic
-code must still return or catch its own error normally, including in functions
-returning rows and category handlers.
-Keep input-validation functions on the same boundary: a domain check returning
-false is invalid input; an exception or private wait inside that check must
-propagate, including through arrays and composite fields.
-Cover row and statement triggers, nested calls, all firing times, partitioned
-writes, deferred triggers, COPY and replication apply. Compare visible rows,
-audit writes, sequence values and errors with PostgreSQL in both transaction
-modes, including repeated waits and empty-cache reads. Do not enable a rejected
-input by bypassing its constraint or by replaying already completed changes.
+Complete these connected execution paths:
 
-Complete the same retained execution positions for the remaining function
-bodies, complex query plans, SQL cursors and results already sent to the client.
-Preserve the reference-backed function result and conversion contracts in the
-[architecture](docs/architecture.md#the-request-path), including once-only input
-and constraint-helper effects.
-Preserve independent input and result widths; an input-argument limit must not
-truncate or crash a wider table-function result.
-Some function-body waits currently reject earlier non-repeatable effects with
-`0A000`. Preserve those effects instead of enlarging retry or memory limits.
-Keep the original command deadline, settings, identity, snapshot and clocks
-while binding inputs, waiting, running handlers or crossing internal commits.
-Preserve the [protocol and COPY ownership rules](docs/architecture.md#the-request-path),
-including buffered replies, error recovery and protected commit receipts.
-A caught timeout must not be delivered again or replay completed work when its
-handler waits; a user-raised cancellation must not disable a future timeout.
-Carry owned control and value-slot buffers through scheduler returns together
-with declared types, selected source definitions, output bindings and the
-enclosing write. Ordinary and numeric active local slots still refer to
-statement-memory payloads. Keep those payloads alive or save them before
-recycling scratch; positions alone cannot resume an invocation.
-Saved output bytes now own reusable control-pool ranges independent of their
-source arenas. Preserve that ownership, the outer value through nested counters,
-failure-preserving growth, rollback and reuse after exhaustion, and decoded
-copies after the saved buffer drops.
-Retain the original 4 MiB nested-output regression and its PostgreSQL fixture.
-Source images now own control-pool bytes shared by compiled syntax and saved
-positions. Preserve original text and program kind after input/parsing storage
-is destroyed, and reject replacement images even when their text is identical.
-Source capture must precede initializers and return failed admission capacity.
-Incomplete blocks must return syntax error `42601` and release their source storage;
-keep that coverage against PostgreSQL for empty bodies, incomplete declarations,
-loops, branches and exception handlers.
-Split procedural statements at SQL token boundaries so semicolons inside dollar
-strings, escaped strings and comments remain part of the original statement.
-Lexer buffer exhaustion must return resource limit `54000`, preserve real syntax
-errors and release temporary scan memory for the next operation.
-Keep those source-owner checks while retaining selected definitions and session
-settings; owning the text alone does not preserve their original meaning.
-Preserve once-only declaration initialization after input/output parameter slots
-are seeded. Keep parameter, local, handler and numeric-loop bindings distinct;
-reads and assignments use the innermost binding, while returning outputs uses
-the original output slots. Preserve quoted names and reject constant assignment
-and FETCH targets before effects. Keep named constant cursors readable at OPEN.
-Caught-error directories and bytes now have control-pool owners. Preserve
-borrowed handler views, saved fields after source/owner destruction, nesting,
-rethrow, admission before initializers, and rollback/reuse after failed capture.
-Nested calls must release diagnostic capacity after each call and keep audit
-writes and sequence effects once; qualify the same SQL in both transaction modes
-and against PostgreSQL. Preserve
-handler variables in rewritten local and NEW-row assignments, including JSON
-subscripts. Keep trigger context types and undefined-name errors compatible.
+- Retain a function paused inside its body, including arguments, local values,
+  loops, handlers, completed writes, pending child calls and unfinished return
+  conversion. SQL-language functions also need their position between body
+  statements. A completed body must not run again if checking its return value
+  waits. Scalar and table functions need the same guarantees; result width is
+  independent of the input-argument limit.
+  Preserve one timing count across pauses; an active timer must release its
+  fixed-stack entry on failure and report exhaustion rather than omit tracking.
+- Finish write phases before and around AFTER work: BEFORE/INSTEAD triggers,
+  source scans, row locks, partitions, constraints and transition collection.
+  Include combined commands, rules, data-modifying common table expressions,
+  COPY, replication apply and deferred triggers. Retain the original command
+  and rollback boundary, rather than undoing inserted rows before a constraint
+  can inspect them. Each insert/update/delete operation keeps its own completed
+  transition table and firing order.
+- Preserve remaining expression values, complex query positions and cursor
+  progress. After the first result flush, continue with one header, every row
+  once and one completion. `FETCH` must not execute effects for unfetched rows;
+  saving a held cursor at commit must also yield during storage waits. Keep
+  declared record and domain types after its source query ends. The
+  [visibility milestone](#finish-transaction-visibility-and-keep-maintenance-moving)
+  owns the overlapping reader and cleanup requirements.
 
-Retain current input, call, diagnostic and result ownership checks described in
-the [architecture](docs/architecture.md#the-request-path): moved/reset/foreign
-owners, nested callback restoration, original selected types and effect positions,
-empty and wide results, and failure-preserving directory growth. Keep immutable
-argument/result images inside unchanged statement capacity. The 4,096-row set
-result and repeated-loop tests must pass with the original 4 MiB arena.
-Nested SQL/procedural result calls must release their row images between calls
-and preserve exactly one sequence increment and audit write per invocation.
-Qualify every reference fixture in both transaction modes. Native trigger audits
-and live PostgreSQL comparisons must use the same SQL file.
-A caught `RETURN QUERY` error keeps its completed
-result prefix; a private wait must not publish that prefix twice.
-Preserve PostgreSQL's different row-consumption rules for static `SELECT INTO`
-and dynamic `EXECUTE INTO`.
+Acceptance applies across every path, rather than as separate roadmap projects:
 
-Simple table, constant `VALUES` and one-row cursor expressions already defer
-work until fetching. Extend that behavior to remaining plans without issuing
-sequence values or taking row locks for unfetched rows. Keep opened plans alive
-through lock waits, separate fetches, `DISCARD PLANS` and holdable commit. Saving
-a holdable result and sending a large ordinary result must yield during object
-reads while preserving one result header, every row once and one completion.
-Keep saved values typed so rendering settings changed before `FETCH` affect
-presentation without changing their values.
-
-Keep retained state inside explicit startup capacity. Release it after success,
-errors, cancellation, rollback and connection closure. Prove no heap growth,
-no stale arena handles, fair progress for another connection and named capacity
-errors. Keep live-call control ownership separate from shared cached plans and
-row payloads. Preserve shared-pool admission before initializer effects and
-return position, resource, local-value, numeric-scope and output-binding capacity
-on failure or owner drop, independently of table count. Keep resource pairing in
-one owner and save only live parameter slots. Preserve unchanged parent counter
-slots when copying a completed numeric scope back. Keep saved output and
-caught-error bytes in their own reusable control-pool ranges, separate from
-binding and handler metadata. Release handler capacity with its invocation;
-repeated catches must reuse buffers, not accumulate abandoned arena allocations.
-Keep file, generated and embedded test configurations explicit and complete;
-capacity regressions must reach their intended limit rather than an earlier
-missing-setting error.
-Existing checked-plan and stored-object tests remain required;
-[reference evidence](https://github.com/e6qu/pos3ql/blob/2303cd158bc419ef508089b87c13537f86c05210/tests/external/reference/2026-11-03-input-plans/README.md)
-retains the PostgreSQL observations and their provenance. Cold-recovery tests
-must enable object storage and synchronous publication before deleting caches.
+- Keep the originally selected definitions, checked inputs, values, settings,
+  effective user, command visibility, timestamps and deadline. Completed
+  sequence calls, advisory-lock holds, input checks, cursor operations, audit
+  writes and already delivered rows happen once, including repeated waits and
+  a new call after resumption. Preserve PostgreSQL's distinct static/dynamic
+  INTO behavior and its errors without overwriting an unchanged target.
+  Preserve exact warnings and their message filtering across the same call
+  handoffs; a failed advisory unlock returns false and its warning once.
+  Internal commits of a concurrent index command retain that command's saved
+  advisory-call position until its next execution attempt.
+- Failed capture leaves the live call usable; failed attachment preserves the
+  saved owner and the caller. Recycling temporary memory cannot change saved
+  text, arrays, records or NULL field types. Private waits bypass user error
+  handlers; an application raising an identical diagnostic code remains an
+  ordinary SQL error. Preserve remote savepoint boundaries when a foreign
+  connection first opens inside nested procedural work.
+  Completion and a paused trigger share the captured table's matching row
+  schema, with independent pins inside the original configured image cell.
+  Assignment input discovery borrows its enclosing write's selected scope
+  instead of resolving the same target again. Exhaustion and
+  repeated nested-write retries must work within the configured image slots.
+  Query descriptions retain domain identities through casts, record expansion,
+  named columns, field selection and array subscripting, including columns
+  selected from derived tables. Saved procedural queries expose
+  ordinary record fields as well as trigger records, including NULL fields.
+  Comparisons between two text-domain fields must also keep their collation.
+  Preserve whole-row aliases such as `(t).*` in procedural query planning.
+  Track expanded columns and selected fields in saved-query dependencies,
+  preserving column precedence when its name matches a table alias.
+  Apply the same reference-kind rules to RETURNING and write expressions,
+  including old/new aliases and excluded conflict rows. Bind local WITH names
+  before describing a derived table inside procedural input analysis. Bind the
+  expression actually executed after checked-input restoration, including
+  declaration initializers that read transition tables. Nested
+  WITH clauses must also expand when the outer query has none. SELECT INTO
+  descriptions use the same local scope as execution, including NULL domain
+  fields, table-backed queries and set-operation branches. ROW constructors
+  resolve field positions after embedded whole rows have expanded, including
+  runtime type identity and wire descriptions. Parse INTO targets at identifier
+  boundaries so set operations remain in their source query. Type-only query
+  contexts preserve whole-row field names, declared types, modifiers and
+  collations without reading row values. Bind query
+  sources inside multi-column assignments through the same substitution walk.
+  Their field projections share one rewritten query, preserving once-only effects.
+  Distinguish sequence-only SQL helpers from programs that need mutable catalog
+  execution; trigger source queries keep their active sequence session.
+  Count expanded record fields consistently in sorting, grouping, window
+  queries and deferred output. For example, after a two-field record expands,
+  `ORDER BY 3` selects the following output column, including without `FROM`.
+- Cancellation, timeout, rollback, connection closure and successful completion
+  release owners. A handled timeout stays consumed if its handler waits.
+  Memory remains inside the existing startup pools, with named exhaustion and
+  no heap growth. Preserve 4,096-row results and repeated loops within the
+  original 4 MiB statement arena. Repeated calls and catches reuse capacity.
+- Demonstrate another client's progress with an actually delayed object-store
+  GET, including empty-cache reads, both transaction modes, simple and extended
+  protocols, triggers and nested functions. Compare the same SQL fixture with
+  PostgreSQL 18: rows, audit writes, sequence values, types, errors and rollback.
+  Keep allocation-forbidden, memory-ownership and failed-restoration coverage.
 
 Audit PostgreSQL 18 built-ins by signature and executable behavior; catalog
-presence alone is not support. Preserve values, declared types, null handling,
-errors, argument effects and permission checks. Keep the real SQLAlchemy,
-Alembic, psycopg2 and other client comparisons, all four full workflows, and
-native Linux amd64/arm64 and macOS arm64 coverage on the finished revision.
-Keep the explicit coverage and native CI profiles and measure build and execution
-separately within unchanged job limits. Preserve assertions and all native targets
-while bounding compiler concurrency and debug-data work. Cancelled builds and
-skipped execution jobs are incomplete qualification. Run final qualification on
-the finished revision.
+presence alone is not support. Keep real SQLAlchemy, Alembic, psycopg2 and other
+client comparisons. Complete all four full workflows on the finished revision,
+including Linux amd64/arm64 and macOS arm64. Cancelled builds and skipped tests
+are incomplete qualification. The native macOS mutex gate runs all ownership
+cases and a direct Apple API control with ThreadSanitizer. Qualify the final
+head using the permanent workflows.
+
+Preserve explicit coverage/native profiles, assertions and all native targets.
+Measure build and execution separately within unchanged job limits; bound
+compiler concurrency and debug data instead of increasing timeouts. Each runner
+job has its own bounded timeout, independent of shorter step timeouts. The
+[contribution guide](CONTRIBUTING.md) owns the verification procedure.
 
 ### Share fixed memory and disk capacity according to demand
 
@@ -365,6 +336,8 @@ Reclaim each polling snapshot's scratch space instead of relying on a favorable
 thread schedule to finish before the arena fills.
 Keep compiler and per-test progress visible through CI cancellation while
 diagnosing deadline overruns; preserve the existing job budgets.
+Require both ownership groups to complete successfully and cover the full named
+manifest without missing, repeated or ignored proofs.
 
 No runtime heap growth, growing pools or allocating sorts. Keep consequential
 settings explicit and avoid needless wrappers and fallbacks. Capacity increases

@@ -308,7 +308,7 @@ fn procedural_for_queries_execute_source_effects_once() {
 // PostgreSQL 18.6 event-trigger visibility reference SQL SHA256:
 // 88cbb1c2ca5aad8e5b7883ef3cda840d008be0f3f790f60cdcf620435a6e8cfe.
 #[test]
-fn checked_trigger_inputs_preserve_visibility_or_reject_before_constraint_effects() {
+fn checked_before_trigger_inputs_reject_before_constraint_effects_and_events_see_rows() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -329,7 +329,7 @@ fn checked_trigger_inputs_preserve_visibility_or_reject_before_constraint_effect
              CREATE FUNCTION checked_row_input() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN \
                IF NEW.id=0 THEN RETURN NEW; END IF; \
                PERFORM cardinality('{1}'::trigger_input_checked[]); RETURN NEW; END$$; \
-             CREATE TRIGGER checked_row_input AFTER INSERT ON trigger_input_rows \
+             CREATE TRIGGER checked_row_input BEFORE INSERT ON trigger_input_rows \
                FOR EACH ROW EXECUTE FUNCTION checked_row_input(); \
              INSERT INTO trigger_input_rows VALUES(0)", true);
         let rejected = session.execute(

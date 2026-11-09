@@ -735,30 +735,18 @@ pub struct CopyRowContext<'a, 'response> {
     guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
-    dml_scratch: CopyDmlScratch<'a>,
     transition_rows: &'a mut exec::CopyTransitionRows,
-}
-
-enum CopyDmlScratch<'a> {
-    ActiveWorkspace,
-    SubscriptionWorker(&'a mut exec::DmlScratch),
 }
 
 pub(crate) struct SubscriptionCopyWorkspace<'a> {
     arena: &'a mut Arena,
-    dml_scratch: &'a mut exec::DmlScratch,
     transition_rows: &'a exec::CopyTransitionRows,
 }
 
 impl<'a> SubscriptionCopyWorkspace<'a> {
-    pub(crate) fn new(
-        arena: &'a mut Arena,
-        dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a exec::CopyTransitionRows,
-    ) -> Self {
+    pub(crate) fn new(arena: &'a mut Arena, transition_rows: &'a exec::CopyTransitionRows) -> Self {
         Self {
             arena,
-            dml_scratch,
             transition_rows,
         }
     }
@@ -777,25 +765,6 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
             guc,
             arena,
             responder,
-            dml_scratch: CopyDmlScratch::ActiveWorkspace,
-            transition_rows,
-        }
-    }
-
-    pub(crate) fn for_subscription_worker(
-        txn: &'a mut TxnState,
-        guc: &'a GucState,
-        arena: &'a Arena,
-        responder: &'a mut Responder<'response>,
-        dml_scratch: &'a mut exec::DmlScratch,
-        transition_rows: &'a mut exec::CopyTransitionRows,
-    ) -> Self {
-        Self {
-            txn,
-            guc,
-            arena,
-            responder,
-            dml_scratch: CopyDmlScratch::SubscriptionWorker(dml_scratch),
             transition_rows,
         }
     }
@@ -2767,10 +2736,6 @@ impl Engine {
         self.work.select(workspace);
         self.wal.select_database(self.work.database_oid());
         let _ = self.replace_read_owner(Some(self.execution_identity().read_owner()));
-    }
-
-    pub(crate) fn row_work_pool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
-        &self.storage.row_work
     }
 
     pub(crate) fn release_query_workspace_rows(&mut self, workspace: QueryWorkspaceId) {
@@ -8506,7 +8471,6 @@ impl Engine {
             arena,
             guc.seq_session(),
             responder,
-            &mut *self.dml_scratch,
             boundary,
         )
     }
@@ -8612,6 +8576,11 @@ impl Engine {
     /// before discovering a lock wait. Transaction-level locks remain held
     /// while the protocol message is parked.
     fn rollback_waiting_statement(&mut self, txn: &mut TxnState, mark: txn::StatementMark) {
+        let mark = if let Some(completion) = txn.pending_write_completion.take() {
+            completion.boundary()
+        } else {
+            mark
+        };
         assert!(
             txn.owns_statement_mark(mark),
             "a statement rewind cannot cross a transaction boundary"
@@ -9586,10 +9555,7 @@ impl Engine {
         }
         let result = match name {
             Some(name) => guc.reset(name),
-            None => {
-                guc.reset_all();
-                Ok(())
-            }
+            None => guc.reset_all(),
         };
         match result {
             Ok(()) => {
@@ -9978,6 +9944,8 @@ impl Engine {
                             txn.txid,
                             arena,
                             &mut result_columns,
+                            crate::sql::exec::DescriptionTarget::Wire,
+                            None,
                         )
                     }),
                 Stmt::SetQuery(query) => query::describe_set_query(
@@ -9986,15 +9954,23 @@ impl Engine {
                     query,
                     &mut result_columns,
                     arena,
+                    crate::sql::exec::DescriptionTarget::Wire,
                 ),
                 Stmt::With { statement, .. } => self.describe_data_modification_columns(
                     statement,
                     arena,
                     txn,
                     &mut result_columns,
+                    crate::sql::exec::DescriptionTarget::Wire,
                 ),
                 Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => self
-                    .describe_data_modification_columns(statement, arena, txn, &mut result_columns),
+                    .describe_data_modification_columns(
+                        statement,
+                        arena,
+                        txn,
+                        &mut result_columns,
+                        crate::sql::exec::DescriptionTarget::Wire,
+                    ),
                 _ => Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "utility statements cannot be prepared"
@@ -10412,6 +10388,9 @@ impl Engine {
         arena: &Arena,
         context: exec::PlpgsqlTransactionContext,
     ) -> Result<bool, SqlError> {
+        if txn.pending_write_completion.is_some() {
+            return Ok(false);
+        }
         if let Some(wait) = &txn.cache_capacity_wait {
             txn.restore_statement_deadline(wait.deadline);
             query::check_timeout()?;
@@ -10613,10 +10592,6 @@ impl Engine {
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
-        let scratch = match context.dml_scratch {
-            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
-            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
-        };
         exec::copy_row(
             &mut self.storage,
             context.txn,
@@ -10625,7 +10600,6 @@ impl Engine {
             line,
             context.arena,
             context.responder,
-            scratch,
             context.transition_rows,
         )
     }
@@ -10653,10 +10627,6 @@ impl Engine {
         query::check_timeout()?;
         self.check_writer_fence()?;
         let _atomic_reads = self.atomic_block_read_scope();
-        let scratch = match context.dml_scratch {
-            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
-            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
-        };
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
@@ -10665,7 +10635,6 @@ impl Engine {
             row,
             context.arena,
             context.responder,
-            scratch,
             context.transition_rows,
         )
     }
@@ -10680,56 +10649,13 @@ impl Engine {
     ) -> Result<(), SqlError> {
         let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
-        Self::copy_start_with_scratch(
-            &mut self.storage,
-            setup,
-            txn,
-            guc,
-            arena,
-            responder,
-            &mut self.dml_scratch,
-        )
-    }
-
-    pub(crate) fn subscription_copy_start(
-        &mut self,
-        setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        guc: &GucState,
-        arena: &Arena,
-        responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
-    ) -> Result<(), SqlError> {
-        let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
-        let _atomic_reads = self.atomic_block_read_scope();
-        Self::copy_start_with_scratch(
-            &mut self.storage,
-            setup,
-            txn,
-            guc,
-            arena,
-            responder,
-            scratch,
-        )
-    }
-
-    fn copy_start_with_scratch(
-        storage: &mut Storage,
-        setup: &exec::CopySetup,
-        txn: &mut TxnState,
-        guc: &GucState,
-        arena: &Arena,
-        responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
-    ) -> Result<(), SqlError> {
         exec::copy_statement_begin(
-            storage,
+            &mut self.storage,
             txn,
             setup,
             guc.seq_session(),
             arena,
             responder,
-            scratch,
         )
     }
 
@@ -10780,14 +10706,13 @@ impl Engine {
             exec::TriggerQueueBoundary::Statement
         };
         self.work.reset();
-        let result = Self::copy_finish_with_scratch(
+        let result = Self::finish_copy_statement(
             &mut self.storage,
             &self.work,
             setup,
             txn,
             guc,
             responder,
-            &mut self.dml_scratch,
             inserted,
             boundary,
         );
@@ -10835,14 +10760,13 @@ impl Engine {
         } else {
             exec::TriggerQueueBoundary::Statement
         };
-        Self::copy_finish_with_scratch(
+        Self::finish_copy_statement(
             &mut self.storage,
             workspace.arena,
             setup,
             txn,
             guc,
             responder,
-            workspace.dml_scratch,
             workspace.transition_rows,
             boundary,
         )?;
@@ -10856,14 +10780,13 @@ impl Engine {
         clippy::too_many_arguments,
         reason = "COPY completion binds its statement state and caller-owned fixed scratch"
     )]
-    fn copy_finish_with_scratch(
+    fn finish_copy_statement(
         storage: &mut Storage,
         arena: &Arena,
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
         responder: &mut Responder,
-        scratch: &mut exec::DmlScratch,
         inserted: &exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
     ) -> Result<(), SqlError> {
@@ -10875,7 +10798,6 @@ impl Engine {
             guc.seq_session(),
             arena,
             responder,
-            scratch,
             inserted,
         )?;
         exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
@@ -10885,7 +10807,6 @@ impl Engine {
             arena,
             guc.seq_session(),
             responder,
-            scratch,
             boundary,
         )?;
         txn.compact_completed_constraints();
@@ -11795,6 +11716,7 @@ impl Engine {
                     arena,
                     guc.seq_session(),
                     txn.suspended_statement_context().is_some(),
+                    Some(self.storage.advisory_journal()),
                 );
                 let output_mark = responder.buffer.mark();
                 let statement_mark =
@@ -11853,6 +11775,7 @@ impl Engine {
                         || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
                         && txn.staged_commit().is_none()
                         && txn.commit_admission().is_none()
+                        && txn.pending_write_completion.is_none()
                         && let Err(error) = sequence::ensure_statement_effects_replayable()
                     {
                         e = error;
@@ -11867,8 +11790,22 @@ impl Engine {
                     if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                         || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                     {
+                        if txn.pending_write_completion.is_some() && !lock_timeout_expired {
+                            self.storage.preserve_advisory_statement();
+                            return Ok(ExecutionStatus::Blocked {
+                                completed_statements: statement_index,
+                                output_mark: responder.buffer.mark(),
+                                wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                    StatementWait::ObjectIo
+                                } else {
+                                    StatementWait::Lock
+                                },
+                            });
+                        }
                         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
-                            if txn.concurrent_index.is_none() {
+                            if txn.concurrent_index.is_some() {
+                                self.storage.preserve_advisory_statement();
+                            } else {
                                 sequence_scope.discard(guc.seq_session());
                             }
                             return Ok(ExecutionStatus::Blocked {
@@ -12329,6 +12266,7 @@ impl Engine {
                             arena,
                             guc.seq_session(),
                             txn.suspended_statement_context().is_some(),
+                            Some(self.storage.advisory_journal()),
                         );
                         let statement_mark = txn.statement_mark(
                             self.wal.stage_mark(txn.txid),
@@ -12489,6 +12427,7 @@ impl Engine {
                                     || e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
                                     && txn.staged_commit().is_none()
                                     && txn.commit_admission().is_none()
+                                    && txn.pending_write_completion.is_none()
                                     && let Err(error) =
                                         sequence::ensure_statement_effects_replayable()
                                 {
@@ -12505,10 +12444,24 @@ impl Engine {
                                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                                 {
+                                    if txn.pending_write_completion.is_some()
+                                        && !lock_timeout_expired
+                                    {
+                                        self.storage.preserve_advisory_statement();
+                                        return Ok(ExtendedExecutionStatus::Blocked {
+                                            wait: if e.sqlstate == sqlstate::INTERNAL_IO_WAIT {
+                                                StatementWait::ObjectIo
+                                            } else {
+                                                StatementWait::Lock
+                                            },
+                                        });
+                                    }
                                     if txn.staged_commit().is_some()
                                         || txn.commit_admission().is_some()
                                     {
-                                        if txn.concurrent_index.is_none() {
+                                        if txn.concurrent_index.is_some() {
+                                            self.storage.preserve_advisory_statement();
+                                        } else {
                                             sequence_scope.discard(guc.seq_session());
                                         }
                                         return Ok(ExtendedExecutionStatus::Blocked {
@@ -12947,6 +12900,7 @@ impl Engine {
                         arena,
                         guc.seq_session(),
                         progress.waiting.is_some(),
+                        Some(self.storage.advisory_journal()),
                     );
                     let output_mark = responder.buffer.mark();
                     let result = if lock_timeout_expired {
@@ -13182,7 +13136,12 @@ impl Engine {
                 Ok(descriptors) => descriptors,
                 Err(error) => return Ok(Err(error)),
             };
-            let scope = sequence::enter_statement(arena, guc.seq_session(), resumed);
+            let scope = sequence::enter_statement(
+                arena,
+                guc.seq_session(),
+                resumed,
+                Some(self.storage.advisory_journal()),
+            );
             let output_mark = responder.buffer.mark();
             let effect_reads = self
                 .ckpt
@@ -13308,6 +13267,7 @@ impl Engine {
                 let value = self
                     .execute_retained_expression(
                         scratch,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -13430,8 +13390,16 @@ impl Engine {
         arena: &'a Arena,
         txn: &TxnState,
         columns: &mut [ColDesc<'a>],
+        description_target: crate::sql::exec::DescriptionTarget,
     ) -> Result<usize, SqlError> {
-        exec::describe_data_modification_columns(&self.storage, statement, arena, txn.txid, columns)
+        exec::describe_data_modification_columns(
+            &self.storage,
+            statement,
+            arena,
+            txn.txid,
+            columns,
+            description_target,
+        )
     }
 
     fn describe_data_modification<'a>(
@@ -13442,7 +13410,13 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match self.describe_data_modification_columns(statement, arena, txn, &mut columns) {
+        match self.describe_data_modification_columns(
+            statement,
+            arena,
+            txn,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
             Ok(count) => {
                 if count == 0 {
                     responder.no_data()?;
@@ -13531,38 +13505,15 @@ impl Engine {
                     }
                 };
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                let described = match &s.from {
-                    Some(from) => {
-                        match query::QueryScope::resolve_schema(
-                            &self.storage,
-                            from,
-                            txn.txid,
-                            arena,
-                            None,
-                        ) {
-                            Ok(scope) => query::describe_select_items(
-                                s.items,
-                                Some(&scope),
-                                &self.storage,
-                                txn.txid,
-                                arena,
-                                &mut columns,
-                            ),
-                            Err(e) => {
-                                responder.error(e.sqlstate, e.message.as_str())?;
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    None => query::describe_select_items(
-                        s.items,
-                        None,
-                        &self.storage,
-                        txn.txid,
-                        arena,
-                        &mut columns,
-                    ),
-                };
+                let described = query::describe_select(
+                    s,
+                    &self.storage,
+                    txn.txid,
+                    arena,
+                    &mut columns,
+                    exec::DescriptionTarget::Wire,
+                    None,
+                );
                 match described {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
@@ -13576,7 +13527,14 @@ impl Engine {
             }
             Stmt::SetQuery(q) => {
                 let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-                match query::describe_set_query(&self.storage, txn.txid, q, &mut columns, arena) {
+                match query::describe_set_query(
+                    &self.storage,
+                    txn.txid,
+                    q,
+                    &mut columns,
+                    arena,
+                    crate::sql::exec::DescriptionTarget::Wire,
+                ) {
                     Ok(n) => {
                         responder.row_description(&columns[..n])?;
                         Ok(true)
@@ -13652,7 +13610,18 @@ impl Engine {
                 Ok(true)
             }
             Stmt::Show(name) => {
-                responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+                let title = match guc::canonical_setting_name(name) {
+                    Ok(title) => title,
+                    Err(error) => {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(false);
+                    }
+                };
+                responder.row_description(&[ColDesc::new(title.as_str(), types::oid::TEXT, -1)])?;
+                Ok(true)
+            }
+            Stmt::ShowAll => {
+                responder.row_description(&guc::SHOW_ALL_COLUMNS)?;
                 Ok(true)
             }
             Stmt::FetchCursor {
@@ -13749,7 +13718,13 @@ impl Engine {
             // Protocol and CTE outputs share view rewriting, target ownership,
             // aliases, and catalog-derived result types.
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = self.describe_data_modification_columns(dml, arena, txn, &mut descs)?;
+            let ncols = self.describe_data_modification_columns(
+                dml,
+                arena,
+                txn,
+                &mut descs,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?;
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,
@@ -13802,7 +13777,6 @@ impl Engine {
             let outcome = match dml {
                 Stmt::Merge(_) => Self::execute_merge(
                     &mut self.storage,
-                    &mut self.dml_scratch,
                     &self.work,
                     dml,
                     txn,
@@ -14727,7 +14701,6 @@ impl Engine {
         if let Err(error) = exec::fire_view_statement_triggers(
             storage,
             txn,
-            scratch,
             arena,
             guc.seq_session(),
             responder,
@@ -14759,7 +14732,6 @@ impl Engine {
         if let Err(error) = exec::fire_view_statement_triggers(
             storage,
             txn,
-            scratch,
             arena,
             guc.seq_session(),
             responder,
@@ -14786,7 +14758,6 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn execute_merge<'a, 'capture>(
         storage: &mut Storage,
-        scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
@@ -14818,7 +14789,6 @@ impl Engine {
         exec::merge(
             storage,
             txn,
-            scratch,
             expanded,
             arena,
             params,
@@ -14973,7 +14943,6 @@ impl Engine {
                 exec::insert(
                     storage,
                     txn,
-                    scratch,
                     insert,
                     authorization,
                     view_check,
@@ -15255,6 +15224,7 @@ impl Engine {
                 pending,
                 &invocations,
                 arena,
+                arena,
                 txn,
                 sqlprep,
                 cursors,
@@ -15270,6 +15240,7 @@ impl Engine {
     fn execute_retained_expression<T>(
         &mut self,
         frame: &Arena,
+        mut continuation: Option<&mut Option<query::RoutineInvocationState>>,
         source_snapshot: u32,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
@@ -15284,52 +15255,88 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
-        let invocations = query::RoutineInvocationState::new(frame);
+        let saved = continuation.as_deref_mut().and_then(Option::take);
+        let resumed = saved.is_some();
+        let owner = if resumed {
+            frame.retention_owner()
+        } else {
+            frame
+        };
+        let invocations = saved.unwrap_or_else(|| query::RoutineInvocationState::new(owner));
+        if let Err(error) = invocations.require_arena(owner) {
+            if let Some(continuation) = continuation {
+                *continuation = Some(invocations);
+            }
+            return Ok(Err(error));
+        }
         let replay = match sequence::begin_replay_cursor() {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
-        loop {
-            if let Err(error) = sequence::rewind_replay_cursor(replay) {
-                return Ok(Err(error));
+        let result = (|| {
+            loop {
+                if let Err(error) = sequence::rewind_replay_cursor(replay) {
+                    return Ok(Err(error));
+                }
+                self.work.reset();
+                self.storage.set_read_snapshot(source_snapshot);
+                invocations.begin_attempt();
+                let output_mark = responder.buffer.mark();
+                let outcome = {
+                    let sequence =
+                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                    query::with_routine_invocation_scope(
+                        Some(query::RoutineInvocationContext::new(&invocations, owner)),
+                        || evaluate(&self.storage, &self.work, &sequence, &invocations, cursors),
+                    )
+                };
+                let Err(error) = outcome else {
+                    return Ok(outcome);
+                };
+                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                    return Ok(Err(error));
+                }
+                responder.buffer.truncate_to(output_mark);
+                let Some(pending) = invocations.take_pending() else {
+                    return Ok(Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "retained expression yielded without a pending call"
+                    )));
+                };
+                if let Err(error) = self.complete_pending_routine(
+                    pending,
+                    &invocations,
+                    owner,
+                    frame,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )? {
+                    return Ok(Err(error));
+                }
             }
-            self.work.reset();
-            self.storage.set_read_snapshot(source_snapshot);
-            invocations.begin_attempt();
-            let output_mark = responder.buffer.mark();
-            let outcome = {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                query::with_routine_invocation_scope(
-                    Some(query::RoutineInvocationContext::new(&invocations, frame)),
-                    || evaluate(&self.storage, &self.work, &sequence, &invocations, cursors),
-                )
+        })();
+        if result.as_ref().is_ok_and(|outcome| {
+            outcome.as_ref().is_err_and(|error| {
+                error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    || error.sqlstate == sqlstate::INTERNAL_IO_WAIT
+            })
+        }) && let Some(continuation) = continuation
+        {
+            let target = frame.retention_owner();
+            let saved = if owner.identity() == target.identity() {
+                Ok(invocations)
+            } else {
+                invocations.relocate(owner, target)
             };
-            let Err(error) = outcome else {
-                return Ok(outcome);
-            };
-            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                return Ok(Err(error));
-            }
-            responder.buffer.truncate_to(output_mark);
-            let Some(pending) = invocations.take_pending() else {
-                return Ok(Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "retained expression yielded without a pending call"
-                )));
-            };
-            if let Err(error) = self.complete_pending_routine(
-                pending,
-                &invocations,
-                frame,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-            )? {
-                return Ok(Err(error));
+            match saved {
+                Ok(saved) => *continuation = Some(saved),
+                Err(error) => return Ok(Err(error)),
             }
         }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15367,6 +15374,7 @@ impl Engine {
                 let txid = txn.txid;
                 let passes = self.execute_retained_expression(
                     frame,
+                    None,
                     source_snapshot,
                     txn,
                     sqlprep,
@@ -15397,6 +15405,7 @@ impl Engine {
                 for index in 0..source.statement_items_len() {
                     let values = self.execute_retained_expression(
                         frame,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -15481,6 +15490,11 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if txn.pending_write_completion.is_some() {
+            return exec::resume_write_completion(
+                self, txn, arena, sqlprep, cursors, guc, responder,
+            );
+        }
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, &self.storage, txn.txid, arena, None)
         {
@@ -15491,6 +15505,42 @@ impl Engine {
             Ok(replay) => replay,
             Err(error) => return Ok(Err(error)),
         };
+        let direct_relation = match statement {
+            Stmt::Insert(insert) => Some(insert.table),
+            Stmt::Update(update) => Some(update.table),
+            Stmt::Delete(delete) => Some(delete.table),
+            Stmt::Merge(merge) => Some(merge.target),
+            _ => None,
+        };
+        let completion_handoff = direct_relation
+            .and_then(|relation| {
+                match self
+                    .storage
+                    .resolve_relation(relation.schema, relation.name, txn.txid)
+                {
+                    Some(crate::storage::ResolvedRelation::Table(table)) => Some(table),
+                    _ => None,
+                }
+            })
+            .is_some_and(|table| {
+                [
+                    crate::storage::RewriteEvent::Insert,
+                    crate::storage::RewriteEvent::Update,
+                    crate::storage::RewriteEvent::Delete,
+                ]
+                .into_iter()
+                .all(|event| {
+                    self.storage
+                        .firing_rules_for(
+                            crate::storage::RuleTarget::Table(table as u16),
+                            event,
+                            txn.replication_apply,
+                            txn.txid,
+                        )
+                        .next()
+                        .is_none()
+                })
+            });
         loop {
             if let Err(error) = sequence::rewind_replay_cursor(replay) {
                 return Ok(Err(error));
@@ -15501,6 +15551,12 @@ impl Engine {
             let output_mark = responder.buffer.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
+                mark: statement_mark,
+                command: txn.command_id(),
+                depth: txn.trigger_depth(),
+            });
+            let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
                 query::with_routine_invocation_scope(
                     Some(query::RoutineInvocationContext::new(&invocations, arena)),
@@ -15523,7 +15579,6 @@ impl Engine {
                             }
                             Stmt::Merge(_) => Self::execute_merge(
                                 &mut self.storage,
-                                &mut self.dml_scratch,
                                 arena,
                                 statement,
                                 txn,
@@ -15538,8 +15593,16 @@ impl Engine {
                             _ => unreachable!("resumable modification has a mutation statement"),
                         })
                     },
-                )?
+                )
             };
+            txn.write_completion_boundary = prior_handoff;
+            let outcome = outcome?;
+            if txn.pending_write_completion.is_some() {
+                self.dml_scratch.clear();
+                return exec::resume_write_completion(
+                    self, txn, arena, sqlprep, cursors, guc, responder,
+                );
+            }
             let Err(error) = outcome else {
                 return Ok(outcome);
             };
@@ -15563,6 +15626,7 @@ impl Engine {
                 pending,
                 &invocations,
                 arena,
+                arena,
                 txn,
                 sqlprep,
                 cursors,
@@ -15582,6 +15646,7 @@ impl Engine {
         pending: query::PendingRoutineInvocation,
         invocations: &query::RoutineInvocationState,
         arena: &Arena,
+        work: &Arena,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -15596,7 +15661,8 @@ impl Engine {
                     None => return Ok(Err(query::inactive_pending_call())),
                 },
                 query::PendingRoutineTarget::Intrinsic(oid) => {
-                    let retained = arena.with_remaining_retained_bytes(|scratch| {
+                    let mut unlock_warning = None;
+                    let retained = work.with_remaining_retained_bytes(arena, |scratch| {
                         let encoded_arguments = pending.arguments(arena)?;
                         let arguments = scratch
                             .alloc_slice_with(pending.argument_count, |_| Datum::Null)
@@ -15620,6 +15686,31 @@ impl Engine {
                             statistics::execute(oid, arguments, self, txn, scratch)
                         } else if logical_replication_intrinsic {
                             logical_replication::execute(oid, arguments, self, txn, scratch)
+                        } else if matches!(oid, 2884 | 2885 | 2890 | 2891) {
+                            let key = match (oid, &*arguments) {
+                                (2884 | 2885, [Datum::Int8(value)]) => {
+                                    lock::AdvisoryKey::from_bigint(*value)
+                                }
+                                (2890 | 2891, [Datum::Int4(first), Datum::Int4(second)]) => {
+                                    lock::AdvisoryKey::from_ints(*first, *second)
+                                }
+                                _ => {
+                                    return Err(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "pending advisory unlock has invalid arguments"
+                                    ));
+                                }
+                            };
+                            let mode = if matches!(oid, 2885 | 2891) {
+                                lock::AdvisoryMode::Shared
+                            } else {
+                                lock::AdvisoryMode::Exclusive
+                            };
+                            let unlocked = self.storage.unlock_advisory_session(key, mode)?;
+                            if !unlocked {
+                                unlock_warning = Some(mode);
+                            }
+                            Ok(Datum::Bool(unlocked))
                         } else {
                             large_object::execute(oid, arguments, &mut self.storage, txn, scratch)
                         }?;
@@ -15636,9 +15727,17 @@ impl Engine {
                             )));
                         }
                     };
+                    if let Some(mode) = unlock_warning {
+                        responder.warning(
+                            sqlstate::WARNING,
+                            stack_format!(96, "you don't own a lock of type {}", mode.name())
+                                .as_str(),
+                        )?;
+                    }
                     return Ok(invocations.complete(
                         query::OwnedRoutineResult::from_scalar_image(retained),
                         arena,
+                        work,
                     ));
                 }
             };
@@ -15660,13 +15759,15 @@ impl Engine {
                 }
                 guc::TrackFunctions::All => true,
             };
-            let timed = statistics::begin_function_timing(track);
+            let timed = match statistics::begin_function_timing(track) {
+                Ok(timed) => timed,
+                Err(error) => return Ok(Err(error)),
+            };
             if track
                 && let Err(error) = self
                     .storage
                     .ensure_function_statistics(crate::storage::routine_oid(&routine))
             {
-                let _ = statistics::finish_function_timing(timed);
                 return Ok(Err(error));
             }
             #[expect(
@@ -15678,7 +15779,7 @@ impl Engine {
                 Wire(WireFull),
             }
             let set_returning = routine.kind.is_set_returning();
-            let executed = arena.with_remaining_retained_bytes(|scratch| {
+            let executed = work.with_remaining_retained_bytes(arena, |scratch| {
                 // Transfer the encoded output directly into retained storage
                 // when the body ends, including inside another borrowed body.
                 if set_returning {
@@ -15710,7 +15811,7 @@ impl Engine {
                 ))),
             };
             let succeeded = executed.is_ok();
-            if let Some((total, own)) = statistics::finish_function_timing(timed)
+            if let Some((total, own)) = timed.finish()
                 && succeeded
                 && let Err(error) = self.storage.record_function_call(
                     txn.txid,
@@ -15731,7 +15832,7 @@ impl Engine {
             } else {
                 query::OwnedRoutineResult::from_scalar_image(retained)
             };
-            Ok(invocations.complete(retained, arena))
+            Ok(invocations.complete(retained, arena, work))
         });
         let role = eval::funcs::system::current_identity();
         let role = if matches!(outcome, Ok(Ok(()))) {
@@ -15932,6 +16033,7 @@ impl Engine {
                             pending,
                             &nested_invocations,
                             arena,
+                            arena,
                             txn,
                             sqlprep,
                             cursors,
@@ -15996,6 +16098,7 @@ impl Engine {
                                 pending,
                                 &nested_invocations,
                                 arena,
+                                arena,
                                 txn,
                                 sqlprep,
                                 cursors,
@@ -16053,6 +16156,7 @@ impl Engine {
                                 pending,
                                 &nested_invocations,
                                 arena,
+                                arena,
                                 txn,
                                 sqlprep,
                                 cursors,
@@ -16083,6 +16187,7 @@ impl Engine {
                     };
                     self.execute_retained_expression(
                         arena,
+                        None,
                         snapshot,
                         txn,
                         sqlprep,
@@ -17478,6 +17583,7 @@ impl Engine {
                                     pending,
                                     &nested_invocations,
                                     arena,
+                                    arena,
                                     txn,
                                     sqlprep,
                                     cursors,
@@ -17539,6 +17645,7 @@ impl Engine {
                                         pending,
                                         &nested_invocations,
                                         arena,
+                                        arena,
                                         txn,
                                         sqlprep,
                                         cursors,
@@ -17599,6 +17706,7 @@ impl Engine {
                                     if let Err(error) = self.complete_pending_routine(
                                         pending,
                                         &nested_invocations,
+                                        arena,
                                         arena,
                                         txn,
                                         sqlprep,
@@ -17669,7 +17777,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -17746,7 +17853,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 &self.work,
                 statement,
                 txn,
@@ -18630,6 +18736,7 @@ impl Engine {
             arena,
             guc.seq_session(),
             txn.suspended_statement_context().is_some(),
+            Some(self.storage.advisory_journal()),
         );
         let routine_transaction_context = txn
             .suspended_statement_context()
@@ -19185,6 +19292,11 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if reset_workspace && txn.pending_write_completion.is_some() {
+            return exec::resume_write_completion(
+                self, txn, arena, sqlprep, cursors, guc, responder,
+            );
+        }
         if let Err(error) = txn.bind_plan_invalidations(&sqlprep.plan_invalidations) {
             return Ok(Err(error));
         }
@@ -20704,7 +20816,6 @@ impl Engine {
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                &mut self.dml_scratch,
                 arena,
                 statement,
                 txn,
@@ -20729,7 +20840,6 @@ impl Engine {
             } => exec::truncate(
                 &mut self.storage,
                 txn,
-                &mut self.dml_scratch,
                 arena,
                 guc.seq_session(),
                 tables,
@@ -23215,6 +23325,7 @@ impl Engine {
             }
             self.execute_retained_expression(
                 frame,
+                None,
                 snapshot,
                 txn,
                 sqlprep,
@@ -23361,6 +23472,7 @@ impl Engine {
                 arena.with_remaining_region(|frame| -> Result<Result<bool, SqlError>, WireFull> {
                     let passes = self.execute_retained_expression(
                         frame,
+                        None,
                         source_snapshot,
                         txn,
                         sqlprep,
@@ -23397,6 +23509,7 @@ impl Engine {
                     for index in 0..count {
                         let values = self.execute_retained_expression(
                             frame,
+                            None,
                             source_snapshot,
                             txn,
                             sqlprep,
@@ -23745,18 +23858,11 @@ impl Engine {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        // The column titles as PostgreSQL canonicalizes them: most parameters
-        // are lowercase, but a few keep their registered mixed case.
-        let title = if name.eq_ignore_ascii_case("timezone") {
-            "TimeZone"
-        } else if name.eq_ignore_ascii_case("datestyle") {
-            "DateStyle"
-        } else if name.eq_ignore_ascii_case("intervalstyle") {
-            "IntervalStyle"
-        } else {
-            name
+        let title = match guc::canonical_setting_name(name) {
+            Ok(title) => title,
+            Err(error) => return Ok(Err(error)),
         };
-        responder.row_description(&[ColDesc::new(title, types::oid::TEXT, -1)])?;
+        responder.row_description(&[ColDesc::new(title.as_str(), types::oid::TEXT, -1)])?;
         responder.data_row(&[Datum::Text(value.as_str())])?;
         responder.command_complete("SHOW")?;
         Ok(Ok(()))
@@ -23770,11 +23876,7 @@ impl Engine {
         txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        responder.row_description(&[
-            ColDesc::new("name", types::oid::TEXT, -1),
-            ColDesc::new("setting", types::oid::TEXT, -1),
-            ColDesc::new("description", types::oid::TEXT, -1),
-        ])?;
+        responder.row_description(&guc::SHOW_ALL_COLUMNS)?;
         self.visit_show_all_rows(guc, txn, |name, value| {
             responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
         })?;
@@ -23886,6 +23988,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "default_table_access_method",
     "default_tablespace",
     "default_text_search_config",
+    "event_triggers",
     "extra_float_digits",
     "idle_in_transaction_session_timeout",
     "integer_datetimes",
@@ -23896,6 +23999,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "max_connections",
     "max_locks_per_transaction",
     "max_prepared_transactions",
+    "password_encryption",
     "row_security",
     "search_path",
     "server_encoding",

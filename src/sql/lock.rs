@@ -459,9 +459,28 @@ pub(crate) struct AdvisoryStatementMark {
 #[derive(Clone, Copy)]
 struct AdvisoryReplayState {
     connection_id: i32,
+    statement: Option<core::num::NonZeroU64>,
     preserved: bool,
     cursor: usize,
     replay_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdvisoryStatementPosition {
+    connection_id: i32,
+    progress: Option<(core::num::NonZeroU64, usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AdvisoryPositionTail {
+    Unchanged,
+    Appended,
+}
+
+#[derive(Debug)]
+pub(crate) struct AdvisoryPositionRestore {
+    connection_id: i32,
+    prior: Option<(core::num::NonZeroU64, usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -524,8 +543,13 @@ impl AdvisoryLockManager {
 
     /// Starts an executor attempt. A parked statement replays its already
     /// applied session-lock calls because pos3ql retries the expression tree
-    /// from its root when the blocker wakes it.
-    pub(crate) fn begin_statement(&mut self, connection_id: i32) -> Result<(), SqlError> {
+    /// from its root when the blocker wakes it. New identities come from the
+    /// shared nonwrapping lock sequence; preserved attempts retain their identity.
+    pub(crate) fn begin_statement(
+        &mut self,
+        connection_id: i32,
+        statement: core::num::NonZeroU64,
+    ) -> Result<(), SqlError> {
         if let Some(index) = self
             .replay_states
             .iter()
@@ -543,6 +567,7 @@ impl AdvisoryLockManager {
                 return Ok(());
             }
             self.clear_replay_actions(connection_id);
+            self.replay_states[index].statement = Some(statement);
             self.replay_states[index].cursor = 0;
             self.replay_states[index].replay_count = 0;
             return Ok(());
@@ -550,6 +575,7 @@ impl AdvisoryLockManager {
         self.replay_states
             .push(AdvisoryReplayState {
                 connection_id,
+                statement: Some(statement),
                 preserved: false,
                 cursor: 0,
                 replay_count: 0,
@@ -561,6 +587,92 @@ impl AdvisoryLockManager {
                     self.replay_states.capacity()
                 )
             })
+    }
+
+    pub(crate) fn statement_position(&self, connection_id: i32) -> AdvisoryStatementPosition {
+        let progress = self
+            .replay_states
+            .iter()
+            .find(|state| state.connection_id == connection_id)
+            .and_then(|state| {
+                let statement = state.statement?;
+                let actions = self
+                    .replay_actions
+                    .iter()
+                    .filter(|action| action.connection_id == connection_id)
+                    .count();
+                let position = if state.cursor < state.replay_count {
+                    state.cursor
+                } else {
+                    actions
+                };
+                Some((statement, actions, position))
+            });
+        AdvisoryStatementPosition {
+            connection_id,
+            progress,
+        }
+    }
+
+    pub(crate) fn resume_position(
+        &mut self,
+        saved: AdvisoryStatementPosition,
+        connection_id: i32,
+        tail: AdvisoryPositionTail,
+    ) -> Result<AdvisoryPositionRestore, SqlError> {
+        let current = self.statement_position(connection_id);
+        let matches = match (saved.progress, current.progress) {
+            (None, None) => true,
+            (Some((statement, actions, position)), Some((live, count, _))) => {
+                statement == live
+                    && position <= actions
+                    && match tail {
+                        AdvisoryPositionTail::Unchanged => actions == count,
+                        AdvisoryPositionTail::Appended => actions <= count,
+                    }
+            }
+            _ => false,
+        };
+        if saved.connection_id != connection_id || !matches {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "advisory lock statement changed while its invocation was suspended"
+            ));
+        }
+        let prior = if let Some((statement, _, position)) = saved.progress {
+            let state = self
+                .replay_states
+                .iter_mut()
+                .find(|state| state.connection_id == connection_id)
+                .expect("validated advisory statement exists");
+            let prior = Some((statement, state.cursor, state.replay_count));
+            state.cursor = position;
+            state.replay_count = current.progress.expect("validated statement exists").1;
+            prior
+        } else {
+            None
+        };
+        Ok(AdvisoryPositionRestore {
+            connection_id,
+            prior,
+        })
+    }
+
+    pub(crate) fn restore_position(&mut self, restore: AdvisoryPositionRestore) {
+        if let Some((statement, cursor, replay_count)) = restore.prior {
+            let state = self
+                .replay_states
+                .iter_mut()
+                .find(|state| state.connection_id == restore.connection_id)
+                .expect("unattached advisory statement is retained");
+            assert_eq!(
+                state.statement,
+                Some(statement),
+                "attachment cannot replace its statement"
+            );
+            state.cursor = cursor;
+            state.replay_count = replay_count;
+        }
     }
 
     pub(crate) fn statement_mark(&self, connection_id: i32) -> AdvisoryStatementMark {
@@ -596,7 +708,7 @@ impl AdvisoryLockManager {
             .iter_mut()
             .find(|state| state.connection_id == connection_id)
         {
-            state.preserved = true;
+            state.preserved = state.statement.is_some();
         }
     }
 
@@ -612,6 +724,7 @@ impl AdvisoryLockManager {
             .iter_mut()
             .find(|state| state.connection_id == connection_id)
         {
+            state.statement = None;
             state.preserved = false;
             state.cursor = 0;
             state.replay_count = 0;
@@ -1017,7 +1130,7 @@ impl AdvisoryLockManager {
         if !self
             .replay_states
             .iter()
-            .any(|state| state.connection_id == connection_id)
+            .any(|state| state.connection_id == connection_id && state.statement.is_some())
         {
             return Ok(());
         }
@@ -1090,6 +1203,203 @@ fn pair_conflicts(left: u8, right: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_retained_positions_skip_completed_calls_and_reject_other_statements() {
+        let mut budget = Budget::new(32 << 10);
+        let mut graph = LockManager::new(&mut budget, 4, 4).unwrap();
+        let mut advisory = AdvisoryLockManager::new(&mut budget, 16, 4).unwrap();
+        let id = |value| core::num::NonZeroU64::new(value).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let absent = advisory.statement_position(11);
+            advisory.begin_statement(22, id(1)).unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(22),
+                    AdvisoryOwner::Session(22),
+                    connection_wait_owner(22),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    1,
+                    &mut graph,
+                )
+                .unwrap();
+            advisory.begin_statement(11, id(2)).unwrap();
+            let error = advisory
+                .resume_position(absent, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::SERIALIZATION_FAILURE);
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(1),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    2,
+                    &mut graph,
+                )
+                .unwrap();
+            let saved = advisory.statement_position(11);
+            // Another connection can remove earlier global receipt slots.
+            advisory.begin_statement(22, id(3)).unwrap();
+            assert_eq!(
+                advisory
+                    .resume_position(saved, 22, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            advisory.preserve_statement(11);
+            advisory.begin_statement(11, id(4)).unwrap();
+            let caller = advisory.statement_mark(11);
+            let prior = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
+            assert_ne!(advisory.statement_mark(11), caller);
+            advisory.restore_position(prior);
+            assert_eq!(advisory.statement_mark(11), caller);
+            let _committed = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(3),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    3,
+                    &mut graph,
+                )
+                .unwrap();
+            let later = advisory.statement_position(11);
+            assert_eq!(
+                advisory
+                    .resume_position(saved, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            let caller = advisory.statement_mark(11);
+            let prior = advisory
+                .resume_position(saved, 11, AdvisoryPositionTail::Appended)
+                .unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(3),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    4,
+                    &mut graph,
+                )
+                .unwrap();
+            assert_eq!(advisory.statement_position(11).progress, later.progress);
+            advisory.restore_position(prior);
+            assert_eq!(advisory.statement_mark(11), caller);
+            advisory.preserve_statement(11);
+            advisory.begin_statement(11, id(5)).unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(1),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    4,
+                    &mut graph,
+                )
+                .unwrap();
+            let middle = advisory.statement_position(11);
+            advisory.preserve_statement(11);
+            advisory.begin_statement(11, id(8)).unwrap();
+            let _committed = advisory
+                .resume_position(middle, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
+            advisory
+                .acquire(
+                    AdvisoryKey::from_bigint(3),
+                    AdvisoryOwner::Session(11),
+                    connection_wait_owner(11),
+                    AdvisoryMode::Exclusive,
+                    false,
+                    5,
+                    &mut graph,
+                )
+                .unwrap();
+            let _committed = advisory
+                .resume_position(later, 11, AdvisoryPositionTail::Unchanged)
+                .unwrap();
+            assert!(
+                advisory
+                    .unlock_session(
+                        11,
+                        AdvisoryKey::from_bigint(1),
+                        AdvisoryMode::Exclusive,
+                        &mut graph
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !advisory
+                    .unlock_session(
+                        11,
+                        AdvisoryKey::from_bigint(1),
+                        AdvisoryMode::Exclusive,
+                        &mut graph
+                    )
+                    .unwrap()
+            );
+            assert!(
+                advisory
+                    .unlock_session(
+                        11,
+                        AdvisoryKey::from_bigint(3),
+                        AdvisoryMode::Exclusive,
+                        &mut graph
+                    )
+                    .unwrap()
+            );
+            assert!(
+                !advisory
+                    .unlock_session(
+                        11,
+                        AdvisoryKey::from_bigint(3),
+                        AdvisoryMode::Exclusive,
+                        &mut graph
+                    )
+                    .unwrap()
+            );
+            let finished = advisory.statement_position(11);
+            advisory.cancel_statement(11, &mut graph);
+            assert_eq!(
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            advisory.begin_statement(11, id(6)).unwrap();
+            assert_eq!(
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            advisory.drop_connection(11);
+            advisory.begin_statement(11, id(7)).unwrap();
+            assert_eq!(
+                advisory
+                    .resume_position(finished, 11, AdvisoryPositionTail::Unchanged)
+                    .unwrap_err()
+                    .sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+        });
+    }
 
     #[test]
     fn compatibility_wait_modes_and_deadlocks() {
@@ -1240,8 +1550,12 @@ mod tests {
         let mut graph = LockManager::new(&mut budget, 4, 4).unwrap();
         let mut advisory = AdvisoryLockManager::new(&mut budget, 16, 4).unwrap();
         crate::mem::guard::forbid_alloc(|| {
-            advisory.begin_statement(11).unwrap();
-            advisory.begin_statement(22).unwrap();
+            advisory
+                .begin_statement(11, core::num::NonZeroU64::new(1).unwrap())
+                .unwrap();
+            advisory
+                .begin_statement(22, core::num::NonZeroU64::new(2).unwrap())
+                .unwrap();
             let first = advisory.statement_mark(11);
             advisory
                 .acquire(
@@ -1268,7 +1582,9 @@ mod tests {
                 .unwrap();
             assert_ne!(advisory.statement_mark(11), first);
             advisory.preserve_statement(11);
-            advisory.begin_statement(11).unwrap();
+            advisory
+                .begin_statement(11, core::num::NonZeroU64::new(3).unwrap())
+                .unwrap();
             let replay = advisory.statement_mark(11);
             advisory
                 .acquire(
@@ -1310,7 +1626,9 @@ mod tests {
         let a = connection_wait_owner(11);
         let b = connection_wait_owner(22);
 
-        advisory.begin_statement(11).unwrap();
+        advisory
+            .begin_statement(11, core::num::NonZeroU64::new(4).unwrap())
+            .unwrap();
         advisory
             .acquire(
                 AdvisoryKey::from_bigint(1),
@@ -1322,7 +1640,9 @@ mod tests {
                 &mut graph,
             )
             .unwrap();
-        advisory.begin_statement(22).unwrap();
+        advisory
+            .begin_statement(22, core::num::NonZeroU64::new(5).unwrap())
+            .unwrap();
         for (key, sequence) in [(2, 2), (3, 3)] {
             advisory
                 .acquire(
@@ -1337,9 +1657,13 @@ mod tests {
                 .unwrap();
         }
 
-        advisory.begin_statement(11).unwrap();
+        advisory
+            .begin_statement(11, core::num::NonZeroU64::new(6).unwrap())
+            .unwrap();
         advisory.preserve_statement(22);
-        advisory.begin_statement(22).unwrap();
+        advisory
+            .begin_statement(22, core::num::NonZeroU64::new(7).unwrap())
+            .unwrap();
         for key in [2, 3] {
             assert_eq!(
                 advisory

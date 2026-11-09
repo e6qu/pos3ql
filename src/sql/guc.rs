@@ -20,6 +20,12 @@ use super::eval::SqlError;
 /// a narrower effective-path array.
 pub const SEARCH_PATH_BYTES: usize = 128;
 
+pub(crate) const SHOW_ALL_COLUMNS: [super::types::ColDesc<'static>; 3] = [
+    super::types::ColDesc::new("name", super::types::oid::TEXT, -1),
+    super::types::ColDesc::new("setting", super::types::oid::TEXT, -1),
+    super::types::ColDesc::new("description", super::types::oid::TEXT, -1),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrngState {
     s0: u64,
@@ -314,16 +320,6 @@ pub fn set_active_config(
 }
 
 pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
-    let txn_pointer = ACTIVE_TXN.with(Cell::get);
-    if !txn_pointer.is_null() {
-        // SAFETY: EvalScope owns the pointer's dynamic extent.
-        let txn = unsafe { &*txn_pointer };
-        if let Some(value) = transaction_setting_owned(txn, name) {
-            let reset = guc.transaction_reset_owned(name).unwrap_or(value);
-            crate::sql::eval::funcs::system::update_session_setting(name, value, reset, "session");
-            return;
-        }
-    }
     if let Some(value) = guc.get_owned(name) {
         let reset = guc.reset_owned(name).unwrap_or(value);
         crate::sql::eval::funcs::system::update_session_setting(
@@ -332,6 +328,19 @@ pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
             reset,
             guc.source(name),
         );
+    } else {
+        // Ordinary settings do not borrow the executor's mutable transaction.
+        let txn_pointer = ACTIVE_TXN.with(Cell::get);
+        if !txn_pointer.is_null() {
+            // SAFETY: EvalScope owns the pointer's dynamic extent.
+            let txn = unsafe { &*txn_pointer };
+            if let Some(value) = transaction_setting_owned(txn, name) {
+                let reset = guc.transaction_reset_owned(name).unwrap_or(value);
+                crate::sql::eval::funcs::system::update_session_setting(
+                    name, value, reset, "session",
+                );
+            }
+        }
     }
     ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
     if name.eq_ignore_ascii_case("timezone") {
@@ -873,7 +882,50 @@ const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
 const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
 const GUC_LC_MONETARY: u32 = 1 << 26;
 const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
-const GUC_ALL: u32 = (1 << 28) - 1;
+const GUC_SETTING_COUNT: usize = 28;
+const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
+
+#[derive(Clone, Copy)]
+struct SettingActions {
+    next: u64,
+    session: [u64; GUC_SETTING_COUNT],
+}
+
+impl SettingActions {
+    const EMPTY: Self = Self {
+        next: 0,
+        session: [0; GUC_SETTING_COUNT],
+    };
+
+    fn record_session(&mut self, mask: u32) -> Result<(), SqlError> {
+        let next = self.next.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "session setting assignment counter exhausted"
+            )
+        })?;
+        for (index, action) in self.session.iter_mut().enumerate() {
+            if mask & (1 << index) != 0 {
+                *action = next;
+            }
+        }
+        self.next = next;
+        Ok(())
+    }
+
+    fn restore_mask(&self, configured: u32, entered: u64) -> u32 {
+        self.session
+            .iter()
+            .enumerate()
+            .fold(configured, |mask, (index, &action)| {
+                if action > entered {
+                    mask & !(1 << index)
+                } else {
+                    mask
+                }
+            })
+    }
+}
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -996,7 +1048,10 @@ fn finish_setting_change(
     bit: u32,
     local: bool,
     resetting: bool,
-) {
+) -> Result<(), SqlError> {
+    if !local {
+        state.actions.record_session(bit)?;
+    }
     state.current = values;
     if !state.transaction.active {
         state.defaults = values;
@@ -1015,6 +1070,7 @@ fn finish_setting_change(
             state.transaction.session_overrides |= bit;
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1023,6 +1079,7 @@ struct GucSavepoint {
     session: GucValues,
     current_overrides: u32,
     session_overrides: u32,
+    session_actions: [u64; GUC_SETTING_COUNT],
 }
 
 pub(crate) struct StatementSettings {
@@ -1036,6 +1093,7 @@ struct GucTransaction {
     session: GucValues,
     start_overrides: u32,
     session_overrides: u32,
+    start_actions: [u64; GUC_SETTING_COUNT],
     savepoints: Vec<Option<GucSavepoint>>,
     savepoint_count: usize,
 }
@@ -1051,6 +1109,7 @@ struct GucStore {
     database_role_overrides: u32,
     client_overrides: u32,
     session_overrides: u32,
+    actions: SettingActions,
     transaction: GucTransaction,
 }
 
@@ -1076,9 +1135,74 @@ pub struct GucState {
 pub(crate) struct RoutineConfigScope {
     guc: *const GucState,
     prior: GucValues,
-    session: GucValues,
-    names: [crate::storage::SqlName; crate::storage::MAX_ROUTINE_CONFIGS],
-    count: usize,
+    configured: u32,
+    entered: u64,
+    owner: super::ExecutionIdentity,
+}
+
+/// Pointer-free settings retained with a paused invocation. The caller stores
+/// this image in its existing execution-control reservation.
+#[derive(Clone, Copy)]
+pub(crate) struct RoutineConfigImage {
+    prior: GucValues,
+    current: GucValues,
+    configured: u32,
+    restore: u32,
+    entered: u64,
+    paused: u64,
+    owner: super::ExecutionIdentity,
+}
+
+impl RoutineConfigScope {
+    pub(crate) fn save(&self) -> Result<RoutineConfigImage, SqlError> {
+        if self.owner != super::execution_identity() || ACTIVE_GUC.with(Cell::get) != self.guc {
+            return Err(routine_config_changed());
+        }
+        // SAFETY: the matching active evaluation still owns this scope.
+        let state = unsafe { &*self.guc }.store.borrow();
+        Ok(RoutineConfigImage {
+            prior: self.prior,
+            current: state.current,
+            configured: self.configured,
+            restore: state.actions.restore_mask(self.configured, self.entered),
+            entered: self.entered,
+            paused: state.actions.next,
+            owner: self.owner,
+        })
+    }
+}
+
+impl RoutineConfigImage {
+    pub(crate) fn enter(&self) -> Result<RoutineConfigScope, SqlError> {
+        if self.owner != super::execution_identity() {
+            return Err(routine_config_changed());
+        }
+        with_active_state(|guc| {
+            let mut state = guc.store.borrow_mut();
+            let mut parent = self.current;
+            copy_guc_values(&mut parent, &self.prior, self.restore);
+            if state.actions.next != self.paused || !parent.same_settings(&state.current) {
+                return Err(routine_config_changed());
+            }
+            state.current = self.current;
+            drop(state);
+            guc.publish_owned_settings();
+            Ok(RoutineConfigScope {
+                guc: guc as *const GucState,
+                prior: self.prior,
+                configured: self.configured,
+                entered: self.entered,
+                owner: self.owner,
+            })
+        })
+    }
+}
+
+fn routine_config_changed() -> SqlError {
+    sql_err!(
+        sqlstate::SERIALIZATION_FAILURE,
+        "saved routine settings belong to another execution or parent scope"
+    )
 }
 
 impl Drop for RoutineConfigScope {
@@ -1087,63 +1211,13 @@ impl Drop for RoutineConfigScope {
         // EvalScope and are dropped before that scope releases the GucState.
         let guc = unsafe { &*self.guc };
         let mut state = guc.store.borrow_mut();
-        let changed = state.transaction.session;
-        let mut restored = self.prior;
-        merge_session_changes(&mut restored, &self.session, &changed);
+        let restore = state.actions.restore_mask(self.configured, self.entered);
+        let mut restored = state.current;
+        copy_guc_values(&mut restored, &self.prior, restore);
         state.current = restored;
         drop(state);
-        for name in &self.names[..self.count] {
-            if let Some(value) = guc.get_owned(name.as_str()) {
-                let reset = guc.reset_owned(name.as_str()).unwrap_or(value);
-                crate::sql::eval::funcs::system::update_session_setting(
-                    name.as_str(),
-                    value,
-                    reset,
-                    guc.source(name.as_str()),
-                );
-            }
-        }
-        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
-        crate::sql::timezone::set_session(guc.timezone());
+        guc.publish_owned_settings();
     }
-}
-
-fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &GucValues) {
-    macro_rules! changed {
-        ($field:ident) => {
-            if before.$field != after.$field {
-                target.$field = after.$field;
-            }
-        };
-    }
-    changed!(current_role);
-    changed!(session_authorization);
-    changed!(datestyle);
-    changed!(intervalstyle);
-    changed!(lc_monetary);
-    if before.timezone != after.timezone {
-        target.timezone = after.timezone;
-        target.parsed_timezone = after.parsed_timezone;
-    }
-    changed!(client_encoding);
-    changed!(application_name);
-    changed!(search_path);
-    changed!(default_tablespace);
-    changed!(default_text_search_config);
-    changed!(client_min_messages);
-    changed!(extra_float_digits);
-    changed!(lock_timeout);
-    changed!(statement_timeout);
-    changed!(row_security);
-    changed!(event_triggers);
-    changed!(bytea_escape);
-    changed!(check_function_bodies);
-    changed!(xml_document);
-    changed!(default_transaction_isolation);
-    changed!(default_transaction_read_only);
-    changed!(default_transaction_deferrable);
-    changed!(password_encryption);
-    changed!(track_functions);
 }
 
 impl Default for GucState {
@@ -1161,6 +1235,7 @@ impl GucState {
                 session: state.transaction.session,
                 current_overrides: state.session_overrides,
                 session_overrides: state.transaction.session_overrides,
+                session_actions: state.actions.session,
             },
             random: self.random.get(),
         }
@@ -1173,6 +1248,7 @@ impl GucState {
             state.transaction.session = mark.values.session;
             state.session_overrides = mark.values.current_overrides;
             state.transaction.session_overrides = mark.values.session_overrides;
+            state.actions.session = mark.values.session_actions;
         }
         self.random.set(mark.random);
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
@@ -1188,6 +1264,7 @@ impl GucState {
                 .same_settings(&mark.values.session)
             && state.session_overrides == mark.values.current_overrides
             && state.transaction.session_overrides == mark.values.session_overrides
+            && state.actions.session == mark.values.session_actions
             && self.random.get() == mark.random
     }
 
@@ -1244,11 +1321,13 @@ impl GucState {
         destination.database_role_overrides = source.database_role_overrides;
         destination.client_overrides = source.client_overrides;
         destination.session_overrides = source.session_overrides;
+        destination.actions = source.actions;
         destination.transaction.active = source.transaction.active;
         destination.transaction.start = source.transaction.start;
         destination.transaction.session = source.transaction.session;
         destination.transaction.start_overrides = source.transaction.start_overrides;
         destination.transaction.session_overrides = source.transaction.session_overrides;
+        destination.transaction.start_actions = source.transaction.start_actions;
         destination.transaction.savepoints.fill(None);
         let count = source.transaction.savepoint_count;
         destination.transaction.savepoints[..count]
@@ -1378,12 +1457,14 @@ impl GucState {
                 database_role_overrides: 0,
                 client_overrides: 0,
                 session_overrides: 0,
+                actions: SettingActions::EMPTY,
                 transaction: GucTransaction {
                     active: false,
                     start: values,
                     session: values,
                     start_overrides: 0,
                     session_overrides: 0,
+                    start_actions: [0; GUC_SETTING_COUNT],
                     savepoints,
                     savepoint_count: 0,
                 },
@@ -1706,8 +1787,7 @@ impl GucState {
         self.capture_setting_value(name)?;
         let mut state = self.store.borrow_mut();
         let values = state.current;
-        finish_setting_change(&mut state, values, guc_bit(name), local, false);
-        Ok(())
+        finish_setting_change(&mut state, values, guc_bit(name), local, false)
     }
 
     pub(crate) fn transaction_reset_owned(&self, name: &str) -> Option<StackStr<256>> {
@@ -1752,8 +1832,7 @@ impl GucState {
         )?;
         let bit = guc_bit(name);
         let resetting = value.is_none();
-        finish_setting_change(&mut state, values, bit, local, resetting);
-        Ok(())
+        finish_setting_change(&mut state, values, bit, local, resetting)
     }
 
     pub(crate) fn set_time_zone_sql(&self, raw: &str, local: bool) -> Result<(), SqlError> {
@@ -1787,8 +1866,7 @@ impl GucState {
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
         apply_time_zone_offset(&mut values, seconds_east)?;
-        finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false);
-        Ok(())
+        finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false)
     }
 
     pub(crate) fn set_cluster_default(&self, name: &str, raw: &str) -> Result<(), SqlError> {
@@ -1900,15 +1978,17 @@ impl GucState {
         self.assign(name, None, false)
     }
 
-    pub fn reset_all(&self) {
+    pub fn reset_all(&self) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
+        state.actions.record_session(GUC_ALL)?;
         let values = state.defaults;
-        state.current = values;
+        copy_guc_values(&mut state.current, &values, GUC_ALL);
         state.session_overrides = 0;
         if state.transaction.active {
-            state.transaction.session = values;
+            copy_guc_values(&mut state.transaction.session, &values, GUC_ALL);
             state.transaction.session_overrides = 0;
         }
+        Ok(())
     }
 
     pub fn discard_all(&self) {
@@ -1934,6 +2014,7 @@ impl GucState {
         state.transaction.start = current;
         state.transaction.session = current;
         state.transaction.start_overrides = state.session_overrides;
+        state.transaction.start_actions = state.actions.session;
         state.transaction.session_overrides = state.session_overrides;
         state.transaction.savepoint_count = 0;
     }
@@ -1956,6 +2037,7 @@ impl GucState {
         }
         state.current = state.transaction.start;
         state.session_overrides = state.transaction.start_overrides;
+        state.actions.session = state.transaction.start_actions;
         state.transaction.active = false;
         state.transaction.savepoint_count = 0;
     }
@@ -1975,6 +2057,7 @@ impl GucState {
             session: state.transaction.session,
             current_overrides: state.session_overrides,
             session_overrides: state.transaction.session_overrides,
+            session_actions: state.actions.session,
         });
         state.transaction.savepoint_count += 1;
     }
@@ -1997,6 +2080,7 @@ impl GucState {
         state.transaction.session = savepoint.session;
         state.session_overrides = savepoint.current_overrides;
         state.transaction.session_overrides = savepoint.session_overrides;
+        state.actions.session = savepoint.session_actions;
         state.transaction.savepoint_count = index + 1;
     }
 
@@ -2081,7 +2165,8 @@ impl GucState {
     ) -> Result<RoutineConfigScope, SqlError> {
         let mut state = self.store.borrow_mut();
         let prior = state.current;
-        let session = state.transaction.session;
+        let entered = state.actions.next;
+        let mut configured = 0;
         let mut current = state.current;
         for config in configs {
             change_setting(
@@ -2090,36 +2175,36 @@ impl GucState {
                 config.name.as_str(),
                 Some(config.value.as_str()),
             )?;
+            configured |= guc_bit(config.name.as_str());
         }
         state.current = current;
         drop(state);
-        for config in configs {
-            if let Some(value) = self.get_owned(config.name.as_str()) {
-                let reset = self.reset_owned(config.name.as_str()).unwrap_or(value);
+        self.publish_owned_settings();
+        Ok(RoutineConfigScope {
+            guc: self as *const GucState,
+            prior,
+            configured,
+            entered,
+            owner: super::execution_identity(),
+        })
+    }
+
+    fn publish_owned_settings(&self) {
+        // A routine can change settings absent from its SET clause. Publish
+        // the whole restored scope before another trigger observes it.
+        for &name in super::SETTING_NAMES {
+            if let Some(value) = self.get_owned(name) {
+                let reset = self.reset_owned(name).unwrap_or(value);
                 crate::sql::eval::funcs::system::update_session_setting(
-                    config.name.as_str(),
+                    name,
                     value,
                     reset,
-                    self.source(config.name.as_str()),
+                    self.source(name),
                 );
             }
         }
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
         crate::sql::timezone::set_session(self.timezone());
-        Ok(RoutineConfigScope {
-            guc: self as *const GucState,
-            prior,
-            session,
-            names: {
-                let mut names =
-                    [crate::storage::SqlName::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
-                for (index, config) in configs.iter().enumerate() {
-                    names[index] = config.name;
-                }
-                names
-            },
-            count: configs.len(),
-        })
     }
 }
 
@@ -3187,6 +3272,349 @@ fn invalid_setting_value(param: &str, v: &str) -> SqlError {
         param,
         v
     )
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn routine_exit_keeps_unlisted_local_settings_and_publishes_restored_values() {
+        assert_eq!(
+            super::super::SETTING_NAMES
+                .iter()
+                .fold(0, |mask, name| mask | guc_bit(name)),
+            GUC_ALL
+        );
+        let guc = GucState::new();
+        let mut budget = Budget::new(
+            super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1) + 128,
+        );
+        let mut txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let arena =
+            crate::mem::Arena::new(&mut budget, "setting-dependent binary output", 128).unwrap();
+        let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+        let _evaluation = enter_eval_scope(&guc, &mut txn);
+        let configs = [crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("application_name").unwrap(),
+            value: StackStr::from_str("configured"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let names = ["application_name", "bytea_output", "client_min_messages"];
+            let initial = [
+                StackStr::from_str("outer"),
+                StackStr::from_str("hex"),
+                StackStr::from_str("notice"),
+            ];
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &initial,
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            guc.begin_transaction();
+            guc.set_config("application_name", Some("outer"), false)
+                .unwrap();
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.set_config("bytea_output", Some("escape"), true)
+                    .unwrap();
+                publish_active_setting(&guc, "bytea_output");
+                guc.set_config("client_min_messages", Some("warning"), false)
+                    .unwrap();
+                publish_active_setting(&guc, "client_min_messages");
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "escape"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+                assert_eq!(
+                    crate::sql::eval::cast_to_text(
+                        crate::sql::types::Datum::Bytea(&[0, b'\\', 127, 255]),
+                        &arena,
+                    )
+                    .unwrap(),
+                    r"\000\\\177\377"
+                );
+            }
+            for (name, expected) in names.into_iter().zip(["outer", "escape", "warning"]) {
+                assert_eq!(guc.get_owned(name).unwrap().as_str(), expected);
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting(name)
+                        .unwrap()
+                        .as_str(),
+                    expected
+                );
+            }
+            assert!(active_render().unwrap().bytea_escape);
+            guc.set_config("bytea_output", Some("hex"), true).unwrap();
+            publish_active_setting(&guc, "bytea_output");
+            assert_eq!(
+                crate::sql::eval::cast_to_text(
+                    crate::sql::types::Datum::Bytea(&[0, b'\\', 127, 255]),
+                    &arena,
+                )
+                .unwrap(),
+                r"\x005c7fff"
+            );
+        });
+    }
+
+    #[test]
+    fn saved_routine_settings_restore_after_worker_reuse_and_repeated_pauses() {
+        use crate::mem::lease_pool::{LeasePool, Purpose};
+
+        let guc = GucState::new();
+        let other = GucState::new();
+        let mut budget = Budget::new(
+            2 * super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1)
+                + LeasePool::budget_bytes(16 << 10, 4),
+        );
+        let mut txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let mut other_txn =
+            super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        let controls =
+            LeasePool::new(&mut budget, Purpose::EXECUTION_CONTROL, 16 << 10, 4).unwrap();
+        let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+        let _evaluation = enter_eval_scope(&guc, &mut txn);
+        let configs = [crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("application_name").unwrap(),
+            value: StackStr::from_str("configured"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            let names = ["application_name", "bytea_output", "client_min_messages"];
+            let initial = [
+                StackStr::from_str("outer"),
+                StackStr::from_str("hex"),
+                StackStr::from_str("notice"),
+            ];
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &initial,
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            guc.begin_transaction();
+            guc.set_config("application_name", Some("outer"), false)
+                .unwrap();
+            let mut saved = {
+                let scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.set_config("bytea_output", Some("escape"), true)
+                    .unwrap();
+                publish_active_setting(&guc, "bytea_output");
+                guc.set_config("client_min_messages", Some("warning"), false)
+                    .unwrap();
+                publish_active_setting(&guc, "client_min_messages");
+                let held = controls.lease::<u8>(16 << 10).unwrap();
+                let image = scope.save().unwrap();
+                assert!(controls.copy_slice(&[image]).is_err());
+                assert_eq!(
+                    guc.get_owned("application_name").unwrap().as_str(),
+                    "configured"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+                drop(held);
+                controls.copy_slice(&[image]).unwrap()
+            };
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            assert!(active_render().unwrap().bytea_escape);
+            // Recycling the worker's published values cannot change the image.
+            crate::sql::eval::funcs::system::set_session_settings(
+                &names,
+                &[StackStr::from_str("other connection"); 3],
+                &initial,
+                &["session"; 3],
+            )
+            .unwrap();
+            {
+                let prior_owner = super::super::execution_identity();
+                super::super::set_execution_connection_id(
+                    prior_owner.connection_id.wrapping_add(1),
+                );
+                let _other_evaluation = enter_eval_scope(&other, &mut other_txn);
+                other
+                    .set_config("application_name", Some("other connection"), false)
+                    .unwrap();
+                assert_eq!(
+                    saved[0].enter().err().unwrap().sqlstate,
+                    sqlstate::SERIALIZATION_FAILURE
+                );
+                assert_eq!(
+                    other.get_owned("application_name").unwrap().as_str(),
+                    "other connection"
+                );
+                super::super::publish_execution_identity(prior_owner);
+            }
+            // Parent settings must still match before any saved value is installed.
+            guc.set_config("application_name", Some("unrelated"), true)
+                .unwrap();
+            assert_eq!(
+                saved[0].enter().err().unwrap().sqlstate,
+                sqlstate::SERIALIZATION_FAILURE
+            );
+            assert_eq!(
+                guc.get_owned("application_name").unwrap().as_str(),
+                "unrelated"
+            );
+            guc.set_config("application_name", Some("outer"), true)
+                .unwrap();
+            let mut expected_application = "configured";
+            let mut expected_messages = "warning";
+            for iteration in 0..3 {
+                let scope = saved[0].enter().unwrap();
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("application_name")
+                        .unwrap()
+                        .as_str(),
+                    expected_application
+                );
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "escape"
+                );
+                assert!(active_render().unwrap().bytea_escape);
+                if iteration == 0 {
+                    guc.set_config("application_name", Some("continued"), true)
+                        .unwrap();
+                    publish_active_setting(&guc, "application_name");
+                    expected_application = "continued";
+                }
+                if iteration == 1 {
+                    guc.set_config("client_min_messages", Some("error"), false)
+                        .unwrap();
+                    publish_active_setting(&guc, "client_min_messages");
+                    expected_messages = "error";
+                }
+                let next = controls.copy_slice(&[scope.save().unwrap()]).unwrap();
+                drop(scope);
+                saved = next;
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("application_name")
+                        .unwrap()
+                        .as_str(),
+                    "outer"
+                );
+                assert_eq!(
+                    crate::sql::eval::funcs::system::session_setting("bytea_output")
+                        .unwrap()
+                        .as_str(),
+                    "escape"
+                );
+                assert_eq!(
+                    guc.get_owned("client_min_messages").unwrap().as_str(),
+                    expected_messages
+                );
+                assert!(active_render().unwrap().bytea_escape);
+            }
+            drop(other);
+            drop(controls);
+            let error: Result<(), SqlError> = (|| {
+                let _scope = saved[0].enter()?;
+                assert!(active_render().unwrap().bytea_escape);
+                Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "original error"))
+            })();
+            assert_eq!(error.unwrap_err().sqlstate, sqlstate::DIVISION_BY_ZERO);
+            assert_eq!(
+                crate::sql::eval::funcs::system::session_setting("bytea_output")
+                    .unwrap()
+                    .as_str(),
+                "escape"
+            );
+            assert!(active_render().unwrap().bytea_escape);
+        });
+    }
+
+    #[test]
+    fn routine_setting_actions_preserve_equal_session_sets_and_rollback() {
+        let guc = GucState::new();
+        let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
+        let configs = [crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("application_name").unwrap(),
+            value: StackStr::from_str("configured"),
+        }];
+        crate::mem::guard::forbid_alloc(|| {
+            guc.begin_transaction();
+            guc.set_config("application_name", Some("outer"), false)
+                .unwrap();
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                // Equal values are still explicit SET actions, overriding SAVE.
+                guc.set_config("application_name", Some("outer"), false)
+                    .unwrap();
+                guc.set_config("application_name", Some("until commit"), true)
+                    .unwrap();
+            }
+            assert_eq!(
+                guc.get_owned("application_name").unwrap().as_str(),
+                "until commit"
+            );
+            guc.commit_transaction();
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+
+            guc.begin_transaction();
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.savepoint();
+                guc.set_config("application_name", Some("outer"), false)
+                    .unwrap();
+                guc.rollback_to_savepoint(0);
+                guc.release_savepoints_from(0);
+                assert_eq!(
+                    guc.get_owned("application_name").unwrap().as_str(),
+                    "configured"
+                );
+            }
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            let authorization = crate::storage::SessionIdentity::unauthenticated("session owner");
+            let local_role = crate::storage::SessionIdentity::unauthenticated("local role");
+            guc.set_session_authorization(authorization, false);
+            guc.set_role(local_role, true);
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                guc.reset_all().unwrap();
+            }
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "");
+            assert_eq!(guc.current_identity(), local_role);
+            assert_eq!(guc.session_identity(), authorization);
+            guc.rollback_transaction();
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+
+            guc.begin_transaction();
+            let mark = guc.statement_settings();
+            guc.set_config("application_name", Some("discarded attempt"), false)
+                .unwrap();
+            guc.restore_statement_settings(mark);
+            {
+                let _scope = guc.enter_routine_configs(&configs).unwrap();
+            }
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            guc.store.borrow_mut().actions.next = u64::MAX;
+            let error = guc
+                .set_config("application_name", Some("unpublished"), false)
+                .unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("session setting assignment counter")
+            );
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+            assert_eq!(
+                guc.reset_all().unwrap_err().sqlstate,
+                sqlstate::PROGRAM_LIMIT_EXCEEDED
+            );
+            assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
+        });
+    }
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

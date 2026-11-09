@@ -82,6 +82,13 @@ pub(crate) struct StatementMark {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransactionEffectMark([usize; 15]);
 
+#[derive(Clone, Copy)]
+pub(super) struct WriteCompletionBoundary {
+    pub(super) mark: StatementMark,
+    pub(super) command: u32,
+    pub(super) depth: u16,
+}
+
 pub(crate) fn establish_savepoint(
     storage: &Storage,
     txn: &mut TxnState,
@@ -212,6 +219,67 @@ pub(crate) struct TriggerSqlScope<'txn> {
     parent_command: u32,
     parent_depth: u16,
     _snapshot: crate::storage::ReadSnapshotScope,
+}
+
+/// One unfinished nested command, independent of its worker and stack frame.
+pub(crate) struct SuspendedTriggerSql {
+    transaction: u32,
+    identity: super::ExecutionIdentity,
+    parent_command: u32,
+    parent_depth: u16,
+    command: u32,
+    depth: u16,
+    snapshot: crate::storage::SavedReadSnapshot,
+}
+
+impl TriggerSqlScope<'_> {
+    pub(crate) fn suspend(self) -> SuspendedTriggerSql {
+        SuspendedTriggerSql {
+            transaction: self.transaction.txid,
+            identity: super::execution_identity(),
+            parent_command: self.parent_command,
+            parent_depth: self.parent_depth,
+            command: self.transaction.command_id,
+            depth: self.transaction.trigger_depth,
+            snapshot: self._snapshot.capture_current(),
+        }
+    }
+}
+
+impl SuspendedTriggerSql {
+    #[expect(
+        clippy::result_large_err,
+        reason = "failed attachment returns the original command owner without allocating"
+    )]
+    pub(crate) fn resume(
+        self,
+        transaction: &mut TxnState,
+    ) -> Result<TriggerSqlScope<'_>, (Self, SqlError)> {
+        if transaction.failed
+            || transaction.mode == TxnMode::Idle
+            || transaction.txid != self.transaction
+            || super::execution_identity() != self.identity
+            || transaction.command_id != self.parent_command
+            || transaction.trigger_depth != self.parent_depth
+            || transaction.command_counter < self.command
+        {
+            return Err((
+                self,
+                sql_err!(
+                    sqlstate::SERIALIZATION_FAILURE,
+                    "suspended nested SQL belongs to a different command"
+                ),
+            ));
+        }
+        transaction.command_id = self.command;
+        transaction.trigger_depth = self.depth;
+        Ok(TriggerSqlScope {
+            transaction,
+            parent_command: self.parent_command,
+            parent_depth: self.parent_depth,
+            _snapshot: self.snapshot.resume(),
+        })
+    }
 }
 
 impl core::ops::Deref for TriggerSqlScope<'_> {
@@ -359,6 +427,8 @@ pub struct TxnState {
     snapshot_taken: bool,
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
+    pub(super) write_completion_boundary: Option<WriteCompletionBoundary>,
+    pub(super) pending_write_completion: Option<super::exec::SuspendedWriteCompletion>,
     pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
@@ -1064,6 +1134,8 @@ impl TxnState {
             snapshot_taken: false,
             transaction_start: None,
             suspended_statement: None,
+            write_completion_boundary: None,
+            pending_write_completion: None,
             cache_capacity_wait: None,
             checkpoint_request: None,
             command_id: 1,
@@ -1653,6 +1725,10 @@ impl TxnState {
 
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
+    }
+
+    pub(crate) fn has_pending_write_completion(&self) -> bool {
+        self.pending_write_completion.is_some()
     }
 
     pub(crate) fn enter_extension_script(&mut self) {
@@ -3182,6 +3258,8 @@ impl TxnState {
     }
 
     pub fn clear(&mut self) {
+        self.pending_write_completion = None;
+        self.write_completion_boundary = None;
         self.concurrent_index = None;
         self.immediate_index_utility = None;
         if let Some(owner) = &self.plan_invalidations {

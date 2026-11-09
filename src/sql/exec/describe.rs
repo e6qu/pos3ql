@@ -17,6 +17,32 @@ use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_ROUTINE_ARGUMENTS, RoutineArgumentDef, TableDef};
 use core::cell::Cell;
 
+/// SQL records retain declared type identities; protocol descriptions expose
+/// the representation expected by PostgreSQL clients.
+#[derive(Clone, Copy)]
+pub enum DescriptionTarget {
+    Sql,
+    Wire,
+}
+
+impl DescriptionTarget {
+    pub(crate) fn finish(
+        self,
+        columns: &mut [ColDesc<'_>],
+        storage: Option<&crate::storage::Storage>,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        for column in columns {
+            if let Self::Wire = self
+                && let Some(storage) = storage
+            {
+                *column = wire_column_description(*column, storage, txid)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The atttypmod RowDescription reports for an output expression: a bare table
 /// column carries its declared modifier, a cast its target's, and every other
 /// expression `-1` — matching what PostgreSQL sends (`upper(v)` has none even
@@ -33,6 +59,8 @@ fn output_type_mod(expression: &Expr<'_>, column_mod: impl Fn(&str) -> i32) -> i
 /// Catalog names escape into the statement arena before their reader is released.
 fn describe_column<'a>(
     column: &ColumnMeta,
+    storage: Option<&crate::storage::Storage>,
+    txid: u32,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<ColDesc<'a>, SqlError> {
     let name = arena.alloc_str(column.name.as_str()).map_err(|_| {
@@ -41,7 +69,18 @@ fn describe_column<'a>(
             "column description exceeds the statement arena"
         )
     })?;
-    Ok(ColDesc::of_type(name, column.ctype)
+    let type_oid = match storage {
+        Some(storage) => storage.routine_type_oid(column.ctype, column.user_type, txid),
+        None if column.user_type.is_none() => Some(column.ctype.oid()),
+        None => None,
+    }
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "output column's declared type is unavailable"
+        )
+    })?;
+    Ok(ColDesc::new(name, type_oid, column.ctype.typlen())
         .with_type_mod(column.type_mod)
         .with_collation(column.collation))
 }
@@ -77,6 +116,10 @@ pub(crate) fn wire_column_description<'a>(
     Ok(description)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub fn describe_items<'q>(
     items: &[SelectItem<'q>],
     def: Option<crate::storage::RelationDefinition<'_>>,
@@ -85,8 +128,9 @@ pub fn describe_items<'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
+    description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
-    describe_items_with_output_aliases(
+    let count = describe_items_with_output_aliases(
         items,
         DescribeContext {
             def,
@@ -97,7 +141,9 @@ pub fn describe_items<'q>(
             arena,
         },
         out,
-    )
+    )?;
+    description_target.finish(&mut out[..count], storage, txid)?;
+    Ok(count)
 }
 
 #[derive(Clone, Copy)]
@@ -139,10 +185,7 @@ fn describe_items_with_output_aliases<'q>(
                     "target lists can have at most 1664 entries"
                 ));
             }
-            out[n] = match storage {
-                Some(storage) => wire_column_description(desc, storage, txid)?,
-                None => desc,
-            };
+            out[n] = desc;
             n += 1;
             Ok(())
         };
@@ -155,7 +198,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 };
                 for c in def.columns() {
-                    push(describe_column(c, context.arena)?)?;
+                    push(describe_column(c, storage, txid, context.arena)?)?;
                 }
             }
             SelectItem::TableWildcard(q) => {
@@ -171,7 +214,7 @@ fn describe_items_with_output_aliases<'q>(
                     ));
                 }
                 for c in def.expect("matched").columns() {
-                    push(describe_column(c, context.arena)?)?;
+                    push(describe_column(c, storage, txid, context.arena)?)?;
                 }
             }
             SelectItem::RecordStar(base) => {
@@ -210,15 +253,15 @@ fn describe_items_with_output_aliases<'q>(
                 let name = alias.unwrap_or(derived_name(expression));
                 let field_meta = match expression {
                     Expr::Field { base, field } => {
-                        record_field_metadata(base, field, resolver).ok()
+                        Some(record_field_metadata(base, field, resolver)?)
                     }
                     _ => None,
                 };
                 if let Some(meta) = field_meta {
-                    type_oid = meta.ctype.oid();
+                    type_oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 } else if let Some(meta) = routine_result_metadata(expression, resolver) {
-                    type_oid = meta.ctype.oid();
+                    type_oid = meta.type_oid;
                     typlen = meta.ctype.typlen();
                 }
                 let type_mod = field_meta.map_or_else(
@@ -231,7 +274,10 @@ fn describe_items_with_output_aliases<'q>(
                     |meta| meta.type_mod,
                 );
                 let mut description = ColDesc::new(name, type_oid, typlen).with_type_mod(type_mod);
-                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable) {
+                let collatable = coltype_of_oid(type_oid)
+                    .or_else(|| resolver.domain_base_type(type_oid))
+                    .is_some_and(ColType::is_collatable);
+                if collatable {
                     let metadata = match def {
                         Some(definition) => described_expression_collation(
                             expression,
@@ -252,9 +298,7 @@ fn describe_items_with_output_aliases<'q>(
                 } else if let Some(meta) = field_meta {
                     description.collation = meta.collation;
                 }
-                if coltype_of_oid(type_oid).is_some_and(ColType::is_collatable)
-                    && description.collation_derivation == CollationDerivation::None
-                {
+                if collatable && description.collation_derivation == CollationDerivation::None {
                     description.collation = crate::sql::ast::Collation::Default;
                     description.collation_derivation = CollationDerivation::Implicit;
                 }
@@ -272,13 +316,21 @@ pub(crate) fn describe_data_modification_columns<'a>(
     arena: &'a crate::mem::arena::Arena,
     txid: u32,
     columns: &mut [ColDesc<'a>],
+    description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
     use crate::sql::ast::Stmt;
     if let Stmt::Merge(merge) = statement {
         if merge.returning.is_empty() {
             return Ok(0);
         }
-        return crate::sql::exec::describe_merge_returning(storage, txid, merge, arena, columns);
+        return crate::sql::exec::describe_merge_returning(
+            storage,
+            txid,
+            merge,
+            arena,
+            columns,
+            description_target,
+        );
     }
     let (target, returning, target_alias) = match statement {
         Stmt::Insert(insert) => {
@@ -333,12 +385,17 @@ pub(crate) fn describe_data_modification_columns<'a>(
             txid,
             arena,
             columns,
+            description_target,
         )
     })
 }
 
 /// Describe a single DML target's `RETURNING` list, including the names that
 /// PostgreSQL adds only to the output scope.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "description explicitly selects SQL identities or protocol types"
+)]
 pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     returning: crate::sql::ast::Returning<'q>,
     definition: Option<&TableDef>,
@@ -347,6 +404,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     txid: u32,
     arena: &'q crate::mem::arena::Arena,
     out: &mut [ColDesc<'q>],
+    description_target: crate::sql::exec::DescriptionTarget,
 ) -> Result<usize, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
     let count = describe_items_with_output_aliases(
@@ -370,6 +428,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             }
         )
     }) {
+        description_target.finish(&mut out[..count], storage, txid)?;
         return Ok(count);
     }
     let Some(storage) = storage else {
@@ -434,6 +493,7 @@ pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
             }
         }
     }
+    description_target.finish(&mut out[..count], Some(storage), txid)?;
     Ok(count)
 }
 
@@ -1146,13 +1206,15 @@ fn describe_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if output_aliases.contains(table)
-            || def.is_some_and(|d| {
-                crate::sql::eval::qualifier_answers_target(d, table_alias, table)
-            }) =>
+        } if (matches!(base, Expr::WholeRow(_))
+            || def.is_some_and(|definition| definition.column_index(table).is_none()))
+            && (output_aliases.contains(table)
+                || def.is_some_and(|d| {
+                    crate::sql::eval::qualifier_answers_target(d, table_alias, table)
+                })) =>
         {
             for c in def.expect("matched").columns() {
-                push(describe_column(c, arena)?)?;
+                push(describe_column(c, storage, txid, arena)?)?;
             }
             Ok(())
         }
@@ -1178,7 +1240,7 @@ fn describe_record_star<'q>(
                             })
                             .and_then(|name| {
                                 push(
-                                    ColDesc::of_type(name, metadata.ctype)
+                                    ColDesc::new(name, metadata.type_oid, metadata.ctype.typlen())
                                         .with_type_mod(metadata.type_mod)
                                         .with_collation(metadata.collation),
                                 )
@@ -1242,9 +1304,20 @@ fn describe_record_star<'q>(
                         )
                     })?;
                     push(
-                        ColDesc::of_type(name, field.ctype)
-                            .with_type_mod(field.type_mod)
-                            .with_collation(field.collation),
+                        ColDesc::new(
+                            name,
+                            storage
+                                .routine_type_oid(field.ctype, field.user_type, txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "output column's declared type is unavailable"
+                                    )
+                                })?,
+                            field.ctype.typlen(),
+                        )
+                        .with_type_mod(field.type_mod)
+                        .with_collation(field.collation),
                     )?;
                 }
                 return Ok(());
@@ -1268,7 +1341,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(error) = push(
-                            ColDesc::of_type(name, meta.ctype)
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {
@@ -1316,7 +1389,7 @@ fn describe_record_star<'q>(
                 match leased {
                     Some(name) => {
                         if let Err(e) = push(
-                            ColDesc::of_type(name, meta.ctype)
+                            ColDesc::new(name, meta.type_oid, meta.ctype.typlen())
                                 .with_type_mod(meta.type_mod)
                                 .with_collation(meta.collation),
                         ) {
@@ -2631,9 +2704,6 @@ pub fn visit_record_shape_metadata(
 pub fn expr_record_handle(base: &Expr, columns: &dyn ColTypeResolver) -> Option<i32> {
     match base {
         Expr::Column { qualifier, name } => {
-            if columns.is_whole_row(name) {
-                return None;
-            }
             let handle = columns.record_column_handle(*qualifier, name)?;
             (handle >= 0).then_some(handle)
         }
@@ -3574,14 +3644,25 @@ fn record_shape_metadata_dyn(
         }
         Expr::WholeRow(table) => Ok(shape_from_columns_metadata(table, columns, visit)),
         Expr::Cast { type_name, .. } => columns.visit_named_composite_fields(type_name, visit),
-        Expr::Column { qualifier, name }
-            if matches!(columns.resolve(*qualifier, name), Ok(ColType::Composite(_))) =>
-        {
-            let ColType::Composite(slot) = columns.resolve(*qualifier, name)? else {
-                unreachable!()
-            };
-            Ok(columns.visit_composite_fields(slot, visit))
-        }
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
+            Ok(ColType::Composite(slot)) => Ok(columns.visit_composite_fields(slot, visit)),
+            Ok(ColType::Record) => match expr_record_handle(base, columns) {
+                Some(handle) => Ok(visit_record_shape_metadata(handle, visit)),
+                None if qualifier.is_none() && columns.is_whole_row(name) => {
+                    Ok(shape_from_columns_metadata(name, columns, visit))
+                }
+                None => Ok(None),
+            },
+            Ok(_) => Ok(None),
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && columns.is_whole_row(name) =>
+            {
+                Ok(shape_from_columns_metadata(name, columns, visit))
+            }
+            Err(error) => Err(error),
+        },
         Expr::Field { base, field }
             if matches!(
                 record_field_type(base, field, columns),
@@ -3615,16 +3696,12 @@ fn record_shape_metadata_dyn(
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
-        Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
+        Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
             Ok(visit_record_shape_metadata(
                 expr_record_handle(base, columns).expect("record shape was selected"),
                 visit,
             ))
         }
-        Expr::Column {
-            qualifier: None,
-            name,
-        } if columns.is_whole_row(name) => Ok(shape_from_columns_metadata(name, columns, visit)),
         _ => Ok(None),
     }
 }
@@ -3642,27 +3719,27 @@ fn shape_from_columns_metadata(
     (count != 0).then_some(count)
 }
 
-/// PostgreSQL cannot form the composite type of a `ROW(...)` that contains a
-/// bare unknown literal, so selecting a field of (or expanding) such a record
-/// fails — even for a well-typed sibling field. Mirror that so `(ROW(1,'x')).f1`
-/// errors exactly as PostgreSQL does.
+/// Star expansion exposes every row field as a projection. PostgreSQL cannot
+/// resolve an unknown field projection to text as it can a bare literal;
+/// explicit field casts make the expansion well typed.
 pub fn check_row_field_types(base: &Expr, columns: &dyn ColTypeResolver) -> Result<(), SqlError> {
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,
         name,
-        args,
         ..
     } = base
         && name.eq_ignore_ascii_case("row")
     {
-        for arg in *args {
-            if infer_type_res(arg, columns)?.0 == oid::UNKNOWN && !matches!(arg, Expr::Cast { .. })
-            {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "failed to find conversion function from unknown to text"
-                ));
-            }
+        let mut unknown = false;
+        record_shape_metadata(base, columns, |_, metadata| {
+            unknown |= metadata.type_oid == oid::UNKNOWN;
+        })?
+        .ok_or_else(|| could_not_identify("*"))?;
+        if unknown {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "failed to find conversion function from unknown to text"
+            ));
         }
     }
     Ok(())
@@ -3687,33 +3764,26 @@ pub fn record_field_metadata(
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,
         name,
-        args,
         ..
     } = base
         && name.eq_ignore_ascii_case("row")
-        && let Some(position) = RECORD_FIELD_NAMES
-            .iter()
-            .position(|n| n.eq_ignore_ascii_case(field))
-        && let Some(arg) = args.get(position)
-        && infer_type_res(arg, columns)?.0 == oid::UNKNOWN
-        && !matches!(arg, Expr::Cast { .. })
     {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "failed to find conversion function from unknown to text"
-        ));
+        let mut selected = None;
+        record_shape_metadata(base, columns, |name, metadata| {
+            if name.eq_ignore_ascii_case(field) {
+                selected = Some(metadata);
+            }
+        })?;
+        let metadata = selected.ok_or_else(|| could_not_identify(field))?;
+        if metadata.type_oid == oid::UNKNOWN {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "failed to find conversion function from unknown to text"
+            ));
+        }
+        return Ok(metadata);
     }
     let precise = match base {
-        Expr::Call {
-            kind: crate::sql::ast::CallKind::SqlSyntax,
-            name,
-            args,
-            ..
-        } if name.eq_ignore_ascii_case("row") => RECORD_FIELD_NAMES
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(field))
-            .and_then(|position| args.get(position))
-            .and_then(|argument| expression_static_metadata(argument, columns)),
         Expr::Call { args, .. } if builtin_expand_array_call(base, columns)? => {
             if field.eq_ignore_ascii_case("x") {
                 expand_array_element_metadata(args, columns)
@@ -3793,21 +3863,30 @@ pub fn record_field_metadata(
             }
         }
         Expr::WholeRow(table) => columns.column_meta(Some(table), field),
-        Expr::Column {
-            qualifier: None,
-            name,
-        } if columns.is_whole_row(name) => columns.column_meta(Some(name), field),
-        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name).ok() {
-            Some(ColType::Composite(slot)) => {
+        Expr::Column { qualifier, name } => match columns.resolve(*qualifier, name) {
+            Ok(ColType::Composite(slot)) => {
                 // A named type uses the selected catalog definition, including
                 // edits made after statement-local anonymous shapes were built.
                 return columns
                     .composite_field(slot, field)
                     .ok_or_else(|| could_not_identify(field));
             }
-            _ => columns
-                .record_column_handle(*qualifier, name)
-                .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+            Ok(ColType::Record) => match expr_record_handle(base, columns) {
+                Some(handle) => record_shape_field_metadata(handle, field).map(|value| value.0),
+                None if qualifier.is_none() && columns.is_whole_row(name) => {
+                    columns.column_meta(Some(name), field)
+                }
+                None => None,
+            },
+            Ok(_) => None,
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && columns.is_whole_row(name) =>
+            {
+                columns.column_meta(Some(name), field)
+            }
+            Err(error) => return Err(error),
         },
         Expr::Field {
             base: inner,
@@ -3978,6 +4057,16 @@ impl ColTypeResolver for DefCols<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for DefCols<'_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        ColTypeResolver::is_whole_row(self, table).then_some(())?;
+        crate::sql::eval::stored_row_field_metadata(self.0.columns().get(index)?, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.column_meta(qualifier, name)
             .map_or(-1, |column| column.type_mod)
@@ -4083,6 +4172,16 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        ColTypeResolver::is_whole_row(self, table).then_some(())?;
+        crate::sql::eval::stored_row_field_metadata(self.definition.columns().get(index)?, catalog)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         self.column_meta(qualifier, name)
             .map_or(-1, |column| column.type_mod)

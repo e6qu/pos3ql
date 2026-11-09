@@ -1102,7 +1102,7 @@ mod tests {
             let mut failed = [None; 2];
             let waiting;
             {
-                let _scope = sequence::enter_statement(&arena, session, false);
+                let _scope = sequence::enter_statement(&arena, session, false, None);
                 for failed in &mut failed {
                     assert!(
                         plans
@@ -1160,7 +1160,7 @@ mod tests {
             }
             arena.recycle_front();
             {
-                let scope = sequence::enter_statement(&arena, session, true);
+                let scope = sequence::enter_statement(&arena, session, true, None);
                 for failed in failed {
                     let plan = failed.unwrap();
                     assert!(
@@ -1201,7 +1201,7 @@ mod tests {
                 scope.finish(session).unwrap();
             }
             assert_eq!(calls.get(), 2);
-            let scope = sequence::enter_statement(&arena, session, false);
+            let scope = sequence::enter_statement(&arena, session, false, None);
             assert!(
                 plans
                     .find_validated(key, |_| panic!("a failed plan has no checked values"))
@@ -1247,7 +1247,7 @@ mod tests {
             let second;
             let original_attempt;
             {
-                let _scope = sequence::enter_statement(&arena, session, false);
+                let _scope = sequence::enter_statement(&arena, session, false, None);
                 let bytes = first.key_bytes();
                 sequence::statement_effect(
                     StatementEffectKind::RoutineInput,
@@ -1296,7 +1296,7 @@ mod tests {
             }
             arena.recycle_front();
             {
-                let scope = sequence::enter_statement(&arena, session, true);
+                let scope = sequence::enter_statement(&arena, session, true, None);
                 for expected in [first, second] {
                     assert!(
                         matches!(plans.find_validated(key, |_| panic!("a receipt selects its original generation")).unwrap(),
@@ -1332,7 +1332,7 @@ mod tests {
                 assert!(!plans.is_retained(parent));
             }
             {
-                let scope = sequence::enter_statement(&arena, session, false);
+                let scope = sequence::enter_statement(&arena, session, false, None);
                 assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
                 let replacement = plans.reserve(key).unwrap();
                 assert_ne!(replacement, first);
@@ -1362,7 +1362,7 @@ mod tests {
             }
             arena.reset();
             {
-                let scope = sequence::enter_statement(&arena, session, false);
+                let scope = sequence::enter_statement(&arena, session, false, None);
                 assert!(!sequence::retains_input_attempt(original_attempt));
                 assert!(plans.find_validated(key, |_| Ok(false)).unwrap().is_none());
                 assert!(plans.lookup(first, key).is_err());
@@ -1762,7 +1762,7 @@ mod tests {
         };
         crate::mem::guard::forbid_alloc(|| {
             for specialized in [true, false] {
-                let scope = sequence::enter_statement(&arena, session, false);
+                let scope = sequence::enter_statement(&arena, session, false, None);
                 let (key, original) = if specialized {
                     let admitted = plans
                         .runtime_routine_key(
@@ -1803,7 +1803,7 @@ mod tests {
                 assert_eq!(error.sqlstate, sqlstate::INTERNAL_LOCK_WAIT);
                 scope.discard(session);
                 drop(scope);
-                let fresh = sequence::enter_statement(&arena, session, false);
+                let fresh = sequence::enter_statement(&arena, session, false, None);
                 let replacement = if specialized {
                     let admitted = plans
                         .runtime_routine_key(

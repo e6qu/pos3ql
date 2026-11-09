@@ -1163,3 +1163,1088 @@ fn input_validation_reports_bad_data_but_propagates_domain_expression_errors() {
         }
     }
 }
+
+#[test]
+fn checked_array_inputs_in_row_triggers_keep_inserted_rows_and_prior_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("retained-trigger-input-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/265_trigger_input_visibility.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["1|3|1|1|1|1|8193|2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn retained_write_completion_keeps_returning_rows_and_trigger_effects_through_lock_waits() {
+    for combined in [false, true] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("retained-write-completion-{mode:?}-{combined}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let wait = if combined {
+                "PERFORM pg_advisory_lock(41), nextval('held_expression_sequence'), pg_advisory_xact_lock(42);"
+            } else {
+                "PERFORM pg_advisory_lock(41); PERFORM pg_advisory_xact_lock(42);"
+            };
+            writer.success(
+            &mut engine,
+            &format!("CREATE SEQUENCE held_trigger_sequence; CREATE SEQUENCE held_expression_sequence; CREATE TABLE held_trigger_rows(id integer); \
+             CREATE TABLE held_trigger_audit(stage text,id integer,n bigint,note text); \
+             CREATE FUNCTION held_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE n bigint:=nextval('held_trigger_sequence'); saved text:=repeat('x',8192); \
+             BEGIN INSERT INTO held_trigger_audit VALUES('before',NEW.id,n,saved); \
+             {wait} \
+             saved:=saved||'!'; INSERT INTO held_trigger_audit VALUES('after',NEW.id,n,saved); \
+             RETURN NEW; END$$; CREATE TRIGGER held_trigger AFTER INSERT ON held_trigger_rows \
+             FOR EACH ROW EXECUTE FUNCTION held_trigger()"),
+            true,
+        );
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
+            let sql = "INSERT INTO held_trigger_rows VALUES(1),(2) RETURNING id";
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            for _ in 0..2 {
+                let ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "trigger did not retain its write: {:?}: {}",
+                        status,
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert!(writer.transaction.has_pending_write_completion());
+                assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
+                assert!(command_tags(writer.send.readable()).is_empty());
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT 40+2; SELECT last_value FROM held_trigger_sequence",
+                        true
+                    )),
+                    ["42", "1"]
+                );
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        sql,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
+            let ExecutionStatus::Blocked {
+                completed_statements,
+                output_mark,
+                wait,
+            } = status
+            else {
+                panic!("trigger stopped waiting before its lock was released");
+            };
+            assert_eq!(wait, StatementWait::Lock);
+            holder.success(&mut engine, "COMMIT", true);
+            writer.send.truncate_to(output_mark);
+            writer.arena.recycle_front();
+            status = crate::mem::guard::forbid_alloc(|| {
+                engine.execute_simple_from(
+                    sql,
+                    completed_statements,
+                    &writer.arena,
+                    &mut writer.transaction,
+                    &mut writer.pool,
+                    &mut writer.cursors,
+                    &writer.guc,
+                    &mut Responder::new(&mut writer.send),
+                    writer.connection_id,
+                    false,
+                )
+            })
+            .unwrap();
+            assert_eq!(status, ExecutionStatus::Complete, "{mode:?}");
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(data_rows(writer.send.readable()), ["1", "2"]);
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 2"]);
+            assert!(!writer.transaction.has_pending_write_completion());
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT stage,id,n,length(note) FROM held_trigger_audit ORDER BY n,stage; \
+             SELECT last_value FROM held_trigger_sequence; \
+            SELECT last_value,is_called FROM held_expression_sequence; \
+             SELECT pg_advisory_unlock(41),pg_advisory_unlock(41),pg_advisory_unlock(41)",
+                    true
+                )),
+                [
+                    "after|1|1|8193",
+                    "before|1|1|8192",
+                    "after|2|2|8193",
+                    "before|2|2|8192",
+                    "2",
+                    if combined { "2|t" } else { "1|f" },
+                    "t|t|f"
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_write_completion_keeps_lock_calls_around_completed_nested_functions() {
+    for (label, fixture) in [
+        (
+            "perform",
+            include_str!(
+                "../../../tests/external/differential/276_suspended_query_invocations.sql"
+            ),
+        ),
+        (
+            "select-into",
+            include_str!("../../../tests/external/differential/277_suspended_select_into.sql"),
+        ),
+    ] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("nested-expression-locks-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+            let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+            writer.success(&mut engine, setup, true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(42)", true);
+            let mut status = writer.execute_status(&mut engine, write, true);
+            for released in [false, false, true] {
+                let ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "query failed to retain completed calls: {status:?}: {}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert_eq!(
+                    message_types(writer.send.readable())
+                        .iter()
+                        .filter(|kind| **kind == b'N')
+                        .count(),
+                    1,
+                    "warning prefix changed across a procedural wait"
+                );
+                assert!(writer.transaction.has_pending_write_completion());
+                assert_eq!(
+                    data_rows(&holder.success(
+                        &mut engine,
+                        "SELECT 40+2; SELECT last_value FROM nested_expression_sequence",
+                        true
+                    )),
+                    ["42", "2"]
+                );
+                if released {
+                    holder.success(&mut engine, "COMMIT", true);
+                }
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        write,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
+            assert_eq!(
+                status,
+                ExecutionStatus::Complete,
+                "{mode:?}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(
+                message_types(writer.send.readable())
+                    .iter()
+                    .filter(|kind| **kind == b'N')
+                    .count(),
+                1,
+                "warning repeated or disappeared after resumption"
+            );
+            assert!(error_sqlstates(writer.send.readable()).is_empty());
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+            assert!(!writer.transaction.has_pending_write_completion());
+            let inspected = writer.success(&mut engine, inspect, true);
+            assert_eq!(
+                data_rows(&inspected),
+                ["one,two,three|6|3|t|f|t|t|t|f|t|f"],
+                "{mode:?}"
+            );
+            assert_eq!(
+                message_types(&inspected)
+                    .iter()
+                    .filter(|kind| **kind == b'N')
+                    .count(),
+                3
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_write_completion_distinguishes_transition_rows_from_catalog_dependencies() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("transition-write-dependencies-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!(
+                "../../../tests/external/differential/280_transition_write_dependencies.sql"
+            ),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["1|13"], "{mode:?}");
+    }
+}
+
+#[test]
+fn retained_write_completion_preserves_advisory_unlock_warnings_and_filtering() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("advisory-unlock-warnings-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        let output = session.success(
+            &mut engine,
+            include_str!("../../../tests/external/differential/279_advisory_unlock_warnings.sql"),
+            true,
+        );
+        assert_eq!(data_rows(&output), ["", "t", "f|f|f|f|t", "f"]);
+        assert_eq!(
+            message_types(&output)
+                .iter()
+                .filter(|kind| **kind == b'N')
+                .count(),
+            4
+        );
+        let wire = String::from_utf8_lossy(&output);
+        for mode_name in ["ExclusiveLock", "ShareLock"] {
+            assert_eq!(
+                wire.matches(&format!(
+                    "SWARNING\0VWARNING\0C01000\0Myou don't own a lock of type {mode_name}\0"
+                ))
+                .count(),
+                2,
+                "{mode:?}: {wire}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_nested_write_completion_returns_once_to_its_waiting_parent() {
+    for dynamic in [false, true] {
+        for (event, seed, command, expected) in [
+            (
+                "UPDATE",
+                "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
+                "UPDATE nested_held_stock SET amount=amount+1;",
+                "2|3|2",
+            ),
+            (
+                "INSERT",
+                "",
+                "INSERT INTO nested_held_stock VALUES(3,0),(4,0);",
+                "2|7|0",
+            ),
+            (
+                "DELETE",
+                "INSERT INTO nested_held_stock VALUES(1,0),(2,0);",
+                "DELETE FROM nested_held_stock;",
+                "0|NULL|NULL",
+            ),
+        ] {
+            let command = if dynamic {
+                format!("EXECUTE $command${command}$command$;")
+            } else {
+                command.to_owned()
+            };
+            for mode in [
+                crate::config::TransactionMode::Mvcc,
+                crate::config::TransactionMode::Locking,
+            ] {
+                let mut config = test_config(&format!(
+                    "retained-nested-completion-{event}-{mode:?}-{dynamic}"
+                ));
+                config.transaction_mode = mode;
+                config.execution_control_bytes = 64 << 10;
+                config.execution_control_leases = 64;
+                config.row_work_bytes = 128 << 10;
+                config.row_work_leases = 64;
+                let mut budget = test_engine_budget(&config, 1 << 29);
+                let mut engine = Engine::new(&config, &mut budget).unwrap();
+                let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+                let mut holder =
+                    ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+                writer.success(&mut engine,
+            &format!("CREATE SEQUENCE nested_held_sequence; CREATE TABLE nested_held_orders(id integer); \
+             CREATE TABLE nested_held_stock(id integer,amount integer); \
+             CREATE TABLE nested_held_audit(kind text,id integer,n bigint,note text); \
+             {seed} \
+             CREATE FUNCTION nested_held_child() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE n bigint:=nextval('nested_held_sequence'); note text:=repeat('c',8192); row_id integer; \
+             BEGIN IF TG_OP='DELETE' THEN row_id:=OLD.id; ELSE row_id:=NEW.id; END IF; \
+             INSERT INTO nested_held_audit VALUES('child-before',row_id,n,note); \
+             PERFORM pg_advisory_xact_lock(43); \
+             INSERT INTO nested_held_audit VALUES('child-after',row_id,n,note||'!'); RETURN NEW; END$$; \
+             CREATE TRIGGER nested_held_child AFTER {event} ON nested_held_stock \
+             FOR EACH ROW EXECUTE FUNCTION nested_held_child(); \
+             CREATE FUNCTION nested_held_parent() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             DECLARE changed bigint; note text:=repeat('p',8192); BEGIN \
+             INSERT INTO nested_held_audit VALUES('parent-before',NEW.id,0,note); \
+             {command} \
+             GET DIAGNOSTICS changed=ROW_COUNT; \
+             IF changed<>2 OR NOT FOUND THEN RAISE EXCEPTION 'nested write count changed'; END IF; \
+             INSERT INTO nested_held_audit VALUES('parent-after',NEW.id,changed,note||'!'); \
+             RETURN NEW; END$$; CREATE TRIGGER nested_held_parent AFTER INSERT ON nested_held_orders \
+             FOR EACH ROW EXECUTE FUNCTION nested_held_parent()"), true);
+                holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+                let sql = "INSERT INTO nested_held_orders VALUES(10) RETURNING id";
+                let mut status = writer.execute_status(&mut engine, sql, true);
+                for released in [false, false, true] {
+                    let ExecutionStatus::Blocked {
+                        completed_statements,
+                        output_mark,
+                        wait,
+                    } = status
+                    else {
+                        panic!(
+                            "nested write did not retain its parent: {:?}: {}",
+                            status,
+                            String::from_utf8_lossy(writer.send.readable())
+                        );
+                    };
+                    assert_eq!(wait, StatementWait::Lock);
+                    assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                    assert!(command_tags(writer.send.readable()).is_empty());
+                    assert_eq!(
+                        data_rows(&holder.success(
+                            &mut engine,
+                            "SELECT last_value FROM nested_held_sequence; SELECT 40+2",
+                            true
+                        )),
+                        ["1", "42"]
+                    );
+                    if released {
+                        holder.success(&mut engine, "COMMIT", true);
+                    }
+                    writer.send.truncate_to(output_mark);
+                    writer.arena.recycle_front();
+                    status = crate::mem::guard::forbid_alloc(|| {
+                        engine.execute_simple_from(
+                            sql,
+                            completed_statements,
+                            &writer.arena,
+                            &mut writer.transaction,
+                            &mut writer.pool,
+                            &mut writer.cursors,
+                            &writer.guc,
+                            &mut Responder::new(&mut writer.send),
+                            writer.connection_id,
+                            false,
+                        )
+                    })
+                    .unwrap();
+                }
+                assert_eq!(status, ExecutionStatus::Complete);
+                assert!(
+                    error_sqlstates(writer.send.readable()).is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(writer.send.readable())
+                );
+                assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+                assert_eq!(data_rows(&writer.success(&mut engine,
+            "SELECT count(*),sum(id),sum(amount) FROM nested_held_stock; \
+             SELECT kind,count(*),min(length(note)),max(length(note)) FROM nested_held_audit GROUP BY kind ORDER BY kind; \
+             SELECT n FROM nested_held_audit WHERE kind='parent-after'; \
+             SELECT last_value FROM nested_held_sequence", true)),
+            [expected, "child-after|2|8193|8193", "child-before|2|8192|8192",
+             "parent-after|1|8193|8193", "parent-before|1|8192|8192", "2", "2"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_nested_write_completion_keeps_dynamic_returned_records_and_bindings() {
+    for (label, fixture, probe, expected_probe, expected) in [
+        (
+            "returned",
+            include_str!("../../../tests/external/differential/273_dynamic_write_completion.sql"),
+            "SELECT 40+2; SELECT (SELECT last_value FROM dynamic_held_bind),(SELECT last_value FROM dynamic_held_child)",
+            ["42", "1|1"],
+            "1|1|1|1|1|1|1|16385|1|1|t|integer",
+        ),
+        (
+            "into-errors",
+            include_str!("../../../tests/external/differential/275_dynamic_into_errors.sql"),
+            "SELECT 40+2; SELECT last_value FROM into_edge_sequence",
+            ["42", "1"],
+            "0|3|0|1|1|42601/P0003/P0002|1|8193|t|integer",
+        ),
+    ] {
+        let (setup, remainder) = fixture.split_once("-- Waitable write\n").unwrap();
+        let (write, inspect) = remainder.split_once("-- Inspect results\n").unwrap();
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("dynamic-nested-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            config.execution_control_bytes = 64 << 10;
+            config.execution_control_leases = 64;
+            config.row_work_bytes = 128 << 10;
+            config.row_work_leases = 64;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine, setup, true);
+            holder.success(&mut engine, "BEGIN; SELECT pg_advisory_xact_lock(43)", true);
+            let mut status = writer.execute_status(&mut engine, write, true);
+            for released in [false, false, true] {
+                let ExecutionStatus::Blocked {
+                    completed_statements,
+                    output_mark,
+                    wait,
+                } = status
+                else {
+                    panic!(
+                        "dynamic write failed to retain returned values: {status:?}: {}",
+                        String::from_utf8_lossy(writer.send.readable())
+                    );
+                };
+                assert_eq!(wait, StatementWait::Lock);
+                assert_eq!(data_rows(writer.send.readable()), ["10"]);
+                assert!(command_tags(writer.send.readable()).is_empty());
+                assert_eq!(
+                    data_rows(&holder.success(&mut engine, probe, true)),
+                    expected_probe
+                );
+                if released {
+                    holder.success(&mut engine, "COMMIT", true);
+                }
+                writer.send.truncate_to(output_mark);
+                writer.arena.recycle_front();
+                status = crate::mem::guard::forbid_alloc(|| {
+                    engine.execute_simple_from(
+                        write,
+                        completed_statements,
+                        &writer.arena,
+                        &mut writer.transaction,
+                        &mut writer.pool,
+                        &mut writer.cursors,
+                        &writer.guc,
+                        &mut Responder::new(&mut writer.send),
+                        writer.connection_id,
+                        false,
+                    )
+                })
+                .unwrap();
+            }
+            assert_eq!(status, ExecutionStatus::Complete);
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(data_rows(writer.send.readable()), ["10"]);
+            assert_eq!(command_tags(writer.send.readable()), ["INSERT 0 1"]);
+            assert_eq!(
+                data_rows(&writer.success(&mut engine, inspect, true)),
+                [expected]
+            );
+        }
+    }
+}
+
+#[test]
+fn procedural_source_boundaries_follow_sql_quoting_comments_and_subscripts() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-lexical-boundaries-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!(
+            "../../../tests/external/differential/274_procedural_lexical_boundaries.sql"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["ok|branch|20|INTO, USING, THEN, LOOP|first,second|x|1"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn utility_descriptions_match_execution() {
+    let config = test_config("utility-descriptions");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE DOMAIN described_positive AS integer CHECK(VALUE>0)",
+        true,
+    );
+    for sql in [
+        "SELECT NULL::described_positive AS value",
+        "SELECT (SELECT NULL::described_positive) AS value",
+        "SELECT value FROM (SELECT NULL::described_positive AS value) s",
+        "SELECT NULL::described_positive AS value UNION ALL SELECT NULL::described_positive WHERE false",
+    ] {
+        let described = describe_with(&mut engine, &mut budget, sql);
+        let executed = session.success(&mut engine, sql, false);
+        assert_eq!(
+            row_description_type_oids(&described),
+            [types::oid::INT4],
+            "{sql}"
+        );
+        assert_eq!(
+            row_description_type_oids(&executed),
+            [types::oid::INT4],
+            "{sql}"
+        );
+    }
+    for (sql, names) in [
+        ("SHOW TIMEZONE", &["TimeZone"][..]),
+        ("SHOW DateStyle", &["DateStyle"][..]),
+        ("SHOW IntervalStyle", &["IntervalStyle"][..]),
+        ("SHOW application_name", &["application_name"][..]),
+        ("SHOW ALL", &["name", "setting", "description"][..]),
+    ] {
+        let described = describe_with(&mut engine, &mut budget, sql);
+        let executed = session.success(&mut engine, sql, false);
+        assert_eq!(row_description_names(&described), names, "{sql}");
+        assert_eq!(row_description_names(&executed), names, "{sql}");
+        assert_eq!(
+            row_description_type_oids(&described),
+            row_description_type_oids(&executed),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("declared-record-types-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let fixture =
+            include_str!("../../../tests/external/differential/278_declared_record_types.sql");
+        let final_query = fixture
+            .find("SELECT check_declared_record_types()")
+            .unwrap();
+        let (setup, final_query) = fixture.split_at(final_query);
+        session.success(&mut engine, setup, true);
+        for query in [
+            "SELECT * FROM record_source",
+            "SELECT id,label FROM record_source",
+            "SELECT t.id,t.label FROM record_source t",
+            "SELECT public.record_source.id,public.record_source.label FROM public.record_source",
+            "SELECT t.* FROM record_source t",
+            "SELECT (t).* FROM record_source t",
+            "SELECT (ROW((t).*)).f1 AS id,(ROW((t).*)).f2 AS label FROM record_source t",
+            "SELECT (ROW(0,(t).*,NULL::record_positive)).f2 AS id,(ROW(0,(t).*,NULL::record_positive)).f3 AS label FROM record_source t",
+            "SELECT f1 AS id,f2 AS label FROM (SELECT (ROW(7::record_positive,'seven'::record_label)).* FROM record_source) q",
+            "SELECT record_return_positive() AS id,record_return_label() AS label",
+            "SELECT record_return_positive() AS id,record_return_label() AS label FROM record_source",
+            "SELECT (ARRAY[7::record_positive])[1] AS id,(ARRAY['seven'::record_label])[1] AS label",
+            "SELECT (ROW(7,'seven')::record_pair).*",
+            "SELECT (record_return_pair()).* FROM record_source",
+            "SELECT (record_return_pair()).id AS id,(record_return_pair()).label AS label FROM record_source",
+            "UPDATE record_source SET id=id RETURNING *",
+            "UPDATE record_source SET id=id RETURNING (record_source).*",
+            "UPDATE record_source AS s SET id=s.id RETURNING (s).*",
+            "UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (before_row).*",
+            "UPDATE record_source SET id=id RETURNING WITH(OLD AS before_row,NEW AS after_row) (after_row).*",
+            "INSERT INTO record_field_copies VALUES(7,'seven') RETURNING (record_field_copies).*",
+            "INSERT INTO record_conflict VALUES(7,'seven') ON CONFLICT(id) DO UPDATE SET label=excluded.label RETURNING (record_conflict).*",
+        ] {
+            let executed = session.success(&mut engine, query, false);
+            assert_eq!(data_rows(&executed), ["7|seven"], "{mode:?}: {query}");
+            assert_eq!(row_description_names(&executed), ["id", "label"], "{query}");
+            assert_eq!(
+                row_description_type_oids(&executed),
+                [types::oid::INT4, types::oid::TEXT],
+                "{query}"
+            );
+            let procedural = format!(
+                "DO $$DECLARE result record; BEGIN EXECUTE '{}' INTO STRICT result; \
+                 IF pg_typeof(result.id)<>'record_positive'::regtype \
+                 OR pg_typeof(result.label)<>'record_label'::regtype \
+                 OR result.id<>7 OR result.label<>'seven' THEN \
+                 RAISE EXCEPTION 'declared record changed: types %, %, values %, %', \
+                 pg_typeof(result.id),pg_typeof(result.label),result.id,result.label; END IF; END$$",
+                query.replace('\'', "''")
+            );
+            session.success(&mut engine, &procedural, true);
+        }
+        for query in [
+            "SELECT check_unknown_record_output()",
+            "SELECT check_null_record_fields()",
+            "SELECT check_following_record_fields()",
+        ] {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, query, true)),
+                ["t"],
+                "{mode:?}: {query}"
+            );
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, final_query, true)),
+            ["t|1|text|text|t"],
+            "{mode:?}"
+        );
+        for (query, types) in [
+            (
+                "SELECT * FROM record_source",
+                [types::oid::INT4, types::oid::TEXT],
+            ),
+            (
+                "SELECT (record_return_pair()).* FROM record_source",
+                [types::oid::INT4, types::oid::TEXT],
+            ),
+            (
+                "SELECT (ROW(NULL::text,'text'::text)).* FROM record_source",
+                [types::oid::TEXT, types::oid::TEXT],
+            ),
+        ] {
+            let described = describe_with(&mut engine, &mut budget, query);
+            let executed = session.success(&mut engine, query, false);
+            assert_eq!(row_description_type_oids(&described), types);
+            assert_eq!(row_description_type_oids(&executed), types);
+        }
+        for query in [
+            "SELECT (ROW(NULL,'text')).* FROM record_source",
+            "SELECT (ROW(NULL,'text')).f1 FROM record_source",
+            "SELECT (ROW(NULL,'text')).f2 FROM record_source",
+        ] {
+            let mut describe_budget = Budget::new(budget.remaining());
+            let arena = Arena::new(&mut describe_budget, "record error describe", 2 << 20).unwrap();
+            let mut described = crate::mem::FixedBuf::new(
+                &mut describe_budget,
+                "record error description",
+                1 << 18,
+            )
+            .unwrap();
+            let accepted = engine
+                .describe(
+                    query,
+                    &arena,
+                    &session.transaction,
+                    None,
+                    &mut Responder::for_describe(
+                        &mut described,
+                        crate::pg::respond::ResultFmt::ALL_TEXT,
+                    ),
+                    &[],
+                )
+                .unwrap();
+            assert!(!accepted, "{query}");
+            let executed = session.execute(&mut engine, query, false);
+            assert_eq!(error_sqlstates(described.readable()), ["XX000"], "{query}");
+            assert_eq!(error_sqlstates(&executed), ["XX000"], "{query}");
+            assert!(command_tags(&executed).is_empty(), "{query}");
+        }
+    }
+}
+
+#[test]
+fn whole_row_dependencies_keep_expanded_and_selected_columns() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("whole-row-dependencies-{mode:?}"));
+        config.transaction_mode = mode;
+        // Ten saved views and room to validate the two rejected definitions.
+        config.max_views = 12;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!("../../../tests/external/differential/281_whole_row_dependencies.sql"),
+                true,
+            )),
+            ["7|seven|7|7|7|7|7|seven|7|7|99|9|8|1|2|2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn record_projection_layout_keeps_sort_group_window_and_deferred_slots() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("record-projection-layout-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        assert_eq!(
+            data_rows(&session.success(
+                &mut engine,
+                include_str!(
+                    "../../../tests/external/differential/282_record_projection_layout.sql"
+                ),
+                true,
+            )),
+            ["t|t|t|t|t|t|t|t|t|t", "2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn nested_static_and_dynamic_writes_preserve_enclosing_row_selection_and_rollback() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("nested-write-selection-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/266_nested_write_selection.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["63|396|123|141|10|0|2|3|8193|3|4"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn uninitialized_domain_locals_validate_null_before_body_effects() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("domain-local-initialization-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!(
+            "../../../tests/external/differential/267_domain_local_initialization.sql"
+        );
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["23502|23514|23502|23502|22004|0|7:true|2"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn adjacent_triggers_observe_restored_settings_and_preserved_session_changes() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("trigger-setting-scope-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/271_trigger_setting_scope.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["10|5|t|t|t|t|t|outer|hex|warning|t"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn write_completion_preserves_empty_actions_captured_rows_and_one_reply() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("write-completion-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql = include_str!("../../../tests/external/differential/272_write_completion.sql");
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(data_rows(&output), ["2", "16|8|6|2|t|3|17"], "{mode:?}");
+        let writes: Vec<_> = command_tags(&output)
+            .into_iter()
+            .filter(|tag| {
+                ["INSERT ", "UPDATE ", "DELETE ", "MERGE ", "SELECT "]
+                    .iter()
+                    .any(|prefix| tag.starts_with(prefix))
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                "INSERT 0 0",
+                "UPDATE 0",
+                "DELETE 0",
+                "MERGE 0",
+                "MERGE 1",
+                "INSERT 0 1",
+                "SELECT 1",
+                "SELECT 1"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn mixed_writes_bind_each_row_trigger_to_its_own_transition_tables() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("mixed-transition-tables-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/270_mixed_transition_tables.sql");
+        let output = session.success(&mut engine, sql, true);
+        assert_eq!(data_rows(&output), ["10|4|4|2|t|t|301"], "{mode:?}");
+        let writes: Vec<_> = command_tags(&output)
+            .into_iter()
+            .filter(|tag| tag.starts_with("INSERT ") || tag.starts_with("MERGE "))
+            .collect();
+        assert_eq!(writes, ["INSERT 0 3", "INSERT 0 2", "MERGE 3"], "{mode:?}");
+    }
+}
+
+#[test]
+fn trigger_parameters_remain_separate_from_prepared_write_parameters() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("trigger-parameter-scope-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/269_trigger_parameter_scope.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["6|2|2|2|t|t|15"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn transition_columns_keep_declared_types_for_old_new_and_null_values() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("transition-column-types-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 64 << 10;
+        config.execution_control_leases = 64;
+        config.row_work_bytes = 128 << 10;
+        config.row_work_leases = 64;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        let sql =
+            include_str!("../../../tests/external/differential/268_transition_column_types.sql");
+        assert_eq!(
+            data_rows(&session.success(&mut engine, sql, true)),
+            ["8|2|2|2|2|4|t"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn unhandled_diagnostic_details_preserve_original_errors_at_small_control_capacity() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("unhandled-diagnostic-details-{mode:?}"));
+        config.transaction_mode = mode;
+        config.execution_control_bytes = 4096;
+        config.execution_control_leases = 16;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session =
+            ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+        session.success(
+            &mut engine,
+            "CREATE TABLE unhandled_error_audit(n integer)",
+            true,
+        );
+        session.success(&mut engine, "CREATE FUNCTION unhandled_detail(p text) RETURNS void LANGUAGE plpgsql AS $$BEGIN INSERT INTO unhandled_error_audit VALUES (1); RAISE EXCEPTION 'original error' USING DETAIL = p; END$$", true);
+        let detail = "z".repeat(8192);
+        for _ in 0..2 {
+            let error = session.execute(
+                &mut engine,
+                "SELECT unhandled_detail(repeat('z',8192))",
+                true,
+            );
+            assert_eq!(error_sqlstates(&error), ["P0001"], "{mode:?}");
+            let text = String::from_utf8_lossy(&error);
+            assert!(text.contains("original error"), "{mode:?}: {text}");
+            assert!(
+                text.contains(&detail),
+                "{mode:?}: original detail must survive"
+            );
+            assert_eq!(
+                data_rows(&session.success(
+                    &mut engine,
+                    "SELECT count(*) FROM unhandled_error_audit",
+                    true,
+                )),
+                ["0"],
+                "{mode:?}: the failed call must roll back its write"
+            );
+        }
+    }
+}

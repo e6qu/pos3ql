@@ -3638,6 +3638,7 @@ fn visit_column_dependencies<'a>(
 ) -> Result<(), SqlError> {
     match expression {
         Expr::Column { .. } | Expr::SchemaColumn { .. } | Expr::WholeRow(_) => visit(expression),
+        Expr::Field { base, field: "*" } => visit_column_dependencies(base, visit),
         Expr::Field { base, .. }
             if matches!(
                 **base,

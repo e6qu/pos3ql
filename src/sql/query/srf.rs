@@ -5993,11 +5993,18 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         resolve(invocations, statement_arena)?.rows(statement_arena, arena)
                     }
                     (None, None) => super::with_active_routine_invocations(|context| {
-                        let (invocations, statement_arena) = context.ok_or_else(|| {
-                            sql_err!(
+                        let (invocations, statement_arena) = context.ok_or_else(|| match access {
+                            super::RoutineProgramAccess::Sequences => sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SQL sequence table functions require an active statement session"
+                            ),
+                            super::RoutineProgramAccess::Engine => sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
                                 "data-modifying SQL table functions require a resumable query executor"
-                            )
+                            ),
+                            super::RoutineProgramAccess::ReadOnly => {
+                                unreachable!("read-only table routines execute directly")
+                            }
                         })?;
                         // An inherited callback owner cannot lend bytes beyond
                         // its scope. This query owns its independent row image.

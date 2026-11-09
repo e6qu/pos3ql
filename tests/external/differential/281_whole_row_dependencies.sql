@@ -19,7 +19,16 @@ CREATE VIEW whole_dep_record_field AS SELECT (t).a AS id FROM whole_dep_record t
 CREATE VIEW whole_dep_record_star AS SELECT (t).* FROM whole_dep_record t;
 ALTER TABLE whole_dep_record DROP COLUMN spare;
 CREATE TABLE whole_dep_scalar(t integer,id integer);
+CREATE TABLE whole_dep_constructor_source(id integer,spare text);
+INSERT INTO whole_dep_constructor_source VALUES(7,'needed by expansion');
+CREATE VIEW whole_dep_constructor AS
+SELECT (ROW((t).*)).f1 AS id FROM whole_dep_constructor_source t;
 DO $$BEGIN
+    BEGIN
+        ALTER TABLE whole_dep_constructor_source DROP COLUMN spare;
+        RAISE EXCEPTION 'constructor expansion dependency was lost';
+    EXCEPTION WHEN SQLSTATE '2BP01' THEN NULL;
+    END;
     BEGIN
         ALTER TABLE whole_dep_source DROP COLUMN label;
         RAISE EXCEPTION 'whole-row dependency was lost';
@@ -44,5 +53,5 @@ END$$;
 SELECT n.id,n.label,(SELECT id FROM whole_dep_qualified),
     (SELECT id FROM whole_dep_derived),(SELECT id FROM whole_dep_field),
     (SELECT id FROM whole_dep_schema_field),(SELECT id FROM whole_dep_record_field),
-    (SELECT b FROM whole_dep_record_star)
+    (SELECT b FROM whole_dep_record_star),(SELECT id FROM whole_dep_constructor)
 FROM whole_dep_nested n;

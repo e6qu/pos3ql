@@ -520,6 +520,9 @@ must recognize the field and retain its domain when `result.id` is NULL.
 used to execute it, including table-backed queries and set-operation branches.
 A nested `WITH orders AS (...)` binds its local name even when the outer query
 has no WITH clause; it must not read a durable `orders` table instead.
+A trigger initializer such as `DECLARE n bigint := (SELECT count(*) FROM new_orders)`
+uses the current statement's saved rows during both type checking and execution,
+including when restoring checked inputs has replaced its expression tree.
 Cast descriptions, record expansion and array subscripts keep the SQL type;
 only the final wire description selects its PostgreSQL base representation.
 Saved-query dependencies distinguish expanding a whole row, such as `(t).*`,

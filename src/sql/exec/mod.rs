@@ -23444,6 +23444,18 @@ fn eval_procedural_expression<'a>(
         }
         Some(_) | None => expression,
     };
+    // Restoring checked inputs can replace the syntax tree. Bind firing-owned
+    // tables to the expression that will actually execute.
+    let expression = match row.invocation.materialized_relations {
+        Some(relations) => super::query::bind_materialized_expression(
+            expression,
+            relations,
+            &engine.storage,
+            txid,
+            arena,
+        )?,
+        None => expression,
+    };
     let snapshot = engine.storage.read_snapshot();
     let mut execute = || {
         engine

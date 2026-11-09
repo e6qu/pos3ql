@@ -102,7 +102,9 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   preserving column precedence when its name matches a table alias.
   Apply the same reference-kind rules to RETURNING and write expressions,
   including old/new aliases and excluded conflict rows. Bind local WITH names
-  before describing a derived table inside procedural input analysis. Nested
+  before describing a derived table inside procedural input analysis. Bind the
+  expression actually executed after checked-input restoration, including
+  declaration initializers that read transition tables. Nested
   WITH clauses must also expand when the outer query has none. SELECT INTO
   descriptions use the same local scope as execution, including NULL domain
   fields, table-backed queries and set-operation branches. ROW constructors

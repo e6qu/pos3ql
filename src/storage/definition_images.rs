@@ -447,7 +447,7 @@ impl TableDefinitionImages {
         let image = unsafe { (*self.pool.cells[identity.index].image.get()).assume_init_ref() };
         image
             .references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < isize::MAX as usize).then(|| count + 1)
             })
             .map_err(|_| {

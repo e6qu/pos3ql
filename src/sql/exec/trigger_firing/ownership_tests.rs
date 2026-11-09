@@ -344,12 +344,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             "caller"
         );
         assert_eq!(saved.saved.metadata.header.routine_oid, 43);
-        let definition = saved
-            .saved
-            .metadata
-            .definitions
-            .retained_relation(saved.saved.metadata.definition)
-            .unwrap();
+        let definition = saved.saved.metadata.definition.relation();
         assert_eq!(definition.columns()[0].name.as_str(), "id");
         assert_eq!(definition.columns()[1].ctype, ColType::Text);
         assert_ne!(definition.columns()[1].ctype, columns[1].ctype);

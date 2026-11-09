@@ -15905,6 +15905,14 @@ impl Engine {
                 };
                 return Ok(Err(error));
             }
+            if invocations.execution == query::RoutineExecution::Retained
+                && matches!(&executed, Err(BodyError::Sql(error)) if matches!(error.sqlstate.internal_control(), Some(sqlstate::INTERNAL_IO_WAIT | sqlstate::INTERNAL_LOCK_WAIT)))
+            {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "function wait requires a retained body"
+                )));
+            }
             let succeeded = executed.is_ok();
             if let Some((total, own)) = timed.finish()
                 && succeeded

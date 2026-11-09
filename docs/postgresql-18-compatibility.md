@@ -419,8 +419,10 @@ Outside an owned query, the command's effect journal must approve restarting
 an unfinished call. Checked inputs, caught input errors and issued sequence
 values keep their original receipts; a command with unrecorded effects returns
 `0A000` instead of repeating them. SQL-language bodies and other expression
-positions still need retained progress. Storage waits remain synchronous on
-protected paths until that work is complete.
+positions still need retained progress. A SQL-language call inside retained
+work returns `0A000`, `function wait requires a retained body`, if it would lose
+its unfinished body on a wait. Storage waits remain synchronous on protected
+paths until that work is complete.
 Cancellation and capacity errors roll back SQL writes; sequence numbers already
 issued remain consumed, as in PostgreSQL.
 

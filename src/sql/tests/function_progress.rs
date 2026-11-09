@@ -621,19 +621,27 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
     ] {
-        for (site, body) in [
+        for (site, language, body) in [
             (
                 "assignment",
+                "plpgsql",
                 "DECLARE n bigint; BEGIN n:=expression_child(); RETURN n; END",
             ),
-            ("return", "BEGIN RETURN expression_child(); END"),
+            ("return", "plpgsql", "BEGIN RETURN expression_child(); END"),
             (
                 "bounds",
+                "plpgsql",
                 "BEGIN FOR i IN 1..expression_child() LOOP NULL; END LOOP; RETURN 1; END",
             ),
             (
                 "message",
+                "plpgsql",
                 "BEGIN RAISE NOTICE '%',expression_child(); RETURN 1; END",
+            ),
+            (
+                "sql_body",
+                "sql",
+                "INSERT INTO expression_audit VALUES(-1); SELECT expression_child()",
             ),
         ] {
             let mut config = test_config(&format!("function-expression-wait-{mode:?}-{site}"));
@@ -653,7 +661,7 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 CREATE FUNCTION expression_child() RETURNS bigint LANGUAGE plpgsql AS $$ \
                     DECLARE n bigint:=nextval('expression_numbers'); BEGIN INSERT INTO expression_audit VALUES(n); \
                     PERFORM pg_advisory_xact_lock(125); RETURN n; END$$; \
-                CREATE FUNCTION expression_parent() RETURNS bigint LANGUAGE plpgsql AS $${body}$$; \
+                CREATE FUNCTION expression_parent() RETURNS bigint LANGUAGE {language} AS $${body}$$; \
                 CREATE FUNCTION expression_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
                     BEGIN PERFORM expression_parent(); RETURN NEW; END$$; \
                 CREATE TRIGGER expression_trigger AFTER INSERT ON expression_root FOR EACH ROW EXECUTE FUNCTION expression_trigger()"),true);
@@ -670,13 +678,21 @@ fn unowned_expression_waits_roll_back_instead_of_repeating_completed_child_write
                 String::from_utf8_lossy(&error)
             );
             assert!(
-                String::from_utf8_lossy(&error)
-                    .contains("expression wait requires an owned invocation log")
+                String::from_utf8_lossy(&error).contains(if language == "sql" {
+                    "function wait requires a retained body"
+                } else {
+                    "expression wait requires an owned invocation log"
+                })
             );
             holder.success(&mut engine, "COMMIT", true);
             assert_eq!(data_rows(&writer.success(&mut engine,"SELECT count(*) FROM expression_root; SELECT count(*) FROM expression_audit; SELECT last_value FROM expression_numbers",true)),["0","0","1"]);
             writer.success(&mut engine, "INSERT INTO expression_root VALUES(2)", true);
-            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM expression_root; SELECT n FROM expression_audit; SELECT last_value FROM expression_numbers",true)),["2","2","2"]);
+            let expected = if language == "sql" {
+                vec!["2", "-1", "2", "2"]
+            } else {
+                vec!["2", "2", "2"]
+            };
+            assert_eq!(data_rows(&writer.success(&mut engine,"SELECT id FROM expression_root; SELECT n FROM expression_audit ORDER BY n; SELECT last_value FROM expression_numbers",true)), expected);
             drop((holder, writer, engine));
             std::fs::remove_dir_all(config.data_dir).unwrap();
         }

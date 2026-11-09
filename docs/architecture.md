@@ -265,21 +265,18 @@ scope. Their row scans may reclaim temporary storage without retaining a
 caller's unfinished input frames in that storage. Returning from the nested
 query restores the caller's input scope, including after an error.
 
-Waiting for another connection's lock can require restarting an unfinished
-function body. Completed cursor operations and checked routine inputs keep
-their results and sequence effects. A caught input-check error keeps its exact
-failed attempt too; replay restores that error without running the check again.
-If restarting would lose their data writes
-or session changes, the command fails explicitly with `0A000` and rolls back;
-it does not silently repeat or discard those effects. Retaining the remaining
-function-body execution position is still a roadmap item.
+Owned procedural queries preserve the unfinished function as well as completed
+cursor operations and checked inputs. Other expression positions still need
+that ownership before they can yield safely. If restarting would lose data
+writes or session changes, an unsupported path returns `0A000` and rolls back.
 
-With `SET track_functions = 'all'`, function statistics separate time spent in
-the function from time spent in its children. An active timer owns its entry
-in a fixed 1,024-entry stack on the SQL execution thread. Completing the call,
-returning an error or unwinding releases that entry; exhaustion returns `54000`
-and names the function timing stack. Saving timing across a function-body pause
-remains part of retaining that unfinished call.
+With `SET track_functions = 'all'`, function statistics separate elapsed time in
+the function from time spent in its children. An active timer owns one of 1,024
+entries on the SQL execution thread. Pausing transfers its timestamps to the
+unfinished call and releases that entry; resumption admits it again. Another
+client's calls cannot become its children. Completing, failing or unwinding
+releases the entry; exhaustion returns `54000` and names the function timing
+stack. The call count is published only after successful completion.
 
 Numeric `FOR` loops reserve reusable local-variable frames before running a
 call's local initializers. The reservation follows maximum simultaneous loop
@@ -589,7 +586,7 @@ frame, so the original owner can still resume it. Resetting the original owner's
 arena invalidates its receipts explicitly.
 Unowned row phases still reject suspension with `0A000`; their full continuations
 remain required before enabling those waits. The remaining expression paths,
-unfinished function bodies and query positions also need complete ownership
+unowned function callers and query positions also need complete ownership
 before their temporary memory can be released across a scheduler return.
 Dependency collection distinguishes catalog relations from materialized rows.
 For example, a trigger can `UPDATE orders FROM changed_rows` using its transition
@@ -663,8 +660,9 @@ append overwrites any unpublished bytes. `RETURN NEXT` releases expression and
 conversion scratch after each row. Output-variable bindings reserve their actual
 count before local initialization, rather than a maximum-width array for every
 invocation. At function completion, exported rows receive independent statement
-storage before the collector releases its leases. These owners do not yet make
-the whole invocation resumable across connection-scheduler returns.
+storage before the collector releases its leases. A suspended PL/pgSQL body
+keeps this collector with its lexical frame; general SQL-language functions
+still need their own unfinished-query positions.
 Input admission also releases parser/dependency scratch when no checked values
 or planner candidates need retaining. Expressions and static statements with no
 input substitutions reuse their compiled source while keeping the normal
@@ -672,7 +670,10 @@ input-owner scope. `PERFORM` uses a scoped arena for query work and nested
 invocation receipts; both are released when the query finishes. Only its row
 count and `FOUND` return to the interpreter. Prior locals, handler diagnostics
 and input bindings stay outside that workspace.
-It does not yet save a function's execution position across a storage wait.
+When the enclosing operation owns the query, an actual wait transfers its
+receipts and unfinished PL/pgSQL calls out of that temporary workspace.
+Synchronous storage protection remains until the enclosing write and remaining
+expression paths can also yield safely.
 
 Procedural exception scopes share savepoint admission, transaction-log rewind
 and remote savepoint mirroring with explicit SQL savepoints. Every admission,

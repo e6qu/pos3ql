@@ -369,7 +369,11 @@ an explicit limit; use `COPY (SELECT ...)`.
 
 State-changing functions and commands use a separate synchronous block client
 when restarting their call stack could repeat effects. They can still block
-the SQL CPU worker on an uncached read. Eligible pure reads retain completed
+the SQL CPU worker on an uncached read. Retained AFTER work and its owned
+procedural queries can preserve an unfinished PL/pgSQL scalar or table-function
+body across a lock wait, without repeating completed writes or sequence calls.
+Other function/query paths and storage waits still need the remaining work in
+[PLAN.md](../PLAN.md). Eligible pure reads retain completed
 columns and navigation across asynchronous waits. Sequence calls retain their
 completed results through command retries; memory exhaustion returns `54000`,
 `volatile sequence replay exceeds statement memory`, before an unrecorded

@@ -1741,7 +1741,15 @@ pub(crate) fn visit_projection_types(
     let mark = arena.mark();
     let result = (|| {
         let select = super::expand_ctes(select, storage, txid, arena)?;
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
+            row,
+            catalog: Some(&catalog),
+        });
         if let Some(tree) = select.set_body {
+            let metadata = outer
+                .zip(transition.as_ref())
+                .map(|(row, columns)| super::type_inputs::MetadataOnly { row, columns });
             let mut columns =
                 [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
             let mut oids = [0; crate::sql::exec::MAX_PROJ];
@@ -1753,7 +1761,9 @@ pub(crate) fn visit_projection_types(
                 arena,
                 Some(&mut oids),
                 crate::sql::exec::DescriptionTarget::Sql,
-                outer,
+                metadata
+                    .as_ref()
+                    .map(|row| row as &dyn crate::sql::eval::ColumnLookup<'_>),
             )?;
             for (oid, column) in oids[..count].iter().zip(&columns[..count]) {
                 visit(*oid, column.collation)?;
@@ -1765,11 +1775,6 @@ pub(crate) fn visit_projection_types(
             .as_ref()
             .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, outer))
             .transpose()?;
-        let catalog = super::storage_catalog(storage, arena, txid);
-        let transition = outer.map(|row| crate::sql::eval::RuntimeColumnTypes {
-            row,
-            catalog: Some(&catalog),
-        });
         let columns = DependencyTypes {
             scope: scope.as_ref(),
             excluded: None,

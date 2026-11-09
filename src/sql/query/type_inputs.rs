@@ -21,9 +21,9 @@ type PlannerVisit<'a> = dyn FnMut(
 
 // Discovery can borrow storage briefly even when caller values live for the
 // entire execution. This adapter exposes the same declared identities only.
-struct MetadataOnly<'s, 'v> {
-    row: &'s dyn ColumnLookup<'v>,
-    columns: &'s dyn ColTypeResolver,
+pub(super) struct MetadataOnly<'s, 'v> {
+    pub(super) row: &'s dyn ColumnLookup<'v>,
+    pub(super) columns: &'s dyn ColTypeResolver,
 }
 
 impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {

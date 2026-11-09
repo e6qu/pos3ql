@@ -5277,9 +5277,38 @@ fn subst_assignments<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
     let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(arena);
+    // A multi-column assignment projects several fields from one query node.
+    // Preserve that node identity so subquery evaluation runs its effects once.
+    let mut row_sources: ArenaList<'a, (&'a Expr<'a>, &'a Expr<'a>)> = ArenaList::new(arena);
     for (column, expression) in source.iter().copied() {
+        let expression = match expression {
+            Expr::RecordFieldIndex { base, index } => {
+                let rewritten = row_sources
+                    .as_slice()
+                    .iter()
+                    .find(|(original, _)| core::ptr::eq(*original, *base))
+                    .map(|(_, rewritten)| *rewritten);
+                let base = match rewritten {
+                    Some(base) => base,
+                    None => {
+                        let rewritten = subst_expr(base, context, arena)?;
+                        row_sources
+                            .push((*base, rewritten))
+                            .map_err(|_| arena_full())?;
+                        rewritten
+                    }
+                };
+                &*arena
+                    .alloc(Expr::RecordFieldIndex {
+                        base,
+                        index: *index,
+                    })
+                    .map_err(|_| arena_full())?
+            }
+            _ => subst_expr(expression, context, arena)?,
+        };
         assignments
-            .push((column, subst_expr(expression, context, arena)?))
+            .push((column, expression))
             .map_err(|_| arena_full())?;
     }
     Ok(assignments.as_slice())

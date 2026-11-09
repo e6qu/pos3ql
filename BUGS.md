@@ -21,7 +21,8 @@ Derived-table descriptions must resolve their own WITH names before column
 lookup, including CTEs that shadow a trigger's transition table. An empty outer
 WITH clause cannot bypass nested bindings. SELECT INTO descriptions must retain
 local record-field types; ROW field positions count expanded fields. Multi-column
-assignment subqueries participate in the same binding and dependency walk.
+assignment subqueries participate in the same binding and dependency walk and
+retain one shared source rather than repeating its effects for each field.
 RETURNING, ordinary write expressions and conflict-update expressions share
 the same reference-kind walk, with explicit old/new and excluded namespaces.
 Sequence-only SQL helpers called inside trigger source queries must use the

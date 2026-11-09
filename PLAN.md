@@ -108,6 +108,7 @@ Acceptance applies across every path, rather than as separate roadmap projects:
   fields, table-backed queries and set-operation branches. ROW constructors
   resolve field positions after embedded whole rows have expanded. Bind query
   sources inside multi-column assignments through the same substitution walk.
+  Their field projections share one rewritten query, preserving once-only effects.
   Distinguish sequence-only SQL helpers from programs that need mutable catalog
   execution; trigger source queries keep their active sequence session.
   Count expanded record fields consistently in sorting, grouping, window

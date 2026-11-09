@@ -32,6 +32,15 @@ UPDATE whole_dep_assignment SET(a,b)=(
     WITH whole_dep_source AS(SELECT 9 AS a,8 AS b)
     SELECT a,b FROM whole_dep_source
 );
+CREATE SEQUENCE whole_dep_assignment_counter;
+CREATE TABLE whole_dep_assignment_once(a integer,b integer);
+INSERT INTO whole_dep_assignment_once VALUES(0,0);
+UPDATE whole_dep_assignment_once SET(a,b)=(
+    WITH whole_dep_source AS(
+        SELECT nextval('whole_dep_assignment_counter')::integer AS a,
+            nextval('whole_dep_assignment_counter')::integer AS b
+    ) SELECT a,b FROM whole_dep_source
+);
 DO $$BEGIN
     BEGIN
         ALTER TABLE whole_dep_constructor_source DROP COLUMN spare;
@@ -64,5 +73,7 @@ SELECT n.id,n.label,(SELECT id FROM whole_dep_qualified),
     (SELECT id FROM whole_dep_schema_field),(SELECT id FROM whole_dep_record_field),
     (SELECT b FROM whole_dep_record_star),(SELECT id FROM whole_dep_constructor),
     (SELECT id FROM whole_dep_constructor_prefix),(SELECT tail FROM whole_dep_constructor_prefix),
-    (SELECT a FROM whole_dep_assignment),(SELECT b FROM whole_dep_assignment)
+    (SELECT a FROM whole_dep_assignment),(SELECT b FROM whole_dep_assignment),
+    (SELECT a FROM whole_dep_assignment_once),(SELECT b FROM whole_dep_assignment_once),
+    currval('whole_dep_assignment_counter')
 FROM whole_dep_nested n;

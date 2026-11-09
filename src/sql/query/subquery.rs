@@ -2617,14 +2617,6 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         self.catalog.visit_composite_fields(creation, visit)
     }
 
-    fn visit_named_composite_fields(
-        &self,
-        name: &str,
-        visit: &mut dyn FnMut(&str, crate::sql::exec::StaticTypeMeta),
-    ) -> Result<Option<usize>, SqlError> {
-        self.catalog.visit_named_composite_fields(name, visit)
-    }
-
     fn whole_row_field(
         &self,
         name: &str,

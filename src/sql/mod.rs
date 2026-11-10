@@ -11588,7 +11588,7 @@ impl Engine {
             let mut parser = match Parser::new(text, arena) {
                 Ok(p) => p,
                 Err(e) => {
-                    report_parse_error(responder, &e)?;
+                    report_parse_error(responder, &e, text)?;
                     return Ok(ExecutionStatus::Complete);
                 }
             };
@@ -11654,7 +11654,7 @@ impl Engine {
                             cursors.on_rollback();
                             self.rollback_txn(txn, guc);
                         }
-                        report_parse_error(responder, &error)?;
+                        report_parse_error(responder, &error, text)?;
                         return Ok(ExecutionStatus::Complete);
                     }
                 }
@@ -12310,7 +12310,7 @@ impl Engine {
                 let mut parser = match Parser::new(text, arena) {
                     Ok(p) => p,
                     Err(e) => {
-                        report_parse_error(responder, &e)?;
+                        report_parse_error(responder, &e, text)?;
                         return Ok(ExtendedExecutionStatus::Complete(false));
                     }
                 };
@@ -12342,7 +12342,7 @@ impl Engine {
                                 } else if txn.is_explicit() {
                                     txn.failed = true;
                                 }
-                                report_parse_error(responder, &e)?;
+                                report_parse_error(responder, &e, text)?;
                                 return Ok(ExtendedExecutionStatus::Complete(false));
                             }
                         };
@@ -13699,7 +13699,7 @@ impl Engine {
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
-                report_parse_error(responder, &e)?;
+                report_parse_error(responder, &e, text)?;
                 return Ok(false);
             }
         };
@@ -13717,7 +13717,7 @@ impl Engine {
                 return Ok(true);
             }
             Err(e) => {
-                report_parse_error(responder, &e)?;
+                report_parse_error(responder, &e, text)?;
                 return Ok(false);
             }
         };
@@ -23953,8 +23953,21 @@ fn emit_parse_warnings(
     Ok(())
 }
 
-fn report_parse_error(responder: &mut Responder, e: &ParseError) -> Result<(), WireFull> {
-    responder.error(e.sqlstate, e.message.as_str())
+/// Reports a failure parsing `text`, with PostgreSQL's cursor position when it
+/// reports one.
+pub(crate) fn report_parse_error(
+    responder: &mut Responder,
+    e: &ParseError,
+    text: &str,
+) -> Result<(), WireFull> {
+    match e.cursor {
+        Some(at) => responder.error_at(
+            e.sqlstate,
+            e.message.as_str(),
+            crate::pg::respond::CursorPosition::in_text(text, at),
+        ),
+        None => responder.error(e.sqlstate, e.message.as_str()),
+    }
 }
 
 pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {

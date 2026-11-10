@@ -3224,47 +3224,35 @@ impl Conn {
         let (n_params, statement_kind) = {
             let mut parser = match Parser::new(query, &self.arena) {
                 Ok(p) => p,
-                Err(e) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::SYNTAX_ERROR,
-                        e.message.as_str(),
-                    );
-                }
+                Err(e) => return ext_parse_err(&mut self.send, &mut self.phase, &e, query),
             };
-            let statement_kind = match parser.next_stmt() {
-                Ok(first) => first.as_ref().map_or(
-                    crate::sql::ProtocolStatement::Utility,
-                    crate::sql::ProtocolStatement::for_statement,
-                ),
-                Err(e) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        e.sqlstate,
-                        e.message.as_str(),
-                    );
-                }
+            let first = match parser.next_stmt() {
+                Ok(first) => first,
+                Err(e) => return ext_parse_err(&mut self.send, &mut self.phase, &e, query),
             };
-            match parser.next_stmt() {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::SYNTAX_ERROR,
-                        "cannot insert multiple commands into a prepared statement",
-                    );
+            let statement_kind = first.as_ref().map_or(
+                crate::sql::ProtocolStatement::Utility,
+                crate::sql::ProtocolStatement::for_statement,
+            );
+            // PostgreSQL parses the whole string before counting commands, so
+            // a later syntax error wins over the multiple-command error.
+            let mut statements = usize::from(first.is_some());
+            loop {
+                match parser.next_stmt() {
+                    Ok(None) => break,
+                    Ok(Some(_)) => statements += 1,
+                    Err(e) => {
+                        return ext_parse_err(&mut self.send, &mut self.phase, &e, query);
+                    }
                 }
-                Err(e) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        e.sqlstate,
-                        e.message.as_str(),
-                    );
-                }
+            }
+            if statements > 1 {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    sqlstate::SYNTAX_ERROR,
+                    "cannot insert multiple commands into a prepared statement",
+                );
             }
             (parser.max_param(), statement_kind)
         };
@@ -6562,6 +6550,20 @@ fn alloc_group_digits(d: i16) -> [u8; 4] {
 /// Writes an error and puts the connection into extended-protocol error
 /// recovery (discard until Sync). Free function so callers can hold
 /// borrows of other connection fields.
+fn ext_parse_err(
+    send: &mut FixedBuf,
+    phase: &mut Phase,
+    error: &crate::sql::parser::ParseError,
+    query: &str,
+) -> Step {
+    let mut responder = Responder::new(send);
+    if crate::sql::report_parse_error(&mut responder, error, query).is_err() {
+        return Step::Close;
+    }
+    *phase = Phase::SkipToSync;
+    Step::Continue
+}
+
 fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, message: &str) -> Step {
     let code = code.as_ref();
     let mut responder = Responder::new(send);
@@ -8907,6 +8909,121 @@ mod tests {
         drop(conn);
         drop(engine);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parse_failures_report_postgresql_cursor_positions_over_the_whole_query() {
+        fn error_fields(mut bytes: &[u8]) -> Vec<(u8, String)> {
+            while bytes[0] != wire::MSG_ERROR_RESPONSE {
+                let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                bytes = &bytes[length + 1..];
+            }
+            let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            bytes[5..length]
+                .split(|byte| *byte == 0)
+                .filter(|field| !field.is_empty())
+                .map(|field| (field[0], String::from_utf8(field[1..].to_vec()).unwrap()))
+                .collect()
+        }
+        let mut config = Config::default_dev();
+        config.data_dir = std::env::temp_dir()
+            .join(format!("pos3ql-parse-cursor-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        config.remove_test_data_dir_on_drop();
+        config.max_tables = 4;
+        config.max_connections = 1;
+        config.row_overlay_slots = 64;
+        let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut conn = Conn::new(&config, &mut budget).unwrap();
+        conn.phase = Phase::Ready;
+        // Expected fields were captured from PostgreSQL 18.6.
+        let cases: [(u8, &str, &str, &str, Option<&str>); 7] = [
+            (
+                wire::FMSG_QUERY,
+                "SELECT 1;\nSELECT 'ü' +\nFROM x",
+                "42601",
+                "syntax error at or near \"FROM\"",
+                Some("24"),
+            ),
+            (
+                wire::FMSG_QUERY,
+                "SELECT 1; SELECT 'é' FROM WHERE; SELECT 2",
+                "42601",
+                "syntax error at or near \"WHERE\"",
+                Some("27"),
+            ),
+            (
+                wire::FMSG_QUERY,
+                "SELECT 1 + -- trailing comment",
+                "42601",
+                "syntax error at end of input",
+                Some("31"),
+            ),
+            (
+                wire::FMSG_QUERY,
+                "SELECT 'é', 'abc",
+                "42601",
+                "unterminated quoted string at or near \"'abc\"",
+                Some("13"),
+            ),
+            (
+                wire::FMSG_PARSE,
+                "SELECT 'é' FROM WHERE",
+                "42601",
+                "syntax error at or near \"WHERE\"",
+                Some("17"),
+            ),
+            (
+                wire::FMSG_PARSE,
+                "SELECT 1; SELEC 2",
+                "42601",
+                "syntax error at or near \"SELEC\"",
+                Some("11"),
+            ),
+            (
+                wire::FMSG_PARSE,
+                "SELECT 1; SELECT 2",
+                "42601",
+                "cannot insert multiple commands into a prepared statement",
+                None,
+            ),
+        ];
+        for (kind, query, sqlstate, message, position) in cases {
+            let mut payload = Vec::new();
+            if kind == wire::FMSG_PARSE {
+                payload.push(0);
+            }
+            payload.extend_from_slice(query.as_bytes());
+            payload.push(0);
+            if kind == wire::FMSG_PARSE {
+                payload.extend_from_slice(&0u16.to_be_bytes());
+            }
+            conn.send.clear();
+            assert!(conn.recv.append(&frontend(kind, &payload)));
+            if kind == wire::FMSG_PARSE {
+                assert!(conn.recv.append(&frontend(wire::FMSG_SYNC, &[])));
+            }
+            while !conn.recv.is_empty() {
+                assert!(matches!(
+                    crate::mem::guard::forbid_alloc(|| conn.process_message(&mut engine)),
+                    Step::Continue
+                ));
+            }
+            let fields = error_fields(conn.send.readable());
+            let field = |code: u8| {
+                fields
+                    .iter()
+                    .find(|(field, _)| *field == code)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(field(b'C'), Some(sqlstate), "{query}");
+            assert_eq!(field(b'M'), Some(message), "{query}");
+            assert_eq!(field(b'P'), position, "{query}");
+            assert_eq!(field(b'p'), None, "{query}");
+            assert_eq!(field(b'q'), None, "{query}");
+        }
     }
 
     #[test]

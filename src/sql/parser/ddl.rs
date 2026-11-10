@@ -1629,6 +1629,7 @@ impl<'a> Parser<'a> {
                     method
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             })
         }
     }
@@ -1884,6 +1885,7 @@ impl<'a> Parser<'a> {
                         "custom selectivity functions are not supported by the bounded planner"
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             } else {
                 return Err(self.err_here("invalid CREATE OPERATOR option"));
@@ -1959,6 +1961,7 @@ impl<'a> Parser<'a> {
                                 "btree ordering operators are not supported in a search operator class"
                             ),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
                         });
                     }
                     self.expect_ident("search")?;
@@ -2034,6 +2037,7 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"commutator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
                         });
                     } else if self.eat_ident("negator")? {
                         return Err(ParseError {
@@ -2043,6 +2047,7 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"negator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
                         });
                     } else if self.eat_ident("hashes")? {
                         return Err(ParseError {
@@ -2052,6 +2057,7 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"hashes\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
                         });
                     } else if self.eat_ident("merges")? {
                         return Err(ParseError {
@@ -2061,6 +2067,7 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"merges\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
                         });
                     } else if self.eat_ident("restrict")? {
                         self.expect_op("=")?;
@@ -2076,6 +2083,7 @@ impl<'a> Parser<'a> {
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                                cursor: None,
                             });
                         }
                         selectivity_reset.restrict = true;
@@ -2093,6 +2101,7 @@ impl<'a> Parser<'a> {
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                                cursor: None,
                             });
                         }
                         selectivity_reset.join = true;
@@ -2127,6 +2136,7 @@ impl<'a> Parser<'a> {
                             "btree ordering operators are not supported in a search operator family"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 }
                 self.expect_ident("search")?;
@@ -2321,6 +2331,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "invalid extension version name: {}", version),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         self.advance()?;
@@ -2559,6 +2570,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "unsupported extension member object kind"),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
         })
     }
 
@@ -2620,6 +2632,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "unrecognized statistics kind \"{}\"", kind),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
                     });
                 };
                 if !fresh {
@@ -2631,6 +2644,7 @@ impl<'a> Parser<'a> {
                             kind
                         ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -2779,6 +2793,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -2805,6 +2820,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             };
             if core::mem::replace(target, true) {
@@ -2957,6 +2973,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "database option {} is not supported", option),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             } else if option.eq_ignore_ascii_case("collation_version") {
                 if options
@@ -3277,6 +3294,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         let name = self.col_ident("trigger name")?;
@@ -3309,6 +3327,7 @@ impl<'a> Parser<'a> {
                                     column
                                 ),
                                 sqlstate: sqlstate::DUPLICATE_COLUMN,
+                                cursor: None,
                             });
                         }
                         self.push(&mut update_columns, column)?;
@@ -3587,6 +3606,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "only input parameters can have default values"),
                     sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    cursor: None,
                 });
             }
             WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
@@ -3637,6 +3657,7 @@ impl<'a> Parser<'a> {
                             "VARIADIC parameter must be the last input parameter"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        cursor: None,
                     });
                 }
                 if argument.mode.is_input() {
@@ -3650,6 +3671,7 @@ impl<'a> Parser<'a> {
                                 "input parameters after one with a default value must also have defaults"
                             ),
                             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                            cursor: None,
                         });
                     }
                 }
@@ -3664,6 +3686,7 @@ impl<'a> Parser<'a> {
                             crate::storage::MAX_COLUMNS
                         ),
                         sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                        cursor: None,
                     });
                 }
                 arguments[count] = argument;
@@ -3695,6 +3718,7 @@ impl<'a> Parser<'a> {
                             "OUT and INOUT arguments cannot be used with RETURNS TABLE"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        cursor: None,
                     });
                 }
                 self.expect_op("(")?;
@@ -3713,6 +3737,7 @@ impl<'a> Parser<'a> {
                                 columns.len()
                             ),
                             sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                            cursor: None,
                         });
                     }
                     columns[column_count] = RoutineResultColumn {
@@ -3787,6 +3812,7 @@ impl<'a> Parser<'a> {
                             unsupported
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 });
             } else if self.eat_ident("as")? {
@@ -3803,6 +3829,7 @@ impl<'a> Parser<'a> {
                             "native-library routine bodies are not supported"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 }
                 body = Some(crate::sql::ast::RoutineBody::String(source));
@@ -3964,18 +3991,21 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "user-defined window functions are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             } else if self.eat_ident("transform")? {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "routine transforms are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             } else if self.eat_ident("support")? {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "planner support functions are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             } else if self.eat_ident("set")? {
                 let config_name = self.configuration_parameter_name()?;
@@ -4017,6 +4047,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
                 sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                cursor: None,
             });
         }
         if !function
@@ -4048,6 +4079,7 @@ impl<'a> Parser<'a> {
                     "ROWS is not applicable when function does not return a set"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if matches!(
@@ -4072,6 +4104,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "PL/pgSQL function execution is not supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
@@ -4311,6 +4344,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
@@ -4353,6 +4387,7 @@ impl<'a> Parser<'a> {
                         crate::pg::auth::SCRAM_SALT_MAX
                     ),
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    cursor: None,
                 });
             }
         }
@@ -4536,6 +4571,7 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "redundant NOT NULL constraint definition"),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
                         });
                     }
                     DomainNullability::Unspecified => {}
@@ -4549,6 +4585,7 @@ impl<'a> Parser<'a> {
                             "not-null constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
                     });
                 }
                 nullability = DomainNullability::NotNull { name: cname };
@@ -4572,6 +4609,7 @@ impl<'a> Parser<'a> {
                             "check constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
                     });
                 }
                 self.push(&mut checks, check)?;
@@ -5338,6 +5376,7 @@ impl<'a> Parser<'a> {
                     "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         Ok(Stmt::CreateSchema {
@@ -5413,6 +5452,7 @@ impl<'a> Parser<'a> {
                         method
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             }
         } else {
@@ -5561,11 +5601,7 @@ impl<'a> Parser<'a> {
     ) -> Result<crate::sql::ast::IndexOperatorClassOptions<'a>, ParseError> {
         let mut options = crate::sql::ast::IndexOperatorClassOptions::DEFAULT;
         if self.peeked == Tok::Op(")") {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: crate::util::StackStr::from_str("syntax error at or near \")\""),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         loop {
             let option = self.any_ident("operator class parameter")?;
@@ -5593,6 +5629,7 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 })?);
             } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
                 if options.n_distinct_per_range.is_some() {
@@ -5620,6 +5657,7 @@ impl<'a> Parser<'a> {
                                 value
                             ),
                             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                            cursor: None,
                         })?,
                 );
             } else if option.eq_ignore_ascii_case("false_positive_rate") {
@@ -5650,6 +5688,7 @@ impl<'a> Parser<'a> {
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 options.false_positive_rate = Some(raw);
@@ -5670,12 +5709,14 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "value {} out of bounds for option \"siglen\"", raw),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 })?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5709,6 +5750,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "fillfactor must be between 10 and 100"),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 options.fillfactor = Some(value);
@@ -5736,6 +5778,7 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 })?;
                 self.advance()?;
                 if !(1..=131_072).contains(&value) {
@@ -5747,6 +5790,7 @@ impl<'a> Parser<'a> {
                             value
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 options.pages_per_range = Some(value);
@@ -5780,6 +5824,7 @@ impl<'a> Parser<'a> {
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 });
                 self.advance()?;
@@ -5805,6 +5850,7 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 })?;
                 self.advance()?;
                 if !(64..=i32::MAX as u32).contains(&value) {
@@ -5816,6 +5862,7 @@ impl<'a> Parser<'a> {
                             value
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 options.gin_pending_list_limit = Some(value);
@@ -5824,6 +5871,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5880,6 +5928,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -5918,6 +5967,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "fillfactor must be between 10 and 100"),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 options.fillfactor = Some(value);
@@ -5926,6 +5976,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5948,6 +5999,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -6087,6 +6139,7 @@ impl<'a> Parser<'a> {
                             rule_action_name(&statement)
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
                     });
                 }
                 let source = self.text[start..self.peek_at].trim();

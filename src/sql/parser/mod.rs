@@ -225,6 +225,9 @@ pub struct ParseError {
     /// SQLSTATE; almost always 42601 (syntax error), but some parse-analysis
     /// errors carry their own (e.g. 42P20 for window-frame shape).
     pub sqlstate: &'static str,
+    /// Byte offset in the parsed text that PostgreSQL reports as the error
+    /// cursor (the ErrorResponse `P` field), or `None` when it reports none.
+    pub cursor: Option<usize>,
 }
 
 impl ParseError {
@@ -233,6 +236,7 @@ impl ParseError {
             at,
             message: stack_format!(96, "{}", text),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
         }
     }
 }
@@ -241,6 +245,7 @@ impl From<LexError> for ParseError {
     fn from(e: LexError) -> Self {
         let mut error = ParseError::new(e.at, e.message);
         error.sqlstate = e.kind.sqlstate();
+        error.cursor = e.cursor();
         error
     }
 }
@@ -252,6 +257,7 @@ impl ParseError {
             at: error.at,
             message: error.render(text),
             sqlstate: error.kind.sqlstate(),
+            cursor: error.cursor(),
         }
     }
 }
@@ -1252,6 +1258,7 @@ impl<'a> Parser<'a> {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                        cursor: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -1262,6 +1269,7 @@ impl<'a> Parser<'a> {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                        cursor: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -1274,6 +1282,7 @@ impl<'a> Parser<'a> {
                 at: statement_start,
                 message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
                 sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                cursor: None,
             });
         }
         self.expect_ident("cursor")?;
@@ -1297,6 +1306,7 @@ impl<'a> Parser<'a> {
                     "DECLARE CURSOR must not contain data-modifying statements in WITH",
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         if let Some(clause) = query.locking.first() {
@@ -1336,6 +1346,7 @@ impl<'a> Parser<'a> {
                         reason,
                     ),
                     sqlstate: state,
+                    cursor: None,
                 });
             }
         }
@@ -1364,11 +1375,7 @@ impl<'a> Parser<'a> {
             match p.peeked {
                 Tok::Num(text) => {
                     // PostgreSQL's SignedIconst requires an int32 magnitude.
-                    let v: i32 = text.parse().map_err(|_| ParseError {
-                        at: p.peek_at,
-                        message: stack_format!(96, "syntax error at or near \"{}\"", text),
-                        sqlstate: sqlstate::SYNTAX_ERROR,
-                    })?;
+                    let v: i32 = text.parse().map_err(|_| p.syntax_error_here())?;
                     p.advance()?;
                     Ok(if negative { -v } else { v })
                 }
@@ -1659,6 +1666,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option BUFFERS requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if options.wal && !options.analyze {
@@ -1666,6 +1674,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option WAL requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if timing_enabled_explicitly && !options.analyze {
@@ -1673,6 +1682,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option TIMING requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if options.serialize != ExplainSerialize::None && !options.analyze {
@@ -1680,6 +1690,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option SERIALIZE requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
@@ -1690,6 +1701,7 @@ impl<'a> Parser<'a> {
                     "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         let statement = self.statement()?;
@@ -2174,6 +2186,7 @@ impl<'a> Parser<'a> {
                     language
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         Ok(Stmt::Do { body })
@@ -2648,6 +2661,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
                     sqlstate: sqlstate::UNDEFINED_FUNCTION,
+                    cursor: None,
                 });
             }
             match operator {
@@ -2661,6 +2675,7 @@ impl<'a> Parser<'a> {
                         operator
                     ),
                     sqlstate: sqlstate::WRONG_OBJECT_TYPE,
+                    cursor: None,
                 }),
             }
         } else if self.eat_ident("desc")? {
@@ -3676,6 +3691,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: StackStr::from_str("DEFAULT namespace is not supported"),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 }
                 let uri = self.expression(0)?;
@@ -3986,6 +4002,7 @@ impl<'a> Parser<'a> {
                     at: method_at,
                     message: stack_format!(96, "tablesample method {} does not exist", method_name),
                     sqlstate: sqlstate::UNDEFINED_OBJECT,
+                    cursor: None,
                 });
             }
         };
@@ -4010,6 +4027,7 @@ impl<'a> Parser<'a> {
                     count
                 ),
                 sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+                cursor: None,
             });
         }
         self.expect_op(")")?;
@@ -4281,6 +4299,7 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "COPY format \"{}\" does not exist", other),
                             sqlstate: sqlstate::UNDEFINED_OBJECT,
+                            cursor: None,
                         });
                     }
                 };
@@ -4398,6 +4417,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "cannot specify {} in BINARY mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             }
         }
@@ -4420,6 +4440,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "COPY {} requires CSV mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             }
         }
@@ -4452,6 +4473,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "COPY {} must be a single one-byte character", what),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
             });
         }
         Ok(bytes[0])
@@ -4481,6 +4503,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "COPY {} requires a quoted string", what),
                 sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: None,
             }),
         }
     }
@@ -4562,6 +4585,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "COPY option \"{}\" is not supported", option),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
         }
     }
 
@@ -4570,6 +4594,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "{} is not supported", what),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
         }
     }
 
@@ -4637,6 +4662,7 @@ impl<'a> Parser<'a> {
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 }
                 if self.eat_op(")")? {
@@ -4659,6 +4685,7 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "unsupported ANALYZE option \"ANALYZE\""),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
                         });
                     }
                     if core::mem::replace(&mut saw_analyze, true) {
@@ -4695,6 +4722,7 @@ impl<'a> Parser<'a> {
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
                     });
                 }
                 break;
@@ -5340,6 +5368,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "unrecognized REINDEX option \"{}\"", option),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -6605,6 +6634,7 @@ impl<'a> Parser<'a> {
                     "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS",
                 ),
                 sqlstate: sqlstate::INVALID_GRANT_OPERATION,
+                cursor: None,
             });
         }
         if grant {
@@ -7193,6 +7223,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "statistics option value {} is out of range", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
         })
     }
 
@@ -7217,6 +7248,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -7240,6 +7272,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             };
             if core::mem::replace(selected, true) {
@@ -7343,6 +7376,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "transaction identifier \"{}\" is too long", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
         })
     }
 
@@ -7557,6 +7591,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "number of columns does not match number of values"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
                 });
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
@@ -8532,6 +8567,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "precision for type float must be at least 1 bit"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         if precision > 53 {
@@ -8539,6 +8575,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "precision for type float must be less than 54 bits"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
             });
         }
         Ok(if precision <= 24 { "float4" } else { "float8" })
@@ -8666,6 +8703,7 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "length for type {} must be at least 1", base),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
@@ -8678,6 +8716,7 @@ impl<'a> Parser<'a> {
                             base
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
                     });
                 }
                 Ok(TypeMod::BitLength(nums[0] as usize).encode())
@@ -8862,6 +8901,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
                     sqlstate: sqlstate::NAME_TOO_LONG,
+                    cursor: None,
                 });
             }
             if count != 0 {
@@ -8911,6 +8951,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "parameter \"{}\" requires a single value", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
                 });
             }
         }
@@ -9064,11 +9105,7 @@ impl<'a> Parser<'a> {
         if let Tok::Ident(word) = self.peeked
             && is_column_name_keyword(word)
         {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "syntax error at or near \"{}\"", word),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         self.any_ident(what)
     }
@@ -9077,11 +9114,7 @@ impl<'a> Parser<'a> {
         if let Tok::Ident(word) = self.peeked
             && is_type_function_name_keyword(word)
         {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "syntax error at or near \"{}\"", word),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         self.any_ident(what)
     }
@@ -9126,6 +9159,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: crate::stack_format!(96, "statement too large for SQL arena"),
             sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
         })
     }
 
@@ -9369,6 +9403,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "target lists can have at most 1664 entries"),
                 sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                cursor: None,
             });
         }
         let index = flat.len();
@@ -9430,6 +9465,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "CUBE is limited to 12 elements"),
                     sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                    cursor: None,
                 });
             }
             for subset in 0usize..(1usize << terms.len()) {
@@ -9480,6 +9516,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "too many grouping sets present (maximum 4096)"),
             sqlstate: sqlstate::STATEMENT_TOO_COMPLEX,
+            cursor: None,
         }
     }
 
@@ -9555,23 +9592,32 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "syntax error: {}", expected),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
         }
     }
 
     /// PostgreSQL's generic grammar failure, naming the token where parsing
     /// stopped. Every failed expectation reports this form.
     fn syntax_error_here(&self) -> ParseError {
+        if self.peeked == Tok::Eof {
+            ParseError {
+                at: self.peek_at,
+                cursor: Some(self.peek_at),
+                message: StackStr::from_str("syntax error at end of input"),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            }
+        } else {
+            self.syntax_error_near(self.peek_at, self.lexer.token_end())
+        }
+    }
+
+    /// The grammar failure at an already consumed token spanning
+    /// `start..end`, echoed as the client wrote it.
+    fn syntax_error_near(&self, start: usize, end: usize) -> ParseError {
         ParseError {
-            at: self.peek_at,
-            message: if self.peeked == Tok::Eof {
-                StackStr::from_str("syntax error at end of input")
-            } else {
-                stack_format!(
-                    96,
-                    "syntax error at or near \"{}\"",
-                    &self.text[self.peek_at..self.lexer.token_end()]
-                )
-            },
+            at: start,
+            cursor: Some(start),
+            message: stack_format!(96, "syntax error at or near \"{}\"", &self.text[start..end]),
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -9587,6 +9633,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: StackStr::from_str(message),
             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+            cursor: None,
         }
     }
 
@@ -9596,6 +9643,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "{}", message),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
         }
     }
 
@@ -9604,6 +9652,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
         }
     }
 }
@@ -12205,8 +12254,60 @@ mod tests {
                 let error = parser.next_stmt().unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
                 assert_eq!(error.at, position, "{sql}");
+                assert_eq!(error.cursor, Some(position), "{sql}");
             });
         }
+    }
+
+    #[test]
+    fn syntax_errors_echo_client_spelling_at_the_postgresql_cursor() {
+        // Messages and cursors (as byte offsets) from PostgreSQL 18.6.
+        for (sql, message, cursor) in [
+            (
+                "SELECT 1 FROM WHERE",
+                "syntax error at or near \"WHERE\"",
+                14,
+            ),
+            ("SELECT 1 + FROM x", "syntax error at or near \"FROM\"", 11),
+            ("SELECT 1 +   ", "syntax error at end of input", 13),
+            ("SELECT 1 + /* c */", "syntax error at end of input", 18),
+            (
+                "CREATE TABLE Select (a int)",
+                "syntax error at or near \"Select\"",
+                13,
+            ),
+            ("SELECT (1,2).f1", "syntax error at or near \".\"", 12),
+            (
+                "FETCH 99999999999 FROM c",
+                "syntax error at or near \"99999999999\"",
+                6,
+            ),
+            (
+                "SELECT 'abc",
+                "unterminated quoted string at or near \"'abc\"",
+                7,
+            ),
+            (
+                "SELECT 1 /* open",
+                "unterminated /* comment at or near \"/* open\"",
+                9,
+            ),
+        ] {
+            with_parser(sql, |parser| {
+                let error = loop {
+                    match parser.next_stmt() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => panic!("{sql} parsed"),
+                        Err(error) => break error,
+                    }
+                };
+                assert_eq!(error.message.as_str(), message, "{sql}");
+                assert_eq!(error.cursor, Some(cursor), "{sql}");
+            });
+        }
+        with_parser("SELECT 1::numeric(2000)", |parser| {
+            assert_eq!(parser.next_stmt().unwrap_err().cursor, None);
+        });
     }
 
     #[test]

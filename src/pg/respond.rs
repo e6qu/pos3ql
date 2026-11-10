@@ -19,6 +19,29 @@ use super::wire::{self, MsgOut, WireFull};
 /// projection limit).
 pub const MAX_RESULT_COLS: usize = crate::sql::exec::MAX_PROJ;
 
+/// An ErrorResponse cursor: the 1-based character position in the client's
+/// query string that PostgreSQL sends as the `P` field and psql shows as a
+/// caret under `LINE n:`. Multi-statement queries count from the start of the
+/// whole string, and characters, not bytes, are counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorPosition(core::num::NonZeroUsize);
+
+impl CursorPosition {
+    /// The position of byte offset `at`, which must not exceed `text.len()`;
+    /// an offset at the end of `text` points just past its last character.
+    pub fn in_text(text: &str, at: usize) -> Self {
+        let preceding = text.as_bytes()[..at]
+            .iter()
+            .filter(|byte| (**byte & 0xC0) != 0x80)
+            .count();
+        Self(core::num::NonZeroUsize::MIN.saturating_add(preceding))
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 /// Per-column result wire format requested by Bind: text (`false`) or binary
 /// (`true`). Encodes PostgreSQL's three cases: no codes (all text), one code
 /// (applies to every column), or one code per column.
@@ -2204,11 +2227,21 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("ERROR", sqlstate.as_ref(), message)
+        self.error_severity("ERROR", sqlstate.as_ref(), message, None)
+    }
+
+    /// [`Self::error`] with the cursor position PostgreSQL reports for it.
+    pub fn error_at<S: AsRef<str>>(
+        &mut self,
+        sqlstate: S,
+        message: &str,
+        cursor: CursorPosition,
+    ) -> Result<(), WireFull> {
+        self.error_severity("ERROR", sqlstate.as_ref(), message, Some(cursor))
     }
 
     pub fn fatal<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        self.error_severity("FATAL", sqlstate.as_ref(), message)
+        self.error_severity("FATAL", sqlstate.as_ref(), message, None)
     }
 
     fn error_severity(
@@ -2216,6 +2249,7 @@ impl<'b> Responder<'b> {
         severity: &str,
         sqlstate: &str,
         message: &str,
+        cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
         self.control(|buffer| {
@@ -2237,6 +2271,11 @@ impl<'b> Responder<'b> {
                     m.u8(b'H');
                     m.cstr(h.as_str());
                 }
+            }
+            // PostgreSQL sends the cursor after detail and hint.
+            if let Some(cursor) = cursor {
+                m.u8(b'P');
+                m.cstr(stack_format!(20, "{}", cursor.get()).as_str());
             }
             m.u8(0);
             m.finish()
@@ -2603,6 +2642,35 @@ mod tests {
         let text = core::str::from_utf8(&bytes[5..]).unwrap();
         assert!(text.contains("42601"));
         assert!(text.contains("syntax error"));
+    }
+
+    #[test]
+    fn error_cursor_counts_characters_and_follows_the_hint() {
+        let text = "SELECT 'é', 'ü' FROM WHERE";
+        let at = text.find("WHERE").unwrap();
+        assert_eq!(super::CursorPosition::in_text(text, at).get(), 22);
+        assert_eq!(super::CursorPosition::in_text(text, 0).get(), 1);
+        assert_eq!(super::CursorPosition::in_text(text, text.len()).get(), 27);
+        let mut budget = Budget::new(256);
+        let mut buffer = FixedBuf::new(&mut budget, "error cursor", 256).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            crate::sql::eval::stash_diagnostic(
+                None,
+                Some(crate::util::StackStr::from_str("check the spelling")),
+            );
+            let mut responder = Responder::new(&mut buffer);
+            responder
+                .error_at(
+                    "42601",
+                    "syntax error at or near \"WHERE\"",
+                    super::CursorPosition::in_text(text, at),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            &buffer.readable()[5..],
+            b"SERROR\0VERROR\0C42601\0Msyntax error at or near \"WHERE\"\0Hcheck the spelling\0P22\0\0"
+        );
     }
 
     #[test]

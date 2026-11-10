@@ -111,6 +111,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "window \"{}\" does not exist", name),
             sqlstate: sqlstate::UNDEFINED_OBJECT,
+            cursor: None,
         })
     }
 
@@ -138,6 +139,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "window \"{}\" is already defined", name),
                     sqlstate: sqlstate::WINDOWING_ERROR,
+                    cursor: None,
                 });
             }
             self.expect_ident("as")?;
@@ -286,6 +288,7 @@ impl<'a> Parser<'a> {
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
+                cursor: None,
             });
         }
         if !base.order_by.is_empty() && !order_by.is_empty() {
@@ -297,6 +300,7 @@ impl<'a> Parser<'a> {
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
+                cursor: None,
             });
         }
         if base.frame.is_some() {
@@ -308,6 +312,7 @@ impl<'a> Parser<'a> {
                     name
                 ),
                 sqlstate: sqlstate::WINDOWING_ERROR,
+                cursor: None,
             });
         }
         Ok(WindowSpec {

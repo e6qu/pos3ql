@@ -280,11 +280,15 @@ resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
-than one deparsed statement per line. Syntax errors use PostgreSQL's wording
-(`syntax error at or near "FROM"`, `unterminated quoted string at or near
-"'abc"`) but do not report the cursor position (the `P` field that psql shows
-as `LINE 1:` and a caret), and an echoed token longer than the 96-byte parser
-message is cut short. Checks the parser makes where PostgreSQL checks later
+than one deparsed statement per line. Syntax and scanner errors in a client's query report PostgreSQL's wording and
+cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
+other errors do not yet: PostgreSQL also points at the unknown relation, column,
+type, function or failed constant (`SELECT * FROM missing_table` reports
+position 15), maps a syntax error inside a SQL function body to its place in the
+`CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
+with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
+pos3ql does not send. An echoed token longer than the 96-byte parser message is
+cut short. Checks the parser makes where PostgreSQL checks later
 still fail with `42601` and `syntax error: <description>`: type modifiers
 (`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
 1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,

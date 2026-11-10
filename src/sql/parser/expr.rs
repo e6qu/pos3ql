@@ -735,7 +735,7 @@ impl<'a> Parser<'a> {
                     // while `((1,2)).f1` — where the outer parens make it one —
                     // is the spelling that works.
                     if self.peeked == Tok::Op(".") {
-                        return Err(self.err_here("syntax error at or near \".\""));
+                        return Err(self.syntax_error_here());
                     }
                 } else {
                     self.expect_op(")")?;
@@ -1211,10 +1211,9 @@ impl<'a> Parser<'a> {
                 // expression. It cannot come earlier — `ARRAY` is reserved and
                 // so is `current_date`, yet both are ordinary expressions.
                 if is_reserved_keyword(name) {
-                    return Err(ParseError {
-                        at: name_at,
-                        ..self.syntax_error_here()
-                    });
+                    // Reserved words are ASCII, so the folded name spans
+                    // the same bytes the client wrote.
+                    return Err(self.syntax_error_near(name_at, name_at + name.len()));
                 }
                 self.arena_expr(Expr::Column {
                     qualifier: None,
@@ -2807,6 +2806,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
                 sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
+                cursor: None,
             });
         }
         if modified {
@@ -2945,6 +2945,7 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
+            cursor: None,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
@@ -2956,6 +2957,7 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+            cursor: None,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -3011,6 +3013,7 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+            cursor: None,
         };
         let value = lit.trim();
 
@@ -3140,6 +3143,7 @@ impl<'a> Parser<'a> {
                     lit
                 ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+                cursor: None,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);

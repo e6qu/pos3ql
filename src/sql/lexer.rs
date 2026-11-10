@@ -43,6 +43,16 @@ pub struct LexError {
 }
 
 impl LexError {
+    /// The byte offset PostgreSQL reports as the error cursor. Scanner
+    /// failures point at the offending text; encoding validation and pos3ql's
+    /// own memory limit report none.
+    pub fn cursor(&self) -> Option<usize> {
+        match self.kind {
+            LexErrorKind::Syntax | LexErrorKind::UnicodeEscape => Some(self.at),
+            LexErrorKind::Encoding | LexErrorKind::Memory => None,
+        }
+    }
+
     /// The message as PostgreSQL's `scanner_yyerror` reports it for `text`,
     /// the input this error's offsets index.
     pub fn render(&self, text: &str) -> StackStr<96> {

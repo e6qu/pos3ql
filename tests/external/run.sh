@@ -390,8 +390,11 @@ psql_run() { # <name>
   # Their ordering after `2>&1` is scheduler-dependent, so compare each
   # stream against the corresponding portion of the established golden file.
   local expected_out="$WORK/$name.expected.out" expected_err="$WORK/$name.expected.err"
+  # An error's cursor position follows it as psql's `LINE n:` and caret lines.
   awk -v out="$expected_out" -v err="$expected_err" \
-    '/^psql:/ { print > err; next } { print > out }' \
+    '/^psql:/ { cursor = 1; print > err; next }
+     cursor && (/^LINE [0-9]+: / || /^ *\^$/) { print > err; next }
+     { cursor = 0; print > out }' \
     "$EXT/expected/$name.out"
   "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -a -q -P pager=off \
     -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2> "$WORK/$name.err"

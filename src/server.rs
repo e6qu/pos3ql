@@ -1195,7 +1195,7 @@ impl Server {
                 subscriptions: config.max_subscriptions,
                 foreign_sessions: config.max_foreign_sessions,
                 object_store: config.object_store_on,
-                credential_rotation: !config.object_store_credentials_file.is_empty(),
+                credential_rotation: !reloadable_credentials_file(config).is_empty(),
                 tls_budget_bytes: config.tls_pool_bytes
                     + Self::extra_tls_pool_bytes(config)
                     + if config.tls_on {
@@ -1209,9 +1209,7 @@ impl Server {
             ownership_ready: true,
             credentials_ready: true,
             credential_reload_pending: false,
-            credentials_file: crate::util::StackStr::from_str(
-                &config.object_store_credentials_file,
-            ),
+            credentials_file: reloadable_credentials_file(config),
         })
     }
 
@@ -4004,6 +4002,19 @@ fn stderr_line(msg: &[u8]) {
     crate::logging::info("server", message.trim_end());
 }
 
+/// The credential file a configuration reload rereads. Local-only durability
+/// never reads it, so a reload there must not either: an absent file would
+/// mark the server unready.
+fn reloadable_credentials_file(
+    config: &Config,
+) -> crate::util::StackStr<{ crate::object_store::CREDENTIAL_FILE_BYTES }> {
+    if config.object_store_on {
+        crate::util::StackStr::from_str(&config.object_store_credentials_file)
+    } else {
+        crate::util::StackStr::new()
+    }
+}
+
 fn token_for(index: u32, generation: u32) -> u64 {
     (u64::from(generation) << 32) | u64::from(index)
 }
@@ -4615,6 +4626,19 @@ mod tests {
         let mut altered = runtime;
         altered.publications[0] = crate::storage::SqlName::parse("inventory").unwrap();
         assert!(binding != SubscriptionBinding::from(altered));
+    }
+
+    #[test]
+    fn only_object_store_durability_rereads_its_credential_file() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_credentials_file = "/nonexistent/object-store.credentials".into();
+        config.object_store_on = false;
+        assert!(super::reloadable_credentials_file(&config).is_empty());
+        config.object_store_on = true;
+        assert_eq!(
+            super::reloadable_credentials_file(&config).as_str(),
+            "/nonexistent/object-store.credentials"
+        );
     }
 
     #[test]

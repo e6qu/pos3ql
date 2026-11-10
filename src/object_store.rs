@@ -98,14 +98,19 @@ pub(crate) fn load_credentials_file(path: &str) -> Result<Credentials, Credentia
     let fail = |message: &str| CredentialFileError(StackStr::from_str(message));
     let mut file = std::fs::File::open(path).map_err(|error| {
         let mut message = StackStr::<256>::new();
-        let _ = write!(message, "cannot open object-store credential file: {error}");
+        let _ = write!(
+            message,
+            "cannot open object-store credential file: {}",
+            crate::util::IoErrorText(&error)
+        );
         CredentialFileError(message)
     })?;
     let metadata = file.metadata().map_err(|error| {
         let mut message = StackStr::<256>::new();
         let _ = write!(
             message,
-            "cannot inspect object-store credential file: {error}"
+            "cannot inspect object-store credential file: {}",
+            crate::util::IoErrorText(&error)
         );
         CredentialFileError(message)
     })?;
@@ -134,7 +139,11 @@ pub(crate) fn load_credentials_file(path: &str) -> Result<Credentials, Credentia
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 let mut message = StackStr::<256>::new();
-                let _ = write!(message, "cannot read object-store credential file: {error}");
+                let _ = write!(
+                    message,
+                    "cannot read object-store credential file: {}",
+                    crate::util::IoErrorText(&error)
+                );
                 return Err(CredentialFileError(message));
             }
         }
@@ -711,6 +720,20 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_credential_file_reports_its_os_error_without_allocating() {
+        let path =
+            std::env::temp_dir().join(format!("pos3ql-missing-credentials-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let error = crate::mem::guard::forbid_alloc(|| {
+            load_credentials_file(path.to_str().unwrap()).err().unwrap()
+        });
+        assert_eq!(
+            error.to_string(),
+            "cannot open object-store credential file: entity not found (os error 2)"
+        );
     }
 
     #[test]

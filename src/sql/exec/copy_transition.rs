@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn copy_transition_values_reserve_the_exact_startup_budget() {
         let config = Config::parse(
-            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nindex_statistics_slots = 4096\n",
+            "txn_rows = 3\ncopy_transition_bytes = 73\ntransaction_mode = mvcc\ncatalog_history_bytes = 16777216\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n",
         ).unwrap();
         assert_eq!(config.copy_transition_bytes, 73);
         let required = CopyTransitionRows::budget_bytes(&config);

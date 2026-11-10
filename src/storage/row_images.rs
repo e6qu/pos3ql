@@ -22,6 +22,10 @@ pub(crate) struct RowSnapshot {
 }
 
 impl RowSnapshot {
+    pub(crate) fn row_version(self) -> RowVersion {
+        RowVersion(self.version)
+    }
+
     pub(crate) fn committed_lsn(self) -> Option<u64> {
         match self.version {
             RowVersionIdentity::Committed(lsn) => Some(lsn),
@@ -34,6 +38,43 @@ impl RowSnapshot {
 pub(super) enum RowVersionIdentity {
     Pending(u64),
     Committed(u64),
+}
+
+/// The MVCC version a reader selected for one row, comparable with a later
+/// selection of the same row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowVersion(RowVersionIdentity);
+
+impl RowVersion {
+    pub(crate) const ENCODED_LEN: usize = 9;
+
+    pub(super) const fn committed(lsn: u64) -> Self {
+        Self(RowVersionIdentity::Committed(lsn))
+    }
+
+    /// An uncommitted version, which only its own transaction can select.
+    pub(crate) fn is_pending(self) -> bool {
+        matches!(self.0, RowVersionIdentity::Pending(_))
+    }
+
+    pub(crate) fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let (tag, value) = match self.0 {
+            RowVersionIdentity::Pending(value) => (1, value),
+            RowVersionIdentity::Committed(value) => (2, value),
+        };
+        let mut bytes = [tag; Self::ENCODED_LEN];
+        bytes[1..].copy_from_slice(&value.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        let value = u64::from_le_bytes(bytes.get(1..Self::ENCODED_LEN)?.try_into().ok()?);
+        match bytes.first()? {
+            1 => Some(Self(RowVersionIdentity::Pending(value))),
+            2 => Some(Self(RowVersionIdentity::Committed(value))),
+            _ => None,
+        }
+    }
 }
 
 /// Byte owners shared by every deferred row in a scan or table rewrite.

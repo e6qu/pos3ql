@@ -2924,15 +2924,13 @@ fn capture_original_drops<'a>(
         let (schema, _) = storage.classify_relation(name.schema, name.name, txid)?;
         relation_reference(storage, txid, schema.as_str(), name.name)
     };
-    let routine = |identity: &RoutineIdentity<'_>| match crate::sql::exec::resolve_routine_identity(
-        storage,
-        txid,
-        identity,
-        RoutineTargetKind::Either,
-    ) {
-        Ok(slot) => Ok(Some(ObjectRef::Routine(slot))),
-        Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => Ok(None),
-        Err(error) => Err(error),
+    let routine = |identity: &RoutineIdentity<'_>| {
+        crate::sql::exec::lookup_routine(storage, txid, RoutineTargetKind::Either, identity).map(
+            |found| match found {
+                Ok(crate::sql::exec::RoutineTarget::Stored(slot)) => Some(ObjectRef::Routine(slot)),
+                Ok(crate::sql::exec::RoutineTarget::Builtin(_)) | Err(_) => None,
+            },
+        )
     };
     match statement {
         Stmt::DropTable(drop) | Stmt::DropForeignTable(drop) => {
@@ -3015,24 +3013,7 @@ fn capture_original_drops<'a>(
         }
         Stmt::DropAggregate { aggregates, .. } => {
             for identity in *aggregates {
-                let mut types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-                let count =
-                    identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
-                if count > types.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many aggregate arguments"
-                    ));
-                }
-                types[..identity.direct_argument_types.len()]
-                    .copy_from_slice(identity.direct_argument_types);
-                types[identity.direct_argument_types.len()..count]
-                    .copy_from_slice(identity.aggregated_argument_types);
-                remember(routine(&RoutineIdentity {
-                    name: identity.name,
-                    argument_types: &types[..count],
-                    signature_is_explicit: true,
-                })?)?;
+                remember(routine(&identity.routine())?)?;
             }
         }
         Stmt::DropCast(cast) => {

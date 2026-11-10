@@ -964,7 +964,7 @@ fn cluster_metadata_system_settings_publish_owned_bounded_images() {
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
     let names = ["setting_a", "setting_b", "setting_c", "setting_d"];
-    let barrier = std::sync::Barrier::new(names.len() + 1);
+    let barrier = crate::mem::mutex::Barrier::new(names.len() + 1);
     std::thread::scope(|scope| {
         for (worker, name) in names.iter().enumerate() {
             let storage = &storage;
@@ -1823,7 +1823,7 @@ fn cluster_metadata_prepared_catalog_snapshots_are_atomic_and_startup_bounded() 
     storage
         .replace_prepared_transaction_catalog(initial)
         .unwrap();
-    let barrier = std::sync::Barrier::new(5);
+    let barrier = crate::mem::mutex::Barrier::new(5);
     std::thread::scope(|scope| {
         for worker in 0..4 {
             let storage = &storage;
@@ -2035,7 +2035,7 @@ fn database_catalog_is_synchronized_and_startup_bounded() {
     config.max_databases = 3 + WORKERS;
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
-    let barrier = std::sync::Barrier::new(WORKERS + 1);
+    let barrier = crate::mem::mutex::Barrier::new(WORKERS + 1);
     let finished = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for worker in 0..WORKERS {
@@ -2474,7 +2474,7 @@ fn index_catalog_is_synchronized_and_startup_bounded() {
     storage
         .create_table(make_def("index_target", &[("id", ColType::Int4, false)]))
         .unwrap();
-    let barrier = std::sync::Barrier::new(WORKERS + 1);
+    let barrier = crate::mem::mutex::Barrier::new(WORKERS + 1);
     let finished = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for name in names {
@@ -2724,7 +2724,7 @@ fn view_rule_catalog_is_synchronized_and_startup_bounded() {
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
     let mut arena = Arena::new(&mut budget, "view snapshot test", 1 << 16).unwrap();
-    let barrier = std::sync::Barrier::new(WORKERS + 1);
+    let barrier = crate::mem::mutex::Barrier::new(WORKERS + 1);
     let finished = std::sync::atomic::AtomicUsize::new(0);
     let names = ["worker_a", "worker_b", "worker_c", "worker_d"];
 
@@ -3494,7 +3494,7 @@ fn sequence_values_concurrent_advances_are_unique_and_allocation_free() {
     let mut budget = test_budget(&config);
     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
     let sequence = create_native_sequence(&mut storage, "serial_counter", native_sequence_spec());
-    let barrier = std::sync::Barrier::new(4);
+    let barrier = crate::mem::mutex::Barrier::new(4);
     let seen: [std::sync::atomic::AtomicBool; 256] =
         core::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false));
     std::thread::scope(|scope| {
@@ -9892,7 +9892,7 @@ fn shared_table_creation_reserves_distinct_slots_and_one_owner_per_name() {
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
     let names = ["parallel_a", "parallel_b", "parallel_c", "parallel_d"];
-    let ready = std::sync::Barrier::new(5);
+    let ready = crate::mem::mutex::Barrier::new(5);
     let storage = &storage;
     let ready = &ready;
     let slots = std::thread::scope(|scope| {
@@ -9915,7 +9915,7 @@ fn shared_table_creation_reserves_distinct_slots_and_one_owner_per_name() {
         );
         assert_eq!(storage.find_visible("public", names[ordinal], 99), None);
     }
-    let ready = std::sync::Barrier::new(3);
+    let ready = crate::mem::mutex::Barrier::new(3);
     let ready = &ready;
     let results = std::thread::scope(|scope| {
         let handles: [_; 2] = core::array::from_fn(|_| {

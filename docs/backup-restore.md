@@ -1,30 +1,20 @@
 # Backup and restore
 
-These commands operate on the configured instance's object-store prefix,
-including its SQL databases. They are offline writer operations, not SQL
-scheduled jobs. [Operations](operations.md#scheduled-work-and-schema-migrations)
-explains scheduling and binary/schema migrations; backups preserve saved bytes
-and do not convert an incompatible pos3ql format.
+A **named backup** is a checkpoint-consistent recovery point kept inside the
+instance's object-store prefix, covering all its SQL databases. An **export**
+copies a backup to a separate prefix, bucket or endpoint, protecting against
+loss of the source prefix.
 
 **User example:** before an upgrade, stop traffic and the server, create a
-backup named `before-upgrade`, then restart the server. If the upgrade damages
-data, stop it again and restore that point. To protect against losing the
-entire source prefix, export the backup to a separate prefix as well.
+backup named `before-upgrade`, then restart. If the upgrade damages data, stop
+the server again and restore that point. Export the backup too if you need to
+survive losing the whole source prefix.
 
-These commands take write ownership of the database. They are offline
-operations: no server may continue using the same prefix while they run.
-Recovery to a timestamp also requires retained history after the backup;
-a backup does not recreate history that has already been discarded.
+Backups preserve saved bytes; they do not convert an incompatible pos3ql
+format. For scheduling and migrations, see
+[operations](operations.md#scheduled-work-and-schema-migrations).
 
-pos3ql can retain a named, checkpoint-consistent recovery point inside the
-configured object-store prefix. The operation copies the published manifest
-and commit head under `backups/<name>/` and publishes a checksummed completion
-record last.
-
-Each backup operation that opens the database promotes its own writer
-incarnation. A running server on the same prefix is fenced and its next durable
-publish fails with SQLSTATE `40001`. Stop traffic and the intended server before
-these commands; restart it after the operation.
+## Commands
 
 ```sh
 pos3ql --config /path/to/pos3ql.conf --backup before-upgrade
@@ -38,81 +28,87 @@ pos3ql --config /path/to/source.conf --export-backup before-upgrade \
 pos3ql --config /path/to/pos3ql.conf --delete-backup before-upgrade
 ```
 
-`--backup` recovers the latest durable state, completes a checkpoint, then
-creates the named recovery point. A name contains 1 to 63 ASCII letters,
-digits, dots, underscores, or hyphens. Names are immutable and cannot be
-reused until `--delete-backup` removes the old or incomplete backup.
-`max_backups` reserves the fixed startup roster used by checkpoint retention;
-creation fails before writing a new backup when that roster is full.
+These are offline commands, not SQL. Each one takes write ownership of the
+prefix by promoting its own writer identity, so a server still running on that
+prefix is fenced: its next durable publish fails with SQLSTATE `40001`. Stop
+traffic and the server first, and restart it afterwards.
 
-Checkpoint maintenance treats every retained backup manifest as a live root.
-It walks the backup's row and value-index rosters before deleting blocks, and
-commit pruning retains history from the oldest backup replay floor, including
-older prepared transactions and logical replication restart positions. An
-interrupted creation that reached the manifest therefore remains a retention
-pin even though restore rejects it without the completion record.
+## Creating and deleting backups
 
-`--restore` replaces the live manifest and commit head with the named roots.
-A durable `restore-pending` marker makes the two-root replacement recoverable:
-ordinary server startup refuses the prefix until the offline restore command
-finishes. Restore publishes that marker before promotion, then verifies writer
-ownership before each root replacement. Before removing the marker, restore deletes `journal.wal`,
-`block-cache`, and `clean.shutdown`, forcing recovery from object storage.
-Other operator-managed files below `data_dir`, including extension packages,
-are preserved. A successful restore can accept new commits and checkpoints,
-forming a new history from the restored point.
+`--backup` recovers the latest durable state, completes a checkpoint, copies
+the published manifest and commit head under `backups/<name>/`, and publishes a
+checksummed completion record last.
 
-`--recovery-target-lsn` replays retained history after the named point through
-the exact `pg_lsn` transaction boundary. A record LSN inside a transaction,
-an LSN before the backup, and an LSN newer than the retained branch are
-rejected. `--recovery-target-time` selects the last transaction committed at
-or before the supplied PostgreSQL `timestamptz`; include `Z` or a numeric
-offset in operational commands. Timestamp recovery requires a backup written
-with the current `pos3ql-backup-v2` completion record. Older v1 backups remain
-restorable by their named point or an exact LSN.
+- A name has 1 to 63 ASCII letters, digits, dots, underscores or hyphens.
+- Names are immutable: reuse requires `--delete-backup` first, including for an
+  incomplete backup.
+- `max_backups` sizes a fixed startup roster; creation fails before writing
+  when it is full.
+
+Checkpoint cleanup treats every retained backup manifest as a live root: its
+row and index files are kept, and commit history is kept from the oldest
+backup's replay floor, including older prepared transactions and logical
+replication restart positions. An interrupted backup that reached its manifest
+is still kept, even though restore rejects it without a completion record.
+Capacity exhaustion stops cleanup before any deletion.
+
+`--delete-backup` removes the completion record first and the manifest last.
+Later checkpoint cleanup can then reclaim objects used only by that backup.
+
+## Restoring
+
+`--restore` replaces the live manifest and commit head with the backup's
+roots. It first publishes a durable `restore-pending` marker, and ordinary
+startup refuses the prefix until the restore command finishes, so an
+interrupted restore can be retried safely. Restore checks writer ownership
+before each root replacement. Before removing the marker it deletes
+`journal.wal`, `block-cache` and `clean.shutdown` from `data_dir`, forcing
+recovery from object storage; other files there, such as extension packages,
+are kept. The restored database accepts new commits, starting a new history.
+
+Point-in-time recovery replays retained history after the backup:
+
+| Option | Stops at | Rejected when |
+|---|---|---|
+| `--recovery-target-lsn` | The exact `pg_lsn` transaction boundary. | The LSN is inside a transaction, before the backup, or beyond the retained history. |
+| `--recovery-target-time` | The last transaction committed at or before the given `timestamptz`. Include `Z` or a numeric offset. | The backup has only a `pos3ql-backup-v1` completion record; time targets need `pos3ql-backup-v2`. v1 backups restore by name or exact LSN. |
 
 For example, restoring to `14:30:00+00` selects the last retained transaction
-committed no later than that time, rather than stopping partway through a
-transaction. Restoring creates a new live history; do not expect to recover a
-discarded later branch from that new history.
+committed no later than that time; it never stops partway through a
+transaction.
 
-Recovery validates the retained descriptor chain, immutable batch checksum,
-WAL framing, and commit timestamps before publishing `restore-pending`. If the
-chosen boundary falls inside a batch, the command publishes a checksummed
-immutable prefix linked to the same predecessor. The marker binds the backup,
-manifest, resolved LSN, and target head, so a retry cannot adopt another
-target. The live commit chain must still descend from the named backup; an
-earlier restore that created a different branch makes its discarded future
-unavailable.
+Before publishing `restore-pending`, recovery validates the retained descriptor
+chain, batch checksums, journal framing and commit timestamps. If the target
+falls inside a batch, it publishes a checksummed prefix of that batch linked to
+the same predecessor. The marker binds the backup, manifest, resolved LSN and
+target head, so a retry cannot pick a different target.
 
-`--delete-backup` removes the completion record first and the manifest
-retention pin last. Later checkpoint maintenance may then reclaim objects used
-only by that backup.
+The live commit chain must still descend from the backup. A backup does not
+recreate history already discarded, and after a restore creates a new branch,
+the discarded later branch cannot be recovered from it.
 
-`--export-backup` copies the named roots and the immutable block, retained
-commit, and durable extension-package namespaces into the destination
-configuration's empty prefix.
-The source and destination may use different S3-compatible endpoints, buckets,
-credentials, or prefixes. The destination `data_dir` must also be distinct.
-Its startup capacities must accommodate the exported database; export checks
-the manifest byte bound before creating the destination marker.
-The command publishes the named point as the destination's live database and
-retains the named backup there. Object bodies stream through a fixed buffer in
-ranged reads, independent of the configured response window. Extra immutable
-source objects may be copied; ordinary destination checkpoint maintenance
-reclaims objects outside the exported live and backup roots.
+## Exporting to another prefix
 
-Export writes `export-pending` before the first copied object. Normal startup
-refuses that destination until the same export command finishes. A retry scans
-the source in fixed `checkpoint_garbage_batch_objects` batches and adopts only
-byte-identical destination objects. It publishes the live manifest and commit
-head after every immutable object is present, clears the destination's local
-journal and block cache, writes an `export-complete` receipt, and removes the
-pending marker last. The receipt lets a retry adopt a completed publication if
-the final response was lost, provided its live roots have not advanced. The
-destination prefix must be empty on the first attempt; this prevents an export
-from silently replacing an existing database.
+`--export-backup` copies the backup's roots plus the immutable block, retained
+commit and durable extension-package objects into the destination
+configuration's prefix. The destination may use a different endpoint, bucket,
+credentials or prefix; its `data_dir` must also differ, and its startup
+capacities must fit the database (the manifest size is checked before
+anything is written). The backup becomes the destination's live database and
+also stays there as a named backup.
 
-Same-prefix named backups protect historical points and the commit history
-needed for LSN and timestamp recovery from ordinary checkpoint cleanup.
-Independent exports also protect against loss of the source prefix.
+- The destination prefix must be empty on the first attempt, so an export can
+  never replace an existing database.
+- Export writes `export-pending` before copying anything; normal startup
+  refuses the destination until the same command finishes.
+- Objects stream through a fixed buffer using ranged reads and conditional
+  writes. A retry scans the source in `checkpoint_garbage_batch_objects`
+  batches and adopts only byte-identical destination objects.
+- After every object is present, export publishes the live manifest and commit
+  head, clears the destination's local journal and block cache, writes an
+  `export-complete` receipt and removes the pending marker last. The receipt
+  lets a retry recognize a completed export whose final response was lost, as
+  long as the destination's roots have not advanced.
+
+Extra immutable source objects may be copied; destination checkpoint cleanup
+reclaims anything outside its live and backup roots.

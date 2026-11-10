@@ -16,6 +16,9 @@ SELECT 1::nosuchtype;
 SELECT 9223372036854775807 + 1;
 SELECT nosuchfunc(1);
 SELECT 1 +;
+-- A syntax error reports its character position (psql's LINE and caret).
+SELECT 'é',
+  'ü' FROM WHERE;
 SELECT count(*), id FROM t_err;
 DROP TABLE missing_table;
 -- psql sends each ;-separated statement as its own Query message and

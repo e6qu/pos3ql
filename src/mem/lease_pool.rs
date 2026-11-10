@@ -45,6 +45,12 @@ impl Purpose {
         leases: "statistics_leases",
         ranges: "statistics free ranges",
     };
+    pub(crate) const RESULT_SPOOL: Self = Self {
+        pool: "result spool pool",
+        bytes: "result_spool_bytes",
+        leases: "result_spool_leases",
+        ranges: "result spool free ranges",
+    };
 }
 
 #[repr(C, align(64))]
@@ -467,6 +473,9 @@ impl<T> MutableSlice<T> {
     pub(crate) fn max_entries(&self) -> usize {
         self.pool.max_entries::<T>()
     }
+    pub(crate) fn capacity_entries(&self) -> usize {
+        self.capacity
+    }
 
     pub(crate) fn reserve_exact(&mut self, entries: usize) -> Result<(), LeaseError> {
         if entries <= self.capacity {
@@ -568,6 +577,14 @@ impl<T> MutableSlice<T> {
         }
         self.len = len;
         Ok(())
+    }
+
+    /// Drops the initialized suffix past `len` while keeping the reservation.
+    pub(crate) fn truncate(&mut self, len: usize)
+    where
+        T: Copy,
+    {
+        self.len = self.len.min(len);
     }
 
     /// Convert owned elements while retaining the same byte and descriptor
@@ -1086,7 +1103,7 @@ mod tests {
     #[test]
     fn parallel_leases_keep_payloads_disjoint_without_callback_locks() {
         let pool = pool(128, 2);
-        let together = std::sync::Barrier::new(2);
+        let together = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let worker = |value| {
                 crate::mem::guard::forbid_alloc(|| {
@@ -1403,7 +1420,7 @@ mod tests {
             })
             .unwrap();
         let retained = values.freeze();
-        let together = std::sync::Barrier::new(2);
+        let together = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let shared = retained.clone();
             let worker = scope.spawn(|| {

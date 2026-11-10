@@ -1,17 +1,49 @@
 # Operations
 
-Use this guide to monitor the server, rotate storage credentials, and replace
-the active writer. Recovery and replacement mechanisms are implemented;
-failover across separate machines with real client routing still needs the
-evidence listed in [the plan](../PLAN.md).
+This guide covers the operational listener, scheduled work, monitoring, logs,
+credential rotation, and replacing the active writer. Cross-machine failover
+with real client routing is not yet qualified; see
+[Qualify production deployment](../PLAN.md#qualify-production-deployment).
 
-**User example:** a server process can answer a local health check while it
-cannot save new commits. Route new database work only after readiness succeeds;
-process liveness alone does not establish durable storage or writer ownership.
+**User example:** a process can answer a local health check while it cannot
+save new commits. Route database work only to a process whose readiness check
+succeeds; being alive does not prove durable storage works or that the process
+still owns writes.
 
-pos3ql can expose a separate HTTP listener for process probes, Prometheus
-metrics, and startup capacity. It is disabled by default. Enable it on a
-private interface:
+## Configuration
+
+`pos3ql --config <path>` is required. Every limit is fixed at startup: the
+server reserves the memory the file implies and returns a named error when a
+pool is exhausted. Sizes accept `KiB`, `MiB`, and `GiB`. A missing required
+setting fails startup. Full examples are `examples/dev.conf` in the source
+tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
+[memory and physical size](architecture.md#memory-and-physical-size).
+
+| Setting | Required | Bounds |
+|---|---|---|
+| `transaction_mode` | yes | `mvcc` keeps older row versions for readers; `locking` makes conflicting work wait. |
+| `catalog_history_bytes` | yes | Encoded catalog history. Nonzero (e.g. `16MiB`) in `mvcc`; `0` in `locking`. |
+| `row_history_slots` | yes | Committed row-history slots shared by all tables and large objects. Nonzero (e.g. `65536`) in `mvcc`; `0` in `locking`. |
+| `row_overlay_slots` | yes | Resident row metadata shared by ordinary tables in all databases. |
+| `row_work_bytes` | yes | Shared foreground bytes for retained row identities and DML buffers; a multiple of 64. |
+| `row_work_leases` | yes | Concurrent leases on `row_work_bytes`. |
+| `execution_control_bytes` | yes | Bytes for live procedural-execution control records. |
+| `execution_control_leases` | yes | Concurrent owned ranges in `execution_control_bytes`. |
+| `definition_image_slots` | yes | Identities for retained table schemas and synthetic query columns. |
+| `table_metadata_bytes` | yes | Bytes for table definitions and index bindings. |
+| `table_metadata_leases` | yes | Concurrent owned ranges in `table_metadata_bytes`. |
+| `statistics_bytes` | yes | Bytes for analyzed-column statistics. |
+| `statistics_leases` | yes | Concurrent owned ranges in `statistics_bytes`, including retained images. |
+| `index_statistics_slots` | yes | Index lifetimes sharing activity counters, including retained readers. |
+| `result_spool_bytes` | yes | Shared bytes queuing result rows for clients that read slower than statements produce them; a multiple of 64 (e.g. `16MiB`). A client further behind gets `54000` naming this setting after the rows already queued. |
+| `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
+| `result_stream_bytes` | yes | Per-connection query, parameters and read positions of a large result that resumes row by row as its client reads (e.g. `256KiB`); at least 64 KiB, or `0` to disable resuming so such results queue in the spool. |
+| `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
+
+## Operational listener
+
+A separate HTTP listener serves health probes, Prometheus metrics, and startup
+capacity. It is disabled by default. Enable it on a private interface:
 
 ```text
 operations_listen_addr = 127.0.0.1:9187
@@ -19,16 +51,11 @@ operations_max_connections = 4
 log_format = json
 ```
 
-The listener is plaintext and unauthenticated. Do not publish it directly to
-an untrusted network. Terminate TLS and apply access control in the surrounding
-platform when remote access is required. Its connection slots and 2 KiB
-request and 16 KiB response buffers are reserved at startup. Operational
-requests therefore remain independent of `max_connections` and cannot grow
-runtime memory.
-
-## HTTP endpoints
-
-To distinguish those cases on a configured development server:
+The listener is plaintext and unauthenticated. Do not expose it to an
+untrusted network; put TLS and access control in front of it when remote
+access is needed. Its connection slots, 2 KiB request buffers and 16 KiB
+response buffers are reserved at startup, so probes do not count against
+`max_connections` and cannot grow runtime memory.
 
 ```sh
 curl --fail http://127.0.0.1:9187/livez
@@ -36,73 +63,66 @@ curl --fail http://127.0.0.1:9187/readyz
 curl --fail http://127.0.0.1:9187/capacity
 ```
 
-`/capacity` shows the reservations chosen at startup and their current use.
-More connections allow more waiting work; SQL CPU execution still uses one worker.
-
-| Path | Success | Meaning |
+| Path | Status | Meaning |
 |---|---:|---|
-| `/livez` or `/healthz` | 200 | The event loop accepted and answered the request. |
-| `/readyz` | 200 | Startup completed, durable progress is healthy, and the process still owns the writer fence. |
-| `/readyz` | 503 | WAL publication or remote checkpoint work failed, the object store is unavailable, or another process owns the writer fence. |
-| `/metrics` | 200 | Prometheus text metrics for current readiness, connections, query workspace capacity, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, and immutable-block object requests. |
-| `/capacity` | 200 | JSON containing current use, waiting work and startup limits for memory, connections, query workspaces, WAL, the row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
+| `/livez`, `/healthz` | 200 | The event loop answered. |
+| `/readyz` | 200 | Startup finished, durable progress is healthy, and this process still owns the writer fence. |
+| `/readyz` | 503 | Journal (WAL) publication or remote checkpoint work failed, object storage is unavailable, or another process owns the writer fence. |
+| `/metrics` | 200 | Prometheus text: readiness, connections, query workspaces, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, immutable-block object requests, result streams and spooled results by reason. |
+| `/capacity` | 200 | JSON: current use, waiting work, and startup limits for memory, connections, query workspaces, WAL, row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
 
-Only `GET` with HTTP/1.0 or HTTP/1.1 is accepted. Unknown paths and methods
-fail explicitly. Responses disable caching and close the connection.
+Only `GET` over HTTP/1.0 or HTTP/1.1 is accepted; other methods and unknown
+paths fail explicitly. Responses are uncacheable and close the connection.
+More connections allow more waiting work; SQL execution still uses one CPU
+worker.
 
-In durable mode, `/readyz` and `/metrics` read and validate the writer fence.
-This detects a displaced idle process before it can continue serving routed
-reads. One separate client and each waiting request's receipt are reserved at
-startup. Concurrent checks can share an unfinished read; each keeps its result,
-and a new check never consumes cached readiness. Slow storage delays those
-responses while cached SQL queries, `/livez` and `/capacity` continue.
-For example, a report can return while a monitor waits to verify ownership.
-Transport failures retry within the existing three-attempt, 30-second request
-limits; a displaced writer stays fenced. No runtime memory grows.
-`/livez` separates process failure from durable-tier failure. Readiness also turns false when commit publication or remote checkpoint work
-fails and returns true after a successful durable publication or completion of
-its pending remote cleanup. A skipped
-maintenance turn, local heap cleanup, or temporary-file spill cannot clear a
-storage failure status. For example, a cached report can succeed while
-`/readyz` still reports that the last durable publication failed.
-Local capacity errors keep their named SQL errors and do not by themselves
-change durable readiness.
+### Readiness
 
-Failed maintenance retries no sooner than one second later. Client traffic
-does not shorten that delay. An idle server also retries a failure that happened
-before a checkpoint started. An empty retry releases its wakeup without changing
-publication readiness. This pacing applies to background maintenance; the commit
-barrier still decides when client responses are durable.
+The writer fence is the object-store record that names the one process
+allowed to publish commits. In durable mode, `/readyz` and `/metrics` read and
+validate it, so a displaced idle process stops reporting ready before it
+serves more routed reads. A reserved storage client performs this check;
+concurrent checks may share one unfinished read, but a new check never reuses
+an earlier result. Transport failures retry within the usual three-attempt,
+30-second request limit. Slow storage delays only these responses: cached SQL
+queries, `/livez`, and `/capacity` keep answering.
+
+Readiness becomes false when commit publication or remote checkpoint work
+fails, and true again only after a successful durable publication or
+completion of the pending remote cleanup. Skipped maintenance, local heap
+cleanup, or a temporary-file spill does not clear it. A cached report can
+therefore succeed while `/readyz` still reports the failed publication. Local
+capacity errors return their named SQL errors and do not change readiness.
+
+Failed background maintenance retries no sooner than one second later; client
+traffic does not shorten the delay, and an idle server retries too. The commit
+barrier, not this pacing, decides when client responses are durable.
 
 ## Scheduled work and schema migrations
 
-Internal checkpointing, file merges, row-history cleanup and eligible object
-deletion run from the server event loop. They advance between client work and
-while idle; no OS cron job is required. A successful COMMIT does not wait for a
-full checkpoint, but it does wait for its durable journal publication.
-Maintenance retries and quotas are described in [architecture](architecture.md#maintenance-and-scheduling).
+Checkpointing, file merges, row-history cleanup, and eligible object deletion
+run inside the server between client work and while idle; no OS cron job is
+needed. COMMIT waits for its durable journal publication, not for a full
+checkpoint. See [maintenance and scheduling](architecture.md#maintenance-and-scheduling).
 
-Application tasks are different. Use an external scheduler, such as an OS cron
-job or your deployment's job runner, to connect with an ordinary PostgreSQL
-client. There is no built-in SQL job scheduler or native background-worker ABI;
-`pg_cron` is not a qualified extension. For example, a daily application job can
-run a reviewed SQL file:
+Application jobs need an external scheduler (OS cron or your job runner)
+connecting as an ordinary PostgreSQL client. There is no built-in SQL job
+scheduler or background-worker interface, and `pg_cron` is not a qualified
+extension. Example daily job:
 
 ```cron
 0 2 * * * PGSERVICE=orders_jobs /usr/bin/psql -X -v ON_ERROR_STOP=1 -f /etc/orders/remove_expired_orders.sql
 ```
 
-`orders_jobs` is an operator-configured libpq service, not a pos3ql setting.
-Give it the required database, host, TLS and account settings, keep passwords in
-an owner-only credential file, record failures and prevent overlapping runs in
-the scheduler. Choose small transactions that fit the configured buffers. A
-scheduler retry after a lost commit reply must check whether its work already
-happened.
+`orders_jobs` is a libpq service you define (database, host, TLS, account),
+not a pos3ql setting. Keep passwords in an owner-only file, and let the
+scheduler record failures and prevent overlapping runs. Keep transactions
+small enough for the configured buffers. A retry after a lost commit reply
+must first check whether the work already happened.
 
-Schema migration tools also use ordinary clients and supported SQL. They must
-coordinate which runner applies a migration and record applied versions. pos3ql
-provides transactional DDL and savepoints, but no migration runner or history
-table. For example, with `orders` already present:
+Migration tools also connect as ordinary clients. pos3ql provides
+transactional DDL and savepoints but no migration runner or history table, so
+the tool must choose one runner and record applied versions. For example:
 
 ```sql
 BEGIN;
@@ -111,51 +131,47 @@ ALTER TABLE orders ADD COLUMN fulfilled_at timestamptz;
 COMMIT;
 ```
 
-A conflicting relation lock can make this fail with `55P03`; rollback before
-retrying. ADD COLUMN, CREATE INDEX, constraint validation and type rewrites can
-have different locking, row-scan and memory costs. A single large migration is
-not made nonblocking by the scheduler. Rehearse the actual SQL and data shape
-under the intended startup capacities.
+A conflicting lock fails this with `55P03`; roll back before retrying. ADD
+COLUMN, CREATE INDEX, constraint validation, and type rewrites differ in
+locking, row scans, and memory. Rehearse the real SQL and data size under the
+intended startup capacities.
 
-Binary upgrades are a separate operation. There is no automatic conversion of
-older pos3ql formats. Check the [format matrix](durable-format.md), stop the
-appropriate traffic, retain the source and verify logical export/restore into a
-fresh namespace when required. [Offline backup commands](backup-restore.md)
-promote their own writer and fence a running server on that prefix; do not put
-one on a live-server cron schedule as though it were a nonblocking SQL backup.
+Upgrading the pos3ql binary is separate: older pos3ql formats are not
+converted automatically. Check the [format matrix](durable-format.md), and
+when needed verify a logical export and restore into a fresh prefix while
+keeping the source. [Offline backup commands](backup-restore.md) take writer
+ownership and fence a running server on that prefix; never schedule them
+against a live server as if they were online SQL backups.
 
 ## Metrics and alerts
 
-Scrape `/metrics` from the private operational network. Useful first alerts
-are:
+Scrape `/metrics` from the private network. Suggested first alerts:
 
-- `pos3ql_up == 0`: the process or operational listener is unreachable.
-- `pos3ql_ready == 0`: stop routing new work and inspect publication errors.
-- `pos3ql_object_store_credential_reload_failures_total` increases: correct
-  the candidate credential file and reload it before routing resumes.
-- PostgreSQL connections approaching `pos3ql_postgres_connection_capacity`:
-  raise the startup limit or reduce client concurrency.
-- WAL or row-heap use approaching its capacity: inspect checkpoint progress
-  and object-store latency before the named capacity is exhausted.
-- Sustained object read latency, cache misses, or prefetch saturation: compare
-  the working set with the configured cache and object-read slot capacities.
+| Signal | Action |
+|---|---|
+| `pos3ql_up == 0` | Process or operational listener unreachable. |
+| `pos3ql_ready == 0` | Stop routing new work; inspect publication errors. |
+| `pos3ql_object_store_credential_reload_failures_total` increases | Fix the credential file and reload. |
+| Connections near `pos3ql_postgres_connection_capacity` | Raise the startup limit or reduce client concurrency. |
+| WAL or row-heap use near capacity | Check checkpoint progress and object-store latency. |
+| Sustained object read latency, cache misses, or prefetch saturation | Compare the working set with cache and object-read slot capacities. |
+| `pos3ql_result_stream_spooled_total{reason="capacity"}` grows | Large simple results queue in the spool because their read position exceeds `result_stream_bytes`; raise it or checkpoint more often. |
 
-Counters reset on process start. Block-object request counters cover immutable
-SST traffic through pos3ql's provider-neutral cache stack. They exclude root,
-commit-batch, LIST, DELETE, and storage-service-internal requests.
+Counters reset at process start. Block-object request counters cover
+immutable SST traffic through the cache stack only, not root, commit-batch,
+LIST, DELETE, or storage-service-internal requests.
 
 ## Logs
 
-`log_format = text` retains human-readable diagnostics. `log_format = json`
-emits one JSON object per line with `timestamp_unix_ms`, `level`, `event`, and
-`message`. Runtime formatting uses fixed stack buffers after memory freezes.
-Database credentials and object-store secret material are not logged.
+`log_format = text` gives human-readable lines. `log_format = json` emits one
+JSON object per line with `timestamp_unix_ms`, `level`, `event`, and
+`message`. Database credentials and object-store secrets are never logged.
 
 ## Object-store credential rotation
 
-Prefer `object_store_credentials_file` over inline credential settings. The
-file must be a regular UTF-8 file no larger than 4 KiB and must grant no group
-or other permissions. Its format is:
+Prefer `object_store_credentials_file` to inline credential settings. The file
+must be a regular UTF-8 file of at most 4096 bytes with no group or other
+permissions:
 
 ```text
 access_key = example-access
@@ -163,112 +179,92 @@ secret_key = example-secret
 session_token = optional-temporary-token
 ```
 
-Rotate without interrupting durable work:
+To rotate without interrupting durable work:
 
-1. Grant the replacement credential access to the configured bucket and
-   prefix while the current credential remains valid.
-2. Write the complete replacement file beside the configured path with mode
-   `0600`, then rename it over the configured path atomically.
-3. Send `SIGHUP` to the server or execute `SELECT pg_reload_conf()`.
-4. Wait for `/readyz` to return 200 and for
+1. Grant the new credential access to the bucket and prefix while the old one
+   remains valid.
+2. Write the new file beside the configured path with mode `0600`, then
+   rename it over the configured path.
+3. Send `SIGHUP` or run `SELECT pg_reload_conf()`.
+4. Wait for `/readyz` to return 200 and
    `pos3ql_object_store_credential_reload_successes_total` to increase.
-5. Revoke the prior credential and confirm durable writes and checkpoints
-   continue.
+5. Revoke the old credential and confirm writes and checkpoints continue.
 
-The candidate is parsed without runtime allocation. A separate reserved client
-conditionally renews the writer fence, then reads back the exact result. Both
-read and write access must succeed before any ordinary client adopts it.
-For example, an account allowed to read orders but forbidden to save them is
-rejected.
+Before adoption, a reserved client renews the writer fence with the new
+credential and reads it back, so both read and write access must work; a
+read-only account is rejected. Queries continue during validation. Then new
+storage requests wait briefly while in-flight signed requests finish, the
+credential installs, and they resume.
 
-Validation yields while cached queries and other object requests continue.
-After validation, new asynchronous requests briefly wait while existing signed
-requests finish; their retained data is preserved. The new credentials then
-install and waiting requests resume. Continuous traffic cannot keep adding work
-ahead of this handoff.
-
-Invalid permissions, syntax, authentication, connectivity, or lost writer
-ownership retain the installed credential, make readiness return 503, increment
-the failure counter, and emit an error without credential values. Correct the
-file and reload again.
+If validation fails (permissions, syntax, authentication, connectivity, or
+lost writer ownership), the old credential stays installed, `/readyz` returns
+503, the failure counter increases, and an error without credential values is
+logged. Fix the file and reload again.
 
 ## Release archive
 
-Tagged releases publish a versioned Linux x86-64 archive and adjacent SHA-256
-file. The archive contains the executable, starter configuration, systemd unit,
-license, roadmap, and operator documentation. CI extracts the same archive,
-runs its executable, starts it from the packaged configuration, probes
-`/livez`, and verifies graceful shutdown. Installation steps are in
-[`packaging/README.md`](../packaging/README.md).
+Tagged releases publish a Linux x86-64 archive with an adjacent SHA-256 file.
+It contains the executable, failover monitor, starter configuration, systemd
+units, license, roadmap, and documentation. CI extracts it, starts the
+packaged configuration, probes `/livez`, and checks graceful shutdown. See
+[installation](../packaging/README.md).
 
 ## Controlled replacement
 
-**User example:** moving the database to another machine uses the same bucket
-and prefix but a separate local cache directory. Starting the replacement
-transfers write ownership. An old server that later wakes up cannot publish
-over the replacement's state. The routing change remains an operator action.
+**User example:** to move the database to another machine, start a server
+with the same bucket and prefix but its own local cache directory. Starting it
+takes write ownership; an old server that later wakes up cannot publish over
+it. Changing client routing is up to you.
 
-1. Confirm the replacement uses the intended bucket and prefix, configuration,
-   and durable credentials.
-2. Start the replacement. Startup recovery promotes its fresh writer
-   incarnation and invalidates both mutable-root generations before readiness.
-3. Wait for the replacement's `/readyz` response and verify its LSN and
-   capacity metrics.
-4. Route clients to the replacement and stop the prior process. If the prior
-   process was still alive, its readiness probe returns 503 and its next
-   durable publication fails through the writer fence.
-5. Confirm WAL, checkpoint, and block-object request counters continue advancing and
-   that no publication errors remain in logs.
+1. Confirm the replacement's bucket, prefix, configuration, and credentials.
+2. Start it. Recovery promotes a fresh writer incarnation and invalidates both
+   mutable-root generations before readiness.
+3. Wait for its `/readyz` and check its LSN and capacity metrics.
+4. Route clients to it and stop the old process. If the old process is still
+   running, its `/readyz` returns 503 and its next publication fails at the
+   writer fence.
+5. Confirm WAL, checkpoint, and block-object counters advance and logs show no
+   publication errors.
 
-If replacement startup fails, resolve the reported recovery or object-store
-error and route only to a process whose fence-validating readiness succeeds.
-Promotion may already have displaced the prior writer; its continued liveness
-does not prove ownership. An interrupted promotion is safe to retry: transition
-state grants no writer ownership, and startup repeats conditional root
-invalidation before activation.
+If startup fails, fix the reported recovery or object-store error. Promotion
+may already have displaced the old writer, so route only to a process whose
+`/readyz` succeeds. Retrying an interrupted promotion is safe: it grants no
+ownership until startup repeats the conditional root invalidation.
 
-For recovery from a named backup or a point in retained history, follow
-[backup and restore](backup-restore.md). Those commands are offline operations
-and promote their own writer incarnation, so no server may continue using the
-same prefix.
+To restore a named backup or a point in retained history, follow
+[backup and restore](backup-restore.md). Those offline commands take writer
+ownership, so no server may keep using the same prefix.
 
 ## Automatic failure detection and promotion
 
-The monitor starts a replacement; it does not configure your load balancer or
-application connection addresses. Test that clients reach the ready replacement
-and stop reaching the displaced server as part of deployment qualification.
+The release includes `libexec/pos3ql/failover-monitor`, an example
+configuration, and `pos3ql-failover.service`. Run it on one passive candidate
+per durable prefix, with that host's `pos3ql.service` disabled: starting the
+database is the promotion. The monitor does not change load balancers or
+client addresses; test client routing during deployment qualification.
 
-The release archive includes `libexec/pos3ql/failover-monitor`, an example
-configuration, and `pos3ql-failover.service`. Run the service on one passive
-candidate for a durable object prefix. Keep that host's `pos3ql.service`
-disabled because starting the database is the promotion action.
+The monitor probes the primary's `/readyz` with bounded timeouts. After the
+configured number of consecutive failures plus one confirmation failure, it
+runs its promotion command (an argument vector, not a shell string) exactly
+once. A lock directory prevents a second local monitor from promoting. The
+unit starts `pos3ql.service`, waits for the candidate's `/readyz`, and stays
+active. A failed start or readiness timeout leaves the unit failed for
+inspection rather than retrying.
 
-The monitor probes the primary's `/readyz` endpoint with bounded connect and
-request timeouts. It requires the configured number of consecutive failures
-and one final confirmation failure, then runs its argument-vector promotion
-command exactly once. It does not evaluate a shell command. A lock directory
-prevents a second local monitor from promoting concurrently. The systemd unit
-starts `pos3ql.service`, waits for the candidate's `/readyz`, and remains
-active after success. A failed start or readiness timeout leaves the unit
-failed for operator inspection instead of retrying promotion indefinitely.
+1. Install the same release with the same bucket, prefix, credentials, and
+   capacities, but separate local cache storage.
+2. Copy `pos3ql-failover.conf.example` to `/etc/pos3ql/pos3ql-failover.conf`;
+   set a remotely reachable primary readiness URL and the candidate's
+   loopback readiness URL.
+3. Confirm `pos3ql.service` is disabled and stopped on the candidate.
+4. Enable and start `pos3ql-failover.service`; watch its journal.
+5. Route clients only to a process whose `/readyz` returns 200. After a
+   promotion, set up a new passive candidate.
 
-Configure the passive candidate:
-
-1. Install the same release and configure the same bucket, prefix, durable
-   credentials, and capacity envelope with separate local cache storage.
-2. Copy `pos3ql-failover.conf.example` to
-   `/etc/pos3ql/pos3ql-failover.conf`. Set a remotely reachable primary
-   readiness URL and the candidate's loopback readiness URL.
-3. Confirm `pos3ql.service` is disabled and stopped on the passive host.
-4. Enable and start `pos3ql-failover.service`, then monitor its journal.
-5. Route clients only to a process whose `/readyz` returns 200. After
-   promotion, provision and arm a new passive candidate.
-
-A loss of connectivity from the monitor to the primary intentionally triggers
-promotion after the threshold. Use one monitor authority per prefix and place
-it on the same failure-observation path as client routing. Object storage
-remains the ownership authority: promotion rewrites both mutable roots with the
-candidate's process incarnation before activating its writer fence. A resumed
-primary therefore reports 503 and its next durable publication fails with
-SQLSTATE `40001`, including when the storage service derives identical ETags
-from identical content.
+Losing connectivity from the monitor to the primary triggers promotion by
+design, so use one monitor per prefix on the same network path as client
+routing. Object storage decides ownership: promotion rewrites both mutable
+roots with the candidate's incarnation before activating its fence. A resumed
+old primary then reports 503, and its next publication fails with SQLSTATE
+`40001`, even when the storage service derives identical ETags from identical
+content.

@@ -1,137 +1,82 @@
 # pos3ql
 
-pos3ql is a database written in Rust that aims to work like PostgreSQL for
-applications and people using SQL. Its durable data lives in an S3-compatible
-object store. Memory and local disk hold caches that can be rebuilt.
+pos3ql is a database written in Rust that works like PostgreSQL 18 for
+applications and SQL users. Its durable data lives in an S3-compatible object
+store; memory and local disk are caches that can be rebuilt.
 
 ## Where we are
 
-Much of the database works today: SQL, transactions, PostgreSQL clients,
-indexes, logical replication, backups, and recovery. Tests compare results,
-errors, and client behavior with actual PostgreSQL 18. There are still
-[compatibility limits](docs/postgresql-18-compatibility.md); the PostgreSQL
-name alone is not a promise that every feature or extension works.
+SQL, transactions, PostgreSQL clients and drivers, indexes, logical
+replication, backups and recovery from object storage work today. CI compares
+results, errors and client behavior with PostgreSQL 18. Unsupported features
+return explicit errors; the [compatibility guide](docs/postgresql-18-compatibility.md)
+lists the limits.
 
-**SQL uses one CPU worker per server process.** Object-store requests can overlap:
-independent reads have separate request slots, and transactions can share a
-durable log upload while other connections continue. This does not run one SQL
-query on several CPU workers. Production performance and failover on separate
-machines still need qualification.
-
-For example, a cached invoice can be read while another connection waits for
-storage. A successful order commit must survive loss of both local caches.
-The [plan](PLAN.md) orders the remaining correctness work, multiple CPU workers
-and qualification on separate machines.
+SQL runs on one CPU worker per server. Object-store requests overlap, and
+transactions can share one durable upload. For example, a cached invoice can be
+read while another connection waits for storage. Performance and failover on
+separate machines have not yet been measured.
 
 See [what works today](docs/implemented-baseline.md) and the
-[remaining plan](PLAN.md) for the details and the evidence still needed.
+[roadmap](PLAN.md) for what remains.
 
 ## Where we want to get
 
 A database where you can:
 
-- Use familiar PostgreSQL SQL and client tools, with clear errors for features
-  we do not support.
-- Run reports and updates at the same time without incorrect results or a
-  slow storage request stopping unrelated work.
-- Trust a successful commit even if the database machine loses its local disk.
-- Replace a failed server, recover from object storage, and route clients to
-  the replacement with a tested procedure.
-- Choose memory and disk limits before startup. Share the reserved capacity
-  according to traffic, so busy tables and requests can use space that cold
-  tables do not need; report an explicit error when required capacity is full.
-  This [adaptive allocation goal](docs/adaptive-resources.md) is unfinished.
-- Judge speed and cost from repeatable measurements against vanilla
-  PostgreSQL, including a comparison with the same CPU and memory allowance.
+- Use familiar PostgreSQL SQL and client tools, with clear errors for anything
+  unsupported.
+- Trust a successful commit even if the server loses its local disk.
+- Run reports and updates together without wrong results, with no slow storage
+  request stopping unrelated work, using several CPU cores.
+- Fix memory and disk limits before startup, share that capacity according to
+  traffic, and get a named error when it runs out.
+- Replace a failed server from object storage and reroute clients with a tested
+  procedure.
+- Judge speed and cost from repeatable measurements against PostgreSQL.
 
-Full saved slices group values by column; small updates use compressed row
-groups. Packed objects, ranged reads, immutable indexes and overlapping storage
-requests reduce unnecessary work. For example, reading two columns can avoid
-fetching a large description column. These are implemented mechanisms; their
-production benefit still needs measurement. [Architecture](docs/architecture.md)
-explains the request path, optimizations and physical size limits;
-[performance](docs/performance.md) distinguishes measured results from estimates.
+## Key choices
 
-One active server writes to each configured object-store prefix, the group of
-object names belonging to that pos3ql instance and its SQL databases. The goal is concurrent transactions
-inside that server. Logical replication creates separate, asynchronously
-updated databases. [Replacement](docs/operations.md#controlled-replacement)
-transfers write ownership to another server.
+One active server writes to each object-store prefix: the set of object names
+that holds one pos3ql instance and all its SQL databases.
+[Replacement](docs/operations.md#controlled-replacement) moves write ownership to
+another server.
 
-## Choose where committed data is saved
+**Where commits are saved** (`object_store`):
 
-| Setting | What happens before a success response | If local disk is lost |
+| Setting | Before a success response | If local disk is lost |
 |---|---|---|
-| `object_store = off` | The local recovery journal is synced to disk. | Local-only data is lost. |
-| `object_store = on` | The transaction data is uploaded and the durable commit record is updated. | The database can recover from object storage. |
+| `off` | The local recovery journal is synced to disk. | Local-only data is lost. |
+| `on` | Transaction data is uploaded and the durable commit record is updated. | The database recovers from object storage. |
 
-In durable mode, transactions can share an upload and commit-record update.
-Each success response waits for that work. Checkpoints organize saved data for
-recovery and later reads. [Object storage](docs/object-storage.md) and
-[durable formats](docs/durable-format.md) explain the failure and upgrade rules.
+**How transactions share data** (`transaction_mode`, required):
 
-## Choose how transactions share data
+- `mvcc` keeps older row values while readers need them. A repeatable-read
+  report keeps seeing an order's earlier status while another transaction
+  changes it.
+- `locking` keeps only current committed values; conflicting work waits on
+  relation locks. It supports read committed (and read uncommitted, which
+  PostgreSQL treats the same). Repeatable read, serializable and exported
+  snapshots return `0A000`.
 
-Every configuration must select `transaction_mode = mvcc` or
-`transaction_mode = locking`; the server requires `--config`.
-Also set both history reservations explicitly: for example,
-`catalog_history_bytes = 16MiB` and `row_history_slots = 65536` in `mvcc` mode,
-or zero for both in `locking` mode. Catalog history keeps older definitions;
-row history shares its slots across all tables while readers need earlier values.
-Also choose the shared hard capacities explicitly:
+Rollback and savepoints work in both modes. The mode is fixed for the server's
+lifetime.
 
-```conf
-row_overlay_slots = 8192
-row_work_bytes = 8MiB
-row_work_leases = 128
-execution_control_bytes = 256KiB
-execution_control_leases = 256
-definition_image_slots = 256
-table_metadata_bytes = 64MiB
-table_metadata_leases = 8192
-statistics_bytes = 1MiB
-statistics_leases = 1024
-index_statistics_slots = 4096
-```
-
-These explicit settings bound resident rows, foreground row workspace, retained
-schema identities and actual table/index metadata for the whole instance.
-`table_metadata_bytes` reserves metadata backing; `table_metadata_leases` bounds
-its occupied ranges. Readers share immutable schema owners. A busy table can use
-available capacity; empty tables receive no private maximum-width schema or row
-allowance.
-`statistics_bytes` and `statistics_leases` bound shared analyzed-column images.
-`index_statistics_slots` bounds index activity counters, including counters
-still held by readers after an index is dropped. Empty tables have no private
-maximum-width statistics or sequence-counter arrays; SQL generators share the
-fixed sequence catalog.
-Large objects retain their separate `large_object_pages` reservation. The
-[architecture](docs/architecture.md#memory-and-physical-size) explains the
-remaining per-table costs and the limits of this work.
-
-- `mvcc` retains older row values while readers need them. For example, a
-  repeatable-read report can keep seeing an order's earlier status while
-  another transaction changes it.
-- `locking` keeps current committed row values. Conflicting work waits on
-  relation locks; work on unrelated tables can continue. This mode supports
-  read committed, including PostgreSQL's equivalent read uncommitted mode.
-  Repeatable read, serializable and exported snapshots return `0A000`
-  because their guarantees require retained versions.
-
-The mode is fixed for the server's lifetime. Uncommitted changes and savepoint
-undo remain private in both modes; disabling MVCC does not disable rollback.
+Every memory and capacity reservation is an explicit setting. The
+[operations guide](docs/operations.md) explains them and
+[architecture](docs/architecture.md#memory-and-physical-size) gives their limits.
 
 ## Getting started
 
-Install a checksummed Linux release using the [installation guide](packaging/README.md).
-For a development binary built on a suitable host, run:
+Install a checksummed Linux release with the [installation guide](packaging/README.md).
+With a development build, run:
 
 ```sh
 pos3ql --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U postgres -d postgres
 ```
 
-In `psql`, try:
+Then in `psql`:
 
 ```sql
 CREATE TABLE orders (id integer PRIMARY KEY, status text);
@@ -140,16 +85,15 @@ SELECT status FROM orders WHERE id = 1;
 ```
 
 This returns `new`. The development configuration saves data locally. To use
-object storage, configure a supported endpoint, bucket, unique prefix, TLS,
-and a credential file readable only by its owner. Size the startup memory
-reservations for the host before starting the server.
+object storage, configure an endpoint, bucket, unique prefix, TLS and a
+credential file readable only by its owner; see
+[object storage](docs/object-storage.md).
 
 ## Documentation
 
-The [documentation index](docs/README.md) routes questions about architecture,
-SQL limits, scheduling and migrations, backups, storage and performance. [CONTRIBUTING.md](CONTRIBUTING.md)
-explains development and checks. [BUGS.md](BUGS.md) lists only known defects
-that cannot currently be fixed because of a stated blocker; it is not a list
-of all unfinished work. License terms are in [LICENSE](LICENSE).
+The [documentation index](docs/README.md) lists every guide.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains development and checks.
+[BUGS.md](BUGS.md) lists only defects blocked by a stated external reason.
+License terms are in [LICENSE](LICENSE).
 
 Copyright (c) Adrian Mârza and pos3ql contributors

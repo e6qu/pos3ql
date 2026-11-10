@@ -1,317 +1,338 @@
 # Finish pos3ql
 
 [Overview](README.md) · [Architecture](docs/architecture.md) ·
-[Current behavior](docs/implemented-baseline.md) ·
+[What works today](docs/implemented-baseline.md) ·
 [Limits](docs/postgresql-18-compatibility.md) · [Contributing](CONTRIBUTING.md)
+
+This plan lists only unfinished work. Current behavior belongs in the
+[guides](docs/README.md); historical plans are preserved in the
+[history index](docs/history/README.md).
 
 ## The destination
 
-Applications use supported PostgreSQL SQL and clients while object storage holds
-the durable copy. A confirmed order survives loss of the server's disk. Reports,
-updates and maintenance make progress without unrelated work waiting on every
-storage request. Memory and concurrency are chosen before startup; exhaustion
-returns an explicit error.
+- Applications use supported PostgreSQL 18 SQL and clients, with explicit errors
+  for anything unsupported.
+- Object storage holds the durable copy. A confirmed commit survives loss of the
+  server's disk.
+- A slow storage request never stalls unrelated connections, and independent
+  connections use several CPU cores.
+- Memory, disk and concurrency limits are fixed before startup. Shared capacity
+  follows demand, and running out gives a named error.
+- A failed server is replaced from object storage through a tested procedure
+  that reroutes clients.
+- Users choose hardware from repeatable measurements against vanilla
+  PostgreSQL 18.
 
-One active process publishes to a prefix containing the instance's SQL databases.
-Its commit history must retain durable order. Reads, independent uploads and SQL
-CPU execution do not all need to be serialized to preserve that order.
+One active process publishes to each object-store prefix and keeps commits in
+durable order. That order does not require running every read, upload or SQL
+statement one at a time.
 
-Today, object-store I/O overlaps and batches requests, while SQL CPU work uses
-one worker. Journal cleanup, saved-file cleanup and row-file merges retain
-their progress and yield while object-store responses wait. Checkpoint row
-capture and index construction also retain their input and output positions.
-Journal cleanup does not prevent checkpoints from freeing row-cache space.
-State-changing commands and reads after the first result flush still have
-synchronous paths.
-Same-host MinIO and SeaweedFS checks establish portability;
-they do not establish production performance. The owning guides describe
-[current behavior](docs/implemented-baseline.md), [physical limits](docs/architecture.md#memory-and-physical-size)
-and [what has actually been measured](docs/performance.md).
+## Where we are
 
-## Remaining work
+SQL, transactions in `mvcc` and `locking` modes, PostgreSQL clients, indexes,
+logical replication, backup and recovery from object storage work today and are
+compared with PostgreSQL 18 in CI. Object-store requests overlap and commits
+share uploads. SQL runs on one CPU worker. Many paths already pause during a
+storage wait and resume later: reads, cleanup, merges, checkpoints, cursors,
+PL/pgSQL and SQL-language functions, and triggers. Writing statements, and any
+statement after its first effect, still block that worker on a storage read. No measurement on separate machines has been published.
 
-### Retain query progress and finish application compatibility
+## Milestones
 
-**Example:** inserting an order writes an audit row and issues an order number.
-A trigger then waits for storage or another connection's lock. Resuming must
-continue that order with the same local values, audit row and number. Another
-client must make progress while the storage response waits.
+Each milestone is a coherent piece of work that ships in complete PRs. The order
+is the intended sequence. Compatibility work runs alongside the others.
 
-Object requests already overlap. The remaining execution work makes more SQL
-paths safe to pause; increasing request slots alone cannot do that. Ordered
-commit publication does not require serializing every query or independent
-upload. Keep synchronous protection on each path until its unfinished work has
-an owner that survives returning to the scheduler.
+| Milestone | Status | Depends on |
+|---|---|---|
+| [Pause and resume every query path](#pause-and-resume-every-query-path) | In progress | — |
+| [Isolate readers and bound cleanup](#isolate-readers-and-bound-cleanup) | In progress | — |
+| [Measure a first deployment baseline](#measure-a-first-deployment-baseline) | Not started | — |
+| [Run SQL on several CPU workers](#run-sql-on-several-cpu-workers) | Not started | Pausing, reader isolation |
+| [Share fixed capacity by demand](#share-fixed-capacity-by-demand) | Partly done | — |
+| [Adapt batching and layout with feedback control](#adapt-batching-and-layout-with-feedback-control) | Designed | Baseline, capacity sharing |
+| [Close application compatibility gaps](#close-application-compatibility-gaps) | Ongoing | — |
+| [Qualify production deployment](#qualify-production-deployment) | Not started | All of the above |
 
-The implementation retains ordered AFTER work, nested INSERT/UPDATE/DELETE
-completion, trigger frames and completed calls within unfinished `PERFORM` and
-`SELECT ... INTO`, including unfinished PL/pgSQL scalar and table-function
-bodies inside those owned expressions, declaration initializers and their type
-checks. SQL-language functions retain their body statement, unfinished child
-calls and completed nested writes, including rows saved before AFTER triggers
-finish. SQL scalar return checks and per-row table checks share the same saved
-call context. The [request path](docs/architecture.md#the-request-path)
-owns their contracts and regression evidence. General function and query
-execution still needs the remaining ownership work below.
+### Pause and resume every query path
 
-Complete these connected execution paths:
+**Goal:** a statement waiting for object storage or another connection's lock
+gives up the CPU worker and later resumes exactly where it stopped.
 
-- Extend function resumption to callers and expression positions without an
-  owned query. Preserve completed PL/pgSQL bodies before return conversion that
-  can wait, and retain write-row phases before a callback can yield. Scalar and
-  table functions need the same guarantees, including one
-  timing count per completed call; output width is independent of the
-  input-argument limit.
-- Finish write phases before and around AFTER work: BEFORE/INSTEAD triggers,
-  source scans, row locks, partitions, constraints and transition collection.
-  Include combined commands, rules, data-modifying common table expressions,
-  COPY, replication apply and deferred triggers. Retain the original command
-  and rollback boundary, rather than undoing inserted rows before a constraint
-  can inspect them. Replace the explicit row-progress rejection for multirow
-  updates with an owner for completed rows and the current callback; prove that
-  a child reads earlier changed rows before the next row is written. Each
-  insert/update/delete operation keeps its own completed transition table and
-  firing order.
-- Preserve remaining expression values, complex query positions and cursor
-  progress. After the first result flush, continue with one header, every row
-  once and one completion. `FETCH` must not execute effects for unfetched rows;
-  saving a held cursor at commit must also yield during storage waits. Keep
-  declared record and domain types after its source query ends. The
-  [visibility milestone](#finish-transaction-visibility-and-keep-maintenance-moving)
-  owns the overlapping reader and cleanup requirements.
+**Example:** inserting an order fires a trigger that writes an audit row and
+takes an order number. The trigger waits for storage. Meanwhile other clients
+run. On resumption the same order keeps the same local values, audit row and
+number.
 
-Acceptance applies across every path:
+**Done today:** ordered AFTER-trigger work; nested INSERT/UPDATE/DELETE;
+trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
+declaration initializers; SQL-language function bodies, child calls and return
+checks; SQL cursors executing from retained query state, including row locks
+taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
+client output that never blocks the worker on a slow reader; large
+single-table results resuming row by row across client, storage and lock
+waits. The
+[request path](docs/architecture.md#the-request-path) describes how saved state
+is owned.
 
-- Keep the originally selected definitions, checked inputs, values, settings,
-  effective user, command visibility, timestamps and deadline. Completed
-  sequence calls, advisory-lock holds, input checks, cursor operations, audit
-  writes and already delivered rows happen once, including repeated waits and
-  a new call after resumption.
-- Failed capture leaves the live call usable; failed attachment preserves the
-  saved owner and caller. Recycling temporary memory cannot change saved text,
-  arrays, records or NULL field types. Private waits bypass user error handlers.
-  Preserve local and remote savepoint boundaries and originally selected row
-  and type definitions without extra full-size copies. Existing metadata,
-  warnings, checked-input and expression-binding regressions remain mandatory;
-  their contracts belong in the [architecture](docs/architecture.md) and
-  [compatibility guide](docs/postgresql-18-compatibility.md).
-- Cancellation, timeout, rollback, connection closure and successful completion
-  release owners. A handled timeout stays consumed if its handler waits.
-  Memory remains inside the existing startup pools, with named exhaustion and
-  no heap growth. Preserve 4,096-row results and repeated loops within the
-  original 4 MiB statement arena. Repeated calls and catches reuse capacity.
-- Demonstrate another client's progress with an actually delayed object-store
-  GET, including empty-cache reads, both transaction modes, simple and extended
-  protocols, triggers and nested functions. Compare the same SQL fixture with
-  PostgreSQL 18: rows, audit writes, sequence values, types, errors and rollback.
-  Keep allocation-forbidden, memory-ownership and failed-restoration coverage.
+**Remaining:**
 
-Audit PostgreSQL 18 built-ins by signature and executable behavior; catalog
-presence alone is not support. Keep real SQLAlchemy, Alembic, psycopg2 and other
-client comparisons. Complete all four full workflows on the finished revision,
-including Linux amd64/arm64 and macOS arm64. Cancelled builds and skipped tests
-are incomplete qualification. The native macOS mutex gate runs all ownership
-cases and a direct Apple API control with ThreadSanitizer. Qualify the final
-head using the permanent workflows.
+- **Functions:** callers and expression positions that have no owning query;
+  PL/pgSQL return conversion that can wait; one timing count per completed call.
+  A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+  grouping, subqueries) restarts once for each first call of a SQL-language
+  routine, so its work grows with the square of those calls; single-table,
+  `VALUES` and `generate_series` sources hand each call off on its row.
+- **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
+  constraints, transition tables, rules, data-modifying common table
+  expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
+  original command and rollback boundary. Replace the current explicit rejection
+  of row progress in multirow updates with saved progress: a child statement must
+  see earlier changed rows before the next row is written, and each operation
+  keeps its own transition table and firing order.
+- **Results and cursors:** resume more large results row by row; only
+  single-table `SELECT` from a simple Query or an unpaged `Execute` does today.
+  Remaining: paged and named portals (`Execute` with a row limit still buffers
+  into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
+  shapes (joins, sorting, grouping, subqueries, set operations, and more
+  set-returning functions than `generate_series` and one-array `unnest`).
+  Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
+  cursor returns saved values where PostgreSQL evaluates a volatile output
+  list again, and a row-locking cursor over a join, or ordered by an
+  expression that is not a source column, locks its rows at `DECLARE`.
+  PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
+  rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
+  commit yields during storage waits. Cursors keep declared record and domain
+  types after their source query ends.
 
-Preserve explicit coverage/native profiles, assertions and all native targets.
-Measure build and execution separately within unchanged job limits; bound
-compiler concurrency and debug data instead of increasing timeouts. Each runner
-job has its own bounded timeout, independent of shorter step timeouts. The
-[contribution guide](CONTRIBUTING.md) owns the verification procedure.
+**Done when:**
 
-### Share fixed memory and disk capacity according to demand
+- Writing statements and statements past their first effect no longer block the
+  worker on storage reads; the blocking list in the
+  [request path](docs/architecture.md#execution-model) is empty except where
+  durable commit order requires it.
+- Resumed work keeps its selected definitions, inputs, settings, effective user,
+  command visibility, timestamps and deadline. Sequence calls, advisory locks,
+  audit writes and delivered rows happen once, across repeated waits.
+- A failed save leaves the live call usable. Reused temporary memory cannot
+  change saved text, arrays, records or NULL field types. Internal waits do not
+  trigger user error handlers. Savepoint boundaries hold.
+- Cancellation, timeout, rollback, disconnect and completion release saved
+  state. Memory stays inside startup pools, including 4,096-row results inside
+  the 4 MiB statement arena.
+- Tests with an actually delayed object-store GET show another client making
+  progress, with empty caches, both transaction modes, both wire protocols,
+  triggers and nested functions. The same SQL gives the same rows, audit writes,
+  sequence values, types, errors and rollback as PostgreSQL 18.
 
-**Example:** configuring many possible tables must not reserve a large private
-row lookup structure for each empty table. If most traffic touches `orders`, it should use
-available shared slots. A long report keeps its selected versions until it
-finishes; those slots cannot be reassigned simply because demand changes.
+### Isolate readers and bound cleanup
 
-Ordinary row metadata, foreground row work, actual table definitions, index
-bindings and analyzed columns share explicit fixed pools. Index counters have
-an independent global limit, and SQL generators use the shared sequence catalog.
-Readers keep their selected owners; a change reserves replacements before
-durability. [Architecture](docs/architecture.md#memory-and-physical-size)
-owns the current limits and admission behavior.
+**Goal:** a reader finishes with the rows and definitions it selected while
+schema changes, commits and maintenance continue; cleanup never removes
+anything a reader or backup still needs.
 
-Retain the ownership, exhaustion, prepared recovery and once-only SQL tests as
-shared resources change. Reserve replacements before effects and preserve old
-images on rollback. For example, if analyzing `orders` cannot reserve statistics
-space, its previous statistics must remain usable. A waiting commit must not
-run an audit trigger again. Joined and recursive row decoding must continue to
-include its complete physical shape, including hidden fields.
+**Example:** a report keeps reading `orders` while another connection renames it
+to `sales` and maintenance replaces its saved files. A waiting schema edit never
+attaches to a new object that reused the old name.
 
-Reduce other catalog reservations using measured component costs. Empty tables
-still have a cost; shared schema storage does not establish an embedded memory
-minimum. Establish whether cache files need guaranteed physical disk reservation,
-then implement and verify it rather than equating file length with reserved disk
-space.
+**Remaining:**
 
-Keep the [ownership/exhaustion tests](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/src/sql/tests/shared_row_work.rs) and
-[two-table spill/recovery case](https://github.com/e6qu/pos3ql/blob/b3aa3099993c351e09a0eb73fd6c1de67228007d/tests/external/run.sh) as regression coverage.
-Saved generations can exceed resident capacity; replaying their newer journal
-tail still needs resident slots and bytes. Extend the
-[measurement matrix](https://github.com/e6qu/pos3ql/blob/main/tools/measure-embedded-capacity.py) with realistic populated
-sessions and pinned-reader pressure before claiming an embedded minimum.
+- Catalog reads after listing an object refer to that same object: columns,
+  indexes, comments and dependencies (including repeated dependency rows).
+  Unfinished edits stay private. Follow PostgreSQL's split between listing an
+  old catalog row and resolving a current name: an older report can still list
+  `orders` while `to_regclass('sales')` finds the renamed table.
+- Keep old rows, indexes and saved files until readers and backups finish, and
+  remove them in bounded batches. Files from an unfinished checkpoint stay owned
+  until its publication resolves. Durable manifests never name unfinished
+  uploads, and switching output producers never cancels another job's files.
+- Keep read counters through savepoint rollback and release. A replacement
+  table reusing a slot never inherits a retired table's counters.
+- Reject corrupt or stale restored state before accepting writes. A lost commit
+  reply resolves to all changes or none.
 
-Reserve forward progress for commit, rollback, required reads and maintenance.
-Use bounded reclamation and report pinned capacity and named exhaustion.
-Control applies to reusable capacity and admission, never SQL visibility or
-durability. Keep memory, cache-disk and temporary/journal limits distinct.
-The [resource design](docs/adaptive-resources.md) records candidate policies and
-code evidence; proposed controls are not current settings.
+**Done when:** overlapping reads, schema edits, publication and maintenance keep
+readers on their selected objects and values, new reads see whole commits, and
+existing rollback, savepoint, prepared-transaction, capacity and empty-cache
+recovery tests keep passing.
 
-Keep the 1/8/32/128-table comparisons at equal explicit global capacity in both
-transaction modes, including narrow/wide schemas, retained readers and the
-temporary overlap during schema/index replacement. Identify memory counters
-and their units; separate named
-startup reservations, resident pages, stack and TLS costs. Old unlabelled RSS
-peaks are not comparable to the corrected current-program measurements described
-in the [performance guide](docs/performance.md). Keep controller state within
-startup budgets and prove capacity conservation, no runtime heap growth and safe
-release after errors.
-Preserve the [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md);
-compare future measurements at identical explicit capacities.
+### Measure a first deployment baseline
 
-### Adapt batching, admission and future layout to the workload
+**Goal:** test the core bet early: commits through object storage give useful
+latency and cost compared with PostgreSQL.
 
-**Example:** an isolated lookup starts immediately. During sustained traffic,
-compatible queued reads and writes share bounded batches for throughput. A
-nightly column report must not evict every frequently reused lookup block.
+**Example:** on two fixed hosts with separate object storage, report typical and
+slow commit latency, point-read and scan latency with warm and empty caches, and
+object requests and bytes per transaction.
 
-Retain fixed object-request slots, backing arenas and disk limits. Adjust active
-windows, lease ownership and compatible batch sizes inside them. Bound queue
-delay and bytes; protect demand reads, commit publication and required
-maintenance before speculative read-ahead or duplicate requests. Use measured
-column demand, reuse, update rate and rewrite cost when choosing future immutable
-row/column output and ranged versus whole-object reads. Avoid rapid layout
-rewrites after short bursts.
+**Work:** record hosts, network and object storage without publishing
+credentials. Run the [measurement suite](docs/performance.md) repeatedly against
+both PostgreSQL 18 controls: one with the host's resources and one with the same
+CPU and memory allowance as pos3ql. Retain revisions, raw results, latency
+distributions, CPU/RSS, request counts, bytes and cost inputs in
+[benchmarks](benchmarks/README.md).
 
-Compare simple feedback with proportional-integral (PI) and
-proportional-integral-derivative (PID) control using explicit policy, ceilings,
-minimum progress, sample interval/count and maximum batch delay/bytes. Clamp
-changes, filter noisy samples, avoid repeated reversals, and prevent integral
-error accumulating when owned capacity cannot be reclaimed. Choose the policy
-from measurements rather than assuming a more elaborate controller is better.
+**Done when:** a dated, reproducible baseline is published. Its results inform
+the order of the later milestones.
 
-Compare fixed and adaptive policies at equal resources on MinIO and SeaweedFS,
-with both vanilla PostgreSQL controls. Test idle/burst/sustained/cooling traffic,
-point/scan mixtures, narrow columns, bulk writes, delay/failure, cancellation,
-long readers and maintenance pressure. Retain latency distributions, throughput,
-requests/bytes, useful prefetch, cache/pinned usage, fairness and controller
-settling. Correctness, durable ordering and startup limits must hold throughout.
+### Run SQL on several CPU workers
 
-### Finish transaction visibility and keep maintenance moving
+**Goal:** independent connections use several CPU cores. Each connection keeps
+its command order, and every confirmed transaction stays recoverable.
 
-**Example:** a report must finish using the rows and definitions it selected,
-even when another connection replaces a table or maintenance replaces saved files.
-A waiting schema edit must never attach itself to a new object that reused a name.
+**Work:** choose a fixed worker pool before startup. Give each worker its own
+temporary execution state and protect shared rows, definitions, locks and
+transactions. Preserve database and account identity, fair queues, cancellation,
+storage waits and commit order. A global lock that runs statements in turn does
+not meet this goal.
 
-- When a report lists an object's saved name, its later column, index, comment
-  and dependency reads must still refer to that same object. Unfinished edits
-  must stay private to their transaction. Preserve repeated dependency rows.
-- Keep older rows, indexes and saved files until readers and backups finish.
-  Remove obsolete versions in limited batches so other queries keep moving.
-  Files written by an unfinished checkpoint remain owned until its publication
-  resolves; a reader finishing must not cause them to be collected as orphans.
-  Switching output producers cannot cancel another job's immutable files;
-  durable manifests never name output that has not finished uploading.
-- Retain the query's scan and output position after sending a result prefix.
-  Today a large result finishes its remaining reads synchronously once bytes
-  leave the connection buffer, because restarting would send a second result
-  header and repeat already-delivered rows. Resumption must preserve one header,
-  every row once and one completion without occupying the worker during a wait.
-  SQL cursors must use the same retained execution positions: `DECLARE` binds
-  the query and its snapshot; `FETCH` advances it. For example, declaring a
-  cursor over `nextval('order_numbers')` must not issue numbers for rows that
-  have not been fetched. Row locks follow fetched rows. Holding a cursor across
-  commit saves the required result before releasing its transaction.
-  Extend retained execution to function calls and effects, joins, ordering and
-  row locks. Make commit-time result saving yield during storage
-  waits, then reuse the positions for ordinary results after their first flush.
-  Keep read counts through savepoint rollback and release; never transfer a
-  retired table’s pending counters to a replacement that reuses its slot.
-  Preserve the existing [cursor input, type and capacity rules](docs/postgresql-18-compatibility.md#capacity-boundaries),
-  declared result types, captured inputs and settings, bound operators, reader
-  ownership, failed-fetch cleanup and scan statistics. Fetching, skipping and
-  moving rows must keep their distinct PostgreSQL effects. Sequence values
-  already issued remain owned by the command across retries and rollback.
-  Finishing or saving a result must release its input owners across embedded
-  calls and wire command paths, including COPY and extended-protocol Sync.
+**Done when:** read, write and mixed workloads scale with workers, overload
+returns explicit errors, and all correctness gates pass with several workers.
 
-Follow PostgreSQL's distinction between listing an old catalog row and resolving
-an object for current use. After `orders` becomes `sales`, an older report can
-still list `orders` while `to_regclass('sales')` resolves the current name.
-Freezing all lookups at the report's position would be incorrect.
+### Share fixed capacity by demand
 
-Acceptance: while reads, schema edits, publication and maintenance overlap,
-readers keep their selected objects and values, and new reads see whole commits.
-Reusing a name or slot never redirects a reader to replacement data. Cleanup
-respects readers and backups. Preserve the existing rollback, savepoint,
-prepared-transaction, capacity and empty-cache recovery checks throughout this
-conversion. Reject corrupt or stale restored state before accepting SQL writes.
-Resumption preserves effects once, including triggers and issued sequence values;
-skipped expression branches must not run their queries or effects.
-Lost commit replies resolve to all changes or none.
+**Goal:** fixed startup pools of memory and disk follow current demand instead
+of private per-table reservations.
 
-### Run independent SQL commands on several CPU workers
+**Example:** configuring many tables does not reserve row tracking space for each
+empty one. If most traffic touches `orders`, it uses the free shared slots. A
+long report keeps its selected versions until it finishes.
 
-**Example:** independent connections can use several CPU cores while each
-connection preserves command order and every confirmed transaction stays recoverable.
+**Done today:** row metadata, foreground row work, table definitions, index
+bindings, analyzed columns and procedural execution state share explicit pools.
+[Architecture](docs/architecture.md#memory-and-physical-size) lists them.
 
-Give each worker its own temporary execution state while protecting shared
-rows, definitions, locks and transactions. Choose the fixed worker pool before
-startup. Preserve database/account identity, fair queues, cancellation, storage
-waits and commit order. A global lock running all statements in
-turn does not meet this goal. Measure read, write and mixed-load scaling and
-overload; extra connection or object-request slots alone do not establish it.
+**Remaining:**
 
-### Measure realistic workloads and server replacement
+- Reserve forward progress for commit, rollback, required reads and maintenance;
+  reclaim in bounded steps; report pinned capacity and named exhaustion.
+  Replacements are reserved before effects. For example, if analyzing `orders`
+  cannot reserve statistics space, the previous statistics stay usable.
+- Reduce the remaining catalog reservations from measured component costs.
+- Decide whether cache files need guaranteed disk reservation, then implement
+  and verify it. File length is not reserved disk space.
+- Measure 1, 8, 32 and 128 tables at equal explicit capacity in both modes, with
+  narrow and wide schemas, retained readers and schema/index replacement. Label
+  every counter and unit; separate startup reservations, resident pages, stack
+  and TLS. Compare with the
+  [historical embedded measurements](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md)
+  only at identical capacities.
 
-**Example:** a user can choose hardware from measured typical and slow response
-times, sustainable transaction rates, storage traffic and failure behavior.
+**Done when:** total reserved memory is unchanged, capacity is conserved, no
+runtime heap growth occurs, release after errors is safe, and the measurement
+matrix supports any claimed embedded minimum. The
+[resource design](docs/adaptive-resources.md) holds the proposed policies.
 
-Discover and record fixed hosts, independent object storage, network/routing and
-owner-only configuration paths without publishing credentials. Run the
-[measurement suite](docs/performance.md) repeatedly. Keep both vanilla PostgreSQL
-18 controls: host-available resources and the same CPU/memory allowance as pos3ql.
-Record PostgreSQL's ordinary durable medium and pos3ql's object store/cache tiers.
+### Adapt batching and layout with feedback control
 
-Cover useful data sizes, warm/empty caches, reads/writes, joins, large catalogs,
-maintenance, workers, logical replicas, delays, recovery and multi-host failover
-through actual client routing. Retain revisions, raw results, errors, latency
-distributions, throughput units, CPU/RSS, object requests, bytes and cost inputs.
-No representative deployment run or qualified production size/TPS/bandwidth
-claim has been published. Theoretical addressability and calculated examples
-are not acceptance evidence.
+**Goal:** inside fixed limits, pos3ql adjusts batch sizes, admission and future
+data layout to the observed workload, using measured feedback control.
 
-## Rules throughout
+**Example:** an isolated lookup starts immediately. Under sustained traffic,
+compatible reads and writes share bounded batches. A nightly column report does
+not evict every frequently reused lookup block.
 
-Fix encountered defects in the same complete PR unless an actual blocker
-prevents repair. Diagnose failures and timeouts; do not extend limits to hide
-them. Match supported PostgreSQL SQL, types, errors, catalogs and wire behavior,
-including one correct command-completion response per statement and transactional
-cleanup of temporary objects.
-Reject unsupported behavior and stored formats explicitly. Earlier pos3ql
-versions are not compatibility targets.
-Keep native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
-regressions passing; use the platform's declared C types at libc boundaries.
-Run shared formatting, Rust type checks and lint before admitting build and test matrices.
-Keep native SQL fixtures in native gates and interpreter ownership cases beside
-their runtime modules, so interpreter startup does not compile irrelevant fixtures.
-Shared fixture helpers remain available to ownership cases; native storage tests
-do not enter interpreter startup. Keep time-only timezone expectations independent
-of the day or season on which CI runs.
-Reclaim each polling snapshot's scratch space instead of relying on a favorable
-thread schedule to finish before the arena fills.
-Keep compiler and per-test progress visible through CI cancellation while
-diagnosing deadline overruns; preserve the existing job budgets.
-Require both ownership groups to complete successfully and cover the full named
-manifest without missing, repeated or ignored proofs.
+**Work:**
 
-No runtime heap growth, growing pools or allocating sorts. Keep consequential
-settings explicit and avoid needless wrappers and fallbacks. Capacity increases
-are not a completion criterion. Keep current contracts in their
-[owning guides](docs/README.md), open acceptance criteria here, and historical
-observations with their original [evidence](benchmarks/README.md). The roadmap is
-finished only when every remaining acceptance criterion is demonstrated.
+- Keep fixed request slots, arenas and disk limits. Adjust active windows,
+  lease ownership and batch sizes inside them. Bound queue delay and bytes.
+  Protect demand reads, commit publication and required maintenance before
+  read-ahead or duplicate requests.
+- Compare simple feedback, proportional-integral (PI) and
+  proportional-integral-derivative (PID) controllers. Each has an explicit
+  policy, ceilings, minimum progress, sample interval and count, and maximum
+  batch delay and bytes. Clamp changes, filter noisy samples, avoid repeated
+  reversals, and stop integral error from accumulating when owned capacity
+  cannot be reclaimed (anti-windup). Choose the controller from measurements,
+  not by assuming a more elaborate one is better.
+- Choose future row or column output, and ranged or whole-object reads, from
+  measured column demand, reuse, update rate and rewrite cost. Avoid rewriting
+  layout after short bursts.
+
+**Done when:** fixed and adaptive policies are compared at equal resources on
+MinIO and SeaweedFS against both PostgreSQL controls, across idle, burst,
+sustained and cooling traffic, point and scan mixes, bulk writes, delays,
+failures, cancellation, long readers and maintenance pressure. Results include
+latency distributions, throughput, requests and bytes, useful prefetch, cache
+and pinned usage, fairness and controller settling time. Correctness, durable
+order and startup limits hold throughout. The
+[resource design](docs/adaptive-resources.md) holds the controller design.
+
+### Close application compatibility gaps
+
+**Goal:** applications that use supported PostgreSQL 18 features work unchanged.
+
+**Work:** audit PostgreSQL 18 built-in functions by signature and executed
+behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
+Alembic, psycopg2 and other client comparisons passing, and turn every
+unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
+and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
+with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
+the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
+'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
+domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks that
+a SQL body ends with a result statement but not its column count or types, so
+`RETURNS integer AS 'SELECT 1, 2'` fails only when called (`42P13`, `Final
+statement must return exactly one column.`) and `RETURNS integer AS 'SELECT
+''a''::text'` converts at the call where PostgreSQL rejects the definition
+(`Actual return type is text.`). A polymorphic SQL function's runtime result
+mismatch names the declared type (`anyelement`) where PostgreSQL names the
+resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+`pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
+`text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
+the view's query text, and a `BEGIN ATOMIC` body is printed as written rather
+than one deparsed statement per line. Syntax and scanner errors in a client's
+query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but
+other errors do not yet: PostgreSQL also points at the unknown relation, column,
+type, function or failed constant (`SELECT * FROM missing_table` reports
+position 15), maps a syntax error inside a SQL function body to its place in the
+`CREATE FUNCTION` text, and reports dynamic SQL failures (`EXECUTE 'SELEC 1'`)
+with an internal query and position (`q`, `p`) plus a `CONTEXT` line, which
+pos3ql does not send. An echoed token longer than the 96-byte parser message is
+cut short. The scanner does not read Unicode-escape literals (`U&'\0041'`,
+`U&"\0041"`, `UESCAPE`), so `SELECT U&'\0041'` fails as an unknown column
+`u`, and an identifier longer than 63 bytes is rejected (`name ... is longer
+than 63 bytes`) where PostgreSQL truncates it with a `NOTICE`. Assigning to an
+array element or slice (`UPDATE t SET a[1] = 9`) fails with `0A000`. A slice
+followed by an index (`a[1:1][1]`) indexes the slice where PostgreSQL treats the
+whole list as a slice, and a subscripted scalar subquery is named `?column?`
+where PostgreSQL names it after the subquery's column. `pg_sleep` and its
+variants are catalog entries only: calling them fails as an unknown function.
+Checks the parser makes where PostgreSQL checks later
+still fail with `42601` and `syntax error: <description>`: type modifiers
+(`numeric(2000)` is `22023` `NUMERIC precision 2000 must be between 1 and
+1000` in PostgreSQL), COPY targets and options, storage parameters, sequence,
+role and large-object values, and SQL/JSON result types. An unsupported cast
+reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
+`42846` `cannot cast type integer to timestamp without time zone`.
+PL/pgSQL `CALL`, written directly or run with `EXECUTE`, fails with `0A000`
+(`CALL is not supported in PL/pgSQL`); supporting it needs output parameters
+assigned to the caller's variables, PostgreSQL's transaction-control rules for
+the calling chain, and a saved call position so the called procedure can pause
+and resume like other nested routines. A table's or view's row type cannot
+appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
+where PostgreSQL accepts it. The
+[compatibility guide](docs/postgresql-18-compatibility.md) records the current
+surface.
+
+**Done when:** every PostgreSQL 18 built-in is either verified against
+PostgreSQL or rejected explicitly, and the client suites pass on every native
+target.
+
+### Qualify production deployment
+
+**Goal:** a user can choose hardware and trust failover from published evidence.
+
+**Work:** extend the baseline to useful data sizes, joins, large catalogs,
+maintenance, several workers, logical replicas, delays, recovery and multi-host
+failover with real client routing. Run each scenario repeatedly on pinned
+hardware with independent object storage and both PostgreSQL controls.
+
+**Done when:** published measurements support stated sizes, transaction rates,
+bandwidth and failover times. Calculated estimates and theoretical address
+limits do not count as evidence.
+
+## Working rules
+
+[AGENTS.md](AGENTS.md) holds the engineering and change rules and
+[CONTRIBUTING.md](CONTRIBUTING.md) holds the verification gates. The roadmap is
+finished only when every milestone's "done when" is demonstrated.

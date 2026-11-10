@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod array_element_comparisons;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod canonical_sequences;
@@ -29,7 +30,9 @@ mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
 mod query_execution;
+mod result_streams;
 mod routine_calls;
+mod routine_identity_diagnostics;
 mod routine_selection;
 mod row_history;
 mod row_layout;
@@ -6201,7 +6204,7 @@ fn cluster_metadata_reload_applies_one_owned_settings_image() {
         SqlName::parse("statement_timeout").unwrap(),
         SqlName::parse("lock_timeout").unwrap(),
     ];
-    let barrier = std::sync::Barrier::new(5);
+    let barrier = crate::mem::mutex::Barrier::new(5);
     let guc = GucState::new();
     std::thread::scope(|scope| {
         for worker in 0..4 {
@@ -18290,7 +18293,7 @@ fn run_with_fixed_memory_and_ddl_capacity(
                 wait,
             } => {
                 assert_eq!(wait, StatementWait::ObjectIo);
-                buffer.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut buffer);
                 resume_statement = completed_statements;
                 engine.commit_wal().unwrap();
             }
@@ -19330,7 +19333,7 @@ fn critical_cache_pressure_parks_writers_while_checkpoint_turns_make_progress() 
                 } => {
                     assert_eq!(wait, StatementWait::CacheCapacity);
                     assert_eq!(completed_statements, 0);
-                    assert_eq!(output_mark, 0);
+                    assert_eq!(output_mark, crate::pg::overflow::OutputMark::new(0, 0));
                     assert!(session.send.is_empty());
                     waited = true;
                     waiting_turns += 1;
@@ -34351,7 +34354,7 @@ fn set_show_transaction_and_show_all() {
     assert!(run("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE").contains("SET"));
     assert!(run("BEGIN ISOLATION LEVEL REPEATABLE READ").contains("BEGIN"));
     assert!(run("ROLLBACK").contains("ROLLBACK"));
-    assert!(run("START TRANSACTION READ ONLY").contains("BEGIN"));
+    assert!(run("START TRANSACTION READ ONLY").contains("START TRANSACTION"));
     assert!(run("ROLLBACK").contains("ROLLBACK"));
     assert!(
         run("BEGIN ISOLATION LEVEL READ COMMITTED, READ WRITE, NOT DEFERRABLE").contains("BEGIN")
@@ -41098,7 +41101,8 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              SELECT clean_routine_value()",
         );
         assert!(
-            String::from_utf8_lossy(&void_transaction_control).contains("25001"),
+            String::from_utf8_lossy(&void_transaction_control)
+                .contains("SAVEPOINT is not allowed in an SQL function"),
             "{}",
             String::from_utf8_lossy(&void_transaction_control)
         );
@@ -41125,7 +41129,8 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
              SELECT transaction_control_in_function()",
         );
         assert!(
-            String::from_utf8_lossy(&transaction_control).contains("25001"),
+            String::from_utf8_lossy(&transaction_control)
+                .contains("SAVEPOINT is not allowed in an SQL function"),
             "{}",
             String::from_utf8_lossy(&transaction_control)
         );
@@ -41283,7 +41288,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                  FROM pg_proc WHERE proname = 'routine_values_from'",
             )),
             [
-                "t|CREATE OR REPLACE FUNCTION public.routine_values_from(integer) RETURNS SETOF integer LANGUAGE sql AS 'SELECT value FROM routine_lookup WHERE id >= $1'"
+                "t|CREATE OR REPLACE FUNCTION public.routine_values_from(integer)\n RETURNS SETOF integer\n LANGUAGE sql\nAS $function$SELECT value FROM routine_lookup WHERE id >= $1$function$\n"
             ],
         );
         let changed_set_contract = run_with(
@@ -41305,7 +41310,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                  FROM pg_proc WHERE proname = 'routine_pairs_from'",
             )),
             [
-                "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE sql AS 'SELECT id, value FROM routine_lookup WHERE id >= $1'"
+                "t|2249|CREATE OR REPLACE FUNCTION public.routine_pairs_from(integer)\n RETURNS TABLE(routine_id integer, routine_value integer)\n LANGUAGE sql\nAS $function$SELECT id, value FROM routine_lookup WHERE id >= $1$function$\n"
             ]
         );
         assert_eq!(
@@ -41361,7 +41366,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
                AS 'INSERT INTO routine_lookup VALUES (3, 42)'",
         );
         assert!(
-            String::from_utf8_lossy(&invalid_body).contains("0A000"),
+            String::from_utf8_lossy(&invalid_body).contains("42P13"),
             "{}",
             String::from_utf8_lossy(&invalid_body)
         );
@@ -41413,7 +41418,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
         assert_eq!(
             definition,
             [
-                "CREATE OR REPLACE FUNCTION public.answer() RETURNS integer LANGUAGE sql AS 'SELECT 42'"
+                "CREATE OR REPLACE FUNCTION public.answer()\n RETURNS integer\n LANGUAGE sql\nAS $function$SELECT 42$function$\n"
             ]
         );
 
@@ -44430,7 +44435,10 @@ fn typed_routine_owner_changes_preserve_kind_and_overload_identity() {
         &mut budget,
         "ALTER FUNCTION routine_lifecycle(text) OWNER TO postgres",
     );
-    assert!(String::from_utf8_lossy(&mismatch).contains("42883"));
+    assert_eq!(error_sqlstates(&mismatch), ["42809"]);
+    assert!(
+        String::from_utf8_lossy(&mismatch).contains("routine_lifecycle(text) is not a function")
+    );
 }
 
 #[test]
@@ -47825,7 +47833,8 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         ["40", "41", "42", "42", "43"]
     );
     let wrong_drop = run_with(&mut engine, &mut budget, "DROP FUNCTION log_value(integer)");
-    assert!(String::from_utf8_lossy(&wrong_drop).contains("42883"));
+    assert_eq!(error_sqlstates(&wrong_drop), ["42809"]);
+    assert!(String::from_utf8_lossy(&wrong_drop).contains("log_value(integer) is not a function"));
     let dropped = run_with(
         &mut engine,
         &mut budget,
@@ -48804,7 +48813,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
             "1|4",
             "2|5",
             "6|9",
-            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs() RETURNS TABLE (\"position\" integer, value integer) LANGUAGE sql AS 'SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value'",
+            "CREATE OR REPLACE FUNCTION public.checkpoint_pairs()\n RETURNS TABLE(\"position\" integer, value integer)\n LANGUAGE sql\nAS $function$SELECT value - 3, value FROM checkpoint_procedure_log ORDER BY value$function$\n",
         ]
     );
 }
@@ -62595,7 +62604,7 @@ fn row_lock_compatibility_nowait_skip_and_wait_resume() {
         status,
         ExecutionStatus::Blocked {
             completed_statements: 0,
-            output_mark: 0,
+            output_mark: crate::pg::overflow::OutputMark::new(0, 0),
             wait: crate::sql::StatementWait::Lock,
         },
         "{}",
@@ -82188,6 +82197,63 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
+fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
+    let config = test_config("array-element-assignment");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE element_targets (a int[], j jsonb); \
+         INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
+    );
+    for statement in [
+        "UPDATE element_targets SET a[1] = 9 WHERE a IS NOT NULL",
+        "UPDATE element_targets SET a[1] = 9 WHERE a IS NULL",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("assignment to array elements and slices is not supported"),
+            "{statement}"
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE element_targets SET j['k'] = '1' RETURNING j::text",
+    );
+    assert_eq!(data_rows(&output), ["{\"k\": 1}", "{\"k\": 1}"]);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn local_journal_commits_leave_no_publication_deadline_for_an_idle_reactor() {
+    let config = test_config("local-journal-idle-deadline");
+    assert!(!config.wal_upload);
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    engine.enable_async_durability();
+    session.success(&mut engine, "CREATE TABLE idle_local (id int)", false);
+    session.success(&mut engine, "INSERT INTO idle_local VALUES (1)", false);
+    // An immediate deadline would make every idle reactor wait time out at once.
+    assert!(
+        engine
+            .advance_wal_publication(std::time::Instant::now(), CommitProgressMode::Reactor)
+            .unwrap()
+    );
+    assert_eq!(engine.wal.pending_batch_bytes(), 0);
+    assert_eq!(engine.next_publication_deadline(), None);
+    assert!(!engine.durable_retry_pending());
+    assert_eq!(engine.durable_lsn(), engine.journal_lsn());
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -94179,9 +94245,17 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         "SELECT 0 UNION ALL SELECT nextval('s')",
         "SELECT currval('s'); SELECT 0",
     ] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            false,
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::Sequences,
@@ -94195,9 +94269,17 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         "SELECT nextval('s'); INSERT INTO t VALUES(1) RETURNING 1",
         "WITH changed AS(INSERT INTO t VALUES(1) RETURNING id) SELECT id FROM changed",
     ] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            false,
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::Engine,
@@ -94205,9 +94287,17 @@ fn type_reference_moves_sequence_programs_require_session_execution() {
         );
     }
     for body in ["SELECT 1", "SELECT abs(-1)", "SELECT random()"] {
-        let program =
-            query::parse_routine_function_program(body, &arena, false, "f", &[], &[], |_| Ok(()))
-                .unwrap();
+        let program = query::parse_routine_function_program(
+            body,
+            &arena,
+            query::RoutineResultContract::Returns("integer"),
+            false,
+            "f",
+            &[],
+            &[],
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(
             query::routine_program_access(&program),
             query::RoutineProgramAccess::ReadOnly,
@@ -94709,7 +94799,7 @@ fn maintenance_metadata_cache_admission_waits_before_sequences_and_triggers_in_b
                     &mut session.cursors, &session.guc, &mut responder, session.connection_id, false).unwrap() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
-                        completed_statements: 0, output_mark: responder.buffer.mark(), wait,
+                        completed_statements: 0, output_mark: responder.mark(), wait,
                     },
                 }
             } else {
@@ -95690,7 +95780,7 @@ fn cleanup_download_overlap_wal_retry_precedes_cleanup_and_preserves_pending_pre
         });
         namespace.borrow_mut().faults.fail_from_op = None;
         engine.commit_wal().unwrap();
-        session.send.truncate_to(output_mark);
+        output_mark.truncate_unsent(&mut session.send);
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
                 "COMMIT",
@@ -97409,7 +97499,10 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                     wait,
                 } => {
                     assert_eq!(wait, StatementWait::ObjectIo);
-                    assert_eq!(session.send.len(), output_mark);
+                    assert_eq!(
+                        output_mark,
+                        crate::pg::overflow::OutputMark::new(session.send.len(), 0)
+                    );
                     assert!(session.transaction.staged_commit().is_some());
                     completed_statements
                 }
@@ -97470,7 +97563,7 @@ fn parallel_commit_partition_detach_keeps_phase_receipts_before_reader_waits() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
                         completed_statements: 0,
-                        output_mark: responder.buffer.mark(),
+                        output_mark: responder.mark(),
                         wait,
                     },
                 }

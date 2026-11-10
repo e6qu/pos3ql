@@ -9,70 +9,57 @@ SELECT * FROM XMLTABLE(
   COLUMNS id integer PATH '@id', name text PATH 'name');
 ```
 
-This returns one row with `id = 1` and `name = 'Gift'`. The supported XPath
-subset includes these child paths and attributes. Expressions using other
-axes, operators, or functions must fail explicitly; full XPath compatibility
-is not implemented. Exact supported forms and capacities are listed below.
+This returns one row: `id = 1`, `name = 'Gift'`. pos3ql supports a subset of
+XPath (the query language inside `PATH`); expressions outside it fail with an
+error.
 
-pos3ql models PostgreSQL's `xml` and `xml[]` types as validated UTF-8 XML
-spelling. The original value is retained for casts to `text`; XML text and
-binary output apply PostgreSQL's declaration rules, including removal of an
-encoding declaration and omission of a redundant XML 1.0 declaration.
-
-The type boundary includes PostgreSQL catalog OIDs, arrays, text and binary
-Bind/Result, portals, COPY, table storage, generated expressions and checks,
-WAL, checkpoints, and object-store cold recovery. `xmloption` is a
-transactional session setting: `content` accepts fragments and `document`
-requires exactly one document element.
-
-The [capacity inventory](postgresql-18-compatibility.md#capacity-boundaries)
-also applies to statement, wire and saved-row sizes. XMLTABLE support does not
-remove the XML/XPath limits or establish a query-throughput rate.
+`xml` and `xml[]` store validated UTF-8 text with PostgreSQL's catalog OIDs,
+through text and binary values, COPY, storage, and recovery. Casting to `text`
+returns the original value; XML output follows PostgreSQL's declaration rules
+(the encoding declaration is removed and a redundant XML 1.0 declaration is
+omitted). The transactional `xmloption` setting chooses `content` (fragments
+allowed) or `document` (exactly one root element).
 
 ## SQL/XML expressions
-
-The supported SQL syntax is:
 
 - `XMLPARSE`, `XMLSERIALIZE`, `XMLELEMENT` with `XMLATTRIBUTES`, `XMLFOREST`,
   `XMLCONCAT`, `XMLCOMMENT`, `XMLPI`, `XMLROOT`, and `XMLEXISTS`;
 - `xml_is_well_formed`, `xml_is_well_formed_document`, and
   `xml_is_well_formed_content`;
-- `xpath` and `xpath_exists`, including PostgreSQL's two-dimensional namespace
-  mapping array;
-- ordered `XMLAGG` with PostgreSQL NULL behavior; and
-- typed `XMLTABLE`, including namespace declarations, ordinality, `PATH`,
-  `DEFAULT`, `NULL`/`NOT NULL`, XML-valued multi-node columns, and scalar
-  cardinality checks.
+- `xpath` and `xpath_exists`, including the two-dimensional namespace array;
+- ordered `XMLAGG` with PostgreSQL NULL behavior;
+- `XMLTABLE` with namespaces, ordinality, `PATH`, `DEFAULT`, `NULL`/`NOT NULL`,
+  multi-node XML columns, and scalar cardinality checks. It works anywhere a
+  table source is allowed: joins, DML and MERGE sources, CTAS, COPY, views,
+  materialized views, cursors, prepared statements, and PL/pgSQL.
 
-`XMLTABLE` is an ordinary lateral query source. It participates in joins,
-INSERT/UPDATE/DELETE/MERGE sources, CTAS, COPY, views, materialized views,
-cursors, prepared statements, and PL/pgSQL. Stored definitions and values
-survive WAL replay, checkpoints, and cacheless object-store recovery.
-Its `PASSING` operand follows PostgreSQL's primary-expression grammar; casts
-on compound expressions belong inside parentheses. This boundary follows
-[PostgreSQL 18's SQL/XML grammar](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y).
-`BY REF` and `BY VALUE` are accepted before or after that operand, as in
-PostgreSQL.
+As in [PostgreSQL 18's grammar](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y),
+the `PASSING` operand is a primary expression (parenthesize a cast on a compound
+expression), and `BY REF`/`BY VALUE` may appear before or after it. The
+`DEFAULT` namespace spelling in `XMLTABLE`, which PostgreSQL also does not
+support, is rejected.
 
-## XPath and resource limits
+## XPath subset
 
-The allocation-free XPath evaluator supports child and descendant paths
-(`/` and `//`), named and wildcard elements, attributes, `text()`, numeric
-positions, attribute-equality predicates, and the scalar `count()`,
-`boolean()`, `string()`, and `number()` forms. Namespace mappings match by URI,
-so the query prefix need not equal the source document's prefix. Other XPath
-axes, operators, and functions are outside the executable subset and reject
-rather than being ignored.
+Supported: child and descendant paths (`/`, `//`), named and wildcard elements,
+attributes, `text()`, numeric positions, attribute-equality predicates, and
+scalar `count()`, `boolean()`, `string()`, and `number()`. Namespace prefixes
+match by URI, so the query prefix need not equal the document's. Other axes,
+operators, and functions are rejected.
 
-Runtime work is bounded at startup. XMLTABLE rows use fixed statement memory
-without a separate row-count limit. One XML value may nest 64 elements; an
-element may have 128 attributes; a document may declare 128 entities; an
-XPath evaluation may index 1,024 elements and 4,096 attributes and use 64 path
-steps. Constructors and XPath scalar materialization are limited to 64 KiB.
-Crossing a limit returns a named program-limit error and never allocates a
-growing runtime structure.
+## Limits
 
-External entity retrieval and native XML/XSLT libraries are not part of the
-runtime. This keeps XML inside the fixed-memory core and prevents evaluation from
-opening an unbudgeted I/O path. PostgreSQL's unsupported `DEFAULT` namespace
-spelling in `XMLTABLE` is rejected explicitly as well.
+| Limit | Value |
+|---|---|
+| Element nesting per value | 64 |
+| Attributes per element | 128 |
+| Entity declarations per document | 128 |
+| Elements / attributes indexed per XPath evaluation | 1,024 / 4,096 |
+| Path steps per XPath expression | 64 |
+| Constructor and XPath scalar output | 64 KiB |
+| `XMLTABLE` rows | Fixed statement memory |
+
+Exceeding a limit returns a named program-limit error. External entities are
+never fetched, and no native XML or XSLT library is used. Statement, wire, and
+row sizes are listed under
+[capacity boundaries](postgresql-18-compatibility.md#capacity-boundaries).

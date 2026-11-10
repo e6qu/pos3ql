@@ -1195,7 +1195,7 @@ impl Server {
                 subscriptions: config.max_subscriptions,
                 foreign_sessions: config.max_foreign_sessions,
                 object_store: config.object_store_on,
-                credential_rotation: !config.object_store_credentials_file.is_empty(),
+                credential_rotation: !reloadable_credentials_file(config).is_empty(),
                 tls_budget_bytes: config.tls_pool_bytes
                     + Self::extra_tls_pool_bytes(config)
                     + if config.tls_on {
@@ -1209,9 +1209,7 @@ impl Server {
             ownership_ready: true,
             credentials_ready: true,
             credential_reload_pending: false,
-            credentials_file: crate::util::StackStr::from_str(
-                &config.object_store_credentials_file,
-            ),
+            credentials_file: reloadable_credentials_file(config),
         })
     }
 
@@ -3013,9 +3011,9 @@ impl Server {
     }
 
     /// Delivers every queued notification to the connections listening on its
-    /// channel, then clears the outbox. A listener whose send buffer cannot hold
-    /// the message (it is not draining its socket) is closed rather than sent a
-    /// truncated stream.
+    /// channel, then clears the outbox. A listener inside a result holds the
+    /// frame until that result ends; one whose held frames exceed their fixed
+    /// buffer is closed rather than sent a truncated stream.
     fn deliver_notifications(&mut self) {
         for n_index in 0..self.engine.notifications().len() {
             // `Notification` is `Copy`, so lift it out and drop the engine
@@ -3656,6 +3654,22 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             io.object_read_micros as f64 / 1_000_000.0,
             io.object_prefetch_saturated,
         );
+        let streams = self.engine.result_stream_metrics();
+        let _ = write!(
+            out,
+            "# HELP pos3ql_result_streams_total Large results that resumed row by row as their client read.\n\
+# TYPE pos3ql_result_streams_total counter\n\
+pos3ql_result_streams_total {}\n\
+# HELP pos3ql_result_stream_spooled_total Large results queued in the result spool instead, by reason.\n\
+# TYPE pos3ql_result_stream_spooled_total counter\n\
+pos3ql_result_stream_spooled_total{{reason=\"shape\"}} {}\n\
+pos3ql_result_stream_spooled_total{{reason=\"capacity\"}} {}\n\
+pos3ql_result_stream_spooled_total{{reason=\"effects\"}} {}\n",
+            streams.opened,
+            streams.spooled_shape,
+            streams.spooled_capacity,
+            streams.spooled_effects,
+        );
     }
 
     fn render_capacity(&self, out: &mut crate::util::StackStr<4096>) {
@@ -3986,6 +4000,19 @@ fn bind_socket_address(address: SocketAddr) -> std::io::Result<TcpListener> {
 fn stderr_line(msg: &[u8]) {
     let message = core::str::from_utf8(msg).unwrap_or("invalid UTF-8 log message");
     crate::logging::info("server", message.trim_end());
+}
+
+/// The credential file a configuration reload rereads. Local-only durability
+/// never reads it, so a reload there must not either: an absent file would
+/// mark the server unready.
+fn reloadable_credentials_file(
+    config: &Config,
+) -> crate::util::StackStr<{ crate::object_store::CREDENTIAL_FILE_BYTES }> {
+    if config.object_store_on {
+        crate::util::StackStr::from_str(&config.object_store_credentials_file)
+    } else {
+        crate::util::StackStr::new()
+    }
 }
 
 fn token_for(index: u32, generation: u32) -> u64 {
@@ -4599,6 +4626,19 @@ mod tests {
         let mut altered = runtime;
         altered.publications[0] = crate::storage::SqlName::parse("inventory").unwrap();
         assert!(binding != SubscriptionBinding::from(altered));
+    }
+
+    #[test]
+    fn only_object_store_durability_rereads_its_credential_file() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_credentials_file = "/nonexistent/object-store.credentials".into();
+        config.object_store_on = false;
+        assert!(super::reloadable_credentials_file(&config).is_empty());
+        config.object_store_on = true;
+        assert_eq!(
+            super::reloadable_credentials_file(&config).as_str(),
+            "/nonexistent/object-store.credentials"
+        );
     }
 
     #[test]

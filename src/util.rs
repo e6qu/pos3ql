@@ -187,3 +187,17 @@ mod tests {
         });
     }
 }
+
+/// Displays an I/O error without allocating, unlike `io::Error`'s own
+/// `Display`, which copies the OS message into a `String` and so cannot run
+/// after the startup memory freeze.
+pub(crate) struct IoErrorText<'a>(pub &'a std::io::Error);
+
+impl core::fmt::Display for IoErrorText<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0.raw_os_error() {
+            Some(code) => write!(formatter, "{} (os error {code})", self.0.kind()),
+            None => write!(formatter, "{}", self.0.kind()),
+        }
+    }
+}

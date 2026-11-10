@@ -373,7 +373,7 @@ fn commit_admission_waits_preserve_defaults_triggers_and_command_responses() {
                     ExtendedExecutionStatus::Complete(_) => ExecutionStatus::Complete,
                     ExtendedExecutionStatus::Blocked { wait } => ExecutionStatus::Blocked {
                         completed_statements: 0,
-                        output_mark: responder.buffer.mark(),
+                        output_mark: responder.mark(),
                         wait,
                     },
                 }
@@ -474,7 +474,7 @@ fn commit_admission_waits_preserve_defaults_triggers_and_command_responses() {
             };
             assert_eq!(wait, StatementWait::Lock);
             assert_eq!(completed_statements, if explicit { 0 } else { 2 });
-            writer.send.truncate_to(output_mark);
+            output_mark.truncate_unsent(&mut writer.send);
             if prepare {
                 assert!(matches!(
                     writer.transaction.commit_admission(),
@@ -866,7 +866,7 @@ fn commit_admission_rewinds_generated_wal_after_repeated_cold_row_waits() {
     {
         assert_eq!(wait, StatementWait::ObjectIo);
         assert!(Instant::now() < deadline, "cold SELECT did not finish");
-        session.send.truncate_to(output_mark);
+        output_mark.truncate_unsent(&mut session.send);
         engine.bind_query_connection(session.connection_id);
         status = crate::mem::guard::forbid_alloc(|| {
             for slot in 0..engine.block_read_slots() {

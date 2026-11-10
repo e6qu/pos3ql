@@ -187,16 +187,12 @@ impl Reactor {
     }
 
     pub fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<&[Event]> {
-        let ms: libc::c_int = match timeout {
-            None => -1,
-            Some(d) => d.as_millis().min(i32::MAX as u128) as libc::c_int,
-        };
         let n = unsafe {
             libc::epoll_wait(
                 self.epfd,
                 self.raw.as_mut_ptr(),
                 self.max_events as libc::c_int,
-                ms,
+                wait_milliseconds(timeout),
             )
         };
         if n < 0 {
@@ -283,12 +279,38 @@ impl std::fmt::Display for ReactorSetupError {
 
 impl std::error::Error for ReactorSetupError {}
 
+/// epoll waits in whole milliseconds. Rounding a deadline up keeps a
+/// sub-millisecond wait from becoming a zero-timeout busy turn; only an
+/// explicit zero polls.
+fn wait_milliseconds(timeout: Option<Duration>) -> libc::c_int {
+    timeout.map_or(-1, |duration| {
+        duration
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(libc::c_int::MAX as u128) as libc::c_int
+    })
+}
+
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn wait_timeout_rounds_partial_milliseconds_up() {
+        assert_eq!(wait_milliseconds(None), -1);
+        assert_eq!(wait_milliseconds(Some(Duration::ZERO)), 0);
+        assert_eq!(wait_milliseconds(Some(Duration::from_nanos(1))), 1);
+        assert_eq!(wait_milliseconds(Some(Duration::from_micros(999))), 1);
+        assert_eq!(wait_milliseconds(Some(Duration::from_millis(2))), 2);
+        assert_eq!(wait_milliseconds(Some(Duration::from_micros(2_001))), 3);
+        assert_eq!(
+            wait_milliseconds(Some(Duration::from_secs(u64::MAX))),
+            libc::c_int::MAX
+        );
+    }
 
     #[test]
     fn write_interest_preserves_disabled_read_interest() {

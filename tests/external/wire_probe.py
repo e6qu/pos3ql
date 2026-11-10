@@ -588,6 +588,42 @@ def test_simple_query_and_empty():
     s.close()
 
 
+def error_fields(payload):
+    return {field[:1].decode(): field[1:].decode() for field in payload.split(b"\x00") if field}
+
+
+def test_syntax_error_cursor_positions():
+    # PostgreSQL 18.6 reports P as a 1-based character position in the whole
+    # query string, and no internal position (p, q) for a top-level query.
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    out = simple_query(s, "SELECT 1; SELECT 'é' FROM WHERE; SELECT 2")
+    errors = [error_fields(payload) for kind, payload in out if kind == b"E"]
+    check("multi-statement syntax error: one error", [kind for kind, _ in out] == [b"E", b"Z"], out)
+    check(
+        "multi-statement syntax error: PostgreSQL fields",
+        [(e.get("C"), e.get("M"), e.get("P"), e.get("p"), e.get("q")) for e in errors]
+        == [("42601", 'syntax error at or near "WHERE"', "27", None, None)],
+        errors,
+    )
+    s.sendall(
+        frontend_message(b"P", "\x00SELECT 'ü' +\nFROM x\x00\x00\x00".encode())
+        + frontend_message(b"S")
+    )
+    out = []
+    while not out or out[-1][0] != b"Z":
+        out.append(read_message(s))
+    errors = [error_fields(payload) for kind, payload in out if kind == b"E"]
+    check(
+        "Parse syntax error: PostgreSQL fields",
+        [(e.get("C"), e.get("M"), e.get("P")) for e in errors]
+        == [("42601", 'syntax error at or near "FROM"', "14")],
+        errors,
+    )
+    s.close()
+
+
 def test_binary_cursor_fetches_binary_rows():
     s = connect()
     s.sendall(startup_payload(0))
@@ -955,6 +991,34 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
         and b"statement response exceeds its configured buffer" in error
         and output[-1][0] == b"Z",
         output,
+    )
+    s.close()
+
+
+def test_unpaged_execute_streams_results_larger_than_the_send_buffer():
+    # Only paged portals retain a bounded result; an unpaged Execute queues
+    # its output for the client like a simple Query.
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    parse = frontend_message(
+        b"P", b"\x00SELECT repeat('x', 1024) FROM generate_series(1,1000)\x00\x00\x00"
+    )
+    bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 0))
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    kinds = [kind for kind, _ in output]
+    check(
+        "unpaged Execute: a 1 MiB result arrives whole, without 54000",
+        kinds == [b"1", b"2"] + [b"D"] * 1000 + [b"C", b"Z"]
+        and output[-2][1] == b"SELECT 1000\x00",
+        kinds[:5] + kinds[-3:],
     )
     s.close()
 

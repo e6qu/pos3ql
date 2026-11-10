@@ -972,7 +972,7 @@ mod tests {
             committed(0),
         )
         .unwrap();
-        let barrier = std::sync::Barrier::new(4);
+        let barrier = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let pools = &pools;

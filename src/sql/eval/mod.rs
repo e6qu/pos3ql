@@ -8345,7 +8345,7 @@ impl SeriesKind {
 
 /// Whether a `generate_series` interval step advances toward larger timestamps.
 /// Uses PostgreSQL's canonical interval ordering (30-day months, 24-hour days).
-fn interval_is_positive(step: super::types::Interval) -> bool {
+pub(crate) fn interval_is_positive(step: super::types::Interval) -> bool {
     let canonical = step.months as i128 * 2_592_000_000_000
         + step.days as i128 * 86_400_000_000
         + step.micros as i128;
@@ -10367,6 +10367,15 @@ fn division_by_zero() -> SqlError {
 }
 
 /// [`type_mismatch`] for callers outside this module (table-function args).
+/// Assigning through an array subscript (`SET a[1] = 9`) is not implemented;
+/// it must not fall through to jsonb subscripting.
+pub(crate) fn array_element_assignment_unsupported() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "assignment to array elements and slices is not supported"
+    )
+}
+
 pub fn type_mismatch_pub(operator: &str, d: &Datum) -> SqlError {
     type_mismatch(operator, d)
 }

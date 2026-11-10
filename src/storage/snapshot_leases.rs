@@ -546,7 +546,7 @@ mod tests {
         let (storage, table) = fixture();
         storage.export_replication_snapshot(77, 7).unwrap();
         let finished = AtomicBool::new(false);
-        let start = std::sync::Barrier::new(2);
+        let start = crate::mem::mutex::Barrier::new(2);
         std::thread::scope(|scope| {
             let reader = storage.resident_row_state(table, 1).unwrap().unwrap();
             scope.spawn(|| {
@@ -586,7 +586,7 @@ mod tests {
             let (storage, table) = fixture();
             storage.export_replication_snapshot(77, 7).unwrap();
             let imported = AtomicBool::new(false);
-            let start = std::sync::Barrier::new(3);
+            let start = crate::mem::mutex::Barrier::new(3);
             std::thread::scope(|scope| {
                 scope.spawn(|| {
                     start.wait();

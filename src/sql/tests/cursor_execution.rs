@@ -2308,6 +2308,7 @@ fn cursor_declaration_rejects_conflicting_options_and_write_effects() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut errors = Vec::new();
     let mut rows = Vec::new();
+    let mut details = Vec::new();
     for sql in include_str!("../../../tests/external/differential_exact/35_cursor_declarations.sql")
         .split(';')
         .filter(|sql| !sql.trim().is_empty())
@@ -2315,7 +2316,18 @@ fn cursor_declaration_rejects_conflicting_options_and_write_effects() {
         let output = session.execute(&mut engine, sql, true);
         errors.extend(error_sqlstates(&output).into_iter().map(str::to_owned));
         rows.extend(data_rows(&output));
+        let text = String::from_utf8_lossy(&output);
+        for detail in ["Holdable", "Scrollable", "Insensitive"] {
+            if text.contains(&format!("{detail} cursors must be READ ONLY.")) {
+                details.push(detail);
+            }
+        }
     }
+    // PostgreSQL explains each read-only restriction in DETAIL.
+    assert_eq!(
+        details,
+        ["Holdable", "Scrollable", "Insensitive", "Holdable"]
+    );
     assert_eq!(
         errors,
         [
@@ -2543,4 +2555,436 @@ fn cursor_motion_counts_match_postgresql_integer_grammar() {
     }
     assert_eq!(rows, ["1", "2", "1", "2", "3", "3", "2", "1"]);
     assert_eq!(errors, ["42601"; 5]);
+}
+
+#[test]
+fn function_source_cursors_generate_rows_as_fetch_reaches_them() {
+    let config = test_config("function-source-cursor-generators");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE calls; BEGIN; \
+         DECLARE lazy NO SCROLL CURSOR FOR SELECT nextval('calls') FROM generate_series(1,3)",
+        true,
+    );
+    // PostgreSQL evaluates the projection per FETCH, not at DECLARE.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value,is_called FROM calls; FETCH 0 FROM lazy; \
+             SELECT last_value,is_called FROM calls; FETCH NEXT FROM lazy; \
+             SELECT last_value,is_called FROM calls; FETCH NEXT FROM lazy; CLOSE lazy; \
+             SELECT last_value,is_called FROM calls; COMMIT",
+            true
+        )),
+        ["1|f", "1|f", "1", "1|t", "2", "2|t"]
+    );
+    // A row-dependent error surfaces on the FETCH that reaches it.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE later_error NO SCROLL CURSOR FOR \
+         SELECT 1/(g-2) FROM generate_series(1,3) AS g",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH NEXT FROM later_error", true)),
+        ["-1"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM later_error", true)),
+        ["22012"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    // Each supported overload keeps only its next value: bounds of bigint,
+    // numeric and timestamp steps, and array elements.
+    for (source, expected) in [
+        (
+            "generate_series(9223372036854775806, 9223372036854775807)",
+            &["9223372036854775806", "9223372036854775807"][..],
+        ),
+        ("generate_series(1.5, 2.5, 0.5)", &["1.5", "2.0", "2.5"][..]),
+        (
+            "generate_series(timestamp '2024-01-31', timestamp '2024-03-31', interval '1 month')",
+            &[
+                "2024-01-31 00:00:00",
+                "2024-02-29 00:00:00",
+                "2024-03-29 00:00:00",
+            ][..],
+        ),
+        ("unnest(ARRAY['a','b',NULL])", &["a", "b", "NULL"][..]),
+        ("generate_series(3, 1)", &[][..]),
+    ] {
+        let rows = data_rows(&session.success(
+            &mut engine,
+            &format!(
+                "BEGIN; DECLARE generated NO SCROLL CURSOR FOR SELECT * FROM {source} AS v; \
+                 FETCH ALL FROM generated; CLOSE generated; COMMIT"
+            ),
+            true,
+        ));
+        assert_eq!(rows, expected, "{source}");
+    }
+    // A zero step is reported by the first fetch, as PostgreSQL starts the
+    // function scan there.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE zero NO SCROLL CURSOR FOR SELECT * FROM generate_series(1, 3, 0)",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH NEXT FROM zero", true)),
+        ["22023"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+    // Function scans read backward, so a default cursor is scrollable.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE automatic CURSOR FOR SELECT * FROM generate_series(1,2)",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT is_scrollable FROM pg_cursors WHERE name='automatic'; CLOSE automatic; COMMIT",
+            true
+        )),
+        ["t"]
+    );
+    // The materialized path shares the series arithmetic, including at the
+    // bigint bound where the next value would overflow.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM generate_series(9223372036854775806, 9223372036854775807)",
+            true
+        )),
+        ["2"]
+    );
+}
+
+#[test]
+fn scroll_cursor_revisits_evaluate_volatile_rows_again_in_postgresql_order() {
+    let config = test_config("scroll-cursor-revisits");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE s; CREATE TABLE t(id integer); \
+         INSERT INTO t SELECT g FROM generate_series(1,4) g",
+        true,
+    );
+    // Expected values are PostgreSQL 18.6 output for the same commands.
+    for (declare, steps) in [
+        (
+            "DECLARE c SCROLL CURSOR FOR SELECT id, nextval('s') FROM t",
+            &[
+                ("FETCH NEXT FROM c", &["1|1"][..]),
+                ("FETCH NEXT FROM c", &["2|2"][..]),
+                ("FETCH PRIOR FROM c", &["1|3"][..]),
+                ("FETCH NEXT FROM c", &["2|4"][..]),
+                ("FETCH ABSOLUTE 1 FROM c", &["1|5"][..]),
+                ("FETCH RELATIVE 0 FROM c", &["1|6"][..]),
+                ("MOVE FORWARD 2 IN c; SELECT last_value FROM s", &["8"][..]),
+                ("FETCH LAST FROM c", &["4|10"][..]),
+                (
+                    "MOVE BACKWARD ALL IN c; SELECT last_value FROM s",
+                    &["10"][..],
+                ),
+            ][..],
+        ),
+        (
+            // A volatile filter runs again for every revisited input.
+            "DECLARE c SCROLL CURSOR FOR SELECT id, nextval('s') FROM t \
+             WHERE id % 2 = 0 OR nextval('s') < 0",
+            &[
+                ("FETCH NEXT FROM c", &["2|12"][..]),
+                ("FETCH NEXT FROM c", &["4|14"][..]),
+                ("FETCH PRIOR FROM c", &["2|16"][..]),
+            ][..],
+        ),
+        (
+            // LIMIT returns its edge row again without evaluating it.
+            "DECLARE c SCROLL CURSOR FOR SELECT id, nextval('s') FROM t LIMIT 2 OFFSET 1",
+            &[
+                ("FETCH ALL FROM c", &["2|18", "3|19"][..]),
+                ("FETCH PRIOR FROM c", &["3|19"][..]),
+                ("FETCH PRIOR FROM c", &["2|20"][..]),
+                ("FETCH PRIOR FROM c", &[][..]),
+                ("FETCH NEXT FROM c", &["2|20"][..]),
+            ][..],
+        ),
+        (
+            "DECLARE c SCROLL CURSOR FOR SELECT g, nextval('s') FROM generate_series(1,3) g",
+            &[
+                ("FETCH NEXT FROM c", &["1|21"][..]),
+                ("FETCH NEXT FROM c", &["2|22"][..]),
+                ("FETCH BACKWARD 2 FROM c", &["1|23"][..]),
+                ("FETCH FORWARD 0 FROM c", &[][..]),
+                ("FETCH ABSOLUTE -1 FROM c", &["3|27"][..]),
+            ][..],
+        ),
+        (
+            // A materialized FROM-less row is returned as saved.
+            "DECLARE c SCROLL CURSOR FOR SELECT nextval('s')",
+            &[
+                ("FETCH NEXT FROM c", &["28"][..]),
+                ("FETCH PRIOR FROM c", &[][..]),
+                ("FETCH NEXT FROM c", &["28"][..]),
+            ][..],
+        ),
+    ] {
+        session.success(&mut engine, &format!("BEGIN; {declare}"), true);
+        for (sql, expected) in steps {
+            assert_eq!(
+                data_rows(&session.success(&mut engine, sql, true)),
+                *expected,
+                "{declare}: {sql}"
+            );
+        }
+        session.success(&mut engine, "CLOSE c; COMMIT", true);
+    }
+    // Saving a held scrollable cursor rewinds and evaluates every row again;
+    // its position is kept.
+    session.success(
+        &mut engine,
+        "SELECT setval('s', 1, false); BEGIN; \
+         DECLARE held SCROLL CURSOR WITH HOLD FOR SELECT id, nextval('s') FROM t; \
+         FETCH NEXT FROM held; FETCH NEXT FROM held; COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT last_value FROM s; FETCH PRIOR FROM held; FETCH ALL FROM held; \
+             SELECT is_holdable, is_scrollable FROM pg_cursors WHERE name = 'held'; \
+             CLOSE held",
+            true
+        )),
+        ["6", "1|3", "2|4", "3|5", "4|6", "t|t"]
+    );
+    // FETCH BACKWARD 0 off a row still asks a NO SCROLL cursor to go back.
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE forward NO SCROLL CURSOR FOR SELECT id FROM t",
+        true,
+    );
+    assert_eq!(
+        command_tags(&session.success(
+            &mut engine,
+            "FETCH FORWARD 0 FROM forward; MOVE BACKWARD 0 IN forward",
+            true
+        )),
+        ["FETCH 0", "MOVE 0"]
+    );
+    assert_eq!(
+        error_sqlstates(&session.execute(&mut engine, "FETCH BACKWARD 0 FROM forward", true)),
+        ["55000"]
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn scroll_cursor_saved_inputs_name_cursor_bytes_and_fail_the_portal() {
+    let mut config = test_config("scroll-cursor-input-capacity");
+    config.cursor_bytes = 256;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE SEQUENCE s; CREATE TABLE wide(id integer, payload text); \
+         INSERT INTO wide SELECT g, repeat('x', 40) FROM generate_series(1,20) g; \
+         BEGIN; DECLARE c SCROLL CURSOR FOR SELECT id, nextval('s') FROM wide; \
+         FETCH NEXT FROM c",
+        true,
+    );
+    let response = session.execute(&mut engine, "FETCH ALL FROM c", true);
+    assert_eq!(error_sqlstates(&response), ["54000"]);
+    assert!(
+        String::from_utf8_lossy(&response).contains("cursor_bytes"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    session.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn locking_cursors_lock_each_row_when_fetched_and_recheck_changed_rows() {
+    // Locking mode protects a row-locking reader's whole table, so only MVCC
+    // shows PostgreSQL's per-row conflicts.
+    {
+        let mode = crate::config::TransactionMode::Mvcc;
+        let mut config = test_config("locking-cursor-fetch");
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut other =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        owner.success(
+            &mut engine,
+            "CREATE SEQUENCE s; CREATE TABLE lt(id integer PRIMARY KEY, v integer); \
+             INSERT INTO lt VALUES (3,30),(1,10),(2,20),(4,40),(5,50)",
+            true,
+        );
+        owner.success(
+            &mut engine,
+            "BEGIN; DECLARE c CURSOR FOR SELECT id, v, nextval('s') FROM lt \
+             WHERE v < 45 ORDER BY id FOR UPDATE",
+            true,
+        );
+        // DECLARE neither locks nor projects.
+        assert_eq!(
+            data_rows(&other.success(
+                &mut engine,
+                "BEGIN; SELECT id FROM lt WHERE id = 1 FOR UPDATE NOWAIT; ROLLBACK",
+                true
+            )),
+            ["1"]
+        );
+        assert_eq!(
+            data_rows(&owner.success(
+                &mut engine,
+                "FETCH 1 FROM c; SELECT is_scrollable FROM pg_cursors",
+                true
+            )),
+            ["1|10|1", "f"]
+        );
+        assert_eq!(
+            error_sqlstates(&other.execute(
+                &mut engine,
+                "SELECT id FROM lt WHERE id = 1 FOR UPDATE NOWAIT",
+                true
+            )),
+            ["55P03"]
+        );
+        // Changes committed after DECLARE: an update is rechecked and
+        // projected again, a row that no longer qualifies or is deleted is
+        // skipped.
+        other.success(
+            &mut engine,
+            "UPDATE lt SET v = v + 1 WHERE id = 2; UPDATE lt SET v = 100 WHERE id = 3; \
+             DELETE FROM lt WHERE id = 4",
+            true,
+        );
+        assert_eq!(
+            data_rows(&owner.success(&mut engine, "FETCH ALL FROM c", true)),
+            ["2|21|3"]
+        );
+        owner.success(&mut engine, "ROLLBACK", true);
+        // A FETCH waits for a conflicting row lock and then sees the newest
+        // version; earlier fetched rows stay fetched.
+        other.success(
+            &mut engine,
+            "BEGIN; UPDATE lt SET v = 11 WHERE id = 1",
+            true,
+        );
+        owner.success(
+            &mut engine,
+            "BEGIN; DECLARE w CURSOR FOR SELECT id, v FROM lt ORDER BY id DESC FOR SHARE",
+            true,
+        );
+        assert_eq!(
+            data_rows(&owner.success(&mut engine, "FETCH 2 FROM w", true)),
+            ["5|50", "3|100"]
+        );
+        let status = owner.execute_status(&mut engine, "FETCH ALL FROM w", true);
+        assert!(
+            matches!(
+                status,
+                ExecutionStatus::Blocked {
+                    wait: StatementWait::Lock,
+                    ..
+                }
+            ),
+            "{mode:?}: {status:?}"
+        );
+        other.success(&mut engine, "COMMIT", true);
+        assert_eq!(
+            data_rows(&owner.success(&mut engine, "FETCH ALL FROM w", true)),
+            ["2|21", "1|11"]
+        );
+        owner.success(&mut engine, "ROLLBACK", true);
+        // Rows changed by the cursor's own transaction after DECLARE are
+        // skipped; OFFSET rows are locked too.
+        owner.success(
+            &mut engine,
+            "BEGIN; DECLARE own CURSOR FOR SELECT id FROM lt ORDER BY id LIMIT 2 OFFSET 1 \
+             FOR UPDATE; UPDATE lt SET v = 0 WHERE id = 2",
+            true,
+        );
+        assert_eq!(
+            data_rows(&owner.success(&mut engine, "FETCH ALL FROM own", true)),
+            ["3", "5"]
+        );
+        assert_eq!(
+            error_sqlstates(&other.execute(
+                &mut engine,
+                "SELECT id FROM lt WHERE id = 1 FOR UPDATE NOWAIT",
+                true
+            )),
+            ["55P03"]
+        );
+        owner.success(&mut engine, "ROLLBACK", true);
+        drop((owner, other, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+#[test]
+fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
+    let mut config = test_config("locking-cursor-repeatable");
+    config.cursor_bytes = 512;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
+        &mut engine,
+        "CREATE TABLE lt(id integer PRIMARY KEY, v integer); \
+         INSERT INTO lt VALUES (1,10),(2,20),(3,30)",
+        true,
+    );
+    for (change, state) in [
+        ("UPDATE lt SET v = 0 WHERE id = 2", "40001"),
+        ("DELETE FROM lt WHERE id = 3", "40001"),
+    ] {
+        owner.success(
+            &mut engine,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; \
+             DECLARE c CURSOR FOR SELECT id FROM lt ORDER BY id DESC FOR UPDATE",
+            true,
+        );
+        other.success(&mut engine, change, true);
+        assert_eq!(
+            error_sqlstates(&owner.execute(&mut engine, "FETCH ALL FROM c", true)),
+            [state],
+            "{change}"
+        );
+        owner.success(&mut engine, "ROLLBACK", true);
+    }
+    // Sorting saves every qualifying row in cursor_bytes before the first
+    // row returns; exhaustion names the setting.
+    owner.success(
+        &mut engine,
+        "INSERT INTO lt SELECT g, g FROM generate_series(10, 200) g; \
+         BEGIN; DECLARE big CURSOR FOR SELECT id FROM lt ORDER BY v FOR UPDATE",
+        true,
+    );
+    let response = owner.execute(&mut engine, "FETCH 1 FROM big", true);
+    assert_eq!(error_sqlstates(&response), ["54000"]);
+    assert!(String::from_utf8_lossy(&response).contains("cursor_bytes"));
+    owner.success(&mut engine, "ROLLBACK", true);
+    // No lock was taken by the failed sort.
+    assert_eq!(
+        data_rows(&other.success(
+            &mut engine,
+            "SELECT id FROM lt WHERE id = 10 FOR UPDATE NOWAIT",
+            true
+        )),
+        ["10"]
+    );
 }

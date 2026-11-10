@@ -18,7 +18,7 @@ fn resume_function_progress_wait(
         );
     };
     assert_eq!(wait, StatementWait::Lock);
-    writer.send.truncate_to(output_mark);
+    output_mark.truncate_unsent(&mut writer.send);
     writer.arena.recycle_front();
     crate::mem::guard::forbid_alloc(|| {
         engine.execute_simple_from(
@@ -654,7 +654,7 @@ fn function_bodies_keep_arguments_locals_writes_and_sequences_through_repeated_w
                     )),
                     ["42", "1"]
                 );
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(
@@ -682,7 +682,7 @@ fn function_bodies_keep_arguments_locals_writes_and_sequences_through_repeated_w
             };
             assert_eq!(wait, StatementWait::Lock);
             holder.success(&mut engine, "COMMIT", true);
-            writer.send.truncate_to(output_mark);
+            output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();
             let status = crate::mem::guard::forbid_alloc(|| {
                 engine.execute_simple_from(
@@ -786,7 +786,7 @@ fn paused_functions_keep_the_selected_body_handler_loop_and_settings() {
                         ["t"]
                     );
                 }
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(
@@ -877,7 +877,7 @@ fn paused_function_capacity_failure_rolls_back_and_returns_its_reservations() {
                 }
             });
             assert!(!pressure.is_empty());
-            writer.send.truncate_to(output_mark);
+            output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();
             let status = crate::mem::guard::forbid_alloc(|| {
                 engine.execute_simple_from(
@@ -969,7 +969,7 @@ fn paused_positional_functions_keep_record_array_and_null_domain_arguments() {
             if release {
                 holder.success(&mut engine, "COMMIT", true);
             }
-            writer.send.truncate_to(output_mark);
+            output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();
             status = crate::mem::guard::forbid_alloc(|| {
                 engine.execute_simple_from(
@@ -1047,7 +1047,7 @@ fn paused_function_converts_its_return_before_restoring_the_callers_timezone() {
         };
         assert_eq!(wait, StatementWait::Lock);
         holder.success(&mut engine, "COMMIT", true);
-        writer.send.truncate_to(output_mark);
+        output_mark.truncate_unsent(&mut writer.send);
         writer.arena.recycle_front();
         let status = crate::mem::guard::forbid_alloc(|| {
             engine.execute_simple_from(
@@ -1160,7 +1160,7 @@ fn paused_initializers_and_domain_checks_retain_their_child_calls_and_values() {
                         ["t"]
                     );
                 }
-                writer.send.truncate_to(output_mark);
+                output_mark.truncate_unsent(&mut writer.send);
                 writer.arena.recycle_front();
                 status = crate::mem::guard::forbid_alloc(|| {
                     engine.execute_simple_from(

@@ -1,252 +1,53 @@
 # S3-compatible object storage
 
-With `object_store = on`, committed data is saved in object storage. Losing
-local caches does not lose that data: a replacement server can recover it from
-the configured bucket and prefix. With `object_store = off`, the local journal
-is the durable copy instead; losing it loses local-only data.
+With `object_store = on` (durable mode), committed data is saved in object
+storage. RAM and disk are caches: a replacement server can recover everything
+from the configured bucket and prefix. With `object_store = off` (local mode),
+the local journal file is the durable copy; losing that disk loses the data.
+
+pos3ql talks directly to the S3 HTTP API with one built-in client. There is no
+vendor SDK, translation proxy, or behavior chosen by the provider's brand.
+Bucket creation, accounts and credential issuing happen outside pos3ql.
+An endpoint is supported only after it passes the
+[qualification suite](#qualification); an "S3-compatible" label is not enough.
+
+[Architecture](architecture.md#writes-and-the-success-response) describes the
+commit path, checkpoints and caches in detail.
+
+## What a successful commit means
+
+| Mode | `COMMIT` succeeds after | Losing the server's disk |
+|---|---|---|
+| `object_store = off` | The local journal is synced to disk. | Loses local-only data. |
+| `object_store = on` | The transaction's log objects are uploaded and the commit head is conditionally updated. | Loses nothing committed; recovery reads object storage. |
 
 **User example:** after `COMMIT` succeeds in durable mode, losing the server's
-disk should not lose the saved order. If storage publication fails, success
-must not be sent. If the final response is lost, the client may not know whether
-the commit happened; it must check before retrying an operation that could
-charge the customer twice.
+disk does not lose the saved order.
 
-[Architecture](architecture.md) explains column-group packing, indexes, caches
-and the difference between network concurrency and SQL CPU workers.
+Failure cases:
 
-pos3ql connects directly to the shared S3-compatible HTTP API. It uses one
-implementation for supported endpoints, with no vendor SDK, translation proxy,
-or database behavior selected by the endpoint's brand.
+- **Object store unavailable during commit.** Uploads are retried (see
+  [timeouts and retries](#timeouts-and-retries)). Success is never sent unless
+  publication completes. If publication of a staged commit fails, durability
+  cannot be confirmed: the server sends the fatal error SQLSTATE `08007`
+  ("commit outcome is unknown; reconnect before checking it"), flushes it,
+  closes the connection and keeps the transaction for recovery. The commit may
+  or may not have happened.
+- **Lost success reply.** The client cannot tell whether the commit happened.
+  Reconnect and check before retrying anything that must not run twice, such as
+  charging a customer.
+- **Installation fails after the commit is durable.** The instance stops
+  accepting queries and checkpoints, keeps the original error and does not undo
+  the durable change. Further work returns `08007` until restart and recovery.
+  This applies in both modes.
+- **Replaced by another server.** See
+  [preventing an old server from overwriting a replacement](#preventing-an-old-server-from-overwriting-a-replacement).
 
-An endpoint is supported only after tests prove the operations below behave
-correctly. Bucket creation, account administration, and credentials are set up
-outside pos3ql; an “S3-compatible” label alone is not enough.
-
-## Concurrent requests and durable commits
-
-**User example:** two customers save orders in different tables. Both can wait
-on the same log publication. Reading a cached invoice can continue while that
-upload waits; success for either order waits for its own durable log position.
-
-`object_store_get_slots` reserves independent read clients. A selected-column
-scan starts a bounded batch of missing columns before waiting, retaining
-completed extents across resumption. Atomic operations use a separate block
-client and can still wait synchronously; SQL CPU work uses one worker.
-A SELECT uses that client from its first routine or state-changing expression
-until the statement finishes, including reads after a routine returns. For
-example, a function can prepare a query and then read an uncached invoice
-without preparing the same query twice. Pure reads keep their concurrent path.
-
-Cached inputs do not make every query cache-only: `ORDER BY` can write and
-read temporary sorting runs. Request counters include that storage traffic.
-
-`object_store_put_slots` reserves upload clients and immutable request bodies.
-A log batch has two independent objects: transaction bytes and a descriptor.
-Those uploads can complete out of order. The commit-head update starts only
-after both succeed. Clients retain their transaction outcome until publication
-and ordered in-memory completion finish, including when the client disconnects.
-
-The commit keeps its transaction identity, table and row locks, transaction
-advisory locks, and serializable checks until its rows and definitions are
-installed and its visible journal position advances. Prepared commit and
-rollback decisions keep both transaction owners and the prepared slot through
-that boundary.
-Ordinary rollback restores rows and definitions before releasing its locks.
-Manual completion confirms the object-store journal before installation, just
-as the server's queued completion does. The server continues grouping several
-connections' commits into one upload batch.
-
-**User example:** one transaction updates an order and its invoice. A competing
-change cannot acquire their conflicting locks between the two installations.
-If installation fails after the transaction is durable, the instance stops
-accepting queries and checkpoints. It preserves the original failure and does
-not undo the durable changes; further work returns `08007` and requires restart
-and recovery. This also applies to local-only test mode and manual completion,
-not just the server's background commit queue. Recover and check the order
-before submitting it again. SQL CPU workers remain [planned work](../PLAN.md).
-
-`object_store_block_put_slots` reserves separate clients for immutable row and
-index output. Table slices, paced merges and secondary indexes retain one operation's bytes while
-its uploads overlap; the new file handle stays private until every upload
-finishes. Table slices retain their selected bytes while later changes append
-another generation. Replacing a table or rewriting its row encodings discards
-the old capture. Index sort runs and final index handles remain private until
-their uploads finish; changed index inputs cancel abandoned reads and uploads
-without waiting for socket readiness. Merge source failures restart the same immutable
-pair with cleared output and checksum state.
-
-Row-file merges keep their source index, column and large-row positions across
-download waits, including with disabled caches. Their scheduling pass reads row
-descriptors without fetching column values. The fixed read pool reserves one
-maintenance owner alongside connections and subscription workers; it shares
-immutable responses without consuming another connection's result. Completed
-column values and row fragments remain in the existing source buffers.
-Output counts and checksums advance after the corresponding rows finish.
-An unrelated completed request can wake a waiting merge, but cannot make it
-repeat output. If request capacity is full, the merge waits for a completion or
-released slot instead of spinning or growing the pool.
-
-Checkpoint row capture and index construction use that maintenance owner too.
-Row capture reads descriptors before fetching values; table output owns its
-partially assembled row. Index input scans own their column and large-row
-buffers, while saved sort runs retain their sparse-index descent and next row.
-Final index output records that a row was consumed before asking for its
-successor. Pausing any of these reads preserves exactly one copy of each output
-row. An index update can still take many turns and requests; yielding does not
-make that work disappear.
-
-A read can pause and restart while its result is still buffered. Once a large
-result fills the connection buffer and starts sending bytes, its remaining
-reads finish synchronously under the statement's existing effect guard.
-The server cannot withdraw a sent prefix: restarting would send another result
-header and repeat rows. For example, a 3,003-row report must arrive as one
-complete result even when later saved-file reads miss the cache. Keeping the
-query's output position across those waits remains work in [the plan](../PLAN.md).
-
-A separate startup-reserved client and metadata buffer upload the manifest,
-the metadata naming the saved files. Its exact bytes survive retries, including a lost response.
-Completion installs matching table and index identities and preserves newer
-changes. Cleanup keeps every file named by that saved manifest, even when a
-later table rewrite has stopped using its indexes.
-
-An explicit SQL CHECKPOINT waits for its requested save while other connections
-continue working. Later writes do not extend an earlier command indefinitely;
-failures reach the commands waiting for that save. Remaining qualification is in
-[the plan](../PLAN.md).
-
-Table output schedules at most the configured number of committed versions,
-processes at most 64 per CPU turn, and stops to drain each emitted batch.
-Deleting or truncating rows during capture retains deletion markers until the
-complete saved-file list installs. For example, deleting an order during its
-first checkpoint cannot make the order reappear after that checkpoint.
-Cleanup removes only deletion markers covered by the saved file list. Finishing
-an older checkpoint must also preserve newer ANALYZE results and the journal
-work of an analysis another transaction has not committed.
-Full table capture reads at most 64 row descriptors per turn without fetching
-column values. A separate fixed row-source buffer and a private scan context
-preserve unfinished values when foreground queries reuse their own scratch.
-Rows larger than one block use bounded overflow chains in the same generation;
-reading such a row requires its complete chain, retained across download waits.
-Exclusive startup recovery and administrative operations can still wait
-synchronously.
-
-Background journal cleanup has a separate startup-reserved metadata client.
-Backup and commit listings visit at most 64 keys per response, retaining the
-provider's continuation token and checking key order. One turn reads at most one
-backup manifest or commit-chain descriptor, or deletes the configured batch of
-obsolete journal objects. Waiting for any of these responses releases the SQL
-worker, including when foreground block reads or commit uploads are active.
-Checkpoints can publish and free row-cache space while journal cleanup waits.
-Journal cleanup, saved-file cleanup and backup administration have separate
-startup-reserved backup lists. The two cleanup tasks also have separate deletion
-queues, so a failed backup preflight cannot overwrite a partial file inventory.
-Each journal pass stops at its captured cutoff; new commits cannot extend that
-pass indefinitely. Later checkpoints queue the latest requested cutoff, while
-a more conservative retention decision cancels the pending deletion work.
-Journal and physical-file cleanup share the configured per-turn deletion limit,
-including when releasing a reader makes another file-cleanup pass necessary.
-If a checkpoint has already written new files, a finishing reader queues file
-cleanup until that checkpoint publishes. Its unfinished files remain owned;
-they are not abandoned objects that cleanup may delete.
-Every physical output batch records whether it belongs to a table, merge,
-index preparation or index writer. Changing producers requires the previous
-batch to finish. An index task ending without output cannot cause a later
-merge's files to be discarded as obsolete index work. The manifest waits for
-all required immutable uploads before publication.
-Saved-file cleanup has its own startup-reserved client, separate from journal
-cleanup and foreground reads. It retains backup listings, manifest reads, row-file
-inventories and index-tree traversal across responses. Each turn reads at most
-one manifest or roster node, lists up to 1,000 keys within
-`checkpoint_garbage_batch_objects`, or deletes the configured per-turn batch. A listing continues from its
-saved provider cursor instead of rescanning all live files for each batch.
-
-Cleanup keeps installed table files and active merge inputs even when a
-different captured file list has published. Before listing deletion candidates,
-it completes and validates the full file inventory for live tables, readers,
-unfinished merges, the durable manifest and named backups. Invalid or missing
-rosters and an exhausted keep-set fail before any deletion. A changed backup
-cancels the old decision and starts a new inventory. Durable file writers wait
-until the captured decision has drained; ordinary row edits can continue in RAM.
-
-Verified cached rosters need no remote request. A cache probe never consumes
-another query's pending read. Downloaded blocks are checked for checksum,
-identity and type before their payload is cached or used for retention.
-
-**User example:** while cleanup waits for the object store to list last week's
-files or delete an obsolete journal batch, another connection can read a cached
-order. Log cleanup also allows checkpoints to save new orders and free row-cache
-space. Saved-file cleanup still pauses new file publication until its inventory
-and deletions finish; it releases the SQL worker during each network wait.
-Cleanup retains its exact request and
-position. A failed deletion does not advance that position; retrying the same
-DELETE is safe even if its response was lost. Each request keeps the existing
-30-second deadline. With the `checkpoint-profile` build feature, file-cleanup
-phase records describe active work in each turn and completed block downloads;
-they exclude time spent waiting between turns. Use client latency and provider
-request counters for total elapsed time and storage traffic. Errors reach waiting
-checkpoint commands and use the normal maintenance retry cadence. Credential installation cancels these repeatable
-requests and resumes the same position with the new credentials.
-
-
-| Setting | Reservation or rejection |
-|---|---|
-| `object_store_get_slots` | Fixed read clients; at least 1 in object-store mode. |
-| `object_store_put_slots` | Fixed journal upload clients; at least 2 in object-store mode. |
-| `object_store_block_put_slots` | Fixed physical-block upload clients; at least 1 in object-store mode. Each reserves one 256 KiB body. |
-| `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot, plus the engine's captured log batch; must be at least `wal_buffer_bytes`. |
-| Credential validation | One conditional upload client with a 128-byte body when `object_store_credentials_file` is configured. The candidate must also read back the result. |
-| Operational ownership check | One fixed client and one receipt slot per `operations_max_connections` when the operational listener and object storage are enabled. Shares the explicit TLS budget. |
-| `checkpoint_manifest_bytes` | Bytes in each of three fixed buffers: metadata scratch, retained manifest, and manifest upload body. |
-| Background metadata | Two independent clients, for journal and saved-file cleanup. Each reserves `object_store_head_bytes`, `object_store_response_bytes`, request state and one reactor descriptor. Key buffers hold up to 1,024 bytes each: 64 for journal cleanup, and `min(checkpoint_garbage_batch_objects, 1000)` for file cleanup. File traversal state and deduplication entries are charged to checkpoint startup memory. No runtime growth. |
-| Row-file merge reads | Two source cursors retain index, column and large-row progress; two metadata cursors retain source scheduling. Their state and wait position are charged to checkpoint startup memory. The existing source buffers and `object_store_get_slots` serve downloads; the pool reserves one maintenance consumer in addition to `max_connections` and `max_subscriptions`. |
-| Table and index source reads | One private row source reserves four block-payload buffers and one maximum assembled row, plus its fixed decoder state. One private scan context reserves member frames, column scratch and a maximum assembled row; the ordinary scan context also reserves its own assembled-row buffer. Source identities, sparse descent, pending input advances and index block-list navigation are included in startup accounting. No extra request clients or dynamically growing buffers. |
-| `checkpoint_write_entries` | Committed versions retained by one table output schedule; SQLSTATE 54000 names exhaustion before publication. |
-| `commit_queue_slots` | Complete transaction and session-context buffers retained through asynchronous publication; at least 1 in object-store mode. |
-
-The development fixture selects 4 read slots, 4 journal upload slots, 4 physical
-upload slots and 4 commit queue slots. Size their startup memory reservations explicitly for a deployment.
-An exhausted commit queue or log buffer returns SQLSTATE `54000`, naming
-`commit_queue_slots` or `wal_upload_buffer_bytes`. It never grows a pool.
-
-The startup memory plan includes cache payloads, their indexes and the RAM needed
-by the disk cache. For example, `disk_cache_bytes = 128MiB` reserves a 128 MiB
-file plus a fixed in-memory slot directory, index and one 256 KiB scratch buffer.
-The file size is reported separately from RAM. Disabled tiers reserve no memory;
-with object storage off, neither object-store cache tier is constructed.
-
-Setting both caches to zero does not evict rows already in memory. For example,
-an `INSERT` followed by `SELECT` can return the new row without downloading it.
-To test reads with empty caches, first make the setup writes durable, then
-restart in object-store mode with an empty local data directory.
-
-TLS has a separate startup ceiling. `tls_pool_bytes` supplies the object-store
-base; startup adds 128 KiB for each of the two transports per subscription
-worker, plus 128 KiB per server connection when server TLS is enabled. Choose
-the base for the configured object-store request concurrency. These reservations
-are fixed before the server accepts connections.
-
-Nonblocking reads have a 30-second deadline. Each upload attempt has a
-30-second deadline, with at most three attempts for retryable failures and
-200 ms then 400 ms backoff. A failed conditional create compares the entire
-stored object, including its length, before accepting an uncertain prior
-success. A different mutable root remains a writer conflict.
-
-Login triggers use the fixed commit queue. If a login trigger records an audit
-row, authentication waits for that row to become durable while the server can
-handle other connections. Waking the login again does not repeat its triggers.
-
-A procedure's internal `COMMIT` and standalone catalog commands retain explicit
-synchronous completion boundaries: their call stack cannot be replayed after a
-commit. During credential rotation they finish accepted journal work with the
-installed credentials; replacement waits for active requests to finish. Ordinary
-client commits and streaming subscription apply use the fixed commit queue.
-
-Saved query results are collected in one scan within the fixed statement arena.
-They do not run expressions a second time to discover the result size. For
-example, a saved query that calls a function to prepare a statement must prepare
-it once, even when another part of the query reads uncached data. Sorting by
-that query's output label or position reuses the saved value, following
-[PostgreSQL's ORDER BY rules](https://www.postgresql.org/docs/18/sql-select.html#SQL-ORDERBY).
+A commit holds its locks, transaction identity and serializable checks until
+its rows are installed in memory, so a competing change cannot slip in between
+an order and its invoice. A client that disconnects while its commit is being
+published does not cancel it. Several connections' commits share one upload
+batch.
 
 ## Required S3-compatible subset
 
@@ -260,137 +61,162 @@ that query's output label or position reuses the saved value, following
 | `DeleteObject` | Delete one key; deleting an absent key is idempotent. |
 
 The bucket is the durable namespace. `object_store_prefix` isolates one pos3ql
-instance and its SQL databases within it. Object keys and list prefixes are encoded once at the S3
-client boundary; storage and database code never inspect endpoint brands.
+instance, including all its SQL databases. Keys and list prefixes are encoded
+once at the client boundary.
 
-ETags are opaque generation tokens. pos3ql must not assume that an ETag is an
-MD5 digest or infer its shape from the provider. Conditional failure, missing
-objects, throttling, transient transport failure, authentication failure, and
-malformed responses remain distinct typed outcomes.
+An ETag is an opaque generation token: pos3ql never assumes it is an MD5 digest.
+Conditional failure, missing object, throttling, transient transport failure,
+authentication failure and malformed response are distinct outcomes.
+
+**Profile limits (v1).** Object keys up to 1,024 bytes (the S3 limit),
+continuation tokens up to 1,024 bytes, strong quoted ETags up to 80 bytes.
+Exceeding a bound fails before I/O or while decoding; nothing is truncated.
+
+This subset is the **pos3ql S3 compatibility profile v1**. It selects existing
+S3 behavior; it is not a new wire protocol. It freezes:
+
+- HTTP methods, request targets, query parameters and required headers;
+- canonical-request construction and Signature Version 4 inputs;
+- virtual-hosted and path-style addressing;
+- successful response headers and XML list bodies;
+- structured XML errors, HTTP status mapping and retry classification;
+- conditional-write, range, pagination, deletion and consistency semantics;
+- configuration fields and their meaning at the client boundary.
+
+Changing any item requires a new profile version, updated fixtures and
+qualification against every required endpoint.
 
 ### Preventing an old server from overwriting a replacement
 
 The `writer-fence` object records which process may write. For example, after
 you replace a failed primary, that primary must not overwrite newer commits if
-it later reconnects. Compare-and-swap (CAS) means updating a reference only if
-its stored generation still matches the one read earlier.
+it reconnects. Compare-and-swap (CAS) means updating an object only if its
+stored generation still matches the one read earlier.
 
-Promotion first marks ownership as changing, updates the commit head and
-checkpoint manifest with the replacement's identity, then activates that
-identity. The commit head names recoverable commits; the manifest names the
-checkpoint's saved objects. A delayed old request either lands before the
-replacement updates its root and is preserved, or fails because the generation
-has changed. Uploaded objects without a successful root update cannot become
-confirmed commits. [Durable formats](durable-format.md#format-details-for-implementers)
-specifies empty roots, writer identities, conflict handling, and upgrade rules.
+Promotion marks ownership as changing, updates the commit head and checkpoint
+manifest with the replacement's identity, then activates it. The commit head
+names recoverable commits; the manifest names a checkpoint's saved objects.
+A delayed request from the old server either lands before the replacement
+updates its root (and is preserved) or fails because the generation changed.
+Uploaded objects without a successful root update never become confirmed
+commits. [Durable formats](durable-format.md#format-details-for-implementers)
+specify the roots and conflict rules.
 
-After an ownership check detects a replacement, new SQL work is rejected with
-SQLSTATE `40001` before another commit enters the journal; rollback remains
-available. An operation already awaiting publication has a different outcome:
-if durability cannot be confirmed, the server sends a terminal `08007` error,
-flushes it before closing the connection, and retains the transaction for
-recovery. Reconnect and check the order before trying to save it again.
+After a server detects that it was replaced, new SQL work fails with SQLSTATE
+`40001` before entering the journal; rollback still works. A commit already
+being published gets the terminal `08007` error described above.
 
-Profile v1 accepts S3's 1,024-byte object-key limit, opaque continuation tokens
-up to 1,024 bytes, and strong quoted ETags up to 80 bytes. Exceeding a fixed
-profile bound fails before I/O or while decoding; it never truncates a key,
-token, validator, or signed request.
+## Timeouts and retries
 
-This subset is the **pos3ql S3 compatibility profile v1**. It selects existing
-S3-compatible protocol behavior; it does not define a pos3ql wire protocol.
-The profile freezes:
+| Behavior | Value |
+|---|---|
+| Read deadline | 30 seconds per request. |
+| Upload deadline | 30 seconds per attempt. |
+| Attempts | At most 3 for retryable failures, with 200 ms then 400 ms backoff. |
+| `object_store_hedge_after_ms` | If nonzero, a read still pending after this many milliseconds is also sent on a spare read slot; the first response wins. Default `0` (off). |
 
-- HTTP methods, request targets, query parameters, and required headers;
-- canonical-request construction and Signature Version 4 inputs;
-- virtual-hosted and path-style addressing;
-- successful response headers and XML list bodies;
-- structured XML errors, HTTP status mapping, and retry classification;
-- conditional-write, range, pagination, deletion, and consistency semantics;
-- configuration fields and their meaning at the object-client boundary.
+Retries apply only to typed retryable outcomes and resend the same conditional
+request; they never switch to different semantics. If a conditional create
+fails because the object exists, pos3ql compares the entire stored object,
+including its length, before accepting it as an earlier attempt's success.
+A different mutable root remains a writer conflict. Retrying a `DELETE` whose
+response was lost is safe. Background cleanup that fails keeps its position
+and retries on the normal one-second maintenance cadence.
 
-Changing any item requires an explicit profile-version change, compatibility
-analysis, updated fixtures, and qualification against every required endpoint.
-Implementation refactors must not change the profile.
+## Concurrency and fixed capacity
 
-## Portability invariants
+All request clients and buffers are reserved at startup; exhaustion is a named
+error, never a growing pool.
 
-- The provider-neutral `block store` is an internal database interface, not a
-  new network protocol.
-- The production binary talks directly to a qualified S3-compatible endpoint.
-- One client implementation and configuration model serves every qualified
-  endpoint. There are no vendor adapters or fallback protocols.
-- Object-store differences are admitted only when they preserve the required
-  S3-compatible semantics. Unsupported behavior fails at startup or at the
-  request boundary.
-- Bucket administration, identity provisioning, credential discovery, and
-  other provider control-plane operations remain outside pos3ql.
+| Setting | Reservation or rule |
+|---|---|
+| `object_store_get_slots` | Read clients; at least 1 in durable mode. |
+| `object_store_put_slots` | Journal upload clients; at least 2 in durable mode. A commit's transaction bytes and descriptor upload in parallel; the commit head updates after both succeed. |
+| `object_store_block_put_slots` | Row and index file upload clients; at least 1 in durable mode. Each reserves one 256 KiB body. |
+| `wal_upload_buffer_bytes` | Immutable body bytes per journal upload slot; must be at least `wal_buffer_bytes`. |
+| `commit_queue_slots` | Commits retained through asynchronous publication; at least 1 in durable mode. |
+| `checkpoint_manifest_bytes` | Size of each of three manifest buffers (scratch, retained, upload body). |
+| `checkpoint_write_entries` | Committed versions in one table output schedule. |
+| `checkpoint_garbage_batch_objects` | Objects deleted per cleanup batch. A pacing unit, not a namespace limit; file-cleanup listings read up to `min(value, 1000)` keys per page. |
+| `object_store_head_bytes`, `object_store_response_bytes` | Response header and body buffers per client. |
+| `tls_pool_bytes` | Object-store TLS base. Startup adds 128 KiB for each of two transports per subscription worker, and 128 KiB per server connection when server TLS is on. |
+| `disk_cache_bytes` | Disk-cache file size, plus RAM for its slot directory, index and one 256 KiB scratch buffer. |
 
-## Transport and authentication
+Separate startup-reserved clients serve atomic metadata operations, manifest
+upload, credential validation (one client, 128-byte body, when
+`object_store_credentials_file` is set), the operational ownership check (one
+client plus one receipt slot per `operations_max_connections`), journal cleanup
+and saved-file cleanup. Disabled cache tiers reserve no memory; with
+`object_store = off`, no object-store cache is built.
 
-**User example:** when temporary storage credentials expire, install their
-replacement while both credentials still work, then reload. A rejected
-replacement keeps the installed credential but makes readiness fail so routing
-can stop until the problem is corrected.
+An exhausted commit queue, log buffer or `checkpoint_write_entries` returns
+SQLSTATE `54000` naming the setting. Exhausted live-set or recovery-chain
+capacity fails with the setting's name and never weakens retention. The
+development fixture uses 4 slots each for reads, journal uploads, file uploads
+and the commit queue; size them explicitly for a deployment.
 
-The direct client uses HTTP over TLS, S3 virtual-hosted or path-style bucket
-addressing, and S3 Signature Version 4 as the shared request-signing
-protocol. Configuration supplies an endpoint, region/signing scope, bucket,
-and either direct credentials or an owner-only `object_store_credentials_file`.
-The file contains strict `access_key`, `secret_key`, and optional
-`session_token` entries. Credential discovery through a vendor SDK, instance
-metadata service, or provider control plane is outside the engine.
+While a request waits on the network, the SQL worker serves other connections.
+For example, reading a cached invoice continues while another connection's
+commit uploads, and while cleanup lists or deletes old files. Two behaviors are
+worth knowing:
 
-Credential reload validates the candidate through a conditional writer-fence
-renewal before installing it. Failure retains the installed credential and
-marks readiness false. Follow the atomic replacement and overlapping-validity
-procedure in [operations](operations.md#object-store-credential-rotation).
+- A large single-table `SELECT` (no sorting, grouping, joins or subqueries)
+  resumes row by row: a cold block after delivered rows yields like any other
+  download. Other large results, once their first bytes have reached the
+  client, finish their remaining reads synchronously, because a sent prefix
+  cannot be withdrawn. Rows the client has not yet read never hold the worker;
+  resuming more result shapes is
+  [planned work](../PLAN.md#pause-and-resume-every-query-path).
+- Setting both caches to zero does not evict rows already in memory: an
+  `INSERT` followed by `SELECT` can return the row without a download. To test
+  cold reads, make the writes durable, then restart in durable mode with an
+  empty `data_dir`.
 
-Request slots, signing state, retry state, response headers, XML list/error
-decoding, and page buffers are fixed at startup. Retries are limited to typed
-retryable outcomes and preserve conditional-request identity; they are not a
-fallback to different semantics or another provider API.
+## Transport and credentials
 
-Checkpoint maintenance uses the same provider-neutral list and delete contract.
-Cold commit-chain replay, live-block retention, SST-pair merge scratch, and
-garbage deletion batches have independent startup capacities. A garbage batch
-is a pacing unit, not a namespace-size limit: automatic checkpoints continue it
-between statements, while an explicit checkpoint returns only after all listed
-obsolete objects are deleted. Live-set or recovery-chain exhaustion fails with
-the corresponding configuration name and never weakens retention.
+The client uses HTTP over TLS (`object_store_tls = on`), virtual-hosted or
+path-style addressing (`object_store_addressing`), and S3 Signature Version 4.
+Configure:
 
-Backups and independent-prefix exports use the same protocol and fixed
-capacities. Backup roots extend the live set and commit-retention floor;
-capacity exhaustion stops cleanup before deletion. Export streams immutable
-objects through bounded ranged GETs and conditional PUTs, with pending markers
-that prevent startup from observing an incomplete destination. The full
-retention, retry, and publication contract is in [backup and restore](backup-restore.md).
+- `object_store_endpoint`, `object_store_region` (signing scope),
+  `object_store_bucket`, `object_store_prefix`;
+- `object_store_tls_ca_file` for a private certificate authority;
+- credentials, either inline (`object_store_access_key`,
+  `object_store_secret_key`, optional `object_store_session_token`) or,
+  preferably, an owner-only `object_store_credentials_file` with strict
+  `access_key`, `secret_key` and optional `session_token` entries.
+
+pos3ql does not discover credentials through a vendor SDK, instance metadata
+service or provider control plane.
+
+**User example:** when temporary credentials expire, install their replacement
+while both still work, then reload. Reload validates the candidate with a
+conditional writer-fence renewal before installing it. A rejected candidate
+leaves the installed credential in place and makes readiness fail, so routing
+can stop until the problem is fixed. In-flight repeatable requests restart from
+the same position with the new credential. See
+[operations](operations.md#object-store-credential-rotation) for the procedure.
+
+Backups and exports use the same client and capacities; see
+[backup and restore](backup-restore.md).
 
 ## Qualification
 
-CI tests MinIO and SeaweedFS as two independent S3 implementations, plus a
-deterministic fixture for exact requests and failures. Those services run on
-the test machine. The same executable can test a separately operated endpoint;
-that deployment evidence is still required by [the plan](../PLAN.md).
+CI runs two independent S3 implementations, MinIO and SeaweedFS, pinned by
+image digest and running on the test machine, plus a deterministic fixture for
+exact requests and failures:
 
-The checks are:
-
-1. Golden-wire tests compare exact requests, canonical signing inputs, parsed
-   responses, pagination, error mapping, TLS transport, and retry behavior with
-   checked-in profile-v1 fixtures.
-2. The black-box durability suite runs the production client against two
-   independently implemented, pinned S3-compatible servers. It proves
-   conditional create and compare-and-swap, opaque ETag handling, full and
+1. **Golden-wire tests** compare exact requests, signing inputs, parsed
+   responses, pagination, error mapping, TLS transport and retries with
+   checked-in profile-v1 fixtures. A fixture change is a reviewed profile
+   change, not a way to make a behavior change pass.
+2. **Black-box durability suite** runs the production client against both
+   servers: conditional create and compare-and-swap, opaque ETags, full and
    ranged reads, prefix listing, idempotent deletion, signing, commit-batch
    recovery, delta-checkpoint carry-forward, and cold start with both local
-   caches absent. The deterministic profile fixture forces multi-page listing
-   through the same qualification executable.
-3. The identical qualification executable can also target independently operated
-   S3-compatible endpoints when credentials are available. It contains no
-   provider selection or provider-specific expectations. This optional run is
-   not evidence supplied by the local MinIO and SeaweedFS CI jobs; representative
-   independent-service qualification remains on the roadmap.
-
-For example:
+   caches absent. The deterministic fixture forces multi-page listing.
+3. **External endpoints.** The same executable, with no provider-specific
+   expectations, can target a separately operated endpoint:
 
 ```sh
 POS3QL_OBJECT_STORE_ENDPOINT=objects.example:443 \
@@ -406,14 +232,12 @@ Set `POS3QL_OBJECT_STORE_SESSION_TOKEN` for temporary credentials,
 `POS3QL_OBJECT_STORE_ADDRESSING=virtual_hosted` when required, and
 `POS3QL_OBJECT_STORE_TLS_CA_FILE` for a private certificate authority.
 
-CI architecture guards enforce the profile request and authentication boundary
-and reject vendor SDK dependencies, provider-named branches or configuration,
-and fallbacks that change protocol semantics.
+The CI services share a host with the tests, so they prove portability across
+implementations, not behavior of a separately operated service. That evidence
+is part of [qualifying production deployment](../PLAN.md#qualify-production-deployment).
 
-Passing that suite is the admission criterion. Marketing an API as
-"S3-compatible" is not sufficient. A fixture change cannot be used merely to
-make a behavior change pass: it is a reviewed compatibility-profile change.
-No S3 request, XML, signing, bucket, region, credential, or endpoint type
-escapes into commit publication, checkpointing, caching, SQL, or other database
-code. The in-process deterministic simulator remains a test implementation of
-the internal block-store interface; it is not a network service.
+CI architecture guards reject vendor SDK dependencies, provider-named branches
+or settings, and fallbacks that change protocol semantics. No S3 request, XML,
+signing, bucket or credential type reaches commit publication, checkpointing,
+caching or SQL code. The in-process simulator (`object_store = sim`) is a test
+implementation of the internal block-store interface, not a network service.

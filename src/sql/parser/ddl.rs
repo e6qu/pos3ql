@@ -30,15 +30,16 @@ use crate::sql::ast::{
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationDescendants,
     PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
-    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind,
-    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
-    RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression, StatisticsKey,
-    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
-    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
-    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod,
-    TableMembership, TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource,
-    TextSearchObjectKind, TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity,
-    TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
+    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType,
+    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
+    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
+    TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
+    TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -264,7 +265,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("to")?;
             AlterEventTriggerAction::Rename(self.col_ident("new event trigger name")?)
         } else {
-            return Err(self.err_here("expected an ALTER EVENT TRIGGER action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterEventTrigger { name, action })
     }
@@ -405,7 +406,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("read_write")? {
             Ok(AggregateFinalModify::ReadWrite)
         } else {
-            Err(self.unexpected("expected READ_ONLY, SHAREABLE, or READ_WRITE"))
+            Err(self.syntax_error_here())
         }
     }
 
@@ -577,7 +578,7 @@ impl<'a> Parser<'a> {
                 self.aggregate_option_equals()?;
                 let operator = match self.peeked {
                     Tok::Ident(value) | Tok::Op(value) => value,
-                    _ => return Err(self.unexpected("expected an operator")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 self.advance()?;
                 options.sort_operator = Some(operator);
@@ -593,14 +594,14 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("unsafe")? {
                     RoutineParallel::Unsafe
                 } else {
-                    return Err(self.unexpected("expected SAFE, RESTRICTED, or UNSAFE"));
+                    return Err(self.syntax_error_here());
                 });
             } else if self.eat_ident("hypothetical")? {
                 if options.hypothetical.replace(true).is_some() {
                     return Err(self.duplicate_aggregate_option("HYPOTHETICAL"));
                 }
             } else {
-                return Err(self.unexpected("expected an aggregate option"));
+                return Err(self.syntax_error_here());
             }
             if self.eat_op(")")? {
                 break;
@@ -820,7 +821,7 @@ impl<'a> Parser<'a> {
                 enabled,
             }
         } else {
-            return Err(self.err_here("expected an ALTER INDEX action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterIndex {
             name,
@@ -1081,14 +1082,14 @@ impl<'a> Parser<'a> {
                     self.any_qual_name("text search configuration name")?,
                 )
             } else {
-                return Err(self.err_here("expected PARSER or COPY"));
+                return Err(self.syntax_error_here());
             };
             self.expect_op(")")?;
             return Ok(Stmt::CreateTextSearchConfiguration(
                 CreateTextSearchConfiguration { name, source },
             ));
         }
-        Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"))
+        Err(self.syntax_error_here())
     }
 
     pub(super) fn foreign_options(&mut self) -> Result<&'a [ForeignOption<'a>], ParseError> {
@@ -1302,7 +1303,7 @@ impl<'a> Parser<'a> {
                 &[]
             };
             if handler.is_none() && validator.is_none() && options.is_empty() {
-                return Err(self.err_here("expected a foreign-data wrapper alteration"));
+                return Err(self.syntax_error_here());
             }
             AlterForeignDataWrapperAction::Definition {
                 handler,
@@ -1337,7 +1338,7 @@ impl<'a> Parser<'a> {
                 &[]
             };
             if version.is_none() && options.is_empty() {
-                return Err(self.err_here("expected a foreign server alteration"));
+                return Err(self.syntax_error_here());
             }
             AlterForeignServerAction::Definition { version, options }
         };
@@ -1418,7 +1419,7 @@ impl<'a> Parser<'a> {
                 return self.create_view(true, persistence);
             }
             if persistence != RelationPersistence::Permanent {
-                return Err(self.err_here("expected VIEW after CREATE OR REPLACE TEMPORARY"));
+                return Err(self.syntax_error_here());
             }
             if self.eat_ident("function")? {
                 return self.create_routine(source_position, true, true);
@@ -1443,9 +1444,7 @@ impl<'a> Parser<'a> {
                 }
                 return self.create_language(true, trusted);
             }
-            return Err(self.unexpected(
-                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, TRANSFORM, or TRIGGER after CREATE OR REPLACE",
-            ));
+            return Err(self.syntax_error_here());
         }
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
@@ -1594,7 +1593,7 @@ impl<'a> Parser<'a> {
         let persistence = if let Some(scope) = temporary_scope {
             if !(self.eat_ident("temporary")? || self.eat_ident("temp")?) {
                 let _ = scope;
-                return Err(self.err_here("expected TEMPORARY or TEMP after GLOBAL or LOCAL"));
+                return Err(self.syntax_error_here());
             }
             RelationPersistence::Temporary
         } else if self.eat_ident("unlogged")? {
@@ -1630,6 +1629,8 @@ impl<'a> Parser<'a> {
                     method
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             })
         }
     }
@@ -1804,7 +1805,7 @@ impl<'a> Parser<'a> {
                 }
                 to_sql = Some(self.transform_function()?);
             } else {
-                return Err(self.err_here("expected FROM SQL or TO SQL transform function"));
+                return Err(self.syntax_error_here());
             }
             if !self.eat_op(",")? {
                 break;
@@ -1885,6 +1886,8 @@ impl<'a> Parser<'a> {
                         "custom selectivity functions are not supported by the bounded planner"
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             } else {
                 return Err(self.err_here("invalid CREATE OPERATOR option"));
@@ -1960,6 +1963,8 @@ impl<'a> Parser<'a> {
                                 "btree ordering operators are not supported in a search operator class"
                             ),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                     self.expect_ident("search")?;
@@ -2035,6 +2040,8 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"commutator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     } else if self.eat_ident("negator")? {
                         return Err(ParseError {
@@ -2044,6 +2051,8 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"negator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     } else if self.eat_ident("hashes")? {
                         return Err(ParseError {
@@ -2053,6 +2062,8 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"hashes\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     } else if self.eat_ident("merges")? {
                         return Err(ParseError {
@@ -2062,6 +2073,8 @@ impl<'a> Parser<'a> {
                                 "operator attribute \"merges\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     } else if self.eat_ident("restrict")? {
                         self.expect_op("=")?;
@@ -2077,6 +2090,8 @@ impl<'a> Parser<'a> {
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                                cursor: None,
+                                hint: None,
                             });
                         }
                         selectivity_reset.restrict = true;
@@ -2094,6 +2109,8 @@ impl<'a> Parser<'a> {
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                                cursor: None,
+                                hint: None,
                             });
                         }
                         selectivity_reset.join = true;
@@ -2108,7 +2125,7 @@ impl<'a> Parser<'a> {
                 AlterOperatorAction::ResetSelectivity(selectivity_reset)
             }
         } else {
-            return Err(self.err_here("expected OWNER TO or SET in ALTER OPERATOR"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterOperator { identity, action })
     }
@@ -2128,6 +2145,8 @@ impl<'a> Parser<'a> {
                             "btree ordering operators are not supported in a search operator family"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 self.expect_ident("search")?;
@@ -2295,7 +2314,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("VALIDATOR specified more than once"));
                 }
             } else {
-                return Err(self.unexpected("language option"));
+                return Err(self.syntax_error_here());
             }
         }
         Ok(Stmt::CreateLanguage(crate::sql::ast::CreateLanguage {
@@ -2322,6 +2341,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "invalid extension version name: {}", version),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         self.advance()?;
@@ -2357,7 +2378,7 @@ impl<'a> Parser<'a> {
                 }
                 cascade = true;
             } else {
-                return Err(self.unexpected("expected SCHEMA, VERSION, or CASCADE"));
+                return Err(self.syntax_error_here());
             }
         }
         Ok(Stmt::CreateExtension {
@@ -2371,7 +2392,8 @@ impl<'a> Parser<'a> {
 
     pub(super) fn routine_identity(&mut self) -> Result<RoutineIdentity<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_types =
+            [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0usize;
         let signature_is_explicit = self.eat_op("(")?;
         if signature_is_explicit && !self.eat_op(")")? {
@@ -2410,7 +2432,9 @@ impl<'a> Parser<'a> {
     /// Parses the identity-bearing portion of one routine argument. OUT-only
     /// arguments are consumed but excluded from the declared signature; the
     /// returned type has already crossed the ordinary typed-name boundary.
-    pub(super) fn routine_identity_argument(&mut self) -> Result<(&'a str, bool), ParseError> {
+    pub(super) fn routine_identity_argument(
+        &mut self,
+    ) -> Result<(RoutineArgumentType<'a>, bool), ParseError> {
         let input = match self.peeked {
             Tok::Ident("out") | Tok::Ident("table") => {
                 self.advance()?;
@@ -2424,8 +2448,8 @@ impl<'a> Parser<'a> {
         };
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
-        let candidate_type = self.type_name()?;
-        let argument_type = if matches!(
+        let candidate_type = self.routine_identity_type()?;
+        let (name, _, written) = if matches!(
             self.peeked,
             Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
         ) {
@@ -2435,9 +2459,52 @@ impl<'a> Parser<'a> {
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
             let _ = self.type_function_ident("routine argument name")?;
-            self.type_name()?
+            self.routine_identity_type()?
         };
-        Ok((argument_type, input))
+        let spelled = if written.schema.is_none() && !written.array {
+            written.name
+        } else {
+            let text = stack_format!(
+                264,
+                "{}{}{}{}",
+                written.schema.unwrap_or(""),
+                if written.schema.is_some() { "." } else { "" },
+                written.name,
+                if written.array { "[]" } else { "" }
+            );
+            self.arena
+                .alloc_str(text.as_str())
+                .map_err(|_| self.err_here("type name too long"))?
+        };
+        Ok((
+            RoutineArgumentType {
+                name,
+                schema: written.schema,
+                written: spelled,
+            },
+            input,
+        ))
+    }
+
+    /// A routine identity argument type. PostgreSQL accepts and ignores
+    /// `SETOF` here.
+    fn routine_identity_type(
+        &mut self,
+    ) -> Result<(&'a str, i32, super::WrittenTypeName<'a>), ParseError> {
+        if self.peeked == Tok::Ident("setof") {
+            let mark = self.lexer.mark();
+            let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+            self.advance()?;
+            if matches!(
+                self.peeked,
+                Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
+            ) {
+                self.lexer.reset(mark);
+                self.peeked = saved_peeked;
+                self.peek_at = saved_peek_at;
+            }
+        }
+        self.type_name_written()
     }
 
     fn extension_member(&mut self) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
@@ -2514,6 +2581,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "unsupported extension member object kind"),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
+            hint: None,
         })
     }
 
@@ -2575,6 +2644,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "unrecognized statistics kind \"{}\"", kind),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
+                        hint: None,
                     });
                 };
                 if !fresh {
@@ -2586,6 +2657,8 @@ impl<'a> Parser<'a> {
                             kind
                         ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -2679,7 +2752,7 @@ impl<'a> Parser<'a> {
                 AlterStatisticsAction::SetTarget(target)
             }
         } else {
-            return Err(self.err_here("expected OWNER, RENAME, or SET after ALTER STATISTICS"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterStatistics { name, action })
     }
@@ -2734,6 +2807,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -2760,6 +2835,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             };
             if core::mem::replace(target, true) {
@@ -2912,6 +2989,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "database option {} is not supported", option),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             } else if option.eq_ignore_ascii_case("collation_version") {
                 if options
@@ -3049,7 +3128,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("version")?;
             AlterDatabaseAction::RefreshCollationVersion
         } else {
-            return Err(self.err_here("expected an ALTER DATABASE action"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterDatabase { name, action })
     }
@@ -3073,7 +3152,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             AlterTablespaceAction::ResetOptions(options)
         } else {
-            return Err(self.err_here("expected a tablespace alteration"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterTablespace { name, action })
     }
@@ -3146,7 +3225,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("delete")? {
                 Kind::Delete
             } else {
-                return Err(self.unexpected("expected ALL, SELECT, INSERT, UPDATE, or DELETE"));
+                return Err(self.syntax_error_here());
             }
         } else {
             Kind::All
@@ -3232,6 +3311,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         let name = self.col_ident("trigger name")?;
@@ -3243,7 +3324,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("of")?;
             TriggerTiming::InsteadOf
         } else {
-            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF for CREATE TRIGGER"));
+            return Err(self.syntax_error_here());
         };
         let mut events = [TriggerEvent::Insert; 4];
         let mut event_count = 0usize;
@@ -3264,6 +3345,8 @@ impl<'a> Parser<'a> {
                                     column
                                 ),
                                 sqlstate: sqlstate::DUPLICATE_COLUMN,
+                                cursor: None,
+                                hint: None,
                             });
                         }
                         self.push(&mut update_columns, column)?;
@@ -3278,8 +3361,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("truncate")? {
                 TriggerEvent::Truncate
             } else {
-                return Err(self
-                    .err_here("expected INSERT, UPDATE, DELETE, or TRUNCATE for CREATE TRIGGER"));
+                return Err(self.syntax_error_here());
             };
             if events[..event_count].contains(&event) {
                 return Err(self.err_here("trigger event specified more than once"));
@@ -3356,7 +3438,7 @@ impl<'a> Parser<'a> {
                 (Some(old), Some(new)) => TriggerTransitionTables::OldNew { old, new },
                 (Some(old), None) => TriggerTransitionTables::Old(old),
                 (None, Some(new)) => TriggerTransitionTables::New(new),
-                (None, None) => return Err(self.err_here("expected OLD TABLE or NEW TABLE")),
+                (None, None) => return Err(self.syntax_error_here()),
             }
         } else {
             TriggerTransitionTables::None
@@ -3429,7 +3511,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("execute")?;
         if !self.eat_ident("function")? && !self.eat_ident("procedure")? {
-            return Err(self.err_here("expected FUNCTION or PROCEDURE after EXECUTE"));
+            return Err(self.syntax_error_here());
         }
         let function = self.qual_name("trigger function")?;
         self.expect_op("(")?;
@@ -3444,7 +3526,7 @@ impl<'a> Parser<'a> {
                         self.advance()?;
                         value
                     }
-                    _ => return Err(self.unexpected("expected trigger argument")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 self.push(&mut arguments, argument)?;
                 if self.eat_op(")")? {
@@ -3543,6 +3625,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "only input parameters can have default values"),
                     sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    cursor: None,
+                    hint: None,
                 });
             }
             WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
@@ -3593,6 +3677,8 @@ impl<'a> Parser<'a> {
                             "VARIADIC parameter must be the last input parameter"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 if argument.mode.is_input() {
@@ -3606,6 +3692,8 @@ impl<'a> Parser<'a> {
                                 "input parameters after one with a default value must also have defaults"
                             ),
                             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                 }
@@ -3620,6 +3708,8 @@ impl<'a> Parser<'a> {
                             crate::storage::MAX_COLUMNS
                         ),
                         sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 arguments[count] = argument;
@@ -3651,6 +3741,8 @@ impl<'a> Parser<'a> {
                             "OUT and INOUT arguments cannot be used with RETURNS TABLE"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 self.expect_op("(")?;
@@ -3669,6 +3761,8 @@ impl<'a> Parser<'a> {
                                 columns.len()
                             ),
                             sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                     columns[column_count] = RoutineResultColumn {
@@ -3697,7 +3791,9 @@ impl<'a> Parser<'a> {
                 }
             } else {
                 if !has_returns {
-                    return Err(self.unexpected("RETURNS clause or OUT parameters"));
+                    return Err(
+                        self.invalid_function_definition("function result type must be specified")
+                    );
                 }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
@@ -3725,7 +3821,7 @@ impl<'a> Parser<'a> {
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             if self.eat_ident("language")? {
                 if language.is_some() {
-                    return Err(self.unexpected("one LANGUAGE clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 language = Some(if self.eat_ident("sql")? {
                     crate::sql::ast::RoutineLanguage::Sql
@@ -3741,11 +3837,13 @@ impl<'a> Parser<'a> {
                             unsupported
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 });
             } else if self.eat_ident("as")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one AS clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 let source = self.str_literal("function body")?;
                 if self.eat_op(",")? {
@@ -3757,12 +3855,14 @@ impl<'a> Parser<'a> {
                             "native-library routine bodies are not supported"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 body = Some(crate::sql::ast::RoutineBody::String(source));
             } else if self.eat_ident("return")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one routine body"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 let start = self.peek_at;
                 let _ = self.expression(0)?;
@@ -3771,7 +3871,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("begin")? {
                 if body.is_some() {
-                    return Err(self.unexpected("one routine body"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 self.expect_ident("atomic")?;
                 let start = self.peek_at;
@@ -3782,7 +3882,7 @@ impl<'a> Parser<'a> {
                         break end;
                     }
                     if self.peeked == Tok::Eof {
-                        return Err(self.unexpected("END"));
+                        return Err(self.syntax_error_here());
                     }
                     let _ = self.statement()?;
                     self.expect_op(";")?;
@@ -3793,7 +3893,7 @@ impl<'a> Parser<'a> {
                 ));
             } else if self.eat_ident("strict")? {
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -3803,7 +3903,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = true;
@@ -3812,31 +3912,31 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 self.expect_ident("input")?;
                 if strict_seen {
-                    return Err(self.unexpected("one null-input clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 strict_seen = true;
                 attributes.strict = false;
             } else if self.eat_ident("immutable")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Immutable;
             } else if self.eat_ident("stable")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Stable;
             } else if self.eat_ident("volatile")? {
                 if volatility_seen {
-                    return Err(self.unexpected("one volatility clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 volatility_seen = true;
                 attributes.volatility = crate::sql::ast::RoutineVolatility::Volatile;
             } else if self.eat_ident("parallel")? {
                 if parallel_seen {
-                    return Err(self.unexpected("one PARALLEL clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 parallel_seen = true;
                 attributes.parallel = if self.eat_ident("safe")? {
@@ -3849,7 +3949,7 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("security")? {
                 if security_seen {
-                    return Err(self.unexpected("one SECURITY clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -3861,7 +3961,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("external")? {
                 self.expect_ident("security")?;
                 if security_seen {
-                    return Err(self.unexpected("one SECURITY clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 security_seen = true;
                 attributes.security_definer = if self.eat_ident("definer")? {
@@ -3872,20 +3972,20 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_ident("leakproof")? {
                 if leakproof_seen {
-                    return Err(self.unexpected("one LEAKPROOF clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = true;
             } else if self.eat_ident("not")? {
                 self.expect_ident("leakproof")?;
                 if leakproof_seen {
-                    return Err(self.unexpected("one LEAKPROOF clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 leakproof_seen = true;
                 attributes.leakproof = false;
             } else if self.eat_ident("cost")? {
                 if cost_seen {
-                    return Err(self.unexpected("one COST clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 cost_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -3900,7 +4000,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
             } else if self.eat_ident("rows")? {
                 if rows_seen {
-                    return Err(self.unexpected("one ROWS clause"));
+                    return Err(self.err_here("conflicting or redundant options"));
                 }
                 rows_seen = true;
                 let Tok::Num(raw) = self.peeked else {
@@ -3918,18 +4018,24 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "user-defined window functions are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             } else if self.eat_ident("transform")? {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "routine transforms are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             } else if self.eat_ident("support")? {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "planner support functions are not supported"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             } else if self.eat_ident("set")? {
                 let config_name = self.configuration_parameter_name()?;
@@ -3958,10 +4064,11 @@ impl<'a> Parser<'a> {
                     config_count += 1;
                 }
             } else {
-                return Err(self.unexpected("routine option"));
+                return Err(self.syntax_error_here());
             }
         }
-        let language = language.ok_or_else(|| self.unexpected("LANGUAGE clause"))?;
+        let language =
+            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql
@@ -3970,6 +4077,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
                 sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                cursor: None,
+                hint: None,
             });
         }
         if !function
@@ -3980,7 +4089,7 @@ impl<'a> Parser<'a> {
                 || cost_seen
                 || rows_seen)
         {
-            return Err(self.unexpected("procedure option"));
+            return Err(self.syntax_error_here());
         }
         if attributes.rows.is_some()
             && !matches!(
@@ -4001,6 +4110,8 @@ impl<'a> Parser<'a> {
                     "ROWS is not applicable when function does not return a set"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if matches!(
@@ -4025,6 +4136,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "PL/pgSQL function execution is not supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
@@ -4036,7 +4149,8 @@ impl<'a> Parser<'a> {
             language,
             attributes,
             configs: self.arena_slice(&configs[..config_count])?,
-            body: body.ok_or_else(|| self.unexpected("routine body"))?,
+            body: body
+                .ok_or_else(|| self.invalid_function_definition("no function body specified"))?,
         }))
     }
 
@@ -4128,10 +4242,10 @@ impl<'a> Parser<'a> {
             });
         }
         let Some(role) = role else {
-            return Err(self.unexpected("expected SET or RESET for ALTER ROLE ALL"));
+            return Err(self.syntax_error_here());
         };
         if database.is_some() {
-            return Err(self.unexpected("expected SET or RESET after IN DATABASE"));
+            return Err(self.syntax_error_here());
         }
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
@@ -4143,7 +4257,7 @@ impl<'a> Parser<'a> {
         let _ = self.eat_ident("with")?;
         let options = self.role_options()?;
         if options == RoleOptions::EMPTY {
-            return Err(self.unexpected("expected a role option"));
+            return Err(self.syntax_error_here());
         }
         Ok(Stmt::AlterRole { role, options })
     }
@@ -4184,7 +4298,7 @@ impl<'a> Parser<'a> {
                 new_name: self.any_ident("new group name")?,
             });
         }
-        Err(self.unexpected("expected ADD USER, DROP USER, or RENAME TO"))
+        Err(self.syntax_error_here())
     }
 
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
@@ -4230,7 +4344,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("limit")?;
             let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
-                return Err(self.unexpected("expected connection limit"));
+                return Err(self.syntax_error_here());
             };
             let parsed = raw
                 .parse::<i32>()
@@ -4243,7 +4357,7 @@ impl<'a> Parser<'a> {
         } else if allow_sysid && self.eat_ident("sysid")? {
             let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
-                return Err(self.unexpected("expected SYSID"));
+                return Err(self.syntax_error_here());
             };
             let parsed = raw
                 .parse::<i32>()
@@ -4263,6 +4377,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
@@ -4305,6 +4421,8 @@ impl<'a> Parser<'a> {
                         crate::pg::auth::SCRAM_SALT_MAX
                     ),
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -4422,7 +4540,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("drop")? {
                     crate::sql::ast::OnCommitAction::Drop
                 } else {
-                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                    return Err(self.syntax_error_here());
                 };
                 has_on_commit = true;
             } else {
@@ -4472,6 +4590,7 @@ impl<'a> Parser<'a> {
         let mut default_text = None;
         let mut checks = ArenaList::new(self.arena);
         loop {
+            let constraint_at = self.peek_at;
             let cname = if self.eat_ident("constraint")? {
                 Some(self.col_ident("constraint name")?)
             } else {
@@ -4481,13 +4600,15 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 match nullability {
                     DomainNullability::Nullable => {
-                        return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                        return Err(self.conflicting_domain_nullability(constraint_at));
                     }
                     DomainNullability::NotNull { .. } => {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(96, "redundant NOT NULL constraint definition"),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                     DomainNullability::Unspecified => {}
@@ -4501,12 +4622,14 @@ impl<'a> Parser<'a> {
                             "not-null constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 nullability = DomainNullability::NotNull { name: cname };
             } else if self.eat_ident("null")? {
                 if matches!(nullability, DomainNullability::NotNull { .. }) {
-                    return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                    return Err(self.conflicting_domain_nullability(constraint_at));
                 }
                 nullability = DomainNullability::Nullable;
             } else if self.eat_ident("check")? {
@@ -4524,6 +4647,8 @@ impl<'a> Parser<'a> {
                             "check constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 self.push(&mut checks, check)?;
@@ -4535,7 +4660,7 @@ impl<'a> Parser<'a> {
                 let _ = self.column_default_expression()?;
                 default_text = Some(self.text[start..self.peek_at].trim_end());
             } else if cname.is_some() {
-                return Err(self.err_here("expected NOT NULL or CHECK after CONSTRAINT"));
+                return Err(self.syntax_error_here());
             } else {
                 break;
             }
@@ -4642,9 +4767,7 @@ impl<'a> Parser<'a> {
                 AlterDomainAction::Rename(self.col_ident("new domain name")?)
             }
         } else {
-            return Err(
-                self.err_here("expected ADD, DROP, RENAME, SET or VALIDATE after ALTER DOMAIN")
-            );
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterDomain { name, action })
     }
@@ -4843,12 +4966,10 @@ impl<'a> Parser<'a> {
                     cascade,
                 }
             } else {
-                return Err(self.err_here("expected SET DATA TYPE after ALTER ATTRIBUTE"));
+                return Err(self.syntax_error_here());
             }
         } else {
-            return Err(
-                self.err_here("expected composite attribute or enum action after ALTER TYPE")
-            );
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterType { name, action })
     }
@@ -5015,15 +5136,13 @@ impl<'a> Parser<'a> {
         }
         match self.peeked {
             Tok::Num(text) => {
-                let magnitude: i128 = text
-                    .parse()
-                    .map_err(|_| self.unexpected("expected an integer"))?;
+                let magnitude: i128 = text.parse().map_err(|_| self.syntax_error_here())?;
                 self.advance()?;
                 let value = if negative { -magnitude } else { magnitude };
                 i64::try_from(value)
                     .map_err(|_| self.unexpected("sequence option value out of range for bigint"))
             }
-            _ => Err(self.unexpected("expected an integer")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -5082,7 +5201,7 @@ impl<'a> Parser<'a> {
                         options.cycle = Some(false);
                     }
                 } else {
-                    return Err(self.err_here("expected an identity sequence option"));
+                    return Err(self.syntax_error_here());
                 }
             }
         }
@@ -5162,7 +5281,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             let Some(n) = name else {
-                return Err(self.err_here("expected schema name or AUTHORIZATION"));
+                return Err(self.syntax_error_here());
             };
             SchemaName::Explicit(n)
         };
@@ -5296,6 +5415,8 @@ impl<'a> Parser<'a> {
                     "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         Ok(Stmt::CreateSchema {
@@ -5371,6 +5492,8 @@ impl<'a> Parser<'a> {
                         method
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             }
         } else {
@@ -5519,11 +5642,7 @@ impl<'a> Parser<'a> {
     ) -> Result<crate::sql::ast::IndexOperatorClassOptions<'a>, ParseError> {
         let mut options = crate::sql::ast::IndexOperatorClassOptions::DEFAULT;
         if self.peeked == Tok::Op(")") {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: crate::util::StackStr::from_str("syntax error at or near \")\""),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         loop {
             let option = self.any_ident("operator class parameter")?;
@@ -5536,7 +5655,7 @@ impl<'a> Parser<'a> {
                 }
                 let raw = match self.peeked {
                     Tok::Num(raw) | Tok::Str(raw) => raw,
-                    _ => return Err(self.err_here("expected an integer")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 let value = raw
                     .parse::<u16>()
@@ -5551,6 +5670,8 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 })?);
             } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
                 if options.n_distinct_per_range.is_some() {
@@ -5578,6 +5699,8 @@ impl<'a> Parser<'a> {
                                 value
                             ),
                             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                            cursor: None,
+                            hint: None,
                         })?,
                 );
             } else if option.eq_ignore_ascii_case("false_positive_rate") {
@@ -5608,6 +5731,8 @@ impl<'a> Parser<'a> {
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 options.false_positive_rate = Some(raw);
@@ -5617,7 +5742,7 @@ impl<'a> Parser<'a> {
                 }
                 let raw = match self.peeked {
                     Tok::Num(raw) | Tok::Str(raw) => raw,
-                    _ => return Err(self.err_here("expected an integer")),
+                    _ => return Err(self.syntax_error_here()),
                 };
                 let value = raw
                     .parse::<u16>()
@@ -5628,12 +5753,16 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "value {} out of bounds for option \"siglen\"", raw),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 })?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5667,6 +5796,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "fillfactor must be between 10 and 100"),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 options.fillfactor = Some(value);
@@ -5694,6 +5825,8 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 })?;
                 self.advance()?;
                 if !(1..=131_072).contains(&value) {
@@ -5705,6 +5838,8 @@ impl<'a> Parser<'a> {
                             value
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 options.pages_per_range = Some(value);
@@ -5738,6 +5873,8 @@ impl<'a> Parser<'a> {
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 });
                 self.advance()?;
@@ -5763,6 +5900,8 @@ impl<'a> Parser<'a> {
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 })?;
                 self.advance()?;
                 if !(64..=i32::MAX as u32).contains(&value) {
@@ -5774,6 +5913,8 @@ impl<'a> Parser<'a> {
                             value
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 options.gin_pending_list_limit = Some(value);
@@ -5782,6 +5923,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5838,6 +5981,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -5876,6 +6021,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "fillfactor must be between 10 and 100"),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 options.fillfactor = Some(value);
@@ -5884,6 +6031,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5906,6 +6055,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", option),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -6010,7 +6161,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("delete")? {
             RuleEvent::Delete
         } else {
-            return Err(self.err_here("expected SELECT, INSERT, UPDATE, or DELETE rule event"));
+            return Err(self.syntax_error_here());
         };
         self.expect_ident("to")?;
         let table = self.qual_name("rule relation")?;
@@ -6045,6 +6196,8 @@ impl<'a> Parser<'a> {
                             rule_action_name(&statement)
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 let source = self.text[start..self.peek_at].trim();
@@ -6488,7 +6641,7 @@ impl<'a> Parser<'a> {
             let (tables, schemas) = self.publication_targets(false)?;
             AlterPublicationAction::DropTargets { tables, schemas }
         } else {
-            return Err(self.err_here("expected SET, ADD, or DROP after ALTER PUBLICATION"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterPublication { name, action })
     }
@@ -6569,7 +6722,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             } else {
-                return Err(self.err_here("expected TABLE or TABLES IN SCHEMA in publication"));
+                return Err(self.syntax_error_here());
             }
             if self.peeked == Tok::Ident("table") || self.peeked == Tok::Ident("tables") {
                 continue;
@@ -6784,9 +6937,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("configuration")? {
                 TextSearchObjectKind::Configuration
             } else {
-                return Err(
-                    self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION")
-                );
+                return Err(self.syntax_error_here());
             };
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -7236,7 +7387,8 @@ impl<'a> Parser<'a> {
         let mut routines = ArenaList::new(self.arena);
         loop {
             let name = self.qual_name("function name")?;
-            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_types =
+                [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0;
             let signature_is_explicit = self.eat_op("(")?;
             if signature_is_explicit && !self.eat_op(")")? {
@@ -7299,16 +7451,14 @@ impl<'a> Parser<'a> {
     pub(super) fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
         let name = self.qual_name("aggregate name")?;
         self.expect_op("(")?;
-        let mut direct = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut aggregated = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut direct_count = 0usize;
-        let mut aggregated_count = 0usize;
+        let mut arguments = [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0usize;
         let mut ordered_set = false;
         if self.eat_op("*")? {
             self.expect_op(")")?;
         } else if !self.eat_op(")")? {
             loop {
-                if self.eat_ident("order")? {
+                if !ordered_set && self.eat_ident("order")? {
                     self.expect_ident("by")?;
                     ordered_set = true;
                     if self.eat_op(")")? {
@@ -7317,22 +7467,12 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let (argument_type, input) = self.routine_identity_argument()?;
-                let target = if ordered_set {
-                    &mut aggregated
-                } else {
-                    &mut direct
-                };
-                let count = if ordered_set {
-                    &mut aggregated_count
-                } else {
-                    &mut direct_count
-                };
                 if input {
-                    if *count == target.len() {
-                        return Err(self.limit("aggregate arguments", target.len()));
+                    if count == arguments.len() {
+                        return Err(self.limit("aggregate arguments", arguments.len()));
                     }
-                    target[*count] = argument_type;
-                    *count += 1;
+                    arguments[count] = argument_type;
+                    count += 1;
                 }
                 if self.eat_op(")")? {
                     break;
@@ -7348,20 +7488,9 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
-        Ok(if ordered_set {
-            AggregateIdentity {
-                name,
-                direct_argument_types: self.arena_slice(&direct[..direct_count])?,
-                aggregated_argument_types: self.arena_slice(&aggregated[..aggregated_count])?,
-                ordered_set: true,
-            }
-        } else {
-            AggregateIdentity {
-                name,
-                direct_argument_types: &[],
-                aggregated_argument_types: self.arena_slice(&direct[..direct_count])?,
-                ordered_set: false,
-            }
+        Ok(AggregateIdentity {
+            name,
+            argument_types: self.arena_slice(&arguments[..count])?,
         })
     }
 
@@ -7405,7 +7534,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("schema")?;
             AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
         } else {
-            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterAggregate { aggregate, action })
     }
@@ -7464,7 +7593,8 @@ impl<'a> Parser<'a> {
         kind: RoutineTargetKind,
     ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
-        let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_types =
+            [RoutineArgumentType::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
         let signature_is_explicit = self.eat_op("(")?;
         if signature_is_explicit && !self.eat_op(")")? {
@@ -7613,7 +7743,7 @@ impl<'a> Parser<'a> {
         }
         let _ = self.eat_ident("restrict")?;
         if action_count == 0 {
-            return Err(self.unexpected("routine alteration action"));
+            return Err(self.syntax_error_here());
         }
         Ok(Stmt::AlterRoutine {
             kind,
@@ -7919,7 +8049,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if cons_name.is_some() {
-                    return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
+                    return Err(self.syntax_error_here());
                 }
                 self.col_ident("column name")?
             };
@@ -7969,6 +8099,7 @@ impl<'a> Parser<'a> {
             let mut generated_text = None;
             let mut identity = None;
             loop {
+                let constraint_at = self.peek_at;
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
                     Some(self.col_ident("constraint name")?)
@@ -7978,7 +8109,11 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     if null_clause == Some(false) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(
+                            constraint_at,
+                            col_name,
+                            name.name,
+                        ));
                     }
                     null_clause = Some(true);
                     not_null = true;
@@ -7994,7 +8129,11 @@ impl<'a> Parser<'a> {
                     }
                 } else if self.eat_ident("null")? {
                     if null_clause == Some(true) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(
+                            constraint_at,
+                            col_name,
+                            name.name,
+                        ));
                     }
                     null_clause = Some(false);
                     not_null = false;
@@ -8060,7 +8199,7 @@ impl<'a> Parser<'a> {
                         crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
                     }
                 } else if col_cons_name.is_some() {
-                    return Err(self.err_here("expected a column constraint after CONSTRAINT name"));
+                    return Err(self.syntax_error_here());
                 } else {
                     break;
                 }
@@ -8153,7 +8292,7 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("drop")? {
                     crate::sql::ast::OnCommitAction::Drop
                 } else {
-                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                    return Err(self.syntax_error_here());
                 };
                 has_on_commit = true;
             } else {
@@ -8232,7 +8371,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("hash")? {
             PartitionStrategy::Hash
         } else {
-            return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
+            return Err(self.syntax_error_here());
         };
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
@@ -8310,7 +8449,7 @@ impl<'a> Parser<'a> {
                     clause.comments = including;
                     clause.statistics = including;
                 }
-                _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),
+                _ => return Err(self.syntax_error_here()),
             }
             self.advance()?;
         }
@@ -8515,7 +8654,9 @@ impl<'a> Parser<'a> {
             let not_attribute = if self.peeked == Tok::Ident("not") {
                 let mut lookahead = self.lexer.clone();
                 matches!(
-                    lookahead.next_token()?,
+                    lookahead
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
                     Tok::Ident("deferrable") | Tok::Ident("enforced") | Tok::Ident("valid")
                 )
             } else {
@@ -8602,7 +8743,7 @@ impl<'a> Parser<'a> {
                 Ok(FkAction::SetDefault)
             }
         } else {
-            Err(self.err_here("expected NO ACTION, RESTRICT, CASCADE, SET NULL, or SET DEFAULT"))
+            Err(self.syntax_error_here())
         }
     }
 

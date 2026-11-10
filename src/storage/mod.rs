@@ -191,11 +191,11 @@ pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::{HeapRowRead, RowHeap};
 pub(crate) use row_images::{
-    OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
+    OrderedRowSnapshot, RowByteRead, RowSnapshot, RowVersion, TableRowSnapshot, VisibleRowHome,
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
-pub(crate) use row_reads::{RowRead, RowSelfChange};
+pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
@@ -9467,6 +9467,32 @@ impl AggregateRoutine {
 }
 
 impl RoutineKind {
+    /// PostgreSQL's `prorettype` that a SQL-language body must produce, with
+    /// `record` for a procedure that has output parameters. `None` means the
+    /// final statement is unchecked: a `void` result or a procedure without
+    /// outputs.
+    pub(crate) fn checked_body_result(
+        self,
+        result_columns: &[RoutineArgumentDef],
+        output_parameters: bool,
+    ) -> Option<RoutineResult> {
+        let result = match self {
+            Self::Function { result } | Self::SetFunction { result } => result,
+            Self::TableFunction if result_columns.len() == 1 => RoutineResult {
+                ctype: result_columns[0].ctype,
+                user_type: result_columns[0].user_type,
+            },
+            Self::RecordFunction { .. } | Self::TableFunction => {
+                RoutineResult::builtin(ColType::Record)
+            }
+            Self::Procedure if output_parameters => RoutineResult::builtin(ColType::Record),
+            Self::Procedure | Self::Trigger | Self::EventTrigger | Self::Aggregate(_) => {
+                return None;
+            }
+        };
+        (result.ctype != ColType::Void).then_some(result)
+    }
+
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),
@@ -15772,6 +15798,8 @@ pub struct Storage {
     pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// Client result output queued behind slow readers.
+    result_spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -18748,6 +18776,7 @@ impl Storage {
         let wait = match reason {
             crate::sql::StatementWait::ObjectIo => (Some("Extension"), Some("ObjectStorageRead")),
             crate::sql::StatementWait::CacheCapacity => (Some("Extension"), Some("CacheCapacity")),
+            crate::sql::StatementWait::ClientOutput => (Some("Client"), Some("ClientWrite")),
             crate::sql::StatementWait::Lock => {
                 lock_wait.map_or((None, None), |event| (Some("Lock"), Some(event)))
             }
@@ -20907,6 +20936,10 @@ impl Storage {
                 config.statistics_bytes,
                 config.statistics_leases,
             ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.result_spool_bytes,
+                config.result_spool_leases,
+            ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
             type_reference_moves::DefinitionPublication::budget_bytes(config),
@@ -21185,6 +21218,12 @@ impl Storage {
             crate::mem::lease_pool::Purpose::STATISTICS,
             config.statistics_bytes,
             config.statistics_leases,
+        )?;
+        let result_spool = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::RESULT_SPOOL,
+            config.result_spool_bytes,
+            config.result_spool_leases,
         )?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
@@ -22001,6 +22040,7 @@ impl Storage {
             execution_control,
             metadata_pool,
             statistics_pool,
+            result_spool,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -23061,6 +23101,13 @@ impl Storage {
                     && schema.visible_to(txid)
                     && schema.name_for(txid).as_str() == name
             })
+    }
+
+    /// Whether `name` is a namespace `txid` sees, including the built-in
+    /// `pg_catalog`, `information_schema` and `pg_toast`.
+    pub(crate) fn namespace_exists(&self, name: &str, txid: u32) -> bool {
+        matches!(name, "pg_catalog" | "information_schema" | "pg_toast")
+            || self.find_schema_visible(name, txid).is_some()
     }
 
     pub fn schema_def(&self, slot: usize) -> SchemaDef {
@@ -46707,6 +46754,22 @@ impl Storage {
         Ok(found)
     }
 
+    /// Visible routines with this schema and name, in catalog order.
+    pub(crate) fn routine_slots_named<'s>(
+        &'s self,
+        schema: &'s str,
+        name: &'s str,
+        txid: u32,
+    ) -> impl Iterator<Item = usize> + 's {
+        self.routine_entries().filter_map(move |(slot, routine)| {
+            (routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.schema_for(txid).as_str() == schema
+                && routine.name_for(txid).as_str() == name)
+                .then_some(slot)
+        })
+    }
+
     pub(crate) const fn routine_access_object(slot: usize) -> AccessObject {
         AccessObject {
             class: AccessClass::Routine,
@@ -51861,6 +51924,16 @@ impl Storage {
             })
     }
 
+    /// Resident row entries of a table: an upper bound on the rows a scan
+    /// captures before reading saved generations.
+    pub(crate) fn resident_row_entries(&self, table_slot: usize) -> usize {
+        self.tables[table_slot].rows.len()
+    }
+
+    pub(crate) fn result_spool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        &self.result_spool
+    }
+
     pub(crate) fn lock_mark(&self) -> u64 {
         self.lock_state().sequence
     }
@@ -52234,11 +52307,26 @@ impl Storage {
         wait: crate::sql::ast::LockWait,
     ) -> Result<crate::sql::lock::LockDecision, SqlError> {
         let wait_owner = self.transaction_wait_owner(txid);
-        let mut locks = self.lock_state();
-        let sequence = locks.next_sequence()?;
-        locks
-            .row
-            .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
+        let decision = {
+            let mut locks = self.lock_state();
+            let sequence = locks.next_sequence()?;
+            locks
+                .row
+                .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
+        };
+        // The lock manager knows row identities, not names. Its only
+        // unavailable outcome is a NOWAIT conflict; PostgreSQL names the table.
+        decision.map_err(|error| {
+            if error.sqlstate == crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE {
+                sql_err!(
+                    crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
+                    "could not obtain lock on row in relation \"{}\"",
+                    self.tables[table].definition().name.as_str()
+                )
+            } else {
+                error
+            }
+        })
     }
 
     pub(crate) fn release_row_locks(&self, txid: u32) {

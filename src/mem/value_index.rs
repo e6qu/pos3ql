@@ -432,7 +432,7 @@ mod tests {
         const WORKERS: usize = 4;
         let mut budget = Budget::new(ValueIndexPool::budget_bytes(WORKERS, 8));
         let pool = ValueIndexPool::new(&mut budget, WORKERS, 8).unwrap();
-        let start = std::sync::Barrier::new(WORKERS);
+        let start = crate::mem::mutex::Barrier::new(WORKERS);
         let claims = [const { AtomicUsize::new(usize::MAX) }; WORKERS];
         let failed = AtomicBool::new(false);
         std::thread::scope(|scope| {

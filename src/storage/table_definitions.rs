@@ -1328,7 +1328,7 @@ mod tests {
             state.identity.existence = CatalogDdlState::Present;
         }
         versions.stage(&table, pending(2, 7, &pool), 8).unwrap();
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let table = &table;
@@ -1441,7 +1441,7 @@ mod tests {
         let versions = versions(WRITERS * 2);
         let tables: [TableDefinition; WRITERS] =
             std::array::from_fn(|_| TableDefinition::new(definition(1, &pool)));
-        let start = std::sync::Barrier::new(WRITERS);
+        let start = crate::mem::mutex::Barrier::new(WRITERS);
         std::thread::scope(|scope| {
             for (worker, table) in tables.iter().enumerate() {
                 let versions = &versions;

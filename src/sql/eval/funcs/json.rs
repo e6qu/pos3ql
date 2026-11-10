@@ -1007,6 +1007,9 @@ pub(crate) fn dispatch<'a>(
                     return Err(arity_err("jsonb subscripting assignment", args.len()));
                 }
                 let base = eval_full(args[0], arena, params, row, hooks)?;
+                if matches!(base, Datum::Array { .. }) {
+                    return Err(crate::sql::eval::array_element_assignment_unsupported());
+                }
                 if let Datum::Geometry { kind, text } = base {
                     if args.len() != 3 {
                         return Err(arity_err("geometric subscripting assignment", args.len()));

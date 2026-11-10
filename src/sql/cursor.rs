@@ -17,7 +17,11 @@ use super::types::Datum;
 use crate::mem::arena::Arena;
 
 mod query;
+mod scroll;
+mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
+pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
+pub(crate) use stream::{ResultStream, StreamProtocol, StreamState};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -25,6 +29,9 @@ pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchMotion {
     Count(i32),
+    /// `BACKWARD 0`: like `Count(0)`, except that off a row PostgreSQL still
+    /// asks a NO SCROLL cursor to scan backward.
+    BackwardZero,
     All,
     BackwardAll,
     Absolute(i32),
@@ -152,8 +159,16 @@ struct CursorSlot {
     failed: bool,
     query: CursorQuery,
     description: FixedBuf,
+    /// Typed output rows grow from the front; saved input rows of a
+    /// scrollable or sorted source grow from the back of the same bytes.
     rows: FixedBuf,
-    spans: Vec<(u32, u32)>,
+    spans: RowIndex,
+    /// PostgreSQL motion over saved inputs, for a scrollable source whose
+    /// revisited rows are evaluated again.
+    scan: Option<ScrollScan>,
+    /// A held scroll cursor is saving its rows at commit.
+    holding: bool,
+    locking: RowLocking,
     /// Logical input rows before the first saved row of the current fetch.
     row_base: usize,
     produced: usize,
@@ -165,12 +180,17 @@ struct CursorSlot {
 }
 
 impl CursorSlot {
-    fn validate_motion(
-        &self,
-        motion: FetchMotion,
-        move_only: bool,
-        input_finished: bool,
-    ) -> Result<(), SqlError> {
+    fn reset_rows(&mut self) {
+        self.rows.clear();
+        self.rows.clear_tail();
+        self.spans.clear();
+        self.spans.clear_inputs();
+        self.scan = None;
+        self.holding = false;
+        self.locking = RowLocking::default();
+    }
+
+    fn require_runnable(&self) -> Result<(), SqlError> {
         if self.failed {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -178,8 +198,19 @@ impl CursorSlot {
                 self.name.as_str()
             ));
         }
+        Ok(())
+    }
+
+    fn validate_motion(
+        &self,
+        motion: FetchMotion,
+        move_only: bool,
+        input_finished: bool,
+    ) -> Result<(), SqlError> {
+        self.require_runnable()?;
         let on_row = self.position >= 1 && self.position <= self.produced as i64;
         let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
+            || (!move_only && motion == FetchMotion::BackwardZero)
             || (matches!(motion, FetchMotion::BackwardAll) && !(move_only && self.position == 0))
             // A negative absolute position first consumes the forward input;
             // its final backward step is rejected after that work.
@@ -189,17 +220,140 @@ impl CursorSlot {
                 && on_row
                 && matches!(motion, FetchMotion::Count(0) | FetchMotion::Relative(0)));
         if self.scroll == CursorScroll::NoScroll && backward {
-            return Err(sql_err!(
-                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                "cursor can only scan forward"
-            ));
+            return Err(forward_only());
         }
         Ok(())
     }
 }
 
-// Each saved row has a four-byte length and a two-byte column count.
+// Each saved row has a four-byte length and a two-byte column count; a saved
+// input has a 17-byte row identity and version and a two-byte column count.
 const MIN_CURSOR_ROW_BYTES: usize = 6;
+
+/// Spans of output rows (from the front) and saved inputs (from the back) in
+/// one startup-sized index. Both live in `cursor_bytes` and each takes at
+/// least [`MIN_CURSOR_ROW_BYTES`], so together they fit the index.
+struct RowIndex {
+    entries: Box<[(u32, u32)]>,
+    outputs: usize,
+    inputs: usize,
+}
+
+impl RowIndex {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: vec![(0, 0); capacity].into_boxed_slice(),
+            outputs: 0,
+            inputs: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn len(&self) -> usize {
+        self.outputs
+    }
+
+    fn is_empty(&self) -> bool {
+        self.outputs == 0
+    }
+
+    fn clear(&mut self) {
+        self.outputs = 0;
+    }
+
+    fn truncate(&mut self, outputs: usize) {
+        self.outputs = self.outputs.min(outputs);
+    }
+
+    fn get(&self, index: usize) -> Option<&(u32, u32)> {
+        self.entries[..self.outputs].get(index)
+    }
+
+    fn last(&self) -> Option<&(u32, u32)> {
+        self.entries[..self.outputs].last()
+    }
+
+    fn full(&self) -> bool {
+        self.outputs + self.inputs == self.entries.len()
+    }
+
+    fn push(&mut self, span: (u32, u32)) -> Result<(), SqlError> {
+        if self.full() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor row index exceeds cursor_bytes-derived capacity of {} rows",
+                self.capacity()
+            ));
+        }
+        self.entries[self.outputs] = span;
+        self.outputs += 1;
+        Ok(())
+    }
+
+    fn input(&self, index: usize) -> Option<(u32, u32)> {
+        (index < self.inputs).then(|| self.entries[self.entries.len() - 1 - index])
+    }
+
+    fn push_input(&mut self, span: (u32, u32)) -> Result<(), SqlError> {
+        if self.full() {
+            return Err(history_full());
+        }
+        self.inputs += 1;
+        let at = self.entries.len() - self.inputs;
+        self.entries[at] = span;
+        Ok(())
+    }
+
+    fn inputs_len(&self) -> usize {
+        self.inputs
+    }
+
+    /// Saved inputs, last first: input `i` is at `len - 1 - i`.
+    fn inputs_mut(&mut self) -> &mut [(u32, u32)] {
+        let len = self.entries.len();
+        &mut self.entries[len - self.inputs..]
+    }
+
+    fn clear_inputs(&mut self) {
+        self.inputs = 0;
+    }
+}
+
+/// Progress of a cursor that locks each row it fetches.
+#[derive(Clone, Copy, Default)]
+struct RowLocking {
+    /// The next sorted input, once every qualifying row is saved and sorted.
+    sorted: Option<usize>,
+    /// Where the pending row's projected output starts while it waits for
+    /// its lock.
+    output: Option<usize>,
+    /// The pending row is a newer version that must pass the filter again.
+    recheck: bool,
+}
+
+/// PostgreSQL's error for backward motion on a NO SCROLL cursor.
+pub(crate) fn forward_only() -> SqlError {
+    super::eval::stash_diagnostic(
+        None,
+        Some(StackStr::from_str(
+            "Declare it with SCROLL option to enable backward scan.",
+        )),
+    );
+    sql_err!(
+        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+        "cursor can only scan forward"
+    )
+}
+
+pub(crate) fn history_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cursor saved input rows exceed cursor_bytes; raise it or narrow the query"
+    )
+}
 
 const fn cursor_row_capacity(config: &Config) -> usize {
     config.cursor_bytes / MIN_CURSOR_ROW_BYTES
@@ -252,7 +406,7 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
     Ok(columns)
 }
 
-fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut Vec<(u32, u32)>) -> Result<(), SqlError> {
+fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut RowIndex) -> Result<(), SqlError> {
     let malformed = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor captured a torn typed row");
     let bytes = rows.readable();
     let mut at = spans
@@ -267,14 +421,7 @@ fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut Vec<(u32, u32)>) -> Re
         if row.len() < 2 || super::exec::projected_row_width(row) != columns {
             return Err(malformed());
         }
-        if spans.len() == spans.capacity() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor row index exceeds cursor_bytes-derived capacity of {} rows",
-                spans.capacity()
-            ));
-        }
-        spans.push((start as u32, length as u32));
+        spans.push((start as u32, length as u32))?;
         at = end;
     }
     Ok(())
@@ -336,6 +483,18 @@ fn description_columns<'a>(
         return Err(corrupt());
     }
     Ok(count)
+}
+
+fn push_emit(emit: &mut Vec<u32>, index: u32) -> Result<(), SqlError> {
+    if emit.len() == emit.capacity() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "cursor fetch exceeds its cursor_bytes-derived row capacity of {} rows",
+            emit.capacity()
+        ));
+    }
+    emit.push(index);
+    Ok(())
 }
 
 impl CursorPool {
@@ -402,7 +561,10 @@ impl CursorPool {
                 query: CursorQuery::new(budget, config.cursor_query_bytes)?,
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
                 rows: FixedBuf::new(budget, "cursor_typed_rows", config.cursor_bytes)?,
-                spans: Vec::with_capacity(row_capacity),
+                spans: RowIndex::new(row_capacity),
+                scan: None,
+                holding: false,
+                locking: RowLocking::default(),
                 row_base: 0,
                 produced: 0,
                 request: None,
@@ -503,8 +665,7 @@ impl CursorPool {
         slot.failed = false;
         slot.query.clear();
         slot.description.clear();
-        slot.rows.clear();
-        slot.spans.clear();
+        slot.reset_rows();
         slot.row_base = 0;
         slot.produced = 0;
         slot.request = None;
@@ -590,8 +751,7 @@ impl CursorPool {
                 )
             })?;
         slot.description.clear();
-        slot.rows.clear();
-        slot.spans.clear();
+        slot.reset_rows();
         slot.row_base = 0;
         slot.produced = 0;
         Ok(())
@@ -671,6 +831,15 @@ impl CursorPool {
                 CursorScroll::NoScroll
             };
         }
+        slot.scan = slot
+            .query
+            .retained
+            .as_ref()
+            .map(|source| source.revisit())
+            .filter(|revisit| {
+                slot.scroll == CursorScroll::Scroll && *revisit != Revisit::SavedOutput
+            })
+            .map(ScrollScan::new);
         slot.active = true;
         Ok(())
     }
@@ -697,6 +866,7 @@ impl CursorPool {
             }
             FetchMotion::Absolute(k) => k as usize,
             FetchMotion::BackwardAll => 0,
+            FetchMotion::BackwardZero => slot.position.max(0) as usize,
         };
         Ok(Some((at, needed)))
     }
@@ -707,6 +877,252 @@ impl CursorPool {
 
     pub(crate) fn saves_history(&self, at: usize) -> bool {
         self.slots[at].scroll == CursorScroll::Scroll
+    }
+
+    /// The named cursor's slot when it moves by [`ScrollScan`].
+    pub(crate) fn scroll_slot(&self, name: &str) -> Option<usize> {
+        self.find(name)
+            .filter(|at| self.slots[*at].scan.is_some() && self.slots[*at].query.retained.is_some())
+    }
+
+    /// Plans a FETCH or MOVE, or resumes the one interrupted by a wait. Only
+    /// the Limit node's saved row survives from earlier commands.
+    pub(crate) fn begin_scroll(
+        &mut self,
+        at: usize,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        slot.require_runnable()?;
+        if let Some(request) = slot.request {
+            if request != (motion, move_only) {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cursor fetch changed while its input was waiting"
+                ));
+            }
+            return Ok(());
+        }
+        let scan = slot.scan.as_mut().expect("scroll cursor plan");
+        let kept = scan
+            .limit_slot()
+            .and_then(|index| slot.spans.get(index as usize).copied());
+        slot.spans.clear();
+        match kept {
+            Some((offset, length)) => {
+                // The row bytes keep their four-byte length prefix.
+                let start = offset as usize - 4;
+                slot.rows
+                    .move_within(start..offset as usize + length as usize, 0);
+                slot.rows.truncate_to(length as usize + 4);
+                slot.spans.push((4, length))?;
+            }
+            None => slot.rows.clear(),
+        }
+        scan.relocate_limit_slot(kept.map(|_| 0));
+        scan.begin(motion, move_only);
+        self.emit.clear();
+        slot.request = Some((motion, move_only));
+        Ok(())
+    }
+
+    /// The next step of the current scroll command; emitted rows are added
+    /// to [`Self::emitted`].
+    pub(crate) fn scroll_next(&mut self, at: usize) -> Result<ScrollAction, SqlError> {
+        let emit = &mut self.emit;
+        let scan = self.slots[at].scan.as_mut().expect("scroll cursor plan");
+        scan.next(&mut |index| push_emit(emit, index))
+    }
+
+    pub(crate) fn scroll_complete(
+        &mut self,
+        at: usize,
+        outcome: VisitOutcome,
+    ) -> Result<(), SqlError> {
+        let emit = &mut self.emit;
+        let scan = self.slots[at].scan.as_mut().expect("scroll cursor plan");
+        scan.complete(outcome, &mut |index| push_emit(emit, index))
+    }
+
+    pub(crate) fn scroll_set_limits(&mut self, at: usize, limits: Option<(u64, u64)>) {
+        self.slots[at]
+            .scan
+            .as_mut()
+            .expect("scroll cursor plan")
+            .set_limits(limits);
+    }
+
+    pub(crate) fn locks_rows(&self, at: usize) -> bool {
+        self.slots[at]
+            .query
+            .source()
+            .is_some_and(|source| source.locks_rows())
+    }
+
+    /// Whether every qualifying row still has to be saved and sorted.
+    pub(crate) fn sort_pending(&self, at: usize) -> bool {
+        let slot = &self.slots[at];
+        slot.locking.sorted.is_none() && slot.query.source().is_some_and(|source| source.sorted())
+    }
+
+    pub(crate) fn sorted_source(&self, at: usize) -> bool {
+        self.slots[at].locking.sorted.is_some()
+    }
+
+    /// Sorts the saved inputs; fetching then reads them in order.
+    pub(crate) fn finish_sorting(
+        &mut self,
+        at: usize,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let source = slot
+            .query
+            .source()
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cursor source is not retained"))?;
+        let rows = &slot.rows;
+        // SAFETY: the comparator only reads saved inputs while the index
+        // entries move; no tail byte changes during the sort.
+        let bytes = |offset: u32, length: u32| -> &'static [u8] {
+            let bytes = rows.tail_bytes(offset as usize, length as usize);
+            unsafe { core::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) }
+        };
+        source.sort_saved_inputs(storage, txid, slot.spans.inputs_mut(), bytes)?;
+        slot.locking.sorted = Some(0);
+        Ok(())
+    }
+
+    /// Makes the next sorted input pending, unless a wait left a row pending.
+    pub(crate) fn prepare_sorted_row(&mut self, at: usize) -> Result<bool, SqlError> {
+        let slot = &self.slots[at];
+        if slot
+            .query
+            .source()
+            .is_some_and(|source| source.has_pending())
+        {
+            return Ok(true);
+        }
+        let next = slot.locking.sorted.expect("sorted inputs");
+        if next >= slot.spans.inputs_len()
+            || slot
+                .query
+                .source()
+                .is_some_and(|source| source.limit_reached())
+        {
+            return Ok(false);
+        }
+        self.prepare_saved_input(at, next)?;
+        Ok(true)
+    }
+
+    /// Ends the pending row of a locking cursor.
+    pub(crate) fn finish_locked_row(&mut self, at: usize) {
+        let locking = &mut self.slots[at].locking;
+        if let Some(next) = locking.sorted.as_mut() {
+            *next += 1;
+        }
+        locking.output = None;
+        locking.recheck = false;
+    }
+
+    pub(crate) fn locked_output(&self, at: usize) -> Option<usize> {
+        self.slots[at].locking.output
+    }
+
+    pub(crate) fn output_mark(&self, at: usize) -> usize {
+        self.slots[at].rows.mark()
+    }
+
+    pub(crate) fn set_locked_output(&mut self, at: usize, mark: usize) {
+        self.slots[at].locking.output = Some(mark);
+    }
+
+    /// Drops the pending row's projected output.
+    pub(crate) fn drop_locked_output(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        if let Some(mark) = slot.locking.output.take() {
+            slot.rows.truncate_to(mark);
+        }
+    }
+
+    pub(crate) fn needs_recheck(&self, at: usize) -> bool {
+        self.slots[at].locking.recheck
+    }
+
+    pub(crate) fn set_recheck(&mut self, at: usize) {
+        self.slots[at].locking.recheck = true;
+    }
+
+    /// Whether rejected source rows are saved for a later filter.
+    pub(crate) fn scroll_rescans(&self, at: usize) -> bool {
+        self.slots[at]
+            .scan
+            .as_ref()
+            .is_some_and(|scan| scan.revisit() == Revisit::Rescan)
+    }
+
+    /// Ends a completed scroll command.
+    pub(crate) fn finish_scroll(&mut self, at: usize) {
+        self.slots[at].request = None;
+    }
+
+    /// Before a kept output is written: the previous output survives only if
+    /// it was emitted (an unemitted one is the replaced Limit row).
+    pub(crate) fn release_unemitted_output(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        let last = slot.spans.len().checked_sub(1);
+        if let Some(last) = last
+            && self.emit.last() != Some(&(last as u32))
+        {
+            let (offset, _) = *slot.spans.last().expect("last output");
+            slot.rows.truncate_to(offset as usize - 4);
+            slot.spans.truncate(last);
+        }
+    }
+
+    /// Indexes the output row just written and returns its index.
+    pub(crate) fn seal_output(&mut self, at: usize) -> Result<u32, SqlError> {
+        let slot = &mut self.slots[at];
+        let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+        let columns = description_type_oids(slot.description.readable(), &mut types)?;
+        let before = slot.spans.len();
+        seal_rows(&slot.rows, columns, &mut slot.spans)?;
+        if slot.spans.len() != before + 1 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor output step did not save exactly one row"
+            ));
+        }
+        Ok(before as u32)
+    }
+
+    /// Saves the pending source row as the next saved input.
+    pub(crate) fn save_pending_input(&mut self, at: usize) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let source =
+            slot.query.retained.as_ref().ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "cursor source is not retained")
+            })?;
+        let length = source.pending_input_len()?;
+        let (offset, bytes) = slot.rows.push_tail(length).ok_or_else(history_full)?;
+        source.encode_pending_input(bytes)?;
+        slot.spans.push_input((offset as u32, length as u32))
+    }
+
+    /// Makes saved input `index` the cursor source's pending row, unless a
+    /// wait left it pending already.
+    pub(crate) fn prepare_saved_input(&mut self, at: usize, index: usize) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let (offset, length) = slot.spans.input(index).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor saved input index is invalid"
+            )
+        })?;
+        let bytes = slot.rows.tail_bytes(offset as usize, length as usize);
+        slot.query.prepare_saved_input(index, bytes)
     }
 
     #[cfg(test)]
@@ -775,6 +1191,10 @@ impl CursorPool {
             }
             slot.failed = true;
             slot.query.clear();
+            slot.request = None;
+            if let Some(scan) = slot.scan.as_mut() {
+                scan.abandon();
+            }
             // The plan is released, but rollback still needs this cursor's
             // creation identity to remove names opened after its savepoint.
             slot.open_site = None;
@@ -933,7 +1353,7 @@ impl CursorPool {
             Ok(())
         };
         match motion {
-            FetchMotion::Count(0) => {
+            FetchMotion::Count(0) | FetchMotion::BackwardZero => {
                 // Re-fetch the current row, position unchanged.
                 push_row(slot.position, out_rows)?;
             }
@@ -1065,6 +1485,49 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         slot.query.finish_source();
         slot.request = None;
+        slot.holding = false;
+        slot.rows.clear_tail();
+        slot.spans.clear_inputs();
+        if let Some(scan) = slot.scan.take() {
+            // The stored rows now hold the whole result in PostgreSQL's
+            // portal position.
+            let (position, at_start, at_end) = scan.portal();
+            let rows = slot.spans.len() as i64;
+            slot.produced = slot.spans.len();
+            slot.row_base = 0;
+            slot.position = if at_start {
+                0
+            } else if at_end {
+                (position + 1).min(rows + 1)
+            } else {
+                position.min(rows + 1)
+            };
+        }
+    }
+
+    /// Starts saving a held scroll cursor: every row from the start.
+    pub(crate) fn begin_scroll_hold(&mut self, at: usize) -> bool {
+        let slot = &mut self.slots[at];
+        let Some(scan) = slot.scan.as_mut() else {
+            return false;
+        };
+        if slot.holding {
+            // A wait interrupted the save; it resumes where it stopped.
+            return true;
+        }
+        slot.holding = true;
+        slot.rows.clear();
+        slot.spans.clear();
+        scan.relocate_limit_slot(None);
+        scan.begin_hold();
+        self.emit.clear();
+        true
+    }
+
+    /// After saving a held scroll cursor, drops a trailing output the Limit
+    /// node pulled but did not return.
+    pub(crate) fn finish_scroll_hold(&mut self, at: usize) {
+        self.release_unemitted_output(at);
     }
 
     pub(crate) fn has_uncommitted_hold_cursor(&self) -> bool {
@@ -1458,6 +1921,7 @@ mod tests {
                 assert_eq!(pool.emit.capacity(), cursor_row_capacity(&config));
                 for slot in &pool.slots {
                     assert_eq!(slot.spans.capacity(), cursor_row_capacity(&config));
+                    assert!(slot.spans.is_empty());
                 }
                 if cursor_row_capacity(&config) != 0 {
                     let mut short = Budget::new(bytes - 1);

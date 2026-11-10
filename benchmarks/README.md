@@ -1,27 +1,14 @@
 # Retained benchmark evidence
 
-**User example:** to compare an old result with a new run, first match the
-commit, row count, clients, hardware, and storage. A faster number from a
-different setup does not establish that today's database became faster.
-The reports below keep their original observations and caveats.
+Each dated run keeps its original workload, revision and binary hashes,
+storage provenance, raw JSON and report. They are exploratory measurements on
+the stated hosts, not current performance claims; new code needs a new run.
+[performance.md](../docs/performance.md#what-the-retained-measurements-actually-show)
+explains how to run the suite and how to read these results.
 
-These dated runs preserve their original workload, revision/binary hashes,
-service/storage provenance, raw JSON, and derived reports. They are exploratory
-measurements on the stated hosts, not current production guarantees. Use
-[performance.md](../docs/performance.md) to run the harness and
-[PLAN.md](../PLAN.md) for outstanding representative qualification.
-
-The matrix keeps two vanilla PostgreSQL 18 comparisons for each fixture,
-MinIO, and SeaweedFS run: available host resources and the same CPU/memory
-allowance as pos3ql. PostgreSQL saves data on ordinary local storage. MinIO and
-SeaweedFS run on the same test host. Different operation counts and saved data
-layouts limit timing comparisons; request metrics describe the actual storage
-work performed.
-
-The [current interpretation](../docs/performance.md#what-the-retained-measurements-actually-show)
-quotes representative old results and distinguishes operations, statements and
-transactions per second. New code requires a new run; theoretical block counts
-and bandwidth calculations do not update these historical reports.
+**User example:** before comparing an old result with a new run, match the
+commit, row count, clients, hardware and storage. A faster number from a
+different setup does not show that the database became faster.
 
 ## Comparison evidence
 
@@ -36,11 +23,7 @@ and bandwidth calculations do not update these historical reports.
 | 2026-10-30 | [Empty-engine memory before and after lazy definition initialization](https://github.com/e6qu/pos3ql/blob/4054a6d3c79e916728f8e84d84139eae6d86b501/benchmarks/baselines/2026-10-30-embedded-lazy-definitions/README.md) |
 | 2026-10-31 | [Instrumented function lookup repair comparison](https://github.com/e6qu/pos3ql/blob/cfd803e74af661d4afc9d9e366b9293d08add65c/benchmarks/baselines/2026-10-31-routine-lookup/README.md) |
 
-Follow each run's README for qualifications and raw artifact locations. Preserve
-these files during documentation cleanup; do not regenerate a report against
-new code under an old date. Historical optimization notes are indexed in
-[implementation history](../docs/history/README.md).
-
-The [complete historical catalog](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/benchmarks/README.md)
-indexes the focused checkpoint experiments. Their original directories and raw
-artifacts remain unchanged; they document past implementation costs.
+Each run's README states its qualifications and raw artifact locations. Never
+regenerate a report against new code under an old date. The
+[complete historical catalog](https://github.com/e6qu/pos3ql/blob/51a21b6b7393022b92c4f6f86c889e9fa3394b93/benchmarks/README.md)
+also indexes the focused checkpoint experiments.

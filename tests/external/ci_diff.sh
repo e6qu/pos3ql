@@ -323,6 +323,28 @@ if POS3QL_PORT=$P3_PORT POS3QL_EXTENSION_WIRE=1 \
   ok "wire probes"
 else bad "wire probes"; cat "$WORK/wire.out"; fi
 
+# --- stalled result clients (raw sockets plus a concurrent psycopg session) --
+restart_p3_fresh || exit 1
+echo "=== stalled result clients (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$P3_PORT" \
+  --pg "$PGPORT" --user "$PGUSER" > "$WORK/result_streams.out" 2>&1; then
+  ok "stalled result clients"
+else bad "stalled result clients"; cat "$WORK/result_streams.out"; fi
+
+# --- SQL cursor execution timing: the PostgreSQL reference, then pos3ql ---
+echo "=== SQL cursor execution (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/cursor_execution.py" --host "$PGHOST" --port "$PGPORT" \
+  --user "$PGUSER" --database postgres --output "$WORK/cursor-pg.json" \
+  > "$WORK/cursor_execution.out" 2>&1; then
+  ok "SQL cursor execution reference"
+else bad "SQL cursor execution reference"; cat "$WORK/cursor_execution.out"; fi
+restart_p3_fresh || exit 1
+if "$PY" "$EXT/cursor_execution.py" --host 127.0.0.1 --port "$P3_PORT" \
+  --user "$PGUSER" --database postgres --output "$WORK/cursor-p3.json" \
+  > "$WORK/cursor_execution_p3.out" 2>&1; then
+  ok "SQL cursor execution pos3ql"
+else bad "SQL cursor execution pos3ql"; cat "$WORK/cursor_execution_p3.out"; fi
+
 # --- psycopg driver (extended protocol, binary params) ---------------------
 restart_p3_fresh || exit 1
 echo "=== psycopg driver ==="

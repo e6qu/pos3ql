@@ -2,67 +2,67 @@
 
 ## Naming
 
-- Spell identifiers out: `interval`, `buffer`, `expression`, `statement`, and `index`, not abbreviations.
-- Standard acronyms are allowed: SQL, WAL, SST, LSN, OID, HTTP, TLS, UUID, and JSON.
-- Established module names are allowed: `ast`, `eval`, `exec`, `guc`, `io`, `mem`, `pg`, `sim`, `sql`, and `wal`.
-- Use a coined term only when it carries a repeated, specific meaning; define it here.
-- Single-letter names are limited to conventional local indices and published algorithm notation.
-
-For the complete request path and interactions, see [architecture](architecture.md).
+- Spell identifiers out: `interval`, `buffer`, `expression`, `statement`, `index`.
+- Allowed acronyms: SQL, WAL, SST, LSN, OID, HTTP, TLS, UUID, JSON.
+- Allowed short module names: `ast`, `eval`, `exec`, `guc`, `io`, `mem`, `pg`, `sim`, `sql`, `wal`.
+- Coin a term only for a repeated, specific meaning, and define it here.
+- Single-letter names only for conventional loop indices and published algorithm notation.
 
 ## Modules
 
-- `config`: configuration and memory budget.
-- `mem`: fixed-capacity memory, pools, arenas, and allocation guard.
-- `io`: operating-system and simulated I/O.
-- `pg`: PostgreSQL wire protocol.
-- `sql`: parser, executor, query engine, and catalogs.
-- `storage`: resident catalog, row state, and visibility.
-- `wal`: durable journal encoding and replay.
-- `checkpoint`: SST publication and cold recovery.
-- `store`: block formats and cache tiers.
-- `sim`: deterministic fault simulation.
+| Module | Contents |
+|---|---|
+| `config` | configuration and memory budget |
+| `mem` | fixed-capacity memory, pools, arenas, allocation guard |
+| `io` | operating-system and simulated I/O |
+| `pg` | PostgreSQL wire protocol |
+| `sql` | parser, executor and catalogs |
+| `storage` | resident catalog, row state, visibility |
+| `wal` | durable journal encoding and replay |
+| `checkpoint` | SST publication and cold recovery |
+| `store` | block formats and cache tiers |
+| `object_store` | S3-compatible HTTP client, request signing, TLS |
+| `crypto` | SHA-256 and HMAC |
+| `sim` | deterministic fault simulation |
+
+The [architecture](architecture.md) describes how they interact.
 
 ## Glossary
 
-Use ordinary words in user guidance and explain a technical term at first use.
-For example, write “keep the order version that this transaction read” before
-describing snapshot retention. The definitions below make technical details
-consistent; readers should not need to memorize them to use the database.
+User guidance should use ordinary words and explain a term at first use; these
+definitions keep technical text consistent.
 
-- **block**: checksummed, content-addressed storage unit with at most 256 KiB including its header.
-- **block store**: provider-neutral internal interface over object storage and cache tiers; it is not a network protocol or deployable storage service.
-- **backup**: a named, checkpoint-consistent manifest and commit-head image whose reachable blocks and commit history are retained until deletion.
-- **backup export**: a restartable copy of one named backup and its durable object graph into an empty independently configured object-store prefix.
-- **checkpoint**: a saved organization of table data and object references that reduces recovery work. Later commits are recovered from the commit history.
-- **compare-and-swap (CAS)**: update a saved reference only if it still has the generation previously read. This prevents an old writer from replacing newer state.
-- **cold start**: recovery with RAM and local disk caches absent.
-- **declared type identity**: the schema-qualified type visible in catalog, parameter, and replication metadata; distinct from an executor value type.
-- **commit batch**: immutable journal bytes plus a descriptor; recoverable only after the CAS commit head names it.
-- **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
-- **entity tag**: an opaque, strong, quoted object generation token used for compare-and-swap.
-- **execution control pool**: fixed startup memory shared by running procedural calls for positions, resource directories, local-value slots, numeric scopes, immutable source and routine-setting images, named-output bindings, saved output bytes, and caught-error directories and text. Active local-variable payloads still use separate storage.
-- **value slot**: one typed SQL value entry. A number can fit directly in the entry; text, arrays and records can refer to bytes stored elsewhere. Owning the entry does not own those referenced bytes.
-- **manifest**: the durable inventory of table definitions and immutable storage objects for a checkpoint; updated by compare-and-swap.
-- **MVCC**: keeping row versions so transactions see the versions allowed by their isolation level. For example, a repeatable-read transaction can keep seeing an order's old status after another transaction commits an update.
-- **LSN**: log sequence number, a position in the recovery journal. It identifies replay and replication progress; only validated transaction boundaries are accepted as recovery targets.
-- **OID**: object identifier used in PostgreSQL catalogs and type metadata.
-- **prefix**: the beginning of object names assigned to one pos3ql instance inside a bucket, including its SQL databases. Separate prefixes keep instance namespaces apart.
-- **promotion**: transfer of durable write ownership to a fresh process incarnation by compare-and-swap.
-- **PAX**: column-oriented row groups inside an SST, allowing selected-column reads. A query for order IDs need not fetch a large description column solely to read those IDs.
-- **physical-demand proof**: the columns a query path may read from a physical row.
-- **S3-compatible API**: the qualified HTTP data-plane subset implemented by MinIO and compatible object stores; it does not imply a vendor SDK, vendor control plane, or provider-specific implementation.
-- **tuple identity value**: a PostgreSQL `tid` block/offset value carried at SQL and wire boundaries; it does not imply that an object-native row has a PostgreSQL heap address.
-- **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks. “Immutable” means a write creates replacement objects rather than editing published bytes in place.
-- **snapshot**: the read position and transaction context that decide which row versions a read may see.
-- **retention**: keeping bytes or objects while a reader, recovery path, or backup still needs them.
-- **reclamation**: reusing memory or deleting old objects after they are no longer needed.
-- **publication**: making prepared state visible through its authoritative reference. Uploading an object alone does not confirm a durable commit.
-- **overlay**: newer in-memory row changes considered alongside checkpointed rows when answering a query.
-- **compaction**: merging saved data into replacement objects so reads need fewer generations, while retaining versions still needed by readers.
-- **pruning**: using safe summaries to skip data that cannot contain a match. Candidate matches still receive exact checks.
-- **backpressure**: making incoming work wait or fail explicitly when fixed resources are busy, instead of growing memory use.
-- **amplification**: extra physical work relative to useful work. If a 1 KiB update rewrites 100 KiB, its byte rewrite amplification is 100 times.
+- **amplification**: extra physical work per unit of useful work. A 1 KiB update that rewrites 100 KiB has 100× byte rewrite amplification.
+- **backpressure**: making new work wait or fail explicitly when fixed resources are busy, instead of growing memory.
+- **backup**: a named, checkpoint-consistent manifest and commit head whose blocks and commit history are retained until the backup is deleted.
+- **backup export**: a restartable copy of one backup's objects into an empty, separately configured object-store prefix.
+- **block**: a checksummed, content-addressed storage unit of at most 256 KiB including its header.
+- **block store**: the internal provider-neutral interface over object storage and cache tiers; not a network service.
+- **checkpoint**: a saved layout of table data that shortens recovery; later commits are replayed from the commit history.
+- **cold start**: recovery with RAM and local disk caches empty.
+- **commit batch**: immutable journal bytes plus a descriptor, recoverable only once the commit head names it.
+- **compaction**: merging saved data into fewer replacement objects while keeping versions readers still need.
+- **compare-and-swap (CAS)**: updating a saved reference only if it still has the generation previously read, so an old writer cannot replace newer state.
+- **declared type**: the schema-qualified type shown in catalog, parameter and replication metadata, as distinct from the executor's value type.
+- **durable mode**: `object_store = on`; a commit is acknowledged only after its commit batch is published.
+- **ETag**: the object store's opaque, quoted generation token used for compare-and-swap.
+- **execution control pool**: fixed startup memory shared by running procedural calls for their positions, local variables, source images and error state.
+- **LSN**: log sequence number, a position in the journal used for replay and replication progress.
+- **manifest**: the durable inventory of table definitions and storage objects for a checkpoint, updated by compare-and-swap.
+- **MVCC**: multiversion concurrency control: keeping row versions so each transaction sees the versions its isolation level allows.
+- **OID**: object identifier used in PostgreSQL catalogs.
+- **overlay**: newer in-memory row changes combined with checkpointed rows when answering a query.
+- **PAX**: column-grouped row blocks inside an SST, so a query reads only the columns it needs.
+- **prefix**: the start of object names reserved for one pos3ql instance in a bucket.
+- **promotion**: moving durable write ownership to a fresh process by compare-and-swap.
+- **pruning**: skipping data that summaries prove cannot match; candidates are still checked exactly.
+- **publication**: making prepared state visible through its authoritative reference. Uploading an object alone does not commit it.
+- **reclamation**: reusing memory or deleting objects once nothing needs them.
+- **retention**: keeping bytes or objects while a reader, recovery or backup still needs them.
+- **S3-compatible API**: the HTTP data-plane subset qualified against MinIO and compatible stores; no vendor SDK or control plane.
+- **snapshot**: the read position and transaction context that decide which row versions a read sees.
+- **SST**: sorted string table: an immutable object of versioned rows with index, filter and roster blocks. Writes create replacement objects instead of editing published ones.
+- **value slot**: one typed SQL value entry; large values refer to bytes stored elsewhere, which the slot does not own.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
-- **WAL**: checksummed local journal encoding used for recovery and logical replication; it is not PostgreSQL physical XLOG.
-- **writer fence**: durable ownership record that prevents an older process incarnation from publishing either mutable root after promotion. A recovered old primary cannot overwrite the replacement's commits.
+- **WAL**: the checksummed journal encoding used for recovery and logical replication; not PostgreSQL's physical WAL format.
+- **writer fence**: a durable ownership record that stops an older process from publishing after promotion.

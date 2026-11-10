@@ -166,6 +166,22 @@ def probe(args, trace):
             owner.execute("CLOSE scrolling")
             owner.execute("COMMIT")
 
+            owner.execute("SELECT setval('calls',500,false)")
+            owner.execute("BEGIN")
+            owner.execute("DECLARE windowed SCROLL CURSOR FOR SELECT g, nextval('calls') FROM generate_series(1,4) g LIMIT 2 OFFSET 1")
+            rows(owner, "scroll.limit_window", "FETCH ALL FROM windowed", [(2, 501), (3, 502)])
+            rows(owner, "scroll.limit_edge_not_evaluated", "FETCH PRIOR FROM windowed", [(3, 502)])
+            rows(owner, "scroll.limit_inner_row_evaluated", "FETCH PRIOR FROM windowed", [(2, 503)])
+            owner.execute("CLOSE windowed")
+            owner.execute("COMMIT")
+
+            owner.execute("BEGIN")
+            owner.execute("DECLARE rechecked NO SCROLL CURSOR FOR SELECT id FROM source_rows WHERE id < 3 ORDER BY id DESC FOR UPDATE")
+            observer.execute("UPDATE source_rows SET id = 10 WHERE id = 2")
+            rows(owner, "locking.changed_row_rechecked", "FETCH ALL FROM rechecked", [(1,)])
+            owner.execute("ROLLBACK")
+            observer.execute("UPDATE source_rows SET id = 2 WHERE id = 10")
+
             owner.execute("BEGIN")
             owner.execute("DECLARE rendered NO SCROLL CURSOR FOR SELECT DATE '2020-01-02'")
             owner.execute("SET DateStyle = 'SQL, DMY'")

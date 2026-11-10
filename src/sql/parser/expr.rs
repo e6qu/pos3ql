@@ -70,8 +70,21 @@ impl<'a> Parser<'a> {
 
     /// Pratt expression parser.
     pub(crate) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
+        let primary_at = self.peek_at;
         let mut left = self.prefix()?;
+        // PostgreSQL subscripts only column references, parameters and
+        // parenthesized expressions: `f(x)[1]` and `ARRAY[1][1]` are syntax
+        // errors that need `(f(x))[1]`.
+        let mut subscriptable = self.parenthesized_primary == Some(primary_at)
+            || matches!(
+                left,
+                Expr::Column { .. }
+                    | Expr::SchemaColumn { .. }
+                    | Expr::RoutineParam { .. }
+                    | Expr::Param(_)
+            );
         loop {
+            let subscript_allowed = core::mem::take(&mut subscriptable);
             let source_position = SourcePosition::new(Some(self.peek_at));
             // Postfix `::type` binds tightest.
             if self.peeked == Tok::Op("::") {
@@ -212,13 +225,11 @@ impl<'a> Parser<'a> {
                     left = self.build_distinct_from(left, right, negated)?;
                     continue;
                 }
-                return Err(self.err_here(
-                    "expected NULL, TRUE, FALSE, UNKNOWN, DISTINCT, JSON, or NORMALIZED after IS",
-                ));
+                return Err(self.syntax_error_here());
             }
             // Array subscript `base[index]` or slice `base[lo:hi]` (1-based,
             // either slice bound optional: `[lo:]`, `[:hi]`, `[:]`).
-            if self.peeked == Tok::Op("[") {
+            if subscript_allowed && self.peeked == Tok::Op("[") {
                 self.advance()?;
                 let lower = if self.peeked == Tok::Op(":") {
                     None
@@ -243,6 +254,7 @@ impl<'a> Parser<'a> {
                     let index = lower.expect("non-slice subscript has an index");
                     left = self.arena_expr(Expr::Subscript { base: left, index })?;
                 }
+                subscriptable = true;
                 continue;
             }
             if self.peeked == Tok::Ident("collate") {
@@ -326,7 +338,11 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 {
                 if self.stop_default_at_not_null && self.peeked == Tok::Ident("not") {
                     let mut lookahead = self.lexer.clone();
-                    if lookahead.next_token()? == Tok::Ident("null") {
+                    if lookahead
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?
+                        == Tok::Ident("null")
+                    {
                         return Ok(left);
                     }
                 }
@@ -341,9 +357,7 @@ impl<'a> Parser<'a> {
                             | Tok::Ident("ilike")
                             | Tok::Ident("similar")
                     ) {
-                        return Err(
-                            self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT")
-                        );
+                        return Err(self.syntax_error_here());
                     }
                     true
                 } else {
@@ -510,9 +524,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if negated {
-                    return Err(
-                        self.unexpected("expected IN, BETWEEN, LIKE or SIMILAR TO after NOT")
-                    );
+                    return Err(self.syntax_error_here());
                 }
             }
             // POSIX regex match operators bind like comparisons.
@@ -532,7 +544,8 @@ impl<'a> Parser<'a> {
             let Some(operator) = self.peek_binary_op() else {
                 if min_prec <= 5
                     && let Tok::Op(operator) = self.peeked
-                    && !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | ":" | "=>")
+                    && is_operator_symbol(operator)
+                    && operator != "=>"
                 {
                     self.advance()?;
                     let right = self.expression(6)?;
@@ -682,6 +695,7 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::Param(n))
             }
             Tok::Op("(") => {
+                let source_position_at = self.peek_at;
                 self.advance()?;
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
@@ -690,6 +704,7 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                    self.parenthesized_primary = Some(source_position_at);
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
                 let inner = self.expression(0)?;
@@ -734,7 +749,7 @@ impl<'a> Parser<'a> {
                     // while `((1,2)).f1` — where the outer parens make it one —
                     // is the spelling that works.
                     if self.peeked == Tok::Op(".") {
-                        return Err(self.err_here("syntax error at or near \".\""));
+                        return Err(self.syntax_error_here());
                     }
                 } else {
                     self.expect_op(")")?;
@@ -752,6 +767,10 @@ impl<'a> Parser<'a> {
                     }
                     let field = self.any_ident("field name")?;
                     base = self.arena_expr(Expr::Field { base, field })?;
+                }
+                // An implicit row `(1, 2)` is not a parenthesized expression.
+                if core::ptr::eq(base, inner) || matches!(base, Expr::Field { .. }) {
+                    self.parenthesized_primary = Some(source_position_at);
                 }
                 Ok(base)
             }
@@ -796,12 +815,18 @@ impl<'a> Parser<'a> {
                     // `-32768::int2` is `-(32768::int2)` — PostgreSQL raises
                     // "smallint out of range" there, and folding would hide it.
                     let cast_follows = self.next_is_cast()?;
+                    // Negate the spelling, not the value: `-9223372036854775808`
+                    // is INT8_MIN although its magnitude exceeds int8. An
+                    // integer that long cannot fit, so it stays numeric.
                     if integral
                         && !cast_follows
-                        && let Some(v) = crate::sql::eval::parse_int_literal(text)
+                        && text.len() < 64
+                        && let Some(v) = crate::sql::eval::parse_int_literal(
+                            crate::stack_format!(64, "-{}", text).as_str(),
+                        )
                     {
                         self.advance()?;
-                        return self.arena_expr(Expr::Int(-v));
+                        return self.arena_expr(Expr::Int(v));
                     }
                 }
                 let operand = self.expression(8)?;
@@ -892,6 +917,9 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 let operand = if self.peeked == Tok::Ident("when") {
                     None
+                } else if self.peeked == Tok::Ident("end") {
+                    // END is reserved; a CASE needs at least one WHEN.
+                    return Err(self.syntax_error_here());
                 } else {
                     Some(self.expression(0)?)
                 };
@@ -903,7 +931,7 @@ impl<'a> Parser<'a> {
                     self.push(&mut whens, (cond, result))?;
                 }
                 if whens.is_empty() {
-                    return Err(self.unexpected("CASE requires at least one WHEN"));
+                    return Err(self.syntax_error_here());
                 }
                 let otherwise = if self.eat_ident("else")? {
                     Some(self.expression(0)?)
@@ -933,7 +961,7 @@ impl<'a> Parser<'a> {
                 if self.peeked == Tok::Op("(") {
                     self.call(kw, true, None)
                 } else {
-                    Err(self.unexpected("expected an expression"))
+                    Err(self.syntax_error_here())
                 }
             }
             // SQL-standard `CAST(expression AS type[(mod)])`, equivalent to `expression::type`.
@@ -1033,10 +1061,9 @@ impl<'a> Parser<'a> {
                 {
                     self.advance()?;
                     let Tok::Num(text) = self.peeked else {
-                        return Err(self.unexpected("expected temporal precision"));
+                        return Err(self.syntax_error_here());
                     };
-                    let precision = parse_uint(text)
-                        .ok_or_else(|| self.err_here("expected temporal precision"))?;
+                    let precision = parse_uint(text).ok_or_else(|| self.syntax_error_here())?;
                     self.advance()?;
                     self.expect_op(")")?;
                     let precision = self.arena_expr(Expr::Int(precision))?;
@@ -1059,7 +1086,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("time")?;
                     self.expect_ident("zone")?;
                     let Tok::Str(lit) = self.peeked else {
-                        return Err(self.unexpected("expected a string literal after type name"));
+                        return Err(self.syntax_error_here());
                     };
                     self.advance()?;
                     let operand = self.arena_expr(Expr::Str(lit))?;
@@ -1208,10 +1235,9 @@ impl<'a> Parser<'a> {
                 // expression. It cannot come earlier — `ARRAY` is reserved and
                 // so is `current_date`, yet both are ordinary expressions.
                 if is_reserved_keyword(name) {
-                    return Err(ParseError {
-                        at: name_at,
-                        ..self.unexpected("expected an expression")
-                    });
+                    // Reserved words are ASCII, so the folded name spans
+                    // the same bytes the client wrote.
+                    return Err(self.syntax_error_near(name_at, name_at + name.len()));
                 }
                 self.arena_expr(Expr::Column {
                     qualifier: None,
@@ -1284,12 +1310,12 @@ impl<'a> Parser<'a> {
                     name,
                 })
             }
-            Tok::Op(operator) if !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | "=") => {
+            Tok::Op(operator) if is_operator_symbol(operator) && operator != "=" => {
                 self.advance()?;
                 let operand = self.expression(6)?;
                 self.catalog_prefix_operator_expr(source_position, None, operator, operand)
             }
-            _ => Err(self.unexpected("expected an expression")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -1479,7 +1505,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("no")? {
                 if self.eat_ident("value")? { -1 } else { 0 }
             } else {
-                return Err(self.err_here("expected YES, NO, or NO VALUE"));
+                return Err(self.syntax_error_here());
             };
             self.arena_expr(Expr::Int(value))?
         } else {
@@ -1705,7 +1731,7 @@ impl<'a> Parser<'a> {
             let key = self.expression(0)?;
             self.push(&mut values, key)?;
             if !self.eat_ident("value")? && !self.eat_op(":")? {
-                return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECT"));
+                return Err(self.syntax_error_here());
             }
             let value = self.expression(0)?;
             let value = self.sql_json_format_argument(value)?;
@@ -1825,7 +1851,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("on")? {
             self.expect_ident("error")?;
         } else if behavior != "false" {
-            return Err(self.unexpected("expected ON ERROR"));
+            return Err(self.syntax_error_here());
         }
         self.expect_op(")")?;
         self.plain_call(
@@ -2276,7 +2302,7 @@ impl<'a> Parser<'a> {
                 if kind == CallKind::SqlSyntax && matches!(self.peeked, Tok::Op("=>" | ":=")) {
                     return Err(self.syntax_error_here());
                 }
-                if self.eat_op("=>")? {
+                if self.eat_op("=>")? || self.eat_op(":=")? {
                     let argument_name = match first {
                         Expr::Column {
                             qualifier: None,
@@ -2445,7 +2471,7 @@ impl<'a> Parser<'a> {
         let source_position = SourcePosition::new(Some(self.peek_at));
         let key = self.expression(0)?;
         if !self.eat_ident("value")? && !self.eat_op(":")? {
-            return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECTAGG"));
+            return Err(self.syntax_error_here());
         }
         let value = self.expression(0)?;
         let value = self.sql_json_format_argument(value)?;
@@ -2538,7 +2564,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(s)
             }
-            _ => Err(self.unexpected("an operator name")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -2690,6 +2716,12 @@ impl<'a> Parser<'a> {
             }
             precision = Some(self.interval_precision()?);
         }
+        // PostgreSQL's grammar starts a range only at YEAR, DAY, HOUR or
+        // MINUTE, and ends it at a finer field; anything else fails at the
+        // token where the grammar stops.
+        if self.peeked == Tok::Ident("to") && matches!(word, "month" | "second") {
+            return Err(self.syntax_error_here());
+        }
         if self.eat_ident("to")? {
             // YEAR TO MONTH carries a self-contained `Y-M` format; the clock
             // ranges (DAY/HOUR/MINUTE TO ...) carry a `D H:M:S` value truncated
@@ -2709,25 +2741,19 @@ impl<'a> Parser<'a> {
                     .encode();
                     return Ok((normalized, modifier));
                 }
-                return Err(self.err_here("expected MONTH after YEAR TO"));
+                return Err(self.syntax_error_here());
             }
             let Some(start) = clock_field_ordinal(word) else {
-                return Err(
-                    self.err_here("INTERVAL range must run from a coarser field to a finer")
-                );
+                return Err(self.syntax_error_here());
             };
             let Some((end_word, _)) = self.peek_interval_field() else {
-                return Err(self.err_here("expected an interval field after TO"));
+                return Err(self.syntax_error_here());
             };
             let Some(end) = clock_field_ordinal(end_word) else {
-                return Err(
-                    self.err_here("INTERVAL range must run from a coarser field to a finer")
-                );
+                return Err(self.syntax_error_here());
             };
             if end <= start {
-                return Err(
-                    self.err_here("INTERVAL range must run from a coarser field to a finer")
-                );
+                return Err(self.syntax_error_here());
             }
             self.advance()?;
             if self.peeked == Tok::Op("(") {
@@ -2804,6 +2830,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
                 sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
+                cursor: None,
+                hint: None,
             });
         }
         if modified {
@@ -2842,31 +2870,45 @@ impl<'a> Parser<'a> {
         }
         let mut lookahead = self.lexer.clone();
         let mut depth = 1_usize;
-        let mut token = lookahead.next_token()?;
+        let mut token = lookahead
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
         loop {
             match token {
                 Tok::Op("(") => depth += 1,
                 Tok::Op(")") => {
                     depth -= 1;
                     if depth == 0 {
-                        token = lookahead.next_token()?;
+                        token = lookahead
+                            .next_token()
+                            .map_err(|error| ParseError::lexical(error, self.text))?;
                         break;
                     }
                 }
                 Tok::Eof => return Ok(false),
                 _ => {}
             }
-            token = lookahead.next_token()?;
+            token = lookahead
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
         }
         if (name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time"))
             && (token == Tok::Ident("with") || token == Tok::Ident("without"))
         {
-            if lookahead.next_token()? != Tok::Ident("time")
-                || lookahead.next_token()? != Tok::Ident("zone")
+            if lookahead
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?
+                != Tok::Ident("time")
+                || lookahead
+                    .next_token()
+                    .map_err(|error| ParseError::lexical(error, self.text))?
+                    != Tok::Ident("zone")
             {
                 return Ok(false);
             }
-            token = lookahead.next_token()?;
+            token = lookahead
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
         }
         Ok(matches!(token, Tok::Str(_)))
     }
@@ -2894,7 +2936,7 @@ impl<'a> Parser<'a> {
             }
         }
         let Tok::Str(literal) = self.peeked else {
-            return Err(self.unexpected("expected a string literal after type modifier"));
+            return Err(self.syntax_error_here());
         };
         self.advance()?;
         let (literal, type_mod) = if name.eq_ignore_ascii_case("interval") {
@@ -2928,6 +2970,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
+            cursor: None,
+            hint: None,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
@@ -2939,6 +2983,8 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+            cursor: None,
+            hint: None,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -2994,6 +3040,8 @@ impl<'a> Parser<'a> {
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+            cursor: None,
+            hint: None,
         };
         let value = lit.trim();
 
@@ -3123,6 +3171,8 @@ impl<'a> Parser<'a> {
                     lit
                 ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
+                cursor: None,
+                hint: None,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);
@@ -3259,6 +3309,15 @@ impl<'a> Parser<'a> {
             _ => None,
         }
     }
+}
+
+/// Whether a token is spelled only from PostgreSQL's operator characters, so it
+/// can name an operator. Punctuation such as `(`, `::`, `:=` and the PL/pgSQL
+/// range `..` cannot.
+fn is_operator_symbol(token: &str) -> bool {
+    token
+        .bytes()
+        .all(|byte| b"+-*/<>=~!@#%^&|`?".contains(&byte))
 }
 
 /// Ordinals for the clock interval fields, coarse to fine. YEAR and MONTH are

@@ -774,6 +774,7 @@ pub(crate) use copy_transition::CopyTransitionRows;
 pub(super) use schema::rename as stage_schema_rename;
 
 mod describe;
+mod routine_lookup;
 pub(crate) use describe::{
     CatalogCols, FunctionLookupFailure, builtin_binary_type, builtin_call, builtin_record_srf_call,
     builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
@@ -800,6 +801,7 @@ pub(crate) use describe::{
     routine_parameter_collation, routine_parameter_depth, with_bound_parameter_types,
 };
 pub(crate) use describe::{describe_data_modification_columns, describe_returning_items};
+pub(crate) use routine_lookup::{RoutineLookupMiss, RoutineTarget, lookup_routine};
 
 mod call_environment;
 mod control_flow;
@@ -11720,7 +11722,7 @@ fn resolve_privilege_objects(
     txid: u32,
     objects: &mut [crate::storage::AccessObject],
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
+    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
     match target {
@@ -11748,51 +11750,7 @@ fn resolve_privilege_objects(
         }
         PrivilegeTarget::Routines { kind, identities } => {
             for identity in identities {
-                let schema = identity.name.schema.unwrap_or("public");
-                let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
-                let Some(slot) = storage.routine_slot_by_declared_signature(
-                    schema,
-                    identity.name.name,
-                    &arguments[..identity.argument_types.len()],
-                    txid,
-                ) else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "function \"{}\" does not exist",
-                        identity.name.name
-                    ));
-                };
-                let actual = storage.routine(slot).kind;
-                let accepted = match kind {
-                    RoutineTargetKind::Function => matches!(
-                        actual,
-                        crate::storage::RoutineKind::Function { .. }
-                            | crate::storage::RoutineKind::SetFunction { .. }
-                            | crate::storage::RoutineKind::TableFunction
-                            | crate::storage::RoutineKind::Trigger
-                            | crate::storage::RoutineKind::Aggregate(_)
-                    ),
-                    RoutineTargetKind::Procedure => {
-                        matches!(actual, crate::storage::RoutineKind::Procedure)
-                    }
-                    RoutineTargetKind::Aggregate => {
-                        matches!(actual, crate::storage::RoutineKind::Aggregate(_))
-                    }
-                    RoutineTargetKind::Either => true,
-                };
-                if !accepted {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "{} \"{}\" does not exist",
-                        match kind {
-                            RoutineTargetKind::Function => "function",
-                            RoutineTargetKind::Procedure => "procedure",
-                            RoutineTargetKind::Aggregate => "aggregate",
-                            RoutineTargetKind::Either => "routine",
-                        },
-                        identity.name.name
-                    ));
-                }
+                let slot = resolve_routine_identity(storage, txid, identity, kind)?;
                 add_privilege_object(objects, &mut count, Storage::routine_access_object(slot))?;
             }
         }
@@ -14186,12 +14144,8 @@ pub(crate) fn drop_schema(
             }
             SchemaObject::Routine(slot) => {
                 let routine = storage.routine_for(*slot, txn.txid);
-                let noun = match routine.kind {
-                    crate::storage::RoutineKind::Procedure => "procedure",
-                    crate::storage::RoutineKind::Aggregate(_) => "aggregate",
-                    _ => "function",
-                };
-                let _ = write!(out, "{} ", noun);
+                // PostgreSQL's getObjectDescription names every routine a function.
+                let _ = write!(out, "function ");
                 write_rel(
                     out,
                     &routine.schema_for(txn.txid),
@@ -18483,6 +18437,16 @@ where
     }
 }
 
+/// Procedures called from PL/pgSQL would need their output parameters
+/// assigned to variables and their transaction control checked against the
+/// calling chain; pos3ql runs CALL only as a top-level statement.
+fn plpgsql_call_unsupported() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "CALL is not supported in PL/pgSQL"
+    )
+}
+
 fn unsupported_trigger_body() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -18596,9 +18560,11 @@ fn split_trigger_statements<'a>(
                 let mut lexer = Lexer::new(remaining, scratch);
                 let mut depth = 0usize;
                 loop {
-                    let token = lexer
-                        .next_token()
-                        .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                    let token = lexer.next_token().map_err(|error| {
+                        super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                            error, remaining,
+                        ))
+                    })?;
                     match token {
                         Tok::Op("(") => depth += 1,
                         Tok::Op(")") if depth > 0 => depth -= 1,
@@ -18634,7 +18600,7 @@ fn trigger_assignment_operator(
     scan_trigger_top_level(statement, arena, |token, start, _| {
         use crate::sql::lexer::Tok;
         Ok(match token {
-            Tok::Op(":") if statement[start..].starts_with(":=") => Some((start, 2)),
+            Tok::Op(":=") => Some((start, 2)),
             Tok::Op("=") => Some((start, 1)),
             _ => None,
         })
@@ -18770,9 +18736,9 @@ fn scan_trigger_top_level<T>(
             let mut lexer = Lexer::new(text, scratch);
             let mut depth = 0usize;
             loop {
-                let token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                let token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(error, text))
+                })?;
                 match token {
                     Tok::Op("(" | "[") => depth += 1,
                     Tok::Op(")" | "]") => {
@@ -18821,9 +18787,9 @@ fn parse_plpgsql_identifier_prefix(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(source, scratch);
-            let token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+            })?;
             let name = match token {
                 Tok::Ident(name) | Tok::QuotedIdent(name) => SqlName::parse(name)?,
                 _ => {
@@ -18853,9 +18819,9 @@ fn parse_plpgsql_identifier<'source>(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(source, scratch);
-            let token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, source))
+            })?;
             let (name, quoted) = match token {
                 Tok::Ident(name) => (SqlName::parse(name)?, false),
                 Tok::QuotedIdent(name) => (SqlName::parse(name)?, true),
@@ -18870,7 +18836,9 @@ fn parse_plpgsql_identifier<'source>(
             if !matches!(
                 lexer
                     .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?,
+                    .map_err(|error| super::parse_error_to_sql(
+                        &super::parser::ParseError::lexical(error, source)
+                    ))?,
                 Tok::Eof
             ) {
                 return Err(sql_err!(
@@ -18932,6 +18900,19 @@ fn parse_trigger_local<'a>(
     if declaration.is_empty() {
         return Err(unsupported_trigger_body());
     }
+    // `name [NO] [SCROLL] CURSOR ... FOR query` declares a bound cursor.
+    let cursor = strip_trigger_keyword(declaration, "no")
+        .map(str::trim_start)
+        .unwrap_or(declaration);
+    let cursor = strip_trigger_keyword(cursor, "scroll")
+        .map(str::trim_start)
+        .unwrap_or(cursor);
+    if strip_trigger_keyword(cursor, "cursor").is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL bound cursor declarations are not supported; declare a refcursor and use OPEN ... FOR"
+        ));
+    }
     let ty = if declaration.eq_ignore_ascii_case("record") {
         ParsedPlpgsqlLocalType::Record
     } else if let Some(reference) = strip_plpgsql_type_suffix(declaration, "%type") {
@@ -18987,14 +18968,16 @@ fn parse_trigger_select_into<'a>(
         .with_remaining_region(|scratch| {
             use crate::sql::lexer::{Lexer, Tok};
             let mut lexer = Lexer::new(after_into, scratch);
-            let mut token = lexer
-                .next_token()
-                .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+            let mut token = lexer.next_token().map_err(|error| {
+                super::parse_error_to_sql(&super::parser::ParseError::lexical(error, after_into))
+            })?;
             let strict = matches!(token, Tok::Ident(word) if word.eq_ignore_ascii_case("strict"));
             if strict {
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
             }
             let mut count = 0usize;
             loop {
@@ -19012,15 +18995,19 @@ fn parse_trigger_select_into<'a>(
                 };
                 count += 1;
                 let end = lexer.token_end();
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
                 if !matches!(token, Tok::Op(",")) {
                     return Ok((count, strict, end));
                 }
-                token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error, after_into,
+                    ))
+                })?;
             }
         })
         .map_err(|_| super::query::arena_full_pub())??;
@@ -19704,10 +19691,7 @@ fn parse_trigger_set_return<'a>(
 
 fn trigger_top_level_range(text: &str, arena: &Arena) -> Result<Option<usize>, SqlError> {
     scan_trigger_top_level(text, arena, |token, start, _| {
-        Ok(
-            (matches!(token, crate::sql::lexer::Tok::Op(".")) && text[start..].starts_with(".."))
-                .then_some(start),
-        )
+        Ok(matches!(token, crate::sql::lexer::Tok::Op("..")).then_some(start))
     })
 }
 
@@ -20140,9 +20124,12 @@ fn parse_plpgsql_cursor_motion<'a>(
             let mut lexer = Lexer::new(motion_and_variable, scratch);
             let mut last = None;
             loop {
-                let token = lexer
-                    .next_token()
-                    .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+                let token = lexer.next_token().map_err(|error| {
+                    super::parse_error_to_sql(&super::parser::ParseError::lexical(
+                        error,
+                        motion_and_variable,
+                    ))
+                })?;
                 if matches!(token, Tok::Eof) {
                     break;
                 }
@@ -20365,12 +20352,12 @@ fn parse_trigger_statement<'a>(
     {
         use crate::sql::lexer::{Lexer, Tok};
         let mut lexer = Lexer::new(segment, arena);
-        let first = lexer
-            .next_token()
-            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
-        let second = lexer
-            .next_token()
-            .map_err(|error| super::parse_error_to_sql(&error.into()))?;
+        let first = lexer.next_token().map_err(|error| {
+            super::parse_error_to_sql(&super::parser::ParseError::lexical(error, segment))
+        })?;
+        let second = lexer.next_token().map_err(|error| {
+            super::parse_error_to_sql(&super::parser::ParseError::lexical(error, segment))
+        })?;
         // A utility starts with two words; assignment punctuation belongs to
         // the local-variable parser even when the variable is named alter.
         if matches!(
@@ -20394,6 +20381,9 @@ fn parse_trigger_statement<'a>(
     }
     if let Some(assignment) = parse_trigger_local_assignment(segment, arena)? {
         return Ok(TriggerStatement::LocalAssign(assignment));
+    }
+    if strip_trigger_keyword(segment, "call").is_some() {
+        return Err(plpgsql_call_unsupported());
     }
     Err(unsupported_trigger_body())
 }
@@ -25628,6 +25618,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "procedural-language catalog mutation is not supported"
                 ))),
+                Stmt::Call { .. } => Ok(Err(plpgsql_call_unsupported())),
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "PL/pgSQL utility command is not implemented"
@@ -28022,10 +28013,11 @@ fn execute_trigger_step<'a>(
                         }
                         debug_assert_eq!(affected, row_count as u64);
                     }
+                    Stmt::Call { .. } => return Err(plpgsql_call_unsupported()),
                     _ => {
                         return Err(sql_err!(
                             sqlstate::SYNTAX_ERROR,
-                            "EXECUTE of a utility command cannot have an INTO clause"
+                            "INTO used with a command that cannot return data"
                         ));
                     }
                 }
@@ -29225,6 +29217,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 super::cursor::FetchMotion::BackwardAll => (2, 0),
                 super::cursor::FetchMotion::Absolute(amount) => (3, amount),
                 super::cursor::FetchMotion::Relative(amount) => (4, amount),
+                super::cursor::FetchMotion::BackwardZero => (5, 0),
             };
             (
                 variable,
@@ -31944,6 +31937,14 @@ pub(crate) fn resolve_routine_type(
             },
             identity,
         )
+    } else if relation_row_type_exists(storage, txid, base) {
+        // PostgreSQL accepts a table's or view's row type here; routine
+        // signatures store only declared types, domains, enums and composites.
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "relation row type \"{}\" cannot be used as a routine argument or result type",
+            written
+        ));
     } else {
         return Err(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -31959,27 +31960,22 @@ pub(crate) fn resolve_routine_type(
     storage.bind_routine_result(result, txid)
 }
 
-/// Parses a routine identity into the same typed contract stored on its
-/// definition.  DDL targets must not compare only storage representations:
-/// two domains over `integer` are distinct PostgreSQL overloads.
-pub(crate) fn resolve_routine_signature(
-    storage: &Storage,
-    txid: u32,
-    type_names: &[&str],
-) -> Result<[crate::storage::RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS], SqlError> {
-    if type_names.len() > MAX_ROUTINE_ARGUMENTS {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "too many routine arguments"
-        ));
+/// Whether `written` names a table or view whose row type would resolve here.
+fn relation_row_type_exists(storage: &Storage, txid: u32, written: &str) -> bool {
+    let visible = |schema: &str, name: &str| {
+        storage.find_visible(schema, name, txid).is_some()
+            || storage.find_view(schema, name, txid).is_some()
+    };
+    match written.split_once('.') {
+        Some((schema, name)) => visible(schema, name),
+        None => storage.path().entries().iter().any(|entry| match entry {
+            crate::storage::PathEntry::Schema(slot) => visible(
+                storage.schema_def_for(*slot as usize, txid).name.as_str(),
+                written,
+            ),
+            _ => false,
+        }),
     }
-    let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
-    for (slot, type_name) in type_names.iter().enumerate() {
-        let resolved = resolve_routine_type(storage, txid, type_name)?;
-        arguments[slot].ctype = resolved.ctype;
-        arguments[slot].user_type = resolved.user_type;
-    }
-    Ok(arguments)
 }
 
 fn qualified_catalog_name(name: crate::sql::ast::QualName<'_>) -> crate::util::StackStr<130> {
@@ -36586,6 +36582,26 @@ pub(crate) fn validate_routine_body(
         Some(&super::query::storage_catalog(storage, arena, txn.txid)),
         crate::sql::ast::Collation::None,
     )?;
+    // PostgreSQL's validator checks the final statement only when
+    // `check_function_bodies` is on and no argument is polymorphic.
+    let sql_result = if check_string_body
+        && !arguments[..argument_count]
+            .iter()
+            .any(|argument| argument.polymorphic_type().is_some())
+    {
+        super::query::RoutineResultContract::declared(
+            storage,
+            txn.txid,
+            kind,
+            &result_columns[..result_column_count],
+            parameters[..routine.arguments.len()]
+                .iter()
+                .any(|parameter| parameter.mode.is_output()),
+            arena,
+        )?
+    } else {
+        super::query::RoutineResultContract::Deferred
+    };
     match kind {
         crate::storage::RoutineKind::Function { result } => {
             if routine.language == RoutineLanguage::PlPgSql {
@@ -36611,16 +36627,11 @@ pub(crate) fn validate_routine_body(
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
-                let returns_void = matches!(
-                    kind,
-                    crate::storage::RoutineKind::Function { result }
-                        if result.ctype == ColType::Void
-                );
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
                     arena,
-                    returns_void,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,
@@ -36682,16 +36693,11 @@ pub(crate) fn validate_routine_body(
                 // The parsed PL/pgSQL program is the persisted contract. SQL
                 // routine dependency analysis applies only to LANGUAGE SQL.
             } else {
-                let returns_void = matches!(
-                    kind,
-                    crate::storage::RoutineKind::SetFunction { result }
-                        if result.ctype == ColType::Void
-                );
                 let program = super::query::parse_stored_routine_function_program(
                     body_kind,
                     body_text,
                     arena,
-                    returns_void,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,
@@ -36751,7 +36757,7 @@ pub(crate) fn validate_routine_body(
                     body_kind,
                     body_text,
                     arena,
-                    true,
+                    sql_result,
                     routine.name.name,
                     &arguments[..argument_count],
                     body_inputs,
@@ -38386,71 +38392,20 @@ fn remove_extension_config(
     Ok(())
 }
 
+/// Resolves a routine identity that must exist, with PostgreSQL's errors.
 pub(crate) fn resolve_routine_identity(
     storage: &Storage,
     txid: u32,
     identity: &super::ast::RoutineIdentity<'_>,
     expected: crate::sql::ast::RoutineTargetKind,
 ) -> Result<usize, SqlError> {
-    use crate::sql::ast::RoutineTargetKind;
-    let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
-    let find_in = |schema: &str| -> Result<Option<usize>, SqlError> {
-        if identity.signature_is_explicit {
-            Ok(storage.routine_slot_by_declared_signature(
-                schema,
-                identity.name.name,
-                &arguments[..identity.argument_types.len()],
-                txid,
-            ))
-        } else {
-            storage
-                .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
-                .map_err(|()| {
-                    sql_err!(
-                        sqlstate::AMBIGUOUS_FUNCTION,
-                        "routine \"{}\" is not unique",
-                        identity.name.name
-                    )
-                })
-        }
-    };
-    let slot = if let Some(schema) = identity.name.schema {
-        find_in(schema)?
-    } else {
-        let mut found = None;
-        for entry in storage.path().entries() {
-            let crate::storage::PathEntry::Schema(slot) = entry else {
-                continue;
-            };
-            if let Some(slot) = find_in(storage.schema_def_for(*slot as usize, txid).name.as_str())?
-            {
-                found = Some(slot);
-                break;
-            }
-        }
-        found
+    match lookup_routine(storage, txid, expected, identity)? {
+        Ok(RoutineTarget::Stored(slot)) => Ok(slot),
+        Ok(RoutineTarget::Builtin(_)) => Err(routine_lookup::builtin_change_error(
+            storage, txid, identity,
+        )),
+        Err(miss) => Err(miss.error(storage, txid, expected, identity)),
     }
-    .ok_or_else(|| {
-        sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "routine \"{}\" does not exist",
-            identity.name.name
-        )
-    })?;
-    let actual = match storage.routine_for(slot, txid).kind {
-        crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
-        crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
-        _ => RoutineTargetKind::Function,
-    };
-    if expected != RoutineTargetKind::Either && expected != actual {
-        return Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "{} \"{}\" does not exist",
-            expected.noun(),
-            identity.name.name
-        ));
-    }
-    Ok(slot)
 }
 
 pub(crate) fn resolve_extension_member(
@@ -38472,27 +38427,7 @@ pub(crate) fn resolve_extension_member(
     match identity {
         ExtensionMemberIdentity::Routine { kind, identity } => routine_object(&identity, kind),
         ExtensionMemberIdentity::Aggregate(aggregate) => {
-            let total =
-                aggregate.direct_argument_types.len() + aggregate.aggregated_argument_types.len();
-            if total > MAX_ROUTINE_ARGUMENTS {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many aggregate arguments"
-                ));
-            }
-            let mut types = [""; MAX_ROUTINE_ARGUMENTS];
-            types[..aggregate.direct_argument_types.len()]
-                .copy_from_slice(aggregate.direct_argument_types);
-            types[aggregate.direct_argument_types.len()..total]
-                .copy_from_slice(aggregate.aggregated_argument_types);
-            routine_object(
-                &super::ast::RoutineIdentity {
-                    name: aggregate.name,
-                    argument_types: &types[..total],
-                    signature_is_explicit: true,
-                },
-                RoutineTargetKind::Aggregate,
-            )
+            routine_object(&aggregate.routine(), RoutineTargetKind::Aggregate)
         }
         ExtensionMemberIdentity::Relation { kind, name } => {
             let Some((schema, actual)) = storage.classify_relation(name.schema, name.name, txid)
@@ -38702,65 +38637,13 @@ pub fn alter_aggregate(
     action: super::ast::AlterRoutineAction<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    let total = identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
-    if total > MAX_ROUTINE_ARGUMENTS {
-        return sql_fail(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "too many aggregate arguments"
-        ));
-    }
-    let mut type_names = [""; MAX_ROUTINE_ARGUMENTS];
-    type_names[..identity.direct_argument_types.len()]
-        .copy_from_slice(identity.direct_argument_types);
-    type_names[identity.direct_argument_types.len()..total]
-        .copy_from_slice(identity.aggregated_argument_types);
-    let arguments = match resolve_routine_signature(storage, txn.txid, &type_names[..total]) {
-        Ok(arguments) => arguments,
-        Err(error) => return sql_fail(error),
-    };
-    let schema = identity.name.schema.unwrap_or("public");
-    let Some(slot) = storage.routine_slot_by_declared_signature(
-        schema,
-        identity.name.name,
-        &arguments[..total],
-        txn.txid,
-    ) else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "aggregate \"{}\" does not exist",
-            identity.name.name
-        ));
-    };
-    let crate::storage::RoutineKind::Aggregate(definition) =
-        storage.routine_for(slot, txn.txid).kind
-    else {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "{} is not an aggregate",
-            identity.name.name
-        ));
-    };
-    let ordered = !matches!(definition.kind, crate::storage::AggregateKind::Normal);
-    if definition.direct_argument_count as usize != identity.direct_argument_types.len()
-        || ordered != identity.ordered_set
-    {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "aggregate \"{}\" does not exist",
-            identity.name.name
-        ));
-    }
     alter_routine(
         storage,
         wal,
         txn,
         AlterRoutineCommand {
             kind: crate::sql::ast::RoutineTargetKind::Aggregate,
-            identity: &super::ast::RoutineIdentity {
-                name: identity.name,
-                argument_types: &type_names[..total],
-                signature_is_explicit: true,
-            },
+            identity: &identity.routine(),
             actions: core::slice::from_ref(&action),
             guc: None,
         },
@@ -38820,54 +38703,11 @@ pub fn alter_routine(
             "ALTER ROUTINE has no action"
         ));
     };
-    let schema = identity.name.schema.unwrap_or("public");
-    let arguments = match resolve_routine_signature(storage, txn.txid, identity.argument_types) {
-        Ok(arguments) => arguments,
+    let slot = match resolve_routine_identity(storage, txn.txid, identity, kind) {
+        Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
-    let slot = if identity.signature_is_explicit {
-        Ok(storage.routine_slot_by_declared_signature(
-            schema,
-            identity.name.name,
-            &arguments[..identity.argument_types.len()],
-            txn.txid,
-        ))
-    } else {
-        storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
-    };
-    let slot = match slot {
-        Ok(Some(slot)) => slot,
-        Ok(None) => {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "{} \"{}\" does not exist",
-                kind.noun(),
-                identity.name.name
-            ));
-        }
-        Err(()) => {
-            return sql_fail(sql_err!(
-                sqlstate::AMBIGUOUS_FUNCTION,
-                "{} name \"{}\" is not unique",
-                kind.noun(),
-                identity.name.name
-            ));
-        }
-    };
     let routine = storage.routine_for(slot, txn.txid);
-    let actual_kind = match routine.kind {
-        crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
-        crate::storage::RoutineKind::Aggregate(_) => crate::sql::ast::RoutineTargetKind::Aggregate,
-        _ => crate::sql::ast::RoutineTargetKind::Function,
-    };
-    if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "{} \"{}\" does not exist",
-            kind.noun(),
-            identity.name.name
-        ));
-    }
     if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
         return sql_fail(error);
     }
@@ -39372,6 +39212,34 @@ fn cascade_routine_cast_operator_dependents(
     Ok(())
 }
 
+/// Resolves one `DROP FUNCTION/PROCEDURE/ROUTINE/AGGREGATE` target.
+/// `DROP FUNCTION` refuses aggregates, as PostgreSQL does.
+fn resolve_drop_routine_target<'a>(
+    storage: &Storage,
+    txid: u32,
+    kind: crate::sql::ast::RoutineTargetKind,
+    identity: &super::ast::RoutineIdentity<'a>,
+) -> Result<Result<RoutineTarget, RoutineLookupMiss<'a>>, SqlError> {
+    let found = lookup_routine(storage, txid, kind, identity)?;
+    if kind == crate::sql::ast::RoutineTargetKind::Function
+        && let Ok(target) = found
+        && target.kind(storage, txid) == crate::sql::ast::RoutineTargetKind::Aggregate
+    {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(StackStr::from_str(
+                "Use DROP AGGREGATE to drop aggregate functions.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is an aggregate function",
+            routine_lookup::QualifiedName(identity.name)
+        ));
+    }
+    Ok(found)
+}
+
 pub fn drop_routine(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -39390,116 +39258,55 @@ pub fn drop_routine(
         DropRoutineTargets::Routines(routines) => routines.len(),
         DropRoutineTargets::Aggregates(aggregates) => aggregates.len(),
     };
+    let identity_at = |index: usize| match targets {
+        DropRoutineTargets::Routines(routines) => routines[index],
+        DropRoutineTargets::Aggregates(aggregates) => aggregates[index].routine(),
+    };
+    // PostgreSQL resolves every target, sending its skip notices and checking
+    // ownership, before it drops any of them. Built-ins are refused only then.
+    let mut builtin = None;
     for target_index in 0..target_count {
-        let mut aggregate_types = [""; MAX_ROUTINE_ARGUMENTS];
-        let (identity_name, argument_types, signature_is_explicit, expected_direct) = match targets
-        {
-            DropRoutineTargets::Routines(routines) => {
-                let identity = routines[target_index];
-                (
-                    identity.name,
-                    identity.argument_types,
-                    identity.signature_is_explicit,
-                    None,
-                )
-            }
-            DropRoutineTargets::Aggregates(aggregates) => {
-                let identity = aggregates[target_index];
-                let total =
-                    identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
-                if total > aggregate_types.len() {
-                    return sql_fail(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many aggregate arguments"
-                    ));
+        let identity = identity_at(target_index);
+        match resolve_drop_routine_target(storage, txn.txid, kind, &identity) {
+            Ok(Ok(RoutineTarget::Stored(slot))) => {
+                if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
+                    return sql_fail(error);
                 }
-                aggregate_types[..identity.direct_argument_types.len()]
-                    .copy_from_slice(identity.direct_argument_types);
-                aggregate_types[identity.direct_argument_types.len()..total]
-                    .copy_from_slice(identity.aggregated_argument_types);
-                (
-                    identity.name,
-                    &aggregate_types[..total],
-                    true,
-                    Some((
-                        identity.direct_argument_types.len() as u8,
-                        identity.ordered_set,
-                    )),
-                )
             }
-        };
-        let identity = super::ast::RoutineIdentity {
-            name: identity_name,
-            argument_types,
-            signature_is_explicit,
-        };
-        let slot = match resolve_routine_identity(
-            storage,
-            txn.txid,
-            &identity,
-            crate::sql::ast::RoutineTargetKind::Either,
-        ) {
-            Ok(slot) => slot,
-            Err(error) if error.sqlstate == sqlstate::AMBIGUOUS_FUNCTION => {
-                return sql_fail(sql_err!(
-                    sqlstate::AMBIGUOUS_FUNCTION,
-                    "function name \"{}\" is not unique",
-                    identity_name.name
-                ));
+            Ok(Ok(RoutineTarget::Builtin(signature))) => {
+                builtin = builtin.or(Some(signature));
             }
-            Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
-                if if_exists {
-                    continue;
-                }
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "{} \"{}\" does not exist",
-                    kind.noun(),
-                    identity_name.name
-                ));
+            Ok(Err(miss)) if if_exists => {
+                miss.notice(storage, txn.txid, kind, &identity, responder)?;
             }
+            Ok(Err(miss)) => return sql_fail(miss.error(storage, txn.txid, kind, &identity)),
+            Err(error) => return sql_fail(error),
+        }
+    }
+    if let Some(signature) = builtin {
+        return sql_fail(routine_lookup::builtin_drop_error(signature));
+    }
+    for target_index in 0..target_count {
+        let identity = identity_at(target_index);
+        // A target found above and missing now was already dropped by this
+        // statement, as a repeated target or a cascaded dependent.
+        let slot = match resolve_drop_routine_target(storage, txn.txid, kind, &identity) {
+            Ok(Ok(RoutineTarget::Stored(slot))) => slot,
+            Ok(Ok(RoutineTarget::Builtin(_)) | Err(_)) => continue,
             Err(error) => return sql_fail(error),
         };
         let actual_kind = match storage.routine(slot).kind {
             crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
-            crate::storage::RoutineKind::Aggregate(definition) => {
-                if let Some((direct, ordered)) = expected_direct
-                    && (definition.direct_argument_count != direct
-                        || matches!(definition.kind, crate::storage::AggregateKind::Normal)
-                            == ordered)
-                {
-                    if if_exists {
-                        continue;
-                    }
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_FUNCTION,
-                        "aggregate \"{}\" does not exist",
-                        identity_name.name
-                    ));
-                }
+            crate::storage::RoutineKind::Aggregate(_) => {
                 crate::sql::ast::RoutineTargetKind::Aggregate
             }
             _ => crate::sql::ast::RoutineTargetKind::Function,
         };
-        if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
-            if if_exists {
-                continue;
-            }
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "{} \"{}\" does not exist",
-                kind.noun(),
-                identity_name.name
-            ));
-        }
         if let Err(error) = storage.require_not_extension_member(
             Storage::routine_access_object(slot),
             txn.txid,
             actual_kind.noun(),
         ) {
-            return sql_fail(error);
-        }
-        if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
             return sql_fail(error);
         }
         let routine = storage.routine(slot);
@@ -48767,22 +48574,13 @@ fn dependency_signature_suffix(
             suffix.write_str("NONE").map_err(|_| too_long())?;
             continue;
         };
-        match argument.user_type {
-            Some(identity) if storage.schema_is_on_path(identity.schema, txid) => {
-                suffix.write_str(identity.name.as_str())
-            }
-            Some(identity) => write!(
-                suffix,
-                "{}.{}",
-                identity.schema.as_str(),
-                identity.name.as_str()
-            ),
-            None => suffix.write_str(argument.ctype.name()),
-        }
-        .map_err(|_| too_long())?;
-        if argument.user_type.is_some() && matches!(argument.ctype, ColType::Array(_)) {
-            suffix.write_str("[]").map_err(|_| too_long())?;
-        }
+        super::catalog::write_visible_routine_type(
+            &mut suffix,
+            storage,
+            txid,
+            argument.ctype,
+            argument.user_type,
+        );
     }
     suffix.write_char(')').map_err(|_| too_long())?;
     Ok(suffix)
@@ -49033,12 +48831,8 @@ fn report_stored_query_dependents(
     let describe_routine =
         |slot: usize, out: &mut crate::util::StackStr<192>| -> Result<(), SqlError> {
             let routine = storage.routine_for(slot, txid);
-            let noun = match routine.kind {
-                crate::storage::RoutineKind::Procedure => "procedure",
-                crate::storage::RoutineKind::Aggregate(_) => "aggregate",
-                _ => "function",
-            };
-            let _ = write!(out, "{} ", noun);
+            // PostgreSQL's getObjectDescription names every routine a function.
+            let _ = write!(out, "function ");
             write_name(out, &routine.schema_for(txid), &routine.name_for(txid));
             let suffix = routine_dependency_suffix(storage, txid, &routine)?;
             let _ = write!(out, "{}", suffix.as_str());
@@ -79057,7 +78851,7 @@ mod tests {
                 "create \"unterminated",
                 4096,
                 sqlstate::SYNTAX_ERROR,
-                "unterminated quoted identifier",
+                "unterminated quoted identifier at or near \"\"unterminated\"",
             ),
         ] {
             let mut budget = Budget::new(8192);

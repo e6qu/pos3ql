@@ -1,9 +1,10 @@
 # What works today
 
-Use this guide for application behavior. The [architecture](architecture.md)
-explains how the server and object storage work; [compatibility](postgresql-18-compatibility.md)
-owns exact SQL and capacity limits. [PLAN.md](../PLAN.md) contains unfinished
-work, rather than a history of completed changes.
+This guide describes application-visible behavior you can rely on now. The
+[architecture](architecture.md) explains how the server and object storage
+work; [compatibility](postgresql-18-compatibility.md) owns the exact SQL surface
+and [capacity limits](postgresql-18-compatibility.md#capacity-boundaries).
+Unfinished work lives only in [PLAN.md](../PLAN.md).
 
 ## What an application can do
 
@@ -14,67 +15,57 @@ work, rather than a history of completed changes.
 | Read selected rows and columns | Immutable indexes and selected-column reads can reduce storage traffic | [Architecture](architecture.md#reads-and-storage-layout), [indexes](index-navigation.md) |
 | Recover without local caches | Checkpoint objects plus later committed journal batches rebuild the database | [Recovery](backup-restore.md) |
 | Copy selected table changes | Logical subscribers keep separate, asynchronously updated databases | [Replication](logical-replication.md) |
-| Operate and replace a server | Readiness, metrics, credential reload, packages and passive-candidate promotion are implemented | [Operations](operations.md) |
-| Query documents | JSON, JSONB, JSON paths and SQL/XML have stated supported forms and limits | [JSON](sql-json.md), [XML](sql-xml.md) |
+| Operate and replace a server | Readiness, metrics, credential reload, packages and passive-candidate promotion | [Operations](operations.md) |
+| Query documents | JSON, JSONB, JSON paths and SQL/XML in their stated forms | [JSON](sql-json.md), [XML](sql-xml.md) |
 
-SQL uses one CPU worker. Several storage requests can be in flight, and cached
-work can run while an eligible query waits for storage. Multiple CPU workers,
-further catalog/resource reductions and representative deployment measurements
-remain in the plan.
+SQL runs on one CPU worker. Several storage requests can be in flight, and
+cached work can run while an eligible query waits for storage. Some paths still
+block that worker; see [Pause and resume every query path](../PLAN.md#pause-and-resume-every-query-path)
+and [Run SQL on several CPU workers](../PLAN.md#run-sql-on-several-cpu-workers).
 
 ## Transactions and durable success
 
-Every configuration explicitly selects `transaction_mode`,
-`catalog_history_bytes` and `row_history_slots` before startup:
+Every configuration sets `transaction_mode`, `catalog_history_bytes` and
+`row_history_slots` explicitly:
 
-| Mode | Reader and writer behavior | Isolation |
-|---|---|---|
-| `mvcc` | Keeps earlier values while readers need them | Supported PostgreSQL snapshot/isolation behavior, subject to fixed history capacity |
-| `locking` | Keeps current committed values; conflicting relation operations wait | Read committed, including PostgreSQL's equivalent read uncommitted; repeatable read, serializable and exported snapshots return `0A000` |
+| Mode | Reader and writer behavior | Isolation | History settings |
+|---|---|---|---|
+| `mvcc` | Readers keep seeing earlier values while they need them | PostgreSQL snapshot and isolation behavior | Positive |
+| `locking` | Readers see current committed values; conflicting relation operations wait | Read committed (and read uncommitted, which PostgreSQL treats the same); repeatable read, serializable and exported snapshots return `0A000` | Zero |
 
-Use positive history reservations in MVCC mode and zero for both in locking
-mode. Row-history slots are shared across tables and large objects. Updates
-reserve their needed slot before commit, even when a reader starts while the
-commit waits. Rollback releases unused slots. Rollback, savepoints and private
-uncommitted changes work in both modes.
-A long report can retain row and catalog history until their fixed pools fill;
-the server returns a named capacity error instead of growing memory.
+Rollback, savepoints and private uncommitted changes work in both modes.
+Row-history slots are shared by all tables and large objects; an update
+reserves its slot before commit and rollback releases it. A long report can
+hold history until the fixed pools fill, at which point the server returns a
+named capacity error instead of growing memory.
 
-**Example:** in MVCC mode, a repeatable-read report can continue seeing an
-order's earlier status after another transaction changes it. In locking mode,
-a conflicting writer waits for the reader's relation lock. Work against an
-unrelated table can continue during that wait.
+**Example:** in MVCC mode, a repeatable-read report keeps seeing an order's
+earlier status after another transaction changes it. In locking mode, a
+conflicting writer waits for the reader's relation lock, while work on
+unrelated tables continues.
 
-Before durability, commit admission reserves replacement definitions, index
-bindings and row keys, then captures journal positions. It uploads durable data
-and installs the complete transaction before releasing locks and success responses. New
-statements cannot select a half-installed order-and-invoice update. Existing
-readers retain their selected data. Prepared commit and rollback decisions
-retain both the transaction and prepared-slot ownership through completion.
+A commit becomes visible all at once, and only after it is durable: new
+statements never see half of an order-and-invoice update. If commit waits for
+storage, completed work is not repeated; a default that issued an order number
+and a trigger that wrote an audit row do not run again. Commit can be cancelled
+until it is published.
 
-If admission waits, it keeps the completed command and buffered output. For
-example, a default that issued an order number and a trigger that wrote an audit
-row do not run again when the wait ends. Admission can be cancelled before
-publication. Share locks protect affected tables while ordinary readers and
-unrelated work continue; prepared transactions save those locks only after
-admission has acquired them.
+Prepared transactions keep their locks and private catalog changes across a
+restart. For example, a domain created before `PREPARE TRANSACTION 'import'`
+stays hidden from other connections until `COMMIT PREPARED 'import'`; rolling
+it back removes the domain.
 
-Saved transactions retain private catalog changes after a restart. For example,
-a domain created before `PREPARE TRANSACTION 'import'` stays hidden from other
-connections until `COMMIT PREPARED 'import'`; rolling it back removes the private
-domain. Resolution reserves metadata before recording a durable commit decision,
-then publishes the reconstructed changes without allocating catalog replay.
-
-A lost final reply leaves the client uncertain whether the commit happened.
-Check application state before retrying an operation that could charge twice.
-If installation fails after durability, the server rejects further work with
-`08007` and requires restart and recovery; it does not undo durable changes.
+A lost final reply leaves the client unsure whether the commit happened. Check
+application state before retrying an operation that could charge twice. If the
+server cannot install a commit after it became durable, it rejects further work
+with `08007` and requires restart and recovery; it never undoes durable changes.
 
 ## Temporary objects and connection cleanup
 
 Temporary tables, views and sequences belong to the connection that created
-them. `DISCARD TEMP` drops them through the same transactional dependency checks
-as an ordinary drop. A rollback restores their rows and definitions:
+them and are never written to object storage. Named types and routines require
+ordinary schemas. `DISCARD TEMP` drops temporary objects with the same
+dependency checks as `DROP`, and rollback restores them:
 
 ```sql
 CREATE TEMP TABLE import_rows (id integer);
@@ -85,19 +76,12 @@ ROLLBACK;
 SELECT id FROM import_rows; -- returns 7
 ```
 
-The connection's temporary namespace keeps its identity, even when it is empty.
 `pg_temp` qualifies table names; a `regnamespace` cast needs the actual schema
-name from `pg_namespace`, not that alias. Temporary objects do
-not enter the durable journal or checkpoint. `DISCARD ALL`, outside an explicit
-transaction, also clears prepared statements, cursors, session settings,
-notifications, sequence-session state and session advisory locks. A temporary
-cleanup capacity error leaves those other session settings intact.
-
-`DISCARD SEQUENCES` clears this connection's remembered sequence values; it does
-not rewind the sequence. `DISCARD PLANS` refreshes future preparation; running
-calls, bound portals and open cursors keep their checked values. Temporary schemas
-currently support tables, views and sequences; named types and routines require
-ordinary schemas.
+name from `pg_namespace`. Outside a transaction, `DISCARD ALL` also clears
+prepared statements, cursors, session settings, notifications, sequence session
+state and session advisory locks. `DISCARD SEQUENCES` forgets this connection's
+remembered sequence values without rewinding the sequence. `DISCARD PLANS`
+affects future preparation; open portals and cursors keep their checked values.
 
 ## Account identity and permissions
 
@@ -108,279 +92,246 @@ ALTER ROLE orders_app RENAME TO orders_writer;
 CREATE ROLE orders_app LOGIN;
 ```
 
-The existing connection becomes `orders_writer`. The new `orders_app` does not
-inherit that connection, its permissions or its cancellation rights. If the
-original account is deleted, simple constant queries remain possible, but
-`current_user` and `session_user` return `42704`; object creation returns `42501`.
-Renaming a prepared transaction's owner changes the displayed name; recreating
-a deleted owner's name does not gain the right to resolve that transaction.
-Superusers can still resolve it.
+The existing connection becomes `orders_writer`. The new `orders_app` gets none
+of its permissions or cancellation rights. If the original account is dropped,
+simple constant queries still work, but `current_user` and `session_user`
+return `42704` and object creation returns `42501`. Recreating a dropped owner's
+name does not grant the right to resolve its prepared transactions; superusers
+still can.
 
-Deleting a role waits for unfinished ownership or permission changes and checks
-dependencies across SQL databases. Savepoint rollback releases locks acquired
-after that savepoint. Prepared transactions retain their locks through recovery;
-`pg_locks` uses durable account and relation identities.
+Memberships and grants follow PostgreSQL:
 
-Permission changes on one object wait for its transaction, while changes on
-other objects can proceed. Object permission lists preserve grant order and explicitly
-empty lists through restart. Revoking the owner's own SELECT permission does
-not remove its right to grant SELECT.
+- Grants by different accounts are independent; revoking one keeps the others.
+  Repeating a grant emits a NOTICE; revoking a missing one emits a WARNING.
+- Changing ADMIN, INHERIT or SET keeps the membership identifier; revoking and
+  regranting creates a new one.
+- Owner privileges follow inherited membership, separately from `SET ROLE`.
+  With INHERIT FALSE and SET TRUE for `owners`, an `app` account must run
+  `SET ROLE owners` before altering their table. With INHERIT TRUE and SET
+  FALSE, it can alter the table directly, but `SET ROLE owners` returns
+  `42501`. The same applies to default privileges and `DROP`/`REASSIGN OWNED`.
+- Revoking an owner's own SELECT does not remove its right to grant SELECT.
+- Default privileges for future objects keep their identifier while any grant
+  remains; resetting to the ordinary defaults removes the row. Dropping a
+  schema removes its default privileges.
 
-Memberships granted by different accounts remain independent. Revoking one
-account's grant keeps the others. Changing ADMIN, INHERIT or SET options keeps
-the membership identifier; revoking and recreating a membership gives it a new
-identifier. Superusers' implicit grants are recorded under the bootstrap
-administrator; inherited administrators grant under the account that holds ADMIN.
-Administrator grants apply PostgreSQL's checks against granting privileges back
-to their source. Membership edits for the same role
-wait for its transaction, including a prepared transaction after recovery;
-other roles and catalog readers can proceed. Repeated grants emit a NOTICE,
-while revoking a missing grant emits a WARNING, matching PostgreSQL's fields.
+Permission and membership changes on one object or role wait for that object's
+open transaction; other objects proceed. Grant order and explicitly empty
+permission lists survive restart.
 
-Owner privileges follow inherited membership; permission to `SET ROLE` is
-separate. For example, an `app` account with INHERIT FALSE and SET TRUE for
-`owners` cannot alter their table until it executes `SET ROLE owners`. With
-INHERIT TRUE and SET FALSE, it can alter the table directly, but `SET ROLE owners`
-returns `42501`. The same distinction applies to changing default privileges
-and dropping or reassigning owned objects.
-
-Default privileges describe what new objects receive. Their catalog identifier
-belongs to the owner, schema and object class, while their permission list is
-sorted by account identifier. For example, granting SELECT on future tables to
-`reader` and INSERT to `writer`, then removing `reader`, preserves the row and
-`writer`'s grant. Returning to the ordinary defaults removes that row; adding a
-grant later creates a new identifier. Dropping a schema removes its default
-privileges automatically. These distinctions survive savepoints, prepared
-transactions, database copies and recovery with empty local caches.
-
-Numeric missing-object permission checks follow PostgreSQL's account-dependent
-rules. A missing table, sequence or large-object identifier returns NULL. For a
-missing type, schema, function, language, database, tablespace, foreign-data
-wrapper or foreign server, a superuser receives true and an ordinary account
-receives NULL. Missing names and invalid privilege names still raise errors.
+Checking privileges on a missing object by OID follows PostgreSQL: a missing
+table, sequence or large object returns NULL; a missing type, schema, function,
+language, database, tablespace, foreign-data wrapper or foreign server returns
+true for a superuser and NULL otherwise. Missing names and invalid privilege
+names raise errors.
 
 ## Reads keep their selected data
 
-A read retains its read position, selected definitions, original resident bytes
-and saved files across suspension. Removing a table, recycling an internal slot,
-replacing a file list or moving the row heap cannot redirect that selection to
-replacement data. Downloads and callbacks run after short metadata guards end.
-Scans capture resident row choices once; saved rows continue streaming.
-Large results use one result header and one completion. After their first
-transport flush, remaining reads finish synchronously to avoid replaying a
-prefix already delivered to the client; [the plan](../PLAN.md) tracks retaining
-the output position across waits.
+A query that pauses for storage keeps the rows, definitions and saved files it
+selected. Concurrent updates, table drops and background maintenance cannot
+redirect it to replacement data; a new query sees the replacement.
 
 **Example:** a report pauses after reading one order. Another connection updates
-an unread order and maintenance replaces saved files. Resuming the report still
-uses its captured values and files. A new read can select the replacement.
-These storage protections do not yet establish every later catalog lookup's
-coherence; the remaining cases are explicit in the plan.
+an unread order and maintenance replaces saved files. The resumed report still
+returns its original values.
 
-Sorting postpones volatile output expressions until the result order is known.
-For example, `SELECT id, nextval('order_numbers') FROM orders ORDER BY id LIMIT 1`
-issues one number. Adding `OFFSET 1` issues two: PostgreSQL also evaluates the
-skipped row. If the generated number is itself the sort key, every candidate
-needs a number before sorting, and output reuses those values. Sorting can use
-the configured memory or temporary-disk path without changing these effects.
-With `FETCH FIRST ... WITH TIES`, finding the end of the tied group also
-evaluates the first following row, even though that row is not returned.
-A sorted nested query with `LIMIT 0` validates names and types without consuming
-sequence values from its input.
-Sorting also preserves whether each joined row existed. For example,
-`row_to_json(profile)` distinguishes a missing profile from a present record
-whose fields are all null; delaying an output expression keeps that distinction.
+Large results send one header and one completion, over the simple protocol
+and an unpaged extended `Execute` alike. A client that reads slowly never
+stalls the server: rows that do not fit the send buffer queue in the shared
+result spool, other sessions keep running, and the slow connection continues
+with its next message once its client has read the result.
 
-`LIMIT` bounds returned rows. Expressions evaluated before sorting can still
-fail on later input rows. SQL constructs such as `GREATEST`, `COALESCE`, JSON
-constructors and XML constructors follow PostgreSQL's expression effects and
-cost boundaries; an explicit sequence call can change their evaluation timing.
+**Example:** a reporting tool runs `SELECT * FROM orders` over a slow link and
+reads it gradually. Meanwhile other applications keep inserting orders. If the
+tool falls behind by more than `result_spool_bytes`, it receives the rows
+already queued followed by `54000` naming that setting, and its session stays
+usable. A large `SELECT` from one ordinary table without sorting, grouping or
+joins resumes row by row instead: it waits for the client and for cold storage
+without holding the worker, and rows already delivered are never repeated.
+Other large results, once their first byte reaches the client, read cold
+storage without yielding; extending resumable output to them is tracked in
+[the plan](../PLAN.md#pause-and-resume-every-query-path).
 
-`NULLIF` uses the selected equality operator and its input conversions.
-For example, `pg_typeof(NULLIF(1, 2.2))` returns `numeric`. Enum labels are
-validated through the catalog, and null operands skip the comparison.
-Conversions from `real` and `double precision` to `numeric` use PostgreSQL's
-six and fifteen significant digits, including NaN and infinities. For example,
-`1.2345678::real::numeric` returns `1.23457`.
-SQL JSON constructors use registered enum-to-JSON conversions, including inside
-arrays and records. Arrays and records retain their structural representation
-instead of invoking a cast registered for the whole container.
+A physical table rewrite follows PostgreSQL's
+[MVCC caveat](https://www.postgresql.org/docs/18/mvcc-caveats.html): an older
+repeatable-read transaction that first opens the table after the rewrite can
+see it as empty.
 
-Geometric conversions follow PostgreSQL's cast rules. For example, assigning a
-polygon to a path column is allowed; assigning a box to a point column needs
-an explicit `::point` cast. Those rules also apply to typed NULL values and
-arrays. Converting an open path to a polygon fails with `22023`, whether written
-as `polygon(value)` or `value::polygon`.
-Registered conversion functions receive the declared size limit and whether the
-SQL requested an explicit conversion. For example, `SELECT 7::varchar(5)` passes
-modifier `9` (PostgreSQL's length-plus-four encoding) and true to a three-argument
-integer-to-varchar cast. Inserting `7` into a `varchar(5)` column passes the same
-modifier and false. Element conversions inside arrays and domains keep that
-size limit too.
+### When volatile expressions run
 
-Explicit array conversions honor a registered whole-array cast first, then
-element conversions when applicable. Element conversions run once in array
-order and preserve dimensions and starting subscripts. A user function that
-accepts NULL may convert a NULL element; a NULL array has no elements to convert.
+Sorting postpones output expressions until the result order is known:
 
-`array_eq`, `array_ne`, `array_lt`, `array_le`, `array_gt`, `array_ge` and
-`btarraycmp` use the array comparison rules of the SQL operators. They accept
-arrays wrapped in domains (types with extra checks), preserving dimensions and
-lower bounds. Input types and enum labels are checked before null handling.
-Within arrays, null elements compare equal to each other and follow non-null
-elements. For example, `ARRAY[NULL::integer] > ARRAY[1]` returns `true`.
+| Query | `nextval` calls |
+|---|---|
+| `SELECT id, nextval('order_numbers') FROM orders ORDER BY id LIMIT 1` | 1 |
+| Same with `OFFSET 1` | 2 (PostgreSQL also evaluates the skipped row) |
+| Same with `FETCH FIRST 1 ROW WITH TIES` | 2 (the next row is checked for a tie) |
+| `ORDER BY nextval(...)` | one per candidate row, reused for output |
+| Sorted subquery with `LIMIT 0` | 0 |
 
-Statements, transaction snapshots, scans and point reads have separate startup
-reservations. Their [exact capacities](postgresql-18-compatibility.md#capacity-boundaries)
-are independent of total durable row count. Completion, cancellation, errors
-and rollback release retained owners. Cleanup respects active readers and
-backup roots. Retaining both row heaps can temporarily prevent reclamation and
-return `54000`.
+`LIMIT` bounds returned rows, but expressions evaluated before sorting can still
+fail on later input rows. Spilling a sort to temporary disk does not change
+these effects. Sorting also keeps whether a joined row existed:
+`row_to_json(profile)` distinguishes a missing profile from one whose fields are
+all null.
 
-SQL cursors save typed values and format each fetched row using the session's
-current settings. For example, a saved `DATE '2020-01-02'` displays as
-`02/01/2020` after `SET DateStyle = 'SQL, DMY'`, including for a cursor kept
-across commit. Procedural `FETCH INTO` assigns the typed value directly.
-Opening a procedural cursor captures its input values and types. For example,
-changing `label` after `OPEN c FOR SELECT label` does not change the saved input.
-A null date remains a date even when the caller's first parameter is an integer.
-Dynamic command strings use only the explicit `USING` arguments; a local variable
-name does not become a SQL column inside the string. Exact rules and reservations
-are in [compatibility](postgresql-18-compatibility.md#capacity-boundaries).
+`GREATEST`, `COALESCE`, `BETWEEN` and JSON and XML constructors evaluate their
+arguments as PostgreSQL does. `1 BETWEEN 2 AND NULL` is false, and a sequence
+call inside `BETWEEN` can issue more than one value.
 
-A simple `NO SCROLL` cursor over one physical table retains its selected rows
-without reading their contents at declaration. For example, `DECLARE c NO SCROLL
-CURSOR FOR SELECT id, label FROM orders` followed by `FETCH 2 FROM c` reads and
-saves two rows; `FETCH 0` before the first row reads none. Closing it releases
-the unread source. Fetching another batch reuses the result buffer: a long
-cursor can use repeated small fetches without retaining earlier batches.
-`MOVE` advances without saving output; a forward jump saves its target row.
-This path accepts columns, wildcards, constants, captured parameters, built-in
-binary operators, negation, boolean logic, null tests, `CASE WHEN` expressions,
-array construction, element access, slices, scalar function calls, built-in
-casts and filters composed from them. A query without a table source retains
-one input row: `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')`
-does not issue a number until its first nonzero fetch. `FETCH 0` issues none,
-and fetching after its one row issues no further number. A holdable cursor
-evaluates an unread row when commit saves its remaining results.
-Fixed input rows use the same fetch boundary. For example,
-`SELECT nextval('order_numbers') FROM (VALUES(10),(20)) input(id)` issues one
-number per fetched row. These constant VALUES sources retain their rows without
-running the outer expressions. Two comma-separated VALUES rows allow backward
-fetching by default; one row and explicit UNION ALL remain forward-only unless
-`SCROLL` is requested. Other cursor plans still execute when opened.
-`BETWEEN` and `NOT BETWEEN`, including `SYMMETRIC`, use the same comparisons
-and boolean evaluation. For example, `1 BETWEEN 2 AND NULL` is false because
-the lower comparison is false. PostgreSQL can evaluate the tested expression
-more than once; a sequence call inside `BETWEEN` can issue multiple values.
-For example, `SELECT 100/id FROM orders WHERE id<>0` tests
-each input as fetching advances; it does not divide by an unread row's `id`.
-`CASE WHEN id<>0 THEN 100/id ELSE NULL END` evaluates only the selected branch
-for each fetched row. Its result type stays the same across fetches.
-`ARRAY[id,id+1]`, `amounts[id]` and `amounts[2:3]` also evaluate as fetching
-advances. An array captured from a procedure keeps its opening values even if
-the procedure later changes its variable.
-Built-in operator choices stay fixed after declaration. A later operator or
-search-path change does not change the open cursor. Type errors and constant
-errors such as `1/0` are checked during declaration, including for empty input.
-Integer `LIMIT` and `OFFSET` expressions keep their counts through storage
-waits. `LIMIT 2 OFFSET 3` skips three qualifying rows and returns at most two;
-`LIMIT 0` reads no rows. Negative bounds fail when fetching starts. Offset rows
-still evaluate the child projection, so a skipped division by zero can fail.
-Filters discard rejected rows and release their temporary memory before
-reading the next input. Scan counters include rejected and erroring input rows. Serializable read
-tracking starts with the scan too: declaration or a provably empty result does
-not mark an unread table as read.
-Function calls, casts, user-defined operators, ordering and row-level security
-still use the eager path.
-With explicit `SCROLL`, the same query shapes also start without reading rows.
-They save visited results so `FETCH PRIOR`, `FETCH 0` and forward jumps within
-that history need no new input reads. `FETCH LAST` first consumes the remaining
-input. Unlike forward-only cursors, their accumulated history must fit
-`cursor_bytes`; exhaustion returns `54000`, releases input owners and leaves
-the cursor failed until closed. When the scroll option is omitted, a physical
-scan permits scrolling; a provably empty result is forward-only. The matching
-`pg_cursors.is_scrollable` value is chosen at declaration. Constant false or
-null filters avoid input reads, including string boolean literals such as `'f'`
-and captured parameter values. A local variable changed after `OPEN` cannot
-change whether that cursor's filter matches.
+### Comparisons and conversions
 
-For these query shapes, `WITH HOLD` saves the unread result during commit
-and keeps the current position. It also works without `BEGIN`: the declaration's
-implicit transaction saves the result before completing. Fetching from a held
-cursor inside a later transaction and rolling that transaction back does not
-rewind or close it. A commit-time result error rolls back and closes new cursors;
-already-held cursors survive. For example, an unread row with `id=0` makes
-`SELECT 100/id` fail during `COMMIT` if the cursor has `WITH HOLD`.
-Unread results must fit `cursor_bytes`; scrolling also retains its prior history.
-Deferred constraint triggers run before saving results, and input owners are
-released before temporary tables' commit actions. Commit-time saving currently
-uses the synchronous commit path; yielding during these storage reads remains
-part of the plan.
-Resident rows keep their immutable byte owner instead of copying a wide row
-into cursor memory just to return a small column. For example, selecting `id`
-does not copy an unselected 128 KiB text field into `cursor_query_bytes`.
-An open retained cursor prevents `DROP TABLE`, `TRUNCATE` and structural
-`ALTER TABLE` in the same session until `CLOSE`; renaming its table keeps the
-saved input valid.
-Other cursor queries still execute during declaration; deferring their
-expressions and row locks remains part of the [plan](../PLAN.md).
+- `NULLIF` uses the selected equality operator: `pg_typeof(NULLIF(1, 2.2))` is
+  `numeric`.
+- `real` and `double precision` convert to `numeric` with six and fifteen
+  significant digits: `1.2345678::real::numeric` is `1.23457`.
+- Geometric casts follow PostgreSQL: assigning a polygon to a path column is
+  allowed; a box to a point column needs `::point`. Converting an open path to a
+  polygon fails with `22023`.
+- Registered cast functions receive the type modifier and explicit flag:
+  `SELECT 7::varchar(5)` passes `9` (length plus four) and true; inserting `7`
+  into a `varchar(5)` column passes `9` and false. Array and domain element
+  conversions keep the modifier.
+- Array casts prefer a registered whole-array cast, then convert elements once
+  each in order, keeping dimensions and lower bounds.
+- `array_eq`, `array_lt` and the other array comparison functions, including
+  `btarraycmp`, match the SQL operators and accept domains over arrays. Null
+  elements compare equal and sort after non-null elements:
+  `ARRAY[NULL::integer] > ARRAY[1]` is true.
+- SQL JSON constructors use registered enum-to-JSON casts, including inside
+  arrays and records.
 
-UPDATE, DELETE, MERGE, conflict handling and schema validation preserve the
-original selected row values in fixed statement memory. They recheck the table
-lifetime and definition before installing a write; a changed source returns
-`40001`. A full rollback log rejects and removes only the change it could not
-record. Metadata-only ALTER avoids rewriting rows when their representation is
-unchanged.
+## Cursors
 
-A physical table rewrite follows PostgreSQL's [MVCC caveat](https://www.postgresql.org/docs/18/mvcc-caveats.html):
-an older repeatable-read transaction first opening that table after the rewrite
-can see it as empty. Existing relation locks and already retained byte sources
-have their own protections; a rewrite is not a promise to retain every old
-logical table image indefinitely.
+SQL cursors save typed values and format each fetched row with the session's
+current settings. A saved `DATE '2020-01-02'` displays as `02/01/2020` after
+`SET DateStyle = 'SQL, DMY'`, even in a cursor held across commit. Procedural
+`FETCH INTO` assigns the typed value directly. Opening a procedural cursor
+captures its inputs: changing `label` after `OPEN c FOR SELECT label` does not
+change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 
-## COPY, functions and retries
+### Cursors that read as you fetch
 
-`COPY FROM` retains its command and read position across input messages.
-Statement triggers receive inserted values saved after BEFORE triggers and
-generated-column calculation, before AFTER row triggers. An AFTER row trigger
-cannot rewrite those saved transition values. Each connection and subscription
-worker has `copy_transition_bytes` plus `txn_rows` records reserved at startup.
-Exhaustion returns `54000` and aborts COPY; cleanup permits a smaller retry.
-If a statement trigger declares `REFERENCING NEW TABLE AS inserted_rows`, its
-queries can read `inserted_rows` while preparing and executing the trigger.
-For example, `INSERT INTO audit SELECT id FROM inserted_rows` sees that COPY
-statement's saved values. Discovering those columns' types does not run the
-trigger's queries or functions. A local `WITH inserted_rows AS (...)` uses its
-own rows under the ordinary SQL name rules.
+A cursor over one table, over constant `VALUES` rows, or over
+`generate_series` (integer, bigint, numeric or timestamp) or a one-array
+`unnest` with constant arguments, reads input only as rows are fetched when
+its query uses only columns, constants, parameters,
+built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
+array construction, subscripts, slices, scalar function calls, `LIMIT` and
+`OFFSET`. A row-locking cursor (`FOR UPDATE`, `FOR SHARE` and their variants)
+over one table may also order by its columns. Other cursor queries, including
+other orderings, user-defined operators or row-level security, run when
+declared; see [the plan](../PLAN.md#pause-and-resume-every-query-path).
 
-`COPY TO` retains the selected schema and row sources and releases them on
-completion or error. Table form reads only that relation; use query form to
-include partitions, views or an explicit order:
+```sql
+DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
+FETCH 2 FROM c;  -- reads two rows
+```
+
+- `FETCH 0` before the first row reads nothing; `MOVE` skips without saving
+  output. Each batch reuses the result buffer, so many small fetches do not
+  accumulate memory.
+- `SELECT 100/id FROM orders WHERE id<>0` divides only fetched rows.
+  `CASE WHEN id<>0 THEN 100/id END` evaluates only the chosen branch.
+- `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')` issues no
+  number until the first nonzero fetch; the same holds for
+  `SELECT nextval('order_numbers') FROM generate_series(1, 3)`. A series keeps
+  only its next value, so `generate_series(1, 70000)` costs no row memory
+  until rows are fetched, and its arguments (a zero step, for example) are
+  checked by the first fetch, as in PostgreSQL. Other functions in `FROM`
+  still run when the cursor is declared.
+- Type errors and constant errors such as `1/0` are reported at `DECLARE`, even
+  for empty input. Operator choices are fixed then; later `search_path` changes
+  do not affect the open cursor.
+- `LIMIT 2 OFFSET 3` skips three matching rows and returns at most two.
+  Negative bounds fail when fetching starts. Skipped rows still evaluate the
+  output list, so a division by zero in a skipped row fails.
+- Constant false or null filters, including `'f'` and captured parameters, read
+  nothing.
+- Under serializable isolation, a table counts as read only once fetching reads
+  it.
+- Selecting `id` from a row with a 128 KiB text column does not copy that text
+  into cursor memory.
+
+`SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
+new reads; `FETCH LAST` reads the rest. When the output list calls a volatile
+function such as `nextval`, a row reached again by `FETCH PRIOR`, `ABSOLUTE`,
+`RELATIVE` or a later forward fetch is evaluated again, as PostgreSQL scans
+backward: with `SELECT id, nextval('s') FROM t`, `FETCH NEXT` twice then
+`FETCH PRIOR` returns row 1 with the third number. The cursor then saves the
+input columns of each row instead of its output, and a volatile filter also
+saves the rows it rejected, because the filter runs again too. `LIMIT` returns
+the row at the edge of its window again without evaluating it, and `MOVE` and
+`FETCH ABSOLUTE` take PostgreSQL's steps (an absolute target less than halfway
+back rewinds and reads forward). History must fit `cursor_bytes`; exhaustion
+returns `54000` and leaves the cursor failed until closed. Without a scroll
+option, a table scan, a retained set-returning function and a list of two or
+more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty
+result are forward-only and return saved rows. `pg_cursors.is_scrollable`
+reports the choice made at declaration.
+
+A row-locking cursor locks each row when a `FETCH` or `MOVE` reaches it, not
+at `DECLARE`, after evaluating its output list and before `OFFSET` counts it:
+
+```sql
+DECLARE c CURSOR FOR SELECT id, v FROM orders ORDER BY id FOR UPDATE;
+FETCH 1 FROM c;  -- locks only the first row
+```
+
+An ordered cursor first saves every qualifying row in `cursor_bytes` (a full
+buffer returns `54000` before any row is locked) and sorts them. A `FETCH` that
+meets a row locked by another transaction waits like `SELECT ... FOR UPDATE`;
+`lock_timeout`, `statement_timeout` and cancel end the wait. A row changed by a
+transaction that committed after `DECLARE` is checked again: under `READ
+COMMITTED` its newest version is filtered and projected again, or skipped if it
+was deleted or no longer matches; under `REPEATABLE READ` and `SERIALIZABLE`
+the fetch fails with `40001`. Rows the cursor's own transaction changed after
+`DECLARE` are skipped. Such cursors are never scrollable by default.
+
+`WITH HOLD` saves the unread rows at commit, including when declared outside
+`BEGIN`. A scrollable cursor that evaluates revisited rows again is rewound and
+saved whole, evaluating every row again; it keeps its position. Rolling back a later transaction that fetched from it does not rewind
+or close it. If saving fails — for example, an unread row with `id=0` makes
+`SELECT 100/id` fail at `COMMIT` — the commit rolls back and closes new
+cursors; cursors held earlier survive. Unread rows must fit `cursor_bytes`.
+
+While such a cursor is open, the same session cannot `DROP`, `TRUNCATE` or
+structurally `ALTER` its table; renaming the table is allowed.
+
+## Writes
+
+UPDATE, DELETE, MERGE, `ON CONFLICT` and validation keep the selected row
+values. If the table or its definition changed before the write is installed,
+the statement returns `40001`. A full rollback log rejects only the change it
+could not record. ALTER that leaves the row representation unchanged does not
+rewrite rows.
+
+## COPY
+
+`COPY TO` in table form reads only that table; use query form to include
+partitions, views or an explicit order:
 
 ```sql
 COPY (SELECT id, status FROM orders ORDER BY id) TO STDOUT (FORMAT csv);
 ```
 
-A partitioned parent without the applicable row-security rewrite returns
-`42809`. Direct view and foreign-table exports require query form. Unpopulated
-materialized views return `0A000` to direct COPY. Direct catalog-table COPY is
-an explicit limit; use `COPY (SELECT ...)`.
+Table-form `COPY TO` returns `42809` for a partitioned parent without an
+applicable row-security rewrite and `0A000` for an unpopulated materialized
+view. Views, foreign tables and catalog tables require query form.
 
-State-changing functions and commands use a separate synchronous block client
-when restarting their call stack could repeat effects. They can still block
-the SQL CPU worker on an uncached read. Retained AFTER work and its owned
-procedural queries can preserve unfinished PL/pgSQL and SQL-language scalar or
-table-function calls across lock waits. SQL functions keep their completed body
-statements, returned rows waiting for AFTER triggers, and unfinished return
-checks. For example, a completed audit INSERT runs once even when the function's
-following SELECT waits repeatedly for a lock.
-Other function/query paths and storage waits still need the remaining work in
-[PLAN.md](../PLAN.md). Eligible pure reads retain completed
-columns and navigation across asynchronous waits. Sequence calls retain their
-completed results through command retries; memory exhaustion returns `54000`,
-`volatile sequence replay exceeds statement memory`, before an unrecorded
-sequence change. Nested SQL keeps the original statement deadline.
+`COPY FROM` statement triggers declared with
+`REFERENCING NEW TABLE AS inserted_rows` see the values saved after BEFORE
+triggers and generated columns: `INSERT INTO audit SELECT id FROM inserted_rows`
+reads that COPY's rows. AFTER row triggers cannot change them. These rows use
+`copy_transition_bytes` plus `txn_rows` records reserved per connection and per
+subscription worker; exhaustion returns `54000` and aborts the COPY.
+
+Deferred constraints run before every commit, including after COPY and at an
+extended-protocol Sync. A failed check rolls back the command instead of
+confirming a partial import. COPY keeps its original user, `search_path`,
+formatting settings, timestamps and statement deadline across data messages.
+
+## Functions, sequences and retries
 
 Ordinary `nextval` is not rolled back; a transactional restart is:
 
@@ -394,69 +345,81 @@ ROLLBACK;
 SELECT nextval('order_numbers'); -- 11
 ```
 
-Deferred checks run before implicit and explicit commits, including COPY and
-extended-protocol Sync. A failed deferred check rolls back the command rather
-than confirming a partial import. Volatile casts execute at runtime; skipped
-scalar and native procedural branches do not consume sequence values. Ordinary
-SQL still prepares some uncorrelated subqueries before choosing a branch;
-removing that eager preparation remains part of the retained execution work.
-Truly immutable constant expressions
-can raise planning errors even when a false filter removes every output row,
-following PostgreSQL's [volatility rules](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat).
-Planning uses registered built-in, stored-function and user-operator volatility.
-For example, `SELECT brin_summarize_new_values('orders_brin')` performs its
-maintenance when the query reaches the call; checking the query for constant
-errors must not perform that maintenance first.
-For a scalar function declared `STRICT`, a constant null argument skips the call and
-its runtime inputs; errors in constant inputs still surface. This includes
-inserted defaults and explicitly null variadic arrays. A null member inside a
-non-null variadic array does not skip the call. Runtime nulls still evaluate
-the other reached inputs. A strict function used in `FROM` evaluates its inputs
-before skipping its body for a null. If procedure `import_batch` accepts two bigint
-inputs, `CALL import_batch(nextval('order_numbers'), 'bad')` rejects the invalid
-integer before issuing an order number. `CALL import_batch(nextval('order_numbers'),
-1/0)` issues a number before its runtime arithmetic error. Functions that produce
-multiple rows evaluate their inputs once, rather than once per output row.
-Constant catalog-identifier casts still validate their names without input rows:
-selecting `'missing_table'::regclass` from an empty table raises `42P01`.
-Capture an object's OID before dropping it when checking that its catalog rows
-were removed.
+When a command waits and resumes, completed effects are not repeated. A
+PL/pgSQL or SQL-language function whose audit INSERT completed runs it once,
+even if its next SELECT waits repeatedly for a lock. Sequence values issued
+before a wait are reused; if recording them exceeds statement memory, the
+command fails with `54000`, `volatile sequence replay exceeds statement memory`,
+before an unrecorded sequence change. Functions that change state can still
+block the SQL worker on an uncached read; see
+[the plan](../PLAN.md#pause-and-resume-every-query-path).
+
+Evaluation order follows PostgreSQL:
+
+- Skipped `CASE` and procedural branches do not run, but ordinary SQL can still
+  prepare some uncorrelated subqueries in a skipped branch.
+- Immutable constant expressions can fail during planning even when a false
+  filter removes every row, following PostgreSQL's
+  [volatility rules](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/catalog/pg_proc.dat).
+  Volatile calls, such as `brin_summarize_new_values('orders_brin')`, run only
+  when reached.
+- A `STRICT` scalar function with a constant null argument is skipped without
+  evaluating its other inputs, including in inserted defaults and an explicitly
+  null variadic array. A null element inside a variadic array does not skip it.
+  A strict function in `FROM` evaluates its inputs first.
+- Given `import_batch(bigint, bigint)`,
+  `CALL import_batch(nextval('order_numbers'), 'bad')` fails before issuing a
+  number, while `CALL import_batch(nextval('order_numbers'), 1/0)` issues one.
+- Set-returning functions evaluate their inputs once.
+- Constant catalog casts validate without input rows: selecting
+  `'missing_table'::regclass` from an empty table raises `42P01`.
+
+## Procedural code
+
+- A trigger can end in a nested `RETURN` or `RAISE`. Reaching the end without
+  returning fails with `2F005` and rolls the command back.
+- Procedural expressions can run subqueries over current variables and trigger
+  rows, such as `IF EXISTS (SELECT 1 FROM orders WHERE id=NEW.id)`. A scalar
+  subquery with no rows is NULL; more than one row fails with `21000`.
+- A numeric `FOR` loop declares its own integer variable, leaving an outer
+  `value text` unchanged. Query `FOR` loops and `FOREACH` assign the declared
+  target, which keeps the last value. An empty query loop assigns a null row;
+  an empty array loop leaves the target unchanged.
+  [PostgreSQL reference results](https://github.com/e6qu/pos3ql/blob/bcbaba7ba47b735c123198a03d14e80935340a3e/tests/external/reference/2026-11-03-input-plans/README.md)
+  show these cases.
+- `EXCEPTION WHEN OTHERS` does not catch cancellation or assertion failures;
+  name `query_canceled` or `assert_failure` explicitly.
+- A caught block is a subtransaction. Its row changes, schema edits, settings
+  and queued deferred triggers are undone; local variables and issued sequence
+  values are kept. After a failed `ALTER TABLE orders ADD COLUMN note text`, the
+  handler sees the original table. Cursors opened inside the failed block close;
+  older cursors keep their position. See the
+  [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
+- DDL succeeds only after its end-of-command event triggers. A failing hook for
+  `DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table and
+  sends no `DO` success tag. Static DDL in routines uses the same path as
+  dynamic `EXECUTE`.
+
+### Statement deadlines
+
+A statement keeps one deadline through waits and nested SQL. Extended-protocol
+Parse, Bind, Describe and Execute share the timer until Execute or Sync
+finishes, so pausing between Bind and Execute does not buy more time. An
+expired timer is reported on the next message, including Flush, Close or Sync.
+Procedural code checks the deadline at every block and instruction, including
+empty loops. During COPY FROM, a row arriving after the deadline fails with
+`57014`. The
+[PostgreSQL probe](https://github.com/e6qu/pos3ql/tree/02d030e49e5a483d567ffb205dd01c4b9faad857/tests/external/reference/2026-11-05-procedural-deadlines)
+records these boundaries.
 
 ## Schema changes and object identity
 
-Schema, table and type edits retain their original object and revision through
-waits and rollback. They update bound columns, indexes, comments, foreign keys,
-owned sequences and saved queries together within their implemented publication
-boundary. A stale edit cannot modify a replacement in the same slot. Table
-columns, constraints and index bindings use shared fixed metadata capacity;
-retained readers keep their original immutable owners. Waiting releases short
-catalog owners, keeps the needed SQL relation locks, and leaves unrelated tables
-available.
-
-Renames preserve object identity; drop and recreate reserve fresh identities
-for relations, row/array types, named types, enum members, indexes, CHECK,
-foreign-key and NOT NULL constraints, statistics, extensions, foreign-data
-wrappers, servers, user mappings, publications, subscriptions, collations,
-conversions, text-search parsers, templates, dictionaries and configurations, casts,
-operators, operator families, operator classes, access methods, event triggers,
-memberships, default privileges, declared and inherited triggers, rewrite rules,
-routines and row-security policies.
-Removing an earlier column or rule does not renumber survivors. Foreign-key triggers retain
-their constraint links. `ADD CONSTRAINT ... USING INDEX` preserves the existing
-index identifier. Database-template copies preserve database-local identifiers, foreign-wrapper,
-server, mapping and table links, and their copied comments. Shared subscriptions
-remain owned by their original database. Remaining catalog lookup and reader
-lifetime guarantees are tracked in the plan.
-
-An inherited trigger keeps its identifier when disabled or renamed. Detaching
-and reattaching its partition creates a new trigger identifier. Each child keeps
-its own enabled mode, so `ALTER TABLE ONLY orders DISABLE TRIGGER audit_order`
-does not disable existing children's copies. Copied definitions and later edits
-stay in their own database through restart. Saved trigger and policy positions
-are restored exactly; recovery rejects stale, missing or corrupt saved images.
-Row triggers declared directly on a child use their own mode; only inherited
-row triggers use the child's saved copy. A parent's statement trigger fires
-once for a command targeting that parent and is not inherited by its children.
+Renames keep an object's identifier (OID); drop and recreate always assign a
+new one. This covers relations, types, enum members, indexes, constraints,
+statistics, extensions, foreign-data objects, publications, subscriptions,
+collations, conversions, text-search objects, casts, operators and their
+classes and families, access methods, event triggers, memberships, default
+privileges, triggers, rules, routines and row-security policies.
 
 ```sql
 CREATE TABLE orders(id integer);
@@ -467,250 +430,123 @@ SELECT has_table_privilege(identity, 'SELECT') IS NULL FROM saved_order_identity
 -- true: the old identifier does not grant access to the replacement
 ```
 
-A trigger can return from a nested branch or raise an exception without a
-`RETURN` statement. Creation accepts both. If execution reaches the end without
-returning, the command fails with `2F005` and rolls back its changes.
-Native procedural expressions can read subqueries using their current variables
-and trigger rows. For example, `IF EXISTS (SELECT 1 FROM orders WHERE id=NEW.id)`
-tests the inserted row's identifier. A scalar subquery with no rows returns
-NULL; more than one row fails with `21000`. A subquery in a skipped `CASE` or
-boolean branch does not run.
+Capture an object's OID before dropping it if you want to check that its
+catalog rows are gone.
 
-Numeric `FOR` loops create a private integer variable. For example, if a routine
-declares `value text := 'outer'`, then `FOR value IN 1..2 LOOP NULL; END LOOP`
-leaves that outer `value` unchanged. Query `FOR` loops and `FOREACH` instead assign
-their declared target, which keeps the last assigned row or element after the
-loop. An empty query loop assigns a null row; an empty array loop leaves the
-target unchanged. These distinctions also apply to function output variables.
-The [PostgreSQL reference evidence](https://github.com/e6qu/pos3ql/blob/bcbaba7ba47b735c123198a03d14e80935340a3e/tests/external/reference/2026-11-03-input-plans/README.md)
-includes matching examples and raw results.
+- A schema change on one table waits for that table's locks; unrelated tables
+  stay available.
+- Dropped columns keep their numbers; new columns append. The 1,600-column limit
+  counts dropped columns.
+- Removing a column or rule does not renumber the others.
+  `ADD CONSTRAINT ... USING INDEX` keeps the index's identifier. NOT NULL
+  constraint names survive table and column renames.
+- `UNIQUE NULLS NOT DISTINCT` treats two keys with NULLs as duplicates;
+  `NULLS DISTINCT` allows them.
+- Copies made from a database template keep the template's local identifiers
+  but edit independently: renaming an operator class in `reporting` does not
+  rename it in `template1`.
+- Inherited triggers keep their identifier when disabled or renamed; detaching
+  and reattaching a partition creates a new one. Each child keeps its own
+  enabled mode, so `ALTER TABLE ONLY orders DISABLE TRIGGER audit_order` leaves
+  children's copies enabled. A parent's statement trigger fires once and is
+  not inherited.
+- Operator classes and families can name built-in and user operators by exact
+  argument types. `pg_catalog.<` picks the built-in operator; plain `<` follows
+  `search_path`.
 
-An `EXCEPTION WHEN OTHERS` handler excludes query cancellation and assertion
-failures. Catch those deliberately with `WHEN query_canceled` or
-`WHEN assert_failure`; a broad handler does not keep cancelled work running.
-Procedural dispatch checks deadlines at block entry and before each instruction,
-including empty loop bodies. A matched cancellation handler consumes an expired
-timeout while preserving a future timer after a user-raised cancellation.
-A command keeps its original deadline through input preparation and cache waits;
-nested SQL does not start a new timer. Extended-protocol Parse, Bind, Describe
-and Execute share the connection's timer until Execute or Sync finishes. For
-example, pausing a client between Bind and Execute does not buy the query more
-time. An expired timer is delivered on the next message, including Flush,
-Close or Sync; buffered portal rows cannot bypass that check. Another connection
-uses its own deadline. COPY retains its original timer
-between data messages: an expired incoming row fails with `57014`; finishing an
-empty stream does not itself require a row check. The
-[PostgreSQL probe](https://github.com/e6qu/pos3ql/tree/02d030e49e5a483d567ffb205dd01c4b9faad857/tests/external/reference/2026-11-05-procedural-deadlines)
-records these boundaries; native tests also interleave connections. COPY binds
-the owning session at start, each row and completion, so trigger handlers can
-restore settings after an error even when other connections run between chunks.
-It also restores the stream's SQL user, search path and formatting before firing
-those triggers. COPY keeps its original statement and transaction timestamps
-across chunks; a background callback restores the frontend's clocks when it
-returns.
-Its completed control effects must not be replayed after a wait; retained handler
-positions remain part of the execution work in [PLAN.md](../PLAN.md).
+Bound references keep their original target:
 
-A caught block is a subtransaction: its database changes are undone while the
-enclosing transaction continues. For example, a handler after a failed
-`ALTER TABLE orders ADD COLUMN note text` sees the original table. Row changes,
-schema edits, staged journal records, settings and queued deferred triggers use
-the same savepoint boundary. The handler regains its login identity while preserving an enclosing function's
-owner permissions. Local variables and issued sequence values retain their effects. Cursors opened inside the failed scope close; older cursors keep
-their advanced position, and closing a cursor is not undone.
-[PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions)
-cover these distinctions, including row and statement triggers.
+- A paused comparison keeps its collation even if that collation is dropped:
+  with a copy of `pg_unicode_fast`, `upper('straße')` is still `STRASSE`.
+- Renaming enum label `pending` to `waiting` changes its display without
+  rewriting rows. A new `pending` label cannot capture old constants.
+- Moving a table to another schema keeps bound references. String SQL bodies
+  and text-based lookups keep their text and can fail after a rename.
+- `pg_type.typdefault` can keep the original text for a domain;
+  `pg_get_expr(typdefaultbin, 0)` shows the current expression.
 
-DDL success follows its end-of-command event triggers. A hook that raises an
-error rolls the command back and keeps its notices, without sending a success
-tag first. Supported static DDL in a `DO` block or routine uses the same
-transactional path as dynamic `EXECUTE`. For example, a failing end hook for
-`DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table
-and sends no successful `DO` tag. Internal comment cleanup during DROP does not become an extra
-COMMENT command in the event-trigger command list.
+A table or view reserves its row-type name; a named type cannot reuse it.
+`search_path` skips schemas without USAGE. Numeric sequence identifiers skip
+name lookup but still require sequence permissions.
 
-User-defined operator classes and families can select modeled built-in operators
-and user operators by their exact argument types. Explicit `pg_catalog.<` selects
-the built-in comparison; an unqualified `<` follows the configured schema search
-order. Member contracts and recovered references use the same checks.
-
-Database-local identities may be the same in a template and its copy. Recovery
-keeps their edits separate: renaming an operator class in `reporting`, for example,
-cannot rename the original class in `template1`. Saved tables, indexes, comments
-and views in the copy keep their selected identifiers after loss of local caches.
-
-A resolved text comparison keeps its original collation's ordering and case
-mapping, even after that collation is dropped and its internal slot is reused.
-For example, a paused query using a copy of `pg_unicode_fast` still expands
-`upper('straße')` to `STRASSE`; creating another collation cannot change that
-choice. Name lookups for new commands still use the current catalog.
-
-Saved type references and enum constants follow their original type/member,
-including arrays, records and defaults. Renaming enum label `pending` to
-`waiting` changes its display without rewriting table rows. Creating a new
-label named `pending` cannot redirect a previously bound constant. Plain text
-is unchanged. Domain `pg_type.typdefault` can preserve the original cached text;
-`pg_get_expr(typdefaultbin, 0)` renders its current bound expression.
-
-A table or view reserves its row-type name in the schema. A named type cannot
-use the same name. Schema moves keep bound references; string SQL bodies and
-explicit text-based name lookups keep their text and can fail after a rename.
-`search_path` skips schemas without USAGE. Numeric sequence identifiers bypass
-schema-name lookup but still require sequence permissions.
-
-Dropped attributes keep their PostgreSQL column numbers and physical type
-metadata. Adding a column appends a new number; the 1,600-column limit includes
-retained dropped entries. NOT NULL constraint names survive table and column
-renames. `UNIQUE NULLS NOT DISTINCT` treats two NULL-bearing keys as conflicting;
-`NULLS DISTINCT` permits them.
-
-Validation checks current committed rows and earlier own changes without
-replacing the caller's ordinary query snapshot. Unique index creation cannot
-miss a duplicate committed after an older report started. Domain validation
-uses compatible table locks and rejects unsupported validation inside stored
-arrays/composites with `0A000`. Adding a rule NOT VALID can defer existing-row
-validation where supported. PostgreSQL's [table validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c),
+Validation, including unique index builds, checks all committed rows and the
+caller's own changes, so it cannot miss a duplicate committed after an older
+report started. `NOT VALID` skips existing rows where supported. Validating a
+domain used inside stored arrays or composites returns `0A000`. PostgreSQL's
+[table validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c),
 [domain validation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/typecmds.c)
 and [index build](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/heapam_handler.c)
-provide the reference behavior.
+are the reference.
 
 ## Views, saved results and rules
 
-`CREATE OR REPLACE VIEW` preserves the view, row type, array type, `_RETURN` rule,
-owner, permissions and comments. Its pending definition still needs reserved
-memory, even when no additional catalog slot is needed. A source-column rename
-preserves the view's output column names.
+`CREATE OR REPLACE VIEW` keeps the view's identifier, row type, `_RETURN` rule,
+owner, permissions and comments. Renaming a source column keeps the view's
+output names.
 
-A materialized view stores results. `WITH NO DATA` makes ordinary reads fail
-with `55000`, including LIMIT 0; an optimized constant-false query can avoid
-the scan. REFRESH requires MAINTAIN, runs as the owner and retains its exclusive
-relation lock until transaction end. Rollback restores both rows and population
-status. Prepared decisions, WAL and empty-cache checkpoint recovery retain
-those states and identities.
+A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
+including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
+exclusive lock until the transaction ends. Rollback restores both rows and
+populated status.
 
-Rewrite rules take the target relation's exclusive lock. A rule that redirects
-an insert therefore conflicts with an ordinary read of that target, while
-unrelated tables remain usable. Replacement keeps enable mode and comments;
-`_RETURN` cannot be renamed. View rule/trigger mode changes and materialized-view
-mode changes retain PostgreSQL's explicit relation-kind errors.
-
-`pg_get_ruledef` reads its identifier and formatting flag once. Unconditional
-`DO NOTHING` rules support both PostgreSQL formatting modes. Other rules return
-their saved SQL when the flag is omitted or false; requesting pretty formatting
-for a condition or action returns `0A000`. For example,
-`pg_get_ruledef(rule_oid, false)` reconstructs a rule without requesting that
-unsupported formatting. Names are quoted when their spelling requires it,
-including reserved words and embedded quotes. A missing rule returns NULL in either mode.
+Rewrite rules take the target table's exclusive lock, so a rule that redirects
+an insert conflicts with ordinary reads of that table. `_RETURN` cannot be
+renamed. `pg_get_ruledef` supports both formatting modes for unconditional
+`DO NOTHING` rules; other rules return their saved SQL, and pretty formatting
+of a condition or action returns `0A000`. A missing rule returns NULL.
 
 ## Catalog listings and current lookups
 
-MVCC catalog listings use their statement or transaction's selected rows.
-Read committed can select newer rows; repeatable read retains its earlier
-listing. Supported PostgreSQL and information-schema reports join those base
-rows, with PostgreSQL's current permission and role-membership checks.
+Catalog listings follow the query's snapshot: read committed can see newer
+rows, repeatable read keeps its earlier listing. Permission checks and role
+names use current state, as in PostgreSQL.
 
-**Example:** another connection renames `orders` to `sales`. An older report
-can still list `orders`, while `to_regclass('sales')` resolves the current name.
-Likewise, an older `pg_get_viewdef` can show a prior query while executing the
-view uses the current rule. Dropping the underlying relation can make the old
-rule fail to deparse with `XX000`; looking up its missing current identifier
-can return NULL. Freezing every lookup at the report's read position would be
-incorrect. The reference is PostgreSQL's [rule lookup](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
+**Example:** another connection renames `orders` to `sales`. An older
+repeatable-read report still lists `orders`, while `to_regclass('sales')`
+resolves the new name. An older `pg_get_viewdef` can show a prior query while
+running the view uses the current rule; if the underlying table was dropped,
+deparsing can fail with `XX000`. This matches PostgreSQL's
+[rule lookup](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/adt/ruleutils.c).
 
-Permission listings retain selected grants but print current role names.
-`pg_get_acl` uses current permissions. Information-schema reports can hide a
-definition when the user can execute/read the object but does not own it.
-Account reports mask or restrict password fields. View dependencies deduplicate
-repeated references and require the applicable ownership role. Their full
-result shapes and definitions follow the pinned PostgreSQL 18.6
-[information schema](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql).
+Information-schema views follow the pinned PostgreSQL 18.6
+[definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql),
+including hiding definitions from non-owners and masking password fields.
 
-Catalog, CTE, table-function and trigger descriptions retain actual column
-metadata and borrowed descriptors. Physical readers share stored schema owners;
-synthetic execution images use a separate typed column payload, including hidden
-fields. Joining small catalogs does not reserve maximum-width tables and their
-constraint arrays. Pool exhaustion remains a named error.
-
-Catalog type properties describe PostgreSQL's interface, independently of the
-object-store layout. Hidden `tableoid` must be named explicitly. Index vectors
-start at subscript zero and preserve that bound when cast to ordinary arrays;
-the reverse SQL casts are rejected with `42846`. `pg_node_tree` values can be
-copied and deparsed, but raw client text/binary input returns `0A000`. A catalog
-relation can resolve by name even when querying its raw rows is unsupported;
-that read must return `0A000`.
+- `tableoid` must be named explicitly.
+- Index vectors start at subscript zero and keep that bound when cast to
+  arrays; casting arrays back returns `42846`.
+- `pg_node_tree` values can be copied and deparsed; client text or binary input
+  returns `0A000`.
+- Some catalog relations resolve by name but return `0A000` when queried.
 
 ## Statistics and maintenance
 
-ANALYZE uses current committed rows and earlier own changes. PostgreSQL gives
-relation counts and column estimates different rollback behavior: `reltuples`
-can remain changed while column estimates revert. Journal capture and checkpoint
-completion clear only the exact statistics revision they saved; later analysis
-remains pending. Table replacement rejects a stale capture with `40001`.
+ANALYZE reads committed rows plus the caller's changes. As in PostgreSQL, a
+rollback can leave `reltuples` changed while column estimates revert.
+`pg_class.relhasindex` is a hint that can stay true after `DROP INDEX`; VACUUM
+clears it. `pg_index` lists the actual indexes.
 
-`pg_index` lists actual visible indexes. `pg_class.relhasindex` is a hint and
-can stay true after DROP INDEX or rollback; VACUUM clears it when appropriate.
-Index creation can refresh the row estimate. These values and prepared ANALYZE
-state survive recovery with their respective transaction rules.
-
-Automatic maintenance advances between client messages and while idle, including
-while eligible downloads wait. Row-history cleanup, eviction and address updates
-visit at most 64 stable row slots per ordinary turn. Heap preparation/copying
-has a separate work allowance; a slot quota is not a wall-time guarantee.
-Owner contention retries on the existing one-second cadence. Completion
-preserves newer writes, active readers, prepared changes and backup roots.
-Journal cleanup retains backup-list pages, retention manifests, commit-chain
-positions and pending deletions while their requests wait. Those waits release
-the SQL worker; listing, retention checks and deletion stay within their fixed
-startup reservations. Saved-file cleanup likewise retains its backup, manifest,
-row-inventory, index-tree, listing and deletion positions. Before deleting a file,
-it validates every retained graph. Its requests have a separate client and yield
-to cached SQL; cache hits preserve other queries' pending reads. Replacing a
-backup invalidates the pending retention decision before cleanup resumes.
-Checkpoints can save new rows and free cache space while obsolete-log requests
-wait. Separate fixed queues prevent either task from changing the other's
-pending deletions, and new commits cannot extend an old cleanup pass forever.
-Explicit CHECKPOINT, shutdown and some atomic reads still have synchronous work.
-
-Combining saved row files also yields while downloads wait. It retains index,
-column and large-row positions in startup-reserved state, including with both
-caches disabled. A cached order query can finish while a merge and another
-connection's download are waiting. Other connections keep their read ownership;
-a completion or freed slot makes the merge runnable again.
-Rows enter its checksum and output count once. A genuine source error restarts
-the same immutable pair with empty output. Checkpoint row capture and index
-construction also yield: their private source buffers retain partial columns,
-large rows and saved-run navigation. Output positions advance only after a row
-has been consumed, so a waiting successor read cannot repeat that row. Index
-block-list setup is retained too. For example, building an index on saved
-orders can wait for storage while a cached lookup and a durable commit finish.
-Changing the captured table or index inputs abandons that job before publication.
-
-At 85% heap use, eligible top-level writes can wait before effects when an active
-maintenance task can free space, including saved-file cleanup or a row-file merge
-that must finish before the next checkpoint. They preserve their command, timestamp and
-deadline and appear as Extension/CacheCapacity waits. Reads and transaction
-completion remain runnable. A transaction does not wait for space that its own
-pending changes pin. When work cannot fit, it receives its named capacity error.
-See [operations](operations.md#scheduled-work-and-schema-migrations) for what
-runs automatically and what an operator must schedule.
+Background maintenance runs between client messages and while idle, and yields
+to queries while it waits for storage. It never removes data needed by active
+readers, prepared transactions or backups. At 85% heap use, eligible writes can
+wait (shown as Extension/CacheCapacity) for maintenance to free space; reads
+and commits keep running. Work that cannot fit gets a named capacity error.
+See [architecture](architecture.md) for the mechanism and
+[operations](operations.md#scheduled-work-and-schema-migrations) for what runs
+automatically and what you schedule.
 
 ### Numbering changes safely
 
-Journal positions and internal change counters use checked arithmetic; their
-64-bit representation does not guarantee unlimited SQL identifiers. Exhausted
-journal positions return `54000`, `WAL LSN space exhausted`. Catalog reservation
-errors name the exhausted object's OID range. Existing objects and saved
-identities remain readable; new reservations cannot wrap or reuse old values.
-The [durable format guide](durable-format.md) owns exact encodings and ranges.
+Journal positions and internal counters never wrap. Running out of journal
+positions returns `54000`, `WAL LSN space exhausted`; catalog reservation errors
+name the exhausted OID range. Existing objects stay readable. The
+[durable format guide](durable-format.md) owns exact encodings and ranges.
 
 ## What the tests establish
 
-Allocation guards, fault simulation, recovery after local-data deletion, real
-PostgreSQL comparisons and actual drivers test the implemented boundaries.
-[Contributing](../CONTRIBUTING.md#verification) defines the complete PR gates.
-Passing those gates does not establish production performance, complete
-PostgreSQL compatibility or deployment failover latency.
-
-The [performance guide](performance.md) distinguishes retained measurements,
-calculated examples and outstanding qualification. The [history index](history/README.md)
-preserves earlier implementation narratives and their evidence.
+Allocation guards, fault simulation, recovery after deleting local data,
+comparisons with real PostgreSQL and real drivers test these boundaries;
+[Contributing](../CONTRIBUTING.md#verification) lists the gates. They do not
+establish production performance, complete PostgreSQL compatibility or failover
+latency; see the [performance guide](performance.md). Earlier implementation
+narratives are in the [history index](history/README.md).

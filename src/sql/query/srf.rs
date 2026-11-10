@@ -5959,7 +5959,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 routine.body_kind,
                 body,
                 arena,
-                scalar_result == Some(ColType::Void),
+                super::RoutineResultContract::stored(storage, txid, routine, arena)?,
                 name,
                 routine.arguments(),
                 inputs,
@@ -6043,6 +6043,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 )?;
             }
             let result_query = match program.result {
+                super::RoutineFunctionResult::Empty => return Ok(&[]),
                 super::RoutineFunctionResult::Query(query) => query,
                 super::RoutineFunctionResult::Void(statement) => match statement {
                     crate::sql::ast::Stmt::Select(query) => arena
@@ -6087,11 +6088,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 &mut |values| {
                     let expected_columns = table_columns.map_or(1, <[_]>::len);
                     if values.len() != expected_columns {
-                        return Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "SQL function query must return {} column{}",
+                        return Err(super::routine_result_width_mismatch(
+                            super::RoutineResultContract::stored(storage, txid, routine, arena)?
+                                .name(),
+                            table_columns.is_none(),
+                            values.len(),
                             expected_columns,
-                            if expected_columns == 1 { "" } else { "s" }
                         ));
                     }
                     let encoded = if let Some(output) = table_columns {
@@ -6239,39 +6241,19 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         } else {
             1
         };
-        if step == 0 {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "step size cannot equal zero"
-            ));
-        }
-        let count = if step > 0 {
-            if stop < start {
-                0
-            } else {
-                ((stop - start) / step) as usize + 1
-            }
-        } else if stop > start {
-            0
-        } else {
-            ((start - stop) / (-step)) as usize + 1
-        };
+        let wide = matches!(start_val, Datum::Int8(_))
+            || matches!(stop_raw, Datum::Int8(_))
+            || matches!(step_raw, Datum::Int8(_));
+        let mut series = super::generator::RowGenerator::integer(start, stop, step, wide)?;
+        let count = usize::try_from(series.known_remaining().expect("integer series count"))
+            .map_err(|_| arena_full())?;
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        let wide = matches!(start_val, Datum::Int8(_))
-            || matches!(stop_raw, Datum::Int8(_))
-            || matches!(step_raw, Datum::Int8(_));
-        let mut v = start;
         for slot in rows.iter_mut() {
-            let value = if wide {
-                Datum::Int8(v)
-            } else {
-                Datum::Int4(v as i32)
-            };
+            let value = series.next(arena)?.expect("integer series count");
             *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-            v += step;
         }
         Ok(&*rows)
     })?;

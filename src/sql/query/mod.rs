@@ -30,7 +30,7 @@ mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
-pub(crate) use retained::RetainedSelect;
+pub(crate) use retained::{LockedRow, RetainedSelect};
 
 #[cfg(test)]
 mod routine_contract_tests;
@@ -39,6 +39,7 @@ mod setops;
 pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
+pub(crate) mod generator;
 mod materialize;
 pub(crate) use materialize::ScopeSchema;
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
@@ -1271,9 +1272,12 @@ impl<'a> RoutineResultShape<'a> {
         Ok(Self::Record(fields))
     }
 
-    pub(crate) fn capture(
+    /// Captures the final statement's row. `declared` names the result type
+    /// only when the row has the wrong width.
+    pub(crate) fn capture<'name>(
         &self,
         values: &[Datum<'_>],
+        declared: impl FnOnce() -> Result<&'name str, SqlError>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
         if let Self::Composite { creation, .. } = self
@@ -1294,11 +1298,11 @@ impl<'a> RoutineResultShape<'a> {
             Self::Composite { width, .. } => *width,
         };
         if values.len() != width {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "SQL function query returns {} columns but {} were declared",
+            return Err(routine_result_width_mismatch(
+                declared()?,
+                matches!(self, Self::Scalar),
                 values.len(),
-                width
+                width,
             ));
         }
         let encoded = super::exec::encode_projected_pub(values, arena)?;
@@ -1429,6 +1433,25 @@ pub(crate) fn with_active_routine_invocations<R>(
 
 thread_local! {
     static ACTIVE_READ_EFFECTS: Cell<Option<core::ptr::NonNull<crate::checkpoint::AtomicBlockReadScope>>> = const { Cell::new(None) };
+    /// Counts effects in both storage modes, so a caller can tell whether a
+    /// statement attempt may still be discarded and run again.
+    static STATEMENT_EFFECT_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Changes whenever any statement starts an effect.
+pub(crate) fn statement_effect_epoch() -> u64 {
+    STATEMENT_EFFECT_EPOCH.with(Cell::get)
+}
+
+/// Whether the running statement attempt has invoked a routine whose result
+/// a later attempt would replay. Such an attempt may still restart, so its
+/// output must not leave for the client yet.
+pub(crate) fn statement_attempt_may_restart() -> bool {
+    with_active_routine_invocations(|context| {
+        context.is_some_and(|(invocations, _)| {
+            invocations.next.get() != 0 || invocations.pending.get().is_some()
+        })
+    })
 }
 
 pub(crate) struct StatementReadEffectScope<'a> {
@@ -1461,6 +1484,7 @@ pub(crate) fn enter_statement_read_effect_scope(
 /// A statement can yield before its first effect. After an effect starts,
 /// remaining reads use the atomic client until that whole statement ends.
 pub(crate) fn protect_statement_effects() {
+    STATEMENT_EFFECT_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
     ACTIVE_READ_EFFECTS.with(|active| {
         if let Some(reads) = active.get() {
             // The scope's borrow pins this stack value through every nested
@@ -1715,6 +1739,8 @@ pub(crate) enum RoutineFunctionResult<'a> {
     DataModification(&'a Stmt<'a>),
     Void(&'a Stmt<'a>),
     Forbidden(&'static str),
+    /// A body with no statements whose result is not checked.
+    Empty,
 }
 
 /// A SQL-language function program with one typed final result statement.
@@ -1724,13 +1750,115 @@ pub(crate) struct RoutineFunctionProgram<'a> {
     pub result: RoutineFunctionResult<'a>,
 }
 
+/// What a SQL-language body's final statement must produce.
+#[derive(Clone, Copy)]
+pub(crate) enum RoutineResultContract<'a> {
+    /// A `void` function or a procedure without output parameters.
+    Void,
+    /// The declared result type, named as PostgreSQL's `format_type_be` does.
+    Returns(&'a str),
+    /// CREATE with `check_function_bodies` off or polymorphic arguments:
+    /// PostgreSQL checks the result at the first call, so the program is
+    /// parsed only for its dependencies.
+    Deferred,
+}
+
+impl<'a> RoutineResultContract<'a> {
+    /// The checked contract for a routine's declared result.
+    pub(crate) fn declared(
+        storage: &Storage,
+        txid: u32,
+        kind: crate::storage::RoutineKind,
+        result_columns: &[crate::storage::RoutineArgumentDef],
+        output_parameters: bool,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        Ok(
+            match kind.checked_body_result(result_columns, output_parameters) {
+                Some(result) => Self::Returns(super::catalog::routine_type_display(
+                    storage, txid, result, arena,
+                )?),
+                None => Self::Void,
+            },
+        )
+    }
+
+    /// The contract of a stored routine at execution time.
+    pub(crate) fn stored(
+        storage: &Storage,
+        txid: u32,
+        routine: &crate::storage::RoutineDef,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        Self::declared(
+            storage,
+            txid,
+            routine.kind,
+            routine.table_columns().unwrap_or(&[]),
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.mode.is_output()),
+            arena,
+        )
+    }
+}
+
+impl<'a> RoutineResultContract<'a> {
+    /// The type named in a result mismatch; `void` when nothing is checked.
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Self::Returns(declared) => declared,
+            Self::Void | Self::Deferred => "void",
+        }
+    }
+}
+
+/// PostgreSQL's `check_sql_stmt_retval` failure for a declared result.
+pub(crate) fn routine_result_mismatch(declared: &str, detail: &str) -> SqlError {
+    crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
+    sql_err!(
+        sqlstate::INVALID_FUNCTION_DEFINITION,
+        "return type mismatch in function declared to return {}",
+        declared
+    )
+}
+
+/// PostgreSQL's width failure: a scalar result takes exactly one column, and
+/// a row result takes one column per field.
+pub(crate) fn routine_result_width_mismatch(
+    declared: &str,
+    scalar: bool,
+    returned: usize,
+    expected: usize,
+) -> SqlError {
+    routine_result_mismatch(
+        declared,
+        if scalar {
+            "Final statement must return exactly one column."
+        } else if returned > expected {
+            "Final statement returns too many columns."
+        } else {
+            "Final statement returns too few columns."
+        },
+    )
+}
+
+pub(crate) const ROUTINE_RESULT_STATEMENT_DETAIL: &str =
+    "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.";
+
 /// Parses a SQL-language function body. PostgreSQL permits supported SQL
-/// statements before the final result, but transaction control cannot cross a
-/// function boundary.
+/// statements before the final result; transaction control is rejected only
+/// when execution reaches it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine parsing keeps its result contract, body form and input sources explicit"
+)]
 pub(crate) fn parse_routine_function_program<'a>(
     body: &'a str,
     arena: &'a Arena,
-    returns_void: bool,
+    result: RoutineResultContract<'_>,
+    unquoted: bool,
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
     inputs: &'a [super::type_inputs::Binding<'a>],
@@ -1759,15 +1887,42 @@ pub(crate) fn parse_routine_function_program<'a>(
         count += 1;
     }
     validate(&parser)?;
-    let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
-        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+    // PostgreSQL's parse analysis rejects utilities in a `BEGIN ATOMIC` body
+    // before it checks the result.
+    if unquoted
+        && let Some(tag) = parsed[..count]
+            .iter()
+            .flatten()
+            .find_map(|step| match step {
+                RoutinePrelude::Statement(statement) => {
+                    super::unquoted_body_unsupported_tag(statement)
+                }
+                RoutinePrelude::Forbidden(name) => Some(*name),
+            })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} is not yet supported in unquoted SQL function body",
+            tag
+        ));
+    }
+    let declared = match result {
+        RoutineResultContract::Returns(declared) => Some(declared),
+        RoutineResultContract::Void | RoutineResultContract::Deferred => None,
     };
-    let result = if returns_void {
-        match last {
-            RoutinePrelude::Statement(statement) => RoutineFunctionResult::Void(statement),
-            RoutinePrelude::Forbidden(statement) => RoutineFunctionResult::Forbidden(statement),
+    let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
+        if let Some(declared) = declared {
+            return Err(routine_result_mismatch(
+                declared,
+                ROUTINE_RESULT_STATEMENT_DETAIL,
+            ));
         }
-    } else {
+        return Ok(RoutineFunctionProgram {
+            preceding: &[],
+            result: RoutineFunctionResult::Empty,
+        });
+    };
+    let result = if let Some(declared) = declared {
         match last {
             RoutinePrelude::Statement(Stmt::Select(query)) => RoutineFunctionResult::Query(
                 arena
@@ -1783,11 +1938,16 @@ pub(crate) fn parse_routine_function_program<'a>(
                 RoutineFunctionResult::DataModification(statement)
             }
             RoutinePrelude::Statement(_) | RoutinePrelude::Forbidden(_) => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
+                return Err(routine_result_mismatch(
+                    declared,
+                    ROUTINE_RESULT_STATEMENT_DETAIL,
                 ));
             }
+        }
+    } else {
+        match last {
+            RoutinePrelude::Statement(statement) => RoutineFunctionResult::Void(statement),
+            RoutinePrelude::Forbidden(statement) => RoutineFunctionResult::Forbidden(statement),
         }
     };
     let preceding = arena
@@ -1806,7 +1966,7 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
     body_kind: crate::storage::RoutineBodyKind,
     body: &'a str,
     arena: &'a Arena,
-    returns_void: bool,
+    result: RoutineResultContract<'_>,
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
     inputs: &'a [super::type_inputs::Binding<'a>],
@@ -1835,7 +1995,8 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
     parse_routine_function_program(
         executable,
         arena,
-        returns_void,
+        result,
+        body_kind == crate::storage::RoutineBodyKind::Atomic,
         routine_name,
         parameters,
         inputs,
@@ -1843,16 +2004,19 @@ pub(crate) fn parse_stored_routine_function_program<'a>(
     )
 }
 
-fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
+/// Names a statement an SQL function cannot run, as PostgreSQL's
+/// `CreateCommandName` names it in the execution-time error.
+pub(crate) fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     Some(match statement {
-        Stmt::Begin(_) => "BEGIN",
+        Stmt::Begin(_, start) => start.command_name(),
         Stmt::Commit => "COMMIT",
-        Stmt::Rollback => "ROLLBACK",
+        Stmt::Rollback | Stmt::RollbackToSavepoint(_) => "ROLLBACK",
         Stmt::Savepoint(_) => "SAVEPOINT",
-        Stmt::ReleaseSavepoint(_) => "RELEASE SAVEPOINT",
-        Stmt::RollbackToSavepoint(_) => "ROLLBACK TO SAVEPOINT",
+        Stmt::ReleaseSavepoint(_) => "RELEASE",
+        Stmt::PrepareTransaction(_) => "PREPARE TRANSACTION",
+        Stmt::CommitPrepared(_) => "COMMIT PREPARED",
+        Stmt::RollbackPrepared(_) => "ROLLBACK PREPARED",
         Stmt::Vacuum { .. } => "VACUUM",
-        Stmt::Checkpoint => "CHECKPOINT",
         _ => return None,
     })
 }
@@ -1924,6 +2088,7 @@ pub(crate) fn routine_program_access(program: &RoutineFunctionProgram<'_>) -> Ro
         RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => {
             RoutineProgramAccess::Engine
         }
+        RoutineFunctionResult::Empty => RoutineProgramAccess::ReadOnly,
     };
     for step in program.preceding {
         access = access.max(match step {
@@ -1934,10 +2099,18 @@ pub(crate) fn routine_program_access(program: &RoutineFunctionProgram<'_>) -> Ro
     access
 }
 
+/// PostgreSQL rejects transaction control when an SQL function reaches it and
+/// VACUUM through its transaction-block check.
 pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
+    if statement == "VACUUM" {
+        return sql_err!(
+            sqlstate::ACTIVE_SQL_TRANSACTION,
+            "VACUUM cannot be executed from a function"
+        );
+    }
     sql_err!(
-        sqlstate::ACTIVE_SQL_TRANSACTION,
-        "{} cannot be executed from an SQL function",
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "{} is not allowed in an SQL function",
         statement
     )
 }
@@ -3395,7 +3568,12 @@ impl StorageCatalog<'_, '_, '_, '_> {
             routine.body_kind,
             routine.body.as_str(),
             self.routine_workspace,
-            result_type == ColType::Void,
+            RoutineResultContract::stored(
+                self.storage,
+                self.txid,
+                routine,
+                self.routine_workspace,
+            )?,
             routine.name.as_str(),
             routine.arguments(),
             inputs,
@@ -3505,6 +3683,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 RoutineFunctionResult::Forbidden(statement) => {
                     return Err(routine_forbidden_statement_error(statement));
                 }
+                RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
             };
             execute_bound_routine_query(
                 result_query,
@@ -3518,7 +3697,19 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 sequences,
                 &mut |values| {
                     if result.is_none() {
-                        result = Some(result_shape.capture(values, arena)?);
+                        result = Some(result_shape.capture(
+                            values,
+                            || {
+                                RoutineResultContract::stored(
+                                    self.storage,
+                                    self.txid,
+                                    routine,
+                                    arena,
+                                )
+                                .map(RoutineResultContract::name)
+                            },
+                            arena,
+                        )?);
                     }
                     Ok(())
                 },
@@ -8986,7 +9177,17 @@ pub(crate) fn lock_result_row(
     scope: &QueryScope<'_>,
     rowids: &[Option<u64>],
 ) -> Result<bool, SqlError> {
-    for clause in statement.locking {
+    lock_clauses_row(storage, txid, statement.locking, scope, rowids)
+}
+
+pub(crate) fn lock_clauses_row(
+    storage: &Storage,
+    txid: u32,
+    clauses: &[crate::sql::ast::LockClause<'_>],
+    scope: &QueryScope<'_>,
+    rowids: &[Option<u64>],
+) -> Result<bool, SqlError> {
+    for clause in clauses {
         for (table, rowid) in rowids.iter().copied().enumerate().take(scope.n) {
             let targeted = if clause.of.is_empty() {
                 scope.derived[table].is_none()

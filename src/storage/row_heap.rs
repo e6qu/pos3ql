@@ -1486,7 +1486,7 @@ mod tests {
     #[test]
     fn shared_heap_append_parallel_writers_publish_disjoint_complete_ranges() {
         let heap = heap(128 * 8);
-        let start = std::sync::Barrier::new(5);
+        let start = crate::mem::mutex::Barrier::new(5);
         std::thread::scope(|scope| {
             let writers: [_; 4] = core::array::from_fn(|worker| {
                 let heap = &heap;
@@ -1680,7 +1680,7 @@ mod tests {
         bytes.copy_from_slice(b"dead");
         let (old, bytes) = heap.append(4).unwrap();
         bytes.copy_from_slice(b"keep");
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let heap = &heap;
@@ -1724,7 +1724,7 @@ mod tests {
         let mut heap = heap(8);
         let (location, bytes) = heap.append(8).unwrap();
         bytes.copy_from_slice(&0u64.to_le_bytes());
-        let start = std::sync::Barrier::new(4);
+        let start = crate::mem::mutex::Barrier::new(4);
         std::thread::scope(|scope| {
             for _ in 0..3 {
                 let heap = &heap;
@@ -1901,7 +1901,7 @@ mod tests {
         heap.append_bytes(b"dead").unwrap();
         let location = heap.append_bytes(b"keep").unwrap();
         let old = heap.get(location).unwrap();
-        let start = std::sync::Barrier::new(2);
+        let start = crate::mem::mutex::Barrier::new(2);
         let done = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
             let start_ref = &start;
@@ -2006,7 +2006,7 @@ mod tests {
             assert_eq!(budget.used(), 0);
         }
         let error = crate::config::Config::parse(
-                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nindex_statistics_slots = 4096\nmemtable_bytes = 4GiB"
+                "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8388608\nrow_work_leases = 128\nexecution_control_bytes = 262144\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\nmemtable_bytes = 4GiB"
             )
             .unwrap_err();
         assert!(error.message.contains("row-location"), "{error}");

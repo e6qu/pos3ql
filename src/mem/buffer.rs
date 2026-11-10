@@ -8,6 +8,9 @@ pub struct FixedBuf {
     buffer: Box<[u8]>,
     start: usize,
     end: usize,
+    /// Bytes at the end of `buffer` held by a second region that grows
+    /// downward. Appends never reach it; socket buffers never use it.
+    tail: usize,
 }
 
 impl FixedBuf {
@@ -21,6 +24,7 @@ impl FixedBuf {
             buffer: vec![0; capacity].into_boxed_slice(),
             start: 0,
             end: 0,
+            tail: 0,
         })
     }
 
@@ -49,12 +53,16 @@ impl FixedBuf {
             self.end -= self.start;
             self.start = 0;
         }
-        &mut self.buffer[self.end..]
+        let limit = self.buffer.len() - self.tail;
+        &mut self.buffer[self.end..limit]
     }
 
     /// Marks `n` bytes of the writable slice as filled.
     pub fn advance(&mut self, n: usize) {
-        assert!(self.end + n <= self.buffer.len(), "advancing past capacity");
+        assert!(
+            self.end + n <= self.buffer.len() - self.tail,
+            "advancing past capacity"
+        );
         self.end += n;
     }
 
@@ -95,6 +103,38 @@ impl FixedBuf {
     /// `truncate_to` to roll back a partially written message.
     pub fn mark(&self) -> usize {
         self.end
+    }
+
+    /// Claims `length` bytes below the downward region, returning their
+    /// absolute offset, or `None` when they would overlap appended bytes.
+    pub fn push_tail(&mut self, length: usize) -> Option<(usize, &mut [u8])> {
+        let tail = self.tail.checked_add(length)?;
+        if self.end.checked_add(tail)? > self.buffer.len() {
+            return None;
+        }
+        self.tail = tail;
+        let offset = self.buffer.len() - tail;
+        Some((offset, &mut self.buffer[offset..offset + length]))
+    }
+
+    /// Bytes previously claimed by [`Self::push_tail`].
+    pub fn tail_bytes(&self, offset: usize, length: usize) -> &[u8] {
+        assert!(
+            offset >= self.buffer.len() - self.tail && offset + length <= self.buffer.len(),
+            "tail range outside the downward region"
+        );
+        &self.buffer[offset..offset + length]
+    }
+
+    /// Releases the downward region; appended bytes are unaffected.
+    pub fn clear_tail(&mut self) {
+        self.tail = 0;
+    }
+
+    /// Moves `range` of the appended bytes to `to` (an earlier offset).
+    pub fn move_within(&mut self, range: core::ops::Range<usize>, to: usize) {
+        assert!(range.end <= self.end && to <= range.start, "invalid move");
+        self.buffer.copy_within(range, to);
     }
 
     pub fn truncate_to(&mut self, mark: usize) {
@@ -148,5 +188,36 @@ mod tests {
         b.append(b"discard");
         b.truncate_to(mark);
         assert_eq!(b.readable(), b"keep");
+    }
+
+    #[test]
+    fn downward_region_and_appends_share_capacity_without_overlap() {
+        let mut budget = Budget::new(1024);
+        let mut b = FixedBuf::new(&mut budget, "test", 12).unwrap();
+        assert!(b.append(b"head"));
+        let (first, bytes) = b.push_tail(3).unwrap();
+        bytes.copy_from_slice(b"one");
+        assert_eq!(first, 9);
+        let (second, bytes) = b.push_tail(5).unwrap();
+        bytes.copy_from_slice(b"two!!");
+        assert_eq!(second, 4);
+        assert!(
+            b.push_tail(1).is_none(),
+            "the region stops at appended bytes"
+        );
+        assert!(!b.append(b"x"), "appends stop at the region");
+        assert_eq!(b.tail_bytes(first, 3), b"one");
+        assert_eq!(b.tail_bytes(second, 5), b"two!!");
+        b.clear();
+        assert_eq!(
+            b.tail_bytes(first, 3),
+            b"one",
+            "clearing appends keeps the region"
+        );
+        assert!(b.append(b"four"));
+        assert!(!b.append(b"x"));
+        b.clear_tail();
+        assert!(b.append(b"more"));
+        assert_eq!(b.readable(), b"fourmore");
     }
 }

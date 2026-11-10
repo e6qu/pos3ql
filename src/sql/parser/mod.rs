@@ -225,6 +225,11 @@ pub struct ParseError {
     /// SQLSTATE; almost always 42601 (syntax error), but some parse-analysis
     /// errors carry their own (e.g. 42P20 for window-frame shape).
     pub sqlstate: &'static str,
+    /// Byte offset in the parsed text that PostgreSQL reports as the error
+    /// cursor (the ErrorResponse `P` field), or `None` when it reports none.
+    pub cursor: Option<usize>,
+    /// PostgreSQL's HINT for this error, if it sends one.
+    pub hint: Option<&'static str>,
 }
 
 impl ParseError {
@@ -233,15 +238,22 @@ impl ParseError {
             at,
             message: stack_format!(96, "{}", text),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
+            hint: None,
         }
     }
 }
 
-impl From<LexError> for ParseError {
-    fn from(e: LexError) -> Self {
-        let mut error = ParseError::new(e.at, e.message);
-        error.sqlstate = e.kind.sqlstate();
-        error
+impl ParseError {
+    /// A scanner error on `text`, echoing the scanned text as PostgreSQL does.
+    pub(crate) fn lexical(error: LexError, text: &str) -> Self {
+        Self {
+            at: error.at,
+            message: error.render(text),
+            sqlstate: error.kind.sqlstate(),
+            cursor: error.cursor(),
+            hint: error.hint,
+        }
     }
 }
 
@@ -300,6 +312,9 @@ pub struct Parser<'a> {
     /// expression parser needs this narrow bit of grammar context to leave the
     /// column constraint for its caller.
     stop_default_at_not_null: bool,
+    /// Where the latest parenthesized primary expression (or scalar
+    /// subquery) began: one of the forms PostgreSQL lets take a subscript.
+    parenthesized_primary: Option<usize>,
     /// SQL-language routine formals. Their names are resolved to the same
     /// positional parameter nodes as `$n` while the body is parsed, so a
     /// runtime value cannot lose its declared type or be mistaken for a table
@@ -315,6 +330,14 @@ pub(crate) struct NamedParameter<'a> {
     pub qualifier: Option<&'a str>,
     pub name: &'a str,
     pub index: u32,
+}
+
+/// The parts of PostgreSQL's `TypeNameToString` for a parsed type name.
+#[derive(Clone, Copy)]
+struct WrittenTypeName<'a> {
+    schema: Option<&'a str>,
+    name: &'a str,
+    array: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -826,7 +849,9 @@ pub(crate) fn parse_expression_list<'a>(
 impl<'a> Parser<'a> {
     pub fn new(text: &'a str, arena: &'a Arena) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(text, arena);
-        let peeked = lexer.next_token()?;
+        let peeked = lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, text))?;
         let peek_at = lexer.token_start();
         Ok(Self {
             text,
@@ -846,6 +871,7 @@ impl<'a> Parser<'a> {
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
+            parenthesized_primary: None,
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
@@ -1152,7 +1178,7 @@ impl<'a> Parser<'a> {
         let statement = self.statement()?;
         match self.peeked {
             Tok::Op(";") | Tok::Eof => Ok(Some(statement)),
-            _ => Err(self.unexpected("expected ';'")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -1231,6 +1257,8 @@ impl<'a> Parser<'a> {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::Scroll;
@@ -1241,6 +1269,8 @@ impl<'a> Parser<'a> {
                         at: statement_start,
                         message: StackStr::from_str("cannot specify both SCROLL and NO SCROLL"),
                         sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 scroll = crate::sql::cursor::CursorScroll::NoScroll;
@@ -1253,6 +1283,8 @@ impl<'a> Parser<'a> {
                 at: statement_start,
                 message: StackStr::from_str("cannot specify both ASENSITIVE and INSENSITIVE"),
                 sqlstate: sqlstate::INVALID_CURSOR_DEFINITION,
+                cursor: None,
+                hint: None,
             });
         }
         self.expect_ident("cursor")?;
@@ -1276,6 +1308,8 @@ impl<'a> Parser<'a> {
                     "DECLARE CURSOR must not contain data-modifying statements in WITH",
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         if let Some(clause) = query.locking.first() {
@@ -1284,19 +1318,27 @@ impl<'a> Parser<'a> {
                     "DECLARE CURSOR WITH HOLD",
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "not supported",
+                    "Holdable cursors must be READ ONLY.",
                 ))
             } else if scroll == crate::sql::cursor::CursorScroll::Scroll {
                 Some((
                     "DECLARE SCROLL CURSOR",
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "not supported",
+                    "Scrollable cursors must be READ ONLY.",
                 ))
             } else if insensitive {
-                Some(("DECLARE INSENSITIVE CURSOR", "42P11", "not valid"))
+                Some((
+                    "DECLARE INSENSITIVE CURSOR",
+                    "42P11",
+                    "not valid",
+                    "Insensitive cursors must be READ ONLY.",
+                ))
             } else {
                 None
             };
-            if let Some((prefix, state, reason)) = restriction {
+            if let Some((prefix, state, reason, detail)) = restriction {
+                crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail)), None);
                 return Err(ParseError {
                     at: statement_start,
                     message: stack_format!(
@@ -1307,6 +1349,8 @@ impl<'a> Parser<'a> {
                         reason,
                     ),
                     sqlstate: state,
+                    cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -1335,15 +1379,11 @@ impl<'a> Parser<'a> {
             match p.peeked {
                 Tok::Num(text) => {
                     // PostgreSQL's SignedIconst requires an int32 magnitude.
-                    let v: i32 = text.parse().map_err(|_| ParseError {
-                        at: p.peek_at,
-                        message: stack_format!(96, "syntax error at or near \"{}\"", text),
-                        sqlstate: sqlstate::SYNTAX_ERROR,
-                    })?;
+                    let v: i32 = text.parse().map_err(|_| p.syntax_error_here())?;
                     p.advance()?;
                     Ok(if negative { -v } else { v })
                 }
-                _ => Err(p.unexpected("expected a row count")),
+                _ => Err(p.syntax_error_here()),
             }
         };
         let motion = if self.eat_ident("next")? {
@@ -1370,7 +1410,10 @@ impl<'a> Parser<'a> {
             if self.eat_ident("all")? {
                 FetchMotion::BackwardAll
             } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
-                FetchMotion::Count(-signed_count(self)?)
+                match signed_count(self)? {
+                    0 => FetchMotion::BackwardZero,
+                    count => FetchMotion::Count(-count),
+                }
             } else {
                 FetchMotion::Count(-1)
             }
@@ -1566,7 +1609,7 @@ impl<'a> Parser<'a> {
                                 .err_here("unrecognized value for EXPLAIN option \"serialize\""));
                         }
                         _ => {
-                            return Err(self.err_here("expected EXPLAIN serialize format"));
+                            return Err(self.syntax_error_here());
                         }
                     };
                 } else {
@@ -1627,6 +1670,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option BUFFERS requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if options.wal && !options.analyze {
@@ -1634,6 +1679,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option WAL requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if timing_enabled_explicitly && !options.analyze {
@@ -1641,6 +1688,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option TIMING requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if options.serialize != ExplainSerialize::None && !options.analyze {
@@ -1648,6 +1697,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "EXPLAIN option SERIALIZE requires ANALYZE"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
@@ -1658,6 +1709,8 @@ impl<'a> Parser<'a> {
                     "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         let statement = self.statement()?;
@@ -1711,20 +1764,26 @@ impl<'a> Parser<'a> {
                 } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
                     crate::sql::ast::DiscardTarget::Temporary
                 } else {
-                    return Err(self.err_here("expected ALL, PLANS, SEQUENCES, or TEMPORARY"));
+                    return Err(self.syntax_error_here());
                 };
                 Ok(Stmt::Discard(target))
             }
             Tok::Ident("begin") => {
                 self.advance()?;
                 let characteristics = self.transaction_modifiers(true)?;
-                Ok(Stmt::Begin(characteristics))
+                Ok(Stmt::Begin(
+                    characteristics,
+                    crate::sql::ast::TransactionStart::Begin,
+                ))
             }
             Tok::Ident("start") => {
                 self.advance()?;
                 self.expect_ident("transaction")?;
                 let characteristics = self.transaction_modifiers(false)?;
-                Ok(Stmt::Begin(characteristics))
+                Ok(Stmt::Begin(
+                    characteristics,
+                    crate::sql::ast::TransactionStart::StartTransaction,
+                ))
             }
             Tok::Ident("commit") | Tok::Ident("end") => {
                 self.advance()?;
@@ -1844,7 +1903,7 @@ impl<'a> Parser<'a> {
                 if let Some(target) = target {
                     let characteristics = self.parse_transaction_characteristics()?;
                     if characteristics == TransactionCharacteristics::EMPTY {
-                        return Err(self.unexpected("expected transaction characteristics"));
+                        return Err(self.syntax_error_here());
                     }
                     return Ok(Stmt::SetTransaction {
                         target,
@@ -1856,7 +1915,7 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat_ident("schema")? {
                     if !matches!(self.peeked, Tok::Str(_)) {
-                        return Err(self.unexpected("schema name string"));
+                        return Err(self.syntax_error_here());
                     }
                     let RoutineConfigValue::Value(value) =
                         self.configuration_value_list("search_path", false)?
@@ -2102,14 +2161,14 @@ impl<'a> Parser<'a> {
                             self.advance()?;
                             Some(s)
                         }
-                        _ => return Err(self.unexpected("expected a payload string literal")),
+                        _ => return Err(self.syntax_error_here()),
                     }
                 } else {
                     None
                 };
                 Ok(Stmt::Notify { channel, payload })
             }
-            _ => Err(self.unexpected("expected a statement")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -2122,7 +2181,7 @@ impl<'a> Parser<'a> {
         let body = self.str_literal("anonymous code block")?;
         if self.eat_ident("language")? {
             if language.is_some() {
-                return Err(self.unexpected("one LANGUAGE clause"));
+                return Err(self.err_here("conflicting or redundant options"));
             }
             language = Some(self.any_ident("procedural language")?);
         }
@@ -2136,6 +2195,8 @@ impl<'a> Parser<'a> {
                     language
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         Ok(Stmt::Do { body })
@@ -2153,7 +2214,7 @@ impl<'a> Parser<'a> {
             loop {
                 let this_variadic = self.eat_ident("variadic")?;
                 let first = self.expression(0)?;
-                let (argument, argument_name) = if self.eat_op("=>")? {
+                let (argument, argument_name) = if self.eat_op("=>")? || self.eat_op(":=")? {
                     let argument_name = match first {
                         Expr::Column {
                             qualifier: None,
@@ -2567,7 +2628,7 @@ impl<'a> Parser<'a> {
                 } else {
                     limit = Some(self.expression(0)?);
                     if !(self.eat_ident("rows")? || self.eat_ident("row")?) {
-                        return Err(self.err_here("expected ROW or ROWS after FETCH count"));
+                        return Err(self.syntax_error_here());
                     }
                 }
                 if self.eat_ident("with")? {
@@ -2610,6 +2671,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
                     sqlstate: sqlstate::UNDEFINED_FUNCTION,
+                    cursor: None,
+                    hint: None,
                 });
             }
             match operator {
@@ -2623,6 +2686,8 @@ impl<'a> Parser<'a> {
                         operator
                     ),
                     sqlstate: sqlstate::WRONG_OBJECT_TYPE,
+                    cursor: None,
+                    hint: None,
                 }),
             }
         } else if self.eat_ident("desc")? {
@@ -2730,9 +2795,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("share")?;
                 LockStrength::KeyShare
             } else {
-                return Err(
-                    self.err_here("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR")
-                );
+                return Err(self.syntax_error_here());
             };
             let mut of = ArenaList::new(self.arena);
             if self.eat_ident("of")? {
@@ -3422,7 +3485,7 @@ impl<'a> Parser<'a> {
                     let this_variadic = self.eat_ident("variadic")?;
                     let first = self.expression(0)?;
                     let (argument, argument_name) =
-                        if self.eat_op("=>")? {
+                        if self.eat_op("=>")? || self.eat_op(":=")? {
                             let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
@@ -3640,6 +3703,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: StackStr::from_str("DEFAULT namespace is not supported"),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 let uri = self.expression(0)?;
@@ -3950,6 +4015,8 @@ impl<'a> Parser<'a> {
                     at: method_at,
                     message: stack_format!(96, "tablesample method {} does not exist", method_name),
                     sqlstate: sqlstate::UNDEFINED_OBJECT,
+                    cursor: None,
+                    hint: None,
                 });
             }
         };
@@ -3974,6 +4041,8 @@ impl<'a> Parser<'a> {
                     count
                 ),
                 sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+                cursor: None,
+                hint: None,
             });
         }
         self.expect_op(")")?;
@@ -4164,7 +4233,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.peeked != Tok::Op(")") {
-                return Err(self.unexpected("expected ')'"));
+                return Err(self.syntax_error_here());
             }
             self.advance()?;
         }
@@ -4177,7 +4246,7 @@ impl<'a> Parser<'a> {
                 .map_err(|_| self.unexpected("COPY FROM supports only STDIN"))?;
             false
         } else {
-            return Err(self.unexpected("expected FROM or TO"));
+            return Err(self.syntax_error_here());
         };
         let options = self.copy_options()?;
         self.validate_copy_options(&options)?;
@@ -4221,7 +4290,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.peeked != Tok::Op(")") {
-                return Err(self.unexpected("expected ')'"));
+                return Err(self.syntax_error_here());
             }
             self.advance()?;
         } else {
@@ -4245,6 +4314,8 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "COPY format \"{}\" does not exist", other),
                             sqlstate: sqlstate::UNDEFINED_OBJECT,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                 };
@@ -4362,6 +4433,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "cannot specify {} in BINARY mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -4384,6 +4457,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "COPY {} requires CSV mode", name),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -4416,23 +4491,23 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "COPY {} must be a single one-byte character", what),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
             });
         }
         Ok(bytes[0])
     }
 
     /// A required single-quoted string literal (e.g. an enum label).
-    pub(super) fn str_literal(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
+    /// `_what` names the expected item for readers; PostgreSQL's error names
+    /// only the token found.
+    pub(super) fn str_literal(&mut self, _what: &'static str) -> Result<&'a str, ParseError> {
         match self.peeked {
             Tok::Str(s) => {
                 self.advance()?;
                 Ok(s)
             }
-            _ => Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "expected {} as a quoted string literal", what),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            }),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -4447,6 +4522,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "COPY {} requires a quoted string", what),
                 sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: None,
+                hint: None,
             }),
         }
     }
@@ -4499,7 +4576,7 @@ impl<'a> Parser<'a> {
     /// A parenthesized column-name list `( a, b, ... )` for a FORCE option.
     fn copy_column_list(&mut self) -> Result<&'a [&'a str], ParseError> {
         if self.peeked != Tok::Op("(") {
-            return Err(self.unexpected("expected '(' for a COPY column list"));
+            return Err(self.syntax_error_here());
         }
         self.advance()?;
         let mut names = [""; crate::storage::MAX_COLUMNS];
@@ -4517,7 +4594,7 @@ impl<'a> Parser<'a> {
             break;
         }
         if self.peeked != Tok::Op(")") {
-            return Err(self.unexpected("expected ')'"));
+            return Err(self.syntax_error_here());
         }
         self.advance()?;
         self.arena_slice(&names[..n])
@@ -4528,6 +4605,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "COPY option \"{}\" is not supported", option),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
+            hint: None,
         }
     }
 
@@ -4536,6 +4615,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "{} is not supported", what),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: None,
+            hint: None,
         }
     }
 
@@ -4603,6 +4684,8 @@ impl<'a> Parser<'a> {
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 if self.eat_op(")")? {
@@ -4625,6 +4708,8 @@ impl<'a> Parser<'a> {
                             at: self.peek_at,
                             message: stack_format!(96, "unsupported ANALYZE option \"ANALYZE\""),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
+                            hint: None,
                         });
                     }
                     if core::mem::replace(&mut saw_analyze, true) {
@@ -4661,6 +4746,8 @@ impl<'a> Parser<'a> {
                             option
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 break;
@@ -4896,7 +4983,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("system")?;
                 Privilege::AlterSystem
             } else {
-                return Err(self.unexpected("expected an object privilege"));
+                return Err(self.syntax_error_here());
             };
             let columns = if self.eat_op("(")? {
                 if !matches!(
@@ -5014,9 +5101,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("schema")?;
                 PrivilegeObjectKind::AllRoutinesInSchema
             } else {
-                return Err(self.unexpected(
-                    "expected TABLES, SEQUENCES, FUNCTIONS, PROCEDURES, or ROUTINES after ALL",
-                ));
+                return Err(self.syntax_error_here());
             }
         } else if self.eat_ident("function")? {
             return self.routine_privilege_target(RoutineTargetKind::Function);
@@ -5118,7 +5203,8 @@ impl<'a> Parser<'a> {
         loop {
             let name = self.qual_name("routine name")?;
             self.expect_op("(")?;
-            let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut argument_types = [crate::sql::ast::RoutineArgumentType::EMPTY;
+                crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0usize;
             if !self.eat_op(")")? {
                 loop {
@@ -5161,7 +5247,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("false")? {
             Ok(false)
         } else {
-            Err(self.unexpected("expected TRUE or FALSE"))
+            Err(self.syntax_error_here())
         }
     }
 
@@ -5307,6 +5393,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "unrecognized REINDEX option \"{}\"", option),
                         sqlstate: sqlstate::SYNTAX_ERROR,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -5326,7 +5414,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("system")? {
             ReindexTarget::System
         } else {
-            return Err(self.err_here("expected INDEX, TABLE, SCHEMA, DATABASE, or SYSTEM"));
+            return Err(self.syntax_error_here());
         };
         if self.eat_ident("concurrently")? {
             if saw_concurrently {
@@ -5613,7 +5701,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("schema")?;
                 crate::sql::ast::AlterCollationAction::SetSchema(self.any_ident("schema name")?)
             } else {
-                return Err(self.err_here("expected a collation alteration"));
+                return Err(self.syntax_error_here());
             };
             return Ok(Stmt::AlterCollation { name, action });
         }
@@ -5635,7 +5723,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("schema")?;
                 crate::sql::ast::AlterConversionAction::SetSchema(self.any_ident("schema name")?)
             } else {
-                return Err(self.err_here("expected a conversion alteration"));
+                return Err(self.syntax_error_here());
             };
             return Ok(Stmt::AlterConversion { name, action });
         }
@@ -6311,7 +6399,7 @@ impl<'a> Parser<'a> {
         if let Some(enabled) = trigger_mode {
             if self.eat_ident("rule")? {
                 if matches!(self.peeked, Tok::Ident("all" | "user")) {
-                    return Err(self.err_here("expected a rewrite rule name"));
+                    return Err(self.syntax_error_here());
                 }
                 let action = AlterAction::SetRuleEnabled {
                     name: self.col_ident("rewrite rule name")?,
@@ -6361,7 +6449,7 @@ impl<'a> Parser<'a> {
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
         let mut buffer = ArenaList::new(self.arena);
         loop {
-            let action = self.alter_table_cmd(foreign)?;
+            let action = self.alter_table_cmd(foreign, table.name)?;
             self.push(&mut buffer, action)?;
             if !self.eat_op(",")? {
                 break;
@@ -6437,7 +6525,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("configuration")? {
             TextSearchObjectKind::Configuration
         } else {
-            return Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"));
+            return Err(self.syntax_error_here());
         };
         let name = self.any_qual_name(kind.noun())?;
         let action = if self.eat_ident("rename")? {
@@ -6487,7 +6575,7 @@ impl<'a> Parser<'a> {
                     }
                 } else {
                     let Some(token_types) = token_types else {
-                        return Err(self.err_here("expected FOR or REPLACE"));
+                        return Err(self.syntax_error_here());
                     };
                     self.expect_ident("with")?;
                     TextSearchMappingAction::Set {
@@ -6510,11 +6598,11 @@ impl<'a> Parser<'a> {
                     token_types: self.text_search_token_types()?,
                 }
             } else {
-                return Err(self.err_here("expected a text search configuration alteration"));
+                return Err(self.syntax_error_here());
             };
             AlterTextSearchAction::ConfigurationMapping(mapping)
         } else {
-            return Err(self.err_here("expected a text search object alteration"));
+            return Err(self.syntax_error_here());
         };
         Ok(Stmt::AlterTextSearch { kind, name, action })
     }
@@ -6563,8 +6651,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("schemas")? {
             DefaultPrivilegeObjectKind::Schemas
         } else {
-            return Err(self
-                .unexpected("expected TABLES, SEQUENCES, FUNCTIONS, ROUTINES, TYPES, or SCHEMAS"));
+            return Err(self.syntax_error_here());
         };
         if !schemas.is_empty() && kind == DefaultPrivilegeObjectKind::Schemas {
             return Err(ParseError {
@@ -6573,6 +6660,8 @@ impl<'a> Parser<'a> {
                     "cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS",
                 ),
                 sqlstate: sqlstate::INVALID_GRANT_OPERATION,
+                cursor: None,
+                hint: None,
             });
         }
         if grant {
@@ -6666,7 +6755,11 @@ impl<'a> Parser<'a> {
 
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
-    fn alter_table_cmd(&mut self, foreign: bool) -> Result<AlterAction<'a>, ParseError> {
+    fn alter_table_cmd(
+        &mut self,
+        foreign: bool,
+        table: &str,
+    ) -> Result<AlterAction<'a>, ParseError> {
         if foreign && self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
@@ -6809,6 +6902,7 @@ impl<'a> Parser<'a> {
             let mut generated_text = None;
             let mut identity = None;
             loop {
+                let constraint_at = self.peek_at;
                 let constraint_name = if self.eat_ident("constraint")? {
                     Some(self.col_ident("constraint name")?)
                 } else {
@@ -6820,7 +6914,7 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     if null_clause == Some(false) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
                     }
                     null_clause = Some(true);
                     not_null = true;
@@ -6836,7 +6930,7 @@ impl<'a> Parser<'a> {
                     }
                 } else if self.eat_ident("null")? {
                     if null_clause == Some(true) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
                     }
                     null_clause = Some(false);
                     not_null = false;
@@ -6974,7 +7068,7 @@ impl<'a> Parser<'a> {
                     && alteration.initially.is_none()
                     && alteration.enforced.is_none()
                 {
-                    return Err(self.err_here("expected a constraint attribute"));
+                    return Err(self.syntax_error_here());
                 }
                 if alteration.deferrable == Some(false)
                     && alteration.initially == Some(ConstraintMode::Deferred)
@@ -7140,17 +7234,17 @@ impl<'a> Parser<'a> {
                     },
                 })
             } else {
-                Err(self.unexpected("expected TYPE, SET, DROP, ADD or RESTART"))
+                Err(self.syntax_error_here())
             }
         } else {
-            Err(self.unexpected("expected ADD, DROP or ALTER"))
+            Err(self.syntax_error_here())
         }
     }
 
     fn column_statistics_distinct(&mut self) -> Result<StatisticsDistinct, ParseError> {
         let negative = self.eat_op("-")?;
         let Tok::Num(raw) = self.peeked else {
-            return Err(self.unexpected("statistics option value"));
+            return Err(self.syntax_error_here());
         };
         let value = raw
             .parse::<f64>()
@@ -7161,6 +7255,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "statistics option value {} is out of range", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
         })
     }
 
@@ -7185,6 +7281,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -7208,6 +7306,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "unrecognized parameter \"{}\"", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             };
             if core::mem::replace(selected, true) {
@@ -7311,6 +7411,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "transaction identifier \"{}\" is too long", value),
             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
         })
     }
 
@@ -7525,6 +7627,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "number of columns does not match number of values"),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    cursor: None,
+                    hint: None,
                 });
             }
             for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
@@ -7905,9 +8009,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("configuration")? {
                 TextSearchObjectKind::Configuration
             } else {
-                return Err(
-                    self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION")
-                );
+                return Err(self.syntax_error_here());
             };
             CommentTarget::TextSearch {
                 kind,
@@ -8295,12 +8397,51 @@ impl<'a> Parser<'a> {
     /// `(...)`). varchar/char carry a length; numeric/decimal carry
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
+        let (name, type_mod, _) = self.type_name_written()?;
+        Ok((name, type_mod))
+    }
+
+    /// Parses a type name and also returns the parts of PostgreSQL's written
+    /// form (its `TypeNameToString`) for routine identity diagnostics.
+    fn type_name_written(&mut self) -> Result<(&'a str, i32, WrittenTypeName<'a>), ParseError> {
         let source = NamespaceSource {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
         let mut name = self.any_ident("type name")?;
+        let mut written = WrittenTypeName {
+            schema: None,
+            name,
+            array: false,
+        };
+        // PostgreSQL's grammar turns these unquoted keywords into
+        // `pg_catalog`-qualified internal names.
+        let keyword = !quoted
+            && matches!(
+                name,
+                "int"
+                    | "integer"
+                    | "smallint"
+                    | "bigint"
+                    | "real"
+                    | "float"
+                    | "double"
+                    | "decimal"
+                    | "dec"
+                    | "numeric"
+                    | "boolean"
+                    | "bit"
+                    | "character"
+                    | "char"
+                    | "varchar"
+                    | "timestamp"
+                    | "time"
+                    | "interval"
+                    | "json"
+                    | "national"
+                    | "nchar"
+            );
         // System-qualified built-ins normalize to their bare spelling. A user
         // schema is part of the type identity and must survive parsing; dropping
         // it aliases same-named domains/enums in different schemas.
@@ -8310,6 +8451,11 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
             let base = self.any_ident("type name")?;
+            written = WrittenTypeName {
+                schema: Some(schema),
+                name: base,
+                array: false,
+            };
             name = if schema == "pg_catalog" || schema == "information_schema" {
                 quoted = base_quoted;
                 base
@@ -8324,6 +8470,16 @@ impl<'a> Parser<'a> {
         // catalog spelling names PostgreSQL's distinct one-byte OID 18 type.
         if quoted && name == "char" {
             name = "\"char\"";
+        }
+        // `NATIONAL CHARACTER`, `NATIONAL CHAR` and `NCHAR` are SQL's
+        // spellings of `character`, with or without `VARYING`.
+        if keyword && name == "national" {
+            if !self.eat_ident("character")? {
+                self.expect_ident("char")?;
+            }
+            name = "character";
+        } else if keyword && name == "nchar" {
+            name = "character";
         }
         if name == "double" {
             self.expect_ident("precision")?;
@@ -8376,21 +8532,58 @@ impl<'a> Parser<'a> {
         } else {
             -1
         };
-        // Repeated `[]` spell the same scalar-element array type.
-        if self.peeked == Tok::Op("[") {
-            self.advance()?;
-            self.expect_op("]")?;
-            while self.peeked == Tok::Op("[") {
-                self.advance()?;
-                self.expect_op("]")?;
+        if keyword && written.schema.is_none() {
+            written = WrittenTypeName {
+                schema: Some("pg_catalog"),
+                name: match name {
+                    "int" | "integer" => "int4",
+                    "smallint" => "int2",
+                    "bigint" => "int8",
+                    "real" => "float4",
+                    "float" => "float8",
+                    "decimal" | "dec" => "numeric",
+                    "boolean" => "bool",
+                    "character" | "char" => "bpchar",
+                    other => other,
+                },
+                array: false,
+            };
+        }
+        // `[]`, `[n]` and `ARRAY [n]` all spell the same array type:
+        // PostgreSQL ignores array bounds and dimension counts in type names.
+        let mut array = false;
+        if self.eat_ident("array")? {
+            array = true;
+            if self.eat_op("[")? {
+                self.array_bound()?;
             }
+        } else {
+            while self.eat_op("[")? {
+                array = true;
+                self.array_bound()?;
+            }
+        }
+        if array {
             let array = self
                 .arena
                 .alloc_str(stack_format!(132, "{}[]", name).as_str())
                 .map_err(|_| self.err_here("type name too long"))?;
-            return Ok((array, type_mod));
+            written.array = true;
+            return Ok((array, type_mod, written));
         }
-        Ok((name, type_mod))
+        Ok((name, type_mod, written))
+    }
+
+    /// The rest of a type name's array bound after `[`: an optional integer
+    /// and `]`.
+    fn array_bound(&mut self) -> Result<(), ParseError> {
+        if let Tok::Num(text) = self.peeked {
+            if text.parse::<i32>().is_err() {
+                return Err(self.syntax_error_here());
+            }
+            self.advance()?;
+        }
+        self.expect_op("]")
     }
 
     /// SQL `float(p)` chooses one of two concrete PostgreSQL types; `p` is not
@@ -8411,6 +8604,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "precision for type float must be at least 1 bit"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         if precision > 53 {
@@ -8418,6 +8613,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "precision for type float must be less than 54 bits"),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                cursor: None,
+                hint: None,
             });
         }
         Ok(if precision <= 24 { "float4" } else { "float8" })
@@ -8437,10 +8634,10 @@ impl<'a> Parser<'a> {
         self.advance()?;
         let last = if self.eat_ident("to")? {
             let Tok::Ident(last_name) = self.peeked else {
-                return Err(self.unexpected("expected an interval field after TO"));
+                return Err(self.syntax_error_here());
             };
             let Some(last) = IntervalField::parse(last_name) else {
-                return Err(self.unexpected("expected an interval field after TO"));
+                return Err(self.syntax_error_here());
             };
             self.advance()?;
             last
@@ -8505,7 +8702,7 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                     break;
                 }
-                _ => return Err(self.unexpected("expected a type modifier")),
+                _ => return Err(self.syntax_error_here()),
             }
         }
         match base {
@@ -8545,6 +8742,8 @@ impl<'a> Parser<'a> {
                         at: self.peek_at,
                         message: stack_format!(96, "length for type {} must be at least 1", base),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 // PostgreSQL 18.6 varbit.c: MaxAttrSize * BITS_PER_BYTE.
@@ -8557,6 +8756,8 @@ impl<'a> Parser<'a> {
                             base
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
                     });
                 }
                 Ok(TypeMod::BitLength(nums[0] as usize).encode())
@@ -8678,7 +8879,7 @@ impl<'a> Parser<'a> {
                     } else if self.eat_ident("uncommitted")? {
                         TransactionIsolation::ReadUncommitted
                     } else {
-                        return Err(self.unexpected("expected COMMITTED or UNCOMMITTED"));
+                        return Err(self.syntax_error_here());
                     }
                 };
                 if parsed.isolation.replace(isolation).is_some() {
@@ -8708,7 +8909,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.eat_op(",")? && matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                return Err(self.unexpected("expected transaction characteristics"));
+                return Err(self.syntax_error_here());
             }
         }
         Ok(parsed)
@@ -8728,12 +8929,12 @@ impl<'a> Parser<'a> {
             let negative = self.eat_op("-")?;
             let positive = !negative && self.eat_op("+")?;
             if (positive || negative) && !matches!(self.peeked, Tok::Num(_)) {
-                return Err(self.unexpected("expected a numeric configuration value"));
+                return Err(self.syntax_error_here());
             }
             let (value, identifier) = match self.peeked {
                 Tok::Ident(value) | Tok::QuotedIdent(value) => (value, true),
                 Tok::Str(value) | Tok::Num(value) => (value, false),
-                _ => return Err(self.unexpected("expected a configuration value")),
+                _ => return Err(self.syntax_error_here()),
             };
             let path = name.eq_ignore_ascii_case("search_path");
             if path && identifier && value.len() > 63 {
@@ -8741,6 +8942,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "search_path identifier is longer than 63 bytes"),
                     sqlstate: sqlstate::NAME_TOO_LONG,
+                    cursor: None,
+                    hint: None,
                 });
             }
             if count != 0 {
@@ -8782,7 +8985,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if !allow_list {
-                return Err(self.unexpected("expected one configuration value"));
+                return Err(self.syntax_error_here());
             }
             if !name.eq_ignore_ascii_case("search_path") && !name.eq_ignore_ascii_case("datestyle")
             {
@@ -8790,6 +8993,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "parameter \"{}\" requires a single value", name),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
                 });
             }
         }
@@ -8801,14 +9006,14 @@ impl<'a> Parser<'a> {
     fn time_zone_setting_value(&mut self) -> Result<&'a str, ParseError> {
         let start = self.peek_at;
         if (self.eat_op("+")? || self.eat_op("-")?) && !matches!(self.peeked, Tok::Num(_)) {
-            return Err(self.unexpected("expected a numeric time zone"));
+            return Err(self.syntax_error_here());
         }
         match self.peeked {
             Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Str(_) | Tok::Num(_) => {
                 self.advance()?;
                 Ok(self.text[start..self.peek_at].trim())
             }
-            _ => Err(self.unexpected("expected a time zone")),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -8884,7 +9089,10 @@ impl<'a> Parser<'a> {
 
     fn advance(&mut self) -> Result<(), ParseError> {
         self.previous_token = Some((self.peeked, self.peek_at, self.lexer.token_end()));
-        self.peeked = self.lexer.next_token()?;
+        self.peeked = self
+            .lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
         self.peek_at = self.lexer.token_start();
         Ok(())
     }
@@ -8895,7 +9103,10 @@ impl<'a> Parser<'a> {
     /// parameter privilege list.
     fn next_token_is_ident(&mut self, word: &str) -> Result<bool, ParseError> {
         let mark = self.lexer.mark();
-        let next = self.lexer.next_token()?;
+        let next = self
+            .lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
         self.lexer.reset(mark);
         Ok(next == Tok::Ident(word))
     }
@@ -8910,11 +9121,7 @@ impl<'a> Parser<'a> {
 
     fn expect_op(&mut self, operator: &str) -> Result<(), ParseError> {
         if !self.eat_op(operator)? {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "expected '{}'", operator),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         Ok(())
     }
@@ -8929,11 +9136,7 @@ impl<'a> Parser<'a> {
 
     fn expect_ident(&mut self, word: &str) -> Result<(), ParseError> {
         if !self.eat_ident(word)? {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "expected '{}'", word),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         Ok(())
     }
@@ -8945,11 +9148,7 @@ impl<'a> Parser<'a> {
         if let Tok::Ident(word) = self.peeked
             && is_column_name_keyword(word)
         {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "syntax error at or near \"{}\"", word),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         self.any_ident(what)
     }
@@ -8958,11 +9157,7 @@ impl<'a> Parser<'a> {
         if let Tok::Ident(word) = self.peeked
             && is_type_function_name_keyword(word)
         {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "syntax error at or near \"{}\"", word),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            });
+            return Err(self.syntax_error_here());
         }
         self.any_ident(what)
     }
@@ -8983,17 +9178,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Unquoted or quoted identifier.
-    fn any_ident(&mut self, what: &str) -> Result<&'a str, ParseError> {
+    /// `_what` names the expected item for readers; PostgreSQL's error names
+    /// only the token found.
+    fn any_ident(&mut self, _what: &str) -> Result<&'a str, ParseError> {
         match self.peeked {
             Tok::Ident(name) | Tok::QuotedIdent(name) => {
                 self.advance()?;
                 Ok(name)
             }
-            _ => Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "expected {}", what),
-                sqlstate: sqlstate::SYNTAX_ERROR,
-            }),
+            _ => Err(self.syntax_error_here()),
         }
     }
 
@@ -9009,6 +9202,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: crate::stack_format!(96, "statement too large for SQL arena"),
             sqlstate: crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
+            hint: None,
         })
     }
 
@@ -9252,6 +9447,8 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(96, "target lists can have at most 1664 entries"),
                 sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                cursor: None,
+                hint: None,
             });
         }
         let index = flat.len();
@@ -9313,6 +9510,8 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(96, "CUBE is limited to 12 elements"),
                     sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                    cursor: None,
+                    hint: None,
                 });
             }
             for subset in 0usize..(1usize << terms.len()) {
@@ -9363,6 +9562,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "too many grouping sets present (maximum 4096)"),
             sqlstate: sqlstate::STATEMENT_TOO_COMPLEX,
+            cursor: None,
+            hint: None,
         }
     }
 
@@ -9374,7 +9575,12 @@ impl<'a> Parser<'a> {
     /// cast binds tighter to.
     pub(super) fn next_is_cast(&self) -> Result<bool, ParseError> {
         let mut lexer = self.lexer.clone();
-        Ok(matches!(lexer.next_token()?, Tok::Op("::")))
+        Ok(matches!(
+            lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?,
+            Tok::Op("::")
+        ))
     }
 
     /// scans a cloned lexer to the matching close paren: a top-level comma is
@@ -9385,7 +9591,9 @@ impl<'a> Parser<'a> {
         let mut depth = 1usize; // the peeked `(` is already consumed by the real lexer
         let mut tokens = 0usize;
         loop {
-            let tok = lexer.next_token()?;
+            let tok = lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
             tokens += 1;
             match tok {
                 Tok::Op("(") | Tok::Op("[") => depth += 1,
@@ -9431,21 +9639,62 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "syntax error: {}", expected),
             sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
+            hint: None,
         }
     }
 
+    /// PostgreSQL's generic grammar failure, naming the token where parsing
+    /// stopped. Every failed expectation reports this form.
     fn syntax_error_here(&self) -> ParseError {
+        if self.peeked == Tok::Eof {
+            ParseError {
+                at: self.peek_at,
+                cursor: Some(self.peek_at),
+                hint: None,
+                message: StackStr::from_str("syntax error at end of input"),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            }
+        } else {
+            self.syntax_error_near(self.peek_at, self.lexer.token_end())
+        }
+    }
+
+    /// The grammar failure at an already consumed token spanning
+    /// `start..end`, echoed as the client wrote it.
+    fn syntax_error_near(&self, start: usize, end: usize) -> ParseError {
         ParseError {
-            at: self.peek_at,
-            message: if self.peeked == Tok::Eof {
-                StackStr::from_str("syntax error at end of input")
-            } else {
-                stack_format!(
-                    96,
-                    "syntax error at or near \"{}\"",
-                    &self.text[self.peek_at..self.lexer.token_end()]
-                )
-            },
+            at: start,
+            cursor: Some(start),
+            hint: None,
+            message: stack_format!(96, "syntax error at or near \"{}\"", &self.text[start..end]),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
+    /// PostgreSQL's column NULL/NOT NULL conflict, at the second constraint.
+    fn conflicting_null_declarations(&self, at: usize, column: &str, table: &str) -> ParseError {
+        ParseError {
+            at,
+            cursor: Some(at),
+            hint: None,
+            message: stack_format!(
+                96,
+                "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{}\"",
+                column,
+                table
+            ),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
+    /// PostgreSQL's domain NULL/NOT NULL conflict, at the second constraint.
+    fn conflicting_domain_nullability(&self, at: usize) -> ParseError {
+        ParseError {
+            at,
+            cursor: Some(at),
+            hint: None,
+            message: StackStr::from_str("conflicting NULL/NOT NULL constraints"),
             sqlstate: sqlstate::SYNTAX_ERROR,
         }
     }
@@ -9454,12 +9703,26 @@ impl<'a> Parser<'a> {
         ParseError::new(self.peek_at, message)
     }
 
+    /// A CREATE FUNCTION definition error that PostgreSQL raises after
+    /// parsing, with `42P13` and no cursor position.
+    fn invalid_function_definition(&self, message: &'static str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: StackStr::from_str(message),
+            sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+            cursor: None,
+            hint: None,
+        }
+    }
+
     /// Statement-arena exhaustion is a resource limit, not a syntax error.
     fn arena_full(&self, message: &'static str) -> ParseError {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "{}", message),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
+            hint: None,
         }
     }
 
@@ -9468,6 +9731,8 @@ impl<'a> Parser<'a> {
             at: self.peek_at,
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
             sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            cursor: None,
+            hint: None,
         }
     }
 }
@@ -11864,7 +12129,7 @@ mod tests {
                 assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
                 assert!(matches!(
                     p.next_stmt().unwrap().unwrap(),
-                    Stmt::Begin(TransactionCharacteristics::EMPTY)
+                    Stmt::Begin(TransactionCharacteristics::EMPTY, _)
                 ));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
@@ -11969,8 +12234,13 @@ mod tests {
                     panic!("ordered aggregate security label did not parse")
                 };
                 assert_eq!(identity.name.name, "percentile");
-                assert_eq!(identity.direct_argument_types, ["float8"]);
-                assert_eq!(identity.aggregated_argument_types, ["float8"]);
+                assert_eq!(identity.argument_types.len(), 2);
+                assert!(
+                    identity
+                        .argument_types
+                        .iter()
+                        .all(|argument| argument.name == "float8" && argument.written == "float8")
+                );
             },
         );
         with_parser("SECURITY LABEL ON INDEX items_index IS 'label'", |parser| {
@@ -12064,8 +12334,116 @@ mod tests {
                 let error = parser.next_stmt().unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
                 assert_eq!(error.at, position, "{sql}");
+                assert_eq!(error.cursor, Some(position), "{sql}");
             });
         }
+    }
+
+    #[test]
+    fn syntax_errors_echo_client_spelling_at_the_postgresql_cursor() {
+        // Messages and cursors (as byte offsets) from PostgreSQL 18.6.
+        for (sql, message, cursor) in [
+            (
+                "SELECT 1 FROM WHERE",
+                "syntax error at or near \"WHERE\"",
+                14,
+            ),
+            ("SELECT 1 + FROM x", "syntax error at or near \"FROM\"", 11),
+            (
+                "CREATE TABLE public.tt (a int NULL CONSTRAINT x NOT NULL)",
+                "conflicting NULL/NOT NULL declarations for column \"a\" of table \"tt\"",
+                35,
+            ),
+            (
+                "ALTER TABLE tt ADD COLUMN b int NOT NULL NULL",
+                "conflicting NULL/NOT NULL declarations for column \"b\" of table \"tt\"",
+                41,
+            ),
+            (
+                "CREATE DOMAIN dd AS int NOT NULL NULL",
+                "conflicting NULL/NOT NULL constraints",
+                33,
+            ),
+            ("SELECT 1 +   ", "syntax error at end of input", 13),
+            ("SELECT 1 + /* c */", "syntax error at end of input", 18),
+            (
+                "CREATE TABLE Select (a int)",
+                "syntax error at or near \"Select\"",
+                13,
+            ),
+            ("SELECT (1,2).f1", "syntax error at or near \".\"", 12),
+            (
+                "FETCH 99999999999 FROM c",
+                "syntax error at or near \"99999999999\"",
+                6,
+            ),
+            (
+                "SELECT 'abc",
+                "unterminated quoted string at or near \"'abc\"",
+                7,
+            ),
+            (
+                "SELECT 1 /* open",
+                "unterminated /* comment at or near \"/* open\"",
+                9,
+            ),
+        ] {
+            with_parser(sql, |parser| {
+                let error = loop {
+                    match parser.next_stmt() {
+                        Ok(Some(_)) => {}
+                        Ok(None) => panic!("{sql} parsed"),
+                        Err(error) => break error,
+                    }
+                };
+                assert_eq!(error.message.as_str(), message, "{sql}");
+                assert_eq!(error.cursor, Some(cursor), "{sql}");
+            });
+        }
+        with_parser("SELECT 1::numeric(2000)", |parser| {
+            assert_eq!(parser.next_stmt().unwrap_err().cursor, None);
+        });
+    }
+
+    #[test]
+    fn subscripts_follow_only_postgresql_indirection_forms() {
+        // PostgreSQL 18.6 rejects each of these at the `[` or `..`.
+        for (sql, message) in [
+            ("SELECT ARRAY[1,2][1]", "syntax error at or near \"[\""),
+            ("SELECT f(x)[1]", "syntax error at or near \"[\""),
+            ("SELECT '{1,2}'[1]", "syntax error at or near \"[\""),
+            ("SELECT (1,2)[1]", "syntax error at or near \"[\""),
+            ("SELECT x::int[][1] + 1[1]", "syntax error at or near \"[\""),
+            ("SELECT 1..2", "syntax error at or near \"..\""),
+        ] {
+            with_parser(sql, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().message.as_str(),
+                    message,
+                    "{sql}"
+                );
+            });
+        }
+        for sql in [
+            "SELECT a[1], t.a[1:2], $1[1], (f(x))[1], ((1,2)).f1, (SELECT ARRAY[1])[1], a[1][2]",
+            "SELECT -9223372036854775808, -0x8000_0000_0000_0000",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().unwrap().is_some(), "{sql}");
+            });
+        }
+        with_parser("SELECT -9223372036854775808", |parser| {
+            let Some(Stmt::Select(select)) = parser.next_stmt().unwrap() else {
+                panic!("not a SELECT");
+            };
+            assert!(matches!(
+                select.items,
+                [SelectItem::Expr {
+                    expression: Expr::Int(i64::MIN),
+                    ..
+                }]
+            ));
+        });
     }
 
     #[test]
@@ -12578,6 +12956,154 @@ mod tests {
                 assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
                 assert_eq!(error.message.as_str(), message);
             });
+        }
+    }
+
+    /// Wording, SQLSTATE and echoed token captured from PostgreSQL 18.6.
+    #[test]
+    fn grammar_and_scanner_failures_use_postgresql_messages() {
+        for (sql, state, message) in [
+            ("SELECT 1 +", "42601", "syntax error at end of input"),
+            ("SELECT (1", "42601", "syntax error at end of input"),
+            ("SELEC 1", "42601", "syntax error at or near \"SELEC\""),
+            (
+                "CREATE TABLE (a int)",
+                "42601",
+                "syntax error at or near \"(\"",
+            ),
+            ("SELECT * FROM", "42601", "syntax error at end of input"),
+            (
+                "INSERT INTO x VALUES 1",
+                "42601",
+                "syntax error at or near \"1\"",
+            ),
+            ("SELECT x NOT 1", "42601", "syntax error at or near \"1\""),
+            (
+                "SELECT CASE END",
+                "42601",
+                "syntax error at or near \"END\"",
+            ),
+            (
+                "ALTER TABLE t FOO",
+                "42601",
+                "syntax error at or near \"FOO\"",
+            ),
+            ("SELECT 1 2", "42601", "syntax error at or near \"2\""),
+            (
+                "BEGIN ISOLATION LEVEL FOO",
+                "42601",
+                "syntax error at or near \"FOO\"",
+            ),
+            (
+                "CREATE TABLE t (a int, )",
+                "42601",
+                "syntax error at or near \")\"",
+            ),
+            ("SELECT f(a := )", "42601", "syntax error at or near \")\""),
+            ("SELECT 1 `", "42601", "syntax error at end of input"),
+            ("SELECT $", "42601", "syntax error at or near \"$\""),
+            (
+                "SELECT interval '1' day to year",
+                "42601",
+                "syntax error at or near \"year\"",
+            ),
+            (
+                "SELECT interval '1' month to day",
+                "42601",
+                "syntax error at or near \"to\"",
+            ),
+            (
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql STABLE VOLATILE AS 'x'",
+                "42601",
+                "conflicting or redundant options",
+            ),
+            (
+                "CREATE FUNCTION f() LANGUAGE sql AS 'select 1'",
+                "42P13",
+                "function result type must be specified",
+            ),
+            (
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql",
+                "42P13",
+                "no function body specified",
+            ),
+            (
+                "CREATE FUNCTION f() RETURNS int AS 'select 1'",
+                "42P13",
+                "no language specified",
+            ),
+            (
+                "SELECT 'abc",
+                "42601",
+                "unterminated quoted string at or near \"'abc\"",
+            ),
+            (
+                "SELECT E'abc",
+                "42601",
+                "unterminated quoted string at or near \"E'abc\"",
+            ),
+            (
+                "SELECT \"abc",
+                "42601",
+                "unterminated quoted identifier at or near \"\"abc\"",
+            ),
+            (
+                "SELECT $$abc",
+                "42601",
+                "unterminated dollar-quoted string at or near \"$$abc\"",
+            ),
+            (
+                "SELECT B'10",
+                "42601",
+                "unterminated bit string literal at or near \"B'10\"",
+            ),
+            (
+                "SELECT X'1F",
+                "42601",
+                "unterminated hexadecimal string literal at or near \"X'1F\"",
+            ),
+            (
+                "SELECT /* abc",
+                "42601",
+                "unterminated /* comment at or near \"/* abc\"",
+            ),
+            (
+                "SELECT \"\"",
+                "42601",
+                "zero-length delimited identifier at or near \"\"\"\"",
+            ),
+            (
+                "SELECT 1a",
+                "42601",
+                "trailing junk after numeric literal at or near \"1a\"",
+            ),
+            (
+                "SELECT 1ex",
+                "42601",
+                "trailing junk after numeric literal at or near \"1ex\"",
+            ),
+            (
+                "SELECT 0x1G",
+                "42601",
+                "trailing junk after numeric literal at or near \"0x1G\"",
+            ),
+            (
+                "SELECT $1abc",
+                "42601",
+                "trailing junk after parameter at or near \"$1abc\"",
+            ),
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena = Arena::new(&mut budget, "postgresql parse errors", 1 << 16).unwrap();
+            let error = match Parser::new(sql, &arena) {
+                Ok(mut parser) => parser.next_stmt().unwrap_err(),
+                Err(error) => error,
+            };
+            assert_eq!(
+                (error.sqlstate, error.message.as_str()),
+                (state, message),
+                "{sql}"
+            );
         }
     }
 

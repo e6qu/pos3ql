@@ -19691,10 +19691,7 @@ fn parse_trigger_set_return<'a>(
 
 fn trigger_top_level_range(text: &str, arena: &Arena) -> Result<Option<usize>, SqlError> {
     scan_trigger_top_level(text, arena, |token, start, _| {
-        Ok(
-            (matches!(token, crate::sql::lexer::Tok::Op(".")) && text[start..].starts_with(".."))
-                .then_some(start),
-        )
+        Ok(matches!(token, crate::sql::lexer::Tok::Op("..")).then_some(start))
     })
 }
 
@@ -78854,7 +78851,7 @@ mod tests {
                 "create \"unterminated",
                 4096,
                 sqlstate::SYNTAX_ERROR,
-                "unterminated quoted identifier",
+                "unterminated quoted identifier at or near \"\"unterminated\"",
             ),
         ] {
             let mut budget = Budget::new(8192);

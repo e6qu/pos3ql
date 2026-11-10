@@ -312,6 +312,9 @@ pub struct Parser<'a> {
     /// expression parser needs this narrow bit of grammar context to leave the
     /// column constraint for its caller.
     stop_default_at_not_null: bool,
+    /// Where the latest parenthesized primary expression (or scalar
+    /// subquery) began: one of the forms PostgreSQL lets take a subscript.
+    parenthesized_primary: Option<usize>,
     /// SQL-language routine formals. Their names are resolved to the same
     /// positional parameter nodes as `$n` while the body is parsed, so a
     /// runtime value cannot lose its declared type or be mistaken for a table
@@ -868,6 +871,7 @@ impl<'a> Parser<'a> {
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
+            parenthesized_primary: None,
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
@@ -6445,7 +6449,7 @@ impl<'a> Parser<'a> {
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
         let mut buffer = ArenaList::new(self.arena);
         loop {
-            let action = self.alter_table_cmd(foreign)?;
+            let action = self.alter_table_cmd(foreign, table.name)?;
             self.push(&mut buffer, action)?;
             if !self.eat_op(",")? {
                 break;
@@ -6751,7 +6755,11 @@ impl<'a> Parser<'a> {
 
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
-    fn alter_table_cmd(&mut self, foreign: bool) -> Result<AlterAction<'a>, ParseError> {
+    fn alter_table_cmd(
+        &mut self,
+        foreign: bool,
+        table: &str,
+    ) -> Result<AlterAction<'a>, ParseError> {
         if foreign && self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
@@ -6894,6 +6902,7 @@ impl<'a> Parser<'a> {
             let mut generated_text = None;
             let mut identity = None;
             loop {
+                let constraint_at = self.peek_at;
                 let constraint_name = if self.eat_ident("constraint")? {
                     Some(self.col_ident("constraint name")?)
                 } else {
@@ -6905,7 +6914,7 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     if null_clause == Some(false) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
                     }
                     null_clause = Some(true);
                     not_null = true;
@@ -6921,7 +6930,7 @@ impl<'a> Parser<'a> {
                     }
                 } else if self.eat_ident("null")? {
                     if null_clause == Some(true) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
                     }
                     null_clause = Some(false);
                     not_null = false;
@@ -9663,6 +9672,33 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// PostgreSQL's column NULL/NOT NULL conflict, at the second constraint.
+    fn conflicting_null_declarations(&self, at: usize, column: &str, table: &str) -> ParseError {
+        ParseError {
+            at,
+            cursor: Some(at),
+            hint: None,
+            message: stack_format!(
+                96,
+                "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{}\"",
+                column,
+                table
+            ),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
+    /// PostgreSQL's domain NULL/NOT NULL conflict, at the second constraint.
+    fn conflicting_domain_nullability(&self, at: usize) -> ParseError {
+        ParseError {
+            at,
+            cursor: Some(at),
+            hint: None,
+            message: StackStr::from_str("conflicting NULL/NOT NULL constraints"),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+        }
+    }
+
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
     }
@@ -12313,6 +12349,21 @@ mod tests {
                 14,
             ),
             ("SELECT 1 + FROM x", "syntax error at or near \"FROM\"", 11),
+            (
+                "CREATE TABLE public.tt (a int NULL CONSTRAINT x NOT NULL)",
+                "conflicting NULL/NOT NULL declarations for column \"a\" of table \"tt\"",
+                35,
+            ),
+            (
+                "ALTER TABLE tt ADD COLUMN b int NOT NULL NULL",
+                "conflicting NULL/NOT NULL declarations for column \"b\" of table \"tt\"",
+                41,
+            ),
+            (
+                "CREATE DOMAIN dd AS int NOT NULL NULL",
+                "conflicting NULL/NOT NULL constraints",
+                33,
+            ),
             ("SELECT 1 +   ", "syntax error at end of input", 13),
             ("SELECT 1 + /* c */", "syntax error at end of input", 18),
             (
@@ -12351,6 +12402,47 @@ mod tests {
         }
         with_parser("SELECT 1::numeric(2000)", |parser| {
             assert_eq!(parser.next_stmt().unwrap_err().cursor, None);
+        });
+    }
+
+    #[test]
+    fn subscripts_follow_only_postgresql_indirection_forms() {
+        // PostgreSQL 18.6 rejects each of these at the `[` or `..`.
+        for (sql, message) in [
+            ("SELECT ARRAY[1,2][1]", "syntax error at or near \"[\""),
+            ("SELECT f(x)[1]", "syntax error at or near \"[\""),
+            ("SELECT '{1,2}'[1]", "syntax error at or near \"[\""),
+            ("SELECT (1,2)[1]", "syntax error at or near \"[\""),
+            ("SELECT x::int[][1] + 1[1]", "syntax error at or near \"[\""),
+            ("SELECT 1..2", "syntax error at or near \"..\""),
+        ] {
+            with_parser(sql, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().message.as_str(),
+                    message,
+                    "{sql}"
+                );
+            });
+        }
+        for sql in [
+            "SELECT a[1], t.a[1:2], $1[1], (f(x))[1], ((1,2)).f1, (SELECT ARRAY[1])[1], a[1][2]",
+            "SELECT -9223372036854775808, -0x8000_0000_0000_0000",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().unwrap().is_some(), "{sql}");
+            });
+        }
+        with_parser("SELECT -9223372036854775808", |parser| {
+            let Some(Stmt::Select(select)) = parser.next_stmt().unwrap() else {
+                panic!("not a SELECT");
+            };
+            assert!(matches!(
+                select.items,
+                [SelectItem::Expr {
+                    expression: Expr::Int(i64::MIN),
+                    ..
+                }]
+            ));
         });
     }
 

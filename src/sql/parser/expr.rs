@@ -70,8 +70,21 @@ impl<'a> Parser<'a> {
 
     /// Pratt expression parser.
     pub(crate) fn expression(&mut self, min_prec: u8) -> Result<&'a Expr<'a>, ParseError> {
+        let primary_at = self.peek_at;
         let mut left = self.prefix()?;
+        // PostgreSQL subscripts only column references, parameters and
+        // parenthesized expressions: `f(x)[1]` and `ARRAY[1][1]` are syntax
+        // errors that need `(f(x))[1]`.
+        let mut subscriptable = self.parenthesized_primary == Some(primary_at)
+            || matches!(
+                left,
+                Expr::Column { .. }
+                    | Expr::SchemaColumn { .. }
+                    | Expr::RoutineParam { .. }
+                    | Expr::Param(_)
+            );
         loop {
+            let subscript_allowed = core::mem::take(&mut subscriptable);
             let source_position = SourcePosition::new(Some(self.peek_at));
             // Postfix `::type` binds tightest.
             if self.peeked == Tok::Op("::") {
@@ -216,7 +229,7 @@ impl<'a> Parser<'a> {
             }
             // Array subscript `base[index]` or slice `base[lo:hi]` (1-based,
             // either slice bound optional: `[lo:]`, `[:hi]`, `[:]`).
-            if self.peeked == Tok::Op("[") {
+            if subscript_allowed && self.peeked == Tok::Op("[") {
                 self.advance()?;
                 let lower = if self.peeked == Tok::Op(":") {
                     None
@@ -241,6 +254,7 @@ impl<'a> Parser<'a> {
                     let index = lower.expect("non-slice subscript has an index");
                     left = self.arena_expr(Expr::Subscript { base: left, index })?;
                 }
+                subscriptable = true;
                 continue;
             }
             if self.peeked == Tok::Ident("collate") {
@@ -530,10 +544,8 @@ impl<'a> Parser<'a> {
             let Some(operator) = self.peek_binary_op() else {
                 if min_prec <= 5
                     && let Tok::Op(operator) = self.peeked
-                    && !matches!(
-                        operator,
-                        ")" | "]" | "," | ";" | "." | "::" | ":" | "=>" | ":="
-                    )
+                    && is_operator_symbol(operator)
+                    && operator != "=>"
                 {
                     self.advance()?;
                     let right = self.expression(6)?;
@@ -683,6 +695,7 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::Param(n))
             }
             Tok::Op("(") => {
+                let source_position_at = self.peek_at;
                 self.advance()?;
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
@@ -691,6 +704,7 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                    self.parenthesized_primary = Some(source_position_at);
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
                 let inner = self.expression(0)?;
@@ -754,6 +768,10 @@ impl<'a> Parser<'a> {
                     let field = self.any_ident("field name")?;
                     base = self.arena_expr(Expr::Field { base, field })?;
                 }
+                // An implicit row `(1, 2)` is not a parenthesized expression.
+                if core::ptr::eq(base, inner) || matches!(base, Expr::Field { .. }) {
+                    self.parenthesized_primary = Some(source_position_at);
+                }
                 Ok(base)
             }
             // PostgreSQL's prefix arithmetic operators are spelled as the
@@ -797,12 +815,18 @@ impl<'a> Parser<'a> {
                     // `-32768::int2` is `-(32768::int2)` — PostgreSQL raises
                     // "smallint out of range" there, and folding would hide it.
                     let cast_follows = self.next_is_cast()?;
+                    // Negate the spelling, not the value: `-9223372036854775808`
+                    // is INT8_MIN although its magnitude exceeds int8. An
+                    // integer that long cannot fit, so it stays numeric.
                     if integral
                         && !cast_follows
-                        && let Some(v) = crate::sql::eval::parse_int_literal(text)
+                        && text.len() < 64
+                        && let Some(v) = crate::sql::eval::parse_int_literal(
+                            crate::stack_format!(64, "-{}", text).as_str(),
+                        )
                     {
                         self.advance()?;
-                        return self.arena_expr(Expr::Int(-v));
+                        return self.arena_expr(Expr::Int(v));
                     }
                 }
                 let operand = self.expression(8)?;
@@ -1286,7 +1310,7 @@ impl<'a> Parser<'a> {
                     name,
                 })
             }
-            Tok::Op(operator) if !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | "=") => {
+            Tok::Op(operator) if is_operator_symbol(operator) && operator != "=" => {
                 self.advance()?;
                 let operand = self.expression(6)?;
                 self.catalog_prefix_operator_expr(source_position, None, operator, operand)
@@ -3285,6 +3309,15 @@ impl<'a> Parser<'a> {
             _ => None,
         }
     }
+}
+
+/// Whether a token is spelled only from PostgreSQL's operator characters, so it
+/// can name an operator. Punctuation such as `(`, `::`, `:=` and the PL/pgSQL
+/// range `..` cannot.
+fn is_operator_symbol(token: &str) -> bool {
+    token
+        .bytes()
+        .all(|byte| b"+-*/<>=~!@#%^&|`?".contains(&byte))
 }
 
 /// Ordinals for the clock interval fields, coarse to fine. YEAR and MONTH are

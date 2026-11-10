@@ -4590,6 +4590,7 @@ impl<'a> Parser<'a> {
         let mut default_text = None;
         let mut checks = ArenaList::new(self.arena);
         loop {
+            let constraint_at = self.peek_at;
             let cname = if self.eat_ident("constraint")? {
                 Some(self.col_ident("constraint name")?)
             } else {
@@ -4599,7 +4600,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("null")?;
                 match nullability {
                     DomainNullability::Nullable => {
-                        return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                        return Err(self.conflicting_domain_nullability(constraint_at));
                     }
                     DomainNullability::NotNull { .. } => {
                         return Err(ParseError {
@@ -4628,7 +4629,7 @@ impl<'a> Parser<'a> {
                 nullability = DomainNullability::NotNull { name: cname };
             } else if self.eat_ident("null")? {
                 if matches!(nullability, DomainNullability::NotNull { .. }) {
-                    return Err(self.err_here("conflicting NULL/NOT NULL constraints"));
+                    return Err(self.conflicting_domain_nullability(constraint_at));
                 }
                 nullability = DomainNullability::Nullable;
             } else if self.eat_ident("check")? {
@@ -8098,6 +8099,7 @@ impl<'a> Parser<'a> {
             let mut generated_text = None;
             let mut identity = None;
             loop {
+                let constraint_at = self.peek_at;
                 // Column-level constraints may carry their own CONSTRAINT name.
                 let col_cons_name = if self.eat_ident("constraint")? {
                     Some(self.col_ident("constraint name")?)
@@ -8107,7 +8109,11 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     if null_clause == Some(false) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(
+                            constraint_at,
+                            col_name,
+                            name.name,
+                        ));
                     }
                     null_clause = Some(true);
                     not_null = true;
@@ -8123,7 +8129,11 @@ impl<'a> Parser<'a> {
                     }
                 } else if self.eat_ident("null")? {
                     if null_clause == Some(true) {
-                        return Err(self.err_here("conflicting NULL/NOT NULL declarations"));
+                        return Err(self.conflicting_null_declarations(
+                            constraint_at,
+                            col_name,
+                            name.name,
+                        ));
                     }
                     null_clause = Some(false);
                     not_null = false;

@@ -222,6 +222,12 @@ impl<'a> Lexer<'a> {
         };
         match c {
             '.' if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) => self.number(),
+            // PostgreSQL's DOT_DOT, the PL/pgSQL integer range separator.
+            '.' if rest.starts_with("..") => {
+                let operator = &self.text[self.at..self.at + 2];
+                self.at += 2;
+                Ok(Tok::Op(operator))
+            }
             '(' | ')' | ',' | ';' | '.' | '[' | ']' => {
                 let operator = &self.text[self.at..self.at + 1];
                 self.at += 1;
@@ -341,61 +347,125 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// PostgreSQL's numeric scanner rules, applied as flex does: the longest
+    /// match wins and ties go to the earlier rule. Underscores separate digits
+    /// (`1_000`), `0x`/`0o`/`0b` prefix non-decimal integers, and an identifier
+    /// directly after a number is trailing junk.
     fn number(&mut self) -> Result<Tok<'a>, LexError> {
+        #[derive(Clone, Copy)]
+        enum Rule {
+            Number,
+            NonDecimalFail(&'static str),
+            NumericFail,
+            RealFail,
+            Junk,
+        }
         let start = self.at;
         let bytes = self.text.as_bytes();
-        let mut i = self.at;
-        // Non-decimal integer literals: `0x1F` / `0o17` / `0b1010` (with `_`
-        // digit separators). The parser validates the digits.
-        if bytes[i] == b'0'
-            && i + 1 < bytes.len()
-            && matches!(bytes[i + 1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
-        {
-            let radix = match bytes[i + 1] {
-                b'x' | b'X' => 16,
-                b'o' | b'O' => 8,
-                _ => 2,
+        let digits_end = |at: usize, radix: u32| -> Option<usize> {
+            let is_digit = |index: usize| {
+                bytes
+                    .get(index)
+                    .is_some_and(|byte| char::from(*byte).is_digit(radix))
             };
-            i += 2;
-            let digits = i;
-            while i < bytes.len()
-                && ((bytes[i] as char).is_digit(radix) || (bytes[i] == b'_' && i > digits))
-            {
-                i += 1;
+            if !is_digit(at) {
+                return None;
             }
-            if i > digits {
-                self.reject_trailing_junk(start, i, "trailing junk after numeric literal")?;
-            }
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            self.at = i;
-            return Ok(Tok::Num(&self.text[start..i]));
-        }
-        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-        }
-        if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-            let mut j = i + 1;
-            if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j].is_ascii_digit() {
-                i = j;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
+            let mut index = at + 1;
+            loop {
+                if is_digit(index) {
+                    index += 1;
+                } else if bytes.get(index) == Some(&b'_') && is_digit(index + 1) {
+                    index += 2;
+                } else {
+                    return Some(index);
                 }
             }
+        };
+        let identifier_end = |at: usize| -> Option<usize> {
+            let rest = &self.text[at..];
+            let first = rest.chars().next().filter(|c| is_identifier_start(*c))?;
+            Some(
+                at + rest[first.len_utf8()..]
+                    .char_indices()
+                    .find(|(_, c)| !is_identifier_continue(*c))
+                    .map_or(rest.len(), |(index, _)| first.len_utf8() + index),
+            )
+        };
+        let decinteger = digits_end(start, 10);
+        let numeric = match decinteger {
+            Some(end) if bytes.get(end) == Some(&b'.') => {
+                Some(digits_end(end + 1, 10).unwrap_or(end + 1))
+            }
+            Some(_) => None,
+            None => digits_end(start + 1, 10),
+        };
+        let exponent = |base: Option<usize>| -> (Option<usize>, Option<usize>) {
+            let Some(base) = base.filter(|end| matches!(bytes.get(*end), Some(b'e' | b'E'))) else {
+                return (None, None);
+            };
+            let signed = matches!(bytes.get(base + 1), Some(b'+' | b'-'));
+            let digits = base + 1 + usize::from(signed);
+            (digits_end(digits, 10), signed.then_some(digits))
+        };
+        let (real_from_integer, real_fail_from_integer) = exponent(decinteger);
+        let (real_from_numeric, real_fail_from_numeric) = exponent(numeric);
+        let real = real_from_integer.max(real_from_numeric);
+        let mut candidates = [None; 12];
+        candidates[0] = decinteger.map(|end| (end, Rule::Number));
+        if bytes[start] == b'0'
+            && let Some((radix, failure)) = match bytes.get(start + 1) {
+                Some(b'x' | b'X') => Some((16, "invalid hexadecimal integer")),
+                Some(b'o' | b'O') => Some((8, "invalid octal integer")),
+                Some(b'b' | b'B') => Some((2, "invalid binary integer")),
+                _ => None,
+            }
+        {
+            let prefixed = start + 2;
+            let separated = prefixed + usize::from(bytes.get(prefixed) == Some(&b'_'));
+            candidates[1] = digits_end(separated, radix).map(|end| (end, Rule::Number));
+            candidates[2] = Some((separated, Rule::NonDecimalFail(failure)));
         }
-        self.reject_trailing_junk(start, i, "trailing junk after numeric literal")?;
-        self.at = i;
-        Ok(Tok::Num(&self.text[start..i]))
+        candidates[3] = numeric.map(|end| (end, Rule::Number));
+        candidates[4] = decinteger
+            .filter(|end| self.text[*end..].starts_with(".."))
+            .map(|end| (end + 2, Rule::NumericFail));
+        candidates[5] = real.map(|end| (end, Rule::Number));
+        candidates[6] = real_fail_from_integer.map(|end| (end, Rule::RealFail));
+        candidates[7] = real_fail_from_numeric.map(|end| (end, Rule::RealFail));
+        for (slot, base) in [decinteger, numeric, real].into_iter().enumerate() {
+            candidates[8 + slot] = base.and_then(identifier_end).map(|end| (end, Rule::Junk));
+        }
+        // `max_by_key` keeps the last maximum; reverse so ties keep the
+        // earliest rule.
+        let (end, rule) = candidates
+            .into_iter()
+            .flatten()
+            .rev()
+            .max_by_key(|(end, _)| *end)
+            .expect("a digit or `.digit` starts a numeric rule");
+        let error = |message| LexError {
+            at: start,
+            message,
+            kind: LexErrorKind::Syntax,
+            near_end: Some(end),
+            hint: None,
+            invalid_bytes: None,
+        };
+        match rule {
+            Rule::Number => {
+                self.at = end;
+                Ok(Tok::Num(&self.text[start..end]))
+            }
+            Rule::NumericFail => {
+                // The integer stands alone; `..` is the next token.
+                let integer_end = end - 2;
+                self.at = integer_end;
+                Ok(Tok::Num(&self.text[start..integer_end]))
+            }
+            Rule::NonDecimalFail(message) => Err(error(message)),
+            Rule::RealFail | Rule::Junk => Err(error("trailing junk after numeric literal")),
+        }
     }
 
     /// PostgreSQL rejects an identifier character directly after a number or
@@ -839,17 +909,34 @@ impl<'a> Lexer<'a> {
     fn dollar(&mut self) -> Result<Tok<'a>, LexError> {
         let start = self.at;
         let rest = self.rest();
-        // $n parameter
-        let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+        // $n parameter: a decimal integer, `_` separators allowed, that must
+        // fit PostgreSQL's int4.
+        let bytes = rest.as_bytes();
+        let mut digits = 0;
+        while bytes.get(1 + digits).is_some_and(u8::is_ascii_digit)
+            || (digits > 0
+                && bytes.get(1 + digits) == Some(&b'_')
+                && bytes.get(2 + digits).is_some_and(u8::is_ascii_digit))
+        {
+            digits += 1;
+        }
         if digits > 0 {
-            let n: u32 = rest[1..1 + digits].parse().map_err(|_| LexError {
+            let too_large = LexError {
                 at: start,
                 message: "parameter number too large",
                 kind: LexErrorKind::Syntax,
                 near_end: Some(start + 1 + digits),
                 hint: None,
                 invalid_bytes: None,
-            })?;
+            };
+            let mut n = 0u32;
+            for byte in bytes[1..1 + digits].iter().filter(|byte| **byte != b'_') {
+                n = n
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(u32::from(byte - b'0')))
+                    .filter(|value| *value <= i32::MAX as u32)
+                    .ok_or(too_large)?;
+            }
             if n == 0 {
                 return Err(LexError {
                     at: start,
@@ -1239,8 +1326,83 @@ mod tests {
                 "Num(\"1.5e-2\")"
             ]
         );
-        // A trailing dot is not part of the number (it's projection syntax).
-        assert_eq!(lex_all("1.x"), ["Num(\"1\")", "Op(\".\")", "Ident(\"x\")"]);
+        assert_eq!(
+            lex_all("1. 1.e5 1_000.000_1 .5_5 1e1_0 0x_1F 0O17 0b1_0 1..2"),
+            [
+                "Num(\"1.\")",
+                "Num(\"1.e5\")",
+                "Num(\"1_000.000_1\")",
+                "Num(\".5_5\")",
+                "Num(\"1e1_0\")",
+                "Num(\"0x_1F\")",
+                "Num(\"0O17\")",
+                "Num(\"0b1_0\")",
+                "Num(\"1\")",
+                "Op(\"..\")",
+                "Num(\"2\")"
+            ]
+        );
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "numeric junk", 1 << 16).unwrap();
+        // Longest-match outcomes from PostgreSQL 18.6's scanner.
+        for (sql, message) in [
+            (
+                "1.x",
+                "trailing junk after numeric literal at or near \"1.x\"",
+            ),
+            (
+                "1_",
+                "trailing junk after numeric literal at or near \"1_\"",
+            ),
+            (
+                "1__0",
+                "trailing junk after numeric literal at or near \"1__0\"",
+            ),
+            (
+                "1._5",
+                "trailing junk after numeric literal at or near \"1._5\"",
+            ),
+            (
+                "1.5_e3",
+                "trailing junk after numeric literal at or near \"1.5_e3\"",
+            ),
+            (
+                "1.5e+",
+                "trailing junk after numeric literal at or near \"1.5e+\"",
+            ),
+            (
+                "1e",
+                "trailing junk after numeric literal at or near \"1e\"",
+            ),
+            (
+                "0b2",
+                "trailing junk after numeric literal at or near \"0b2\"",
+            ),
+            (
+                "0x1Fg",
+                "trailing junk after numeric literal at or near \"0x1Fg\"",
+            ),
+            ("0x", "invalid hexadecimal integer at or near \"0x\""),
+            ("0x_", "invalid hexadecimal integer at or near \"0x_\""),
+            ("0o", "invalid octal integer at or near \"0o\""),
+            ("0B_", "invalid binary integer at or near \"0B_\""),
+            (
+                "$1_0x",
+                "trailing junk after parameter at or near \"$1_0x\"",
+            ),
+            (
+                "$2147483648",
+                "parameter number too large at or near \"$2147483648\"",
+            ),
+        ] {
+            let error = Lexer::new(sql, &arena).next_token().unwrap_err();
+            assert_eq!(error.render(sql).as_str(), message, "{sql}");
+            assert_eq!(error.cursor(), Some(0), "{sql}");
+        }
+        assert_eq!(
+            lex_all("$1_0 $2147483647"),
+            ["Param(10)", "Param(2147483647)"]
+        );
     }
 
     #[test]

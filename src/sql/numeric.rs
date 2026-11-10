@@ -237,9 +237,67 @@ impl<'a> Numeric<'a> {
         }
         // Collect the decimal digit string and the position of the point.
         let mut dec_digits: [u8; MAX_NDIGITS * DEC_DIGITS] = [0; MAX_NDIGITS * DEC_DIGITS];
+        let radix = match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b'0'), Some(b'x' | b'X')) => 16,
+            (Some(b'0'), Some(b'o' | b'O')) => 8,
+            (Some(b'0'), Some(b'b' | b'B')) => 2,
+            _ => 10,
+        };
+        if radix != 10 {
+            // PostgreSQL's set_var_from_non_decimal_integer_str: digits of the
+            // radix, each `_` followed by a digit, accumulated exactly.
+            let mut little_endian = 0usize;
+            let mut saw_digit = false;
+            i += 2;
+            while i < bytes.len() {
+                if let Some(digit) = char::from(bytes[i]).to_digit(radix) {
+                    let mut carry = digit;
+                    for value in &mut dec_digits[..little_endian] {
+                        let product = u32::from(*value) * radix + carry;
+                        *value = (product % 10) as u8;
+                        carry = product / 10;
+                    }
+                    while carry > 0 {
+                        if little_endian == dec_digits.len() {
+                            return Err(overflow());
+                        }
+                        dec_digits[little_endian] = (carry % 10) as u8;
+                        little_endian += 1;
+                        carry /= 10;
+                    }
+                    saw_digit = true;
+                    i += 1;
+                } else if bytes[i] == b'_'
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|next| char::from(*next).is_digit(radix))
+                {
+                    i += 1;
+                } else {
+                    return Err(bad());
+                }
+            }
+            if !saw_digit {
+                return Err(bad());
+            }
+            dec_digits[..little_endian].reverse();
+            return Self::from_decimal_digits(
+                &dec_digits[..little_endian],
+                little_endian as i64,
+                0,
+                neg,
+                arena,
+            );
+        }
+        // PostgreSQL's set_var_from_str: a digit (after an optional leading
+        // point) must come first; `_` must be followed by a digit, and a point
+        // must not be.
+        let digit_at = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
+        if !digit_at(i) && !(bytes.get(i) == Some(&b'.') && digit_at(i + 1)) {
+            return Err(bad());
+        }
         let mut ndec = 0usize;
         let mut point_at: Option<usize> = None; // index into dec_digits
-        let mut saw_digit = false;
         while i < bytes.len() {
             let c = bytes[i];
             if c.is_ascii_digit() {
@@ -248,17 +306,21 @@ impl<'a> Numeric<'a> {
                 }
                 dec_digits[ndec] = c - b'0';
                 ndec += 1;
-                saw_digit = true;
                 i += 1;
             } else if c == b'.' && point_at.is_none() {
+                if bytes.get(i + 1) == Some(&b'_') {
+                    return Err(bad());
+                }
                 point_at = Some(ndec);
+                i += 1;
+            } else if c == b'_' {
+                if !digit_at(i + 1) {
+                    return Err(bad());
+                }
                 i += 1;
             } else {
                 break;
             }
-        }
-        if !saw_digit {
-            return Err(bad());
         }
         // Optional exponent.
         let mut exp: i64 = 0;
@@ -271,16 +333,23 @@ impl<'a> Numeric<'a> {
                 }
                 i += 1;
             }
-            let estart = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                exp = exp
-                    .checked_mul(10)
-                    .and_then(|v| v.checked_add((bytes[i] - b'0') as i64))
-                    .ok_or_else(overflow)?;
-                i += 1;
-            }
-            if i == estart {
+            if !digit_at(i) {
                 return Err(bad());
+            }
+            while i < bytes.len() {
+                if bytes[i].is_ascii_digit() {
+                    exp = exp
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((bytes[i] - b'0') as i64))
+                        .ok_or_else(overflow)?;
+                    i += 1;
+                } else if bytes[i] == b'_' && digit_at(i + 1) {
+                    i += 1;
+                } else if bytes[i] == b'_' {
+                    return Err(bad());
+                } else {
+                    break;
+                }
             }
             exp *= esign;
         }
@@ -2041,6 +2110,38 @@ mod tests {
             "0.30000000000000000",
         ] {
             assert_eq!(disp(&p(s, &a)), s, "roundtrip {s}");
+        }
+    }
+
+    #[test]
+    fn input_accepts_postgresql_separators_and_integer_prefixes() {
+        let a = arena();
+        // Accepted and rejected spellings from PostgreSQL 18.6's numeric_in.
+        for (input, shown) in [
+            ("1_000.5", "1000.5"),
+            (" 1_2 ", "12"),
+            ("1_2.3_4e1_0", "123400000000"),
+            ("1.", "1"),
+            (".5", "0.5"),
+            ("0x1F", "31"),
+            ("0x1e5", "485"),
+            ("-0b101", "-5"),
+            ("+0o_17", "15"),
+            ("0xFFFFFFFFFFFFFFFFFF", "4722366482869645213695"),
+            ("0x0", "0"),
+        ] {
+            assert_eq!(disp(&p(input, &a)), shown, "{input}");
+        }
+        for input in [
+            "_1", "1_", "1__0", "1_.5", "1._5", "1.5_", "._5", ".", "0x", "0x_", "0x1_", "0x1.5",
+            "0b2", "1e", "1e_1", "1e1_", "-",
+        ] {
+            let error = Numeric::parse(input, &a).unwrap_err();
+            assert_eq!(
+                error.sqlstate,
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "{input}"
+            );
         }
     }
 

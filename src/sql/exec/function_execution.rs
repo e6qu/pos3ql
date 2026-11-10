@@ -429,6 +429,9 @@ impl SuspendedFunctionState {
             seeded,
             Some(self.binding.boundary),
         );
+        if let Err(error) = admission.preserve_caller_inputs() {
+            return Ok(Err(error));
+        }
         match result {
             Ok(flow) => {
                 let output =

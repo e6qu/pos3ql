@@ -243,7 +243,9 @@ SQL-language scalar and table functions retain their current body statement,
 selected source and dependencies, arguments, checked inputs and result work in
 the same fixed pools. A completed statement is skipped after a wait. Re-evaluating
 an expression preserves newly admitted caller inputs when a completed value is
-reused, while leaving later receipts pending. Phase restarts restore their
+reused, while leaving later receipts pending. Returning from a resumed function
+or trigger also preserves checks the caller completed before attachment, without
+rewinding sequence values produced by the child. Phase restarts restore their
 recorded position explicitly. An unfinished child call resumes before its statement is
 evaluated again, with its original effect receipts. Nested INSERT/UPDATE/DELETE completion retains returned rows
 while its AFTER triggers finish. For example, an order function can write an audit

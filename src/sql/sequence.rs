@@ -613,6 +613,46 @@ pub(crate) struct StatementPositionAdmission<'session> {
 }
 
 impl StatementPositionAdmission<'_> {
+    /// An owned child can restore earlier phases while its caller has already
+    /// checked inputs. Keep that completed prefix when control returns, without
+    /// rewinding the child's sequence values or consuming later unchecked work.
+    pub(crate) fn preserve_caller_inputs(&self) -> Result<(), SqlError> {
+        if !self.committed {
+            return Err(replay_changed());
+        }
+        with_statement_context(|context| {
+            let Some((arena, session)) = context else {
+                return if self.session.is_none() {
+                    Ok(())
+                } else {
+                    Err(replay_changed())
+                };
+            };
+            if !self
+                .session
+                .is_some_and(|prior| core::ptr::eq(prior, session))
+            {
+                return Err(replay_changed());
+            }
+            if self.prior.input_attempt.is_none() {
+                return Ok(());
+            }
+            let mut current = session.statement_replay.get();
+            if current.input_attempt != self.prior.input_attempt
+                || current.journal != self.prior.journal
+            {
+                return Err(replay_changed());
+            }
+            let completed =
+                EffectPosition::capture(self.prior.effects_next, self.prior.effects_tail);
+            current.effects_next = completed_input_position(arena, current, completed)?;
+            session.statement_replay.set(current);
+            #[cfg(test)]
+            trace_replay("caller-inputs", arena, current);
+            Ok(())
+        })
+    }
+
     /// Commit only after every part of the invocation has attached, before SQL
     /// can change the journal. Failed attachment restores the caller's cursor.
     pub(crate) fn commit(&mut self) {
@@ -1873,6 +1913,7 @@ mod tests {
             assert_eq!(issue(1), 1);
             ready_routine_input(plan(1), &output).unwrap();
             let completed = finish_replay_cursor(start, &output).unwrap();
+            let position = SavedStatementPosition::capture().unwrap();
             ready_routine_input(plan(2), &output).unwrap();
             let caller_input = session.statement_replay.get().effects_tail;
             restore_replay_cursor(completed, ReplayInputPosition::RecordedEnd).unwrap();
@@ -1888,10 +1929,35 @@ mod tests {
             ready_routine_input(plan(2), &output).unwrap();
             restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
             assert!(session.statement_replay.get().effects_next == later_input);
+            position
+                .with_resume(
+                    (),
+                    super::super::lock::AdvisoryPositionTail::Appended,
+                    |(), admission| {
+                        admission.commit();
+                        assert!(session.statement_replay.get().effects_next == caller_input);
+                        admission.preserve_caller_inputs().unwrap();
+                        assert!(session.statement_replay.get().effects_next == later_input);
+                    },
+                )
+                .unwrap();
             ready_routine_input(plan(3), &output).unwrap();
             assert_eq!(issue(2), 2);
             restore_replay_cursor(completed, ReplayInputPosition::KeepConsumed).unwrap();
             assert_eq!(issue(99), 2);
+            position
+                .with_resume(
+                    (),
+                    super::super::lock::AdvisoryPositionTail::Appended,
+                    |(), admission| {
+                        admission.commit();
+                        assert!(session.statement_replay.get().effects_next == caller_input);
+                        assert_eq!(issue(99), 2);
+                        admission.preserve_caller_inputs().unwrap();
+                        assert!(session.statement_replay.get().effects_next.is_none());
+                    },
+                )
+                .unwrap();
             assert_eq!(calls.get(), 2);
             scope.finish(session).unwrap();
             drop(scope);

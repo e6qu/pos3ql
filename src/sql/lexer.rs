@@ -426,53 +426,98 @@ impl<'a> Lexer<'a> {
 
     fn plain_string(&mut self) -> Result<Tok<'a>, LexError> {
         let start = self.at;
-        self.at += 1; // opening quote
         let bytes = self.text.as_bytes();
-        let mut has_escape = false;
-        let mut i = self.at;
-        loop {
+        let mut copied = false;
+        let mut i = start + 1;
+        let close = loop {
             match bytes.get(i) {
-                None => {
-                    return Err(LexError {
-                        at: self.token_start,
-                        message: "unterminated quoted string",
-                        kind: LexErrorKind::Syntax,
-                        near_end: Some(self.text.len()),
-                        hint: None,
-                        invalid_bytes: None,
-                    });
-                }
+                None => return Err(self.unterminated_string()),
                 Some(b'\'') if bytes.get(i + 1) == Some(&b'\'') => {
-                    has_escape = true;
+                    copied = true;
                     i += 2;
                 }
-                Some(b'\'') => break,
+                Some(b'\'') => match self.string_continuation(i + 1) {
+                    Some(next) => {
+                        copied = true;
+                        i = next;
+                    }
+                    None => break i,
+                },
                 Some(_) => i += 1,
             }
+        };
+        self.at = close + 1;
+        if !copied {
+            return Ok(Tok::Str(&self.text[start + 1..close]));
         }
-        let raw = &self.text[self.at..i];
-        self.at = i + 1;
-        if !has_escape {
-            return Ok(Tok::Str(raw));
-        }
-        // Copy into the arena replacing '' with '.
+        // Copy into the arena, undoubling quotes and joining continued segments.
         let out = self
             .arena
-            .alloc_slice_copy(raw.as_bytes())
+            .alloc_slice_with(close - start - 1, |_| 0u8)
             .map_err(|_| self.arena_full(start))?;
         let mut w = 0;
-        let mut r = 0;
-        let src = raw.as_bytes();
-        while r < src.len() {
-            out[w] = src[r];
-            if src[r] == b'\'' {
-                r += 1; // skip the doubled quote
+        let mut r = start + 1;
+        while r < close {
+            if bytes[r] == b'\'' {
+                if bytes[r + 1] == b'\'' {
+                    out[w] = b'\'';
+                    w += 1;
+                    r += 2;
+                } else {
+                    r = self
+                        .string_continuation(r + 1)
+                        .expect("the first pass found this continuation");
+                }
+            } else {
+                out[w] = bytes[r];
+                w += 1;
+                r += 1;
             }
-            r += 1;
-            w += 1;
         }
-        let out = &mut out[..w];
-        Ok(Tok::Str(unsafe { core::str::from_utf8_unchecked(out) }))
+        // Segments split only at ASCII quotes, so each keeps whole characters.
+        Ok(Tok::Str(unsafe {
+            core::str::from_utf8_unchecked(&out[..w])
+        }))
+    }
+
+    /// PostgreSQL's `quotecontinue`: string segments separated only by
+    /// whitespace containing a newline (and `--` comments) are one literal.
+    /// Returns the offset just past the next segment's opening quote.
+    fn string_continuation(&self, mut at: usize) -> Option<usize> {
+        let bytes = self.text.as_bytes();
+        let mut newline = false;
+        loop {
+            match *bytes.get(at)? {
+                b' ' | b'\t' | b'\x0C' => at += 1,
+                b'\n' | b'\r' => {
+                    newline = true;
+                    at += 1;
+                }
+                // Vertical tab is whitespace only after the newline.
+                b'\x0B' if newline => at += 1,
+                b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                    while bytes
+                        .get(at)
+                        .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                    {
+                        at += 1;
+                    }
+                }
+                b'\'' if newline => return Some(at + 1),
+                _ => return None,
+            }
+        }
+    }
+
+    fn unterminated_string(&self) -> LexError {
+        LexError {
+            at: self.token_start,
+            message: "unterminated quoted string",
+            kind: LexErrorKind::Syntax,
+            near_end: Some(self.text.len()),
+            hint: None,
+            invalid_bytes: None,
+        }
     }
 
     fn escape_string(&mut self) -> Result<Tok<'a>, LexError> {
@@ -503,7 +548,10 @@ impl<'a> Lexer<'a> {
                     w += 1;
                     i += 2;
                 }
-                Some(b'\'') => break,
+                Some(b'\'') => match self.string_continuation(i + 1) {
+                    Some(next) => i = next,
+                    None => break,
+                },
                 Some(b'\\') => {
                     let esc = bytes.get(i + 1).ok_or(LexError {
                         at: self.token_start,
@@ -692,21 +740,39 @@ impl<'a> Lexer<'a> {
                         invalid_bytes: None,
                     });
                 }
-                Some(b'\'') => break,
+                Some(b'\'') => match self.string_continuation(i + 1) {
+                    Some(next) => i = next,
+                    None => break,
+                },
                 Some(_) => i += 1,
             }
         }
-        let raw = &self.text[self.at..i];
-        self.at = i + 1;
+        let close = i;
+        self.at = close + 1;
         // Retain the spelling class so the evaluator can distinguish binary
         // and hexadecimal input errors without widening the AST.
         let out = self
             .arena
-            .alloc_slice_with(raw.len() + 1, |_| 0u8)
+            .alloc_slice_with(close - start, |_| 0u8)
             .map_err(|_| self.arena_full(start))?;
         out[0] = if hex { b'X' } else { b'B' };
-        out[1..].copy_from_slice(raw.as_bytes());
-        Ok(Tok::Bit(unsafe { core::str::from_utf8_unchecked(out) }))
+        let mut w = 1;
+        let mut r = start + 1;
+        while r < close {
+            if bytes[r] == b'\'' {
+                r = self
+                    .string_continuation(r + 1)
+                    .expect("the first pass found this continuation");
+            } else {
+                out[w] = bytes[r];
+                w += 1;
+                r += 1;
+            }
+        }
+        // Segments split only at ASCII quotes, so each keeps whole characters.
+        Ok(Tok::Bit(unsafe {
+            core::str::from_utf8_unchecked(&out[..w])
+        }))
     }
 
     fn quoted_ident(&mut self) -> Result<Tok<'a>, LexError> {
@@ -1129,6 +1195,25 @@ mod tests {
         );
         let long = "A".repeat(200);
         assert_eq!(lex_all(&long), [format!("Ident({:?})", "a".repeat(200))]);
+    }
+
+    #[test]
+    fn string_segments_separated_by_a_newline_concatenate() {
+        // PostgreSQL 18.6 joins these into one constant.
+        for (sql, expected) in [
+            ("'a'\n'b'", "Str(\"ab\")"),
+            ("'a' -- note\n  'b'", "Str(\"ab\")"),
+            ("'it''s'\r\n\x0B'x'", "Str(\"it'sx\")"),
+            ("E'\\n'\n'\\t'", "Str(\"\\n\\t\")"),
+            ("B'10'\n'01'", "Bit(\"B1001\")"),
+            ("'é'\n'ü'", "Str(\"éü\")"),
+        ] {
+            assert_eq!(lex_all(sql), [expected], "{sql:?}");
+        }
+        // Without a newline, or across a block comment, they stay separate.
+        assert_eq!(lex_all("'a' 'b'"), ["Str(\"a\")", "Str(\"b\")"]);
+        assert_eq!(lex_all("'a'/* c */\n'b'"), ["Str(\"a\")", "Str(\"b\")"]);
+        assert_eq!(lex_all("'a'\x0B\n'b'"), ["Str(\"a\")", "Str(\"b\")"]);
     }
 
     #[test]

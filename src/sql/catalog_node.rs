@@ -24,7 +24,8 @@ impl<'a> CatalogNode<'a> {
             rest = rest.split_once('\n')?.1;
         }
         let source = rest.strip_prefix('\n')?;
-        if source.is_empty() || source.contains('\0') {
+        // `BEGIN ATOMIC END` stores a query list with no statements.
+        if (source.is_empty() && kind != "query") || source.contains('\0') {
             return None;
         }
         let mut sites = sites.lines();

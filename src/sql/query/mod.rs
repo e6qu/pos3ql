@@ -1736,6 +1736,8 @@ pub(crate) enum RoutineFunctionResult<'a> {
     DataModification(&'a Stmt<'a>),
     Void(&'a Stmt<'a>),
     Forbidden(&'static str),
+    /// A `void` function or procedure whose body has no statements.
+    Empty,
 }
 
 /// A SQL-language function program with one typed final result statement.
@@ -1781,7 +1783,16 @@ pub(crate) fn parse_routine_function_program<'a>(
     }
     validate(&parser)?;
     let Some(last) = count.checked_sub(1).and_then(|index| parsed[index]) else {
-        return Err(sql_err!(sqlstate::SYNTAX_ERROR, "function body is empty"));
+        if returns_void {
+            return Ok(RoutineFunctionProgram {
+                preceding: &[],
+                result: RoutineFunctionResult::Empty,
+            });
+        }
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "SQL function body must end with a SELECT query or data-modifying statement with RETURNING"
+        ));
     };
     let result = if returns_void {
         match last {
@@ -1945,6 +1956,7 @@ pub(crate) fn routine_program_access(program: &RoutineFunctionProgram<'_>) -> Ro
         RoutineFunctionResult::DataModification(_) | RoutineFunctionResult::Forbidden(_) => {
             RoutineProgramAccess::Engine
         }
+        RoutineFunctionResult::Empty => RoutineProgramAccess::ReadOnly,
     };
     for step in program.preceding {
         access = access.max(match step {
@@ -3526,6 +3538,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 RoutineFunctionResult::Forbidden(statement) => {
                     return Err(routine_forbidden_statement_error(statement));
                 }
+                RoutineFunctionResult::Empty => return Ok(Some(Datum::Text(""))),
             };
             execute_bound_routine_query(
                 result_query,

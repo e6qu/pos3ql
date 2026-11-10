@@ -3648,3 +3648,51 @@ fn nested_query_inputs_preserve_caller_scratch_record_shapes_and_index_metadata(
         );
     }
 }
+
+#[test]
+fn empty_sql_bodies_are_void_routines_that_do_nothing() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE FUNCTION empty_string() RETURNS void LANGUAGE sql AS ''; \
+             CREATE FUNCTION empty_statements() RETURNS void LANGUAGE sql AS ';;'; \
+             CREATE PROCEDURE empty_procedure(int) LANGUAGE sql AS ''; \
+             CREATE FUNCTION empty_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC END; \
+             CREATE PROCEDURE empty_atomic_procedure() LANGUAGE sql BEGIN ATOMIC END",
+            NONE,
+        ),
+        (
+            "SELECT empty_string(), empty_statements(), empty_atomic(); \
+             SELECT * FROM empty_string(); \
+             SELECT x, empty_string() FROM generate_series(1, 2) AS x; \
+             CALL empty_procedure(1); CALL empty_atomic_procedure()",
+            NONE,
+        ),
+        (
+            "CREATE FUNCTION empty_integer() RETURNS integer LANGUAGE sql AS ''",
+            &[(
+                'E',
+                "0A000",
+                "SQL function body must end with a SELECT query or data-modifying statement \
+                 with RETURNING",
+            )],
+        ),
+    ]);
+    let config = test_config("empty-sql-body-definition");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "CREATE FUNCTION empty_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC END; \
+         SELECT pg_get_functiondef('empty_atomic'::regproc), prosqlbody IS NOT NULL \
+         FROM pg_proc WHERE proname = 'empty_atomic'",
+        true,
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "CREATE OR REPLACE FUNCTION public.empty_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC\nEND|t"
+        ]
+    );
+}

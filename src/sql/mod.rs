@@ -17815,12 +17815,6 @@ impl Engine {
                     if let Err(error) = validated {
                         return Ok(Err(error));
                     }
-                    if statement_count == 0 {
-                        return Ok(Err(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "procedure body is empty"
-                        )));
-                    }
                     let mut output_parameters = [crate::storage::RoutineParameterDef::EMPTY;
                         crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let mut output_count = 0usize;
@@ -17829,6 +17823,13 @@ impl Engine {
                             output_parameters[output_count] = *parameter;
                             output_count += 1;
                         }
+                    }
+                    // An empty body is a procedure that does nothing.
+                    if statement_count == 0 && output_count != 0 {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "SQL procedure with output parameters must end with a query"
+                        )));
                     }
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let mut output_rows = 0usize;

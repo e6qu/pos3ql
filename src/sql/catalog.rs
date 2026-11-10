@@ -14677,6 +14677,9 @@ pub fn function_def_text<'a>(
             write!(definition, " RETURN {}", routine.body.as_str())
                 .map_err(|_| super::eval::arena_full())?;
         }
+        crate::storage::RoutineBodyKind::Atomic if routine.body.as_str().trim().is_empty() => {
+            write!(definition, " BEGIN ATOMIC\nEND").map_err(|_| super::eval::arena_full())?;
+        }
         crate::storage::RoutineBodyKind::Atomic => {
             write!(definition, " BEGIN ATOMIC\n{};\nEND", routine.body.as_str())
                 .map_err(|_| super::eval::arena_full())?;

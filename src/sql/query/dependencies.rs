@@ -389,7 +389,7 @@ pub(super) fn collect_routine_program(
             arena,
             CollectionContext::ordinary(&path, None),
         )?,
-        super::RoutineFunctionResult::Forbidden(_) => {}
+        super::RoutineFunctionResult::Forbidden(_) | super::RoutineFunctionResult::Empty => {}
     }
     Ok(dependencies)
 }

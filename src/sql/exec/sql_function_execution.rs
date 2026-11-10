@@ -414,6 +414,7 @@ impl SqlExecution {
                         query::RoutineFunctionResult::Forbidden(statement) => {
                             Err(query::routine_forbidden_statement_error(statement))
                         }
+                        query::RoutineFunctionResult::Empty => Ok(()),
                     }
                 } else {
                     match parsed

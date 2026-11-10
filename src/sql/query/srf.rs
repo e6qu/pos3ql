@@ -6043,6 +6043,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 )?;
             }
             let result_query = match program.result {
+                super::RoutineFunctionResult::Empty => return Ok(&[]),
                 super::RoutineFunctionResult::Query(query) => query,
                 super::RoutineFunctionResult::Void(statement) => match statement {
                     crate::sql::ast::Stmt::Select(query) => arena

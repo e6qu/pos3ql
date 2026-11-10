@@ -5714,11 +5714,18 @@ pub fn infer_type_res(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
-            "__jsonb_subscript_set" => args
-                .first()
-                .map(|base| infer_type_res(base, columns))
-                .transpose()?
-                .unwrap_or_else(|| of(ColType::Jsonb)),
+            "__jsonb_subscript_set" => {
+                let base = args
+                    .first()
+                    .map(|base| infer_type_res(base, columns))
+                    .transpose()?;
+                if base.is_some_and(|(oid, _)| {
+                    matches!(ColType::from_oid(oid), Some(ColType::Array(_)))
+                }) {
+                    return Err(crate::sql::eval::array_element_assignment_unsupported());
+                }
+                base.unwrap_or_else(|| of(ColType::Jsonb))
+            }
             name if name.starts_with("__json_query_") => {
                 if name.ends_with("_jsonb") {
                     of(ColType::Jsonb)

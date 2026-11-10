@@ -82197,6 +82197,39 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
+fn array_element_assignment_is_rejected_instead_of_treated_as_jsonb() {
+    let config = test_config("array-element-assignment");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE element_targets (a int[], j jsonb); \
+         INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
+    );
+    for statement in [
+        "UPDATE element_targets SET a[1] = 9 WHERE a IS NOT NULL",
+        "UPDATE element_targets SET a[1] = 9 WHERE a IS NULL",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert_eq!(error_sqlstates(&output), ["0A000"], "{statement}");
+        assert!(
+            String::from_utf8_lossy(&output)
+                .contains("assignment to array elements and slices is not supported"),
+            "{statement}"
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE element_targets SET j['k'] = '1' RETURNING j::text",
+    );
+    assert_eq!(data_rows(&output), ["{\"k\": 1}", "{\"k\": 1}"]);
+    drop(engine);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn local_journal_commits_leave_no_publication_deadline_for_an_idle_reactor() {
     let config = test_config("local-journal-idle-deadline");
     assert!(!config.wal_upload);

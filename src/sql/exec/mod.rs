@@ -29238,6 +29238,7 @@ fn cursor_statement_effect<'s, 'a, 'b>(
                 super::cursor::FetchMotion::BackwardAll => (2, 0),
                 super::cursor::FetchMotion::Absolute(amount) => (3, amount),
                 super::cursor::FetchMotion::Relative(amount) => (4, amount),
+                super::cursor::FetchMotion::BackwardZero => (5, 0),
             };
             (
                 variable,

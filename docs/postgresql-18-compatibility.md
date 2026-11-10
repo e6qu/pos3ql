@@ -296,7 +296,13 @@ rows fit; raising `cursor_bytes` does not help there.
 
 - `NO SCROLL`: `cursor_bytes` bounds one fetched batch and is reused.
 - `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
-- `WITH HOLD`: the unread suffix (plus history when scrolling) must fit.
+  When revisited rows are evaluated again, the history holds each row's input
+  columns plus 17 bytes of row identity, and a volatile filter adds the rows it
+  rejected; the current fetch's output shares the same bytes.
+- Ordered row-locking cursors save every qualifying row's input columns (plus
+  17 bytes) at the first `FETCH`.
+- `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
+  scrollable cursor whose rows are evaluated again saves its whole result.
 
 Destructive changes to a table an open cursor reads raise `55006`, as in
 [PostgreSQL](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).

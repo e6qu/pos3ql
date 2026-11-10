@@ -66,9 +66,11 @@ number.
 **Done today:** ordered AFTER-trigger work; nested INSERT/UPDATE/DELETE;
 trigger frames; PL/pgSQL calls inside `PERFORM`, `SELECT ... INTO` and
 declaration initializers; SQL-language function bodies, child calls and return
-checks; SQL cursors executing from retained query state; client output that
-never blocks the worker on a slow reader; large single-table results resuming
-row by row across client, storage and lock waits. The
+checks; SQL cursors executing from retained query state, including row locks
+taken per `FETCH` and scrollable cursors that evaluate revisited rows again;
+client output that never blocks the worker on a slow reader; large
+single-table results resuming row by row across client, storage and lock
+waits. The
 [request path](docs/architecture.md#the-request-path) describes how saved state
 is owned.
 
@@ -76,6 +78,10 @@ is owned.
 
 - **Functions:** callers and expression positions that have no owning query;
   PL/pgSQL return conversion that can wait; one timing count per completed call.
+  A top-level `SELECT` that the retained reader cannot hold (joins, sorting,
+  grouping, subqueries) restarts once for each first call of a SQL-language
+  routine, so its work grows with the square of those calls; single-table,
+  `VALUES` and `generate_series` sources hand each call off on its row.
 - **Write phases:** BEFORE/INSTEAD triggers, source scans, row locks, partitions,
   constraints, transition tables, rules, data-modifying common table
   expressions (CTEs), COPY, replication apply and deferred triggers. Keep the
@@ -88,13 +94,15 @@ is owned.
   Remaining: paged and named portals (`Execute` with a row limit still buffers
   into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
   shapes (joins, sorting, grouping, subqueries, set operations, and more
-  set-returning functions than `generate_series` and one-array `unnest`). Two
-  cursor differences keep `tests/external/cursor_execution.py` on PostgreSQL
-  only: a sorted `FOR UPDATE` cursor locks its rows at `DECLARE` instead of
-  per `FETCH`, and a `SCROLL` cursor returns saved values on backward fetches
-  instead of evaluating its projection again. Saving a held cursor at commit
-  yields during storage waits. Cursors keep declared record and domain types
-  after their source query ends.
+  set-returning functions than `generate_series` and one-array `unnest`).
+  Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
+  cursor returns saved values where PostgreSQL evaluates a volatile output
+  list again, and a row-locking cursor over a join, or ordered by an
+  expression that is not a source column, locks its rows at `DECLARE`.
+  PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
+  rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
+  commit yields during storage waits. Cursors keep declared record and domain
+  types after their source query ends.
 
 **Done when:**
 
@@ -256,7 +264,11 @@ order and startup limits hold throughout. The
 **Work:** audit PostgreSQL 18 built-in functions by signature and executed
 behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
-unsupported case into an explicit error. The
+unsupported case into an explicit error. Known gaps: `DROP FUNCTION`,
+`PROCEDURE`, `ROUTINE` and `AGGREGATE ... IF EXISTS` on a missing routine send
+no `... does not exist, skipping` notice, and the error without `IF EXISTS`
+quotes the bare name where PostgreSQL prints the signature (`function f(integer,
+text) does not exist`). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

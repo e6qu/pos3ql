@@ -191,11 +191,11 @@ pub(crate) use spill_generations::{StatementFileLease, StatementFileScope};
 pub(crate) use definition_images::TableDefinitionImages;
 pub(crate) use row_heap::{HeapRowRead, RowHeap};
 pub(crate) use row_images::{
-    OrderedRowSnapshot, RowByteRead, RowSnapshot, TableRowSnapshot, VisibleRowHome,
+    OrderedRowSnapshot, RowByteRead, RowSnapshot, RowVersion, TableRowSnapshot, VisibleRowHome,
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
-pub(crate) use row_reads::{RowRead, RowSelfChange};
+pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
 use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};

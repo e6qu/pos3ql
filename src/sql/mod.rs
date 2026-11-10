@@ -2749,6 +2749,19 @@ fn cursor_result_too_large() -> SqlError {
     )
 }
 
+/// Where an evaluated cursor row goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorRowSink {
+    Save,
+    /// Saved after releasing an earlier output nothing emitted.
+    SaveReplacing,
+    /// Saved before OFFSET applies, while the row still needs its lock.
+    Locking,
+    Discard,
+    /// Only the filter runs.
+    FilterOnly,
+}
+
 fn cursor_input_wait(error: &SqlError) -> bool {
     error.sqlstate == sqlstate::INTERNAL_IO_WAIT
         || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
@@ -22992,6 +23005,10 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<bool, SqlError> {
+        if cursors.locks_rows(at) {
+            return self
+                .advance_locking_cursor(at, saved, arena, txn, sqlprep, cursors, guc, responder);
+        }
         let owner = cursors.plan_owner(at)?;
         let source_snapshot = self.storage.read_snapshot();
         loop {
@@ -23010,9 +23027,200 @@ impl Engine {
             if !ready {
                 return Ok(false);
             }
-            let txid = txn.txid;
-            let row =
-                arena.with_remaining_region(|frame| -> Result<Result<bool, SqlError>, WireFull> {
+            let output = if saved {
+                CursorRowSink::Save
+            } else {
+                CursorRowSink::Discard
+            };
+            let emitted = self.evaluate_cursor_row(
+                at,
+                true,
+                output,
+                owner,
+                source_snapshot,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )?;
+            cursors.execution_parts(at).0.finish_row(emitted);
+            if emitted {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Produces the next row of a cursor that locks rows as PostgreSQL's
+    /// LockRows node does: the row is projected, then locked, then rechecked
+    /// against its latest version, and only then counted by OFFSET. A sorted
+    /// source first saves and sorts every qualifying row. A lock wait keeps
+    /// the projected row, so the retried FETCH neither repeats its effects
+    /// nor skips it.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_locking_cursor(
+        &mut self,
+        at: usize,
+        saved: bool,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<bool, SqlError> {
+        let owner = cursors.plan_owner(at)?;
+        let source_snapshot = self.storage.read_snapshot();
+        let txid = txn.txid;
+        while cursors.sort_pending(at) {
+            self.storage.set_read_snapshot(source_snapshot);
+            let ready = {
+                let (work, buffers) = self.work.cursor_parts();
+                let (query, _, _) = cursors.execution_parts(at);
+                query.prepare_row(&self.storage, txid, datetime::now_micros(), work, buffers)?
+            };
+            if !ready {
+                cursors.finish_sorting(at, &self.storage, txid)?;
+                break;
+            }
+            let passed = self.evaluate_cursor_row(
+                at,
+                true,
+                CursorRowSink::FilterOnly,
+                owner,
+                source_snapshot,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )?;
+            if passed {
+                cursors.save_pending_input(at)?;
+            }
+            cursors.execution_parts(at).0.finish_row(false);
+        }
+        let sorted = cursors.sorted_source(at);
+        loop {
+            self.storage.set_read_snapshot(source_snapshot);
+            if cursors.locked_output(at).is_none() {
+                let ready = if sorted {
+                    cursors.prepare_sorted_row(at)?
+                } else {
+                    let (work, buffers) = self.work.cursor_parts();
+                    let (query, _, _) = cursors.execution_parts(at);
+                    query.prepare_row(&self.storage, txid, datetime::now_micros(), work, buffers)?
+                };
+                if !ready {
+                    return Ok(false);
+                }
+                let mark = cursors.output_mark(at);
+                let filter = !sorted || cursors.needs_recheck(at);
+                let passed = self.evaluate_cursor_row(
+                    at,
+                    filter,
+                    CursorRowSink::Locking,
+                    owner,
+                    source_snapshot,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )?;
+                if !passed {
+                    cursors.execution_parts(at).0.finish_row(false);
+                    cursors.finish_locked_row(at);
+                    continue;
+                }
+                cursors.set_locked_output(at, mark);
+            }
+            let locked = cursors
+                .execution_parts(at)
+                .0
+                .lock_pending(&self.storage, txid)?;
+            let recheck = if locked {
+                cursors
+                    .execution_parts(at)
+                    .0
+                    .recheck_pending(&self.storage, txid)?
+            } else {
+                query::LockedRow::Skip
+            };
+            let repeatable = matches!(
+                txn.isolation,
+                ast::TransactionIsolation::RepeatableRead | ast::TransactionIsolation::Serializable
+            );
+            match recheck {
+                query::LockedRow::Unchanged => {}
+                query::LockedRow::Updated if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent update"
+                    ));
+                }
+                query::LockedRow::Deleted if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent delete"
+                    ));
+                }
+                query::LockedRow::Updated => {
+                    // The latest version is filtered and projected again.
+                    cursors.drop_locked_output(at);
+                    cursors.set_recheck(at);
+                    continue;
+                }
+                query::LockedRow::Skip | query::LockedRow::Deleted => {
+                    cursors.drop_locked_output(at);
+                    cursors.execution_parts(at).0.finish_row(false);
+                    cursors.finish_locked_row(at);
+                    continue;
+                }
+            }
+            let skipped = cursors.execution_parts(at).0.skip_row();
+            if skipped || !saved {
+                cursors.drop_locked_output(at);
+            }
+            cursors.execution_parts(at).0.finish_row(!skipped);
+            cursors.finish_locked_row(at);
+            if !skipped {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Evaluates the cursor source's pending row: its filter when `filter`,
+    /// its projection, OFFSET, and output. Returns whether the row was
+    /// produced; the caller finishes the pending row.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_cursor_row(
+        &mut self,
+        at: usize,
+        filter: bool,
+        output: CursorRowSink,
+        owner: type_input_plans::Owner,
+        source_snapshot: u32,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<bool, SqlError> {
+        let txid = txn.txid;
+        let changed = || {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor source changed during evaluation"
+            )
+        };
+        let row =
+            arena.with_remaining_region(|frame| -> Result<Result<bool, SqlError>, WireFull> {
+                if filter {
                     let passes = self.execute_retained_expression(
                         frame,
                         None,
@@ -23024,10 +23232,7 @@ impl Engine {
                         responder,
                         |storage, work, sequences, invocations, cursors| {
                             if cursors.plan_owner(at)? != owner {
-                                return Err(sql_err!(
-                                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                                    "cursor source changed during evaluation"
-                                ));
+                                return Err(changed());
                             }
                             let (query, _, _) = cursors.execution_parts(at);
                             query.evaluate_predicate(
@@ -23040,111 +23245,193 @@ impl Engine {
                             )
                         },
                     )?;
-                    let passes = match passes {
-                        Ok(passes) => passes,
+                    match passes {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(Ok(false)),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                if output == CursorRowSink::FilterOnly {
+                    return Ok(Ok(true));
+                }
+                let count = cursors.execution_parts(at).0.items_len();
+                let mut projected = crate::mem::arena::ArenaList::new(frame);
+                for index in 0..count {
+                    let values = self.execute_retained_expression(
+                        frame,
+                        None,
+                        source_snapshot,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        |storage, work, sequences, invocations, cursors| {
+                            if cursors.plan_owner(at)? != owner {
+                                return Err(changed());
+                            }
+                            let (query, _, _) = cursors.execution_parts(at);
+                            query.evaluate_item(
+                                index,
+                                storage,
+                                txid,
+                                work,
+                                Some(sequences),
+                                invocations,
+                                frame,
+                            )
+                        },
+                    )?;
+                    let values = match values {
+                        Ok(values) => values,
                         Err(error) => return Ok(Err(error)),
                     };
-                    if !passes {
-                        return Ok(Ok(false));
-                    }
-                    let count = cursors.execution_parts(at).0.items_len();
-                    let mut projected = crate::mem::arena::ArenaList::new(frame);
-                    for index in 0..count {
-                        let values = self.execute_retained_expression(
-                            frame,
-                            None,
-                            source_snapshot,
-                            txn,
-                            sqlprep,
-                            cursors,
-                            guc,
-                            responder,
-                            |storage, work, sequences, invocations, cursors| {
-                                if cursors.plan_owner(at)? != owner {
-                                    return Err(sql_err!(
-                                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                                        "cursor source changed during evaluation"
-                                    ));
-                                }
-                                let (query, _, _) = cursors.execution_parts(at);
-                                query.evaluate_item(
-                                    index,
-                                    storage,
-                                    txid,
-                                    work,
-                                    Some(sequences),
-                                    invocations,
-                                    frame,
-                                )
-                            },
-                        )?;
-                        let values = match values {
-                            Ok(values) => values,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        for value in values {
-                            if projected.len() == MAX_PROJ {
-                                return Ok(Err(sql_err!(
-                                    sqlstate::TOO_MANY_COLUMNS,
-                                    "cursor output has too many columns"
-                                )));
-                            }
-                            if projected.push(*value).is_err() {
-                                return Ok(Err(eval::arena_full()));
-                            }
+                    for value in values {
+                        if projected.len() == MAX_PROJ {
+                            return Ok(Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "cursor output has too many columns"
+                            )));
+                        }
+                        if projected.push(*value).is_err() {
+                            return Ok(Err(eval::arena_full()));
                         }
                     }
-                    let actual_owner = match cursors.plan_owner(at) {
-                        Ok(owner) => owner,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if actual_owner != owner {
-                        return Ok(Err(sql_err!(
-                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                            "cursor source changed during evaluation"
-                        )));
-                    }
-                    if cursors.execution_parts(at).0.skip_row() {
-                        return Ok(Ok(false));
-                    }
-                    let (_, description, rows) = cursors.execution_parts(at);
-                    let output = if saved {
-                        crate::pg::respond::CursorRowOutput::Save(rows)
-                    } else {
-                        crate::pg::respond::CursorRowOutput::Discard
-                    };
-                    let mut capture = Responder::for_cursor(description, output);
-                    capture.set_render(guc.render());
-                    match query::emit_data_row(
-                        &self.storage,
-                        txid,
-                        frame,
-                        &mut capture,
-                        projected.as_slice(),
-                    )? {
-                        Ok(()) => Ok(Ok(true)),
-                        Err(error) => Ok(Err(error)),
-                    }
-                });
-            let emitted = match row {
-                Ok(result) => result.map_err(|_| cursor_result_too_large())??,
-                Err(error) => {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "cursor row exceeds statement memory: {}",
-                        error
-                    ));
                 }
-            };
-            if cursors.plan_owner(at)? != owner {
+                match cursors.plan_owner(at) {
+                    Ok(actual) if actual == owner => {}
+                    Ok(_) => return Ok(Err(changed())),
+                    Err(error) => return Ok(Err(error)),
+                }
+                if output != CursorRowSink::Locking && cursors.execution_parts(at).0.skip_row() {
+                    return Ok(Ok(false));
+                }
+                if output == CursorRowSink::SaveReplacing {
+                    cursors.release_unemitted_output(at);
+                }
+                let (_, description, rows) = cursors.execution_parts(at);
+                let sink = if output == CursorRowSink::Discard {
+                    crate::pg::respond::CursorRowOutput::Discard
+                } else {
+                    crate::pg::respond::CursorRowOutput::Save(rows)
+                };
+                let mut capture = Responder::for_cursor(description, sink);
+                capture.set_render(guc.render());
+                match query::emit_data_row(
+                    &self.storage,
+                    txid,
+                    frame,
+                    &mut capture,
+                    projected.as_slice(),
+                )? {
+                    Ok(()) => Ok(Ok(true)),
+                    Err(error) => Ok(Err(error)),
+                }
+            });
+        let produced = match row {
+            Ok(result) => result.map_err(|_| cursor_result_too_large())??,
+            Err(error) => {
                 return Err(sql_err!(
-                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-                    "cursor source changed during evaluation"
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cursor row exceeds statement memory: {}",
+                    error
                 ));
             }
-            cursors.execution_parts(at).0.finish_row(emitted);
-            if emitted {
-                return Ok(true);
+        };
+        if cursors.plan_owner(at)? != owner {
+            return Err(changed());
+        }
+        Ok(produced)
+    }
+
+    /// Runs a FETCH or MOVE on a scrollable cursor whose revisited rows are
+    /// evaluated again, following PostgreSQL's portal steps.
+    #[allow(clippy::too_many_arguments)]
+    fn run_scroll_command(
+        &mut self,
+        at: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<u64, SqlError> {
+        let owner = cursors.plan_owner(at)?;
+        let source_snapshot = self.storage.read_snapshot();
+        loop {
+            match cursors.scroll_next(at)? {
+                cursor::ScrollAction::Done(count) => return Ok(count),
+                cursor::ScrollAction::Limits => {
+                    let limits = {
+                        let (work, _) = self.work.cursor_parts();
+                        cursors.execution_parts(at).0.take_limits(work)?
+                    };
+                    cursors.scroll_set_limits(at, limits);
+                }
+                cursor::ScrollAction::Visit {
+                    input,
+                    filter,
+                    keep,
+                } => {
+                    self.storage.set_read_snapshot(source_snapshot);
+                    let source = input == cursor::ScrollInput::Source;
+                    match input {
+                        cursor::ScrollInput::Source => {
+                            let ready = {
+                                let (work, buffers) = self.work.cursor_parts();
+                                let (query, _, _) = cursors.execution_parts(at);
+                                query.prepare_row(
+                                    &self.storage,
+                                    txn.txid,
+                                    datetime::now_micros(),
+                                    work,
+                                    buffers,
+                                )?
+                            };
+                            if !ready {
+                                cursors.scroll_complete(at, cursor::VisitOutcome::SourceEnd)?;
+                                continue;
+                            }
+                        }
+                        cursor::ScrollInput::Saved(index) => {
+                            cursors.prepare_saved_input(at, index)?;
+                        }
+                    }
+                    let sink = if keep {
+                        CursorRowSink::SaveReplacing
+                    } else {
+                        CursorRowSink::Discard
+                    };
+                    let passed = self.evaluate_cursor_row(
+                        at,
+                        filter,
+                        sink,
+                        owner,
+                        source_snapshot,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )?;
+                    let output = if passed && keep {
+                        Some(cursors.seal_output(at)?)
+                    } else {
+                        None
+                    };
+                    if source && (passed || cursors.scroll_rescans(at)) {
+                        cursors.save_pending_input(at)?;
+                    }
+                    cursors.execution_parts(at).0.finish_row(passed);
+                    let outcome = if passed {
+                        cursor::VisitOutcome::Passed { output }
+                    } else {
+                        cursor::VisitOutcome::Rejected
+                    };
+                    cursors.scroll_complete(at, outcome)?;
+                }
             }
         }
     }
@@ -23159,11 +23446,16 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         while let Some(at) = cursors.next_hold_source() {
-            cursors.begin_fetch(at, cursor::FetchMotion::All, false)?;
-            while self
-                .advance_cursor_resumable(at, true, arena, txn, sqlprep, cursors, guc, responder)?
-            {
-                cursors.record_row(at, true)?;
+            if cursors.begin_scroll_hold(at) {
+                self.run_scroll_command(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                cursors.finish_scroll_hold(at);
+            } else {
+                cursors.begin_fetch(at, cursor::FetchMotion::All, false)?;
+                while self.advance_cursor_resumable(
+                    at, true, arena, txn, sqlprep, cursors, guc, responder,
+                )? {
+                    cursors.record_row(at, true)?;
+                }
             }
             cursors.finish_hold_source(at);
         }
@@ -23187,6 +23479,18 @@ impl Engine {
             ..
         } = context;
         let result = (|| {
+            if let Some(at) = cursors.scroll_slot(name) {
+                cursors.begin_scroll(at, motion, move_only)?;
+                let count =
+                    self.run_scroll_command(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                cursors.finish_scroll(at);
+                return usize::try_from(count).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "cursor row count exceeds this platform's range"
+                    )
+                });
+            }
             if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
                 cursors.begin_fetch(at, motion, move_only)?;
                 while cursors.produced_rows(at) < needed {

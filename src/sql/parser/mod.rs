@@ -1284,19 +1284,27 @@ impl<'a> Parser<'a> {
                     "DECLARE CURSOR WITH HOLD",
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "not supported",
+                    "Holdable cursors must be READ ONLY.",
                 ))
             } else if scroll == crate::sql::cursor::CursorScroll::Scroll {
                 Some((
                     "DECLARE SCROLL CURSOR",
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "not supported",
+                    "Scrollable cursors must be READ ONLY.",
                 ))
             } else if insensitive {
-                Some(("DECLARE INSENSITIVE CURSOR", "42P11", "not valid"))
+                Some((
+                    "DECLARE INSENSITIVE CURSOR",
+                    "42P11",
+                    "not valid",
+                    "Insensitive cursors must be READ ONLY.",
+                ))
             } else {
                 None
             };
-            if let Some((prefix, state, reason)) = restriction {
+            if let Some((prefix, state, reason, detail)) = restriction {
+                crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail)), None);
                 return Err(ParseError {
                     at: statement_start,
                     message: stack_format!(
@@ -1370,7 +1378,10 @@ impl<'a> Parser<'a> {
             if self.eat_ident("all")? {
                 FetchMotion::BackwardAll
             } else if matches!(self.peeked, Tok::Num(_) | Tok::Op("-" | "+")) {
-                FetchMotion::Count(-signed_count(self)?)
+                match signed_count(self)? {
+                    0 => FetchMotion::BackwardZero,
+                    count => FetchMotion::Count(-count),
+                }
             } else {
                 FetchMotion::Count(-1)
             }

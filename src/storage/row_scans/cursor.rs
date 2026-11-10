@@ -10,6 +10,8 @@ use crate::storage::{
 
 pub(crate) struct CursorRow<'a> {
     pub(crate) rowid: u64,
+    /// The version this scan's snapshot selected.
+    pub(crate) version: crate::storage::RowVersion,
     bytes: CursorRowBytes<'a>,
 }
 
@@ -196,6 +198,7 @@ impl RowCursor {
                 source.resident += 1;
                 continue;
             };
+            let version = home.snapshot().row_version();
             let copy = |bytes: &[u8]| {
                 arena
                     .alloc_slice_copy(bytes)
@@ -214,7 +217,11 @@ impl RowCursor {
             };
             let rowid = record.rowid;
             source.resident += 1;
-            return Ok(Some(CursorRow { rowid, bytes }));
+            return Ok(Some(CursorRow {
+                rowid,
+                version,
+                bytes,
+            }));
         }
         let mut members = state_arena
             .retained_slice_mut(source.members)
@@ -236,9 +243,10 @@ impl RowCursor {
                         .spill
                         .resume(&mut members, &buffers.scan, 1, u64::MAX),
                 ),
-                &mut |rowid, _, representation| {
+                &mut |rowid, commit_lsn, representation| {
                     row = Some(CursorRow {
                         rowid,
+                        version: crate::storage::RowVersion::committed(commit_lsn),
                         bytes: CursorRowBytes::Spilled(representation),
                     });
                     Ok(ControlFlow::Break(()))

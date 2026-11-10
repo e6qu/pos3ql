@@ -218,9 +218,10 @@ A cursor over one table, over constant `VALUES` rows, or over
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
-`OFFSET`. Other cursor queries, including those with ordering, user-defined
-operators or row-level security, run when declared; see
-[the plan](../PLAN.md#pause-and-resume-every-query-path).
+`OFFSET`. A row-locking cursor (`FOR UPDATE`, `FOR SHARE` and their variants)
+over one table may also order by its columns. Other cursor queries, including
+other orderings, user-defined operators or row-level security, run when
+declared; see [the plan](../PLAN.md#pause-and-resume-every-query-path).
 
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
@@ -253,14 +254,43 @@ FETCH 2 FROM c;  -- reads two rows
   into cursor memory.
 
 `SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
-new reads; `FETCH LAST` reads the rest. Their history must fit `cursor_bytes`;
-exhaustion returns `54000` and leaves the cursor failed until closed. Without a
-scroll option, a table scan, a retained set-returning function and a list of
-two or more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty result are forward-only. `pg_cursors.is_scrollable`
+new reads; `FETCH LAST` reads the rest. When the output list calls a volatile
+function such as `nextval`, a row reached again by `FETCH PRIOR`, `ABSOLUTE`,
+`RELATIVE` or a later forward fetch is evaluated again, as PostgreSQL scans
+backward: with `SELECT id, nextval('s') FROM t`, `FETCH NEXT` twice then
+`FETCH PRIOR` returns row 1 with the third number. The cursor then saves the
+input columns of each row instead of its output, and a volatile filter also
+saves the rows it rejected, because the filter runs again too. `LIMIT` returns
+the row at the edge of its window again without evaluating it, and `MOVE` and
+`FETCH ABSOLUTE` take PostgreSQL's steps (an absolute target less than halfway
+back rewinds and reads forward). History must fit `cursor_bytes`; exhaustion
+returns `54000` and leaves the cursor failed until closed. Without a scroll
+option, a table scan, a retained set-returning function and a list of two or
+more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty
+result are forward-only and return saved rows. `pg_cursors.is_scrollable`
 reports the choice made at declaration.
 
+A row-locking cursor locks each row when a `FETCH` or `MOVE` reaches it, not
+at `DECLARE`, after evaluating its output list and before `OFFSET` counts it:
+
+```sql
+DECLARE c CURSOR FOR SELECT id, v FROM orders ORDER BY id FOR UPDATE;
+FETCH 1 FROM c;  -- locks only the first row
+```
+
+An ordered cursor first saves every qualifying row in `cursor_bytes` (a full
+buffer returns `54000` before any row is locked) and sorts them. A `FETCH` that
+meets a row locked by another transaction waits like `SELECT ... FOR UPDATE`;
+`lock_timeout`, `statement_timeout` and cancel end the wait. A row changed by a
+transaction that committed after `DECLARE` is checked again: under `READ
+COMMITTED` its newest version is filtered and projected again, or skipped if it
+was deleted or no longer matches; under `REPEATABLE READ` and `SERIALIZABLE`
+the fetch fails with `40001`. Rows the cursor's own transaction changed after
+`DECLARE` are skipped. Such cursors are never scrollable by default.
+
 `WITH HOLD` saves the unread rows at commit, including when declared outside
-`BEGIN`. Rolling back a later transaction that fetched from it does not rewind
+`BEGIN`. A scrollable cursor that evaluates revisited rows again is rewound and
+saved whole, evaluating every row again; it keeps its position. Rolling back a later transaction that fetched from it does not rewind
 or close it. If saving fails — for example, an unread row with `id=0` makes
 `SELECT 100/id` fail at `COMMIT` — the commit rolls back and closes new
 cursors; cursors held earlier survive. Unread rows must fit `cursor_bytes`.

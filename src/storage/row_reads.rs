@@ -31,7 +31,41 @@ pub(crate) enum RowSelfChange {
     TriggeredCommand,
 }
 
+/// What became of a row a reader selected, once its row lock is held.
+pub(crate) enum LockedRowRecheck {
+    Unchanged,
+    /// The locking transaction itself changed or deleted the row since.
+    OwnChange,
+    /// Another transaction deleted the row and committed.
+    Deleted,
+    /// Another transaction replaced the row and committed.
+    Updated(super::VisibleRowHome),
+}
+
 impl super::Storage {
+    /// Compares the version `seen` under an older snapshot with the row's
+    /// latest version, including the transaction's own changes. The caller
+    /// holds the row lock, so no other writer can change it further.
+    pub(crate) fn recheck_locked_row(
+        &self,
+        table: usize,
+        rowid: u64,
+        txid: u32,
+        seen: super::RowVersion,
+    ) -> Result<LockedRowRecheck, SqlError> {
+        let latest = match self.row_state(table, rowid)? {
+            Some(state) => self.uniqueness_row_home(table, rowid, state, txid)?,
+            None => None,
+        };
+        Ok(match latest {
+            None if self.row_has_own_pending(table, rowid, txid) => LockedRowRecheck::OwnChange,
+            None => LockedRowRecheck::Deleted,
+            Some(home) if home.snapshot().row_version() == seen => LockedRowRecheck::Unchanged,
+            Some(home) if home.snapshot().row_version().is_pending() => LockedRowRecheck::OwnChange,
+            Some(home) => LockedRowRecheck::Updated(home),
+        })
+    }
+
     /// Only pending metadata is needed; no byte read or callback runs while
     /// definition, version, and row-map guards are held.
     pub(crate) fn row_self_change(

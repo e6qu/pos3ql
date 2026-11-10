@@ -30,7 +30,7 @@ mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
 use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
-pub(crate) use retained::RetainedSelect;
+pub(crate) use retained::{LockedRow, RetainedSelect};
 
 #[cfg(test)]
 mod routine_contract_tests;
@@ -9007,7 +9007,17 @@ pub(crate) fn lock_result_row(
     scope: &QueryScope<'_>,
     rowids: &[Option<u64>],
 ) -> Result<bool, SqlError> {
-    for clause in statement.locking {
+    lock_clauses_row(storage, txid, statement.locking, scope, rowids)
+}
+
+pub(crate) fn lock_clauses_row(
+    storage: &Storage,
+    txid: u32,
+    clauses: &[crate::sql::ast::LockClause<'_>],
+    scope: &QueryScope<'_>,
+    rowids: &[Option<u64>],
+) -> Result<bool, SqlError> {
+    for clause in clauses {
         for (table, rowid) in rowids.iter().copied().enumerate().take(scope.n) {
             let targeted = if clause.of.is_empty() {
                 scope.derived[table].is_none()

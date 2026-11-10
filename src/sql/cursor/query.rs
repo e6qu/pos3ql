@@ -359,6 +359,57 @@ impl CursorQuery {
         })
     }
 
+    pub(crate) fn source(&self) -> Option<&crate::sql::query::RetainedSelect<'static>> {
+        self.retained.as_ref()
+    }
+
+    pub(crate) fn lock_pending(
+        &self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<bool, SqlError> {
+        self.retained
+            .as_ref()
+            .expect("retained cursor input")
+            .lock_pending(storage, txid)
+    }
+
+    pub(crate) fn recheck_pending(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+    ) -> Result<crate::sql::query::LockedRow, SqlError> {
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        self.retained
+            .as_mut()
+            .expect("retained cursor input")
+            .recheck_pending(storage, txid, arena)
+    }
+
+    pub(crate) fn take_limits(&mut self, work: &Arena) -> Result<Option<(u64, u64)>, SqlError> {
+        let bound = self.bound.as_ref().expect("bound cursor query");
+        let source = self.retained.as_mut().expect("retained cursor input");
+        crate::sql::type_input_plans::with_owner(self.owner, || {
+            crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
+                source.take_cursor_limits(work, bound.params)
+            })
+        })
+    }
+
+    /// Makes saved input `index` the source's pending row; a wait may have
+    /// left it pending already.
+    pub(crate) fn prepare_saved_input(
+        &mut self,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<(), SqlError> {
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        source.prepare_saved_row(index, bytes, arena)
+    }
+
     pub(crate) fn evaluate_predicate(
         &self,
         storage: &crate::storage::Storage,

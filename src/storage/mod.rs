@@ -52258,11 +52258,26 @@ impl Storage {
         wait: crate::sql::ast::LockWait,
     ) -> Result<crate::sql::lock::LockDecision, SqlError> {
         let wait_owner = self.transaction_wait_owner(txid);
-        let mut locks = self.lock_state();
-        let sequence = locks.next_sequence()?;
-        locks
-            .row
-            .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
+        let decision = {
+            let mut locks = self.lock_state();
+            let sequence = locks.next_sequence()?;
+            locks
+                .row
+                .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
+        };
+        // The lock manager knows row identities, not names. Its only
+        // unavailable outcome is a NOWAIT conflict; PostgreSQL names the table.
+        decision.map_err(|error| {
+            if error.sqlstate == crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE {
+                sql_err!(
+                    crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,
+                    "could not obtain lock on row in relation \"{}\"",
+                    self.tables[table].definition().name.as_str()
+                )
+            } else {
+                error
+            }
+        })
     }
 
     pub(crate) fn release_row_locks(&self, txid: u32) {

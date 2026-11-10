@@ -343,13 +343,18 @@ fn sorted_and_paged_projection_effects(external: bool) {
         "external={external}"
     );
     let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-    assert_eq!(
-        error_sqlstates(&other.execute(
-            &mut engine,
-            "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
-            true
-        )),
-        ["55P03"]
+    let refused = other.execute(
+        &mut engine,
+        "SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE NOWAIT",
+        true,
+    );
+    assert_eq!(error_sqlstates(&refused), ["55P03"]);
+    // PostgreSQL names the relation whose row is locked.
+    assert!(
+        String::from_utf8_lossy(&refused)
+            .contains("could not obtain lock on row in relation \"projection_locks\""),
+        "{}",
+        String::from_utf8_lossy(&refused)
     );
     session.success(&mut engine, "ROLLBACK", true);
     assert_eq!(
